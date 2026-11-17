@@ -876,8 +876,10 @@ mod tests {
                 response: None,
             },
             Row {
-                case: "the package is not held",
-                run: Err(super::super::execution::Unrunnable::PackageNotHeld),
+                case: "the package is not a readable archive",
+                run: Err(super::super::execution::Unrunnable::PackageUnreadable(
+                    "invalid Zip archive".to_string(),
+                )),
                 ending: Ending::AttemptsSpent,
                 condition: CONDITION_RETRIES_EXHAUSTED,
                 response: None,

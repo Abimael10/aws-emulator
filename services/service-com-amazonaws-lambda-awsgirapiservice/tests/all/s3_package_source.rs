@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! End-to-end tests for a deployment package named by an AMAZON S3 LOCATION: what a write
-//! that names one is served or refused, and which bytes the package ends up being.
+//! that names one is served or refused, which bytes the package ends up being, and what
+//! RUNNING those bytes answers.
 //!
 //! The RULE asserted here, over a table of inputs for each of the three writes that store
 //! such a package: **Lambda READS the package out of the Amazon S3 object the write names
@@ -14,10 +15,23 @@
 //! DOES hand over that is no readable .zip archive at all is refused too, with the sentence
 //! Lambda words for an archive it could not unzip.
 //!
+//! Those bytes are the function's FROM THEN ON, which the second half of this file asserts
+//! through the data plane: a `RequestResponse` `Invoke` runs the handler they hold and keeps
+//! running it however the object is changed or deleted afterwards, and a stored package that
+//! yields no module for the configured `Handler` is the runtime's own import failure rather
+//! than the modelled refusal for an archive that could not be unzipped. See the comment block
+//! above those suites.
+//!
 //! The rows differ along what the rule generalises over: whether the object is there, WHICH
 //! part of the location is absent (the key, the bucket), the shape and the size of the key
 //! and of the object, whether the object is an archive, and which of the three writes names
 //! the location.
+//!
+//! Amazon S3 is mounted BESIDE Lambda on one engine, and every object read here is written
+//! through S3's own `CreateBucket`/`PutObject` — so the digest asserted is the digest of the
+//! bytes that bucket holds rather than one this test handed Lambda. The Lambda-side harness
+//! (the `Answer` wrapper, `json_call` and `package_bytes`) is the one `function_lifecycle.rs`
+//! publishes.
 //!
 //! Amazon S3 is mounted BESIDE Lambda on one engine, and every object read here is written
 //! through S3's own `CreateBucket`/`PutObject` — so the digest asserted is the digest of the
@@ -34,8 +48,13 @@ use sha2::Digest as _;
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::function_lifecycle::{
-    create_function, json_call, make_activation_due, package_bytes, Answer, REGION, ROLE,
+    create_function, json_call, make_activation_due, make_update_due, package_bytes, zip_file,
+    Answer, REGION, ROLE,
 };
+// The archive writer a sibling suite publishes, which takes the entries of a package as
+// (path, source) pairs — so the packages these suites upload are written by one writer rather
+// than by a second copy of it.
+use crate::node_invoke_run::package as handler_package;
 
 /// The error code every refusal in this suite carries, and its status.
 const INVALID_PARAMETER: &str = "InvalidParameterValueException";
@@ -654,5 +673,638 @@ async fn a_layer_publish_follows_the_location_its_content_names() {
                  {reported:?}"
             );
         }
+    }
+}
+
+// What the WRITES above store, the RUN below spends: a package read out of an Amazon S3
+// object is one Lambda then OWNS, so an invocation runs those bytes and keeps running them
+// however the object changes afterwards.
+//
+// The RULE these three suites assert: **the call that writes a package reads the Amazon S3
+// object its location names once, and the function owns those bytes from then on — so a
+// `RequestResponse` `Invoke` runs the handler held in them and answers 200 with what that run
+// produced, and nothing re-reads the object at invocation time, whatever becomes of it.** The
+// last suite asserts the ERROR CLASS the same ownership implies: a stored package that yields
+// no module for the configured `Handler` is a failure of the runtime's INITIALIZATION phase —
+// the served 200 carrying that runtime's own `Runtime.ImportModuleError` document and the
+// `X-Amz-Function-Error: Unhandled` signal — while the modelled `InvalidZipFileException`
+// (HTTP 502, "Lambda could not unzip the deployment package") is reserved for stored bytes
+// that are no readable .zip archive.
+//
+// The rows differ along what the rule generalises over: which runtime the package is written
+// for and in which module system, what the handler computes, how many entries the archive
+// holds, the shape of the key the location names, which write stored the package
+// (`CreateFunction` or `UpdateFunctionCode`), and what happens to the object afterwards
+// (deleted, replaced with another package, left alone).
+
+/// The header `Invoke`'s `InvocationType` is bound to (`httpHeader: X-Amz-Invocation-Type`),
+/// and the synchronous value, which RUNS the function.
+const INVOCATION_TYPE_HEADER: &str = "x-amz-invocation-type";
+const REQUEST_RESPONSE: &str = "RequestResponse";
+
+/// The two headers a synchronous invocation reports a run under: the version it ran
+/// (`Invoke$ExecutedVersion`, `httpHeader: X-Amz-Executed-Version`) and the failure signal
+/// (`Invoke$FunctionError`, `httpHeader: X-Amz-Function-Error`).
+const EXECUTED_VERSION_HEADER: &str = "x-amz-executed-version";
+const FUNCTION_ERROR_HEADER: &str = "x-amz-function-error";
+
+/// The unpublished version an invocation stating no qualifier resolves to, which is what
+/// `X-Amz-Executed-Version` then names.
+const LATEST: &str = "$LATEST";
+
+/// The `FunctionError` signal of a run that ended in an error the function did not handle.
+const UNHANDLED: &str = "Unhandled";
+
+/// The `errorType` a runtime reports when it cannot import the module the configured
+/// `Handler` names — the class AWS's own managed runtimes raise in the initialization phase.
+const IMPORT_MODULE_ERROR: &str = "Runtime.ImportModuleError";
+
+/// The error this service answers for stored bytes that are no readable .zip archive, and the
+/// status its model gives it (`InvalidZipFileException`, errorKind server, httpError 502).
+const INVALID_ZIP_FILE: &str = "InvalidZipFileException";
+const INVALID_ZIP_FILE_STATUS: u16 = 502;
+
+/// How long one invocation of these suites' functions is given, as the function's own
+/// `Timeout`: far past what any of these handlers needs on any host, because what is under
+/// test is WHICH bytes ran and not how fast an interpreter gets through them.
+const RUN_TIMEOUT_SECONDS: i64 = 60;
+
+/// Remove `key` from [`BUCKET`] through Amazon S3's own `DeleteObject`, and check the object
+/// really is gone — the premise of every row that then invokes a function whose package came
+/// out of an object nobody holds any more.
+async fn delete_object(router: &MultiServiceRouter, case: &str, key: &str) {
+    s3_ok(router, case, "DELETE", &format!("/{BUCKET}/{key}"), &[]).await;
+    let read = s3_request(router, "GET", &format!("/{BUCKET}/{key}"), &[]).await;
+    assert_eq!(
+        read.status, 404,
+        "case {case:?}: the object must be gone from the bucket, got {} {}",
+        read.status,
+        String::from_utf8_lossy(&read.body)
+    );
+}
+
+/// `CreateFunction` for a `Zip` function whose `Code` names the Amazon S3 location
+/// [`BUCKET`]/`key` and nothing else about the package.
+async fn create_from_object(
+    router: &MultiServiceRouter,
+    name: &str,
+    runtime: &str,
+    handler: &str,
+    key: &str,
+) -> Answer {
+    create_function(
+        router,
+        &json!({
+            "FunctionName": name,
+            "Role": ROLE,
+            "Runtime": runtime,
+            "Handler": handler,
+            "Timeout": RUN_TIMEOUT_SECONDS,
+            "Code": { "S3Bucket": BUCKET, "S3Key": key },
+        }),
+    )
+    .await
+}
+
+/// `Invoke` with `InvocationType=RequestResponse` on the function `name`.
+async fn invoke(router: &MultiServiceRouter, name: &str, event: &Value) -> Answer {
+    crate::function_lifecycle::send(
+        router,
+        "POST",
+        &format!("/2015-03-31/functions/{name}/invocations"),
+        "application/json",
+        serde_json::to_vec(event).expect("the event serializes"),
+        &[(INVOCATION_TYPE_HEADER, REQUEST_RESPONSE.to_string())],
+    )
+    .await
+}
+
+/// The `CodeSha256` Lambda reports for the function's unpublished version.
+async fn reported_digest(router: &MultiServiceRouter, name: &str) -> Option<String> {
+    member(
+        &get_function(router, name).await.json(),
+        "/Configuration/CodeSha256",
+    )
+    .and_then(|digest| digest.as_str().map(str::to_string))
+}
+
+/// Assert that `answer` is a RUN that was served, whose payload is `expected`.
+fn assert_ran(case: &str, answer: &Answer, expected: &Value) {
+    assert_eq!(
+        answer.status,
+        200,
+        "case {case:?}: expected the run to be answered 200, got {} {}",
+        answer.status,
+        String::from_utf8_lossy(&answer.body)
+    );
+    assert_eq!(
+        answer.header(FUNCTION_ERROR_HEADER),
+        None,
+        "case {case:?}: expected no function error, got {:?}",
+        answer.header(FUNCTION_ERROR_HEADER)
+    );
+    assert_eq!(
+        answer.header(EXECUTED_VERSION_HEADER).as_deref(),
+        Some(LATEST),
+        "case {case:?}: expected the executed version {LATEST}, got {:?}",
+        answer.header(EXECUTED_VERSION_HEADER)
+    );
+    let payload = answer.json();
+    assert_eq!(
+        &payload, expected,
+        "case {case:?}: expected the handler's own value {expected}, got {payload}"
+    );
+}
+
+/// One row of the create-and-run table: the package the bucket holds, the configuration the
+/// function names it under, and what invoking it must answer.
+struct RunRow {
+    case: &'static str,
+    function: &'static str,
+    /// The Amazon S3 key the `Code` location names.
+    key: &'static str,
+    runtime: &'static str,
+    handler: &'static str,
+    /// The archive's entries, as (path, source) pairs.
+    entries: &'static [(&'static str, &'static str)],
+    /// The event the invocation carries.
+    event: Value,
+    /// What the handler returns for that event.
+    expected: Value,
+}
+
+fn run_rows() -> Vec<RunRow> {
+    vec![
+        RunRow {
+            case: "a Python package under a flat key",
+            function: "s3-flat-python",
+            key: "worker.zip",
+            runtime: "python3.12",
+            handler: "lambda_function.lambda_handler",
+            entries: &[(
+                "lambda_function.py",
+                "def lambda_handler(event, context):\n    return {'stage': 'alpha'}\n",
+            )],
+            event: json!({}),
+            expected: json!({"stage": "alpha"}),
+        },
+        RunRow {
+            case: "a Python package of another module name, under a nested key",
+            function: "s3-nested-python",
+            key: "builds/2026/07/app-rev.zip",
+            runtime: "python3.13",
+            handler: "app.run",
+            entries: &[(
+                "app.py",
+                "def run(event, context):\n    return {'doubled': event['n'] * 2}\n",
+            )],
+            event: json!({"n": 21}),
+            expected: json!({"doubled": 42}),
+        },
+        RunRow {
+            case: "a Python package of several modules, the handler importing a sibling",
+            function: "s3-multi-module-python",
+            key: "releases/bundle.with.dots.zip",
+            runtime: "python3.12",
+            handler: "lambda_function.lambda_handler",
+            entries: &[
+                (
+                    "lambda_function.py",
+                    "import helper\n\n\ndef lambda_handler(event, context):\n    \
+                     return {'joined': helper.join(event['parts'])}\n",
+                ),
+                ("helper.py", "def join(parts):\n    return '-'.join(parts)\n"),
+            ],
+            event: json!({"parts": ["ship", "it"]}),
+            expected: json!({"joined": "ship-it"}),
+        },
+        RunRow {
+            case: "a node ES module package",
+            function: "s3-node-esm",
+            key: "node/handler.zip",
+            runtime: "nodejs20.x",
+            handler: "index.handler",
+            entries: &[(
+                "index.mjs",
+                "export const handler = async (event) => ({ keys: Object.keys(event).sort() });",
+            )],
+            event: json!({"b": 2, "a": 1}),
+            expected: json!({"keys": ["a", "b"]}),
+        },
+    ]
+}
+
+/// RULE: an invocation of a function whose `Code` named an Amazon S3 location RUNS the
+/// handler that object held, and the function reports the object's own digest.
+#[tokio::test]
+async fn an_invocation_runs_the_handler_the_referenced_object_held() {
+    let engine = Arc::new(engine::InMemoryEngine::new());
+    let router = emulator(&engine);
+    create_bucket(&router, "the table's bucket").await;
+
+    for row in run_rows() {
+        let case = row.case;
+        let bytes = handler_package(row.entries);
+        put_object(&router, case, row.key, &bytes).await;
+
+        let created =
+            create_from_object(&router, row.function, row.runtime, row.handler, row.key).await;
+        assert_eq!(
+            created.status,
+            201,
+            "case {case:?}: expected the create to be served 201, got {} {}",
+            created.status,
+            String::from_utf8_lossy(&created.body)
+        );
+        // The create answers the function `Pending`, and Lambda takes no invocation in that
+        // window; the transition is owed by the CLOCK, so the due instant is brought forward
+        // rather than waited out.
+        make_activation_due(&engine);
+
+        assert_ran(case, &invoke(&router, row.function, &row.event).await, &row.expected);
+
+        // ... and the package that ran is the OBJECT's, which the digest the function reports
+        // says: the expected value is computed here from the bytes the bucket was given.
+        let expected_digest = digest_of(&bytes);
+        let reported = reported_digest(&router, row.function).await;
+        assert_eq!(
+            reported.as_deref(),
+            Some(expected_digest.as_str()),
+            "case {case:?}: expected CodeSha256 {expected_digest:?}, got {reported:?}"
+        );
+    }
+}
+
+/// What happens to the Amazon S3 object after the package was read out of it.
+#[derive(Clone, Copy)]
+enum Afterwards {
+    /// Nothing: the object stays where it is.
+    Untouched,
+    /// The object is deleted, so nobody holds it any more.
+    Deleted,
+    /// The object is replaced with a DIFFERENT package, whose handler answers differently.
+    Replaced,
+}
+
+/// One row of the ownership table.
+struct OwnershipRow {
+    case: &'static str,
+    function: &'static str,
+    key: &'static str,
+    afterwards: Afterwards,
+}
+
+/// RULE: the bytes the write read ARE the function's from then on — the object is not read
+/// again at invocation time, so deleting it or replacing it changes neither the payload the
+/// function answers nor the digest it reports.
+#[tokio::test]
+async fn the_package_stays_the_functions_after_the_object_changes() {
+    let rows = [
+        OwnershipRow {
+            case: "the object is left where it is",
+            function: "owned-untouched",
+            key: "owned/untouched.zip",
+            afterwards: Afterwards::Untouched,
+        },
+        OwnershipRow {
+            case: "the object is deleted after the create read it",
+            function: "owned-deleted",
+            key: "owned/deleted.zip",
+            afterwards: Afterwards::Deleted,
+        },
+        OwnershipRow {
+            case: "the object is replaced with a different package",
+            function: "owned-replaced",
+            key: "owned/replaced.zip",
+            afterwards: Afterwards::Replaced,
+        },
+    ];
+
+    // The package every row is created from, and the one the "replaced" row puts under the
+    // same key afterwards: two archives whose handlers answer differently, so a run of the
+    // wrong bytes shows up in the payload.
+    let held = handler_package(&[(
+        "lambda_function.py",
+        "def lambda_handler(event, context):\n    return {'generation': 'first'}\n",
+    )]);
+    let successor = handler_package(&[(
+        "lambda_function.py",
+        "def lambda_handler(event, context):\n    return {'generation': 'second'}\n",
+    )]);
+    let expected = json!({"generation": "first"});
+
+    let engine = Arc::new(engine::InMemoryEngine::new());
+    let router = emulator(&engine);
+    create_bucket(&router, "the table's bucket").await;
+
+    for row in rows {
+        let case = row.case;
+        put_object(&router, case, row.key, &held).await;
+        let created = create_from_object(
+            &router,
+            row.function,
+            "python3.12",
+            "lambda_function.lambda_handler",
+            row.key,
+        )
+        .await;
+        assert_eq!(
+            created.status,
+            201,
+            "case {case:?}: expected the create to be served 201, got {} {}",
+            created.status,
+            String::from_utf8_lossy(&created.body)
+        );
+        make_activation_due(&engine);
+
+        // The run BEFORE the object is touched, so each row starts from a function known to
+        // answer.
+        assert_ran(case, &invoke(&router, row.function, &json!({})).await, &expected);
+
+        match row.afterwards {
+            Afterwards::Untouched => {}
+            Afterwards::Deleted => delete_object(&router, case, row.key).await,
+            Afterwards::Replaced => put_object(&router, case, row.key, &successor).await,
+        }
+
+        assert_ran(case, &invoke(&router, row.function, &json!({})).await, &expected);
+        let expected_digest = digest_of(&held);
+        let reported = reported_digest(&router, row.function).await;
+        assert_eq!(
+            reported.as_deref(),
+            Some(expected_digest.as_str()),
+            "case {case:?}: expected the CodeSha256 of the package that was read, \
+             {expected_digest:?}, got {reported:?}"
+        );
+    }
+}
+
+/// One row of the code-update-and-run table: the package a later `UpdateFunctionCode` points
+/// the function at, and what invoking it must then answer.
+struct UpdateRunRow {
+    case: &'static str,
+    function: &'static str,
+    /// The key the create's location named.
+    first_key: &'static str,
+    /// The key the update's location names.
+    second_key: &'static str,
+    entries: &'static [(&'static str, &'static str)],
+    expected: Value,
+}
+
+/// RULE: `UpdateFunctionCode` naming an Amazon S3 location reads that object the same way, so
+/// the function then runs ITS handler — and owns those bytes just as the create's were, which
+/// removing the object afterwards does not change.
+#[tokio::test]
+async fn a_code_update_by_reference_runs_the_new_objects_handler() {
+    let rows = [
+        UpdateRunRow {
+            case: "a replacement package under a flat key",
+            function: "updated-by-reference",
+            first_key: "updates/v1.zip",
+            second_key: "updates/v2.zip",
+            entries: &[(
+                "lambda_function.py",
+                "def lambda_handler(event, context):\n    return {'revision': 2}\n",
+            )],
+            expected: json!({"revision": 2}),
+        },
+        UpdateRunRow {
+            case: "a replacement package of several modules, under a nested key",
+            function: "updated-by-nested-reference",
+            first_key: "updates/nested/v1.zip",
+            second_key: "updates/nested/2026/07/v2.zip",
+            entries: &[
+                (
+                    "lambda_function.py",
+                    "import helper\n\n\ndef lambda_handler(event, context):\n    \
+                     return {'revision': helper.REVISION}\n",
+                ),
+                ("helper.py", "REVISION = 7\n"),
+            ],
+            expected: json!({"revision": 7}),
+        },
+    ];
+
+    // The package every row is CREATED from, whose handler answers differently from the one
+    // the update points at.
+    let original = handler_package(&[(
+        "lambda_function.py",
+        "def lambda_handler(event, context):\n    return {'revision': 1}\n",
+    )]);
+
+    let engine = Arc::new(engine::InMemoryEngine::new());
+    let router = emulator(&engine);
+    create_bucket(&router, "the table's bucket").await;
+
+    for row in rows {
+        let case = row.case;
+        put_object(&router, case, row.first_key, &original).await;
+        let created = create_from_object(
+            &router,
+            row.function,
+            "python3.12",
+            "lambda_function.lambda_handler",
+            row.first_key,
+        )
+        .await;
+        assert_eq!(
+            created.status,
+            201,
+            "case {case:?}: expected the create to be served 201, got {} {}",
+            created.status,
+            String::from_utf8_lossy(&created.body)
+        );
+        make_activation_due(&engine);
+        assert_ran(
+            case,
+            &invoke(&router, row.function, &json!({})).await,
+            &json!({"revision": 1}),
+        );
+
+        let replacement = handler_package(row.entries);
+        put_object(&router, case, row.second_key, &replacement).await;
+        let updated = update_function_code(
+            &router,
+            row.function,
+            &json!({ "S3Bucket": BUCKET, "S3Key": row.second_key }),
+        )
+        .await;
+        assert_eq!(
+            updated.status,
+            200,
+            "case {case:?}: expected the code update to be served 200, got {} {}",
+            updated.status,
+            String::from_utf8_lossy(&updated.body)
+        );
+        // "During this time, you can't modify the function, but you can still invoke it":
+        // the update's own window is the clock's as well, so it is brought forward too.
+        make_update_due(&engine);
+
+        assert_ran(
+            case,
+            &invoke(&router, row.function, &json!({})).await,
+            &row.expected,
+        );
+        let expected_digest = digest_of(&replacement);
+        let reported = reported_digest(&router, row.function).await;
+        assert_eq!(
+            reported.as_deref(),
+            Some(expected_digest.as_str()),
+            "case {case:?}: expected CodeSha256 {expected_digest:?}, got {reported:?}"
+        );
+
+        // And the update's bytes are the function's too: the object they were read out of is
+        // removed, and the function still runs them.
+        delete_object(&router, case, row.second_key).await;
+        assert_ran(
+            case,
+            &invoke(&router, row.function, &json!({})).await,
+            &row.expected,
+        );
+    }
+}
+
+/// What the store holds for the function's package, in the error-class table below.
+enum StoredPackage {
+    /// Nothing: the `Code` named an Amazon S3 location this emulator resolved no object for,
+    /// so no bytes were stored for the version.
+    NoBytes,
+    /// A readable archive holding the given (path, source) entries.
+    Archive(&'static [(&'static str, &'static str)]),
+    /// Bytes that are no readable .zip archive at all.
+    NotAnArchive,
+}
+
+/// One row of the error-class table.
+struct ClassRow {
+    case: &'static str,
+    function: &'static str,
+    stored: StoredPackage,
+    /// `Some(error type)` when the invocation must be a SERVED RUN reporting an
+    /// initialization failure, `None` when it must be the modelled unzip refusal.
+    import_failure: Option<&'static str>,
+}
+
+/// RULE: a stored package that yields NO module for the configured `Handler` is the runtime's
+/// own import failure — HTTP 200, `X-Amz-Function-Error: Unhandled` and
+/// `Runtime.ImportModuleError` — whether the archive simply carries no entry that handler
+/// names or the store holds no bytes for the package at all; `InvalidZipFileException` (502,
+/// "Lambda could not unzip the deployment package") is reserved for stored bytes that are no
+/// readable archive.
+///
+/// The first row's function is created with a `Code` naming an Amazon S3 location on a router
+/// carrying NO Amazon S3 at all, which is a read that shows nothing about the object: it
+/// refuses nothing and stores no bytes, so the stored package is empty.
+#[tokio::test]
+async fn a_package_with_no_module_to_import_is_the_runtimes_import_failure() {
+    let rows = [
+        ClassRow {
+            case: "a package the store holds no bytes for",
+            function: "no-bytes-held",
+            stored: StoredPackage::NoBytes,
+            import_failure: Some(IMPORT_MODULE_ERROR),
+        },
+        ClassRow {
+            case: "an archive holding no entry the handler names",
+            function: "no-such-module",
+            stored: StoredPackage::Archive(&[(
+                "other.py",
+                "def lambda_handler(event, context):\n    return {}\n",
+            )]),
+            import_failure: Some(IMPORT_MODULE_ERROR),
+        },
+        ClassRow {
+            case: "bytes that are no readable archive at all",
+            function: "not-an-archive",
+            stored: StoredPackage::NotAnArchive,
+            import_failure: None,
+        },
+    ];
+
+    let engine = Arc::new(engine::InMemoryEngine::new());
+    // Lambda ALONE on this engine: the first row's Amazon S3 read reaches no Amazon S3, so
+    // nothing is shown about the object its location names.
+    let router = crate::function_lifecycle::router_on(&engine);
+
+    for row in rows {
+        let case = row.case;
+        let code = match row.stored {
+            StoredPackage::NoBytes => json!({ "S3Bucket": BUCKET, "S3Key": "never-read.zip" }),
+            StoredPackage::Archive(entries) => {
+                json!({ "ZipFile": zip_file(&handler_package(entries)) })
+            }
+            StoredPackage::NotAnArchive => json!({ "ZipFile": zip_file(&package_bytes(64)) }),
+        };
+        let created = create_function(
+            &router,
+            &json!({
+                "FunctionName": row.function,
+                "Role": ROLE,
+                "Runtime": "python3.12",
+                "Handler": "lambda_function.lambda_handler",
+                "Timeout": RUN_TIMEOUT_SECONDS,
+                "Code": code,
+            }),
+        )
+        .await;
+        assert_eq!(
+            created.status,
+            201,
+            "case {case:?}: expected the create to be served 201, got {} {}",
+            created.status,
+            String::from_utf8_lossy(&created.body)
+        );
+        make_activation_due(&engine);
+
+        let answered = invoke(&router, row.function, &json!({})).await;
+
+        let Some(expected_type) = row.import_failure else {
+            assert_eq!(
+                answered.status, INVALID_ZIP_FILE_STATUS,
+                "case {case:?}: expected the modelled {INVALID_ZIP_FILE_STATUS} for bytes that \
+                 are no archive, got {} {}",
+                answered.status,
+                String::from_utf8_lossy(&answered.body)
+            );
+            assert!(
+                answered.error_code().contains(INVALID_ZIP_FILE),
+                "case {case:?}: expected {INVALID_ZIP_FILE}, got {:?}",
+                answered.error_code()
+            );
+            continue;
+        };
+
+        assert_eq!(
+            answered.status,
+            200,
+            "case {case:?}: expected an initialization failure to be a served 200, got {} {}",
+            answered.status,
+            String::from_utf8_lossy(&answered.body)
+        );
+        assert_eq!(
+            answered.header(FUNCTION_ERROR_HEADER).as_deref(),
+            Some(UNHANDLED),
+            "case {case:?}: expected the {UNHANDLED} signal, got {:?}",
+            answered.header(FUNCTION_ERROR_HEADER)
+        );
+        let document = answered.json();
+        let reported = document.get("errorType").and_then(Value::as_str);
+        assert_eq!(
+            reported,
+            Some(expected_type),
+            "case {case:?}: expected errorType {expected_type:?}, got {document}"
+        );
+        // The message is the RUNTIME's own, naming the module the `Handler` asked it to
+        // import — never this service's own wording for a package it does not hold.
+        let worded = document
+            .get("errorMessage")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        assert!(
+            worded.contains("lambda_function"),
+            "case {case:?}: expected the import failure to name the module the handler named, \
+             got {worded:?}"
+        );
     }
 }

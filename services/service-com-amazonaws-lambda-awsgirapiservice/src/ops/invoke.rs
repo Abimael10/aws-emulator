@@ -1171,19 +1171,7 @@ fn unrunnable(why: crate::state::Unrunnable) -> InvokeError {
             .into()
         }
         // "Lambda could not unzip the deployment package": the bytes this emulator holds
-        // for the package are not a package it can read, or it holds none at all (an S3
-        // object or an image it does not resolve).
-        crate::state::Unrunnable::PackageNotHeld => {
-            InvokeErrorModeled::InvalidZipFileException(InvalidZipFileException {
-                r#type: None,
-                message: Some(
-                    "The deployment package of this function is not held by this emulator, so \
-                     there is nothing to run."
-                        .to_string(),
-                ),
-            })
-            .into()
-        }
+        // for the package are not a package it can read.
         crate::state::Unrunnable::PackageUnreadable(why) => {
             InvokeErrorModeled::InvalidZipFileException(InvalidZipFileException {
                 r#type: None,

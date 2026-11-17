@@ -738,17 +738,6 @@ fn unrunnable(why: crate::state::Unrunnable) -> InvokeWithResponseStreamError {
         crate::state::Unrunnable::NoHandler => invalid_parameter(
             "The function configuration names no Handler to run.".to_string(),
         ),
-        crate::state::Unrunnable::PackageNotHeld => {
-            InvokeWithResponseStreamErrorModeled::InvalidZipFileException(InvalidZipFileException {
-                r#type: None,
-                message: Some(
-                    "The deployment package of this function is not held by this emulator, so \
-                     there is nothing to run."
-                        .to_string(),
-                ),
-            })
-            .into()
-        }
         crate::state::Unrunnable::PackageUnreadable(why) => {
             InvokeWithResponseStreamErrorModeled::InvalidZipFileException(InvalidZipFileException {
                 r#type: None,

@@ -552,10 +552,6 @@ pub(crate) fn unrunnable_reason(why: &super::execution::Unrunnable, subject: &st
             "the function's configuration names no Handler to run, so {subject} was never \
              executed"
         ),
-        super::execution::Unrunnable::PackageNotHeld => format!(
-            "this emulator holds no deployment package for the version {subject} was \
-             addressed to, so there was nothing to run it on"
-        ),
         super::execution::Unrunnable::PackageUnreadable(detail) => format!(
             "the deployment package of the version {subject} was addressed to could not be \
              read: {detail}"

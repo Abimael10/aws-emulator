@@ -545,8 +545,6 @@ pub enum Unrunnable {
     },
     /// The function's configuration names no handler to run.
     NoHandler,
-    /// This emulator holds no bytes for the resolved version's package.
-    PackageNotHeld,
     /// The bytes it holds are not a readable archive.
     PackageUnreadable(String),
     /// Too many handlers are already running, or too many runs have been abandoned.
@@ -721,7 +719,13 @@ pub async fn run_invocation(
     };
     let mut modules = match read {
         Ok(modules) => modules,
-        Err(package::PackageFault::NotHeld) => return Err(Unrunnable::PackageNotHeld),
+        // A package the store holds NO bytes for holds no module either, which is the same
+        // thing to the runtime as an archive carrying no entry the configured handler names:
+        // the initialization phase gets no module to import, so the run reports the import
+        // failure that runtime words for it. It is not the modelled failure for an archive
+        // that could not be unzipped — "Lambda could not unzip the deployment package" is
+        // about bytes that are no readable .zip, which is the arm below.
+        Err(package::PackageFault::NotHeld) => Vec::new(),
         Err(package::PackageFault::Unreadable(why)) => {
             return Err(Unrunnable::PackageUnreadable(why))
         }
