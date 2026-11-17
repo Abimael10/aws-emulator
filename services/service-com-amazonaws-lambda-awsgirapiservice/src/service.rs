@@ -111,6 +111,11 @@ use std::sync::Arc;
 /// body, and what that answer is; see the module's own header.
 mod absent_association;
 
+/// The DATA leg of this front door: which of this service's calls CloudTrail records as data
+/// events of the function they run, and how one such record reaches the account's trails; see
+/// the module's own header.
+pub mod data_events;
+
 /// The class of fault every error body of this service names in its `Type` member, which
 /// no raise site carries because it is a property of the failure rather than of the call.
 /// Applied to every response [`StatedPerOperation`] answers; see the module's own header.
@@ -392,8 +397,6 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
             get_provisioned_concurrency_config::GetProvisionedConcurrencyConfig,
             get_resource_policy::GetResourcePolicy,
             get_runtime_management_config::GetRuntimeManagementConfig,
-            invoke::Invoke,
-            invoke_async::InvokeAsync,
             list_aliases::ListAliases,
             list_capacity_providers::ListCapacityProviders,
             list_code_signing_configs::ListCodeSigningConfigs,
@@ -436,6 +439,14 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
             update_function_event_invoke_config::UpdateFunctionEventInvokeConfig,
             update_function_url_config::UpdateFunctionUrlConfig,
         );
+        // The INVOCATIONS, which are the two rows above that are NOT management events of the
+        // account: a call that runs a function acts on that function's contents, which
+        // CloudTrail records as a DATA event and delivers only into the bucket of a trail
+        // whose event selectors admit it (see [`data_events`]). Each one is served behind the
+        // same `StatedPerOperation` wrapper every other row carries — the record is built
+        // inside it, from the operation's own typed input and outcome, and the delivery is
+        // made outside it, once the response that names the request exists.
+        data_events::serve_invocation_data_events(&mut stated, &engine);
         Self {
             entry: function_url_refusal::FunctionUrlRefusals::new(Arc::clone(&engine)),
             response_stream: NamingItsRequest(EventStreamRoute(

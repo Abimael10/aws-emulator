@@ -293,6 +293,28 @@ pub trait AuditedService: Send + Sync + 'static {
         None
     }
 
+    /// What this service reports about the call BESIDE its parameters — the record's
+    /// `additionalEventData` — for the facts the REQUEST itself already determines.
+    ///
+    /// The default is none. A service whose records carry such a fact answers it here rather
+    /// than per handler, because nothing about it needs the handler to have run: the resource
+    /// an identifier addresses in its FULL form, say, which a record reports beside the
+    /// parameters because those carry the identifier the caller wrote. A fact only the HANDLER
+    /// knows is reported from inside the typed call instead
+    /// ([`report_additional_event_data`]), and what a handler reported wins — it saw the call.
+    ///
+    /// `operation` is the modelled name of the operation that served the call and `region` the
+    /// Region it was served in, for the same reason [`Self::resources`] takes them.
+    fn additional_event_data(
+        &self,
+        operation: &str,
+        request_parameters: &serde_json::Value,
+        region: &str,
+    ) -> Option<serde_json::Value> {
+        let _ = (operation, request_parameters, region);
+        None
+    }
+
     /// Whether a failure answered with this error identity is the refusal this service's
     /// PERMISSION CHECK answers BEFORE the operation acts on the request — the one failure
     /// whose record carries no `requestParameters` and no `responseElements`, because the
@@ -507,6 +529,13 @@ impl<O: Operation, S: AuditedService> AuditedOperation<O, S> {
             return None;
         }
         let region = self.service.region(ctx);
+        // What the HANDLER reported stands; a service that reports the same field off the
+        // request itself answers it where nothing reported one
+        // ([`AuditedService::additional_event_data`]).
+        let additional_event_data = additional_event_data.or_else(|| {
+            self.service
+                .additional_event_data(O::NAME, request_parameters, &region)
+        });
         // "responseElements" is what the call ANSWERED with, which a reporting call has
         // nothing of: CloudTrail records a read with a null `responseElements`. Neither does
         // a DATA event carry one: what such a call answers IS the contents of the resource
