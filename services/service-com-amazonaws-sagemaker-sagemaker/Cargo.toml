@@ -93,6 +93,9 @@ service-com-amazonaws-ecr-amazonec2containerregistry-v20150921 = { workspace = t
 emulator-core-build-support = { workspace = true }
 
 [dev-dependencies]
+# Declares one module per `tests/all/<name>.rs` for the crate's single test target, so a
+# new suite is picked up by being a file rather than by a hand-kept `mod` list.
+automod = { workspace = true }
 # Amazon S3, mounted beside SageMaker on one engine by the training-run suite: a run reads
 # the channel objects a test staged with `PutObject` and writes its model artifact where
 # `GetObject` then reads it back.

@@ -183,9 +183,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .ok_or_else(|| crate::scaffolded::Scaffolded::validation(crate::state::NO_STATE))?;
 
         let region = crate::state::request_region(ctx);
+        let now = ::std::time::SystemTime::now();
 
         let mut store = state.lock();
-        let Some(domain) = store.domains.get_mut(&input.domain_id) else {
+        // Resolved through the crate's one domain lookup, which answers nothing for a
+        // domain whose removal the clock already completed: past that instant the domain
+        // is gone whether or not a sweep has dropped the record yet.
+        let Some(domain) = store.domain_mut(&input.domain_id, now) else {
             return Err(DescribeDomainErrorModeled::ResourceNotFound(
                 ResourceNotFound {
                     message: Some(crate::state::domain_not_found(&region, &input.domain_id)),
@@ -197,7 +201,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The only write a reporting call makes: the transition the clock already owed.
         // It was due at the stored instant whether or not anybody described the domain,
         // so a waiter terminates and no caller's read changes the outcome.
-        let settled = domain.settle_status(::std::time::SystemTime::now());
+        let settled = domain.settle_status(now);
 
         let output = DescribeDomainOutput {
             domain_arn: Some(domain.arn.clone()),

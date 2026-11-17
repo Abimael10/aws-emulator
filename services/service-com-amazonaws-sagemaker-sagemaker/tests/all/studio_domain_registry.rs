@@ -650,7 +650,7 @@ async fn domain_readers_refuse_what_they_cannot_resolve() {
             "case {case}: error code, got {parsed}"
         );
         let expected = format!(
-            "Domain [arn:aws:sagemaker:{region}:{ACCOUNT}:domain/{domain_id}] does not exist"
+            "Domain [arn:aws:sagemaker:{region}:{ACCOUNT}:domain/{domain_id}] does not exist."
         );
         assert_eq!(
             message(&parsed),

@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! The STUDIO DOMAIN slice of this service's state: the domain `CreateDomain` writes,
-//! `DescribeDomain` replays and `ListDomains` pages over, with its ARN kind, its id
-//! mint, its Studio address, its statuses, the clock span it moves on, its store bound
-//! and the sentence its not-found refusal is worded with.
+//! `DescribeDomain` replays, `ListDomains` pages over and `DeleteDomain` tears down, with
+//! its ARN kind, its id mint, its Studio address, its statuses, the clock spans it moves
+//! on, its store bound and the sentences its refusals are worded with.
 //!
 //! Its own file, like the other resource slices here, so the parent module stays inside
 //! the project's file-length limit. Every name is re-exported from [`super`], so a
@@ -33,6 +33,9 @@ pub const DOMAIN_STATUS_IN_SERVICE: &str = "InService";
 /// complete settles in — a placement the account's network does not admit
 /// ([`crate::state::domain_network`]) — beside the `FailureReason` that states why.
 pub const DOMAIN_STATUS_FAILED: &str = "Failed";
+/// See [`DOMAIN_STATUS_PENDING`]. What a domain reports from the `DeleteDomain` that asked
+/// for its deletion until the clock completes the teardown ([`Domain::begin_deletion`]).
+pub const DOMAIN_STATUS_DELETING: &str = "Deleting";
 
 /// How long after `CreateDomain` the clock owes the `Pending` -> `InService` transition.
 ///
@@ -41,6 +44,16 @@ pub const DOMAIN_STATUS_FAILED: &str = "Failed";
 /// takes minutes to provision a Studio domain; the span is compressed, never zero, and
 /// the due instant is stored rather than slept on ([`Domain::settle_status`]).
 pub const DOMAIN_IN_SERVICE_AFTER: Duration = Duration::from_secs(3);
+
+/// How long after `DeleteDomain` the clock owes the `Deleting` -> gone transition of a
+/// domain.
+///
+/// The same compressed, never-zero span as [`DOMAIN_IN_SERVICE_AFTER`]: a caller that
+/// describes the domain straight after asking for its deletion still observes `Deleting`,
+/// and one that polls observes it gone. Real SageMaker takes minutes to tear a Studio
+/// domain down, so the span is compressed; the due instant is stored rather than slept on
+/// ([`Domain::is_released`]).
+pub const DOMAIN_RELEASED_AFTER: Duration = DOMAIN_IN_SERVICE_AFTER;
 
 /// The page `ListDomains` serves when the request names no `MaxResults`: its
 /// `MaxResults` doc says "The default value for MaxResults is 10". [`MAX_PAGE_SIZE`]
@@ -83,17 +96,38 @@ pub fn studio_domain_url(region: &str, domain_id: &str) -> String {
 
 /// How the domain operations state a `DomainId` this account holds no domain under: the
 /// entity, then the ARN the requested id resolves to in the Region the request signed for
-/// IN SQUARE BRACKETS, then `does not exist` — the sentence the Studio family of
-/// resources words this fact with (see [`app_image_config_not_found`]), carrying no
-/// closing period.
+/// IN SQUARE BRACKETS, then `does not exist.` — the sentence the Studio family of
+/// resources words this fact with, closing period included, as an app's own not-found
+/// refusal does (`App [<arn>] does not exist.`).
 ///
 /// Stated once here so the reader and whichever update or delete resolves the same id
 /// later cannot word the one fact differently.
 pub fn domain_not_found(region: &str, domain_id: &str) -> String {
     format!(
-        "Domain [{}] does not exist",
+        "Domain [{}] does not exist.",
         resource_arn(region, DOMAIN_ARN_KIND, domain_id)
     )
+}
+
+/// How the domain operations state that a domain cannot take the change asked of it while
+/// the service is already moving it: the entity, then the ARN the request resolves to IN
+/// SQUARE BRACKETS — the subject form [`domain_not_found`] names the same resource with —
+/// then the status that stands in the way.
+///
+/// What a delete of a domain the service is already tearing down is answered with, so a
+/// repeat of that call reports the work in flight rather than claiming a second deletion.
+pub fn domain_not_deletable(arn: &str, status: &str) -> String {
+    format!("Domain [{arn}] cannot be deleted while it is in {status} status.")
+}
+
+/// How `DeleteDomain` states that the domain still holds Studio apps, which have to be
+/// deleted first: the same bracketed-ARN subject as [`domain_not_found`], then the apps
+/// that have not been deleted and so stand in the way.
+///
+/// Named for the sentence rather than for the question, so it cannot be mistaken for
+/// [`ComAmazonawsSagemakerSagemakerState::domain_holds_apps`], which is what ASKS it.
+pub fn domain_holds_apps_refusal(arn: &str) -> String {
+    format!("Domain [{arn}] has non-deleted Apps.")
 }
 
 /// A Studio domain created by `CreateDomain`, as `DescribeDomain` replays it and
@@ -144,6 +178,12 @@ pub struct Domain {
     pub creation_time: SystemTime,
     pub last_modified_time: SystemTime,
     pub in_service_due_at: SystemTime,
+    /// The instant the clock owes this domain's removal, set by
+    /// [`Domain::begin_deletion`]; `None` while no `DeleteDomain` has asked for one. Past
+    /// it the domain is gone for every caller ([`Domain::is_released`]), whether or not a
+    /// sweep has dropped the record yet — the way [`FeatureGroup::removal_due_at`] carries
+    /// the same fact.
+    pub removal_due_at: Option<SystemTime>,
 }
 
 impl Domain {
@@ -175,11 +215,85 @@ impl Domain {
         }
         false
     }
+
+    /// Start the teardown `DeleteDomain` asked for: the domain reports `Deleting`, and the
+    /// clock owes its removal [`DOMAIN_RELEASED_AFTER`] later.
+    ///
+    /// The record is NOT dropped here: `DomainStatus` carries `Deleting` and SageMaker
+    /// answers it until the teardown finishes, so the transient status is observable and
+    /// the removal is the clock's — stored as an instant and never slept on. The status
+    /// change is a change to the domain, so it moves `last_modified_time` too.
+    pub fn begin_deletion(&mut self, now: SystemTime) {
+        self.status = DOMAIN_STATUS_DELETING.to_string();
+        self.last_modified_time = now;
+        self.removal_due_at = Some(now + DOMAIN_RELEASED_AFTER);
+    }
+
+    /// Whether a `DeleteDomain` has asked for this domain's deletion, i.e. it is
+    /// `Deleting` and on its way out.
+    pub fn is_deleting(&self) -> bool {
+        self.removal_due_at.is_some()
+    }
+
+    /// Whether the removal the clock owed has completed, i.e. the domain is gone.
+    ///
+    /// A lookup answers `None` for such a domain and a listing leaves it out, so no caller
+    /// sees a domain whose removal was already due — the record itself is dropped by
+    /// [`ComAmazonawsSagemakerSagemakerState::release_deleted_domains`], which frees the
+    /// quota slot it still held.
+    pub fn is_released(&self, now: SystemTime) -> bool {
+        self.removal_due_at.is_some_and(|due| now >= due)
+    }
 }
 
 impl ComAmazonawsSagemakerSagemakerState {
     /// Whether another domain fits, i.e. the store is below [`DOMAIN_QUOTA`].
     pub fn domains_below_quota(&self) -> bool {
         self.domains.len() < DOMAIN_QUOTA
+    }
+
+    /// The domain a `DomainId` names, or `None` when this account holds none under it.
+    ///
+    /// The one lookup every domain reader resolves that member with, so no handler
+    /// re-implements it: a domain whose removal the clock already completed resolves to
+    /// nothing — past that instant the domain is gone whether or not the record has been
+    /// dropped yet ([`Domain::is_released`]).
+    ///
+    /// `now` is the caller's instant, so one request weighs the store against ONE clock
+    /// reading: the same instant its sweep and its transitions used.
+    pub fn domain_mut(&mut self, domain_id: &str, now: SystemTime) -> Option<&mut Domain> {
+        self.domains
+            .get_mut(domain_id)
+            .filter(|domain| !domain.is_released(now))
+    }
+
+    /// Drop every domain whose removal the clock already completed.
+    ///
+    /// Materialises only what was already due: the removal was owed at the stored instant
+    /// whether or not anybody called, and a lookup already answers `None` for such a
+    /// domain ([`Domain::is_released`]), so this changes nothing a later caller sees — it
+    /// frees the quota slot the gone domain still held. The call that asked for each
+    /// removal already recorded it, so nothing is answered back.
+    pub fn release_deleted_domains(&mut self, now: SystemTime) {
+        let released: Vec<String> = self
+            .domains
+            .values()
+            .filter(|domain| domain.is_released(now))
+            .map(|domain| domain.id.clone())
+            .collect();
+        for id in &released {
+            self.domains.remove(id);
+        }
+    }
+
+    /// Whether the domain `domain_id` still holds Studio apps, i.e. apps created in it
+    /// that no `DeleteApp` has released.
+    ///
+    /// An app hangs off the domain it was created in ([`AppKey::domain_id`]), so this is
+    /// what `DeleteDomain` weighs before tearing the domain down: releasing the domain
+    /// while its apps stayed behind would leave records addressing a domain no reader
+    /// resolves.
+    pub fn domain_holds_apps(&self, domain_id: &str) -> bool {
+        self.apps.keys().any(|key| key.domain_id == domain_id)
     }
 }

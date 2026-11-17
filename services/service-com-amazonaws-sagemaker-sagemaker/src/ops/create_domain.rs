@@ -244,7 +244,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         )
         .await;
 
+        let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
+        // The removals the clock already completed are materialised first, so a domain
+        // whose teardown is done is gone here too and the quota slot it held is free
+        // again. Each was due at its stored instant whether or not anybody called, so this
+        // call's observer makes no difference to the result.
+        store.release_deleted_domains(now);
         // The store is bounded, so a caller creating domain after domain cannot grow it
         // without end. `ResourceLimitExceeded` is the limit failure this operation models.
         if !store.domains_below_quota() {
@@ -261,7 +267,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        let now = ::std::time::SystemTime::now();
         store.domains.insert(
             domain_id.clone(),
             crate::state::Domain {
@@ -304,6 +309,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 creation_time: now,
                 last_modified_time: now,
                 in_service_due_at: now + crate::state::DOMAIN_IN_SERVICE_AFTER,
+                // Nothing has asked for this domain's removal, so the clock owes none.
+                removal_due_at: None,
             },
         );
         drop(store);

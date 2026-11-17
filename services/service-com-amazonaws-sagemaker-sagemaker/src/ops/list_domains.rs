@@ -138,7 +138,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
-        // The only write this reporting call makes: the `Pending` -> `InService` moves the
+        // The removals the clock already completed are materialised first, so a domain
+        // whose teardown is done is left out of the page and the quota slot it held is
+        // free again. Each was due at its stored instant whether or not anybody listed
+        // the domains.
+        store.release_deleted_domains(now);
+        // The only other write this reporting call makes: the `Pending` -> `InService` moves the
         // clock already owed. Each was due at the domain's stored instant whether or not
         // anybody listed the domains, so no caller's read changes what a later one sees.
         let mut settled: Vec<String> = Vec::new();

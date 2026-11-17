@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteDomain
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteDomain`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteDomain::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: tears down the Studio domain the request names — the domain reports
+//! `Deleting` from this call until the clock completes its removal, past which it resolves
+//! to nothing for every reader. This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -158,18 +152,80 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteDomain` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteDomainErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteDomain"))
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(|| crate::scaffolded::Scaffolded::validation(crate::state::NO_STATE))?;
+
+        let region = crate::state::request_region(ctx);
+        let now = ::std::time::SystemTime::now();
+
+        let mut store = state.lock();
+        // The removals the clock already completed are materialised first, so a domain
+        // whose teardown is done is gone here too and the quota slot it held is free
+        // again. Each was due at its stored instant whether or not anybody called, so
+        // this call's observer makes no difference to the result.
+        store.release_deleted_domains(now);
+
+        // Whether the domain still holds Studio apps is asked before the record is taken
+        // mutably, so the one store answers both questions under one lock.
+        let holds_apps = store.domain_holds_apps(&input.domain_id);
+
+        // `DomainId` is the only member that addresses a domain, resolved through the
+        // crate's one domain lookup so this call and every reader agree on which ids
+        // resolve. `ResourceNotFound` is what an id this account holds no domain under is
+        // answered with — never a 200, which a caller could not tell from a teardown that
+        // happened.
+        let Some(domain) = store.domain_mut(&input.domain_id, now) else {
+            return Err(DeleteDomainErrorModeled::ResourceNotFound(ResourceNotFound {
+                message: Some(crate::state::domain_not_found(&region, &input.domain_id)),
+            })
+            .into());
+        };
+
+        // The provisioning the clock already owed is materialised BEFORE the deletion is
+        // weighed, so a domain whose `InService` had fallen due is torn down from the
+        // status it had already reached rather than from the `Pending` it had left.
+        domain.settle_status(now);
+
+        // A domain the service is already tearing down cannot take a second deletion: the
+        // work is in flight, which is what `ResourceInUse` reports. A repeat of this call
+        // lands here, because the first one left the domain `Deleting`.
+        if domain.is_deleting() {
+            let refusal = crate::state::domain_not_deletable(&domain.arn, &domain.status);
+            return Err(DeleteDomainErrorModeled::ResourceInUse(ResourceInUse {
+                message: Some(refusal),
+            })
+            .into());
+        }
+
+        // A domain whose apps are still there is in use: the teardown takes the domain's
+        // own resources with it ("All of the members of the domain will lose access to
+        // their EFS volume"), so the apps running in it have to be deleted first
+        // (`DeleteApp`). Refusing here is also what keeps the store consistent: releasing
+        // the domain while its apps stayed behind would leave records addressing a domain
+        // no reader resolves.
+        if holds_apps {
+            let refusal = crate::state::domain_holds_apps_refusal(&domain.arn);
+            return Err(DeleteDomainErrorModeled::ResourceInUse(ResourceInUse {
+                message: Some(refusal),
+            })
+            .into());
+        }
+
+        // `RetentionPolicy` states whether the domain's EFS volume is retained, and that
+        // volume is an Amazon EFS file system no service of this emulator holds (which is
+        // why `DescribeDomain` reports no `HomeEfsFileSystemId`): there is no file system
+        // for either choice to keep or to remove, so the policy decides nothing here
+        // rather than being reported as if a volume had been retained.
+        let _ = &input.retention_policy;
+
+        // The record is kept until the clock completes the teardown, so the `Deleting`
+        // status a caller reads straight after this call is observable; past that instant
+        // every lookup answers as if the domain were gone.
+        domain.begin_deletion(now);
+        let arn = domain.arn.clone();
+        drop(store);
+
+        crate::state::record_state_change(Self::NAME, &arn, ctx);
+        Ok(DeleteDomainOutput)
     }
 }
