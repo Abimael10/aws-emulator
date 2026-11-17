@@ -26,11 +26,20 @@
 //!   directory buckets" (`$StartAfter`), and "only prefixes that end in a delimiter (/) are
 //!   supported" (`$Prefix`) — each refused with the code, status and sentence S3 answers it
 //!   with, and each served as asked on a GENERAL PURPOSE bucket, which is the other half of
-//!   the same rule.
+//!   the same rule;
+//! * the partition holds for a bucket created the way a client creates a directory bucket —
+//!   `PUT /<bucket>` on `s3express-control.<region>.amazonaws.com`, "you must use path-style
+//!   requests in the format `https://s3express-control.region-code.amazonaws.com/bucket-name`"
+//!   (`CreateBucket`) — and such a bucket is sessionable from the moment it exists, which is
+//!   the positive control the partition is read against;
+//! * a bucket this account does not hold is refused `NoSuchBucket` with HTTP 404 —
+//!   `CreateSession`'s single modelled error (`httpError 404`) — in the sentence the SURFACE
+//!   that name belongs to words it: the directory-bucket surface's ends in a full stop where
+//!   the general purpose surface's does not.
 
 use smithy_server_runtime::MultiServiceRouter;
 
-use super::bucket_lifecycle::{router, send, send_bytes_signed, Answer};
+use super::bucket_lifecycle::{router, send, send_bytes_signed, send_in_region, Answer};
 use super::directory_bucket_sessions_and_appends::directory_bucket;
 use super::object_and_tagging_roundtrip::{bucket, put_object, text};
 
@@ -72,6 +81,406 @@ fn continuation_token(answer: &Answer) -> Option<String> {
     answer
         .element("ContinuationToken")
         .filter(|token| !token.is_empty())
+}
+
+/// The ONE Region the two tests below drive every call against, so what the two listings are
+/// asserted to partition is the KIND of each bucket and nothing else.
+const EXPRESS_REGION: &str = "us-west-2";
+
+/// [`S3_EXPRESS_AUTHORIZATION`] scoped to `region`: the credential scope a client that
+/// reached the S3 Express surface of that Region presents.
+fn express_authorization(region: &str) -> String {
+    format!(
+        "AWS4-HMAC-SHA256 Credential=emulator-test-key/20260101/{region}/s3express/aws4_request, \
+         SignedHeaders=host, Signature=not-verified"
+    )
+}
+
+/// The host the S3 Express control endpoint of `region` is addressed as — "the HTTP Host
+/// header syntax is `s3express-control.region.amazonaws.com`" (`CreateBucket`'s own
+/// documentation of its directory-bucket surface).
+fn express_control_host(region: &str) -> String {
+    format!("s3express-control.{region}.amazonaws.com")
+}
+
+/// The `CreateBucketConfiguration` that asks for a DIRECTORY bucket in `zone_id`: the zone it
+/// is placed in (`Location`) and the kind of bucket it is (`Bucket`), in the model's own
+/// element order.
+fn directory_configuration(location_type: &str, zone_id: &str, data_redundancy: &str) -> String {
+    format!(
+        "<CreateBucketConfiguration xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\
+         <Location><Type>{location_type}</Type><Name>{zone_id}</Name></Location>\
+         <Bucket><DataRedundancy>{data_redundancy}</DataRedundancy><Type>Directory</Type>\
+         </Bucket></CreateBucketConfiguration>"
+    )
+}
+
+/// `PUT /<name>` on the S3 Express CONTROL endpoint of `region` — the create a client sends
+/// for a directory bucket: "you must use path-style requests in the format
+/// `https://s3express-control.region-code.amazonaws.com/bucket-name`" (`CreateBucket`).
+async fn create_directory_bucket_on_the_control_endpoint(
+    router: &MultiServiceRouter,
+    region: &str,
+    name: &str,
+    configuration: &str,
+) -> Answer {
+    send_bytes_signed(
+        router,
+        &express_authorization(region),
+        "PUT",
+        &express_control_host(region),
+        &format!("/{name}"),
+        &[("content-type", "application/xml")],
+        configuration.as_bytes(),
+    )
+    .await
+}
+
+/// `GET /<name>?session` signed for the S3 Express surface of `region` — `CreateSession`, the
+/// call a client makes before it reaches the Zonal data plane of a directory bucket.
+async fn create_session(router: &MultiServiceRouter, region: &str, name: &str) -> Answer {
+    send_bytes_signed(
+        router,
+        &express_authorization(region),
+        "GET",
+        &express_control_host(region),
+        &format!("/{name}?session"),
+        &[],
+        b"",
+    )
+    .await
+}
+
+/// `GET /<query>` on the S3 Express control endpoint of `region` — `ListDirectoryBuckets`.
+async fn list_directory_buckets_in(
+    router: &MultiServiceRouter,
+    region: &str,
+    query: &str,
+) -> Answer {
+    send_bytes_signed(
+        router,
+        &express_authorization(region),
+        "GET",
+        &express_control_host(region),
+        &format!("/{query}"),
+        &[],
+        b"",
+    )
+    .await
+}
+
+/// The `CreateBucketConfiguration` that places a GENERAL PURPOSE bucket in `region`.
+fn location_constraint(region: &str) -> String {
+    format!(
+        "<CreateBucketConfiguration xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\
+         <LocationConstraint>{region}</LocationConstraint></CreateBucketConfiguration>"
+    )
+}
+
+/// The every-bucket name a page of `ListDirectoryBuckets` reports, walked to exhaustion the
+/// way Express tooling walks it: a page size and the `ContinuationToken` the previous page
+/// handed back ("you can use this ContinuationToken for the pagination of the list results",
+/// `ListDirectoryBucketsRequest$ContinuationToken`).
+async fn every_directory_bucket(
+    router: &MultiServiceRouter,
+    region: &str,
+    page_size: i32,
+) -> Vec<String> {
+    // Generously more rounds than there are buckets to report, so a listing that handed back
+    // a cursor for ever is a failed assertion rather than a test that never ends.
+    const MOST_PAGES: usize = 64;
+    let mut collected: Vec<String> = Vec::new();
+    let mut token: Option<String> = None;
+    for _ in 0..MOST_PAGES {
+        let query = match token.as_deref() {
+            Some(resume) => {
+                format!("?max-directory-buckets={page_size}&continuation-token={resume}")
+            }
+            None => format!("?max-directory-buckets={page_size}"),
+        };
+        let page = list_directory_buckets_in(router, region, &query).await;
+        assert_eq!(
+            page.status,
+            200,
+            "case \"a page of max-directory-buckets={page_size}\": expected HTTP 200, got {} \
+             with body {:?}",
+            page.status,
+            text(&page)
+        );
+        collected.extend(listed_names(&page));
+        match continuation_token(&page) {
+            Some(next) => token = Some(next),
+            None => return collected,
+        }
+    }
+    panic!("case \"paging the directory-bucket listing\": paging must terminate");
+}
+
+/// RULE: a bucket's KIND is part of its identity, so the two account-wide listings partition
+/// the account between them — `ListDirectoryBuckets` reports the S3 Express One Zone
+/// directory buckets and `ListBuckets` the general purpose ones, neither reporting the
+/// other's — whatever endpoint the bucket was created through, and however the directory
+/// listing is paged.
+///
+/// The rows differ along what the rule generalises over: the kind of bucket, and for a
+/// directory bucket the kind of zone it is placed in (two Availability Zones and a Local
+/// Zone), each created through the S3 Express control endpoint of its own Region the way a
+/// client creates one. Each directory bucket is sessioned right after its create, which is
+/// the positive control the partition is read against: a name the directory listing reports
+/// is a name the Express surface serves.
+#[tokio::test]
+async fn the_two_account_listings_partition_the_account_by_bucket_kind() {
+    let router = router();
+
+    // (case, name, location type, zone id, data redundancy)
+    let directory_rows: [(&str, &str, &str, &str, &str); 3] = [
+        (
+            "an Availability Zone bucket",
+            "expart-a--usw2-az1--x-s3",
+            "AvailabilityZone",
+            "usw2-az1",
+            "SingleAvailabilityZone",
+        ),
+        (
+            "another Availability Zone's bucket",
+            "expart-b--usw2-az2--x-s3",
+            "AvailabilityZone",
+            "usw2-az2",
+            "SingleAvailabilityZone",
+        ),
+        (
+            "a Local Zone bucket",
+            "expart-c--usw2-lax1-az1--x-s3",
+            "LocalZone",
+            "usw2-lax1-az1",
+            "SingleLocalZone",
+        ),
+    ];
+    for (case, name, location_type, zone_id, redundancy) in directory_rows {
+        let created = create_directory_bucket_on_the_control_endpoint(
+            &router,
+            EXPRESS_REGION,
+            name,
+            &directory_configuration(location_type, zone_id, redundancy),
+        )
+        .await;
+        assert_eq!(
+            created.status,
+            200,
+            "case {case:?}: the create must be served on the Express control endpoint, got {} \
+             with body {:?}",
+            created.status,
+            text(&created)
+        );
+        let session = create_session(&router, EXPRESS_REGION, name).await;
+        assert_eq!(
+            session.status,
+            200,
+            "case {case:?}: the bucket must be sessionable from the moment it exists, got {} \
+             with body {:?}",
+            session.status,
+            text(&session)
+        );
+        assert!(
+            !session
+                .element("AccessKeyId")
+                .unwrap_or_default()
+                .is_empty(),
+            "case {case:?}: the session must carry credentials, got {:?}",
+            text(&session)
+        );
+    }
+
+    // The GENERAL PURPOSE buckets of the same account in the same Region, created through
+    // that Region's own endpoint.
+    let general_purpose_rows: [(&str, &str); 2] = [
+        ("a general purpose bucket", "expart-general-purpose"),
+        ("another general purpose bucket", "expart-plain-bucket"),
+    ];
+    for (case, name) in general_purpose_rows {
+        let created = send_in_region(
+            &router,
+            EXPRESS_REGION,
+            "PUT",
+            &format!("/{name}"),
+            &[],
+            &location_constraint(EXPRESS_REGION),
+        )
+        .await;
+        assert_eq!(
+            created.status,
+            200,
+            "case {case:?}: expected HTTP 200, got {} with body {:?}",
+            created.status,
+            text(&created)
+        );
+    }
+
+    let expected_directory: Vec<String> = directory_rows
+        .iter()
+        .map(|(_, name, _, _, _)| (*name).to_string())
+        .collect();
+    let expected_general_purpose: Vec<String> = general_purpose_rows
+        .iter()
+        .map(|(_, name)| (*name).to_string())
+        .collect();
+
+    // The directory listing, paged every way the model admits: the member's own ceiling (the
+    // page size Express tooling asks for), a page that holds one bucket, and the page the
+    // request names no size at all for.
+    for (case, page_size) in [("the model's maximum page", 1_000), ("one bucket a page", 1)] {
+        let listed = every_directory_bucket(&router, EXPRESS_REGION, page_size).await;
+        assert_eq!(
+            listed, expected_directory,
+            "case {case:?}: ListDirectoryBuckets must report this account's directory buckets \
+             and no general purpose bucket, got {listed:?}"
+        );
+    }
+    let unpaged = list_directory_buckets_in(&router, EXPRESS_REGION, "").await;
+    assert_eq!(
+        listed_names(&unpaged),
+        expected_directory,
+        "case \"no page size at all\": ListDirectoryBuckets must report this account's \
+         directory buckets and no general purpose bucket, got {:?}",
+        listed_names(&unpaged)
+    );
+
+    let general_purpose = send_in_region(&router, EXPRESS_REGION, "GET", "/", &[], "").await;
+    assert_eq!(
+        general_purpose.status,
+        200,
+        "case \"the general purpose listing\": expected HTTP 200, got {} with body {:?}",
+        general_purpose.status,
+        text(&general_purpose)
+    );
+    assert_eq!(
+        listed_names(&general_purpose),
+        expected_general_purpose,
+        "case \"the general purpose listing\": ListBuckets must report this account's general \
+         purpose buckets and no directory bucket, got {:?}",
+        listed_names(&general_purpose)
+    );
+}
+
+/// The sentence the DIRECTORY-bucket surface refuses a bucket it does not hold with, as
+/// recorded against `CreateSession` — the same condition the general purpose surface words
+/// below, terminated with a full stop.
+const DIRECTORY_BUCKET_ABSENT_SENTENCE: &str = "The specified bucket does not exist.";
+
+/// The sentence the GENERAL PURPOSE surface words the same condition in (Amazon S3's
+/// published error list).
+const GENERAL_PURPOSE_ABSENT_SENTENCE: &str = "The specified bucket does not exist";
+
+/// RULE: a request about a bucket this account does not hold is refused `NoSuchBucket` with
+/// HTTP 404 and the sentence the SURFACE that bucket name belongs to words — the
+/// directory-bucket surface's ends in a full stop where the general purpose surface's does
+/// not — and the refusal leaves no bucket behind.
+///
+/// The rows differ along what the rule generalises over: which surface the addressed name
+/// belongs to (a directory-bucket name, in each of two zones, against a general purpose
+/// one) — asked of `CreateSession`, whose single modelled error this is (`NoSuchBucket`,
+/// `httpError 404`) — and then of a second operation of the general purpose surface, so what
+/// decides the wording is the name's surface rather than the operation.
+#[tokio::test]
+async fn an_absent_bucket_is_refused_in_the_wording_of_its_own_surface() {
+    let router = router();
+    let held = "expmiss-held--usw2-az1--x-s3";
+    let created = create_directory_bucket_on_the_control_endpoint(
+        &router,
+        EXPRESS_REGION,
+        held,
+        &directory_configuration("AvailabilityZone", "usw2-az1", "SingleAvailabilityZone"),
+    )
+    .await;
+    assert_eq!(
+        created.status,
+        200,
+        "the directory bucket {held:?} must be created first, got {} with body {:?}",
+        created.status,
+        text(&created)
+    );
+
+    // (case, the name the call addresses, the sentence that surface words this condition in)
+    let rows: [(&str, &str, &str); 4] = [
+        (
+            "a directory-bucket name in the zone the held bucket is in",
+            "expmiss-gone--usw2-az1--x-s3",
+            DIRECTORY_BUCKET_ABSENT_SENTENCE,
+        ),
+        (
+            "a directory-bucket name in another zone",
+            "expmiss-gone--use1-az4--x-s3",
+            DIRECTORY_BUCKET_ABSENT_SENTENCE,
+        ),
+        (
+            "a directory-bucket name in a Local Zone",
+            "expmiss-gone--usw2-lax1-az1--x-s3",
+            DIRECTORY_BUCKET_ABSENT_SENTENCE,
+        ),
+        (
+            "a general purpose bucket name",
+            "expmiss-gone-general-purpose",
+            GENERAL_PURPOSE_ABSENT_SENTENCE,
+        ),
+    ];
+    for (case, name, sentence) in rows {
+        let refused = create_session(&router, EXPRESS_REGION, name).await;
+        assert_eq!(
+            (
+                refused.status,
+                refused.error_code().as_str(),
+                refused.error_message().as_str()
+            ),
+            (404, "NoSuchBucket", sentence),
+            "case {case:?}: expected 404 NoSuchBucket {sentence:?}, got {} {:?} {:?}",
+            refused.status,
+            refused.error_code(),
+            refused.error_message()
+        );
+    }
+
+    // The general purpose surface words the same condition the same way on another of its
+    // operations, so the wording belongs to the surface and not to `CreateSession`.
+    let listed = send_in_region(
+        &router,
+        EXPRESS_REGION,
+        "GET",
+        "/expmiss-gone-general-purpose?list-type=2",
+        &[],
+        "",
+    )
+    .await;
+    assert_eq!(
+        (
+            listed.status,
+            listed.error_code().as_str(),
+            listed.error_message().as_str()
+        ),
+        (404, "NoSuchBucket", GENERAL_PURPOSE_ABSENT_SENTENCE),
+        "case \"a listing of a general purpose bucket nothing holds\": expected 404 \
+         NoSuchBucket {GENERAL_PURPOSE_ABSENT_SENTENCE:?}, got {} {:?} {:?}",
+        listed.status,
+        listed.error_code(),
+        listed.error_message()
+    );
+
+    // A refused call creates nothing and takes nothing away: the held bucket is still the
+    // one directory bucket of the account, and it still sessions.
+    let still_listed = list_directory_buckets_in(&router, EXPRESS_REGION, "").await;
+    assert_eq!(
+        listed_names(&still_listed),
+        vec![held.to_string()],
+        "case \"after the refusals\": no refused name may become a bucket, got {:?}",
+        listed_names(&still_listed)
+    );
+    let session = create_session(&router, EXPRESS_REGION, held).await;
+    assert_eq!(
+        session.status,
+        200,
+        "case \"the held bucket after the refusals\": expected HTTP 200, got {} with body {:?}",
+        session.status,
+        text(&session)
+    );
 }
 
 /// RULE: the directory-bucket listing reports this account's directory buckets and nothing
