@@ -17,9 +17,11 @@
 //! The rows span what the rule generalises over: the exit status itself — the success
 //! status, the two failure statuses a shell's own utilities and a command's `exit` produce,
 //! and the largest status a shell reports (`exit` takes its operand modulo 256, so
-//! `0..=255` are the statuses a container can end with). Each row's status is named by its
-//! OWN rule, pointed at its OWN queue, and every row's task is placed in the one cluster at
-//! the same time, so the routing is decided by the events alone.
+//! `0..=255` are the statuses a container can end with) — and HOW LONG the container was
+//! live before it produced that status, from none at all to a program that runs for a span
+//! first, so the status is produced while the task is already running. Each row's status is
+//! named by its OWN rule, pointed at its OWN queue, and every row's task is placed in the
+//! one cluster at the same time, so the routing is decided by the events alone.
 //!
 //! The exit statuses below are produced by REAL programs run through the container data
 //! plane, and every value asserted is read back off the delivered envelope or through
@@ -163,12 +165,12 @@ fn event_in<'a>(events: &[&'a Value], status: &str) -> Option<&'a Value> {
         .find(|event| event["detail"]["lastStatus"] == json!(status))
 }
 
-/// Register one FARGATE revision whose single, essential container exits with `exit_code`,
-/// and place one task of it. Answers the task's ARN.
+/// Register one FARGATE revision whose single, essential container runs `program` through a
+/// shell, and place one task of it. Answers the task's ARN.
 async fn place_task(
     router: &MultiServiceRouter,
     family: &str,
-    exit_code: i64,
+    program: &str,
     case: &str,
 ) -> String {
     ok(
@@ -185,7 +187,7 @@ async fn place_task(
                 "name": "app",
                 "image": IMAGE,
                 "essential": true,
-                "command": ["sh", "-c", format!("exit {exit_code}")],
+                "command": ["sh", "-c", program],
             }],
         }),
         case,
@@ -274,7 +276,8 @@ async fn a_stopped_task_event_reaches_only_the_rule_naming_its_container_exit_st
     let mut task_arns: Vec<String> = Vec::new();
     for (index, row) in ROWS.iter().enumerate() {
         let family = format!("exitrouting{index}");
-        task_arns.push(place_task(&router, &family, row.exit_code, row.case).await);
+        let program = format!("exit {}", row.exit_code);
+        task_arns.push(place_task(&router, &family, &program, row.case).await);
     }
 
     // ONLY the queues are polled from here: a client that watches a task through
@@ -346,10 +349,7 @@ async fn a_stopped_task_event_reaches_only_the_rule_naming_its_container_exit_st
 
         // What the event says about the stop is what the control plane says about it.
         let task = describe(&router, task_arn, case).await;
-        let reported: Vec<i64> = list(&task, "containers", case)
-            .iter()
-            .filter_map(|container| container["exitCode"].as_i64())
-            .collect();
+        let reported = reported_exit_codes(&task, case);
         let last = scoped_events
             .last()
             .unwrap_or_else(|| panic!("case {case:?}: expected a delivered STOPPED event"));
@@ -414,5 +414,210 @@ async fn a_stopped_task_event_reaches_only_the_rule_naming_its_container_exit_st
             "case {case:?}: expected the STOPPED event to report exit status {wanted}, got \
              {stopped}"
         );
+    }
+}
+
+/// One row of the table below: the program a container runs, and the status that program
+/// ends with — so the status named by the rule that is to receive the task's `STOPPED` event.
+struct RanThenExitedRow {
+    case: &'static str,
+    /// The operand the container's shell runs. The container is LIVE for as long as the
+    /// program waits before it ends, so the status it reports is produced after the task has
+    /// already been running rather than at the instant it started.
+    program: &'static str,
+    /// The status that program ends with — a shell reports `0..=255`.
+    exit_code: i64,
+}
+
+/// The table spans how long the container is live before it produces its status — not at
+/// all, a span, a longer span — against the status it then ends with, success and failure
+/// alike. Every wait is the container program's own, performed by the shell session behind
+/// the container; nothing here waits on the test's thread outside a poll loop.
+const RAN_THEN_EXITED_ROWS: &[RanThenExitedRow] = &[
+    RanThenExitedRow {
+        case: "a container that ends the moment it starts",
+        program: "exit 4",
+        exit_code: 4,
+    },
+    RanThenExitedRow {
+        case: "a container that runs for a span and then fails",
+        program: "sleep 1; exit 9",
+        exit_code: 9,
+    },
+    RanThenExitedRow {
+        case: "a container that runs for a longer span and then succeeds",
+        program: "sleep 2; exit 0",
+        exit_code: 0,
+    },
+];
+
+/// The exit statuses one task's containers report through `DescribeTasks`.
+fn reported_exit_codes(task: &Value, case: &str) -> Vec<i64> {
+    list(task, "containers", case)
+        .iter()
+        .filter_map(|container| container["exitCode"].as_i64())
+        .collect()
+}
+
+#[tokio::test]
+async fn a_task_whose_container_ran_before_ending_is_routed_by_the_status_it_ended_with() {
+    let setup = "rules naming the status a container that ran for a span ended with";
+    let router = emulator();
+    let cluster_arn = cluster_arn();
+    ok(
+        &router,
+        "CreateCluster",
+        json!({ "clusterName": CLUSTER }),
+        setup,
+    )
+    .await;
+
+    // One rule per row, each scoped to its own exit status and pointed at its own queue.
+    let mut scoped: Vec<String> = Vec::new();
+    for row in RAN_THEN_EXITED_ROWS {
+        let name = format!("ran-exit-{}", row.exit_code);
+        let (url, queue_arn) = given_queue(&router, row.case, &name).await;
+        grant_delivery(&router, row.case, &url, &queue_arn).await;
+        given_rule(
+            &router,
+            row.case,
+            &format!("stopped-{name}"),
+            exit_code_pattern(&cluster_arn, row.exit_code),
+            &queue_arn,
+        )
+        .await;
+        scoped.push(url);
+    }
+
+    // Every row's task is placed before any of them is waited on, so they run at once in the
+    // one cluster and the routing is decided by the events alone.
+    let mut task_arns: Vec<String> = Vec::new();
+    for (index, row) in RAN_THEN_EXITED_ROWS.iter().enumerate() {
+        let family = format!("ranexit{index}");
+        task_arns.push(place_task(&router, &family, row.program, row.case).await);
+    }
+
+    // The CONTROL PLANE half, watched the way a client watches it: `DescribeTasks` is polled
+    // until every task reports STOPPED, and what it then reports is what the delivered events
+    // are held against below.
+    let mut reported: Vec<Value> = Vec::new();
+    let deadline = Instant::now() + POLL_BUDGET;
+    loop {
+        reported.clear();
+        for (index, task_arn) in task_arns.iter().enumerate() {
+            reported.push(describe(&router, task_arn, RAN_THEN_EXITED_ROWS[index].case).await);
+        }
+        let settled = reported
+            .iter()
+            .all(|task| task["lastStatus"] == json!(STOPPED));
+        if settled || Instant::now() >= deadline {
+            break;
+        }
+        tokio::time::sleep(POLL_INTERVAL).await;
+    }
+    for (index, row) in RAN_THEN_EXITED_ROWS.iter().enumerate() {
+        let (case, task) = (row.case, &reported[index]);
+        assert_eq!(
+            task["lastStatus"],
+            json!(STOPPED),
+            "case {case:?}: expected the task to reach STOPPED, got {task}"
+        );
+        assert_eq!(
+            reported_exit_codes(task, case),
+            vec![row.exit_code],
+            "case {case:?}: expected the container to report exit status {}, got {task}",
+            row.exit_code
+        );
+    }
+
+    // The BUS half: each task's stop is on the queue of the rule naming the status its
+    // container ended with, and on no other rule's queue.
+    let mut delivered: Vec<Vec<Value>> = RAN_THEN_EXITED_ROWS.iter().map(|_| Vec::new()).collect();
+    let deadline = Instant::now() + POLL_BUDGET;
+    loop {
+        for (index, url) in scoped.iter().enumerate() {
+            let batch = drain(&router, RAN_THEN_EXITED_ROWS[index].case, url).await;
+            delivered[index].extend(batch);
+        }
+        let settled = delivered.iter().enumerate().all(|(index, events)| {
+            event_in(&events_of(events, &task_arns[index]), STOPPED).is_some()
+        });
+        if settled || Instant::now() >= deadline {
+            break;
+        }
+        tokio::time::sleep(POLL_INTERVAL).await;
+    }
+
+    for (index, row) in RAN_THEN_EXITED_ROWS.iter().enumerate() {
+        let case = row.case;
+        let task_arn = &task_arns[index];
+        let wanted = row.exit_code;
+        let mine = events_of(&delivered[index], task_arn);
+        let stopped = event_in(&mine, STOPPED).unwrap_or_else(|| {
+            panic!(
+                "case {case:?}: expected the rule naming exit status {wanted} to receive the \
+                 STOPPED event of task {task_arn}, got {:?}",
+                delivered[index]
+            )
+        });
+        assert_eq!(
+            stopped["source"],
+            json!(EVENT_SOURCE),
+            "case {case:?}: expected source {EVENT_SOURCE}, got {stopped}"
+        );
+        assert_eq!(
+            stopped["detail-type"],
+            json!(TASK_STATE_CHANGE),
+            "case {case:?}: expected detail-type {TASK_STATE_CHANGE}, got {stopped}"
+        );
+        assert_eq!(
+            exit_codes_of(stopped),
+            vec![wanted],
+            "case {case:?}: expected the STOPPED event to report exit status {wanted}, got \
+             {stopped}"
+        );
+
+        // What the event reports about the stop is what the control plane reports about it.
+        let task = &reported[index];
+        assert_eq!(
+            exit_codes_of(stopped),
+            reported_exit_codes(task, case),
+            "case {case:?}: the event's container exit statuses must be the task's, got \
+             {stopped} and {task}"
+        );
+        assert_eq!(
+            stopped["detail"]["stopCode"],
+            task["stopCode"].clone(),
+            "case {case:?}: the event's stopCode must be the task's, got {stopped} and {task}"
+        );
+        assert_eq!(
+            stopped["detail"]["stoppedReason"],
+            task["stoppedReason"].clone(),
+            "case {case:?}: the event's stoppedReason must be the task's, got {stopped} and \
+             {task}"
+        );
+
+        // Every envelope this rule's target received is about THIS row's task, and the
+        // sibling rules' targets never saw it.
+        for event in &delivered[index] {
+            assert_eq!(
+                event["detail"]["taskArn"],
+                json!(task_arn),
+                "case {case:?}: a rule naming exit status {wanted} must receive only the task \
+                 that ended with it ({task_arn}), got {event}"
+            );
+        }
+        for (other, url) in scoped.iter().enumerate() {
+            if other == index {
+                continue;
+            }
+            let others = events_of(&delivered[other], task_arn);
+            assert!(
+                others.is_empty(),
+                "case {case:?}: the rule naming exit status {} must not receive the task that \
+                 ended with {wanted} ({url}), got {others:?}",
+                RAN_THEN_EXITED_ROWS[other].exit_code
+            );
+        }
     }
 }
