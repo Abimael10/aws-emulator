@@ -1,15 +1,27 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateOpsMetadata
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateOpsMetadata`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Rewrites the metadata entries of the OpsMetadata object an `OpsMetadataArn` names in
+//! [`crate::state::ops_metadata`], where `GetOpsMetadata` reads them back and
+//! `ListOpsMetadata` reports when the object was last written and by whom.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateOpsMetadata::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! An update is addressed by ARN alone, so the object it writes to is the one a create
+//! MINTED that ARN for ([`crate::state::ops_metadata::ops_metadata_arn`]): an update never
+//! registers an object, and an ARN naming none is the `OpsMetadataNotFoundException` rather
+//! than a new object. The two ways an ARN names no object of this requester's are the two the
+//! reads classify, in the same order
+//! ([`crate::state::ops_metadata::OPS_METADATA_NOT_THE_OWNER`]).
+//!
+//! What the update carries is what the object holds afterwards: each `MetadataToUpdate` entry
+//! is written over the key it names, each `KeysToDelete` key is dropped, and everything else
+//! the object holds is left as the last write persisted it
+//! ([`crate::state::ops_metadata::OpsMetadataRecord::apply_update`]). A request naming
+//! neither is no change to make to the object and is refused
+//! ([`crate::state::ops_metadata::OPS_METADATA_UPDATE_IS_EMPTY`]), and so is a write that
+//! would leave the object holding more keys than the emulator keeps per object
+//! ([`crate::state::ops_metadata::MAX_OPS_METADATA_KEYS`]): either way nothing is written.
+//! A served update records the principal that made it and the instant it ran, which is what
+//! a listing reports as the object's last write.
 //!
 //! ## Shape of an operation
 //!
@@ -81,6 +93,14 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+
+/// The member path a refusal about a `MetadataToUpdate` key names: the MAP member that
+/// carries the keys, as the framework spells a member path (lowerCamel).
+const METADATA_TO_UPDATE_MEMBER: &str = "metadataToUpdate";
+
+/// The member path a refusal about a `KeysToDelete` entry names: the LIST member that
+/// carries the keys, spelled the same way.
+const KEYS_TO_DELETE_MEMBER: &str = "keysToDelete";
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -154,18 +174,109 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateOpsMetadata` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateOpsMetadataErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateOpsMetadata"))
+        use crate::state::ops_metadata as metadata;
+
+        // `OpsMetadataArn`'s presence, its 1..1011 length and its ARN pattern, the
+        // `MetadataToUpdate` map's 1..5 size and the `KeysToDelete` list's 1..10 size are
+        // MODELLED constraints the centralized walk has already refused anything outside of:
+        // reaching here means the ARN is shaped like one, and what is left is what the request
+        // asks to be changed, whose the ARN is and whether it names an object.
+        let invalid_argument = |message: String| {
+            UpdateOpsMetadataError::from(
+                UpdateOpsMetadataErrorModeled::OpsMetadataInvalidArgumentException(
+                    OpsMetadataInvalidArgumentException {
+                        message: Some(message),
+                    },
+                ),
+            )
+        };
+
+        // The one modelled constraint that walk cannot take: the shape of a metadata KEY,
+        // which both members of this request carry one of
+        // ([`crate::state::ops_metadata::METADATA_KEY_PATTERN`] says why it reaches here).
+        // Every clause one request breaks is stated at once, in member order, the way the
+        // walk states the violations of one request.
+        let mut clauses: Vec<String> = Vec::new();
+        if let Some(metadata_to_update) = input.metadata_to_update.as_ref() {
+            clauses.extend(metadata::metadata_map_key_clause(
+                METADATA_TO_UPDATE_MEMBER,
+                metadata_to_update,
+            ));
+        }
+        if let Some(keys_to_delete) = input.keys_to_delete.as_ref() {
+            clauses.extend(metadata::metadata_key_list_clause(
+                KEYS_TO_DELETE_MEMBER,
+                keys_to_delete,
+            ));
+        }
+        if let Some(message) = metadata::metadata_key_refusal(&clauses) {
+            return Err(crate::scaffolded::Scaffolded::validation(message));
+        }
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            UpdateOpsMetadataError::from(UpdateOpsMetadataErrorModeled::InternalServerError(
+                InternalServerError {
+                    message: Some("the OpsMetadata store is unavailable".to_string()),
+                },
+            ))
+        })?;
+
+        // What the request asks to be changed, read before the object is looked up: a request
+        // naming no change at all is about the request rather than about the object.
+        let to_update = metadata::to_metadata_entries(input.metadata_to_update);
+        let to_delete = input.keys_to_delete.unwrap_or_default();
+        if to_update.is_empty() && to_delete.is_empty() {
+            return Err(invalid_argument(
+                metadata::OPS_METADATA_UPDATE_IS_EMPTY.to_string(),
+            ));
+        }
+
+        // Whose the ARN is comes next, for the reason the reads state: an object of another
+        // account is not this requester's to write to, and a not-found must not report on one.
+        if !metadata::names_this_account(&input.ops_metadata_arn) {
+            return Err(invalid_argument(
+                metadata::OPS_METADATA_NOT_THE_OWNER.to_string(),
+            ));
+        }
+
+        let region = crate::state::request_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
+        // Who is writing the object, resolved from the credential the request was signed with,
+        // through the same reading `sts:GetCallerIdentity` answers from. Taken before the
+        // store guard, so no guard of this service is held while another store is read.
+        let user = crate::state::identity_authorization::caller_arn(&*self.engine, ctx);
+        let mut store = state.lock();
+
+        let Some(record) = store.ops_metadata_object_mut(&region, &input.ops_metadata_arn) else {
+            return Err(UpdateOpsMetadataErrorModeled::OpsMetadataNotFoundException(
+                OpsMetadataNotFoundException {
+                    message: Some(metadata::OPS_METADATA_NOT_FOUND.to_string()),
+                },
+            )
+            .into());
+        };
+
+        // The entries ONE object holds are bounded: a write that would leave it holding more
+        // than the emulator keeps per object is refused through the modelled refusal for
+        // exactly that, and the object keeps the entries the last served write persisted.
+        if record.key_count_after_update(&to_update, &to_delete) > metadata::MAX_OPS_METADATA_KEYS
+        {
+            return Err(
+                UpdateOpsMetadataErrorModeled::OpsMetadataKeyLimitExceededException(
+                    OpsMetadataKeyLimitExceededException {
+                        message: Some(metadata::ops_metadata_key_ceiling_message()),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        record.apply_update(to_update, &to_delete, user, now);
+
+        // "The Amazon Resource Name (ARN) of the OpsMetadata Object that was updated": the
+        // object this call wrote to, which is the one the request named.
+        Ok(UpdateOpsMetadataOutput {
+            ops_metadata_arn: Some(input.ops_metadata_arn),
+        })
     }
 }

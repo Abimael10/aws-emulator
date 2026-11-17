@@ -92,6 +92,10 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+/// The member path a refusal about a `Metadata` key names: the MAP member that carries the
+/// keys, as the framework spells a member path (lowerCamel).
+const METADATA_MEMBER: &str = "metadata";
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -168,7 +172,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // `ResourceId`'s presence and its 1..1024 length, the `Metadata` map's 1..5 size and
         // every tag's shape are MODELLED constraints the centralized walk has already refused
-        // anything outside of.
+        // anything outside of. The shape of a metadata KEY is the one it cannot take
+        // ([`crate::state::ops_metadata::METADATA_KEY_PATTERN`] says why), so this operation
+        // holds every key it is handed to it.
+        if let Some(entries) = input.metadata.as_ref() {
+            if let Some(clause) = metadata::metadata_map_key_clause(METADATA_MEMBER, entries) {
+                let message = metadata::metadata_key_refusal(std::slice::from_ref(&clause))
+                    .unwrap_or(clause);
+                return Err(crate::scaffolded::Scaffolded::validation(message));
+            }
+        }
+
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             CreateOpsMetadataErrorModeled::InternalServerError(InternalServerError {
                 message: Some("the OpsMetadata store is unavailable".to_string()),

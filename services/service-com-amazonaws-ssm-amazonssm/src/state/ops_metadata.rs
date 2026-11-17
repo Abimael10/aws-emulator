@@ -5,9 +5,10 @@
 //!
 //! "Systems Manager calls this type of data OpsData" — an OpsMetadata object is the
 //! metadata Application Manager keeps ABOUT one application: `CreateOpsMetadata` registers
-//! one for the application a `ResourceId` names, `GetOpsMetadata` reports what it holds,
-//! `ListOpsMetadata` reports the objects a Region holds and `DeleteOpsMetadata` removes one.
-//! All four reach the one store below
+//! one for the application a `ResourceId` names, `UpdateOpsMetadata` rewrites and drops its
+//! entries, `GetOpsMetadata` reports what it holds, `ListOpsMetadata` reports the objects a
+//! Region holds and `DeleteOpsMetadata` removes one.
+//! All five reach the one store below
 //! ([`super::ComAmazonawsSsmAmazonssmState::ops_metadata`]), so whatever the create
 //! persisted is what a later read reports.
 //!
@@ -39,7 +40,176 @@
 use std::collections::BTreeMap;
 use std::time::SystemTime;
 
+use ::aws_smithy_schema_server::constraints::ViolationKind;
+use ::service_common::validation::{
+    quoted_echo, rendered_list, rendered_map_in_key_order, rendered_record, unanchored,
+    UNSET_MEMBER,
+};
+use ::service_common::validation_message::{
+    element_set_requirement, envelope_over, map_key_refusal_quoting, requirement,
+};
+
 use crate::ops::types::{MetadataValue, OpsMetadata};
+
+/// The least number of characters the modelled `MetadataKey` admits, as a refusal states
+/// the bound (`smithy_query(query="shape",shape="MetadataMap")`: the key targets
+/// `MetadataKey`, `length 1..256`).
+pub const MIN_METADATA_KEY_CHARACTERS: i64 = 1;
+
+/// See [`MIN_METADATA_KEY_CHARACTERS`].
+pub const MAX_METADATA_KEY_CHARACTERS: i64 = 256;
+
+/// The expression the modelled `MetadataKey` requires a key to satisfy: not empty, and not a
+/// run of whitespace.
+///
+/// A key is held to it HERE rather than by the framework's own walk, for two reasons that
+/// each make the walk admit a key the shape does not: a map's key is a path segment to that
+/// walk rather than a constrained leaf, so none of the key shape's constraints are taken at
+/// all, and the expression is a negative LOOKAHEAD, which the walk's regular-expression
+/// engine cannot compile — and a pattern it cannot compile is read as satisfied, so even a
+/// key carried as a list ELEMENT passes. So whatever member carries a key, the operation
+/// taking it is what holds the key to the shape.
+pub const METADATA_KEY_PATTERN: &str = r"^(?!\s*$).+$";
+
+/// Whether `key` is a key the modelled `MetadataKey` admits: between
+/// [`MIN_METADATA_KEY_CHARACTERS`] and [`MAX_METADATA_KEY_CHARACTERS`] characters, carrying
+/// something other than whitespace ([`METADATA_KEY_PATTERN`]).
+#[must_use]
+pub fn metadata_key_is_well_formed(key: &str) -> bool {
+    let characters = i64::try_from(key.chars().count()).unwrap_or(i64::MAX);
+    (MIN_METADATA_KEY_CHARACTERS..=MAX_METADATA_KEY_CHARACTERS).contains(&characters)
+        && !key.trim().is_empty()
+}
+
+/// The expression a clause of this service quotes for [`METADATA_KEY_PATTERN`]: the model's
+/// text without the whole-value pair it wraps the published expression in, which is how this
+/// service states a `@pattern` (`crate::service::refusal`, rule 4) and the tree's one reading
+/// of that pair ([`unanchored`]).
+///
+/// A clause a HANDLER states has to read like the one a member the framework's own walk
+/// reported gets — that walk reports an element of `KeysToDelete` outside the key shape's
+/// `@length`, and this service renders its expression that way — so both halves of the same
+/// shape's refusal quote the same text.
+#[must_use]
+pub fn quoted_metadata_key_pattern() -> String {
+    unanchored(METADATA_KEY_PATTERN)
+}
+
+/// The requirements the modelled `MetadataKey` states, in the order a clause lists a
+/// constraint set: the bounds, longest first, and then the expression.
+fn metadata_key_requirements() -> Vec<String> {
+    vec![
+        requirement(ViolationKind::MaxLength(MAX_METADATA_KEY_CHARACTERS)),
+        requirement(ViolationKind::MinLength(MIN_METADATA_KEY_CHARACTERS)),
+        requirement(ViolationKind::Pattern(quoted_metadata_key_pattern())),
+    ]
+}
+
+/// The shape a metadata entry's value is printed as inside a quoted map, and the one member
+/// it declares (`smithy_query(query="shape",shape="MetadataValue")`).
+const METADATA_VALUE_SHAPE: &str = "MetadataValue";
+
+/// See [`METADATA_VALUE_SHAPE`].
+const METADATA_VALUE_MEMBER: &str = "Value";
+
+/// `entries` as a clause quotes a map-valued member: each entry `<key>=<value>` in ascending
+/// key order inside braces ([`rendered_map_in_key_order`]), with a value printed as the
+/// structure it is ([`rendered_record`]) and a member the request left unset stated the way
+/// the validating front end states one. `None` for a map too large for a clause to quote.
+fn rendered_metadata_map(
+    entries: &std::collections::HashMap<String, MetadataValue>,
+) -> Option<String> {
+    let rendered: Vec<(&str, String)> = entries
+        .iter()
+        .map(|(key, value)| {
+            (
+                key.as_str(),
+                rendered_record(
+                    METADATA_VALUE_SHAPE,
+                    &[(
+                        METADATA_VALUE_MEMBER,
+                        value.value.as_deref().unwrap_or(UNSET_MEMBER),
+                    )],
+                ),
+            )
+        })
+        .collect();
+    rendered_map_in_key_order(&rendered)
+}
+
+/// The CLAUSE of `message`, a whole refusal a shared renderer wrote over ONE clause.
+///
+/// What the framework's envelope puts in front of one clause is what [`envelope_over`] puts
+/// in front of one, so dropping that prefix leaves the clause itself — which is what lets the
+/// clauses about two members go into ONE envelope, the way the framework's own walk states
+/// two violations of one request. Nothing of the sentence is re-spelled here.
+fn clause_of(message: String) -> String {
+    let empty = String::new();
+    let prefix = envelope_over(std::slice::from_ref(&empty)).unwrap_or_default();
+    match message.strip_prefix(&prefix) {
+        Some(clause) => clause.to_string(),
+        None => message,
+    }
+}
+
+/// The clause a MAP carrying a key outside the modelled `MetadataKey` is refused with, or
+/// `None` when every key of `entries` is one the shape admits.
+///
+/// It states the map MEMBER `member_path` names, the map the request carried, and what a key
+/// of it has to satisfy ([`::service_common::validation_message::map_key_refusal_quoting`],
+/// the shared rendering of that clause, so a clause about a key cannot drift from the one a
+/// reported member gets). ONE clause however many of the map's keys offend: the clause is
+/// about that member's keys and the set they have to satisfy.
+///
+/// The clause QUOTES the map, the way a clause of this service stated at a COLLECTION member
+/// quotes the collection the request submitted (`crate::service::refusal`, rule 5); a map
+/// past the largest value a clause carries is stated without one.
+#[must_use]
+pub fn metadata_map_key_clause(
+    member_path: &str,
+    entries: &std::collections::HashMap<String, MetadataValue>,
+) -> Option<String> {
+    if entries.keys().all(|key| metadata_key_is_well_formed(key)) {
+        return None;
+    }
+    let quoted = rendered_metadata_map(entries).map(|map| quoted_echo(&map).into_owned());
+    Some(clause_of(map_key_refusal_quoting(
+        member_path,
+        quoted.as_deref(),
+        MIN_METADATA_KEY_CHARACTERS,
+        MAX_METADATA_KEY_CHARACTERS,
+        Some(&quoted_metadata_key_pattern()),
+    )))
+}
+
+/// The clause a LIST carrying a key outside the modelled `MetadataKey` is refused with, or
+/// `None` when every element of `keys` is one the shape admits.
+///
+/// The key shape's whole set, stated once at the collection member and quoting the list the
+/// request carried, which is where this service states a constraint its elements broke
+/// ([`::service_common::validation_message::element_set_requirement`]).
+#[must_use]
+pub fn metadata_key_list_clause(member_path: &str, keys: &[String]) -> Option<String> {
+    if keys.iter().all(|key| metadata_key_is_well_formed(key)) {
+        return None;
+    }
+    let elements: Vec<&str> = keys.iter().map(String::as_str).collect();
+    let quoted = quoted_echo(&rendered_list(&elements)).into_owned();
+    Some(format!(
+        "Value '{quoted}' at '{member_path}' failed to satisfy constraint: {}",
+        element_set_requirement(&metadata_key_requirements())
+    ))
+}
+
+/// The whole refusal `clauses` make, in the framework's own envelope
+/// ([`envelope_over`]) — `None` for a request that broke nothing, which is no refusal at all.
+///
+/// Every clause of one request goes in ONE envelope, so a request breaking the key shape at
+/// two members is answered for both at once rather than one member at a time.
+#[must_use]
+pub fn metadata_key_refusal(clauses: &[String]) -> Option<String> {
+    envelope_over(clauses)
+}
 
 /// The resource prefix an `OpsMetadata` ARN carries, from the modelled `OpsMetadataArn`
 /// pattern `^arn:(aws[a-zA-Z-]*)?:ssm:…:opsmetadata\/([a-zA-Z0-9-_\.\/]*)$`.
@@ -100,6 +270,28 @@ pub fn ops_metadata_ceiling_message() -> String {
 pub fn ops_metadata_already_exists_message(arn: &str) -> String {
     format!("An OpsMetadata object already exists for the specified resource: {arn}")
 }
+
+/// How many metadata keys ONE OpsMetadata object holds at once.
+///
+/// The EMULATOR's own ceiling rather than a quota Systems Manager publishes: a create admits
+/// at most the five entries `MetadataMap` carries, but an update may add five more each time
+/// it runs, so without a ceiling one object's entries would grow for as long as updates keep
+/// arriving. A write that would leave the object holding more than this is refused through
+/// the modelled `OpsMetadataKeyLimitExceededException` and writes nothing.
+pub const MAX_OPS_METADATA_KEYS: usize = 20;
+
+/// What a write refused by [`MAX_OPS_METADATA_KEYS`] reports: the emulator's own ceiling,
+/// named as the emulator's, with the figure it stands at.
+#[must_use]
+pub fn ops_metadata_key_ceiling_message() -> String {
+    format!("This emulator holds at most {MAX_OPS_METADATA_KEYS} metadata keys per OpsMetadata object")
+}
+
+/// What an update carrying neither metadata to write nor keys to drop is refused with: such a
+/// request names no change to make to the object, which is one of the arguments
+/// `OpsMetadataInvalidArgumentException` is for.
+pub const OPS_METADATA_UPDATE_IS_EMPTY: &str = "Invalid request. Specify MetadataToUpdate, \
+                                                KeysToDelete, or both, and try again.";
 
 /// The published bounds of `GetOpsMetadataMaxResults` (range 1..10). The maximum is also the
 /// page a request naming no `MaxResults` is served: "the maximum number of items to return
@@ -283,6 +475,49 @@ impl OpsMetadataRecord {
             }
             _ => false,
         })
+    }
+
+    /// How many metadata keys this object would hold once the keys `to_delete` names are
+    /// dropped from it and the entries `to_update` carries are written over it.
+    ///
+    /// Taken BEFORE anything is written, since a write past [`MAX_OPS_METADATA_KEYS`] is
+    /// refused and leaves the object as it was. An entry whose key the object already holds
+    /// REPLACES that entry rather than adding one, and a key named by both lists is held
+    /// afterwards, so neither is counted twice.
+    #[must_use]
+    pub fn key_count_after_update(
+        &self,
+        to_update: &BTreeMap<String, String>,
+        to_delete: &[String],
+    ) -> usize {
+        let mut keys: std::collections::BTreeSet<&str> =
+            self.metadata.keys().map(String::as_str).collect();
+        for key in to_delete {
+            keys.remove(key.as_str());
+        }
+        keys.extend(to_update.keys().map(String::as_str));
+        keys.len()
+    }
+
+    /// Write `to_update` over this object's entries, drop the ones `to_delete` names, and
+    /// record that `user` wrote the object at `at`.
+    ///
+    /// The deletions are applied FIRST, so a key named by both lists is left holding the value
+    /// this write carries: the update states what the entry is to be, where the deletion only
+    /// states that what was there is to go. A key the object does not hold is nothing to drop.
+    pub fn apply_update(
+        &mut self,
+        to_update: BTreeMap<String, String>,
+        to_delete: &[String],
+        user: String,
+        at: SystemTime,
+    ) {
+        for key in to_delete {
+            self.metadata.remove(key);
+        }
+        self.metadata.extend(to_update);
+        self.last_modified_user = user;
+        self.last_modified_at = at;
     }
 
     /// This object as a listing reports it: the `OpsMetadata` members, each read out of what
