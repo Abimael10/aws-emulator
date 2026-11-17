@@ -588,11 +588,21 @@ async fn serve_query(
         Ok(answer) => answer,
         Err(error) => {
             context.sessions.idle(facts.connection_id);
+            // A refused statement is a line of the engine's ERROR LOG, which a resource with
+            // that log exported streams to CloudWatch Logs ([`super::log_export`]), after the
+            // lines the statement produced before it failed.
+            let mut lines = error.lines_logged().to_vec();
+            lines.push(super::log_export::LogLine::of_refusal(&error));
+            super::log_export::export(context, facts, &lines).await;
             return write_engine_error(conn, sequence, &error).await;
         }
     };
     // The statement is through, so the thread is between statements again.
     context.sessions.idle(facts.connection_id);
+    // And so is every message the statement itself produced, at the severities that log.
+    if !answer.log_lines.is_empty() {
+        super::log_export::export(context, facts, &answer.log_lines).await;
+    }
     if let Some((name, value)) = answer.setting_changed.clone() {
         facts.settings.insert(name, value);
     }

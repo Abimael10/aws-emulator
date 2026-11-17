@@ -53,6 +53,10 @@
 //!   place of a password;
 //! * [`read_only`] — the statements an endpoint that serves no writes refuses, and how each
 //!   engine words that refusal;
+//! * [`pg_code_block`] — the anonymous `DO` block a PostgreSQL client sends, and the server
+//!   messages its `RAISE` statements produce;
+//! * [`log_export`] — the lines the engine writes to its own log, and the CloudWatch Logs
+//!   group a resource with `EnableCloudwatchLogsExports` streams them to;
 //! * [`pg_wire`] and [`mysql_wire`] — the server half of each protocol.
 //!
 //! The endpoint is the RESOURCE: dropping the stored [`DbEngineEndpoint`] closes the port
@@ -75,12 +79,14 @@ pub mod engine_s3_role;
 pub mod engine_time;
 pub mod iam_auth_token;
 pub mod lock_plan;
+pub mod log_export;
 pub mod mysql_accounts;
 pub mod mysql_s3_load;
 pub mod mysql_server;
 pub mod mysql_wire;
 pub mod pg_aws_s3;
 pub mod pg_binary;
+pub mod pg_code_block;
 pub mod pg_copy;
 pub mod pg_grants;
 pub mod pg_numeric;
@@ -566,6 +572,11 @@ pub struct EngineEndpointPlan {
     /// The storage to serve: the volume of the DB cluster an endpoint belongs to, where
     /// that storage already exists. `None` starts the resource's own engine.
     pub storage: Option<Arc<sql_engine::InstanceDatabase>>,
+    /// The in-process callback of the operation opening this endpoint
+    /// (`OperationContext::callback`), which every session on it is served with: a session
+    /// has no request context of its own, and this is what the engine's log lines are
+    /// delivered to CloudWatch Logs over ([`log_export`]).
+    pub callback: ::smithy_server_runtime::EmbeddedEmulator,
 }
 
 /// Open the engine endpoint `plan` describes, and the resource's READ-ONLY endpoint where it
@@ -598,6 +609,7 @@ pub async fn open_engine_endpoint<Eng: Send + Sync + 'static>(
         role,
         reader,
         storage,
+        callback,
     } = plan;
     let listeners = shared_engine(engine)
         .ok_or_else(|| "this emulator's engine has no listener surface".to_string())?
@@ -633,6 +645,7 @@ pub async fn open_engine_endpoint<Eng: Send + Sync + 'static>(
             iam: engine_s3_role::iam_store(engine),
             generation: generation_rx.clone(),
             next_connection_id: Arc::clone(&next_connection_id),
+            callback: callback.clone(),
         })
     };
     // ONE protocol handler per endpoint, served at both of its ends: the listener the core

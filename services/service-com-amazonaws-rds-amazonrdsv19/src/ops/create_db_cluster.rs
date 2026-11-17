@@ -1356,6 +1356,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         // both are opened: see `open_engine_endpoint`.
                         reader: true,
                         storage: None,
+                        callback: ctx.callback().clone(),
                     },
                 )
                 .await

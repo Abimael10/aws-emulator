@@ -191,6 +191,11 @@ pub struct SessionContext {
     pub generation: watch::Receiver<u64>,
     /// The connection ids this endpoint has handed out.
     pub next_connection_id: Arc<AtomicU32>,
+    /// The IN-PROCESS CALLBACK the operation that opened this listener was given
+    /// (`OperationContext::callback`), kept because a session on this endpoint has no
+    /// request context of its own: it is what the engine's log lines are delivered to
+    /// CloudWatch Logs over ([`super::log_export`]).
+    pub callback: ::smithy_server_runtime::EmbeddedEmulator,
 }
 
 impl SessionContext {
@@ -1357,6 +1362,13 @@ pub struct StatementAnswer {
     /// What the server has to say about the statement beside its answer: the notices and
     /// warnings PostgreSQL sends before a `CommandComplete`.
     pub notices: Vec<WireNotice>,
+    /// What the ENGINE WROTE TO ITS LOG about the statement, which is what a resource with
+    /// log exports turned on streams to CloudWatch Logs ([`super::log_export`]).
+    ///
+    /// Not the same list as `notices`: the two message floors are read in different orders,
+    /// so a message the log carries is not necessarily one the client is sent, and the other
+    /// way round ([`super::log_export::Severity`]).
+    pub log_lines: Vec<super::log_export::LogLine>,
 }
 
 /// One thing the server says about a statement without refusing it: a PostgreSQL
@@ -1366,27 +1378,44 @@ pub struct WireNotice {
     /// `NOTICE` or `WARNING`.
     pub severity: &'static str,
     /// The SQLSTATE the condition carries (`00000` where it is merely successful).
-    pub code: &'static str,
+    ///
+    /// A `Cow` for the reason [`super::sql_engine::EngineError::sqlstate`] is one: a code
+    /// block's `RAISE … USING ERRCODE = '<code>'` names the code the message carries, and
+    /// that value is the client's.
+    pub code: ::std::borrow::Cow<'static, str>,
     pub message: String,
 }
 
 impl WireNotice {
     /// A `NOTICE`: the server did something the client did not ask about.
     #[must_use]
-    pub fn notice(code: &'static str, message: impl Into<String>) -> Self {
-        Self {
-            severity: "NOTICE",
-            code,
-            message: message.into(),
-        }
+    pub fn notice(
+        code: impl Into<::std::borrow::Cow<'static, str>>,
+        message: impl Into<String>,
+    ) -> Self {
+        Self::at("NOTICE", code, message)
     }
 
     /// A `WARNING`: the statement succeeded but not as the client assumed.
     #[must_use]
-    pub fn warning(code: &'static str, message: impl Into<String>) -> Self {
+    pub fn warning(
+        code: impl Into<::std::borrow::Cow<'static, str>>,
+        message: impl Into<String>,
+    ) -> Self {
+        Self::at("WARNING", code, message)
+    }
+
+    /// A message at the severity the server RAISED it at, for the levels a code block's
+    /// `RAISE` names beyond those two ([`super::pg_code_block`]).
+    #[must_use]
+    pub fn at(
+        severity: &'static str,
+        code: impl Into<::std::borrow::Cow<'static, str>>,
+        message: impl Into<String>,
+    ) -> Self {
         Self {
-            severity: "WARNING",
-            code,
+            severity,
+            code: code.into(),
             message: message.into(),
         }
     }
@@ -1403,12 +1432,23 @@ impl StatementAnswer {
             database_changed: None,
             databases_changed: false,
             notices: Vec::new(),
+            log_lines: Vec::new(),
         }
     }
 
     /// The same answer, with one more thing the server says about it.
+    ///
+    /// A message the server sends the client is also one its own LOG may carry, at a
+    /// different floor ([`super::log_export::Severity`]), so it is recorded on both channels
+    /// here and each channel decides for itself whether it carries it.
     #[must_use]
     pub fn with_notice(mut self, notice: WireNotice) -> Self {
+        if let Some(severity) = super::log_export::Severity::named(notice.severity) {
+            self.log_lines.push(super::log_export::LogLine::new(
+                severity,
+                notice.message.clone(),
+            ));
+        }
         self.notices.push(notice);
         self
     }
@@ -1450,6 +1490,31 @@ pub fn run_statement(
     sql: &str,
     params: &[Option<String>],
 ) -> Result<StatementAnswer, EngineError> {
+    run_statement_at(
+        database,
+        facts,
+        sql,
+        params,
+        &mut super::pg_code_block::BlockBudget::default(),
+    )
+}
+
+/// [`run_statement`] under a BUDGET, which is what a statement run from inside a code block
+/// ([`super::pg_code_block`]) is served under.
+///
+/// One budget covers everything a single client statement makes this endpoint run — the
+/// statement itself, the statements of every block nested in it and the expressions those
+/// blocks' messages are filled from — so the work one request can buy is bounded by the
+/// budget's own constants however the client distributes it across nesting levels. A
+/// statement a client sent starts a fresh budget, which is what [`run_statement`] hands on.
+pub(super) fn run_statement_at(
+    database: &InstanceDatabase,
+    facts: &SessionFacts,
+    sql: &str,
+    params: &[Option<String>],
+    block: &mut super::pg_code_block::BlockBudget,
+) -> Result<StatementAnswer, EngineError> {
+    block.take_statement()?;
     if sql.len() > MAX_STATEMENT_BYTES {
         return Err(EngineError::new(
             EngineErrorKind::Syntax,
@@ -1524,6 +1589,14 @@ pub fn run_statement(
     // The role statements, which this server keeps in its own role catalog rather than
     // handing to the engine, and which it answers in PostgreSQL's words.
     if facts.wire == EngineWire::Postgres {
+        // An anonymous code block is not a query the engine plans: its body's own statements
+        // are run one by one, and its `RAISE` statements are messages of the server
+        // ([`super::pg_code_block`]).
+        if let Some(answer) =
+            super::pg_code_block::code_block(database, facts, &words, &tokens, block)?
+        {
+            return Ok(answer);
+        }
         if let Some(answer) = super::pg_server::role_statement(database, facts, &words, &tokens)? {
             return Ok(answer);
         }
@@ -2577,7 +2650,7 @@ pub fn significant_tokens(wire: EngineWire, sql: &str) -> Result<Vec<Token>, Eng
 
 /// The statement's tokens, keeping the whitespace that separates them (so a re-rendered
 /// statement still parses) but dropping comments.
-fn statement_tokens(wire: EngineWire, sql: &str) -> Result<Vec<Token>, EngineError> {
+pub(super) fn statement_tokens(wire: EngineWire, sql: &str) -> Result<Vec<Token>, EngineError> {
     let dialect: Box<dyn Dialect> = match wire {
         EngineWire::Postgres => Box::new(PostgreSqlDialect {}),
         EngineWire::MySql => Box::new(MySqlDialect {}),

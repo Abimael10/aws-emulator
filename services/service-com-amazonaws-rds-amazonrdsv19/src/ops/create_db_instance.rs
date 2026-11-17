@@ -1004,6 +1004,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 role: crate::state::EndpointRole::ClusterMember(record.identifier.clone()),
                 reader: false,
                 storage: Some(storage),
+                callback: ctx.callback().clone(),
             }),
             // An instance that runs its own engine, for the engines whose wire this emulator
             // speaks.
@@ -1019,6 +1020,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     // endpoint is opened for it.
                     reader: false,
                     storage: None,
+                    callback: ctx.callback().clone(),
                 }
             }),
         };

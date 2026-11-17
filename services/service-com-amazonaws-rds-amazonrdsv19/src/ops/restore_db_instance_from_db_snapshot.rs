@@ -857,6 +857,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         // read-only endpoint is opened for it.
                         reader: false,
                         storage: None,
+                        callback: ctx.callback().clone(),
                     },
                 )
                 .await

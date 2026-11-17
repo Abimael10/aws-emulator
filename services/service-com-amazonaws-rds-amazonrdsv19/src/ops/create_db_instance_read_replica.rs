@@ -823,6 +823,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         role: crate::state::EndpointRole::Writer,
                         reader: false,
                         storage: None,
+                        callback: ctx.callback().clone(),
                     },
                 )
                 .await

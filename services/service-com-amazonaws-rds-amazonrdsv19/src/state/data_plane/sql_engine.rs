@@ -188,7 +188,13 @@ pub struct EngineError {
     pub offset: Option<usize>,
     /// The SQLSTATE the PostgreSQL wire reports this refusal under, where the CONDITION
     /// names one of its own rather than the kind's ([`EngineError::with_sqlstate`]).
-    pub sqlstate: Option<&'static str>,
+    ///
+    /// Owned, because the code is not always one of this crate's own literals: a code
+    /// block's `RAISE … USING ERRCODE = '<code>'` names the SQLSTATE the client is to branch
+    /// on, and that value is the client's ([`super::pg_code_block`]). A boxed string rather
+    /// than a `String`, because this type is the `Err` of every statement and is moved on
+    /// every refusal.
+    pub sqlstate: Option<Box<str>>,
     /// The error number and SQLSTATE the MySQL wire reports this refusal under, where the
     /// CONDITION names one of its own ([`EngineError::with_mysql_error`]).
     pub mysql_error: Option<(u16, &'static str)>,
@@ -197,6 +203,27 @@ pub struct EngineError {
     /// inside its sentence — a client reads it to decide which unique or foreign-key rule it
     /// broke ([`EngineError::with_constraint`]).
     pub constraint: Option<String>,
+    /// What the server SAID about the statement before it failed: the messages a code
+    /// block's earlier `RAISE` statements produced ([`super::pg_code_block`]), or `None` for
+    /// a failure with nothing said before it — which is every other one.
+    ///
+    /// They travel WITH the refusal because the statement they belong to is the one that
+    /// failed: PostgreSQL sends those notices before the `ErrorResponse` and writes the ones
+    /// its log carries, so dropping them with the answer would lose messages the server
+    /// really produced. Behind a box, so a failure that said nothing costs one pointer
+    /// rather than two vectors — this type is the `Err` of every statement.
+    pub said: Option<Box<SaidBefore>>,
+}
+
+/// What the server said about a statement BEFORE it failed, on each of its two channels
+/// ([`EngineError::said`]).
+#[derive(Debug, Clone, Default)]
+pub struct SaidBefore {
+    /// The messages as the client is sent them, in the order they were said.
+    pub notices: Vec<super::wire_session::WireNotice>,
+    /// The same messages as the lines the engine's LOG carries, for the severities it logs
+    /// ([`super::log_export`]).
+    pub logged: Vec<super::log_export::LogLine>,
 }
 
 impl EngineError {
@@ -209,7 +236,43 @@ impl EngineError {
             sqlstate: None,
             mysql_error: None,
             constraint: None,
+            said: None,
         }
+    }
+
+    /// The messages the server said before this failure, in the order it said them.
+    #[must_use]
+    pub fn notices_said(&self) -> &[super::wire_session::WireNotice] {
+        self.said
+            .as_ref()
+            .map_or(&[], |said| said.notices.as_slice())
+    }
+
+    /// The same messages as the lines the engine's log carries.
+    #[must_use]
+    pub fn lines_logged(&self) -> &[super::log_export::LogLine] {
+        self.said.as_ref().map_or(&[], |said| said.logged.as_slice())
+    }
+
+    /// The same failure, carrying what the server said before it ([`Self::said`]).
+    ///
+    /// The messages given here come BEFORE any the failure already carries, because an outer
+    /// block's statements ran before the inner one that failed.
+    #[must_use]
+    pub fn with_messages(
+        mut self,
+        notices: Vec<super::wire_session::WireNotice>,
+        logged: Vec<super::log_export::LogLine>,
+    ) -> Self {
+        if notices.is_empty() && logged.is_empty() {
+            return self;
+        }
+        let already = self.said.take().unwrap_or_default();
+        self.said = Some(Box::new(SaidBefore {
+            notices: [notices, already.notices].concat(),
+            logged: [logged, already.logged].concat(),
+        }));
+        self
     }
 
     /// The same failure, naming the CONSTRAINT the row violated.
@@ -225,8 +288,8 @@ impl EngineError {
     /// duplicate DATABASE (`42P04`) is not a duplicate object in general (`42710`) — and
     /// what a client branches on is the one the condition carries.
     #[must_use]
-    pub fn with_sqlstate(mut self, sqlstate: &'static str) -> Self {
-        self.sqlstate = Some(sqlstate);
+    pub fn with_sqlstate(mut self, sqlstate: impl Into<Box<str>>) -> Self {
+        self.sqlstate = Some(sqlstate.into());
         self
     }
 

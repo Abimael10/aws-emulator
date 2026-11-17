@@ -539,7 +539,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // create published are taken back out before the failure is answered, so a caller is
         // never left with a deployment whose green database has no endpoint.
         if let Err(refusal) =
-            open_the_green_endpoint(&*self.engine, &state, &source_identifier, &green_engine).await
+            open_the_green_endpoint(
+                &*self.engine,
+                &state,
+                &source_identifier,
+                &green_engine,
+                ctx.callback().clone(),
+            )
+            .await
         {
             let mut store = state.lock();
             store
@@ -588,6 +595,7 @@ async fn open_the_green_endpoint<Eng: Send + Sync + 'static>(
     state: &::engine::ServiceState<crate::state::ComAmazonawsRdsAmazonrdsv19State>,
     source_identifier: &str,
     green: &GreenDatabase,
+    callback: ::smithy_server_runtime::EmbeddedEmulator,
 ) -> Result<(), CreateBlueGreenDeploymentError> {
     let Some(wire) = crate::state::engine_wire(&green.engine) else {
         return Ok(());
@@ -626,6 +634,7 @@ async fn open_the_green_endpoint<Eng: Send + Sync + 'static>(
             // A DB cluster publishes a reader endpoint beside its writer one.
             reader: green.is_cluster,
             storage: None,
+            callback,
         },
     )
     .await

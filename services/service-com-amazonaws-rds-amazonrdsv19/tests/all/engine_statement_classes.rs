@@ -20,6 +20,11 @@
 //! Every client here is the wire client the sibling engine-endpoint suite drives, so what
 //! these tests exercise is the protocol a stock driver speaks.
 
+use service_com_amazonaws_rds_amazonrdsv19::state::data_plane::pg_code_block::{
+    MAX_BLOCK_DEPTH, MAX_BLOCK_STATEMENTS, MAX_MESSAGE_BYTES_PER_REQUEST,
+    MAX_STATEMENTS_PER_REQUEST,
+};
+
 use crate::db_instance_engine_endpoint::{
     available_instance, mysql_login, postgres_login, MySqlSession, PostgresSession, Rows,
     Transport, DATABASE, MASTER_PASSWORD, MASTER_USER,
@@ -723,4 +728,251 @@ async fn a_statement_that_cannot_be_read_is_refused_in_its_own_engines_words() {
         },
     ];
     run_postgres(&mut postgres, &cases).await;
+}
+
+/// The ANONYMOUS CODE BLOCK class — `DO $$ … $$`, "executes an anonymous code block … as if
+/// it were a function body returning void" — which is how a client makes the server produce
+/// a MESSAGE of its own.
+///
+/// The rule: a block's body is run statement by statement — a `RAISE` is a message of the
+/// server at the level it names, and everything else is SQL the engine runs — and the level
+/// decides what the client is told: a `NOTICE` and a `WARNING` reach it, a `LOG` does not,
+/// and an `EXCEPTION` aborts the block under `raise_exception` or the SQLSTATE the statement
+/// named. What the block's SQL did is observable afterwards, which is what says the engine
+/// really ran it.
+///
+/// The rows span the frame forms (framed, bare, with a language named), the levels, a format
+/// with and without arguments, the `USING` options, and the forms the endpoint does not run.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_postgres_session_runs_the_anonymous_code_blocks_the_engine_defines() {
+    let router = emulator();
+    let (address, port) = available_instance(&router, "emu-pg-do-blocks", "postgres", &[]).await;
+    let mut session = postgres_login(
+        &address,
+        port,
+        Transport::Tls,
+        MASTER_USER,
+        MASTER_PASSWORD,
+        Some(DATABASE),
+    )
+    .await
+    .expect("the master user must be admitted");
+
+    let cases = [
+        Case {
+            case: "a framed block that raises a LOG",
+            statement: "DO $$ BEGIN RAISE LOG 'the server logged this'; END $$",
+            refusal: None,
+        },
+        Case {
+            case: "a block with no BEGIN frame at all",
+            statement: "DO $$ RAISE NOTICE 'bare body'; $$",
+            refusal: None,
+        },
+        Case {
+            case: "a block naming the language it runs in",
+            statement: "DO LANGUAGE plpgsql $$ BEGIN RAISE WARNING 'named language'; END $$",
+            refusal: None,
+        },
+        Case {
+            case: "a block carrying two statements",
+            statement: "DO $$ BEGIN RAISE NOTICE 'first'; RAISE NOTICE 'second'; END $$",
+            refusal: None,
+        },
+        Case {
+            case: "a block whose SQL the engine runs",
+            statement: "DO $$ BEGIN CREATE TABLE block_rows (id integer); \
+                        INSERT INTO block_rows VALUES (1), (2); END $$",
+            refusal: None,
+        },
+        Case {
+            case: "a block that raises an exception",
+            statement: "DO $$ BEGIN RAISE EXCEPTION 'denied for %', 'tenant-9'; END $$",
+            refusal: Some(("P0001", "denied for tenant-9")),
+        },
+        Case {
+            case: "a block that raises under the SQLSTATE and message it names",
+            statement: "DO $$ BEGIN RAISE EXCEPTION USING ERRCODE = '22012', \
+                        MESSAGE = 'the divisor was zero'; END $$",
+            refusal: Some(("22012", "the divisor was zero")),
+        },
+        Case {
+            case: "a language with no inline code handler",
+            statement: "DO LANGUAGE sql $$ BEGIN RAISE NOTICE 'x'; END $$",
+            refusal: Some((
+                "0A000",
+                "language \"sql\" does not support inline code execution",
+            )),
+        },
+        Case {
+            case: "a block carrying procedural control flow",
+            statement: "DO $$ BEGIN IF true THEN RAISE NOTICE 'x'; END IF; END $$",
+            refusal: Some((
+                "0A000",
+                "this endpoint runs the SQL statements and the RAISE statements of a code \
+                 block; `IF` is not served",
+            )),
+        },
+        Case {
+            case: "a block declaring a variable",
+            statement: "DO $$ DECLARE total integer; BEGIN RAISE NOTICE 'x'; END $$",
+            refusal: Some((
+                "0A000",
+                "this endpoint runs the SQL statements and the RAISE statements of a code \
+                 block; `DECLARE` is not served",
+            )),
+        },
+        Case {
+            case: "a DO with no body",
+            statement: "DO",
+            refusal: Some(("42601", "syntax error at end of input")),
+        },
+        Case {
+            case: "a RAISE with no parameters, outside an exception handler",
+            statement: "DO $$ BEGIN RAISE; END $$",
+            refusal: Some((
+                "42601",
+                "RAISE without parameters cannot be used outside an exception handler",
+            )),
+        },
+    ];
+    run_postgres(&mut session, &cases).await;
+
+    // WHICH levels reach the client: a `LOG` is below the default `client_min_messages` and
+    // a `NOTICE` and a `WARNING` are at or above it, each carrying its own severity.
+    let logged = session
+        .query("DO $$ BEGIN RAISE LOG 'not for the client'; END $$")
+        .await
+        .expect("a block that raises a LOG is served");
+    assert!(
+        logged.notices.is_empty(),
+        "case {:?}: a LOG message is not sent to the client, got {:?}",
+        "a LOG at the default client_min_messages",
+        logged.notices
+    );
+    // And the format's placeholders are filled by the ENGINE evaluating each argument: the
+    // sum below is the engine's answer, not the text of the expression.
+    let noticed = session
+        .query("DO $$ BEGIN RAISE NOTICE 'counted % of %', 1 + 1, 'them'; END $$")
+        .await
+        .expect("a block that raises a NOTICE is served");
+    assert_eq!(
+        noticed
+            .notices
+            .iter()
+            .map(|notice| notice.message.as_str())
+            .collect::<Vec<_>>(),
+        vec!["counted 2 of them"],
+        "case {:?}: the NOTICE must carry the format filled by the engine, got {:?}",
+        "a NOTICE whose format carries two placeholders",
+        noticed.notices
+    );
+    let escaped = session
+        .query("DO $$ BEGIN RAISE WARNING '100%% of them'; END $$")
+        .await
+        .expect("a block that raises a WARNING is served");
+    assert_eq!(
+        escaped
+            .notices
+            .first()
+            .map(|notice| (notice.code.as_str(), notice.message.as_str())),
+        // A message a `RAISE` produced for a level below `EXCEPTION` is not a failure, so it
+        // carries the successful-completion class.
+        Some(("00000", "100% of them")),
+        "case {:?}: `%%` is a literal per cent and the message carries the \
+         successful-completion class, got {:?}",
+        "a WARNING whose format escapes a per cent",
+        escaped.notices
+    );
+
+    // A refusal the engine answers one of the body's statements with is the block's: it
+    // reaches the client under the class that statement's own condition carries.
+    let refused = session
+        .query("DO $$ BEGIN INSERT INTO a_table_that_is_not_there VALUES (1); END $$")
+        .await
+        .expect_err("a block whose SQL names no relation of the database is refused");
+    assert_eq!(
+        refused.code, "42P01",
+        "case {:?}: an undefined relation inside a block is refused under its own class, \
+         got {refused:?}",
+        "a block whose SQL the engine refuses"
+    );
+
+    // What the block's SQL did is there afterwards: the rows it inserted are in the table it
+    // created, which is what says the engine ran the body rather than the server reading it.
+    let rows = session
+        .query("SELECT count(*) FROM block_rows")
+        .await
+        .expect("the table the block created is there");
+    assert_eq!(
+        column(&rows),
+        vec!["2".to_string()],
+        "case {:?}: the rows the block inserted must be in the table it created, got {rows:?}",
+        "the state a block's SQL left behind"
+    );
+
+    // The BOUNDS one client statement is held to, which is what keeps a block of blocks from
+    // buying this endpoint unbounded work. Each payload is BUILT from the bound it tests, so
+    // the row cannot drift from the constant, and each is refused as the limit it exceeded
+    // (`program_limit_exceeded`).
+    let nested = (0..=u32::from(MAX_BLOCK_DEPTH)).fold(
+        "RAISE NOTICE 'deep';".to_string(),
+        |inner, level| format!("DO $b{level}$ BEGIN {inner} END $b{level}$;"),
+    );
+    let raises = |count: usize, message: &str| {
+        let body: String = (0..count)
+            .map(|_| format!("RAISE NOTICE '{message}';"))
+            .collect();
+        format!("DO $$ BEGIN {body} END $$")
+    };
+    let bounds: [(&str, String, String); 4] = [
+        (
+            "a block nested deeper than this endpoint runs",
+            nested,
+            format!("this endpoint runs code blocks nested at most {MAX_BLOCK_DEPTH} deep"),
+        ),
+        (
+            "a body carrying more statements than one block may",
+            raises(MAX_BLOCK_STATEMENTS + 1, "one"),
+            format!(
+                "one code block may carry at most {MAX_BLOCK_STATEMENTS} statements in this \
+                 emulator"
+            ),
+        ),
+        (
+            "blocks running more statements in total than one statement may",
+            format!(
+                "DO $outer$ BEGIN {} END $outer$",
+                (0..MAX_BLOCK_STATEMENTS)
+                    .map(|at| format!(
+                        "DO $i{at}$ BEGIN RAISE NOTICE 'a'; RAISE NOTICE 'b'; \
+                         RAISE NOTICE 'c'; RAISE NOTICE 'd'; END $i{at}$;"
+                    ))
+                    .collect::<String>()
+            ),
+            format!(
+                "one statement may run at most {MAX_STATEMENTS_PER_REQUEST} statements in \
+                 this emulator, code blocks included"
+            ),
+        ),
+        (
+            "blocks raising more message bytes than one statement may",
+            raises(32, &"m".repeat(1_200)),
+            format!(
+                "one statement may raise at most {MAX_MESSAGE_BYTES_PER_REQUEST} bytes of \
+                 messages in this emulator"
+            ),
+        ),
+    ];
+    for (case, statement, message) in bounds {
+        let refusal = session
+            .query(&statement)
+            .await
+            .expect_err("a block past one of this endpoint's bounds is refused");
+        assert_eq!(
+            (refusal.code.as_str(), refusal.message.as_str()),
+            ("54000", message.as_str()),
+            "case {case:?}: expected the bound's own refusal ({message:?}), got {refusal:?}"
+        );
+    }
 }

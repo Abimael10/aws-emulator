@@ -910,6 +910,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         // A DB instance publishes ONE address, its own `Endpoint`.
                         reader: false,
                         storage: None,
+                        callback: ctx.callback().clone(),
                     },
                 )
                 .await

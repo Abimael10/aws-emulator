@@ -1006,7 +1006,24 @@ async fn run_statement(
     }
     .map_err(|error| EngineError::new(EngineErrorKind::Internal, error.to_string()));
     context.sessions.idle(facts.connection_id);
-    let answer = answer??;
+    let answer = match answer? {
+        Ok(answer) => answer,
+        Err(refusal) => {
+            // A refused statement is a line of the engine's log: PostgreSQL writes an
+            // `ERROR` carrying the very sentence the client is told, and that is what a
+            // resource with its log exported streams ([`super::log_export`]). The messages
+            // the statement produced BEFORE it failed are lines of that same log, and they
+            // were written first.
+            let mut lines = refusal.lines_logged().to_vec();
+            lines.push(super::log_export::LogLine::of_refusal(&refusal));
+            super::log_export::export(context, facts, &lines).await;
+            return Err(refusal);
+        }
+    };
+    // And so is every message the statement itself produced, at the levels the engine logs.
+    if !answer.log_lines.is_empty() {
+        super::log_export::export(context, facts, &answer.log_lines).await;
+    }
     if let Some((name, value)) = answer.setting_changed.clone() {
         facts.settings.insert(name, value);
     }
@@ -1347,11 +1364,21 @@ fn sqlstate(kind: EngineErrorKind) -> &'static str {
 }
 
 /// Report a failed statement, keeping the engine's own message.
+///
+/// What the server SAID before the statement failed comes first, as PostgreSQL sends those
+/// notices before the `ErrorResponse` ([`EngineError::said`]): the messages a code block's
+/// earlier `RAISE` statements produced belong to this statement.
 async fn engine_error_response(
     conn: &mut ::emulator_server::ListenerConn,
     error: &EngineError,
 ) -> std::io::Result<()> {
-    let code = error.sqlstate.unwrap_or_else(|| sqlstate(error.kind));
+    for notice in error.notices_said() {
+        notice_response(conn, notice).await?;
+    }
+    let code = error
+        .sqlstate
+        .as_deref()
+        .unwrap_or_else(|| sqlstate(error.kind));
     // The CONSTRAINT field, for a refusal that is about one: PostgreSQL carries the
     // constraint's name in its own field of the error, which is where a client reads which
     // rule the row broke rather than parsing it out of the sentence.
@@ -1363,7 +1390,7 @@ async fn notice_response(
     conn: &mut ::emulator_server::ListenerConn,
     notice: &wire_session::WireNotice,
 ) -> std::io::Result<()> {
-    message_response(conn, b'N', notice.severity, notice.code, &notice.message, None).await
+    message_response(conn, b'N', notice.severity, &notice.code, &notice.message, None).await
 }
 
 /// One `ErrorResponse`.
