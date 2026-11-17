@@ -11,7 +11,16 @@ use super::*;
 
 smithy_macros::smithy_model!("smithy-model/com-amazonaws-ecr-amazonec2containerregistry-v20150921.json");
 
-#[smithy_macros::smithy(shape = "com.amazonaws.ecr#ListImagesRequest")]
+// `skip_validation = ["repositoryName"]`: `ListImages` is one of the operations whose
+// validator does NOT police `RepositoryName`'s `@pattern` — the recorded answer for a name
+// the expression does not admit is this registry's not-found error naming that name, so the
+// name reaches the lookup here, while `DescribeImages` and `CreateRepository` keep the
+// model's constraint. The name's modelled length bounds are judged where the lookup
+// happens; see `crate::state::repository_name` for the whole rule and its evidence.
+#[smithy_macros::smithy(
+    shape = "com.amazonaws.ecr#ListImagesRequest",
+    skip_validation = ["repositoryName"]
+)]
 #[derive(Debug, Clone, Default)]
 pub struct ListImagesInput {
     pub registry_id: Option<String>,

@@ -2879,15 +2879,24 @@ pub struct ComAmazonawsEcrAmazonec2containerregistryV20150921State {
 
 impl ComAmazonawsEcrAmazonec2containerregistryV20150921State {
     /// The repository `name` of the registry in `region`, or [`Fault::RepositoryNotFound`].
+    ///
+    /// The name is judged before it is resolved, and only against the bounds a name this
+    /// registry resolves must be inside ([`check_repository_name`]): a name outside the
+    /// modelled length bounds is [`Fault::InvalidParameter`], and every other name is
+    /// LOOKED UP whether or not the modelled `@pattern` admits it — which operations police
+    /// that expression is settled at the request boundary (see `state/repository_name.rs`),
+    /// so a name that reaches here is reported as missing rather than refused.
     pub fn repository(&self, region: &str, name: &str) -> Result<&Repo, Fault> {
+        check_repository_name(name)?;
         self.repositories
             .get(&repository_key(region, name))
             .ok_or_else(|| Fault::RepositoryNotFound(repository_not_found_message(name)))
     }
 
-    /// The repository `name` of the registry in `region`, for mutation, or
-    /// [`Fault::RepositoryNotFound`].
+    /// The repository `name` of the registry in `region`, for mutation, judged the way
+    /// [`Self::repository`] judges it, or [`Fault::RepositoryNotFound`].
     pub fn repository_mut(&mut self, region: &str, name: &str) -> Result<&mut Repo, Fault> {
+        check_repository_name(name)?;
         self.repositories
             .get_mut(&repository_key(region, name))
             .ok_or_else(|| Fault::RepositoryNotFound(repository_not_found_message(name)))
@@ -4089,7 +4098,11 @@ pub fn repository_name_from_arn(arn: &str) -> Result<String, Fault> {
     }
     let name = resource
         .strip_prefix(REPOSITORY_RESOURCE_PREFIX)
-        .filter(|name| !name.is_empty())
+        // A resource segment carrying no repository name, or one no repository of this
+        // registry could be named by ([`within_repository_name_length`]), is not an ECR
+        // repository ARN at all — so it is refused as the ARN it is, naming the parameter
+        // the request carried, rather than as the `repositoryName` it does not carry.
+        .filter(|name| within_repository_name_length(name))
         .ok_or_else(invalid)?;
     if account != registry_id() {
         return Err(Fault::InvalidParameter(format!(
@@ -4590,6 +4603,11 @@ pub mod pull_metrics;
 pub mod signing;
 mod image_scan;
 mod layer_download;
+/// What ECR judges about a `repositoryName` a request addresses an existing repository by,
+/// in `state/repository_name.rs`. Declared and re-exported here, so a handler reaches it as
+/// `crate::state::…` like every other part of this store.
+mod repository_name;
+pub use repository_name::*;
 /// The endpoint a registry address this service announces names, and the repository URI
 /// and `docker login` URL built on it, in `state/registry_address.rs`. Declared and
 /// re-exported here, so a handler reaches it as `crate::state::…` like every other part

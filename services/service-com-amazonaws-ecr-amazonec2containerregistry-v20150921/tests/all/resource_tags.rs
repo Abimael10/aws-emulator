@@ -401,6 +401,20 @@ async fn an_arn_that_is_not_this_registrys_repository_is_refused() {
             format!("arn:aws:ecr:{REGION}:{REGISTRY_ID}:repository/"),
         ),
         (
+            // A name no repository of this registry could carry: `RepositoryName` is
+            // modelled `@length(min: 2, max: 256)`, so a one-character segment names no
+            // repository and the value is not a repository ARN at all.
+            "a name below the modelled minimum length",
+            format!("arn:aws:ecr:{REGION}:{REGISTRY_ID}:repository/a"),
+        ),
+        (
+            "a name above the modelled maximum length",
+            format!(
+                "arn:aws:ecr:{REGION}:{REGISTRY_ID}:repository/{}",
+                "a".repeat(257)
+            ),
+        ),
+        (
             "a resource field carrying no resource type",
             format!("arn:aws:ecr:{REGION}:{REGISTRY_ID}:present"),
         ),

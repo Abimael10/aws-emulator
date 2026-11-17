@@ -16,9 +16,12 @@
 //!    words, while a value the model-driven walk caught — a member of a NESTED structure,
 //!    or a parameter whose value the registry only RECORDS — keeps that walk's path and
 //!    the `@pattern` as the model declares it;
-//! 3. a `repositoryName` the modelled expression ADMITS is a name to look up, so it is
-//!    the modelled not-found error and not a parameter failure — which is what a
-//!    registry-qualified image reference passed where a name belongs is;
+//! 3. which operations police `RepositoryName`'s `@pattern` is ECR's own per-OPERATION
+//!    fact: a listing LOOKS the name up, so a name no repository carries — a registry-
+//!    qualified image reference passed where a name belongs included — is the modelled
+//!    not-found error there and a parameter failure on an operation that does police the
+//!    expression, while the modelled length bounds are stated as a parameter failure by
+//!    both;
 //! 4. a value outside an enumerated type states that type's whole value set in the order
 //!    the values' own hash table is walked, not the order the model declares;
 //! 5. whether the expression ECR publishes for a value class is DELIMITED inside the
@@ -425,27 +428,145 @@ fn repository_not_found(name: &str) -> String {
     format!("The repository with name '{name}' does not exist in the registry with id '{REGISTRY_ID}'")
 }
 
-/// A `repositoryName` the model's `@pattern` ADMITS reaches the lookup, so a name no
-/// repository carries answers the modelled `RepositoryNotFoundException` — while a name
-/// the expression does not admit is refused as a parameter, before any lookup.
+/// Which operations police `RepositoryName`'s `@pattern` is ECR's own per-OPERATION fact,
+/// and `ListImages` is one that does NOT: every name inside the modelled length bounds
+/// reaches its lookup, so a name this registry holds no repository for is the modelled
+/// `RepositoryNotFoundException` naming the name as the request spelled it.
 ///
-/// The row that matters for a caller is a registry-qualified image reference: the
-/// authority AWS publishes a registry under —
-/// `<account>.dkr.ecr.<region>.amazonaws.com/<repository>` — is lowercase letters, digits,
-/// dots and hyphens with a `/` before the repository, and `RepositoryName`'s `@pattern`
-/// admits every one of those (`smithy_query(query="shape", shape="RepositoryName")` gives
-/// `^[a-z0-9]+((\.|_|__|-+)[a-z0-9]+)*(\/[a-z0-9]+((\.|_|__|-+)[a-z0-9]+)*)*$`, where `.`,
-/// `_`, `-` and `/` are the separators). So passing such a reference where a repository
-/// name belongs names a repository that does not exist. An authority carrying a character
-/// the expression does NOT admit — a `:` before a port, an uppercase letter — is the other
-/// side of the same boundary and is a parameter failure.
+/// `RepositoryName` is modelled `@length(min: 2, max: 256)` with the `@pattern`
+/// `^[a-z0-9]+((\.|_|__|-+)[a-z0-9]+)*(\/[a-z0-9]+((\.|_|__|-+)[a-z0-9]+)*)*$`
+/// (`smithy_query(query="shape", shape="RepositoryName")`). The recorded instance is one
+/// call of this operation naming a registry-qualified image reference — an image URI passed
+/// where a repository name belongs, whose authority carries a port the expression does not
+/// admit — answered as a repository that does not exist. The operations that DO police the
+/// expression are the other half of the rule, pinned by the suite below.
+///
+/// The rows differ along what the rule generalises over: the shape of the name — a plain
+/// name, a namespaced one, registry-qualified references in two Regions and two accounts,
+/// an authority carrying a port (the recorded shape), a reference carrying a tag, an
+/// uppercase letter, a space, and both ends of the admitted length — plus the two length
+/// bounds, which are the one thing this operation still refuses the name against.
+#[tokio::test]
+async fn every_length_legal_name_a_listing_names_is_looked_up() {
+    /// What the answer to one name is: the lookup's own not-found, or the parameter clause
+    /// stating the length bound the name failed.
+    enum Answer {
+        LookedUp,
+        Refused(&'static str),
+    }
+
+    let too_long = "a".repeat(257);
+    let longest = "a".repeat(256);
+    let longest_case = format!("{} characters, the longest the model admits", longest.len());
+    // (case, the repositoryName sent, what the answer is)
+    let names: Vec<(&str, &str, Answer)> = vec![
+        ("a plain name no repository carries", "absent-repository", Answer::LookedUp),
+        ("a namespaced name", "team/absent-repository", Answer::LookedUp),
+        (
+            "a registry-qualified image reference",
+            "000000000000.dkr.ecr.us-west-2.amazonaws.com/absent-repository",
+            Answer::LookedUp,
+        ),
+        (
+            "another account and Region's reference",
+            "111111111111.dkr.ecr.eu-west-1.amazonaws.com/team/absent-repository",
+            Answer::LookedUp,
+        ),
+        (
+            // The recorded instance's shape.
+            "an authority carrying a port",
+            "127.0.0.1:4566/absent",
+            Answer::LookedUp,
+        ),
+        ("a reference carrying a tag", "absent-repository:latest", Answer::LookedUp),
+        ("an uppercase letter", "Absent-Repository", Answer::LookedUp),
+        ("a space", "absent repository", Answer::LookedUp),
+        ("the shortest name the model admits", "ab", Answer::LookedUp),
+        (&longest_case, &longest, Answer::LookedUp),
+        (
+            "one character — one below the modelled minimum",
+            "a",
+            Answer::Refused("Member must have length greater than or equal to 2"),
+        ),
+        (
+            "257 characters — one above the modelled maximum",
+            &too_long,
+            Answer::Refused("Member must have length less than or equal to 256"),
+        ),
+    ];
+
+    let router = emulator();
+    for (shape, name, expected) in &names {
+        let case = format!("{shape} on ListImages");
+        let answer = call(&router, "ListImages", &json!({"repositoryName": name})).await;
+        assert_eq!(
+            answer.status, 400,
+            "case {case:?}: expected HTTP 400, got {} with {:?}",
+            answer.status, answer.body
+        );
+        let (code, expected) = match expected {
+            Answer::LookedUp => ("RepositoryNotFoundException", repository_not_found(name)),
+            Answer::Refused(constraint) => {
+                (INVALID_PARAMETER, clause("repositoryName", constraint))
+            }
+        };
+        assert_eq!(
+            answer.error_code(),
+            code,
+            "case {case:?}: expected {code}, got {:?}",
+            answer.body
+        );
+        assert_eq!(
+            answer.message(),
+            expected,
+            "case {case:?}: expected {expected:?}, got {:?}",
+            answer.message()
+        );
+    }
+
+    // The rest of the member's contract, which taking the expression off the boundary
+    // leaves untouched: the name is still `@required`, so a call naming no repository at
+    // all is refused before any lookup, and a name the registry DOES hold is served.
+    assert_clause(
+        &router,
+        "no repositoryName at all on ListImages",
+        "ListImages",
+        &json!({}),
+        "repositoryName",
+        "Member must not be null",
+    )
+    .await;
+    let held = "held-repository";
+    let created = call(&router, "CreateRepository", &json!({"repositoryName": held})).await;
+    assert_eq!(
+        created.status, 200,
+        "the repository a served listing needs must be created, got {:?}",
+        created.body
+    );
+    let listed = call(&router, "ListImages", &json!({"repositoryName": held})).await;
+    assert_eq!(
+        listed.status, 200,
+        "a name this registry holds a repository for must be listed, got {} with {:?}",
+        listed.status, listed.body
+    );
+}
+
+/// A `repositoryName` outside the modelled expression IS a parameter failure on an
+/// operation whose validator polices it, and a name the expression admits is looked up
+/// there: the other half of the per-operation rule above.
+///
+/// The recorded pair is one client's two calls: `DescribeImages` naming a reference that
+/// carries a tag, answered with the clause stating the expression ECR publishes, where
+/// `ListImages` naming a registry-qualified reference was answered with the not-found error.
 ///
 /// The rows differ along what the rule generalises over: the shape of the name (a plain
-/// name, a namespaced one, a registry-qualified reference in two Regions and two accounts,
-/// a reference with a port, one with a tag, one with an uppercase letter) crossed with the
-/// operations that take the parameter.
+/// name, a namespaced one, a registry-qualified reference in two Regions and two accounts —
+/// every one of which the expression admits — against an authority carrying a port, a
+/// reference carrying a tag, and an uppercase letter, which it does not) crossed with the
+/// operations that take the parameter, spanning a metadata read, a policy read, a push
+/// preparation and a delete.
 #[tokio::test]
-async fn a_name_the_expression_admits_is_looked_up_and_one_it_does_not_is_a_parameter() {
+async fn a_name_outside_the_expression_is_a_parameter_where_the_expression_is_policed() {
     // (case, the repositoryName sent, whether the expression admits it)
     let names: Vec<(&str, &str, bool)> = vec![
         ("a plain name no repository carries", "absent-repository", true),
@@ -461,10 +582,16 @@ async fn a_name_the_expression_admits_is_looked_up_and_one_it_does_not_is_a_para
             true,
         ),
         ("an authority carrying a port", "127.0.0.1:4566/absent", false),
+        // The recorded instance's shape, on the recorded operation.
         ("a reference carrying a tag", "absent-repository:latest", false),
         ("an uppercase letter", "Absent-Repository", false),
     ];
-    let operations = ["ListImages", "DescribeImages", "GetRepositoryPolicy"];
+    let operations = [
+        "DescribeImages",
+        "GetRepositoryPolicy",
+        "InitiateLayerUpload",
+        "DeleteRepository",
+    ];
 
     let router = emulator();
     let malformed = clause(

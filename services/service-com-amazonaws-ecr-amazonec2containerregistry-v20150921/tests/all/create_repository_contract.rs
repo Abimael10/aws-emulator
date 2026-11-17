@@ -184,11 +184,15 @@ async fn a_value_outside_a_modelled_constraint_is_refused_as_an_invalid_paramete
             "Member must have value less than or equal to 1000".to_string(),
         ),
         (
-            "an invalid name in a listing",
+            // A listing's `repositoryName` is a name this registry RESOLVES, so what it
+            // refuses about one is the modelled length and not the expression — a name
+            // inside the bounds is looked up (see
+            // `parameter_constraint_clauses::every_length_legal_name_a_listing_names_is_looked_up`).
+            "a one-character name in a listing",
             "ListImages",
-            json!({"repositoryName": "Bad"}),
+            json!({"repositoryName": "a"}),
             "repositoryName",
-            REPOSITORY_NAME_CLAUSE.to_string(),
+            "Member must have length greater than or equal to 2".to_string(),
         ),
         (
             "a push with no imageManifest",

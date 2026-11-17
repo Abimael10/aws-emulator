@@ -5,7 +5,10 @@
 //! The rule under test: every call MINTS one `docker login` credential for the one
 //! registry this emulator serves, reported as a single `authorizationData` entry whose
 //! `authorizationToken` is the base64 of `AWS:<freshly minted password>`, whose
-//! `expiresAt` is the call's instant plus the documented 12-hour validity, and whose
+//! `expiresAt` is the call's instant plus the documented 12-hour validity STATED IN THE
+//! UNIT the member documents — "the Unix time in seconds and milliseconds", so a whole
+//! number of milliseconds and nothing finer, whatever precision the host clock carries —
+//! and whose
 //! `proxyEndpoint` is the registry endpoint THIS EMULATOR serves — `proxyEndpoint` is
 //! where `docker login` and every pull after it go, and this emulator is what answers the
 //! registry API (`service/registry_v2.rs`), so an address naming AWS's own
@@ -44,6 +47,18 @@ const LIFETIME_SECONDS: f64 = 12.0 * 60.0 * 60.0;
 /// How far `expiresAt` may sit from `now + 12h` and still be the same instant: the slack
 /// covers only the wall-clock time the call itself takes.
 const CLOCK_SLACK_SECONDS: f64 = 120.0;
+
+/// How many milliseconds one second carries, which is the resolution `expiresAt` is stated
+/// to: `AuthorizationData$expiresAt` is "the Unix time in seconds and milliseconds when the
+/// authorization token expires", so the value is a whole number of milliseconds and carries
+/// nothing finer.
+const MILLISECONDS_PER_SECOND: f64 = 1000.0;
+
+/// How far the value may sit from a whole millisecond and still be one: only the rounding of
+/// the multiplication above, which for an instant of this magnitude is far below a
+/// thousandth of a millisecond. A value carrying sub-millisecond precision misses a whole
+/// millisecond by a fraction of one, so nothing in between is admitted.
+const MILLISECOND_SLACK: f64 = 0.001;
 
 /// The modelled member names of `AuthorizationData`, as the awsJson1_1 wire carries them.
 const MEMBER_TOKEN: &str = "authorizationToken";
@@ -154,6 +169,15 @@ async fn issue(
         (earliest..=latest).contains(&expires_at),
         "case {case:?}: expected expiresAt in {earliest}..={latest} \
          (the call's instant plus 12 hours), got {expires_at}"
+    );
+    // The unit the value is stated in: seconds AND MILLISECONDS, so a whole number of
+    // milliseconds. A host clock carries nanoseconds, and an instant reported with that
+    // precision is one no seconds-and-milliseconds reader can take.
+    let in_milliseconds = expires_at * MILLISECONDS_PER_SECOND;
+    assert!(
+        (in_milliseconds - in_milliseconds.round()).abs() < MILLISECOND_SLACK,
+        "case {case:?}: expected expiresAt to be a whole number of milliseconds, got \
+         {expires_at} ({in_milliseconds} ms)"
     );
 
     let proxy_endpoint = data[MEMBER_PROXY]
