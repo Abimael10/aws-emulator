@@ -24,12 +24,6 @@
 //! the inner attribute that closes the header contribute no sentence, so they only break a
 //! paragraph.
 //!
-//! It is read for this crate's own root while its target keeps one; where its suites are
-//! declared with `automod` instead, the rule has no subject here, and what the workspace's
-//! hand-kept roots are held to is the PARAGRAPH rule of
-//! [`super::declaration_roots_state_each_header_paragraph_once`], which reads them through this
-//! module's [`paragraph_prose_of`].
-//!
 //! It reads one file; it starts no router and reaches no network.
 
 // The header boundary this rule is read against, and which lines of that header say
@@ -79,7 +73,10 @@ fn opens_a_sentence(prose: &str) -> bool {
 /// One report per header line of `source` that begins in the middle of a sentence: a line
 /// which opens a paragraph, or follows a line that ended a sentence, and does not open a
 /// sentence of its own.
-fn header_lines_beginning_mid_sentence(source: &str) -> Vec<String> {
+///
+/// Shared with the sibling that reads this rule for the declaration roots of the workspace,
+/// so one rule keeps one reading.
+pub(crate) fn header_lines_beginning_mid_sentence(source: &str) -> Vec<String> {
     let mut reports = Vec::new();
     let mut previous: Option<&str> = None;
     for (index, line) in header_of(source).into_iter().enumerate() {

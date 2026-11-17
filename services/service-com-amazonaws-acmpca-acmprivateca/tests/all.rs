@@ -59,6 +59,8 @@ mod issuance_authorization;
 mod issuance_metrics;
 #[path = "all/issued_certificate_reads.rs"]
 mod issued_certificate_reads;
+#[path = "all/minted_serial_values.rs"]
+mod minted_serial_values;
 #[path = "all/permission_action_set.rs"]
 mod permission_action_set;
 #[path = "all/permissions.rs"]
