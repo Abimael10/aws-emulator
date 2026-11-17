@@ -2230,8 +2230,8 @@ pub fn event_payload(payload: &[u8]) -> EventInput {
 /// An execution's start and end instants are each reported TWICE: as the modelled
 /// timestamps of a read (`GetDurableExecution$StartTimestamp` / `$EndTimestamp`) and of the
 /// call that ended it (`StopDurableExecution$StopTimestamp`), and as the instants the
-/// status-change event of the same move carries, which that event reports as whole
-/// milliseconds since the epoch ([`durable_events::StatusChange::detail`]). One instant has
+/// status-change event of the same move carries, which that event reports to the
+/// millisecond ([`durable_events::StatusChange::detail`]). One instant has
 /// ONE value, so it is recorded at the resolution those reports share: a finer reading of
 /// the clock would leave the two reports of the same instant disagreeing below the
 /// millisecond, and a client that compares the `StopTimestamp` it was answered with the end
@@ -3875,15 +3875,17 @@ pub fn layer_version_without_policy_message(layer_version_arn: &str) -> String {
 /// one rendering serves them all, and a caller parsing any of them with the offset form
 /// reads every one of them.
 ///
-/// A function URL's own instants are the one exception, and a recorded one: see
-/// [`function_url::FUNCTION_URL_UTC_DESIGNATOR`].
+/// A function URL's own instants are the one exception among the modelled members, and a
+/// recorded one: see [`function_url::FUNCTION_URL_UTC_DESIGNATOR`]. The instants a
+/// status-change EVENT states carry the designator its envelope does
+/// ([`durable_events`]), which is not a modelled member at all.
 pub const UTC_DESIGNATOR: &str = "+0000";
 
 /// `at` as an ISO-8601 instant ("in ISO-8601 format (YYYY-MM-DDThh:mm:ss.sTZD)") whose
 /// time-zone designator is `designator` — the ONE rendering of an instant this service
-/// has, so the two designators it reports an instant under
-/// ([`UTC_DESIGNATOR`], [`function_url::FUNCTION_URL_UTC_DESIGNATOR`]) cannot differ in
-/// anything else.
+/// has, so the designators it reports an instant under
+/// ([`UTC_DESIGNATOR`], [`function_url::FUNCTION_URL_UTC_DESIGNATOR`],
+/// [`durable_events::EVENT_UTC_DESIGNATOR`]) cannot differ in anything else.
 ///
 /// The subsecond field is TRUNCATED to whole milliseconds and rendered at a fixed three
 /// digits, so two instants this service reports always compare the same way as strings

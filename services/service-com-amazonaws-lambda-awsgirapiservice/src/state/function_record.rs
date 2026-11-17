@@ -521,9 +521,24 @@ impl FunctionRecord {
     #[must_use]
     pub fn durable_execution_arn(&self, execution: &DurableExecutionRecord) -> String {
         format!(
-            "{}:{}/{DURABLE_EXECUTION_ARN_INFIX}/{}/{}",
-            self.arn, execution.version, execution.name, execution.execution_id
+            "{}/{DURABLE_EXECUTION_ARN_INFIX}/{}/{}",
+            self.durable_execution_function_arn(execution),
+            execution.name,
+            execution.execution_id
         )
+    }
+
+    /// The ARN of the function VERSION `execution` runs on, as a durable execution names the
+    /// function it belongs to: this function's ARN qualified by that version, `$LATEST`
+    /// included.
+    ///
+    /// It is the function part of the execution's own ARN ([`Self::durable_execution_arn`]),
+    /// whose pattern carries the qualifier for every version — so the function a durable
+    /// execution's status-change event names and the function its ARN names are one string,
+    /// spelled once here.
+    #[must_use]
+    pub fn durable_execution_function_arn(&self, execution: &DurableExecutionRecord) -> String {
+        format!("{}:{}", self.arn, execution.version)
     }
 
     /// The `Execution` the wire reports for `execution`, built entirely out of what is

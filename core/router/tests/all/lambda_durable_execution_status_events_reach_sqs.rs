@@ -6,9 +6,10 @@
 //!
 //! The RULE under test: **every status a durable execution MOVES INTO is published once onto
 //! the account's default EventBridge bus as one `aws.lambda` /
-//! `Lambda Durable Execution Status Change` event whose `detail` names the execution, the
-//! FUNCTION it belongs to — by the ARN Lambda reports for that function — and the status it
-//! moved into, with the instants it started and ended; so a rule on that bus keyed on the
+//! `Durable Execution Status Change` event whose `detail` names the execution, the
+//! FUNCTION it belongs to — by the ARN of the function VERSION the execution runs on — and
+//! the status it moved into, with the instants it started and ended stated in ISO-8601; so a
+//! rule on that bus keyed on the
 //! class, on one status or on that function delivers one envelope per status to its targets,
 //! and the end instant the `STOPPED` envelope carries is the `StopTimestamp` the
 //! `StopDurableExecution` call answered.**
@@ -58,11 +59,10 @@ const REGION: &str = "us-east-1";
 
 /// The `source` and `detail-type` the events must carry, spelled out here rather than
 /// imported from the implementation, so a wrong constant there cannot make this suite pass.
-/// EventBridge names the publishing service in an event's `source` as `aws.<service>`, and a
-/// resource's status change is `<service> <resource> Status Change`, the form this tree's
-/// other publishers carry (`Step Functions Execution Status Change`).
+/// EventBridge names the publishing service in an event's `source` as `aws.<service>`, and
+/// the `detail-type` names the resource whose status moved and the move itself.
 const EVENT_SOURCE: &str = "aws.lambda";
-const DURABLE_EXECUTION_STATUS_CHANGE: &str = "Lambda Durable Execution Status Change";
+const DURABLE_EXECUTION_STATUS_CHANGE: &str = "Durable Execution Status Change";
 
 /// The bus an Amazon Web Services service's own events go to.
 const DEFAULT_BUS: &str = "default";
@@ -91,6 +91,10 @@ const DURABLE_EXECUTION_ARN_HEADER: &str = "x-amz-durable-execution-arn";
 const RUNNING: &str = "RUNNING";
 const SUCCEEDED: &str = "SUCCEEDED";
 const STOPPED: &str = "STOPPED";
+
+/// The qualifier of the version every execution here runs on: an invocation that names none
+/// runs the unpublished one.
+const VERSION_LATEST: &str = "$LATEST";
 
 /// The `DurableConfig$ExecutionTimeout` the function runs under, in seconds: far longer than
 /// any row takes, so nothing here times out. ("The maximum time (in seconds) that a durable
@@ -621,6 +625,15 @@ async fn prove_wiring(router: &MultiServiceRouter, name: &str, url: &str, arn: &
     );
 }
 
+/// The instant the ISO-8601 text `value` states, in epoch milliseconds, so two reports of
+/// one instant are compared as instants; `None` for anything that is not such text.
+fn instant_millis(value: &Value) -> Option<i64> {
+    let text = value.as_str()?;
+    ::aws_smithy_types::DateTime::from_str(text, ::aws_smithy_types::date_time::Format::DateTime)
+        .ok()
+        .map(|at| at.secs() * 1_000 + i64::from(at.subsec_nanos()) / 1_000_000)
+}
+
 /// Start one durable execution of `function` named `execution`, whose handler waits
 /// `wait_seconds`; answers the `DurableExecutionArn` the accepted invocation reported.
 async fn start_execution(
@@ -732,6 +745,10 @@ async fn drive() {
         Some(function_arn.as_str()),
         "setup: the ARN the stack published must be the one Lambda reports, got {configuration}"
     );
+    // The ARN of the VERSION every execution below runs on, which is how a durable execution's
+    // events name the function: the function ARN qualified by that version, `$LATEST`
+    // included — the form the execution's own ARN carries it in.
+    let unpublished_arn = format!("{function_arn}:{VERSION_LATEST}");
 
     // The function is made DURABLE, which is what makes an invocation of it start a durable
     // execution with an execution timeout of its own.
@@ -787,7 +804,7 @@ async fn drive() {
         &json!({
             "source": [EVENT_SOURCE],
             "detail-type": [DURABLE_EXECUTION_STATUS_CHANGE],
-            "detail": {"functionArn": [&function_arn]},
+            "detail": {"functionArn": [&unpublished_arn]},
         }),
         &function_queue_arn,
     )
@@ -902,21 +919,22 @@ async fn drive() {
             );
             assert_eq!(
                 detail["functionArn"].as_str(),
-                Some(function_arn.as_str()),
-                "case {:?}: expected the {status} detail to name the function by the ARN \
-                 Lambda reports for it, got {detail}",
+                Some(unpublished_arn.as_str()),
+                "case {:?}: expected the {status} detail to name the function by the ARN of the \
+                 version the execution runs on, got {detail}",
                 row.case
             );
-            let begun = detail["startTimestamp"].as_i64();
+            let begun = instant_millis(&detail["startTimestamp"]);
             assert!(
                 begun.is_some_and(|instant| instant > 0),
-                "case {:?}: expected a start instant in the {status} detail, got {detail}",
+                "case {:?}: expected a start instant in ISO-8601 in the {status} detail, got \
+                 {detail}",
                 row.case
             );
-            let ended = detail["endTimestamp"].as_i64();
+            let ended = instant_millis(&detail["endTimestamp"]);
             if status == RUNNING {
                 assert!(
-                    ended.is_none(),
+                    detail["endTimestamp"].is_null(),
                     "case {:?}: an execution that is still running ended at no instant, got \
                      {detail}",
                     row.case

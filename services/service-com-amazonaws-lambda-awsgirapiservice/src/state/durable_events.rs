@@ -25,8 +25,9 @@
 //! [`record_status_changes`] compares every stored execution against the status last
 //! published for it and queues one change per execution whose status differs — whichever
 //! call, run or clock tick materialised it, and without any transition site having to
-//! remember to announce itself. Nothing is invented: an execution's status, its instants and
-//! its error are read off the record a `GetDurableExecution` of the same instant reports.
+//! remember to announce itself. Nothing is invented: the identity, the status and the
+//! instants an event reports are read off the record a `GetDurableExecution` of the same
+//! instant reports.
 //!
 //! A queued change goes out with NO lock held and off the response path, on the one clock
 //! [`drive`] runs per store: an execution's terminal status falls due after the call that
@@ -59,7 +60,11 @@ use super::ComAmazonawsLambdaAwsgirapiserviceState;
 pub const EVENT_SOURCE: &str = "aws.lambda";
 
 /// The `detail-type` of the event published when a DURABLE EXECUTION changes status.
-pub const DURABLE_EXECUTION_STATUS_CHANGE: &str = "Lambda Durable Execution Status Change";
+///
+/// The service that publishes the event is already named by the event's `source`
+/// ([`EVENT_SOURCE`]), so the `detail-type` names the RESOURCE whose status moved and the
+/// move itself: a durable execution's status change.
+pub const DURABLE_EXECUTION_STATUS_CHANGE: &str = "Durable Execution Status Change";
 
 /// The event bus this service publishes onto.
 ///
@@ -126,7 +131,9 @@ pub struct StatusChange {
     pub durable_execution_arn: String,
     /// The execution's own name, as the call that started it named it.
     pub durable_execution_name: String,
-    /// The ARN of the function version the execution runs on.
+    /// The ARN of the function version the execution runs on, qualified by that version —
+    /// `$LATEST` included, the form the execution's own ARN carries its function in
+    /// ([`super::FunctionRecord::durable_execution_function_arn`]).
     pub function_arn: String,
     /// The name of the function the execution belongs to.
     pub function_name: String,
@@ -171,16 +178,32 @@ impl StatusChange {
         detail.insert("status".to_string(), Value::String(self.status.clone()));
         detail.insert(
             "startTimestamp".to_string(),
-            Value::from(epoch_millis(self.started)),
+            Value::String(instant_text(self.started)),
         );
         if let Some(ended) = self.ended {
             detail.insert(
                 "endTimestamp".to_string(),
-                Value::from(epoch_millis(ended)),
+                Value::String(instant_text(ended)),
             );
         }
         Value::Object(detail)
     }
+}
+
+/// The time-zone designator an event's instants are stated under: the one the envelope's own
+/// `time` carries, rather than the `+0000` a modelled member of this service reports
+/// ([`super::UTC_DESIGNATOR`]).
+const EVENT_UTC_DESIGNATOR: &str = "Z";
+
+/// An instant as a durable execution's status-change event states it: the date and time in
+/// ISO-8601, the form the model states an execution's own instants in (`ExecutionTimestamp`
+/// is "in ISO-8601 format (YYYY-MM-DDThh:mm:ss.sTZD)"), under [`EVENT_UTC_DESIGNATOR`].
+///
+/// The rendering is this service's ONE rendering of an instant
+/// ([`super::designated_iso8601`]), so the instant an event states and the instant a read of
+/// the same execution states cannot differ in anything but that designator.
+fn instant_text(instant: SystemTime) -> String {
+    super::designated_iso8601(instant, EVENT_UTC_DESIGNATOR)
 }
 
 /// Queue every status change this store has not published yet, and keep the clock that
@@ -271,7 +294,7 @@ fn record_status_changes(store: &mut ComAmazonawsLambdaAwsgirapiserviceState, no
                 region: function.region.clone(),
                 durable_execution_arn: arn,
                 durable_execution_name: execution.name.clone(),
-                function_arn: function.versioned_arn(&execution.version),
+                function_arn: function.durable_execution_function_arn(execution),
                 function_name: function.config.name.clone(),
                 status: execution.status.clone(),
                 started: execution.started,
@@ -519,7 +542,7 @@ fn in_flight_or_release(
     owed
 }
 
-/// `at` as the epoch milliseconds an event's `time` and a detail's instants carry.
+/// `at` as the epoch milliseconds an event's `time` carries.
 fn epoch_millis(at: SystemTime) -> i64 {
     i64::try_from(at.duration_since(UNIX_EPOCH).unwrap_or_default().as_millis())
         .unwrap_or_default()
@@ -626,15 +649,16 @@ mod tests {
         }
     }
 
-    /// RULE: the detail reports the execution's identity, its status and its instants, and
-    /// leaves out an instant the execution does not carry.
+    /// RULE: the detail reports the execution's identity, its status and its instants — each
+    /// instant in ISO-8601, the form the model states an execution's instants in — and leaves
+    /// out an instant the execution does not carry.
     #[test]
     fn the_detail_reports_what_the_execution_carries() {
         let started = UNIX_EPOCH + Duration::from_secs(1_800_000_000);
         let ended = UNIX_EPOCH + Duration::from_secs(1_800_000_030);
         // (case, the status the execution carries, the end instant it carries, what
         // endTimestamp must be)
-        let rows: [(&str, &str, Option<SystemTime>, Option<i64>); 2] = [
+        let rows: [(&str, &str, Option<SystemTime>, Option<&str>); 2] = [
             (
                 "an execution still running",
                 super::super::EXECUTION_STATUS_RUNNING,
@@ -645,7 +669,7 @@ mod tests {
                 "an execution that ended",
                 super::super::EXECUTION_STATUS_SUCCEEDED,
                 Some(ended),
-                Some(1_800_000_030_000),
+                Some("2027-01-15T08:00:30.000Z"),
             ),
         ];
         for (case, status, end, expected) in rows {
@@ -655,7 +679,8 @@ mod tests {
                                         $LATEST/durable-execution/one/abc"
                     .to_string(),
                 durable_execution_name: "one".to_string(),
-                function_arn: "arn:aws:lambda:us-east-1:000000000000:function:f".to_string(),
+                function_arn: "arn:aws:lambda:us-east-1:000000000000:function:f:$LATEST"
+                    .to_string(),
                 function_name: "f".to_string(),
                 status: status.to_string(),
                 started,
@@ -669,11 +694,11 @@ mod tests {
                 "case {case:?}: expected the status in the detail, got {detail}"
             );
             assert_eq!(
-                detail.get("startTimestamp").and_then(Value::as_i64),
-                Some(1_800_000_000_000),
-                "case {case:?}: expected the start instant in epoch milliseconds, got {detail}"
+                detail.get("startTimestamp").and_then(Value::as_str),
+                Some("2027-01-15T08:00:00.000Z"),
+                "case {case:?}: expected the start instant in ISO-8601, got {detail}"
             );
-            let reported = detail.get("endTimestamp").and_then(Value::as_i64);
+            let reported = detail.get("endTimestamp").and_then(Value::as_str);
             assert_eq!(
                 reported, expected,
                 "case {case:?}: expected endTimestamp {expected:?}, got {reported:?}"

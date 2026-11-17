@@ -21,6 +21,15 @@
 //! (`STOPPED`) — and each row asserts both the `RUNNING` event the start owes and the
 //! terminal one, each exactly once.
 //!
+//! The second rule pinned here is the ENVELOPE a consumer and its rule read
+//! ([`a_status_change_envelope_names_the_function_version_and_its_instants`]): the `detail`
+//! names the function by the ARN of the function VERSION the execution runs on — qualified by
+//! that version, `$LATEST` included, the form the execution's own ARN carries it in — and
+//! states each instant in ISO-8601, the form the model states an execution's own instants in
+//! (`ExecutionTimestamp` is "in ISO-8601 format (YYYY-MM-DDThh:mm:ss.sTZD)"), which is the
+//! same instant `GetDurableExecution` reports for the execution. Those rows differ along
+//! WHICH version the execution runs on and HOW it reaches its terminal status.
+//!
 //! The package writer is the one `synchronous_invoke_run.rs` publishes, so there is one
 //! writer of a deployment archive in this target.
 
@@ -41,13 +50,12 @@ use crate::synchronous_invoke_run::package;
 /// published value is checked against an expectation of its own.
 const EVENT_SOURCE: &str = "aws.lambda";
 
-/// The `detail-type` every event this suite reads must carry, in the form AWS names a
-/// resource's status change by — `<service> <resource> Status Change`, the shape this tree's
-/// other publishers carry (`Step Functions Execution Status Change`,
-/// `CloudFormation StackSet Status Change`). Written out here for the same reason as
-/// [`EVENT_SOURCE`]: a rule matches on this string, so the test states it rather than reading
-/// it back out of the code that publishes it.
-const DURABLE_EXECUTION_STATUS_CHANGE: &str = "Lambda Durable Execution Status Change";
+/// The `detail-type` every event this suite reads must carry. Written out here rather than
+/// taken from the implementation's own constant, for the same reason as [`EVENT_SOURCE`]: a
+/// rule matches on this string, so the test states it rather than reading it back out of the
+/// code that publishes it. The publishing service is already named by the event's `source`,
+/// so the `detail-type` names the resource whose status moved and the move itself.
+const DURABLE_EXECUTION_STATUS_CHANGE: &str = "Durable Execution Status Change";
 
 /// Where `Invoke` is bound.
 const INVOCATIONS_URI: &str = "/2015-03-31/functions";
@@ -334,17 +342,18 @@ async fn every_durable_execution_status_change_reaches_a_rule_on_the_default_bus
                     "case {case:?}: expected {member} in the {status} detail, got {event}"
                 );
             }
-            let started = detail["startTimestamp"].as_i64();
+            let started = instant_millis(&detail["startTimestamp"]);
             assert!(
                 started.is_some_and(|instant| instant > 0),
-                "case {case:?}: expected a start instant in the {status} detail, got {event}"
+                "case {case:?}: expected a start instant in ISO-8601 in the {status} detail, \
+                 got {event}"
             );
             // A terminal status reports WHEN the execution ended; one still running reports
             // no end instant at all, because nothing ended.
-            let ended = detail["endTimestamp"].as_i64();
+            let ended = instant_millis(&detail["endTimestamp"]);
             if status == "RUNNING" {
                 assert!(
-                    ended.is_none(),
+                    detail["endTimestamp"].is_null(),
                     "case {case:?}: expected no end instant on a RUNNING event, got {event}"
                 );
             } else {
@@ -366,8 +375,8 @@ async fn every_durable_execution_status_change_reaches_a_rule_on_the_default_bus
         .map(|(_, arn, terminal)| (arn.clone(), (*terminal).to_string()))
         .expect("the timed-out row is in the table");
     let event = &delivered[&timed_out][0];
-    let started = event["detail"]["startTimestamp"].as_i64().unwrap_or_default();
-    let ended = event["detail"]["endTimestamp"].as_i64().unwrap_or_default();
+    let started = instant_millis(&event["detail"]["startTimestamp"]).unwrap_or_default();
+    let ended = instant_millis(&event["detail"]["endTimestamp"]).unwrap_or_default();
     assert!(
         ended - started >= SHORT_EXECUTION_TIMEOUT * 1_000,
         "expected the timed-out execution to end at least {SHORT_EXECUTION_TIMEOUT}s after it \
@@ -400,6 +409,297 @@ async fn every_durable_execution_status_change_reaches_a_rule_on_the_default_bus
         vec!["SUCCEEDED".to_string()],
         "expected the SUCCEEDED-only rule to receive just that status, got {statuses:?}"
     );
+}
+
+/// One row of the ENVELOPE table: the version the execution runs on, and how it reaches its
+/// terminal status.
+struct Envelope {
+    /// What makes this row its own case, and names its function and execution.
+    case: &'static str,
+    /// The handler's body.
+    source: &'static str,
+    /// Whether the invocation runs a PUBLISHED version rather than the unpublished one,
+    /// which is the qualifier the event's function ARN must carry.
+    published: bool,
+    /// The `DurableConfig$ExecutionTimeout` the function runs under.
+    execution_timeout: i64,
+    /// The `ExecutionStatus` the execution must end in.
+    terminal: &'static str,
+}
+
+/// A handler that RETURNS at once.
+const RETURNS: &str = "def lambda_handler(event, context):\n    return {'done': True}\n";
+
+/// A handler that waits for the span its event names, which is what makes a row outlive its
+/// execution timeout.
+const WAITS: &str = "import time\n\n\ndef lambda_handler(event, context):\n    \
+                     time.sleep(event['wait_seconds'])\n    return {'done': True}\n";
+
+/// The qualifier of the version an invocation that names none runs.
+const VERSION_LATEST: &str = "$LATEST";
+
+/// RULE: a durable execution's status change reaches the SQS target of a rule keyed on the
+/// event's `source`, its `detail-type` and the qualified ARN of the function VERSION the
+/// execution runs on; and each instant the `detail` states is that instant in ISO-8601 — the
+/// same instant `GetDurableExecution` reports for the execution.
+#[tokio::test]
+async fn a_status_change_envelope_names_the_function_version_and_its_instants() {
+    let rows = [
+        Envelope {
+            case: "an execution of the unpublished version whose handler returned",
+            source: RETURNS,
+            published: false,
+            execution_timeout: LONG_EXECUTION_TIMEOUT,
+            terminal: "SUCCEEDED",
+        },
+        Envelope {
+            case: "an execution of a published version whose handler returned",
+            source: RETURNS,
+            published: true,
+            execution_timeout: LONG_EXECUTION_TIMEOUT,
+            terminal: "SUCCEEDED",
+        },
+        Envelope {
+            case: "an execution of the unpublished version that outlived its timeout",
+            source: WAITS,
+            published: false,
+            execution_timeout: SHORT_EXECUTION_TIMEOUT,
+            terminal: "TIMED_OUT",
+        },
+    ];
+
+    for (index, row) in rows.iter().enumerate() {
+        // One store per row, so each row reads its own queue from nothing.
+        let engine = Arc::new(engine::InMemoryEngine::new());
+        let router = emulator(&engine);
+        let function = format!("durable-envelope-{index}");
+        let created = create_function(
+            &router,
+            &json!({
+                "FunctionName": function,
+                "Role": ROLE,
+                "Runtime": "python3.12",
+                "Handler": "lambda_function.lambda_handler",
+                "Timeout": FUNCTION_TIMEOUT,
+                "DurableConfig": { "ExecutionTimeout": row.execution_timeout },
+                "Code": { "ZipFile": base64_of(&package(row.source)) },
+            }),
+        )
+        .await;
+        assert_eq!(
+            created.status,
+            201,
+            "case {:?}: expected 201 from CreateFunction, got {} {}",
+            row.case,
+            created.status,
+            String::from_utf8_lossy(&created.body)
+        );
+        let function_arn = created.string("FunctionArn").unwrap_or_else(|| {
+            panic!("case {:?}: CreateFunction must answer a FunctionArn", row.case)
+        });
+        tokio::time::sleep(ACTIVATION_DELAY + POLL_INTERVAL).await;
+
+        // The version the execution will run on, and the ARN of THAT version — which is what
+        // the event's `detail` must name the function by.
+        let (qualifier, version) = if row.published {
+            let published = json_call(
+                &router,
+                "POST",
+                &format!("/2015-03-31/functions/{function}/versions"),
+                &Value::Null,
+            )
+            .await;
+            assert_eq!(
+                published.status,
+                201,
+                "case {:?}: expected 201 from PublishVersion, got {} {}",
+                row.case,
+                published.status,
+                String::from_utf8_lossy(&published.body)
+            );
+            let version = published.string("Version").unwrap_or_else(|| {
+                panic!(
+                    "case {:?}: PublishVersion must answer the version it made",
+                    row.case
+                )
+            });
+            (format!("?Qualifier={version}"), version)
+        } else {
+            (String::new(), VERSION_LATEST.to_string())
+        };
+        let version_arn = format!("{function_arn}:{version}");
+
+        // No RETRY for a run that does not succeed, for the reason the table above gives.
+        let configured = json_call(
+            &router,
+            "PUT",
+            &format!("/2019-09-25/functions/{function}/event-invoke-config"),
+            &json!({ "MaximumRetryAttempts": 0 }),
+        )
+        .await;
+        assert_eq!(
+            configured.status,
+            200,
+            "case {:?}: expected 200 from PutFunctionEventInvokeConfig, got {} {}",
+            row.case,
+            configured.status,
+            String::from_utf8_lossy(&configured.body)
+        );
+
+        // The consumer: a queue behind a rule pinned on the event class AND on the qualified
+        // ARN of the version the execution runs on, so a delivery proves both keys match.
+        let queue = control_queue(
+            &router,
+            &format!("durable-envelope-{index}"),
+            &format!("durable-envelope-rule-{index}"),
+            &json!({
+                "source": [EVENT_SOURCE],
+                "detail-type": [DURABLE_EXECUTION_STATUS_CHANGE],
+                "detail": { "functionArn": [&version_arn] },
+            }),
+        )
+        .await;
+
+        let execution = format!("envelope-{index}");
+        let invoked = send(
+            &router,
+            "POST",
+            &format!("{INVOCATIONS_URI}/{function}/invocations{qualifier}"),
+            "application/json",
+            format!("{{\"wait_seconds\":{HANDLER_WAIT_SECONDS}}}").into_bytes(),
+            &[
+                ("x-amz-invocation-type", "Event".to_string()),
+                (DURABLE_EXECUTION_NAME_HEADER, execution.clone()),
+            ],
+        )
+        .await;
+        assert_eq!(
+            invoked.status,
+            202,
+            "case {:?}: expected 202 from an asynchronous Invoke, got {} {}",
+            row.case,
+            invoked.status,
+            String::from_utf8_lossy(&invoked.body)
+        );
+        let arn = invoked
+            .header(DURABLE_EXECUTION_ARN_HEADER)
+            .unwrap_or_else(|| {
+                panic!(
+                    "case {:?}: the accepted invocation must answer an execution ARN",
+                    row.case
+                )
+            });
+
+        // Both statuses the execution moves through reach the rule's queue: the one the start
+        // owes, and the terminal one the run or the clock produced.
+        let mut delivered: BTreeMap<(String, String), Vec<Value>> = BTreeMap::new();
+        for status in ["RUNNING", row.terminal] {
+            collect_until(&router, &queue, &mut delivered, row.case, &arn, status).await;
+        }
+
+        // The execution as a READ of it reports it, which is what the envelope's instants are
+        // held against: one instant has one value however it is reported.
+        let read = json_call(
+            &router,
+            "GET",
+            &format!("/2025-12-01/durable-executions/{}", arn.replace('/', "%2F")),
+            &Value::Null,
+        )
+        .await;
+        assert_eq!(
+            read.status,
+            200,
+            "case {:?}: expected 200 from GetDurableExecution, got {} {}",
+            row.case,
+            read.status,
+            String::from_utf8_lossy(&read.body)
+        );
+        let reported = read.json();
+        assert_eq!(
+            reported["Status"].as_str(),
+            Some(row.terminal),
+            "case {:?}: expected the execution to end {}, got {reported}",
+            row.case,
+            row.terminal
+        );
+
+        for status in ["RUNNING", row.terminal] {
+            let events = delivered
+                .get(&(arn.clone(), status.to_string()))
+                .cloned()
+                .unwrap_or_default();
+            assert_eq!(
+                events.len(),
+                1,
+                "case {:?}: expected exactly one {status} envelope for {arn}, got {} \
+                 ({events:?})",
+                row.case,
+                events.len()
+            );
+            let envelope = &events[0];
+            assert_eq!(
+                envelope["source"].as_str(),
+                Some(EVENT_SOURCE),
+                "case {:?}: expected the {status} envelope to come from {EVENT_SOURCE}, got \
+                 {envelope}",
+                row.case
+            );
+            assert_eq!(
+                envelope["detail-type"].as_str(),
+                Some(DURABLE_EXECUTION_STATUS_CHANGE),
+                "case {:?}: expected the {status} envelope's detail-type to be \
+                 {DURABLE_EXECUTION_STATUS_CHANGE}, got {envelope}",
+                row.case
+            );
+            let detail = &envelope["detail"];
+            assert_eq!(
+                detail["functionArn"].as_str(),
+                Some(version_arn.as_str()),
+                "case {:?}: expected the {status} detail to name the function by the ARN of the \
+                 version the execution runs on ({version_arn}), got {detail}",
+                row.case
+            );
+            assert_eq!(
+                instant_millis(&detail["startTimestamp"]),
+                timestamp_millis(&reported["StartTimestamp"]),
+                "case {:?}: expected the {status} detail's startTimestamp to be the instant \
+                 GetDurableExecution reports ({}) in ISO-8601, got {detail}",
+                row.case,
+                reported["StartTimestamp"]
+            );
+            // Both sides are an INSTANT rather than nothing: two absent members would
+            // satisfy the comparison above without either reporting one.
+            assert!(
+                instant_millis(&detail["startTimestamp"]).is_some(),
+                "case {:?}: expected an instant in ISO-8601 as the {status} detail's \
+                 startTimestamp, got {detail}",
+                row.case
+            );
+            if status == "RUNNING" {
+                assert!(
+                    detail["endTimestamp"].is_null(),
+                    "case {:?}: an execution that is still running ended at no instant, got \
+                     {detail}",
+                    row.case
+                );
+            } else {
+                assert_eq!(
+                    instant_millis(&detail["endTimestamp"]),
+                    timestamp_millis(&reported["EndTimestamp"]),
+                    "case {:?}: expected the {status} detail's endTimestamp to be the instant \
+                     GetDurableExecution reports ({}) in ISO-8601, got {detail}",
+                    row.case,
+                    reported["EndTimestamp"]
+                );
+                assert!(
+                    instant_millis(&detail["endTimestamp"]).is_some(),
+                    "case {:?}: expected an instant in ISO-8601 as the {status} detail's \
+                     endTimestamp, got {detail}",
+                    row.case
+                );
+            }
+        }
+    }
 }
 
 /// Lambda, Amazon EventBridge and Amazon SQS over ONE shared engine, as
@@ -607,6 +907,22 @@ async fn collect_until(
          {DELIVERY_CEILING:?}; the queue held {:?}",
         into.keys().collect::<Vec<_>>()
     );
+}
+
+/// The instant the ISO-8601 text `value` states, in epoch milliseconds, so the instants two
+/// reports of one instant carry are compared as instants; `None` for anything that is not
+/// such text, which is what an instant stated in any other form answers.
+fn instant_millis(value: &Value) -> Option<i64> {
+    let text = value.as_str()?;
+    ::aws_smithy_types::DateTime::from_str(text, ::aws_smithy_types::date_time::Format::DateTime)
+        .ok()
+        .map(|at| at.secs() * 1_000 + i64::from(at.subsec_nanos()) / 1_000_000)
+}
+
+/// The instant a modelled `restJson1` timestamp member carries, in epoch milliseconds: such a
+/// member is epoch seconds with a fraction.
+fn timestamp_millis(value: &Value) -> Option<i64> {
+    value.as_f64().map(|seconds| (seconds * 1_000.0).round() as i64)
 }
 
 /// A blob member: restJson1 carries one base64-encoded in a JSON body.
