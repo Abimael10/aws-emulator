@@ -37,7 +37,7 @@ const ACCOUNT: &str = "000000000000";
 
 /// Comfortably longer than [`state::TRANSITION_SPAN`], so a transition the clock owes has
 /// certainly come due and the environment accepts an update.
-const PAST_TRANSITION: Duration = Duration::from_millis(900);
+const PAST_TRANSITION: Duration = Duration::from_millis(6_500);
 
 /// Every `AirflowVersion` the member's own doc lists as valid ("Valid values: 2.7.2, 2.8.1,
 /// 2.9.2, 2.10.1, 2.10.3, 2.11.0, and 3.0.6"), from

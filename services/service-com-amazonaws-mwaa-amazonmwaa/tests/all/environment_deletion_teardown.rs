@@ -46,6 +46,29 @@ const MARGIN: Duration = Duration::from_millis(400);
 /// [`state::TRANSITION_SPAN`], so no phase of a lifecycle slips between two reads.
 const POLL_INTERVAL: Duration = Duration::from_millis(25);
 
+/// The sentence Amazon MWAA refuses a delete of an environment it has already torn down
+/// with: entirely fixed text, with no value from the request or the state in it.
+///
+/// Written out here rather than read back from the service, so a change to the wording this
+/// suite asserts fails this suite.
+const TORN_DOWN_SENTENCE: &str = "Environments with DELETED status cannot be deleted.";
+
+/// The sentence it refuses an operation on an environment that has one in flight with: fixed
+/// text whose only variable part is the status that environment is in. Written out here for
+/// the same reason.
+fn operation_in_flight_sentence(status: &str) -> String {
+    format!(
+        "Environments with {status} status must complete previous operation before \
+         initiating a new operation."
+    )
+}
+
+/// The sentence it refuses a create of a name it already holds with: fixed text, with the
+/// `Name` the REQUEST asked for in it. Written out here for the same reason.
+fn name_taken_sentence(name: &str) -> String {
+    format!("An environment with name {name} already exists. Please use other name.")
+}
+
 /// One HTTP answer, reduced to what these tests assert on.
 struct Answer {
     status: u16,
@@ -211,6 +234,25 @@ impl Harness {
                 Instant::now() < deadline,
                 "case {case}: the create never settled into {}, last saw {status}",
                 state::STATUS_AVAILABLE
+            );
+            tokio::time::sleep(POLL_INTERVAL).await;
+        }
+    }
+
+    /// Wait for the CONDITION a finished teardown leaves, not for a span: poll until
+    /// `GetEnvironment` reports the environment gone.
+    async fn wait_until_gone(&self, case: &str, name: &str) {
+        let deadline = Instant::now() + state::TRANSITION_SPAN * 20;
+        loop {
+            let answer = self.get(name).await;
+            if answer.status == 404 {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "case {case}: the teardown never finished, last answer {} {}",
+                answer.status,
+                answer.body
             );
             tokio::time::sleep(POLL_INTERVAL).await;
         }
@@ -428,7 +470,7 @@ async fn an_environment_being_torn_down_accepts_no_change_and_keeps_its_name() {
         );
         assert_eq!(
             refused.message(),
-            state::update_not_allowed_message(row.name, state::STATUS_DELETING),
+            operation_in_flight_sentence(state::STATUS_DELETING),
             "case {}: the refusal's message, got {}",
             row.name,
             refused.message()
@@ -444,7 +486,7 @@ async fn an_environment_being_torn_down_accepts_no_change_and_keeps_its_name() {
         );
         assert_eq!(
             taken.message(),
-            format!("An environment named {} already exists", row.name),
+            name_taken_sentence(row.name),
             "case {}: the refusal's message, got {}",
             row.name,
             taken.message()
@@ -463,7 +505,7 @@ async fn every_reader_loses_the_environment_once_its_teardown_comes_due() {
             "case {}: delete",
             row.name
         );
-        tokio::time::sleep(state::TRANSITION_SPAN + MARGIN).await;
+        harness.wait_until_gone(row.name, row.name).await;
 
         let gone = harness.get(row.name).await;
         assert_eq!(
@@ -490,11 +532,42 @@ async fn every_reader_loses_the_environment_once_its_teardown_comes_due() {
             "case {}: the ARN of a removed environment must resolve to nothing, got {} {}",
             row.name, tags.status, tags.body
         );
+        // A delete reaches the record the finished teardown left behind the not-found read,
+        // and is refused by its DELETED status: that is what tells a retrying deleter
+        // "already torn down" from a name that never existed.
         let again = harness.delete(row.name).await;
         assert_eq!(
-            again.status, 404,
-            "case {}: DeleteEnvironment of a removed environment, got {} {}",
+            again.status, 400,
+            "case {}: DeleteEnvironment of a torn-down environment, got {} {}",
             row.name, again.status, again.body
+        );
+        assert_eq!(
+            again.error_code(),
+            "ValidationException",
+            "case {}: the error code of a delete of a torn-down environment, got {}",
+            row.name,
+            again.body
+        );
+        assert_eq!(
+            again.message(),
+            TORN_DOWN_SENTENCE,
+            "case {}: the refusal's message, got {}",
+            row.name,
+            again.message()
+        );
+        // A name nothing was ever created under is the other answer: a lookup miss.
+        let never = harness.delete("NeverCreatedEnv").await;
+        assert_eq!(
+            never.status, 404,
+            "case {}: DeleteEnvironment of a name that never existed, got {} {}",
+            row.name, never.status, never.body
+        );
+        assert_eq!(
+            never.error_code(),
+            "ResourceNotFoundException",
+            "case {}: the error code of a delete of a name that never existed, got {}",
+            row.name,
+            never.body
         );
 
         // The name the teardown held is free again, and the environment created under it
@@ -511,6 +584,14 @@ async fn every_reader_loses_the_environment_once_its_teardown_comes_due() {
             state::STATUS_DELETING,
             "case {}: a re-created environment must not report the old teardown, got {status}",
             row.name
+        );
+        // And the name holds an environment again, so a delete of it starts that
+        // environment's own teardown rather than being refused by the old one's record.
+        let deleted_again = harness.delete(row.name).await;
+        assert_eq!(
+            deleted_again.status, 200,
+            "case {}: a delete of the re-created environment, got {} {}",
+            row.name, deleted_again.status, deleted_again.body
         );
     }
 }

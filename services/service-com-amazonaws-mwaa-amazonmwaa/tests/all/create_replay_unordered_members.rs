@@ -1,25 +1,26 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! `CreateEnvironment`'s `@idempotent` replay check, judged on members whose value is an
-//! unordered COLLECTION, end to end over HTTP through the router this service mounts in
-//! production.
+//! A second `CreateEnvironment` for a name that is already stored, judged on members whose
+//! value is an unordered COLLECTION, end to end over HTTP through the router this service
+//! mounts in production.
 //!
-//! The rule every case here asserts: whether a second `CreateEnvironment` for a stored
-//! name is a replay (the stored ARN, writing nothing) or a different create of a taken
-//! name (HTTP 400 `ValidationException`) is decided by what each member MEANS, so for a
-//! member the model gives no order — `NetworkConfiguration.SubnetIds` and
-//! `.SecurityGroupIds`, which name sets of ids, and the key/value members
-//! `AirflowConfigurationOptions` / `Tags` — only the entries decide, never the order the
-//! request listed them in. Two creates naming the same entries in different orders are one
-//! create; a create whose entries actually differ is still refused.
+//! The rule every case here asserts: an environment NAME is unique per account per Region,
+//! so a second `CreateEnvironment` for a name this Region already holds is refused with HTTP
+//! 400 `ValidationException` and the sentence Amazon MWAA words a taken name with
+//! ([`name_taken_sentence`]) — whatever members the second
+//! request carries and however it spells them. The name is the environment's identity, so
+//! nothing in the rest of the request can make a second create of it a success: not naming
+//! the same entries of an unordered member, not naming them in another order, and not
+//! naming different ones. Every row reads the stored environment back on both sides of the
+//! refusal, so the refused create is shown to change nothing.
 //!
 //! Each table row varies what the rule generalises over: WHICH unordered member is
 //! re-ordered (the subnets, the security groups, the configuration options, several at
 //! once), HOW MANY entries it carries (the published bounds of each list: 2 subnets, 1 to 5
-//! security groups) and HOW the second create differs when it does differ (an entry
-//! replaced, dropped, added, duplicated, or an ordered member moved beside a re-ordered
-//! one). The second test sweeps EVERY permutation of a stored list rather than one
-//! re-ordering, since order-insensitivity is an invariant over permutations.
+//! security groups) and HOW else the second create differs (an entry replaced, dropped,
+//! added, duplicated, or an ordered member moved beside a re-ordered one). The second test
+//! sweeps EVERY permutation of a stored list rather than one re-ordering, since the rule is
+//! an invariant over permutations.
 
 use std::sync::Arc;
 
@@ -33,12 +34,17 @@ const AUTHORIZATION: &str = "AWS4-HMAC-SHA256 \
      Credential=AKIDTEST/20260101/us-east-1/airflow/aws4_request, \
      SignedHeaders=host, Signature=0000";
 
-/// The region the `AUTHORIZATION` scope above signs for; every ARN this service mints for
-/// these requests carries it.
-const REGION: &str = "us-east-1";
-
 /// The canonical emulator account id every emulated ARN carries.
 const ACCOUNT: &str = "000000000000";
+
+/// The sentence Amazon MWAA refuses a create of a name it already holds with: its fixed
+/// text, with the `Name` the REQUEST asked for in it.
+///
+/// Written out here rather than read back from the service, so a change to the wording this
+/// suite is about fails this suite.
+fn name_taken_sentence(name: &str) -> String {
+    format!("An environment with name {name} already exists. Please use other name.")
+}
 
 /// One HTTP answer, reduced to what these tests assert on.
 struct Answer {
@@ -82,10 +88,6 @@ impl Answer {
 
     fn text(&self) -> String {
         String::from_utf8_lossy(&self.body).to_string()
-    }
-
-    fn arn(&self) -> Value {
-        self.json().get("Arn").cloned().unwrap_or(Value::Null)
     }
 }
 
@@ -191,8 +193,8 @@ fn create_body(
     body
 }
 
-/// How a second create of an already stored name is spelled, and therefore whether it is a
-/// replay of the create that stored the environment.
+/// How a second create of an already stored name is spelled. Every one of them is refused:
+/// what the rows vary is the spelling, not the outcome.
 struct Case {
     /// Names the case in every assertion.
     label: &'static str,
@@ -205,8 +207,6 @@ struct Case {
     /// `DagS3Path` for the second create: an ORDERED member, so a row that moves it asks
     /// for a different environment however its unordered members are spelled.
     second_dag_s3_path: &'static str,
-    /// Whether the second create asks for exactly the stored environment.
-    replay: bool,
 }
 
 /// The `DagS3Path` every row's first create carries.
@@ -252,9 +252,10 @@ const OPTIONS_REVERSED: &[(&str, &str)] = &[
     ("core.default_task_retries", "3"),
 ];
 
-/// The table. The replay rows are what the comparison must ACCEPT (a re-ordering of each
-/// unordered member, at each published list size); the refusal rows are entry sets that
-/// really differ, so the fix cannot be "accept any second create naming the same count".
+/// The table. The first rows spell the SAME environment the first create stored (byte for
+/// byte, and with each unordered member re-ordered, at each published list size); the rest
+/// spell entry sets that really differ. Every one of them is a create of a name that is
+/// taken.
 fn cases() -> Vec<Case> {
     vec![
         Case {
@@ -266,7 +267,6 @@ fn cases() -> Vec<Case> {
             second_groups: ONE_GROUP,
             second_options: &[],
             second_dag_s3_path: STORED_DAG_PATH,
-            replay: true,
         },
         Case {
             label: "the two subnets listed the other way round",
@@ -277,7 +277,6 @@ fn cases() -> Vec<Case> {
             second_groups: ONE_GROUP,
             second_options: &[],
             second_dag_s3_path: STORED_DAG_PATH,
-            replay: true,
         },
         Case {
             label: "three security groups rotated",
@@ -288,7 +287,6 @@ fn cases() -> Vec<Case> {
             second_groups: THREE_GROUPS_ROTATED,
             second_options: &[],
             second_dag_s3_path: STORED_DAG_PATH,
-            replay: true,
         },
         Case {
             label: "the full five security groups reversed",
@@ -299,7 +297,6 @@ fn cases() -> Vec<Case> {
             second_groups: FIVE_GROUPS_REVERSED,
             second_options: &[],
             second_dag_s3_path: STORED_DAG_PATH,
-            replay: true,
         },
         Case {
             label: "every unordered member re-ordered at once",
@@ -310,7 +307,6 @@ fn cases() -> Vec<Case> {
             second_groups: FIVE_GROUPS_REVERSED,
             second_options: OPTIONS_REVERSED,
             second_dag_s3_path: STORED_DAG_PATH,
-            replay: true,
         },
         Case {
             label: "the configuration options listed the other way round",
@@ -321,7 +317,6 @@ fn cases() -> Vec<Case> {
             second_groups: THREE_GROUPS,
             second_options: OPTIONS_REVERSED,
             second_dag_s3_path: STORED_DAG_PATH,
-            replay: true,
         },
         Case {
             label: "one subnet replaced by another, the count kept",
@@ -332,7 +327,6 @@ fn cases() -> Vec<Case> {
             second_groups: ONE_GROUP,
             second_options: &[],
             second_dag_s3_path: STORED_DAG_PATH,
-            replay: false,
         },
         Case {
             label: "one security group replaced by another, the count kept",
@@ -347,7 +341,6 @@ fn cases() -> Vec<Case> {
             ],
             second_options: &[],
             second_dag_s3_path: STORED_DAG_PATH,
-            replay: false,
         },
         Case {
             label: "a security group dropped, the rest re-ordered",
@@ -358,7 +351,6 @@ fn cases() -> Vec<Case> {
             second_groups: &["sg-0a1b2c3d4e5f60002", "sg-0a1b2c3d4e5f60001"],
             second_options: &[],
             second_dag_s3_path: STORED_DAG_PATH,
-            replay: false,
         },
         Case {
             label: "a security group added before the stored one",
@@ -369,7 +361,6 @@ fn cases() -> Vec<Case> {
             second_groups: &["sg-0a1b2c3d4e5f60002", "sg-0a1b2c3d4e5f60001"],
             second_options: &[],
             second_dag_s3_path: STORED_DAG_PATH,
-            replay: false,
         },
         Case {
             label: "a stored group repeated in place of another",
@@ -380,7 +371,6 @@ fn cases() -> Vec<Case> {
             second_groups: &["sg-0a1b2c3d4e5f60001", "sg-0a1b2c3d4e5f60001"],
             second_options: &[],
             second_dag_s3_path: STORED_DAG_PATH,
-            replay: false,
         },
         Case {
             label: "one configuration option's value changed, the pairs re-ordered",
@@ -394,7 +384,6 @@ fn cases() -> Vec<Case> {
                 ("core.default_task_retries", "3"),
             ],
             second_dag_s3_path: STORED_DAG_PATH,
-            replay: false,
         },
         Case {
             label: "an ordered member moved beside re-ordered unordered ones",
@@ -405,7 +394,6 @@ fn cases() -> Vec<Case> {
             second_groups: THREE_GROUPS_ROTATED,
             second_options: OPTIONS_REVERSED,
             second_dag_s3_path: "somewhere/else",
-            replay: false,
         },
     ]
 }
@@ -431,12 +419,11 @@ impl Case {
 }
 
 #[tokio::test]
-async fn a_second_create_replays_when_only_the_order_of_an_unordered_member_differs() {
+async fn a_second_create_of_a_stored_name_is_refused_however_its_members_are_spelled() {
     let harness = Harness::new();
 
     for (index, case) in cases().into_iter().enumerate() {
         let name = format!("OrderCase{index:02}");
-        let arn = format!("arn:aws:airflow:{REGION}:{ACCOUNT}:environment/{name}");
 
         let first = harness.create(&name, case.first_body()).await;
         assert_eq!(
@@ -448,7 +435,7 @@ async fn a_second_create_replays_when_only_the_order_of_an_unordered_member_diff
             first.text()
         );
 
-        // The stored placement, as the create that stored it wrote it: the comparison below
+        // The stored placement, as the create that stored it wrote it: the refusal below
         // must not change what a reader reports.
         let stored_network = json!({
             "SubnetIds": case.stored_subnets,
@@ -462,51 +449,31 @@ async fn a_second_create_replays_when_only_the_order_of_an_unordered_member_diff
         );
 
         let second = harness.create(&name, case.second_body()).await;
-        if case.replay {
-            assert_eq!(
-                second.status,
-                200,
-                "case {:?}: a create naming the same entries of every unordered member is a \
-                 replay and must succeed, got {} {}",
-                case.label,
-                second.status,
-                second.text()
-            );
-            assert_eq!(
-                second.arn(),
-                json!(arn),
-                "case {:?}: a replay must answer the stored ARN, got {:?}",
-                case.label,
-                second.arn()
-            );
-        } else {
-            assert_eq!(
-                second.status,
-                400,
-                "case {:?}: a create of a taken name whose entries differ must be refused, \
-                 got {} {}",
-                case.label,
-                second.status,
-                second.text()
-            );
-            assert_eq!(
-                second.error_code(),
-                "ValidationException",
-                "case {:?}: a name clash is a ValidationException, got {:?}",
-                case.label,
-                second.error_code()
-            );
-            let message = second.message();
-            assert!(
-                message.contains(&name) && message.contains("already exists"),
-                "case {:?}: the refusal must name the environment whose name is taken, got \
-                 {message:?}",
-                case.label
-            );
-        }
+        assert_eq!(
+            second.status,
+            400,
+            "case {:?}: a create of a taken name must be refused, got {} {}",
+            case.label,
+            second.status,
+            second.text()
+        );
+        assert_eq!(
+            second.error_code(),
+            "ValidationException",
+            "case {:?}: a name clash is a ValidationException, got {:?}",
+            case.label,
+            second.error_code()
+        );
+        assert_eq!(
+            second.message(),
+            name_taken_sentence(&name),
+            "case {:?}: the refusal's message, got {:?}",
+            case.label,
+            second.message()
+        );
 
-        // Either way the environment is the one the FIRST create stored, in the order it
-        // listed: a replay writes nothing, and a refused create writes nothing.
+        // The environment is the one the FIRST create stored, in the order it listed: a
+        // refused create writes nothing.
         let after = harness.network_configuration(&name).await;
         assert_eq!(
             after, stored_network,
@@ -537,10 +504,9 @@ fn permutations(items: &[&str]) -> Vec<Vec<String>> {
 }
 
 #[tokio::test]
-async fn every_permutation_of_the_stored_placement_replays() {
+async fn every_permutation_of_the_stored_placement_is_refused() {
     let harness = Harness::new();
     let name = "OrderSweep";
-    let arn = format!("arn:aws:airflow:{REGION}:{ACCOUNT}:environment/{name}");
     // Four security groups (inside `SecurityGroupList`'s published 1..5) times the two
     // orderings of the two subnets: 48 spellings of ONE placement.
     let groups: &[&str] = &[
@@ -574,32 +540,32 @@ async fn every_permutation_of_the_stored_placement_replays() {
             let case = (subnets.clone(), ordering.clone());
             let subnet_refs: Vec<&str> = subnets.iter().map(String::as_str).collect();
             let group_refs: Vec<&str> = ordering.iter().map(String::as_str).collect();
-            let replay = harness
+            let refused = harness
                 .create(
                     name,
                     create_body(&subnet_refs, &group_refs, OPTIONS, STORED_DAG_PATH),
                 )
                 .await;
             assert_eq!(
-                replay.status,
-                200,
-                "case {case:?}: the same placement spelled in another order is the same \
-                 create and must replay, got {} {}",
-                replay.status,
-                replay.text()
+                refused.status,
+                400,
+                "case {case:?}: the name is taken, so a second create is refused however it \
+                 orders its members, got {} {}",
+                refused.status,
+                refused.text()
             );
             assert_eq!(
-                replay.arn(),
-                json!(arn),
-                "case {case:?}: a replay must answer the stored ARN, got {:?}",
-                replay.arn()
+                refused.message(),
+                name_taken_sentence(name),
+                "case {case:?}: the refusal's message, got {:?}",
+                refused.message()
             );
             let after = harness.network_configuration(name).await;
             assert_eq!(
                 after, stored_network,
-                "case {case:?}: a replay must leave the stored placement as the create wrote \
-                 it, got {after:?}",
-                );
+                "case {case:?}: a refused create must leave the stored placement as the \
+                 create wrote it, got {after:?}",
+            );
         }
     }
 }

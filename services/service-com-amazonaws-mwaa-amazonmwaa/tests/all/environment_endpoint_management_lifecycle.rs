@@ -38,7 +38,7 @@ const ENDPOINT_MANAGEMENT_MODES: [&str; 2] = ["CUSTOMER", "SERVICE"];
 
 /// Comfortably longer than [`state::TRANSITION_SPAN`], so a status change the clock owes
 /// has certainly come due.
-const PAST_TRANSITION: Duration = Duration::from_millis(900);
+const PAST_TRANSITION: Duration = Duration::from_millis(6_500);
 
 /// The emulator, assembled as the router assembles it: one shared engine, one service.
 struct Harness {

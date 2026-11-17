@@ -26,8 +26,15 @@ tracing = { workspace = true }
 # name, so both are stable across reads and differ between environments.
 sha2 = { workspace = true }
 # Opaque pagination cursors: hex-encode the internal list cursor so `NextToken` is a
-# single-token string a client only ever echoes back.
+# single-token string a client only ever echoes back. Also the hex of the CLI token digests
+# an environment remembers (`state::airflow_cli`).
 hex = { workspace = true }
+# The Apache Airflow CLI endpoint reports a command's `stdout` and `stderr` base64-encoded,
+# which is the encoding that document carries output of any encoding in unchanged.
+base64 = "0.22"
+# The command line a client posts to that endpoint is split the way a shell splits one, so a
+# quoted argument travels as one argument rather than as its words.
+shlex = "2"
 # `arn` (the tree's one ARN parse, which reads the NAME out of the calling identity's ARN)
 # and `request_access_key_id` (the key id a request presents, wherever SigV4 put it).
 service-common = { path = "../common" }
@@ -56,6 +63,9 @@ aws-sdk-ec2 = { version = "1", default-features = false }
 emulator-core-build-support = { workspace = true }
 
 [dev-dependencies]
+# One integration-test target rooted at `tests/all/main.rs`: `automod` declares one module
+# per `tests/all/<name>.rs`, so a new suite needs no declaration of its own.
+automod = { workspace = true }
 # The identity suite makes the callers it signs as through IAM's and STS's OWN operations
 # (a user and its access key, a role and a session of it), so the identities asserted on
 # are the ones those services minted.

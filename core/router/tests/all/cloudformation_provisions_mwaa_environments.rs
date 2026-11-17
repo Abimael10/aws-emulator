@@ -45,11 +45,14 @@ use super::query_wire::{elements, form_encode, opt_element, outputs_of};
 /// The region every request here is signed for, and so the region the stacks belong to.
 const REGION: &str = "us-east-1";
 
-/// How long one poll of a stack's status waits before asking again, and how many times: the
-/// stack's own clock-owed span and Amazon MWAA's are each half a second, so a create settles
-/// well inside this budget and nothing is waited out past the first observation.
+/// How long one poll of a stack's status waits before asking again, and how many times. The
+/// budget is generous on purpose: it bounds a condition that has to HOLD — the stack
+/// reporting the status its operation ends in — and never how fast the host runs. A stack
+/// here waits on Amazon MWAA's own clock-owed phases (one transition span for a create or a
+/// teardown, two for an accepted update) and then on its own, and nothing is waited out past
+/// the first observation, since each wait returns as soon as the status it wants is reported.
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
-const POLLS: usize = 60;
+const POLLS: usize = 600;
 
 /// The fixed text CloudFormation refuses a template declaring a type it does NOT know with,
 /// which is what the defect this suite pins answered for a type AWS publishes.

@@ -33,7 +33,7 @@ const ACCOUNT: &str = "000000000000";
 /// Comfortably longer than `state::TRANSITION_SPAN`, so a transition the clock owes has
 /// certainly come due: a create has settled into `AVAILABLE` and an accepted update has
 /// reached the phase that applies it.
-const PAST_TRANSITION: Duration = Duration::from_millis(900);
+const PAST_TRANSITION: Duration = Duration::from_millis(6_500);
 
 /// The three pairs, as `(path member, version member)`. From the members of
 /// `smithy_query(query="operation", operation="UpdateEnvironment")`: `PluginsS3Path` /

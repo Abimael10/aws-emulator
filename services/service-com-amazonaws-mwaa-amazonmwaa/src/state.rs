@@ -36,6 +36,10 @@ pub mod webserver_address;
 /// own them before a create or an update stores that configuration.
 pub mod configuration_dependencies;
 
+/// The Apache Airflow CLI of an environment: the tokens `CreateCliToken` mints for it, and
+/// what a command run through the web server's `aws_mwaa/cli` endpoint answers.
+pub mod airflow_cli;
+
 pub use webserver_address::{published_webserver_url, webserver_hostname, webserver_url};
 
 /// STS's own state accessors, which answer who a request's credential speaks for. The
@@ -57,22 +61,27 @@ pub const DEFAULT_REGION: &str = "us-east-1";
 ///
 /// `CREATING`, `CREATING_SNAPSHOT`, `UPDATING` and `DELETING` are non-terminal
 /// `EnvironmentStatus` values, so the move out of each of them is a transition the clock
-/// owes. The span is the
-/// emulator's own choice (no AWS-documented duration applies to MWAA provisioning) and is
-/// deliberately non-zero, so a caller reading straight after the call still observes the
-/// transient status as it does against the real service. The instant it comes due is
-/// stored on the record ([`PendingTransition::due_at`]) and materialised by
+/// owes. The span is the emulator's own choice (no AWS-documented duration applies to MWAA
+/// provisioning), and what it has to be long enough for is OBSERVATION: a client finds out
+/// that a call was accepted, and that the work it started is still running, by POLLING the
+/// resource at an interval of seconds, so a transient status that lasts less than such an
+/// interval is reported by the API and yet visible to nobody. Several seconds is therefore
+/// the floor rather than a preference. The instant it comes due is stored on the record
+/// ([`PendingTransition::due_at`]) and materialised by
 /// [`ComAmazonawsMwaaAmazonmwaaState::settle`]; nothing sleeps.
-pub const TRANSITION_SPAN: Duration = Duration::from_millis(500);
+pub const TRANSITION_SPAN: Duration = Duration::from_secs(3);
 
-/// How long each PHASE of an accepted update lasts.
+/// How long each PHASE of an accepted update lasts: one whole [`TRANSITION_SPAN`], the
+/// same span every other non-terminal status of this service lasts.
 ///
 /// An accepted update walks two non-terminal statuses before it settles —
-/// [`STATUS_CREATING_SNAPSHOT`] and then [`STATUS_UPDATING`] — so each phase takes half of
-/// [`TRANSITION_SPAN`]: every phase is non-zero, so a caller polling straight after the
-/// call still observes the snapshot phase, and the whole update still settles one
-/// [`TRANSITION_SPAN`] after the call that started it, exactly like a create.
-pub const UPDATE_PHASE_SPAN: Duration = Duration::from_millis(250);
+/// [`STATUS_CREATING_SNAPSHOT`] and then [`STATUS_UPDATING`] — and each of them is a status
+/// the API reports, so each of them has to be observable to a client polling at a normal
+/// interval. A phase given a FRACTION of the span is not: a lifecycle of several phases
+/// would hide every phase but the last behind one poll interval. So a lifecycle takes one
+/// span per non-terminal status it walks, and an accepted update settles two spans after
+/// the call that started it.
+pub const UPDATE_PHASE_SPAN: Duration = TRANSITION_SPAN;
 
 /// `MaxResults` upper bound on `ListEnvironments`, from its `@range(1, 25)`. Also the
 /// page size used when a caller names none, so one unparameterised request cannot
@@ -87,6 +96,16 @@ pub const MAX_RESULTS_LIMIT: i32 = 25;
 /// caller looping on create — in one Region or in many — cannot grow this process's
 /// memory without bound.
 pub const MAX_ENVIRONMENTS: usize = 1_000;
+
+/// How many finished teardowns this emulator remembers, across every Region together.
+///
+/// A teardown leaves a record behind the not-found read ([`TornDownEnvironment`]), and a
+/// caller that creates and deletes environments in a loop would otherwise accumulate one
+/// per delete: this is the emulator's own ceiling on that ledger, set to the store's own
+/// environment ceiling so a deployment that filled the store once can still tell every one
+/// of those names from a name that never existed. It is NOT a fidelity claim about how long
+/// Amazon MWAA keeps a `DELETED` environment.
+pub const MAX_TORN_DOWN_ENVIRONMENTS: usize = MAX_ENVIRONMENTS;
 
 /// How many tags one environment can carry, from `TagMap`'s own `@length(1, 50)`.
 pub const MAX_TAGS: usize = 50;
@@ -666,8 +685,7 @@ impl LoggingConfigurationRecord {
 /// The VPC networking components an environment was placed in.
 ///
 /// Each list is kept in the order its caller wrote, because that is the order every reader
-/// reports it in; neither order MEANS anything, so a comparison of two configurations
-/// disregards it ([`EnvironmentSpec::describes_same`]).
+/// reports it in; neither order MEANS anything to the environment's placement.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct NetworkConfigurationRecord {
     pub subnet_ids: Vec<String>,
@@ -682,31 +700,13 @@ impl NetworkConfigurationRecord {
             security_group_ids: Some(self.security_group_ids.clone()),
         }
     }
-
-    /// Put each id list in a fixed order, so two records naming the same components
-    /// compare equal whatever order each was listed in.
-    ///
-    /// Both members are sets of ids: `SubnetList` and `SecurityGroupList` carry no ordering
-    /// trait, so WHICH position an id was listed at says nothing about where the
-    /// environment is placed.
-    ///
-    /// Only the comparable form of a configuration is put in this order (see
-    /// [`EnvironmentSpec::describes_same`]); the STORED record keeps the order its caller
-    /// wrote, which is the order every reader reports it back in.
-    fn canonicalise(&mut self) {
-        self.subnet_ids.sort();
-        self.security_group_ids.sort();
-    }
 }
 
 /// Everything about an environment that a caller chose: the create's members, as every
 /// later `UpdateEnvironment` merged into them.
 ///
 /// Kept apart from the values the SERVICE minted (ARN, URLs, queue, endpoint service
-/// names) so `CreateEnvironment` — which is `@idempotent` — can tell a replay of the same
-/// create from a different create of a name that is already taken. The create records one
-/// more member of its own beside this one, the tag pairs, so that comparison is
-/// [`EnvironmentRecord::matches_create`] rather than a bare spec equality.
+/// names), which no caller chooses and no update replaces.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct EnvironmentSpec {
     pub execution_role_arn: String,
@@ -775,35 +775,6 @@ impl EnvironmentSpec {
                 *version = None;
             }
         }
-    }
-
-    /// Whether `other` describes the SAME environment as this configuration does.
-    ///
-    /// Member by member, except that a member whose value is a COLLECTION the model gives
-    /// no order — a map of key/value pairs, a list of ids carrying no ordering trait — is
-    /// compared disregarding the order the request listed its entries in: the order says
-    /// nothing about the environment asked for, so two configurations describing one and
-    /// the same environment are the same configuration however each request happened to
-    /// order such a member. The key/value members get this from being stored in a
-    /// `BTreeMap`; the id lists keep the order their caller wrote (it is the order every
-    /// reader reports them in), so they are put in a fixed order HERE, for the comparison
-    /// alone.
-    ///
-    /// Asked (through [`EnvironmentRecord::matches_create`]) by `CreateEnvironment`, which
-    /// is `@idempotent`: whether a second create of a stored name is a replay of the create
-    /// that stored it cannot depend on how either request ordered a member whose value is a
-    /// set.
-    pub fn describes_same(&self, other: &Self) -> bool {
-        self.comparable() == other.comparable()
-    }
-
-    /// This configuration with every unordered collection in a fixed order — the form
-    /// [`Self::describes_same`] compares. Never stored: it exists only for the duration of
-    /// a comparison, so no response order changes.
-    fn comparable(&self) -> Self {
-        let mut comparable = self.clone();
-        comparable.network_configuration.canonicalise();
-        comparable
     }
 
     /// Every rule the RESOLVED environment configuration must satisfy that the Smithy
@@ -981,15 +952,40 @@ impl RequestedS3Objects<'_> {
 /// Why an environment in this status cannot be updated.
 ///
 /// An `UpdateEnvironment` reconfigures a RUNNING environment, so the environment has to
-/// have finished the transition it is in: a create that has not landed yet, or an update
-/// already in flight, is not something a second update can be applied on top of. The
-/// sentence is built from the request's own environment and the status it is actually in,
-/// and names the one status in which an update is accepted.
-pub fn update_not_allowed_message(name: &str, status: &str) -> String {
+/// have finished the operation it is in: a create that has not landed yet, an update
+/// already in flight, or a teardown that has started, is not something a second operation
+/// can be applied on top of. The sentence states the CONDITION — the status the environment
+/// is actually in, and that the operation it is in has to finish first — and names no
+/// environment: the caller addressed one environment, so there is nothing in its name to
+/// tell it.
+pub fn update_not_allowed_message(status: &str) -> String {
     format!(
-        "Environment {name} is in status {status}. An environment can only be updated \
-         while its status is {STATUS_AVAILABLE}."
+        "Environments with {status} status must complete previous operation before \
+         initiating a new operation."
     )
+}
+
+/// Why an environment in this status cannot be deleted: the sentence `DeleteEnvironment`
+/// refuses a name whose environment this service has already torn down with.
+///
+/// Built from the status the record it found is in, exactly like
+/// [`update_not_allowed_message`], and naming no environment for the same reason. The one
+/// status it is raised for today is [`STATUS_DELETED`]: a teardown that finished leaves a
+/// record behind the not-found read ([`TornDownEnvironment`]), so a repeat delete of that
+/// name is refused by that record's status rather than answered as a name that never
+/// existed.
+pub fn delete_not_allowed_message(status: &str) -> String {
+    format!("Environments with {status} status cannot be deleted.")
+}
+
+/// Why a create cannot take a name that is taken: the sentence `CreateEnvironment` refuses
+/// a name an environment of this account already holds in this Region with.
+///
+/// An environment name is unique per account per Region, so the name itself is the conflict
+/// and the sentence states it — with the name the REQUEST asked for, which is the one value
+/// in it a caller could not already know.
+pub fn environment_exists_message(name: &str) -> String {
+    format!("An environment with name {name} already exists. Please use other name.")
 }
 
 /// Why no change can be applied to an environment in this status.
@@ -1118,6 +1114,10 @@ pub struct EnvironmentRecord {
     /// Apache Airflow REST API (`InvokeRestApi`) reads and writes. Per environment,
     /// because two environments run two web servers over two databases.
     pub airflow: AirflowMetadata,
+    /// The DIGESTS of the Apache Airflow CLI tokens `CreateCliToken` minted for this
+    /// environment, oldest first: what makes a token presented to the web server's
+    /// `aws_mwaa/cli` endpoint resolve to this environment ([`airflow_cli`]).
+    pub cli_tokens: VecDeque<String>,
 }
 
 impl EnvironmentRecord {
@@ -1216,28 +1216,6 @@ impl EnvironmentRecord {
     /// cannot drift apart about what an environment's tags are.
     pub fn tags_member(&self) -> Option<HashMap<String, String>> {
         (!self.tags.is_empty()).then(|| map_of(&self.tags))
-    }
-
-    /// Whether a `CreateEnvironment` asking for `spec` with `tags` is a REPLAY of the
-    /// create this environment was stored by, rather than a different create of a name
-    /// that is already taken.
-    ///
-    /// The operation is `@idempotent`, so a create repeated byte for byte has to answer
-    /// with the stored environment and write nothing. That holds only when the repeat asks
-    /// for exactly what is stored in EVERY member the create records — the configuration a
-    /// caller chose ([`EnvironmentSpec`]) and the tag pairs it asked to associate alike:
-    /// `CreateEnvironment` is one of the writers of the tag map `GetEnvironment` and
-    /// `ListTagsForResource` read, so a create carrying different pairs is asking for a
-    /// different environment and must be refused rather than answered success with that
-    /// member thrown away.
-    ///
-    /// Asked by `CreateEnvironment` alone, so the set of members a replay has to match is
-    /// decided in one place beside the record whose members they are. Each member is
-    /// compared by what it MEANS and not by how the request spelled it: see
-    /// [`EnvironmentSpec::describes_same`] for the configuration, and the tag pairs are a
-    /// `BTreeMap` for the same reason.
-    pub fn matches_create(&self, spec: &EnvironmentSpec, tags: &BTreeMap<String, String>) -> bool {
-        self.spec.describes_same(spec) && self.tags == *tags
     }
 
     /// Whether this environment is in a status an `UpdateEnvironment` can be applied to:
@@ -1508,6 +1486,28 @@ fn environment_key(region: &str, name: &str) -> EnvironmentKey {
     (region.to_string(), name.to_string())
 }
 
+/// What this service keeps of an environment whose teardown has FINISHED: the record
+/// `DeleteEnvironment` reaches behind the not-found read.
+///
+/// A finished teardown retires the environment from every report of it — `GetEnvironment`
+/// answers `ResourceNotFoundException`, `ListEnvironments` leaves it out, and the name is
+/// free for a new create — and yet the service still knows the environment was torn down:
+/// a second `DeleteEnvironment` on that name is refused by its `DELETED` status
+/// ([`delete_not_allowed_message`]) rather than answered as a name that never existed, so a
+/// retrying deleter can tell "already torn down" (a refusal) from "no such environment" (a
+/// lookup miss). That status is the whole of what is observable about such a record, so it
+/// is the whole of what is kept, beside the instant the teardown finished, which is what
+/// decides whose record goes when the ledger is full.
+#[derive(Debug, Clone)]
+pub struct TornDownEnvironment {
+    /// The `EnvironmentStatus` the record is in, which is [`STATUS_DELETED`]: the status
+    /// whose arrival retired it. Stored rather than restated, so the refusal built from it
+    /// states the status the record really carries.
+    pub status: String,
+    /// When the teardown finished.
+    pub deleted_at: SystemTime,
+}
+
 /// Per-service state for com-amazonaws-mwaa-amazonmwaa. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsMwaaAmazonmwaaState {
@@ -1518,6 +1518,10 @@ pub struct ComAmazonawsMwaaAmazonmwaaState {
     /// the tags. Written and removed alongside `environments`, so it never names an
     /// environment that is gone.
     pub arn_index: HashMap<String, EnvironmentKey>,
+    /// The environments whose teardown has finished, by the key they were stored under:
+    /// see [`TornDownEnvironment`]. Bounded by [`MAX_TORN_DOWN_ENVIRONMENTS`], and a key a
+    /// new create takes again is no longer torn down.
+    pub torn_down: BTreeMap<EnvironmentKey, TornDownEnvironment>,
 }
 
 impl ComAmazonawsMwaaAmazonmwaaState {
@@ -1529,26 +1533,74 @@ impl ComAmazonawsMwaaAmazonmwaaState {
         for environment in self.environments.values_mut() {
             environment.settle(now);
         }
-        self.reap_deleted_environments();
+        self.reap_deleted_environments(now);
     }
 
-    /// Drop every environment that has reached [`STATUS_DELETED`] — the status that says
-    /// its teardown is complete — and with it its ARN index entry, so a finished teardown
-    /// frees the name and the ARN for good.
+    /// Retire every environment that has reached [`STATUS_DELETED`] — the status that says
+    /// its teardown is complete: the record and its ARN index entry go, so the name and the
+    /// ARN report as nothing a reader holds, and what the teardown left behind
+    /// ([`TornDownEnvironment`]) is recorded under the same key.
     ///
-    /// Part of the one write a reporting operation may make: the removal was owed at the
+    /// Part of the one write a reporting operation may make: the retirement was owed at the
     /// instant [`EnvironmentRecord::settle`] landed that status, whether or not anybody
     /// called, so what a reader answers is what the store would hold unpolled.
-    fn reap_deleted_environments(&mut self) {
-        let torn_down: Vec<EnvironmentKey> = self
+    fn reap_deleted_environments(&mut self, now: SystemTime) {
+        let finished: Vec<EnvironmentKey> = self
             .environments
             .iter()
             .filter(|(_, record)| record.status == STATUS_DELETED)
             .map(|(key, _)| key.clone())
             .collect();
-        for (region, name) in torn_down {
-            self.remove(&region, &name);
+        for key in finished {
+            let Some(record) = self.remove(&key.0, &key.1) else {
+                continue;
+            };
+            self.record_teardown(key, &record.status, now);
         }
+    }
+
+    /// Record that the environment stored under `key` was torn down, in `status`, at `now`.
+    ///
+    /// The ledger is bounded ([`MAX_TORN_DOWN_ENVIRONMENTS`]): once it is full the teardown
+    /// recorded LONGEST ago makes room, so a caller looping on create-and-delete cannot
+    /// grow this process's memory without bound, and the names most recently torn down —
+    /// the ones a retrying deleter is still working on — are the ones kept.
+    fn record_teardown(&mut self, key: EnvironmentKey, status: &str, now: SystemTime) {
+        while self.torn_down.len() >= MAX_TORN_DOWN_ENVIRONMENTS {
+            let Some(oldest) = self
+                .torn_down
+                .iter()
+                .min_by_key(|(_, record)| record.deleted_at)
+                .map(|(key, _)| key.clone())
+            else {
+                break;
+            };
+            self.torn_down.remove(&oldest);
+        }
+        self.torn_down.insert(
+            key,
+            TornDownEnvironment {
+                status: status.to_string(),
+                deleted_at: now,
+            },
+        );
+    }
+
+    /// What the finished teardown of `name` in `region` left behind, or `None` when this
+    /// service tore down no environment of that name there.
+    ///
+    /// Answered for a name no LIVE environment holds: a name that is live again (a create
+    /// took it after the teardown) carries the live record, which every reader resolves
+    /// first.
+    pub fn torn_down_environment(&self, region: &str, name: &str) -> Option<&TornDownEnvironment> {
+        self.torn_down.get(&environment_key(region, name))
+    }
+
+    /// Forget the finished teardown of `name` in `region`, because that name holds an
+    /// environment again: a create of a retired name is accepted, and the environment it
+    /// stores is not a torn-down one.
+    pub fn forget_teardown(&mut self, region: &str, name: &str) {
+        self.torn_down.remove(&environment_key(region, name));
     }
 
     /// The environment `name` names in `region`, or `None` when that Region holds no
@@ -2058,4 +2110,107 @@ pub fn service_state<Eng: Send + Sync + 'static>(
     (engine as &dyn ::std::any::Any)
         .downcast_ref::<::engine::InMemoryEngine>()
         .map(::engine::InMemoryEngine::state::<ComAmazonawsMwaaAmazonmwaaState>)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// RULE: each refusal sentence of this service is the one Amazon MWAA words that class
+    /// of refusal with — its fixed text EXACTLY, with its variable part taken from the
+    /// request (the name a create asked for) or from the stored record (the status an
+    /// environment is in) and from nowhere else.
+    ///
+    /// The expected text is written out HERE, character for character, rather than read
+    /// back from the builder under test: a sentence a test takes from the code it tests
+    /// cannot fail when the code's wording changes, and the wording is the requirement. The
+    /// rows vary what the rule generalises over — which sentence, and the variable part it
+    /// carries (every form `EnvironmentName`'s pattern admits for a name, and each status an
+    /// environment can be refused in).
+    #[test]
+    fn every_refusal_sentence_is_the_one_amazon_mwaa_words() {
+        // (case, the sentence the builder answers, the sentence AWS words)
+        let rows: Vec<(&str, String, String)> = vec![
+            (
+                "a create of a name this Region holds",
+                environment_exists_message("MyMWAAEnvironment"),
+                "An environment with name MyMWAAEnvironment already exists. Please use other \
+                 name."
+                    .to_string(),
+            ),
+            (
+                "the same, for a one-character name",
+                environment_exists_message("E"),
+                "An environment with name E already exists. Please use other name.".to_string(),
+            ),
+            (
+                "the same, for a name carrying both separators",
+                environment_exists_message("env-2_with-parts"),
+                "An environment with name env-2_with-parts already exists. Please use other \
+                 name."
+                    .to_string(),
+            ),
+            (
+                "a delete of an environment already torn down",
+                delete_not_allowed_message(STATUS_DELETED),
+                "Environments with DELETED status cannot be deleted.".to_string(),
+            ),
+            (
+                "an update of an environment still being created",
+                update_not_allowed_message(STATUS_CREATING),
+                "Environments with CREATING status must complete previous operation before \
+                 initiating a new operation."
+                    .to_string(),
+            ),
+            (
+                "an update of one snapshotting its database",
+                update_not_allowed_message(STATUS_CREATING_SNAPSHOT),
+                "Environments with CREATING_SNAPSHOT status must complete previous operation \
+                 before initiating a new operation."
+                    .to_string(),
+            ),
+            (
+                "an update of one already under update",
+                update_not_allowed_message(STATUS_UPDATING),
+                "Environments with UPDATING status must complete previous operation before \
+                 initiating a new operation."
+                    .to_string(),
+            ),
+            (
+                "an update of one being torn down",
+                update_not_allowed_message(STATUS_DELETING),
+                "Environments with DELETING status must complete previous operation before \
+                 initiating a new operation."
+                    .to_string(),
+            ),
+            (
+                "an update of one whose create was paused",
+                update_not_allowed_message(STATUS_PENDING),
+                "Environments with PENDING status must complete previous operation before \
+                 initiating a new operation."
+                    .to_string(),
+            ),
+        ];
+        for (case, built, expected) in rows {
+            assert_eq!(
+                built, expected,
+                "case {case:?}: expected {expected:?}, got {built:?}"
+            );
+        }
+
+        // And the sentences that name an environment are the ones that name one: the
+        // status-conflict refusals carry no environment at all, whatever it is called.
+        for status in [STATUS_CREATING, STATUS_UPDATING, STATUS_DELETED] {
+            for sentence in [
+                update_not_allowed_message(status),
+                delete_not_allowed_message(status),
+            ] {
+                assert!(
+                    !sentence.contains("MyMWAAEnvironment"),
+                    "case {status:?}: a status-conflict refusal names no environment, got \
+                     {sentence:?}"
+                );
+            }
+        }
+    }
 }

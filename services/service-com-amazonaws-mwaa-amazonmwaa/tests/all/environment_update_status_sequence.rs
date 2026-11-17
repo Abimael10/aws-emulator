@@ -36,11 +36,11 @@ const ACCOUNT: &str = "000000000000";
 
 /// How often the status poll below reads the environment. Far shorter than
 /// [`state::UPDATE_PHASE_SPAN`], so no phase of the update can slip between two reads.
-const POLL_INTERVAL: Duration = Duration::from_millis(10);
+const POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 /// How long a poll waits for a lifecycle to settle before it calls the walk broken. Many
 /// times the whole update span, so a slow machine does not fail the assertion.
-const SETTLE_DEADLINE: Duration = Duration::from_secs(10);
+const SETTLE_DEADLINE: Duration = Duration::from_secs(60);
 
 /// The Apache Airflow version every environment here is created on: not the newest and not
 /// the oldest supported one, so both an upgrade and a downgrade are reachable from it.
@@ -330,7 +330,9 @@ async fn the_snapshot_phase_is_observable_before_any_other_call_is_made() {
         200,
         "the fixture create must succeed"
     );
-    tokio::time::sleep(state::TRANSITION_SPAN + POLL_INTERVAL).await;
+    // Waiting for the CONDITION the update needs — a settled environment — rather than for
+    // a span.
+    observe_until_available(&harness, "seed", name, false).await;
     assert_eq!(
         status_of(&harness, "seed", name).await,
         state::STATUS_AVAILABLE,
@@ -356,13 +358,18 @@ async fn the_snapshot_phase_is_observable_before_any_other_call_is_made() {
             state::STATUS_CREATING_SNAPSHOT
         );
 
-        // And the whole walk is done one TRANSITION_SPAN after the call, like a create.
-        tokio::time::sleep(state::TRANSITION_SPAN + POLL_INTERVAL).await;
+        // And the walk ends where every accepted update's does: the poll waits for that
+        // condition and answers the distinct statuses it saw on the way, which must be the
+        // phase that follows the snapshot and then AVAILABLE.
+        let observed = observe_until_available(&harness, &case, name, true).await;
         assert_eq!(
-            status_of(&harness, &case, name).await,
-            state::STATUS_AVAILABLE,
-            "case {case}: the update must have settled {:?} after the call",
-            state::TRANSITION_SPAN
+            observed,
+            vec![
+                state::STATUS_CREATING_SNAPSHOT.to_string(),
+                state::STATUS_UPDATING.to_string(),
+                state::STATUS_AVAILABLE.to_string()
+            ],
+            "case {case}: the walk from the snapshot phase on, observed {observed:?}"
         );
     }
 }

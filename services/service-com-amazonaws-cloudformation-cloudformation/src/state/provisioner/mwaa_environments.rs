@@ -508,9 +508,16 @@ pub(super) async fn retag_mwaa_environment(
 }
 
 /// Delete the environment a stack created, addressed by the name Amazon MWAA knows it by —
-/// this resource's physical id. An environment that service no longer holds
-/// (`ResourceNotFoundException`, judged on the CODE and never on a message that carries the
-/// request's own name) is already in the state the delete asks for.
+/// this resource's physical id.
+///
+/// An environment that service no longer holds is already in the state the delete asks for,
+/// and it says so in two ways: a name it holds nothing under at all is
+/// `ResourceNotFoundException`, and a name whose environment it has already TORN DOWN is a
+/// refusal by that environment's `DELETED` status (that service keeps the deleted record
+/// behind its own not-found read, so a repeat delete is refused rather than answered as a
+/// lookup miss). Both are judged without reading a message: the first on the CODE, the
+/// second by asking that service whether it still holds a live environment under the name —
+/// if it does not, the deletion this resource waits on has happened.
 pub(super) async fn delete_mwaa_environment(
     ctx: &smithy_server_runtime::OperationContext<'_>,
     region: &str,
@@ -529,7 +536,12 @@ pub(super) async fn delete_mwaa_environment(
     {
         Ok(_) => Ok(()),
         Err(refusal) if refusal.code == MWAA_RESOURCE_NOT_FOUND => Ok(()),
-        Err(refusal) => Err(refusal),
+        // A read that cannot be answered at all says nothing about the environment, so the
+        // delete's OWN refusal is the one reported: nothing here replaces the reason.
+        Err(refusal) => match read_mwaa_environment(ctx, region, physical_resource_id).await {
+            Ok(None) => Ok(()),
+            _ => Err(refusal),
+        },
     }
 }
 

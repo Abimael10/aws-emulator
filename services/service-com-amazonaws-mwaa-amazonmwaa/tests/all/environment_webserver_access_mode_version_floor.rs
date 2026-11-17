@@ -39,7 +39,7 @@ const ACCOUNT: &str = "000000000000";
 
 /// Comfortably longer than [`state::TRANSITION_SPAN`], so a transition the clock owes has
 /// certainly come due and the environment accepts an update.
-const PAST_TRANSITION: Duration = Duration::from_millis(900);
+const PAST_TRANSITION: Duration = Duration::from_millis(6_500);
 
 /// Every `WebserverAccessMode` value, from
 /// `smithy_query(query="shape", shape="WebserverAccessMode")`.

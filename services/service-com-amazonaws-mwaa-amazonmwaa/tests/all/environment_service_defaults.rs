@@ -72,7 +72,7 @@ const LOG_TYPES: [&str; 5] = [
 /// Comfortably longer than [`state::TRANSITION_SPAN`], so a transition the clock owes an
 /// environment has certainly come due — an `UpdateEnvironment` is accepted only once the
 /// environment has settled into AVAILABLE.
-const PAST_TRANSITION: Duration = Duration::from_millis(900);
+const PAST_TRANSITION: Duration = Duration::from_millis(6_500);
 
 /// The days `WeeklyMaintenanceWindowStart`'s pattern accepts
 /// (`(MON|TUE|WED|THU|FRI|SAT|SUN):([01]\d|2[0-3]):(00|30)`).

@@ -38,7 +38,7 @@ const ACCOUNT: &str = "000000000000";
 
 /// Comfortably longer than [`state::TRANSITION_SPAN`], so a transition the clock owes has
 /// certainly come due and the environment accepts an update.
-const PAST_TRANSITION: Duration = Duration::from_millis(900);
+const PAST_TRANSITION: Duration = Duration::from_millis(6_500);
 
 /// Every `EnvironmentClass` the member's own doc lists as valid ("Valid values: mw1.micro,
 /// mw1.small, mw1.medium, mw1.large, mw1.xlarge, and mw1.2xlarge"), from

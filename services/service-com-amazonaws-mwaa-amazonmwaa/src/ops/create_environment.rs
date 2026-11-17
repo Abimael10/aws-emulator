@@ -466,28 +466,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
         store.settle(now);
 
-        // The operation is `@idempotent`: replaying the SAME create of a name that is
-        // already stored IN THIS REGION answers with the stored ARN and writes nothing. A
-        // create of that name that differs in ANY member it records — the configuration or
-        // the tag pairs, which this create writes just as it writes the configuration — is
-        // a different request, and is refused rather than allowed to clobber the stored
-        // record or answered success with that member thrown away. A name stored in
-        // ANOTHER Region is a different environment and no obstacle here: a name identifies
-        // an environment only within its Region.
+        // An environment NAME is unique per account per Region: a create of a name this
+        // Region already holds is refused, whatever the rest of the request carries. The
+        // operation is `@idempotent`, which makes a retry SAFE — a repeat changes nothing —
+        // and not successful: the name is the resource's identity, so the second create
+        // asked for a resource that already exists and is told so, which is the whole of
+        // how a client claims a name. A name stored in ANOTHER Region is a different
+        // environment and no obstacle here.
         //
-        // An environment whose teardown is running still HOLDS its name, so the name is
-        // not free yet; but it is on its way out, so there is no live environment for a
-        // replay to answer with and a create of that name is refused until the teardown
-        // frees it.
-        if let Some(existing) = store.environment(&region, &input.name) {
-            if existing.matches_create(&spec, &tags) && !existing.is_deleting() {
-                return Ok(CreateEnvironmentOutput {
-                    arn: Some(existing.arn.clone()),
-                });
-            }
-            return Err(validation(format!(
-                "An environment named {} already exists",
-                input.name
+        // An environment whose teardown is RUNNING still holds its name, so it is refused
+        // by this same gate; one whose teardown has FINISHED holds it no longer (its record
+        // is retired, see `crate::state::TornDownEnvironment`), so the name is free and the
+        // create below takes it.
+        if store.contains(&region, &input.name) {
+            return Err(validation(crate::state::environment_exists_message(
+                &input.name,
             )));
         }
 
@@ -539,7 +532,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // The Apache Airflow metadata database the new environment's web server
             // serves: empty but for the pool Apache Airflow seeds every database with.
             airflow: crate::state::AirflowMetadata::new(),
+            // No Apache Airflow CLI token has been minted for it yet.
+            cli_tokens: ::std::collections::VecDeque::new(),
         });
+        // The name holds an environment again, so it names no torn-down one: what a
+        // finished teardown left behind under this key is forgotten, and a delete of this
+        // environment is the delete of the environment created here.
+        store.forget_teardown(&region, &name);
 
         // Answer with the ARN read back out of the stored record, so this response cannot
         // drift from the state a later read sees.

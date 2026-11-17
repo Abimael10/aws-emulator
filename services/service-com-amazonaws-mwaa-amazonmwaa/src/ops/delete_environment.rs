@@ -148,9 +148,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
         store.settle(now);
 
-        // A delete of a name the store does not hold is a lookup miss — and an
-        // environment whose teardown already finished is such a name, because the removal
-        // the clock owed it was materialised by the `settle` above.
+        // A delete of a name the store holds no LIVE environment under is either a name
+        // this service tore down already, or a name it never held. The two are different
+        // answers, and a retrying deleter branches on exactly that difference: a finished
+        // teardown leaves a record behind the not-found read
+        // (`crate::state::TornDownEnvironment`), and a delete that reaches it is refused by
+        // that record's `DELETED` status — `ValidationException` (HTTP 400), a terminal
+        // answer — while a name nothing was ever created under is the lookup miss
+        // `ResourceNotFoundException` (HTTP 404).
+        if store.environment(&region, &input.name).is_none() {
+            if let Some(torn_down) = store.torn_down_environment(&region, &input.name) {
+                return Err(
+                    DeleteEnvironmentErrorModeled::ValidationException(ValidationException {
+                        message: Some(crate::state::delete_not_allowed_message(&torn_down.status)),
+                    })
+                    .into(),
+                );
+            }
+        }
         let stored = store.environment_mut(&region, &input.name).ok_or_else(|| {
             DeleteEnvironmentErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
                 message: Some(crate::state::environment_not_found_message(&input.name)),

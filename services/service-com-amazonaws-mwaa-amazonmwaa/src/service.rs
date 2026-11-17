@@ -52,6 +52,9 @@ pub mod endpoints;
 /// The refusal contract of the ENVIRONMENT data endpoint: who words it, and the shape it
 /// travels in on each of the operations hosted there.
 pub mod env_endpoint;
+/// The Apache Airflow CLI endpoint of an environment's own web server — the endpoint the
+/// token `CreateCliToken` mints is FOR, which no Smithy model describes.
+pub mod airflow_cli;
 
 /// The error code this service answers an input-constraint violation with: the modeled
 /// `ValidationException`, which every operation that can be refused declares with
@@ -157,6 +160,11 @@ pub struct EmulatedService<Eng: Send + Sync + 'static> {
     /// operation that relays another API's answer. Built once, because that seam returns a
     /// reference to it.
     airflow_proxy: env_endpoint::AirflowProxy,
+    /// The one operation an environment's own Apache Airflow CLI endpoint is served as
+    /// ([`airflow_cli::AirflowCliEndpoint`]), built from the same shared engine every
+    /// modelled operation is built from and resolved by
+    /// [`override_operation`](Service::override_operation).
+    airflow_cli: airflow_cli::AirflowCliEndpoint<Eng>,
 }
 
 impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
@@ -165,8 +173,9 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     /// operation's behaviour lives in that operation's own `impl Operation`.
     pub fn new(engine: Arc<Eng>) -> Self {
         Self {
-            entry: crate::ServiceDefinition::new(engine),
+            entry: crate::ServiceDefinition::new(Arc::clone(&engine)),
             airflow_proxy: env_endpoint::AirflowProxy,
+            airflow_cli: airflow_cli::AirflowCliEndpoint::new(engine),
         }
     }
 }
@@ -183,10 +192,17 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // Claim a request whose resolved route key is this service's signing
         // name. Edit this for anything the model does not express — a signing
         // name shared by several services, or access-key-id-based routing.
-        match smithy_server_runtime::resolve_route_key(parts) {
-            Some(key) => key == self.entry.identity().signing_name(),
-            None => false,
+        if let Some(key) = smithy_server_runtime::resolve_route_key(parts) {
+            if key == self.entry.identity().signing_name() {
+                return true;
+            }
         }
+        // And a request to the Apache Airflow CLI endpoint of an environment's own web
+        // server ([`airflow_cli`]). Such a request names no modelled operation and carries
+        // no SigV4 credential scope — its credential is the bearer token `CreateCliToken`
+        // minted — so the front door could resolve no target service for it and answered
+        // `404 UnknownService`, for the one address that operation told the client to dial.
+        airflow_cli::claims_parts(parts)
     }
 
     fn override_operation(
@@ -200,7 +216,18 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // the way that endpoint sent it (see [`env_endpoint`]). Every other request, the
         // token operations and the control-plane lookups included, resolves through the
         // generated routing table untouched and keeps the protocol's error document.
-        env_endpoint::routes(&self.entry, req).then_some(&self.airflow_proxy as _)
+        if env_endpoint::routes(&self.entry, req) {
+            return Some(&self.airflow_proxy as _);
+        }
+        // A request to an environment's Apache Airflow CLI endpoint is served as the one
+        // operation this service serves that endpoint with, resolved HERE — ahead of the
+        // generated routing table, which names no operation under that path, and ahead of
+        // authentication, which is what lets a request carrying a bearer token rather than
+        // a SigV4 signature be answered at all.
+        if airflow_cli::claims_request(req) {
+            return Some(&self.airflow_cli as _);
+        }
+        None
     }
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {

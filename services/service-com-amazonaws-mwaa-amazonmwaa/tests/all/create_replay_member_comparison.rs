@@ -1,23 +1,29 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! `CreateEnvironment`'s `@idempotent` replay check, end to end over HTTP through the
-//! router this service mounts in production.
+//! `CreateEnvironment`'s name gate, end to end over HTTP through the router this service
+//! mounts in production.
 //!
-//! The rule every case here asserts: a second `CreateEnvironment` for a name that is
-//! already stored is a REPLAY — answered with the stored ARN, writing nothing — only when
-//! it asks for exactly the environment that is stored in every member the create records,
-//! the configuration and the tag pairs alike; a second create differing in any of those
-//! members is a different request and is refused with HTTP 400 `ValidationException`,
-//! leaving the stored environment untouched. No member a create writes may be answered
-//! success and then dropped.
+//! The rule every case here asserts: an environment NAME is unique per account per Region,
+//! so a second `CreateEnvironment` for a name this Region already holds is refused with HTTP
+//! 400 `ValidationException` and the sentence Amazon MWAA words a taken name with,
+//! whatever members the second request carries — and the stored environment is left exactly
+//! as the create that stored it left it. The name is the environment's identity: the
+//! operation's `@idempotent` trait makes a retry SAFE (nothing is written twice) and not
+//! successful, because the second caller asked for a resource that already exists. That is
+//! the whole of how a client CLAIMS a name, and how a racing fleet finds out that exactly
+//! one of its members won.
 //!
-//! Each table row varies what the rule generalises over: WHICH recorded member differs (a
-//! tag value, a tag key, the `Tags` member's presence, or one of the configuration members
-//! `DagS3Path` / `MaxWorkers` / `AirflowVersion` / `EnvironmentClass`), HOW it differs
-//! (changed, added, removed, re-cased, omitted) and HOW MANY tags travel with the request
-//! (none, one, a handful, the full `TagMap` of `state::MAX_TAGS`). Every refusal row is
-//! paired with a read-back of the stored environment, so a refusal is shown to change
-//! nothing, and the replay rows pin the other side of the comparison.
+//! Each table row varies what the rule generalises over: WHICH recorded member differs from
+//! the stored environment, if any (a tag value, a tag key, the `Tags` member's presence, or
+//! one of the configuration members `DagS3Path` / `MaxWorkers` / `AirflowVersion` /
+//! `EnvironmentClass`), HOW it differs (identical, changed, added, removed, re-cased,
+//! omitted) and HOW MANY tags travel with the request (none, one, a handful, the full
+//! `TagMap` of `state::MAX_TAGS`). Every row is paired with a read-back of the stored
+//! environment, so the refusal is shown to change nothing.
+//!
+//! Beside the table: four identical creates of ONE new name, racing, must leave exactly one
+//! winner; and the name of an environment whose teardown has FINISHED is free again, so a
+//! create takes it.
 
 use std::sync::Arc;
 
@@ -39,6 +45,15 @@ const REGION: &str = "us-east-1";
 
 /// The canonical emulator account id every emulated ARN carries.
 const ACCOUNT: &str = "000000000000";
+
+/// The sentence Amazon MWAA refuses a create of a name it already holds with: its fixed
+/// text, with the `Name` the REQUEST asked for in it.
+///
+/// Written out here rather than read back from the service, so a change to the wording this
+/// suite is about fails this suite.
+fn name_taken_sentence(name: &str) -> String {
+    format!("An environment with name {name} already exists. Please use other name.")
+}
 
 /// The members of the `Environment` a case may move: the tag map plus every configuration
 /// member a row changes. Read back on both sides of a refused create, so "nothing was
@@ -235,8 +250,8 @@ fn generated_tags(count: usize) -> Vec<(String, String)> {
         .collect()
 }
 
-/// How a second create of an already stored name differs from the create that stored it,
-/// and therefore whether it is a replay.
+/// How a second create of an already stored name differs from the create that stored it.
+/// Every one of them is refused: what the rows vary is the request, not the outcome.
 struct Case {
     /// Names the case in every assertion.
     label: &'static str,
@@ -246,13 +261,11 @@ struct Case {
     second_tags: Option<Vec<(String, String)>>,
     /// A configuration member the second create changes, if any.
     config_change: Option<(&'static str, Value)>,
-    /// Whether the second create asks for exactly the stored environment.
-    replay: bool,
 }
 
-/// The table. Rows 1–4 are the replays (what the comparison must ACCEPT, across tag
-/// counts); the rest each differ in exactly one recorded member, so the member that makes
-/// a create a different request is what varies and not the request's size or shape.
+/// The table. Rows 1–4 ask for EXACTLY the stored environment (across tag counts, up to the
+/// full `TagMap`); the rest each differ in exactly one recorded member, so what varies is
+/// the request and never the answer.
 ///
 /// `AirflowVersion` and `EnvironmentClass` rows take their changed value from the catalogs
 /// the service publishes (`state::SUPPORTED_AIRFLOW_VERSIONS`,
@@ -282,14 +295,12 @@ fn cases() -> Vec<Case> {
             stored_tags: Vec::new(),
             second_tags: None,
             config_change: None,
-            replay: true,
         },
         Case {
             label: "the identical create of a one-tag environment",
             stored_tags: pairs(&[("Team", "data")]),
             second_tags: Some(pairs(&[("Team", "data")])),
             config_change: None,
-            replay: true,
         },
         Case {
             label: "the identical create of a three-tag environment",
@@ -300,63 +311,54 @@ fn cases() -> Vec<Case> {
                 ("CostCenter", "42"),
             ])),
             config_change: None,
-            replay: true,
         },
         Case {
             label: "the identical create of an environment carrying a full TagMap",
             stored_tags: generated_tags(state::MAX_TAGS),
             second_tags: Some(generated_tags(state::MAX_TAGS)),
             config_change: None,
-            replay: true,
         },
         Case {
             label: "one tag's value changed",
             stored_tags: pairs(&[("Team", "data")]),
             second_tags: Some(pairs(&[("Team", "platform")])),
             config_change: None,
-            replay: false,
         },
         Case {
             label: "one tag's value re-cased",
             stored_tags: pairs(&[("Team", "Data")]),
             second_tags: Some(pairs(&[("Team", "data")])),
             config_change: None,
-            replay: false,
         },
         Case {
             label: "a tag key added beside the stored one",
             stored_tags: pairs(&[("Team", "data")]),
             second_tags: Some(pairs(&[("Team", "data"), ("CostCenter", "42")])),
             config_change: None,
-            replay: false,
         },
         Case {
             label: "a tag key dropped from the stored pair set",
             stored_tags: pairs(&[("Team", "data"), ("CostCenter", "42")]),
             second_tags: Some(pairs(&[("Team", "data")])),
             config_change: None,
-            replay: false,
         },
         Case {
             label: "a tag key renamed, its value kept",
             stored_tags: pairs(&[("Team", "data")]),
             second_tags: Some(pairs(&[("Squad", "data")])),
             config_change: None,
-            replay: false,
         },
         Case {
             label: "the Tags member omitted for a tagged environment",
             stored_tags: pairs(&[("Team", "data")]),
             second_tags: None,
             config_change: None,
-            replay: false,
         },
         Case {
             label: "a Tags member added for an untagged environment",
             stored_tags: Vec::new(),
             second_tags: Some(pairs(&[("Team", "data")])),
             config_change: None,
-            replay: false,
         },
         Case {
             label: "one tag of a full TagMap changed",
@@ -367,42 +369,36 @@ fn cases() -> Vec<Case> {
                 tags
             }),
             config_change: None,
-            replay: false,
         },
         Case {
             label: "DagS3Path changed, the tags identical",
             stored_tags: pairs(&[("Team", "data")]),
             second_tags: Some(pairs(&[("Team", "data")])),
             config_change: Some(("DagS3Path", json!("somewhere/else"))),
-            replay: false,
         },
         Case {
             label: "MaxWorkers changed on an untagged environment",
             stored_tags: Vec::new(),
             second_tags: None,
             config_change: Some(("MaxWorkers", json!(25))),
-            replay: false,
         },
         Case {
             label: "AirflowVersion changed, the tags identical",
             stored_tags: pairs(&[("Team", "data")]),
             second_tags: Some(pairs(&[("Team", "data")])),
             config_change: Some(("AirflowVersion", json!(changed_version))),
-            replay: false,
         },
         Case {
             label: "EnvironmentClass changed, the tags identical",
             stored_tags: pairs(&[("Team", "data")]),
             second_tags: Some(pairs(&[("Team", "data")])),
             config_change: Some(("EnvironmentClass", json!(changed_class))),
-            replay: false,
         },
         Case {
             label: "a configuration member and the tags both changed",
             stored_tags: pairs(&[("Team", "data")]),
             second_tags: Some(pairs(&[("Team", "platform"), ("CostCenter", "42")])),
             config_change: Some(("DagS3Path", json!("somewhere/else"))),
-            replay: false,
         },
     ]
 }
@@ -450,7 +446,7 @@ fn watched(environment: &Value) -> Vec<(&'static str, Value)> {
 }
 
 #[tokio::test]
-async fn a_second_create_replays_only_when_every_recorded_member_matches_the_stored_environment() {
+async fn a_second_create_of_a_stored_name_is_refused_whatever_members_it_carries() {
     let harness = Harness::new();
 
     for (index, case) in cases().into_iter().enumerate() {
@@ -484,50 +480,38 @@ async fn a_second_create_replays_only_when_every_recorded_member_matches_the_sto
         let before = watched(&harness.environment(&name).await);
 
         let second = harness.create(&name, case.second_body()).await;
-        if case.replay {
-            assert_eq!(
-                second.status,
-                200,
-                "case {:?}: a create asking for exactly the stored environment is a replay \
-                 and must succeed, got {} {}",
-                case.label,
-                second.status,
-                second.text()
-            );
-            assert_eq!(
-                second.arn(),
-                first.arn(),
-                "case {:?}: a replay must answer the stored ARN, got {:?}",
-                case.label,
-                second.arn()
-            );
-        } else {
-            assert_eq!(
-                second.status,
-                400,
-                "case {:?}: a create of a taken name differing in a recorded member must be \
-                 refused, got {} {}",
-                case.label,
-                second.status,
-                second.text()
-            );
-            assert_eq!(
-                second.error_code(),
-                "ValidationException",
-                "case {:?}: a name clash is a ValidationException, got {:?}",
-                case.label,
-                second.error_code()
-            );
-            let message = second.message();
-            assert!(
-                message.contains(&name) && message.contains("already exists"),
-                "case {:?}: the refusal must name the environment whose name is taken, got {message:?}",
-                case.label
-            );
-        }
+        assert_eq!(
+            second.status,
+            400,
+            "case {:?}: a create of a name this Region already holds must be refused, got {} {}",
+            case.label,
+            second.status,
+            second.text()
+        );
+        assert_eq!(
+            second.error_code(),
+            "ValidationException",
+            "case {:?}: a name clash is a ValidationException, got {:?}",
+            case.label,
+            second.error_code()
+        );
+        assert_eq!(
+            second.message(),
+            name_taken_sentence(&name),
+            "case {:?}: the refusal's message, got {:?}",
+            case.label,
+            second.message()
+        );
+        assert_eq!(
+            second.arn(),
+            Value::Null,
+            "case {:?}: a refusal carries no ARN, got {:?}",
+            case.label,
+            second.arn()
+        );
 
-        // Either way the stored environment is what the FIRST create stored: a replay
-        // writes nothing, and a refused create writes nothing.
+        // The stored environment is what the FIRST create stored: a refused create writes
+        // nothing.
         let after = watched(&harness.environment(&name).await);
         assert_eq!(
             after,
@@ -549,7 +533,80 @@ async fn a_second_create_replays_only_when_every_recorded_member_matches_the_sto
 }
 
 #[tokio::test]
-async fn a_create_matching_the_tag_map_a_later_write_left_is_still_a_replay() {
+async fn four_racing_creates_of_one_name_leave_exactly_one_winner() {
+    let harness = Harness::new();
+    let name = "RacedName";
+    let arn = format!("arn:aws:airflow:{REGION}:{ACCOUNT}:environment/{name}");
+    let body = create_body(Some(pairs(&[("Team", "data")]).as_slice()));
+
+    // Four identical creates in flight at once, the way four pipeline runs claim one name.
+    let (first, second, third, fourth) = ::tokio::join!(
+        harness.create(name, body.clone()),
+        harness.create(name, body.clone()),
+        harness.create(name, body.clone()),
+        harness.create(name, body.clone()),
+    );
+    let answers = [first, second, third, fourth];
+    let winners: Vec<&Answer> = answers
+        .iter()
+        .filter(|answer| answer.status == 200)
+        .collect();
+    assert_eq!(
+        winners.len(),
+        1,
+        "expected exactly one winner, got {:?}",
+        answers
+            .iter()
+            .map(|answer| (answer.status, answer.text()))
+            .collect::<Vec<(u16, String)>>()
+    );
+    assert_eq!(
+        winners[0].arn(),
+        json!(arn),
+        "the winner must answer the ARN of the environment it stored, got {:?}",
+        winners[0].arn()
+    );
+    for loser in answers.iter().filter(|answer| answer.status != 200) {
+        assert_eq!(
+            loser.status,
+            400,
+            "every other racer must be refused, got {} {}",
+            loser.status,
+            loser.text()
+        );
+        assert_eq!(
+            loser.error_code(),
+            "ValidationException",
+            "every refusal is a ValidationException, got {:?}",
+            loser.error_code()
+        );
+        assert_eq!(
+            loser.message(),
+            name_taken_sentence(name),
+            "every refusal states the name is taken, got {:?}",
+            loser.message()
+        );
+    }
+
+    // And the one environment the race left is readable, with the configuration the winner
+    // asked for.
+    let stored = harness.environment(name).await;
+    assert_eq!(
+        stored.get("Arn").cloned(),
+        Some(json!(arn)),
+        "the stored environment must be the one the winner created, got {:?}",
+        stored.get("Arn")
+    );
+    assert_eq!(
+        harness.tags(&arn).await,
+        tag_map(&pairs(&[("Team", "data")])),
+        "the stored environment must carry the Tags the winning create named, got {:?}",
+        harness.tags(&arn).await
+    );
+}
+
+#[tokio::test]
+async fn a_create_is_refused_whatever_a_later_tag_write_left_on_the_environment() {
     let harness = Harness::new();
     let name = "ReplayAfterTagWrite";
     let arn = format!("arn:aws:airflow:{REGION}:{ACCOUNT}:environment/{name}");
@@ -570,49 +627,41 @@ async fn a_create_matching_the_tag_map_a_later_write_left_is_still_a_replay() {
         "the tag write must succeed"
     );
 
-    // The comparison is made against what is STORED, not against what the first create
-    // carried: the tag map `TagResource` left is the environment's tag map now, so the
-    // create that asks for exactly that map is the replay...
-    let replay = harness
-        .create(name, create_body(Some(written.as_slice())))
-        .await;
-    assert_eq!(
-        replay.status,
-        200,
-        "a create asking for the tag map now stored must replay, got {} {}",
-        replay.status,
-        replay.text()
-    );
-    assert_eq!(
-        replay.arn(),
-        json!(arn),
-        "a replay must answer the stored ARN, got {:?}",
-        replay.arn()
-    );
-
-    // ...and the create carrying the pairs the environment NO LONGER has is a different
-    // create of a taken name, so it is refused rather than answered success with its Tags
-    // dropped.
-    let refused = harness
-        .create(name, create_body(Some(stored.as_slice())))
-        .await;
-    assert_eq!(
-        refused.status,
-        400,
-        "a create carrying tags the stored environment does not have must be refused, got {} {}",
-        refused.status,
-        refused.text()
-    );
-    assert_eq!(
-        refused.error_code(),
-        "ValidationException",
-        "a name clash is a ValidationException, got {:?}",
-        refused.error_code()
-    );
-    assert_eq!(
-        harness.tags(&arn).await,
-        tag_map(&written),
-        "the refused create must leave the stored tag map as the tag write left it, got {:?}",
-        harness.tags(&arn).await
-    );
+    // The name is taken, so a second create is refused whether it carries the tag map the
+    // environment has NOW or the one its own create carried: neither is a request to create
+    // an environment that does not exist.
+    for (case, carried) in [
+        ("the tag map the environment carries now", &written),
+        ("the tag map its create carried", &stored),
+    ] {
+        let refused = harness
+            .create(name, create_body(Some(carried.as_slice())))
+            .await;
+        assert_eq!(
+            refused.status,
+            400,
+            "case {case:?}: a create of a taken name must be refused, got {} {}",
+            refused.status,
+            refused.text()
+        );
+        assert_eq!(
+            refused.error_code(),
+            "ValidationException",
+            "case {case:?}: a name clash is a ValidationException, got {:?}",
+            refused.error_code()
+        );
+        assert_eq!(
+            refused.message(),
+            name_taken_sentence(name),
+            "case {case:?}: the refusal's message, got {:?}",
+            refused.message()
+        );
+        assert_eq!(
+            harness.tags(&arn).await,
+            tag_map(&written),
+            "case {case:?}: the refused create must leave the stored tag map as the tag \
+             write left it, got {:?}",
+            harness.tags(&arn).await
+        );
+    }
 }

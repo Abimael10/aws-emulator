@@ -29,7 +29,7 @@ const ACCOUNT: &str = "000000000000";
 
 /// Comfortably longer than [`state::TRANSITION_SPAN`], so a transition the clock owes has
 /// certainly come due and an environment accepts an update.
-const PAST_TRANSITION: Duration = Duration::from_millis(900);
+const PAST_TRANSITION: Duration = Duration::from_millis(6_500);
 
 /// The Regions the table runs over: every one of them gets the same environment names, so
 /// a lookup that ignored the Region would answer with another Region's record. They differ

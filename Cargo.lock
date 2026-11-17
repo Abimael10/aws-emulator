@@ -17354,6 +17354,7 @@ dependencies = [
 name = "service-com-amazonaws-mwaa-amazonmwaa"
 version = "0.1.0"
 dependencies = [
+ "automod",
  "aws-emulator-build-support",
  "aws-emulator-emulator-telemetry",
  "aws-emulator-engine",
@@ -17365,6 +17366,7 @@ dependencies = [
  "aws-smithy-runtime-api",
  "aws-smithy-schema 0.2.1",
  "aws-smithy-types",
+ "base64 0.22.1",
  "bytes",
  "hex",
  "http",
@@ -17377,6 +17379,7 @@ dependencies = [
  "service-com-amazonaws-sts-awssecuritytokenservicev20110615",
  "service-common",
  "sha2 0.10.9",
+ "shlex",
  "tokio",
  "tracing",
 ]

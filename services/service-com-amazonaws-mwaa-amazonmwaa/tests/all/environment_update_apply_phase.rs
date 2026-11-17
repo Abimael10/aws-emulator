@@ -39,15 +39,15 @@ const ACCOUNT: &str = "000000000000";
 
 /// How often a row reads the environment while its update walks the phases. Far shorter
 /// than [`state::UPDATE_PHASE_SPAN`], so no phase can slip between two reads.
-const POLL_INTERVAL: Duration = Duration::from_millis(10);
+const POLL_INTERVAL: Duration = Duration::from_millis(100);
 
 /// Comfortably longer than [`state::TRANSITION_SPAN`], so a transition the clock owes has
 /// certainly come due.
-const PAST_TRANSITION: Duration = Duration::from_millis(900);
+const PAST_TRANSITION: Duration = Duration::from_millis(6_500);
 
 /// How long a row waits for its update to settle before it calls the walk broken. Many
 /// times the whole update span, so a slow machine does not fail the assertion.
-const SETTLE_DEADLINE: Duration = Duration::from_secs(10);
+const SETTLE_DEADLINE: Duration = Duration::from_secs(60);
 
 /// One HTTP answer, reduced to what these tests assert on.
 struct Answer {

@@ -14,7 +14,7 @@
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
@@ -35,9 +35,16 @@ const REGION: &str = "us-east-1";
 /// The canonical emulator account id every emulated ARN carries.
 const ACCOUNT: &str = "000000000000";
 
-/// Comfortably longer than [`state::TRANSITION_SPAN`], so a transition the clock owes has
+/// Comfortably longer than the TWO [`state::TRANSITION_SPAN`]s an accepted update's phases
+/// take (and so than the one a create takes), so every transition the clock owes has
 /// certainly come due.
-const PAST_TRANSITION: Duration = Duration::from_millis(900);
+const PAST_TRANSITION: Duration = Duration::from_millis(6_500);
+
+/// How often a poll below reads the resource it is waiting on, and how long it waits for
+/// that condition before calling the lifecycle broken. The deadline is generous: it bounds a
+/// condition that has to HOLD, never how fast the host runs.
+const POLL_INTERVAL: Duration = Duration::from_millis(100);
+const POLL_DEADLINE: Duration = Duration::from_secs(120);
 
 /// The endpoint this harness's emulator is served at — the base URL a client addresses it
 /// at, which the production router records when its data port starts. Every address this
@@ -45,6 +52,23 @@ const PAST_TRANSITION: Duration = Duration::from_millis(900);
 /// is where the emulator answers for the environment; the suite that pins that rule over
 /// every form an endpoint takes is `tests/all/webserver_published_address.rs`.
 const EMULATOR_ENDPOINT: &str = "https://127.0.0.1:9297";
+
+/// The ADDRESS an environment's Apache Airflow web server is published at under that
+/// endpoint: its authority, which is what a client dials. See the suite named above.
+const PUBLISHED_WEBSERVER_ADDRESS: &str = "127.0.0.1:9297";
+
+/// The sentence Amazon MWAA refuses a delete of an environment it has already torn down
+/// with: entirely fixed text, with no value from the request or the state in it.
+///
+/// Written out here rather than read back from the service, so a change to the wording fails
+/// this suite.
+const TORN_DOWN_SENTENCE: &str = "Environments with DELETED status cannot be deleted.";
+
+/// The sentence it refuses a create of a name it already holds with: fixed text, with the
+/// `Name` the REQUEST asked for in it. Written out here for the same reason.
+fn name_taken_sentence(name: &str) -> String {
+    format!("An environment with name {name} already exists. Please use other name.")
+}
 
 /// One HTTP answer, reduced to what these tests assert on.
 struct Answer {
@@ -73,6 +97,16 @@ impl Answer {
             .unwrap_or_default()
             .rsplit(['#', '/'])
             .next()
+            .unwrap_or_default()
+            .to_string()
+    }
+
+    /// The sentence a refusal carries.
+    fn message(&self) -> String {
+        let body = self.json();
+        body.get("message")
+            .or_else(|| body.get("Message"))
+            .and_then(Value::as_str)
             .unwrap_or_default()
             .to_string()
     }
@@ -160,6 +194,48 @@ impl Harness {
     async fn delete(&self, name: &str) -> Answer {
         self.send("DELETE", &format!("/environments/{name}"), None)
             .await
+    }
+
+    /// Wait for the CONDITION, not for a span: poll `GetEnvironment` until the environment
+    /// has settled into `AVAILABLE`, or a generous deadline passes.
+    async fn wait_until_available(&self, name: &str) {
+        let deadline = Instant::now() + POLL_DEADLINE;
+        loop {
+            let status = self
+                .environment(name)
+                .await
+                .get("Status")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            if status == state::STATUS_AVAILABLE {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "case {name}: never reached {}, last status {status}",
+                state::STATUS_AVAILABLE
+            );
+            tokio::time::sleep(POLL_INTERVAL).await;
+        }
+    }
+
+    /// The same for a teardown: poll until `GetEnvironment` reports the environment gone.
+    async fn wait_until_gone(&self, name: &str) {
+        let deadline = Instant::now() + POLL_DEADLINE;
+        loop {
+            let answer = self.get(name).await;
+            if answer.status == 404 {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "case {name}: the teardown never finished, last answer {} {}",
+                answer.status,
+                String::from_utf8_lossy(&answer.body)
+            );
+            tokio::time::sleep(POLL_INTERVAL).await;
+        }
     }
 
     async fn list_tags(&self, arn: &str) -> Answer {
@@ -673,8 +749,8 @@ fn assert_minted(case: &EnvCase, environment: &Value) {
     // Region at one endpoint.
     let url = text("WebserverUrl");
     assert_eq!(
-        url, EMULATOR_ENDPOINT,
-        "case {name}: WebserverUrl must be the endpoint this emulator is served at, got \
+        url, PUBLISHED_WEBSERVER_ADDRESS,
+        "case {name}: WebserverUrl must be the address this emulator is reached at, got \
          {url:?}"
     );
     assert_eq!(
@@ -837,24 +913,28 @@ async fn get_and_the_tag_operations_answer_404_for_an_unknown_resource() {
 }
 
 #[tokio::test]
-async fn an_idempotent_replay_returns_the_stored_arn_and_a_different_create_is_refused() {
+async fn a_second_create_of_a_stored_name_is_refused_and_leaves_the_record_alone() {
     let harness = Harness::new();
     for case in cases() {
         let first = harness.create(&case).await;
         assert_eq!(first.status, 200, "case {}: first create", case.name);
 
-        // `@idempotent`: the SAME create replays to the SAME stored ARN.
-        let replay = harness.create(&case).await;
+        // The name is the environment's identity, so a second create of it is refused —
+        // the identical one as much as one that differs in a member.
+        let repeated = harness.create(&case).await;
         assert_eq!(
-            replay.status, 200,
-            "case {}: replaying an identical create must succeed, got {}",
-            case.name, replay.status
+            repeated.status, 400,
+            "case {}: a create of a name that is taken must be refused, got {} {}",
+            case.name,
+            repeated.status,
+            String::from_utf8_lossy(&repeated.body)
         );
         assert_eq!(
-            replay.json().get("Arn"),
-            first.json().get("Arn"),
-            "case {}: a replay must answer the stored ARN",
-            case.name
+            repeated.message(),
+            name_taken_sentence(case.name),
+            "case {}: the refusal's message, got {:?}",
+            case.name,
+            repeated.message()
         );
 
         // A DIFFERENT create of a name that is taken must not clobber the record.
@@ -878,10 +958,16 @@ async fn an_idempotent_replay_returns_the_stored_arn_and_a_different_create_is_r
             "case {}: a name clash is a ValidationException",
             case.name
         );
+        assert_eq!(
+            first.json().get("Arn"),
+            harness.environment(case.name).await.get("Arn"),
+            "case {}: the stored environment must still be the one the first create stored",
+            case.name
+        );
     }
 
-    tokio::time::sleep(PAST_TRANSITION).await;
     for case in cases() {
+        harness.wait_until_available(case.name).await;
         let environment = harness.environment(case.name).await;
         assert_matches_case(&case, &environment);
     }
@@ -1296,7 +1382,9 @@ async fn delete_tears_the_environment_down_and_only_then_every_reader_loses_it()
             case.name
         );
     }
-    tokio::time::sleep(PAST_TRANSITION).await;
+    for case in cases() {
+        harness.wait_until_available(case.name).await;
+    }
 
     let mut all_names: Vec<String> = cases()
         .iter()
@@ -1366,7 +1454,9 @@ async fn delete_tears_the_environment_down_and_only_then_every_reader_loses_it()
     }
 
     // Only once the teardown has come due does every reader lose it.
-    tokio::time::sleep(PAST_TRANSITION).await;
+    for case in cases() {
+        harness.wait_until_gone(case.name).await;
+    }
     for case in cases() {
         let arn = case.arn();
         let gone = harness.get(case.name).await;
@@ -1388,13 +1478,29 @@ async fn delete_tears_the_environment_down_and_only_then_every_reader_loses_it()
             tags.status
         );
 
-        // And a delete of the name is now a 404, not a silent success.
+        // And a delete of the name now reaches the record the finished teardown left: it is
+        // refused by its DELETED status, which is how a retrying deleter tells "already
+        // torn down" from a name that never existed.
         let again = harness.delete(case.name).await;
         assert_eq!(
-            again.status, 404,
-            "case {}: DeleteEnvironment after a finished teardown must answer 404, got {}",
+            again.status, 400,
+            "case {}: DeleteEnvironment after a finished teardown must be refused, got {}",
             case.name,
             again.status
+        );
+        assert_eq!(
+            again.error_code(),
+            "ValidationException",
+            "case {}: a delete of a torn-down environment is a ValidationException, got {}",
+            case.name,
+            again.error_code()
+        );
+        assert_eq!(
+            again.message(),
+            TORN_DOWN_SENTENCE,
+            "case {}: the refusal's message, got {:?}",
+            case.name,
+            again.message()
         );
     }
     let listed = harness.list("").await;

@@ -185,36 +185,68 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The router builds the one engine that does carry the store, so this is
         // unreachable there.
         let state = crate::state::service_state(&*self.engine).ok_or_else(store_unavailable)?;
-        let mut store = state.lock();
-        // The transition the clock already owes, materialised before anything is read.
-        store.settle(now);
 
         // The web server a token is minted for is the one the STORED record names, so a
-        // name matching no environment has nothing to mint a token against.
+        // name matching no environment has nothing to mint a token against — and nothing is
+        // minted for it: the lookup comes first, so a refused call leaves no credential
+        // behind. The guard is RELEASED before the mint, because the token comes from the
+        // emulator's credential store and this service never holds its own store while
+        // another component's is taken.
         //
         // This operation is hosted on the ENVIRONMENT data endpoint (`@endpoint` host
         // prefix `env.`), whose front door resolves the request to one environment's web
         // server: it is that front door that refuses an unresolvable name, with its own
         // FIXED, environment-free sentence, not the control plane's request-derived builder
         // (see `crate::state::ENVIRONMENT_ENDPOINT_NOT_FOUND_MESSAGE`).
-        let stored = store.environment(&region, &input.name).ok_or_else(|| {
-            CreateCliTokenErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-                message: Some(crate::state::ENVIRONMENT_ENDPOINT_NOT_FOUND_MESSAGE.to_string()),
-            })
-        })?;
-        // The host is the host of the address that environment's web server is PUBLISHED
-        // at ([`crate::state::webserver_address`]), which is the endpoint this emulator
+        {
+            let mut store = state.lock();
+            // The transition the clock already owes, materialised before anything is read.
+            store.settle(now);
+            if store.environment(&region, &input.name).is_none() {
+                return Err(not_found());
+            }
+        }
+
+        // A token nothing was minted for is no answer, so the operation refuses rather than
+        // reporting one it made up.
+        let cli_token =
+            crate::state::mint_airflow_token(ctx.credential_store()).ok_or_else(token_not_minted)?;
+
+        // The clock is read again, because the mint took time the clock may owe a transition
+        // for, and the environment is re-resolved for the same reason: it is the record as it
+        // stands NOW that remembers the token.
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        store.settle(now);
+        let stored = store
+            .environment_mut(&region, &input.name)
+            .ok_or_else(not_found)?;
+        // The environment REMEMBERS the token just minted — its digest, never the token
+        // itself — because that is what makes the token usable: a request to this
+        // environment's `aws_mwaa/cli` endpoint carries the token as its whole credential,
+        // and nothing but this record says which environment it authenticates to (see
+        // `crate::state::airflow_cli`). Minting a credential is what this operation does,
+        // so recording it is its own effect and not a read's.
+        stored.remember_cli_token(&cli_token);
+        // The host is the address that environment's web server is PUBLISHED at
+        // ([`crate::state::webserver_address`]), which is the endpoint this emulator
         // answers the environment's Apache Airflow surface on — so the host handed to a
-        // caller together with the token is one the caller can reach. `None` for an endpoint
-        // whose host the `Hostname` shape has no spelling for.
+        // caller together with the token is one the caller can reach.
         let web_server_hostname = crate::state::webserver_hostname(&stored.webserver_url);
         drop(store);
 
-        let cli_token =
-            crate::state::mint_airflow_token(ctx.credential_store()).ok_or_else(token_not_minted)?;
         Ok(CreateCliTokenOutput {
             cli_token: Some(cli_token),
-            web_server_hostname,
+            web_server_hostname: Some(web_server_hostname),
         })
     }
+}
+
+/// No environment of that name in the Region this request was signed for: the operation's
+/// one modelled lookup failure, worded by the front door this operation is hosted behind.
+fn not_found() -> CreateCliTokenError {
+    CreateCliTokenErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(crate::state::ENVIRONMENT_ENDPOINT_NOT_FOUND_MESSAGE.to_string()),
+    })
+    .into()
 }

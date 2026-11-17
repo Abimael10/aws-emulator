@@ -302,7 +302,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // Checked AFTER the lookup, so an unknown name is still a 404.
             if !stored.accepts_update() {
                 return Err(validation(crate::state::update_not_allowed_message(
-                    &input.name,
                     &stored.status,
                 )));
             }
@@ -358,7 +357,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .ok_or_else(|| not_found(&input.name))?;
         if !stored.accepts_update() {
             return Err(validation(crate::state::update_not_allowed_message(
-                &input.name,
                 &stored.status,
             )));
         }

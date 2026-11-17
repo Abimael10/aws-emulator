@@ -3,20 +3,20 @@
 //! The ADDRESS this service PUBLISHES for an environment's Apache Airflow web server, end
 //! to end over HTTP through the router this service mounts in production.
 //!
-//! The rule: an address an operation hands a caller to DIAL is the address this emulator is
-//! reached at — the endpoint it serves this service's whole surface on — and never a host in
-//! a zone Amazon Web Services publishes its own endpoints in, which resolves to nothing on
-//! the machine this emulator runs on. It holds for every member that carries that address:
-//! `Environment$WebserverUrl` on the read path, and the `WebServerHostname` both token
-//! operations report beside a minted token, which is the HOST of that same URL — a client
-//! that mints a CLI or web login token composes its next request on it.
+//! The rule: the address an operation hands a caller to DIAL is the address this emulator is
+//! reached at — the authority of the endpoint it serves this service's whole surface on,
+//! host and port together — carried with no scheme, and never a host in a zone Amazon Web
+//! Services publishes its own endpoints in, which resolves to nothing on the machine this
+//! emulator runs on. It holds for every member that carries that address, and both carry the
+//! SAME value, because both name one web server: `Environment$WebserverUrl` on the read path
+//! ("the Apache Airflow web server HOST NAME for the Amazon MWAA environment") and the
+//! `WebServerHostname` both token operations report beside a minted token, on which a client
+//! composes its next request (`https://<address>/aws_mwaa/cli`).
 //!
 //! Each row varies what the rule generalises over: the endpoint the emulator is served at
 //! (a loopback address with a port, a loopback NAME on the default port, a routable
 //! interface, an IPv6 endpoint, and an emulator served on no port at all), the Region the
-//! create is signed for, and the environment name. The `Hostname` shape's own constraints
-//! are asserted on every published host, since a port and the brackets of an IPv6 literal
-//! fit in no value of that shape.
+//! create is signed for, and the environment name.
 
 use std::sync::Arc;
 
@@ -35,8 +35,10 @@ const AWS_ENDPOINT_SUFFIXES: [&str; 4] =
     [".amazonaws.com", ".amazonaws.com.cn", ".api.aws", ".on.aws"];
 
 /// `Hostname` is `@length(1, 255)`
-/// (`smithy_query(query="shape",shape="Hostname",model_path="services/service-com-amazonaws-mwaa-amazonmwaa/smithy-model/com-amazonaws-mwaa-amazonmwaa.json")`).
-const HOSTNAME_MAX_LENGTH: usize = 255;
+/// (`smithy_query(query="shape",shape="Hostname",model_path="services/service-com-amazonaws-mwaa-amazonmwaa/smithy-model/com-amazonaws-mwaa-amazonmwaa.json"`).
+/// `WebserverUrl` is `@length(1, 256)`, so the published address stays inside the shorter of
+/// the two.
+const PUBLISHED_ADDRESS_MAX_LENGTH: usize = 255;
 
 /// One HTTP answer, reduced to what this suite asserts on.
 struct Answer {
@@ -167,28 +169,20 @@ impl Harness {
     }
 }
 
-/// Whether `host` is a value the modelled `Hostname` admits: dot-separated labels of ASCII
-/// letters, digits and inner hyphens, inside `@length(1, 255)`. Written out here from the
-/// shape's own `@pattern`
-/// (`^(([a-zA-Z0-9]|[a-zA-Z0-9][a-zA-Z0-9\-]*[a-zA-Z0-9])\.)*([A-Za-z0-9]|[A-Za-z0-9][A-Za-z0-9\-]*[A-Za-z0-9])$`)
-/// so the assertion does not read its answer from the code under test.
-fn satisfies_the_hostname_shape(host: &str) -> bool {
-    !host.is_empty()
-        && host.len() <= HOSTNAME_MAX_LENGTH
-        && host.split('.').all(|label| {
-            !label.is_empty()
-                && !label.starts_with('-')
-                && !label.ends_with('-')
-                && label
-                    .bytes()
-                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
-        })
+/// Whether `https://<address>/<path>` — the composition every client of a published address
+/// performs — is a URL whose authority is that address, which is what makes the published
+/// value usable at all. Read with the `http` crate's own URI parse rather than by hand.
+fn is_composable_address(address: &str) -> bool {
+    let Ok(uri) = format!("https://{address}/aws_mwaa/cli").parse::<::http::Uri>() else {
+        return false;
+    };
+    uri.authority().map(::http::uri::Authority::as_str) == Some(address)
+        && uri.path() == "/aws_mwaa/cli"
 }
 
-/// One endpoint this emulator can be served at, and what an environment publishes there:
-/// `(case, endpoint, published URL, published host)`. The host is `None` for an endpoint
-/// whose host no `Hostname` value can spell.
-type EndpointCase = (&'static str, &'static str, &'static str, Option<&'static str>);
+/// One endpoint this emulator can be served at, and the address an environment publishes
+/// there: `(case, endpoint, published address)`.
+type EndpointCase = (&'static str, &'static str, &'static str);
 
 /// The endpoints the rule is asserted over, spanning the forms the emulator's own base URL
 /// takes: a loopback address with a port (what the production router records), a loopback
@@ -199,33 +193,24 @@ fn endpoint_cases() -> Vec<EndpointCase> {
         (
             "a served loopback port",
             "https://127.0.0.1:9297",
-            "https://127.0.0.1:9297",
-            Some("127.0.0.1"),
+            "127.0.0.1:9297",
         ),
         (
             "a loopback name on the default port",
             "https://localhost:443",
-            "https://localhost:443",
-            Some("localhost"),
+            "localhost:443",
         ),
         (
             "a routable interface",
             "https://10.0.0.7:18080",
-            "https://10.0.0.7:18080",
-            Some("10.0.0.7"),
+            "10.0.0.7:18080",
         ),
         (
             "an emulator served on no port",
             UNSERVED_URL_BASE,
-            "https://emulator.invalid",
-            Some("emulator.invalid"),
+            "emulator.invalid",
         ),
-        (
-            "an IPv6 endpoint",
-            "https://[::1]:9297",
-            "https://[::1]:9297",
-            None,
-        ),
+        ("an IPv6 endpoint", "https://[::1]:9297", "[::1]:9297"),
     ]
 }
 
@@ -237,9 +222,54 @@ const REGIONS: [&str; 2] = ["us-east-1", "eu-west-2"];
 /// `EnvironmentName`'s `@pattern ^[a-zA-Z][0-9a-zA-Z-_]*$` admits.
 const NAMES: [&str; 3] = ["MyMWAAEnvironment", "env-2_with-parts", "E"];
 
+/// RULE, stated as the deliberate deviation it is: the published address carries the PORT
+/// this emulator is served on, and no value of the modelled `Hostname` shape can spell one —
+/// its `@pattern`
+/// (`^(([a-zA-Z0-9]|[a-zA-Z0-9][a-zA-Z0-9\-]*[a-zA-Z0-9])\.)*([A-Za-z0-9]|…)$`) admits
+/// neither a colon nor the brackets of an IPv6 literal. The port is carried anyway, for both
+/// members, because what they name is an address a client DIALS: a host without the port it
+/// is served on names a port nothing listens on, which is the defect this fix is about (the
+/// Apache Airflow CLI endpoint is reached at exactly this address). The bound both members do
+/// keep is the length one, which every published address stays inside.
+///
+/// The addresses are the ones the tests below read back out of the service for each endpoint
+/// form, so this states a property of what the service publishes and not of a literal.
+#[test]
+fn the_published_address_carries_the_port_the_hostname_shape_cannot_spell() {
+    for (case, endpoint, published) in endpoint_cases() {
+        let served_port = endpoint.rsplit_once(':').and_then(|(_, port)| {
+            port.parse::<u16>().ok().map(|port| port.to_string())
+        });
+        match served_port {
+            Some(port) => {
+                assert!(
+                    published.ends_with(&format!(":{port}")),
+                    "case {case:?}: the published address must carry the port a client has \
+                     to dial ({port}), got {published:?}"
+                );
+                assert!(
+                    published.contains(':'),
+                    "case {case:?}: that port makes the value one no Hostname @pattern \
+                     admits, which is the deviation this rule states, got {published:?}"
+                );
+            }
+            None => assert!(
+                !published.contains(':'),
+                "case {case:?}: an emulator served on no port publishes no port, got \
+                 {published:?}"
+            ),
+        }
+        assert!(
+            (1..=PUBLISHED_ADDRESS_MAX_LENGTH).contains(&published.len()),
+            "case {case:?}: the published address stays inside the members' length bound, \
+             got {published:?}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn the_read_path_publishes_the_web_server_at_the_endpoint_this_emulator_is_served_at() {
-    for (case, endpoint, published_url, _host) in endpoint_cases() {
+    for (case, endpoint, published) in endpoint_cases() {
         let harness = Harness::served_at(endpoint);
         for region in REGIONS {
             for name in NAMES {
@@ -255,14 +285,20 @@ async fn the_read_path_publishes_the_web_server_at_the_endpoint_this_emulator_is
                     .and_then(Value::as_str)
                     .unwrap_or_else(|| panic!("case {row:?}: GetEnvironment reported no WebserverUrl"));
                 assert_eq!(
-                    url, published_url,
-                    "case {row:?}: expected the emulator's own endpoint {published_url:?}, got \
-                     {url:?}"
+                    url, published,
+                    "case {row:?}: expected the authority of this emulator's own endpoint \
+                     {published:?}, got {url:?}"
                 );
-                // `WebserverUrl` is `@pattern ^https://.+$` and `@length(1, 256)`.
+                // The member is the web server's HOST NAME, so it carries no scheme — and a
+                // client composes its own URL on it.
                 assert!(
-                    url.starts_with("https://") && (1..=256).contains(&url.len()),
-                    "case {row:?}: WebserverUrl must be an https URL inside its bound, got {url:?}"
+                    !url.contains("://"),
+                    "case {row:?}: WebserverUrl is a host name, not a URL, got {url:?}"
+                );
+                assert!(
+                    is_composable_address(url) && (1..=PUBLISHED_ADDRESS_MAX_LENGTH).contains(&url.len()),
+                    "case {row:?}: WebserverUrl must be an address a client can compose a URL \
+                     on, inside its bound, got {url:?}"
                 );
                 for suffix in AWS_ENDPOINT_SUFFIXES {
                     assert!(
@@ -277,8 +313,8 @@ async fn the_read_path_publishes_the_web_server_at_the_endpoint_this_emulator_is
 }
 
 #[tokio::test]
-async fn both_token_operations_report_the_host_of_the_published_web_server_url() {
-    for (case, endpoint, published_url, published_host) in endpoint_cases() {
+async fn both_token_operations_report_the_published_web_server_address() {
+    for (case, endpoint, published) in endpoint_cases() {
         let harness = Harness::served_at(endpoint);
         for region in REGIONS {
             for name in NAMES {
@@ -288,7 +324,7 @@ async fn both_token_operations_report_the_host_of_the_published_web_server_url()
                     200,
                     "case {row:?}: the fixture create must succeed"
                 );
-                // The URL the read path publishes, which the host member reports the host of.
+                // The address the read path publishes, which the host member reports too.
                 let url = harness
                     .environment(region, name)
                     .await
@@ -297,8 +333,8 @@ async fn both_token_operations_report_the_host_of_the_published_web_server_url()
                     .map(str::to_string)
                     .unwrap_or_else(|| panic!("case {row:?}: GetEnvironment reported no WebserverUrl"));
                 assert_eq!(
-                    url, published_url,
-                    "case {row:?}: expected {published_url:?}, got {url:?}"
+                    url, published,
+                    "case {row:?}: expected {published:?}, got {url:?}"
                 );
 
                 for (operation, uri) in [
@@ -316,28 +352,16 @@ async fn both_token_operations_report_the_host_of_the_published_web_server_url()
                     let reported = answer.member("WebServerHostname");
                     assert_eq!(
                         reported.as_deref(),
-                        published_host,
-                        "case {row:?}/{operation}: expected the host of {url:?} \
-                         ({published_host:?}), got {reported:?}"
+                        Some(published),
+                        "case {row:?}/{operation}: expected the address the record publishes \
+                         ({published:?}), got {reported:?}"
                     );
-                    if let Some(reported) = &reported {
+                    for suffix in AWS_ENDPOINT_SUFFIXES {
                         assert!(
-                            satisfies_the_hostname_shape(reported),
-                            "case {row:?}/{operation}: the reported host must satisfy the \
-                             Hostname shape, got {reported:?}"
+                            !published.ends_with(suffix),
+                            "case {row:?}/{operation}: a published host must not name an \
+                             endpoint zone of AWS's ({suffix}), got {published:?}"
                         );
-                        assert!(
-                            url.contains(reported.as_str()),
-                            "case {row:?}/{operation}: the reported host must be the host of \
-                             {url:?}, got {reported:?}"
-                        );
-                        for suffix in AWS_ENDPOINT_SUFFIXES {
-                            assert!(
-                                !reported.ends_with(suffix),
-                                "case {row:?}/{operation}: a published host must not name an \
-                                 endpoint zone of AWS's ({suffix}), got {reported:?}"
-                            );
-                        }
                     }
                 }
             }
@@ -346,13 +370,8 @@ async fn both_token_operations_report_the_host_of_the_published_web_server_url()
 }
 
 #[tokio::test]
-async fn the_published_host_is_a_host_this_emulator_answers_requests_addressed_to() {
-    for (case, endpoint, _published_url, published_host) in endpoint_cases() {
-        let Some(published_host) = published_host else {
-            // An endpoint no `Hostname` can spell publishes no host; the URL beside it still
-            // names the address, and the row above pins that.
-            continue;
-        };
+async fn the_published_address_is_one_this_emulator_answers_requests_addressed_to() {
+    for (case, endpoint, published) in endpoint_cases() {
         let harness = Harness::served_at(endpoint);
         let region = REGIONS[0];
         let name = NAMES[0];
@@ -367,12 +386,12 @@ async fn the_published_host_is_a_host_this_emulator_answers_requests_addressed_t
             .member("WebServerHostname")
             .unwrap_or_else(|| panic!("case {case:?}: CreateCliToken reported no WebServerHostname"));
         assert_eq!(
-            hostname, published_host,
-            "case {case:?}: expected {published_host:?}, got {hostname:?}"
+            hostname, published,
+            "case {case:?}: expected {published:?}, got {hostname:?}"
         );
 
         // The address handed to the caller is one this emulator answers on: a request
-        // addressed to that very host reaches this service's environment, rather than
+        // addressed to that very address reaches this service's environment, rather than
         // leaving for a host of AWS's that resolves elsewhere.
         let answer = harness
             .send(
@@ -386,7 +405,7 @@ async fn the_published_host_is_a_host_this_emulator_answers_requests_addressed_t
         assert_eq!(
             answer.status,
             200,
-            "case {case:?}: a request addressed to the published host {hostname:?} must be \
+            "case {case:?}: a request addressed to the published address {hostname:?} must be \
              answered by this emulator, got {} {}",
             answer.status,
             answer.text()
