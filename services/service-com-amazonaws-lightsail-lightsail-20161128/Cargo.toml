@@ -39,9 +39,14 @@ ssh-key = { version = "0.6", default-features = false, features = ["alloc", "ed2
 aws-lc-rs = "1"
 # The PKCS#1 `RSAPrivateKey` an "RSA PRIVATE KEY" PEM carries, and the PKCS#8
 # wrapper the generated key arrives in: the two encodings a minted RSA key pair
-# is read out of and published in.
-pkcs1 = "0.7"
+# is read out of and published in. The `pkcs8` feature carries the RSA algorithm
+# identifier the DER public key an imported pair's fingerprint is taken over
+# names.
+pkcs1 = { version = "0.7", features = ["pkcs8"] }
 pkcs8 = "0.10"
+# The `SubjectPublicKeyInfo` an RSA public key is DER-encoded as, which an AWS
+# key pair fingerprint is the MD5 digest of.
+spki = "0.7"
 # The DER and PEM framing those two encodings are written with.
 der = { version = "0.7", features = ["alloc", "pem"] }
 # The MD5 digest an AWS RSA key pair fingerprint is published as.

@@ -1,15 +1,18 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ImportKeyPair
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ImportKeyPair`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Importing a key pair holds the PUBLIC half a caller brought for the account
+//! under the name the request names — the same record a pair this service minted
+//! itself is held as ([`crate::state::StoredKeyPair`]), so a later read cannot
+//! tell the two apart beyond the key each carries. The submitted value is read by
+//! the crate that implements the SSH key formats, and the `fingerprint` the
+//! record keeps is the digest of that key's DER-encoded public half, computed the
+//! way a minted pair's is
+//! ([`crate::state::imported_public_key_fingerprint`]). No private half is
+//! involved: the caller keeps it, which is why this call reports only the
+//! operation it logged.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ImportKeyPair::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -163,18 +166,108 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ImportKeyPair` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ImportKeyPairErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ImportKeyPair"))
+        // A key pair belongs to one Region, for the reason a created one does:
+        // Lightsail's API is regional and the modelled `KeyPair$location` is
+        // "the region and Availability Zone where the key pair was created", so
+        // the Region of the request's SigV4 credential scope is what the
+        // imported pair is recorded in. A key pair is not zonal: nothing in this
+        // request picks an Availability Zone, so there is none to report.
+        let region = crate::state::request_region(ctx.parts());
+        let location = crate::state::StoredLocation::regional(&region);
+        let now = crate::state::now_ms();
+
+        // `keyPairName` is a modelled `@required` member carrying the modelled
+        // `ResourceName` pattern, so the centralized walk refused an absent or
+        // malformed one before this body ran. `publicKeyBase64` is modelled
+        // `@required` as well but carries no modelled constraint beyond that:
+        // what counts as a public key of the documented type is this handler's.
+        let name = input.key_pair_name;
+        // The key is read BEFORE the store is reached, so a value carrying no
+        // key leaves the account holding no name for it. What the record keeps
+        // of an imported pair is the fingerprint of that key: the private half
+        // stays with the caller, and no read of a key pair reports a public one.
+        let Some(fingerprint) =
+            crate::state::imported_public_key_fingerprint(&input.public_key_base64)
+        else {
+            return Err(invalid(
+                "publicKeyBase64 is not a base64-encoded public key of the ssh-rsa type"
+                    .to_string(),
+            ));
+        };
+
+        crate::state::with_state(&*self.engine, |store| {
+            // A key pair name addresses ONE key pair of the account, whichever
+            // call put it there: an import under a name the account already
+            // holds is refused rather than replacing the public key every
+            // instance launched with that pair is reachable through. The check
+            // and the insert run under ONE exclusive hold on the store, so
+            // concurrent imports of one name elect exactly one winner and the
+            // rest are refused.
+            if store.key_pair(&name).is_some() {
+                return Err(invalid(crate::state::names_already_in_use_message(&name)));
+            }
+            if store.key_pairs.len() >= crate::state::MAX_KEY_PAIRS {
+                return Err(invalid(format!(
+                    "importing a key pair would take this account past the {} this emulator \
+                     holds",
+                    crate::state::MAX_KEY_PAIRS
+                )));
+            }
+
+            let id = store.mint_uuid();
+            // The record is the one every key pair read answers from, carrying
+            // the fingerprint of the key that was brought — the public half
+            // itself is reported by no read, and the private half the caller
+            // keeps was never sent. Nothing in this request asks for tags, so
+            // the pair carries none.
+            store.insert_key_pair(crate::state::StoredKeyPair {
+                name: name.clone(),
+                arn: crate::state::key_pair_arn(&region, &id),
+                support_code: crate::state::support_code(&id),
+                created_at_ms: now,
+                location: location.clone(),
+                tags: Vec::new(),
+                fingerprint,
+            });
+            // The pair exists as this call returns — a `KeyPair` carries no
+            // status member, so there is nothing for the clock to settle later —
+            // which is why the operation it logs is answered terminal.
+            let operation = store.start_operation(
+                now,
+                crate::state::OPERATION_TYPE_IMPORT_KEY_PAIR,
+                crate::state::RESOURCE_TYPE_KEY_PAIR,
+                &name,
+                &location,
+                None,
+            );
+            // The operation is the whole of what this call reports: the modelled
+            // result carries no key pair and no key material, because the caller
+            // brought the key and holds both halves already.
+            Ok(ImportKeyPairOutput {
+                operation: Some(operation.view()),
+            })
+        })
+        .ok_or_else(unavailable)?
     }
+}
+
+/// This operation's 400 refusal for a request the model admits but the service
+/// does not: the modelled `InvalidInputException`, whose message names the member
+/// that is wrong and the constraint it broke.
+fn invalid(message: String) -> ImportKeyPairError {
+    ImportKeyPairErrorModeled::InvalidInputException(InvalidInputException {
+        message: Some(message),
+        ..Default::default()
+    })
+    .into()
+}
+
+/// The store is unreachable — the engine is not the shared in-memory one. A
+/// modelled server fault, never a fresh engine.
+fn unavailable() -> ImportKeyPairError {
+    ImportKeyPairErrorModeled::ServiceException(ServiceException {
+        message: Some("the Lightsail key pair store is unavailable".to_string()),
+        ..Default::default()
+    })
+    .into()
 }

@@ -147,6 +147,94 @@ impl MintedKeyPairMaterial {
     }
 }
 
+/// "The RSA fingerprint of the key pair" (`KeyPair$fingerprint`) of the public
+/// half a caller IMPORTS, read out of the value the request submitted — or
+/// `None` when that value carries no public key of the `ssh-rsa` type this
+/// service holds key pairs of.
+///
+/// The digest is the one [`MintedKeyPairMaterial::fingerprint`] documents: the
+/// MD5 of the key's DER-encoded public half in colon-separated hex. It is
+/// computed from the key ALONE, so a pair whose public half a caller brought
+/// publishes the same fingerprint as a pair this service minted from the same
+/// key — and it is all an imported pair needs beside what the service assigns
+/// it, because the private half stays with the caller and the public half is
+/// reported by no read of a key pair ([`StoredKeyPair`]).
+///
+/// `submitted` is a `publicKeyBase64` member — "a base64-encoded public key of
+/// the ssh-rsa type" — so what is read is the key's own SSH encoding,
+/// base64-encoded. BOTH renderings that encoding is published in are read: the
+/// base64 body alone, which is what every member of this service that reports an
+/// SSH public key carries, and the whole OpenSSH public key line
+/// `<algorithm> <body>[ <comment>]` a caller reads out of a `.pub` file, whose
+/// body is that same base64. Whitespace around the value is not part of either,
+/// so it is not read as key material.
+///
+/// The line form is read because the modelled `Base64` shape is a plain string
+/// carrying no pattern (`smithy_query(query="shape",shape="Base64")`), so the
+/// model refuses none of the text a caller pastes out of that file — and the two
+/// forms carry the SAME key, which is what this answers about. The algorithm name
+/// a line opens with is not extra key material either: an SSH public key's own
+/// encoding names its algorithm inside itself, so the label only has to agree
+/// with the body.
+///
+/// The key is decoded by the crate that implements the SSH key formats, so what
+/// is accepted is a real key of the documented type: a value that is not base64,
+/// that does not decode to an SSH public key, that decodes to a key of another
+/// algorithm, or whose OpenSSH label disagrees with the key its body carries, is
+/// refused rather than held as a key pair with no key behind it.
+pub fn imported_public_key_fingerprint(submitted: &str) -> Option<String> {
+    use ::md5::Digest;
+
+    let text = submitted.trim();
+    let mut fields = text.split_whitespace();
+    let first = fields.next()?;
+    let key = match fields.next() {
+        // The base64 body alone. An SSH public key's own encoding names its
+        // algorithm inside itself (RFC 4253 section 6.6), and the key crate
+        // refuses a line whose label disagrees with the blob — so reading the
+        // body under the `ssh-rsa` label is what fixes the type.
+        None => ::ssh_key::PublicKey::from_openssh(&format!("{SSH_RSA_ALGORITHM} {first}")).ok()?,
+        // A whole OpenSSH public key line, read as the line it is: its algorithm
+        // label has to agree with the key its body carries, and the comment it
+        // may carry is not key material.
+        Some(_) => ::ssh_key::PublicKey::from_openssh(text).ok()?,
+    };
+    let rsa = key.key_data().rsa()?;
+    Some(colon_hex(&::md5::Md5::digest(rsa_public_key_der(rsa)?)))
+}
+
+/// The algorithm name of the key type a Lightsail key pair is of: "a
+/// base64-encoded public key of the ssh-rsa type"
+/// (`ImportKeyPairRequest$publicKeyBase64`, and the same wording on the two
+/// results that report a public half).
+const SSH_RSA_ALGORITHM: &str = "ssh-rsa";
+
+/// The DER-encoded public half of the RSA public key `public` — the
+/// `SubjectPublicKeyInfo` that `openssl rsa -pubout -outform DER` writes, which
+/// an AWS RSA key pair fingerprint is the MD5 digest of
+/// ([`MintedKeyPairMaterial::fingerprint`]).
+///
+/// Built from the key's modulus and public exponent by the crates that implement
+/// those encodings, so a key pair whose public half a caller brought publishes
+/// the SAME fingerprint a pair this service minted does: the digest is taken
+/// over the key, never over the text it arrived in.
+fn rsa_public_key_der(public: &::ssh_key::public::RsaPublicKey) -> Option<Vec<u8>> {
+    use ::der::Encode;
+
+    let pkcs1 = ::pkcs1::RsaPublicKey {
+        modulus: ::der::asn1::UintRef::new(public.n.as_positive_bytes()?).ok()?,
+        public_exponent: ::der::asn1::UintRef::new(public.e.as_positive_bytes()?).ok()?,
+    }
+    .to_der()
+    .ok()?;
+    ::spki::SubjectPublicKeyInfoRef {
+        algorithm: ::pkcs1::ALGORITHM_ID,
+        subject_public_key: ::der::asn1::BitStringRef::new(0, &pkcs1).ok()?,
+    }
+    .to_der()
+    .ok()
+}
+
 /// The key material this service HOLDS for the account's Lightsail default key
 /// pair: the pair the service minted itself.
 ///
