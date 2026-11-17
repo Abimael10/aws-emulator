@@ -1,0 +1,58 @@
+Issue-Source: trace-sweep-divergence
+Issue-Trace: acm-certificate-error-paths
+Issue-Step: setup#1
+Issue-Severity: HIGH
+Issue-Corpus: simparity-wire-aws-v1
+Issue-Corpus-Kind: wire
+Issue-Trace-Ids: acm-certificate-error-paths acm-certificate-dns-explicit-key-algorithm-and-logging-pending-validation-tags-and-not-found
+Issue-Shape-Id: com.amazonaws.acm#CertificateManager
+Issue-Key: acm|ImportCertificate|2xx->4xx|status
+Issue-Key: acm|DescribeCertificate|2xx->2xx|$.Certificate.CreatedAt
+Issue-Key: acm|DescribeCertificate|2xx->2xx|$.Certificate.DomainValidationOptions[*].ResourceRecord.Value
+Issue-Commit: 854dfce53ce69ac447e011f82eaa051fb3476260
+
+# ACM certificate import and DNS-validation projection diverge: a valid ImportCertificate is refused 400 and DescribeCertificate publishes an unservable validation target (2 causes)
+
+> _Note: this issue was identified against the code base at commit `854dfce53ce69ac447e011f82eaa051fb3476260`. If you are an issue fixer working on this, the code base you are currently working in can have drifted, so you might need to trace the issue back to the current code base._
+
+## Operation
+ImportCertificate
+
+## Description
+Two net-new root causes in the ACM service crate, both found by replaying the wire corpus. They share one fault area: the facts ACM derives for a certificate (whether an import is admissible at all, and what the DNS-validation projection publishes) are computed from the replay host's own environment instead of from the request and the service's own served surface. THIS ISSUE HAS 2 CAUSES; both must be closed before it is submitted.
+
+Cause 1 of 2: ImportCertificate refuses a well-formed import with HTTP 400 where AWS answers 200.
+AWS: Smithy ImportCertificate takes Certificate (CertificateBodyBlob, required, @length 1..32768), PrivateKey (PrivateKeyBlob, required, @length 1..5120, sensitive), optional CertificateChain and Tags, and answers 200 with ImportCertificateResponse$CertificateArn (Arn, pattern ^arn:[\w+=/,.@-]+:acm:...$). Every modeled refusal (ConflictException, InvalidArnException, InvalidParameterException, InvalidTagException, LimitExceededException, ResourceNotFoundException, TagPolicyException, TooManyTagsException, ValidationException) is a 400 class, so a 400 here is AWS saying the material or a parameter is unacceptable. The operation's own documented guidelines are the only admissibility rules: PEM encoding, an unencrypted matching private key, a non-empty Issuer field, and the current time between Not Before and Not After. Recorded behavior for this step: HTTP 200, i.e. AWS accepted this exact certificate/key pair and minted an ARN.
+Emulator: the same request answers HTTP 400, so nothing is imported. The replay reports this cluster as a status-only divergence ("status: expected 200, got 400"), so the refusal's error code and message are not quoted here — whichever modeled 400 class the handler picked, the requirement is that an import meeting ACM's documented guidelines is accepted with 200 and a CertificateArn. The failure also costs the fixture its dependent step (this replay reports 1 blocked step), so the error paths the fixture exists to exercise never run.
+Hypothesis: the handler decides the validity window against the replay host's wall clock — services/service-com-amazonaws-acm-certificatemanager/src/ops/import_certificate.rs takes `let now = ::std::time::SystemTime::now();` and then refuses with the fixed sentences "The certificate is expired. You can Import a certificate only during its validity period." / "The certificate is not valid yet. You can Import a certificate only during its validity period." — so a corpus certificate with a pinned validity window is admissible or not depending on when the emulator happens to run, not on the request. The other refusals reachable on this path are the chain check ("Passed PEM is not a certificate chain.", "A certificate in the chain is expired. ..."), the private-key checks ("The private key is not PEM-encoded or is not valid.", "Key provided does not match the certificate."), the key-type check ("ACM does not support this key type.") and the InvalidParameterException content checks (empty Issuer, no subject CN or DNS SAN); any of these firing on material AWS accepted is the same defect.
+Why: ImportCertificate is how a client brings an already-ISSUED certificate into ACM, and it is the one path that does not depend on DNS validation. A client whose success path answers 400 cannot import at all, so every downstream flow keyed to an imported certificate ARN (describe, list, get, association with a presenting service) is unreachable, and a script that works on AWS fails in the emulator with a refusal AWS never gives.
+Fix: ImportCertificate's admissibility validation and its clock source in the ACM service crate's ImportCertificate handler (the material checks and the validity-window comparison), so an import is judged against the request's own instant and ACM's documented guidelines rather than the host clock.
+Traces: acm-certificate-error-paths#setup#1.
+
+Cause 2 of 2: DescribeCertificate's DNS-validation projection publishes a validation CNAME target the emulator does not serve, and dates the certificate with a timestamp outside AWS's wire resolution.
+AWS: Smithy DomainValidation$ResourceRecord is a ResourceRecord{Name, Type=CNAME, Value} and is documented as "the CNAME record that you add to your DNS database for domain validation" — the target is a host the service itself answers for, which is what lets ACM observe the published record and move the certificate to ISSUED. CertificateDetail$CreatedAt is a timestamp; on ACM's awsJson1_1 wire it is epoch seconds, and AWS emits it at millisecond resolution. Recorded behavior: the step's recording asserts both members by shape rather than by literal value (the fixture's expected values are '<shaped-not-asserted>').
+Emulator: $.Certificate.DomainValidationOptions[0].ResourceRecord.Value is '_87a310bf0d758666bc6087b0431fd372.96c7a0e559.acm-validations.aws.' and the replay verdict is host_not_own — the emulator announces a host under the real-AWS acm-validations.aws domain, which is not a name this emulator serves or resolves on the surface it is reached on. In that string only the trailing '.acm-validations.aws.' is fixed text; the leading '_<32 hex>' token label and the middle label are per-validation state values and are not themselves requirements. $.Certificate.CreatedAt is emitted as 1794957932.8015523, which fails the recording's shape assertion for that member (seven fractional digits, i.e. sub-millisecond precision; the value itself is a per-run clock reading and is not the finding).
+Why: a client that does what ACM documents — publish the CNAME at ResourceRecord.Name pointing at ResourceRecord.Value and wait — points its record at a domain nothing in the emulated environment answers for, so DNS validation can never be observed and no requested certificate can reach ISSUED through the documented flow; the emulator must publish a validation target on the surface it actually serves. The over-precise CreatedAt additionally breaks clients and fixtures that parse ACM timestamps at the resolution AWS emits them.
+Fix: the DNS-validation record generator and the CertificateDetail projection in the ACM service crate's certificate state (the CNAME target minting behind RequestCertificate and certificate_detail, read by DescribeCertificate) — mint a validation target the emulator serves and resolves, and serialize CreatedAt at AWS's epoch-seconds/millisecond resolution.
+Related open issues that do NOT carry this replay key: 20261022T143245Z-acm-certificate-representation-dns-validation-and-error-message.md (its cause 2 covers the CNAME's label SHAPE, which now has the middle label; it does not cover the target being unservable) and 20261109T132410Z-acm-elbv2-the-alb-s-published-dnsname-is.md (the same class of defect for an ALB's elb.amazonaws.com DNSName).
+Traces: acm-certificate-dns-explicit-key-algorithm-and-logging-pending-validation-tags-and-not-found#task#2 (cluster also covers task#11).
+
+## Evidence
+Replay of trace set simparity-wire-aws-v1 against the emulator built from this checkout: 407 steps, 403 passed, 3 mismatched, 1 blocked, score 99.0%, emulator_up=true, bootstrap_signal=false.
+
+Cause 1 — fixture acm-certificate-error-paths, step setup#1, operation ImportCertificate, verdict mismatch, divergence_key service=acm|ImportCertificate|status=200->400|keys=status: expected HTTP 200 (with ImportCertificateResponse$CertificateArn), got HTTP 400. Detail: "status: expected 200, got 400". No response-body keys are reported for this cluster, so no error code or message is quoted. 1 step of this replay is blocked as a consequence.
+
+Cause 2 — fixture acm-certificate-dns-explicit-key-algorithm-and-logging-pending-validation-tags-and-not-found, step task#2, operation DescribeCertificate, verdict mismatch, divergence_key service=acm|DescribeCertificate|status=200->200|keys=$.Certificate.CreatedAt,$.Certificate.DomainValidationOptions[0].ResourceRecord.Value (affected_count 2; the cluster's other member is task#11). Detail:
+  $.Certificate.CreatedAt: value_mismatch (expected '<shaped-not-asserted>', got 1794957932.8015523)
+  $.Certificate.DomainValidationOptions[0].ResourceRecord.Value: host_not_own (expected '<shaped-not-asserted>', got '_87a310bf0d758666bc6087b0431fd372.96c7a0e559.acm-validations.aws.')
+Status is 200 in both cases, so the divergence is purely in the projected members.
+
+Smithy citations (services/service-com-amazonaws-acm-certificatemanager/smithy-model/com-amazonaws-acm-certificatemanager.json): ImportCertificate{Certificate required blob @length 1..32768, PrivateKey required blob @length 1..5120 sensitive, CertificateChain, Tags} -> ImportCertificateResponse{CertificateArn}, errors all httpError 400; DescribeCertificate -> DescribeCertificateResponse{Certificate: CertificateDetail}; DomainValidation$ResourceRecord doc: "Contains the CNAME record that you add to your DNS database for domain validation."
+Code citations: services/service-com-amazonaws-acm-certificatemanager/src/ops/import_certificate.rs (`let now = ::std::time::SystemTime::now();`; the expired / not-yet-valid ValidationException sentences; the chain, private-key and key-type refusals), services/service-com-amazonaws-acm-certificatemanager/src/ops/describe_certificate.rs:184-208 (now from SystemTime::now(), projection via crate::state::certificate_detail).
+
+## Steps to Reproduce
+1. Clone the repo and boot the emulator built from this checkout; confirm /__admin/health answers 200.
+2. Replay the wire corpus (trace set simparity-wire-aws-v1).
+3. Cause 1: replay fixture acm-certificate-error-paths step setup#1 — an ImportCertificate carrying the fixture's PEM certificate and matching private key. The recording expects HTTP 200 with a CertificateArn; the emulator answers HTTP 400, and the fixture's dependent step is blocked.
+4. Cause 2: replay fixture acm-certificate-dns-explicit-key-algorithm-and-logging-pending-validation-tags-and-not-found step task#2 (and task#11) — a DescribeCertificate on a DNS-validated, PENDING_VALIDATION certificate. Read $.Certificate.DomainValidationOptions[0].ResourceRecord.Value: it is a '*.acm-validations.aws.' host the emulator does not serve (verdict host_not_own). Read $.Certificate.CreatedAt: it is an epoch value with sub-millisecond (7-digit) precision, outside the shape the recording asserts.
+5. After fixing, re-replay both bindings: acm-certificate-error-paths#setup#1 and acm-certificate-dns-explicit-key-algorithm-and-logging-pending-validation-tags-and-not-found#task#2.
