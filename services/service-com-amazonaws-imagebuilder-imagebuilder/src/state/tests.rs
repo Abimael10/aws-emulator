@@ -442,3 +442,93 @@ fn billable_follows_the_component_s_owner() {
         );
     }
 }
+
+/// RULE: the status a build version reports is read from the clock — a build is outstanding
+/// until it is due, a build something asked to STOP is the running build until its
+/// cancellation is due and cancelled from that instant on (so it never reaches available), and
+/// a build something ENDED reports the status it was ended in at every instant.
+#[test]
+fn the_status_of_a_build_version_follows_the_clock_of_its_build_and_its_cancellation() {
+    let queued = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000);
+    let due = queued + IMAGE_BUILD_SPAN;
+    // (case, the instant the build is due, the instant a cancellation of it is due, the status
+    // something ended it in, the instants to read it at with the status each one reports)
+    type Row<'row> = (
+        &'row str,
+        Option<SystemTime>,
+        Option<SystemTime>,
+        Option<&'row str>,
+        &'row [(Duration, &'row str)],
+    );
+    let rows: &[Row<'_>] = &[
+        (
+            "a build nothing stopped",
+            Some(due),
+            None,
+            None,
+            &[
+                (Duration::ZERO, IMAGE_STATUS_PENDING),
+                (IMAGE_BUILD_SPAN, IMAGE_STATUS_AVAILABLE),
+                (
+                    IMAGE_BUILD_SPAN + Duration::from_secs(60),
+                    IMAGE_STATUS_AVAILABLE,
+                ),
+            ],
+        ),
+        (
+            "a build cancelled before it was due",
+            Some(due),
+            Some(queued + Duration::from_secs(1) + IMAGE_CANCELLATION_SPAN),
+            None,
+            &[
+                (Duration::ZERO, IMAGE_STATUS_PENDING),
+                // Still the running build while its cancellation is outstanding, even past the
+                // instant its own build would have been due.
+                (IMAGE_BUILD_SPAN, IMAGE_STATUS_PENDING),
+                (
+                    Duration::from_secs(1) + IMAGE_CANCELLATION_SPAN,
+                    IMAGE_STATUS_CANCELLED,
+                ),
+                (Duration::from_secs(600), IMAGE_STATUS_CANCELLED),
+            ],
+        ),
+        (
+            "a build something ended",
+            Some(due),
+            Some(queued + IMAGE_CANCELLATION_SPAN),
+            Some(IMAGE_STATUS_FAILED),
+            &[
+                (Duration::ZERO, IMAGE_STATUS_FAILED),
+                (IMAGE_CANCELLATION_SPAN, IMAGE_STATUS_FAILED),
+                (Duration::from_secs(600), IMAGE_STATUS_FAILED),
+            ],
+        ),
+        (
+            "a build that was already available",
+            None,
+            None,
+            None,
+            &[
+                (Duration::ZERO, IMAGE_STATUS_AVAILABLE),
+                (Duration::from_secs(600), IMAGE_STATUS_AVAILABLE),
+            ],
+        ),
+    ];
+    for (case, available_at, cancelled_at, terminal_status, reads) in rows {
+        let record = ImageBuildVersionRecord {
+            available_at: *available_at,
+            cancelled_at: *cancelled_at,
+            terminal_status: terminal_status.map(ToString::to_string),
+            ..ImageBuildVersionRecord::default()
+        };
+        for (after, expected) in *reads {
+            let at = queued + *after;
+            let actual = record.status_at(at);
+            assert_eq!(
+                actual, *expected,
+                "case {case:?}: expected {expected:?} {after:?} after the build was queued, \
+                 got {actual:?}"
+            );
+        }
+    }
+}

@@ -476,6 +476,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> CreateImage<Eng> 
                 // modelled `ImageState`): nothing has ended this build, so the status it
                 // reports is the one its clock decides.
                 terminal_status: None,
+                // Nothing has asked for this build to be stopped either
+                // (`CancelImageCreation`), so no cancellation of it is due.
+                cancelled_at: None,
                 // The AMI this build produces is registered with Amazon EC2 below, once the
                 // build version is filed: a build that was only just queued has produced
                 // nothing.

@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CancelImageCreation
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CancelImageCreation`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Stops the build of an image build version that has not ended, so that build version moves
+//! to the cancelled status.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CancelImageCreation::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! What a reference reaches is the store's own reading of an image
+//! ([`crate::state::ComAmazonawsImagebuilderImagebuilderState::resolve_image`]), and what the
+//! cancellation does to that build version is the store's own
+//! ([`crate::state::ComAmazonawsImagebuilderImagebuilderState::cancel_image_build`]):
+//! "cancellation is asynchronous: the request returns immediately, then Image Builder stops
+//! the running build and moves the image to the CANCELLED state. Output resources that the
+//! build already created … aren't removed".
 //!
 //! ## Shape of an operation
 //!
@@ -97,6 +98,10 @@
 //!   processed the request. Retrying the request may succeed.
 //! * `ServiceUnavailableException` (HTTP 503) — The service is unable to process your request
 //!   at this time.
+//! * `InvalidParameterValueException` (HTTP 400) — widened in through `extra_errors` (see
+//!   below): the refusal a build that has already ended earns.
+//! * `ResourceNotFoundException` (HTTP 404) — widened in through `extra_errors`: the report a
+//!   reference naming no build version of this Region earns.
 
 #[allow(unused_imports)]
 use super::types::*;
@@ -107,20 +112,32 @@ use super::types::*;
 // `CancelImageCreationError` enum is never produced.
 smithy_macros::smithy_model!("smithy-model/com-amazonaws-imagebuilder-imagebuilder.json");
 
-// The operation's MODELED errors. `#[operation_error]` accepts only variants the
-// model declares for this operation, so the scaffold's `NotImplemented` cannot live
-// here — hence the `CancelImageCreationError` alias below. An operation that models no errors
-// generates an UNINHABITED enum here, which is correct and expected: there is nothing
-// to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.imagebuilder#CancelImageCreation")]
+// The operation's MODELED errors, plus the two this SERVICE models for a request this one
+// refuses and its own `errors` list omits, exactly as `RetryImage` — the other control of a
+// build version — widens them in:
+//
+// * `com.amazonaws.imagebuilder#ResourceNotFoundException` (HTTP 404, "At least one of the
+//   resources referenced by your request does not exist", declared in
+//   `types/shared_types.rs`) — `imageBuildVersionArn` may name no build version at all, and a
+//   reference that resolves to nothing is reported MISSING rather than dressed up as an
+//   invalid request, which is a different claim a client branches on;
+// * `com.amazonaws.imagebuilder#InvalidParameterValueException` (HTTP 400, "The value that
+//   you provided for the specified parameter is invalid") — the class this service refuses a
+//   parameter VALUE with, which is what a build that has already ended is.
+#[smithy_macros::operation_error(
+    "com.amazonaws.imagebuilder#CancelImageCreation",
+    extra_errors = ["InvalidParameterValueException", "ResourceNotFoundException"]
+)]
 #[derive(Debug)]
 pub enum CancelImageCreationErrorModeled {
     CallRateLimitExceededException(CallRateLimitExceededException),
     ClientException(ClientException),
     ForbiddenException(ForbiddenException),
     IdempotentParameterMismatchException(IdempotentParameterMismatchException),
+    InvalidParameterValueException(InvalidParameterValueException),
     InvalidRequestException(InvalidRequestException),
     ResourceInUseException(ResourceInUseException),
+    ResourceNotFoundException(ResourceNotFoundException),
     ServiceException(ServiceException),
     ServiceUnavailableException(ServiceUnavailableException),
 }
@@ -176,18 +193,116 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CancelImageCreation` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CancelImageCreationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CancelImageCreation"))
+        // Every modelled constraint on this input — the ARN pattern and the token length —
+        // has been refused by the centralized walk before this body runs, so what is checked
+        // here is only what the model cannot say.
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CancelImageCreationErrorModeled::ServiceException(ServiceException {
+                message: Some(crate::state::store_unavailable_message()),
+            })
+        })?;
+
+        let region = crate::state::request_region(ctx.parts());
+        // The instant is read ONCE, so the status the build reports and the instant its
+        // cancellation is due are decided against one instant.
+        let at = ::std::time::SystemTime::now();
+        let fingerprint = crate::state::cancel_image_creation_request_fingerprint(&input);
+
+        // The idempotency check, the status the build reports and the end of that build all
+        // happen under ONE lock, so two cancellations of one build version cannot both end it.
+        let mut store = state.lock();
+
+        // "If you retry a request with the same client token, Image Builder returns the
+        // original response without running the operation again" — so a repeat of the request
+        // answers what the first call answered, the request id it named included.
+        if let Some(receipt) = store.create_receipt(
+            crate::state::CANCEL_IMAGE_CREATION_OPERATION,
+            &region,
+            &input.client_token,
+        ) {
+            if receipt.fingerprint != fingerprint {
+                return Err(
+                    CancelImageCreationErrorModeled::IdempotentParameterMismatchException(
+                        IdempotentParameterMismatchException {
+                            message: Some(crate::state::idempotent_parameter_mismatch_message()),
+                        },
+                    )
+                    .into(),
+                );
+            }
+            return Ok(answer(
+                receipt.request_id.clone(),
+                receipt.client_token.clone(),
+                receipt.arn.clone(),
+            ));
+        }
+
+        // The reference is read the way every reference to an image of this service is
+        // ([`crate::state::ComAmazonawsImagebuilderImagebuilderState::resolve_image`]): the
+        // modelled `ImageBuildVersionArn` names ONE build version, and one of another Region —
+        // or of Amazon's published catalog, which no build of this account runs — is reached
+        // by no reference of this endpoint, so it is reported MISSING. What is carried out of
+        // the reading is the build version's OWN ARN, so the write below reaches the record the
+        // reference resolved to rather than re-keying on the text the request carried, and the
+        // answer names that build version as this service holds it.
+        let Some((arn, status)) = store
+            .resolve_image(&input.image_build_version_arn, &region, at)
+            .map(|record| (record.arn.clone(), record.status_at(at).to_string()))
+        else {
+            return Err(missing(&input.image_build_version_arn));
+        };
+
+        // "This operation can only be used on images in a non-terminal state": a build that
+        // has already ended has no running build left to stop, so it is refused as a value of
+        // this parameter and nothing about it is written.
+        if crate::state::TERMINAL_IMAGE_STATUSES.contains(&status.as_str()) {
+            return Err(CancelImageCreationErrorModeled::InvalidParameterValueException(
+                InvalidParameterValueException {
+                    message: Some(crate::state::image_not_cancellable_message()),
+                },
+            )
+            .into());
+        }
+
+        // "Cancellation is asynchronous: the request returns immediately, then Image Builder
+        // stops the running build and moves the image to the CANCELLED state" — so what this
+        // call writes is the instant that cancellation is due
+        // ([`crate::state::IMAGE_CANCELLATION_SPAN`]), from which the build version reports the
+        // cancelled status; until then it is still the running build, and what its build
+        // already registered is left where it is.
+        if !store.cancel_image_build(&arn, &region, at) {
+            return Err(missing(&input.image_build_version_arn));
+        }
+        let request_id = crate::state::new_request_id();
+        store.file_create_receipt(
+            crate::state::CANCEL_IMAGE_CREATION_OPERATION,
+            &region,
+            &input.client_token,
+            fingerprint,
+            request_id.clone(),
+            arn.clone(),
+        );
+
+        Ok(answer(request_id, input.client_token, arn))
+    }
+}
+
+/// The report a reference naming no build version of the calling Region earns.
+fn missing(reference: &str) -> CancelImageCreationError {
+    CancelImageCreationErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(crate::state::required_resource_not_found_message(reference)),
+    })
+    .into()
+}
+
+/// The answer a cancelled build version is reported by, which a repeat of its request repeats
+/// verbatim: the request this answer names, the token that identified that request, and "the
+/// Amazon Resource Name (ARN) of the image whose creation this request canceled" — the build
+/// version the request named, since a cancellation creates nothing.
+fn answer(request_id: String, client_token: String, arn: String) -> CancelImageCreationOutput {
+    CancelImageCreationOutput {
+        request_id: Some(request_id),
+        client_token: Some(client_token),
+        image_build_version_arn: Some(arn),
     }
 }

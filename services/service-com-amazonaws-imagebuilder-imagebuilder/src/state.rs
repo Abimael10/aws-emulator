@@ -202,7 +202,8 @@ mod schedule_expression;
 pub use schedule_expression::*;
 
 use crate::ops::types::{
-    AdditionalInstanceConfiguration, AmiDistributionConfiguration, Component,
+    AdditionalInstanceConfiguration, AmiDistributionConfiguration, CancelImageCreationInput,
+    Component,
     ComponentConfiguration, ComponentParameterDetail,
     ComponentState, ComponentSummary, ComponentVersion, CreateComponentInput,
     CreateDistributionConfigurationInput, CreateImageInput,
@@ -294,6 +295,11 @@ pub const CREATE_IMAGE_OPERATION: &str = "CreateImage";
 /// `clientToken` of its own, so its receipts are filed under its own name: the same token
 /// may queue a build and then retry it.
 pub const RETRY_IMAGE_OPERATION: &str = "RetryImage";
+
+/// See [`CREATE_INFRASTRUCTURE_CONFIGURATION_OPERATION`]. A cancellation of a build carries a
+/// `clientToken` of its own, so its receipts are filed under its own name: the same token may
+/// queue a build and then cancel it.
+pub const CANCEL_IMAGE_CREATION_OPERATION: &str = "CancelImageCreation";
 
 /// The listing a page token belongs to, so a token issued by one list operation cannot
 /// be spent on another ([`encode_page_token`]).
@@ -567,6 +573,19 @@ pub const IMAGE_STATUS_FAILED: &str = "FAILED";
 /// `imageBuildVersionArn` member).
 pub const RETRYABLE_IMAGE_STATUSES: &[&str] = &[IMAGE_STATUS_FAILED, IMAGE_STATUS_CANCELLED];
 
+/// The statuses a build has ENDED in, so nothing is still running for it to stop.
+///
+/// The modelled `ImageState`'s own documentation names them: a new image "moves through build,
+/// test, and distribution statuses during creation, and ends in the AVAILABLE, FAILED, or
+/// CANCELLED state". `CancelImageCreation` "can only be used on images in a non-terminal
+/// state", which is every status that is not one of these — in this store, the one a build
+/// reports while it is still outstanding ([`IMAGE_STATUS_PENDING`]).
+pub const TERMINAL_IMAGE_STATUSES: &[&str] = &[
+    IMAGE_STATUS_AVAILABLE,
+    IMAGE_STATUS_FAILED,
+    IMAGE_STATUS_CANCELLED,
+];
+
 /// How a build a caller asked for by hand was initiated, from the modelled `BuildType`
 /// enum, whose own documentation names `USER_INITIATED` for a manual build request, as
 /// against the `SCHEDULED` build that only a pipeline's own schedule starts.
@@ -589,6 +608,18 @@ pub const IMAGE_TYPE_DOCKER: &str = "DOCKER";
 /// zero, so a caller that reads straight after the call still observes the queued state,
 /// and short enough that a caller waiting for the image does not wait long.
 pub const IMAGE_BUILD_SPAN: Duration = Duration::from_secs(3);
+
+/// How long after the call that asked for it a cancellation is due to have stopped the build,
+/// and so how long the build version goes on reporting the status of a running build before it
+/// reports [`IMAGE_STATUS_CANCELLED`].
+///
+/// CHOSEN, not documented: `CancelImageCreation` states that "cancellation is asynchronous:
+/// the request returns immediately, then Image Builder stops the running build and moves the
+/// image to the CANCELLED state", but names no duration. It is deliberately not zero, so a
+/// caller that acts straight after the call still observes the build it asked to stop — and
+/// the state errors that build earns, a retry of a build that has not ended among them — and
+/// short enough that a caller waiting for the cancelled image does not wait long.
+pub const IMAGE_CANCELLATION_SPAN: Duration = Duration::from_secs(3);
 
 /// The metadata-tag keys a caller may not assign to the build and test instances.
 ///
@@ -1254,6 +1285,14 @@ pub struct ImageBuildVersionRecord {
     /// of them reports it until something re-runs the build ([`IMAGE_STATUS_CANCELLED`],
     /// [`IMAGE_STATUS_FAILED`]). A record carrying none reports the status its clock decides.
     pub terminal_status: Option<String>,
+    /// The instant the cancellation of this build is due to have stopped it, when one was
+    /// asked for: `CancelImageCreation`'s "cancellation is asynchronous: the request returns
+    /// immediately, then Image Builder stops the running build and moves the image to the
+    /// CANCELLED state", so the build is still the running one until that instant
+    /// ([`IMAGE_CANCELLATION_SPAN`]) and reports [`IMAGE_STATUS_CANCELLED`] from it on
+    /// ([`Self::status_at`]) — which the clock decides and no call has to materialise. A
+    /// record nothing asked to cancel carries none.
+    pub cancelled_at: Option<SystemTime>,
     /// The AMIs this build version produced, as Amazon EC2 answered for each one: "the
     /// Amazon EC2 AMIs created by this image" (`OutputResources`' `amis`), which a read
     /// reports from the instant the build is due on
@@ -1278,12 +1317,22 @@ impl ImageBuildVersionRecord {
     /// A build that was queued is outstanding until the instant it is due to finish
     /// ([`IMAGE_BUILD_SPAN`]), which the clock decides and no call has to materialise: the
     /// same read answers [`IMAGE_STATUS_PENDING`] before that instant and
-    /// [`IMAGE_STATUS_AVAILABLE`] from it on. A build something ENDED instead reports the
-    /// status it was ended in ([`Self::terminal_status`]), which no instant moves it out of.
+    /// [`IMAGE_STATUS_AVAILABLE`] from it on. A build something asked to CANCEL is the running
+    /// build until its cancellation is due ([`Self::cancelled_at`]) and reports
+    /// [`IMAGE_STATUS_CANCELLED`] from that instant on, since "cancellation is asynchronous".
+    /// A build something ENDED instead reports the status it was ended in
+    /// ([`Self::terminal_status`]), which no instant moves it out of.
     #[must_use]
     pub fn status_at(&self, at: SystemTime) -> &str {
         if let Some(ended) = self.terminal_status.as_deref() {
             return ended;
+        }
+        if let Some(cancelled) = self.cancelled_at {
+            return if at < cancelled {
+                IMAGE_STATUS_PENDING
+            } else {
+                IMAGE_STATUS_CANCELLED
+            };
         }
         match self.available_at {
             Some(due) if at < due => IMAGE_STATUS_PENDING,
@@ -3648,6 +3697,22 @@ pub fn retry_image_request_fingerprint(input: &RetryImageInput) -> String {
         .collect()
 }
 
+/// A deterministic rendering of the parameters one `CancelImageCreation` request carries
+/// beside its `clientToken`: the build version whose creation it cancels. See
+/// [`infrastructure_configuration_request_fingerprint`].
+#[must_use]
+pub fn cancel_image_creation_request_fingerprint(input: &CancelImageCreationInput) -> String {
+    let mut fields: BTreeMap<&'static str, String> = BTreeMap::new();
+    fields.insert(
+        "imageBuildVersionArn",
+        text(Some(input.image_build_version_arn.as_str())),
+    );
+    fields
+        .iter()
+        .map(|(member, rendered)| format!("{member}={rendered};"))
+        .collect()
+}
+
 /// One string member, length-prefixed so no two different values render alike.
 fn text(value: Option<&str>) -> String {
     value.map_or_else(
@@ -4209,6 +4274,23 @@ pub fn image_not_retryable_message() -> String {
     ::service_common::validation_message::parameter_value_mismatch(
         IMAGE_ARN_MEMBER,
         "The provided image is not in a failed or cancelled state and cannot be retried.",
+    )
+}
+
+/// Why a cancellation of a build that has already ended is refused.
+///
+/// `CancelImageCreation` "can only be used on images in a non-terminal state", so a build that
+/// has ended ([`TERMINAL_IMAGE_STATUSES`]) is a value of that parameter this service cannot act
+/// on: there is no running build left to stop. Stated in the sentence this service states every
+/// refused parameter in (`service_common::validation_message::parameter_value_mismatch`), whose
+/// variable part is the member alone — the same parameter a retry's own state refusal names
+/// ([`image_not_retryable_message`]) — so the clause states the requirement and echoes nothing
+/// of the request.
+#[must_use]
+pub fn image_not_cancellable_message() -> String {
+    ::service_common::validation_message::parameter_value_mismatch(
+        IMAGE_ARN_MEMBER,
+        "The provided image is in a terminal state and cannot be cancelled.",
     )
 }
 

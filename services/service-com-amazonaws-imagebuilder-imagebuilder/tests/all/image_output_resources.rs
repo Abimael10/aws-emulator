@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! End-to-end HTTP tests for the AMIs an Image Builder image produces, and for the retry of
-//! a build that ended.
+//! End-to-end HTTP tests for the AMIs an Image Builder image produces, and for the two
+//! controls of a build version: the retry of a build that ended, and the cancellation of one
+//! that has not.
 //!
 //! Every case drives the real wire path (the production `MultiServiceRouter`, restJson1
 //! serialization, the modelled-constraint walk and the handlers), so what is asserted is what
@@ -31,6 +32,17 @@
 //!   version is created": a build in any other status is refused HTTP 400
 //!   `InvalidParameterValueException` and keeps running, and a build that ended is queued
 //!   again under its own ARN.
+//! * `CancelImageCreation` "can only be used on images in a non-terminal state", and
+//!   "cancellation is asynchronous: the request returns immediately, then Image Builder stops
+//!   the running build and moves the image to the CANCELLED state": a build version that has
+//!   not ended is accepted whichever path queued it and reports CANCELLED once its
+//!   cancellation is due; one that has already ended — in any of the statuses a build ends in
+//!   — is refused HTTP 400 `InvalidParameterValueException` with its own status left
+//!   untouched. A reference reaching no build version of the calling Region is reported
+//!   missing, and the `clientToken` makes a repeat of the request answer the original
+//!   response. That the build is still the running one until its cancellation is due is
+//!   asserted against the store's own clock in `src/state/tests.rs`, which needs no wall
+//!   clock to observe the transient state.
 //!
 //! The rows span what the rules generalise over: which path queued the build (a build asked
 //! for by hand, a pipeline execution), whether a distribution configuration names the output
@@ -89,6 +101,21 @@ const INVALID_PARAMETER_VALUE: &str = "InvalidParameterValueException";
 const NOT_RETRYABLE_MESSAGE: &str = "The value supplied for parameter 'imageArn' is not valid. \
                                      The provided image is not in a failed or cancelled state \
                                      and cannot be retried.";
+
+/// The sentence a cancellation of a build that has already ended is refused with: fixed text
+/// for this class, naming the parameter the service's own validator addresses — the same one a
+/// retry's own state refusal names.
+const NOT_CANCELLABLE_MESSAGE: &str = "The value supplied for parameter 'imageArn' is not \
+                                       valid. The provided image is in a terminal state and \
+                                       cannot be cancelled.";
+
+/// The error a request whose `clientToken` was already spent on other parameters earns
+/// (`smithy_query(query="operation",operation="CancelImageCreation")`: a client error,
+/// `@httpError` 400).
+const IDEMPOTENT_PARAMETER_MISMATCH: &str = "IdempotentParameterMismatchException";
+
+/// The error a reference reaching no resource of the calling Region earns.
+const RESOURCE_NOT_FOUND: &str = "ResourceNotFoundException";
 
 /// The prefix EC2 prints an AMI id with.
 const AMI_ID_PREFIX: &str = "ami-";
@@ -514,6 +541,17 @@ async fn get_image(router: &MultiServiceRouter, region: &str, reference: &str) -
         percent_encoding::utf8_percent_encode(reference, percent_encoding::NON_ALPHANUMERIC)
     );
     call_in(router, region, "GET", &uri, None).await
+}
+
+/// `CancelImageCreation` of `reference` in `region`, with `token`.
+async fn cancel_image_creation(
+    router: &MultiServiceRouter,
+    region: &str,
+    reference: &str,
+    token: &str,
+) -> (u16, Value) {
+    let body = json!({ "imageBuildVersionArn": reference, "clientToken": token });
+    call_in(router, region, "PUT", "/CancelImageCreation", Some(&body)).await
 }
 
 /// `RetryImage` of `reference` in `region`, with `token`.
@@ -1164,4 +1202,348 @@ async fn two_builds_of_one_image_produce_differently_named_amis() {
             "case {case:?}: expected the build timestamp of this run in {name:?}"
         );
     }
+}
+
+/// RULE: a cancellation of a build version that has NOT ended is accepted, whichever path
+/// queued that build; the build is still the running one when the call returns, reports the
+/// cancelled status once its cancellation is due, and is then past cancelling. A repeat of the
+/// same request answers the original response.
+#[tokio::test]
+async fn a_cancel_ends_a_build_that_has_not_ended() {
+    let (router, _engine) = emulator_with_ec2();
+    let parent_image = held_ami_id(&router).await;
+    let component = create_component(&router, REGION, "greet").await;
+    let configuration = create_configuration(&router, REGION, "build-infra").await;
+    let recipe = create_recipe(
+        &router,
+        REGION,
+        "cancelled-build",
+        &parent_image,
+        &component,
+        None,
+    )
+    .await;
+    let pipeline = create_pipeline(
+        &router,
+        REGION,
+        "cancelled-build-pipeline",
+        &recipe,
+        &configuration,
+        None,
+    )
+    .await;
+
+    // (case, whether a pipeline execution queued the build, the token that queued it, the
+    // token the cancellation carries) — one row per path that queues a build: the one a caller
+    // asks for by hand, and the one a pipeline execution starts.
+    let rows: &[(&str, bool, &str, &str)] = &[
+        (
+            "a build a create queued",
+            false,
+            "create-cancelled-build",
+            "cancel-created-build",
+        ),
+        (
+            "a build a pipeline execution queued",
+            true,
+            "start-cancelled-build",
+            "cancel-started-build",
+        ),
+    ];
+
+    for (case, by_pipeline, queue_token, token) in rows {
+        // The build is queued right before it is cancelled, so the cancellation reaches a
+        // build that is still outstanding however long the row before it took.
+        let build = if *by_pipeline {
+            start_pipeline(&router, REGION, &pipeline, queue_token).await
+        } else {
+            create_image(&router, REGION, &recipe, &configuration, None, queue_token).await
+        };
+        let build = &build;
+        let (status, answer) = cancel_image_creation(&router, REGION, build, token).await;
+        let answer = assert_ok(case, status, answer);
+        let cancelled_arn = text(case, &answer, "imageBuildVersionArn");
+        assert_eq!(
+            cancelled_arn, *build,
+            "case {case:?}: expected the build version the request named, got {cancelled_arn:?}"
+        );
+        let echoed = text(case, &answer, "clientToken");
+        assert_eq!(
+            echoed, *token,
+            "case {case:?}: expected the request's own token, got {echoed:?}"
+        );
+        let request_id = text(case, &answer, "requestId");
+        assert!(
+            !request_id.is_empty(),
+            "case {case:?}: expected a request id in {answer}"
+        );
+
+        // "Cancellation is asynchronous: the request returns immediately, then Image Builder
+        // stops the running build and moves the image to the CANCELLED state": the build
+        // version reports that status once the cancellation is due, which is waited for by
+        // polling for the CONDITION — never by a fixed sleep, and never by asserting how fast
+        // the host got there. That the build is still the running one until that instant is
+        // asserted against the store's own clock, where no wall clock can flake it
+        // (`the_status_of_a_build_version_follows_the_clock_of_its_build_and_its_cancellation`
+        // in `src/state/tests.rs`).
+        //
+        // A repeat of the request answers the original response rather than cancelling again.
+        let (status, repeat) = cancel_image_creation(&router, REGION, build, token).await;
+        let repeat = assert_ok(case, status, repeat);
+        assert_eq!(
+            repeat, answer,
+            "case {case:?}: expected the original response, got {repeat}"
+        );
+
+        let cancelled = poll_for_status(&router, REGION, build, CANCELLED_STATUS).await;
+        let reported = image_status(case, &cancelled);
+        assert_eq!(
+            reported, CANCELLED_STATUS,
+            "case {case:?}: expected the build version to report {CANCELLED_STATUS}, got \
+             {reported:?}"
+        );
+
+        // The build has ended now, so a cancellation under a token of its own is refused and
+        // the build version keeps the status it ended in.
+        let (status, answer) =
+            cancel_image_creation(&router, REGION, build, &format!("{token}-again")).await;
+        assert_refused(
+            case,
+            status,
+            &answer,
+            400,
+            INVALID_PARAMETER_VALUE,
+            NOT_CANCELLABLE_MESSAGE,
+        );
+        let after = read_image(&router, REGION, build).await;
+        let kept = image_status(case, &after);
+        assert_eq!(
+            kept, CANCELLED_STATUS,
+            "case {case:?}: expected the refused cancellation to change nothing, got {kept:?}"
+        );
+    }
+}
+
+/// RULE: a cancellation of a build version that has ALREADY ended — in any of the statuses a
+/// build ends in — is refused HTTP 400 `InvalidParameterValueException`, and that build
+/// version keeps the status it ended in.
+#[tokio::test]
+async fn a_cancel_refuses_a_build_that_has_already_ended() {
+    let (router, engine) = emulator_with_ec2();
+    let parent_image = held_ami_id(&router).await;
+    let component = create_component(&router, REGION, "greet").await;
+    let configuration = create_configuration(&router, REGION, "build-infra").await;
+    let recipe = create_recipe(
+        &router,
+        REGION,
+        "settled-build",
+        &parent_image,
+        &component,
+        None,
+    )
+    .await;
+
+    // A build the clock has settled on its available status has ended, and the other two
+    // statuses a build ends in are ones something ended it in.
+    let available = create_image(
+        &router,
+        REGION,
+        &recipe,
+        &configuration,
+        None,
+        "create-settled-build",
+    )
+    .await;
+    poll_for_status(&router, REGION, &available, AVAILABLE_STATUS).await;
+    let failed = file_ended_build(&engine, REGION, "failed-build", Some(FAILED_STATUS));
+    let cancelled =
+        file_ended_build(&engine, REGION, "ended-cancelled-build", Some(CANCELLED_STATUS));
+
+    // (case, the build version, the status it ended in) — every status the modelled
+    // `ImageState`'s own documentation names a build as ending in: "ends in the AVAILABLE,
+    // FAILED, or CANCELLED state" (`crate::state::TERMINAL_IMAGE_STATUSES`).
+    let rows: &[(&str, &str, &str)] = &[
+        (
+            "a build the clock settled as available",
+            &available,
+            AVAILABLE_STATUS,
+        ),
+        ("a build that failed", &failed, FAILED_STATUS),
+        (
+            "a build something already cancelled",
+            &cancelled,
+            CANCELLED_STATUS,
+        ),
+    ];
+    for (case, build, ended_in) in rows {
+        let (status, answer) =
+            cancel_image_creation(&router, REGION, build, &format!("cancel-{ended_in}")).await;
+        assert_refused(
+            case,
+            status,
+            &answer,
+            400,
+            INVALID_PARAMETER_VALUE,
+            NOT_CANCELLABLE_MESSAGE,
+        );
+        let after = read_image(&router, REGION, build).await;
+        let reported = image_status(case, &after);
+        assert_eq!(
+            reported, *ended_in,
+            "case {case:?}: expected the build version to keep reporting {ended_in:?}, got \
+             {reported:?}"
+        );
+    }
+}
+
+/// RULE: a cancellation whose reference reaches no build version of the calling Region is
+/// reported MISSING, naming the kind of resource the ARN identifies and the ARN the request
+/// carried; and a `clientToken` already spent on another build version is a mismatch that
+/// cancels nothing.
+#[tokio::test]
+async fn a_cancel_reports_a_reference_it_cannot_reach() {
+    let (router, engine) = emulator_with_ec2();
+    let parent_image = held_ami_id(&router).await;
+    let component = create_component(&router, REGION, "greet").await;
+    let configuration = create_configuration(&router, REGION, "build-infra").await;
+    let recipe = create_recipe(
+        &router,
+        REGION,
+        "unreachable-build",
+        &parent_image,
+        &component,
+        None,
+    )
+    .await;
+
+    let elsewhere = file_ended_build(&engine, OTHER_REGION, "other-region-build", None);
+    let never_built = image_build_version_arn(REGION, "never-built", "9.9.9", 7);
+    // An image of Amazon's published catalog: an owner this store holds no build of, which the
+    // modelled `ImageBuildVersionArn` admits as the account field.
+    let published = format!("arn:aws:imagebuilder:{REGION}:aws:image/amazon-linux-2-x86/2023.0.1/1");
+    // (case, the reference)
+    let rows: &[(&str, &str)] = &[
+        ("a build version nothing created", &never_built),
+        ("a build version of another Region", &elsewhere),
+        ("a build version of another owner", &published),
+    ];
+    for (case, reference) in rows {
+        let (status, answer) = cancel_image_creation(
+            &router,
+            REGION,
+            reference,
+            &format!("cancel-unreachable-{}", reference.len()),
+        )
+        .await;
+        assert_refused(
+            case,
+            status,
+            &answer,
+            404,
+            RESOURCE_NOT_FOUND,
+            &format!("The following required resource 'Image' cannot be found: '{reference}'."),
+        );
+    }
+
+    // One token, two different build versions: the second request is a mismatch, and the build
+    // version it named is not cancelled.
+    let token = "one-cancel-token";
+    let first = create_image(
+        &router,
+        REGION,
+        &recipe,
+        &configuration,
+        None,
+        "create-unreachable-first",
+    )
+    .await;
+    let (status, answer) = cancel_image_creation(&router, REGION, &first, token).await;
+    assert_ok("the first cancellation of a token", status, answer);
+
+    let second = create_image(
+        &router,
+        REGION,
+        &recipe,
+        &configuration,
+        None,
+        "create-unreachable-second",
+    )
+    .await;
+    let case = "a token spent on another build version";
+    let (status, answer) = cancel_image_creation(&router, REGION, &second, token).await;
+    assert_eq!(
+        status, 400,
+        "case {case:?}: expected HTTP 400, got {status} with {answer}"
+    );
+    let code = error_code(case, &answer);
+    assert_eq!(
+        code, IDEMPOTENT_PARAMETER_MISMATCH,
+        "case {case:?}: expected {IDEMPOTENT_PARAMETER_MISMATCH}, got {code:?} with {answer}"
+    );
+    let after = read_image(&router, REGION, &second).await;
+    let reported = image_status(case, &after);
+    assert_ne!(
+        reported, CANCELLED_STATUS,
+        "case {case:?}: expected the refused request to cancel nothing, got {reported:?}"
+    );
+}
+
+/// RULE: the status a cancellation writes is the one the rest of the service reads, so the
+/// cancelled build version is one `RetryImage` accepts — "retries a failed or canceled image
+/// build" — whose re-run produces an AMI of its own.
+#[tokio::test]
+async fn a_cancelled_build_is_the_one_a_retry_runs_again() {
+    let (router, _engine) = emulator_with_ec2();
+    let parent_image = held_ami_id(&router).await;
+    let component = create_component(&router, REGION, "greet").await;
+    let configuration = create_configuration(&router, REGION, "build-infra").await;
+    let recipe = create_recipe(
+        &router,
+        REGION,
+        "cancelled-then-retried",
+        &parent_image,
+        &component,
+        None,
+    )
+    .await;
+    let case = "a cancelled build that is retried";
+    let build = create_image(
+        &router,
+        REGION,
+        &recipe,
+        &configuration,
+        None,
+        "create-cancelled-then-retried",
+    )
+    .await;
+
+    let (status, answer) =
+        cancel_image_creation(&router, REGION, &build, "cancel-then-retry").await;
+    assert_ok(case, status, answer);
+
+    // The build version reports the cancelled status once the cancellation is due, which is
+    // waited for by polling for the CONDITION rather than for a time.
+    let cancelled = poll_for_status(&router, REGION, &build, CANCELLED_STATUS).await;
+    let reported = image_status(case, &cancelled);
+    assert_eq!(
+        reported, CANCELLED_STATUS,
+        "case {case:?}: expected {CANCELLED_STATUS} before the retry, got {reported:?}"
+    );
+
+    let (status, answer) = retry_image(&router, REGION, &build, "retry-after-cancel").await;
+    let answer = assert_ok(case, status, answer);
+    let retried = text(case, &answer, "imageBuildVersionArn");
+    assert_eq!(
+        retried, build,
+        "case {case:?}: expected the same build version to re-run, got {retried:?}"
+    );
+
+    let produced = poll_for_output_ami(&router, REGION, &build).await;
+    let settled = image_status(case, &produced);
+    assert_eq!(
+        settled, AVAILABLE_STATUS,
+        "case {case:?}: expected the re-run to reach {AVAILABLE_STATUS}, got {settled:?}"
+    );
+    let ami = single_ami(case, &produced);
+    assert_backed_by_ec2(case, &router, REGION, &ami).await;
 }
