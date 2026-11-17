@@ -4,11 +4,14 @@
 //! Serves one sprite file of one sheet. The (`Style`, `ColorScheme`, `Variant`)
 //! labels select a stored sprite-sheet record in [`crate::state`]; `FileName`
 //! chooses which of that sheet's two paired files is returned — the PNG sheet
-//! or the JSON index describing it — and at which `pixelRatio` (`@2x`). Both
-//! files are derived from one layout of the same record, so the index always
-//! describes the sheet it is paired with. Both are served as STORED objects of
-//! the asset bucket, so both report the media type that bucket stores them
-//! with — see `crate::service::wire` for the object headers that carries.
+//! or the JSON index describing it — and at which `pixelRatio` (`@2x`). The
+//! index is that record's own stored geometry — the icon names the sheet
+//! publishes and the rectangle each of them occupies on it — rather than an
+//! atlas computed per request, and the PNG is drawn from those same
+//! rectangles, so the index always describes the sheet it is paired with. Both
+//! are served as STORED objects of the asset bucket, so both report the media
+//! type that bucket stores them with — see `crate::service::wire` for the
+//! object headers that carries.
 //!
 //! ## Shape of an operation
 //!
@@ -193,11 +196,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     variant.as_wire()
                 )));
             };
-            // Read the record and release the catalog: laying the sheet out,
-            // drawing it and encoding it read nothing from state. Both of a
-            // sheet's files are stored objects of the asset bucket, so the
-            // media type they are delivered with comes from that record rather
-            // than from what is inside the object.
+            // Read the record and release the catalog: scaling the stored
+            // sheet, drawing it and encoding it read nothing further from
+            // state. Both of a sheet's files are stored objects of the asset
+            // bucket, so the media type they are delivered with comes from
+            // that record rather than from what is inside the object.
             (sheet.clone(), catalog.asset_delivery.content_type.clone())
         };
 

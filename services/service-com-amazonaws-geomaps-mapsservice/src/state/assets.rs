@@ -1258,60 +1258,41 @@ pub struct SpriteLayout {
     pub pixel_ratio: u32,
 }
 
-/// Lay a sheet's icons out, at `pixel_ratio` device pixels per style pixel.
+/// The stored sheet at `pixel_ratio` device pixels per style pixel.
 ///
-/// The icons of a published sheet are not one size, so they are packed in rows
-/// rather than in a grid of equal cells: each icon takes the next free
-/// horizontal run of its own width, an icon that would cross the sheet's width
-/// bound starts the next row, and a row is as tall as its tallest icon. Rows
-/// are top-aligned and icons within a row abut, which is what the manifest the
-/// asset endpoint serves reports (consecutive entries share a `y` and the next
-/// entry's `x` is the previous one's `x` plus its width).
+/// Nothing is laid out here: an icon's rectangle on its sheet is catalog data
+/// (`SpriteSheetRecord::icons`), so this only scales the stored geometry and
+/// measures the sheet it adds up to. The `@2x` sheet is therefore the same
+/// sheet at twice the size — an icon's rectangle there is exactly twice its
+/// rectangle at ratio 1.
 ///
-/// Every dimension scales with `pixel_ratio`, including the width bound, so the
-/// `@2x` sheet is the same layout at twice the size: an icon's rectangle there
-/// is exactly twice its rectangle here.
-///
-/// The layout is the single source for both the PNG and the JSON index, which
-/// is why the index always describes the sheet it is paired with.
+/// The one stored geometry feeds both the PNG and the JSON index, which is why
+/// the index always describes the sheet it is paired with.
 pub fn layout_sprites(sheet: &SpriteSheetRecord, pixel_ratio: u32) -> SpriteLayout {
     let ratio = pixel_ratio.max(1);
-    let widest = sheet.icons.iter().map(|icon| icon.width).max().unwrap_or(0);
-    // A sheet is never narrower than its widest icon, whatever bound the record
-    // carries: an icon that cannot fit any row would never be placed.
-    let bound = sheet.max_width.max(widest) * ratio;
     let mut slots = Vec::with_capacity(sheet.icons.len());
-    let mut x = 0;
-    let mut y = 0;
-    let mut row_height = 0;
     let mut width = 0;
+    let mut height = 0;
     for icon in &sheet.icons {
-        let icon_width = (icon.width * ratio).max(1);
-        let icon_height = (icon.height * ratio).max(1);
-        if x > 0 && x + icon_width > bound {
-            y += row_height;
-            x = 0;
-            row_height = 0;
-        }
-        slots.push(SpriteSlot {
+        let slot = SpriteSlot {
             name: icon.name.clone(),
-            x,
-            y,
-            width: icon_width,
-            height: icon_height,
+            x: icon.x * ratio,
+            y: icon.y * ratio,
+            width: (icon.width * ratio).max(1),
+            height: (icon.height * ratio).max(1),
             tint: icon.tint,
             shape: icon.shape,
-        });
-        x += icon_width;
-        row_height = row_height.max(icon_height);
-        width = width.max(x);
+        };
+        width = width.max(slot.x + slot.width);
+        height = height.max(slot.y + slot.height);
+        slots.push(slot);
     }
     SpriteLayout {
         slots,
         // A sheet with no icons is still a 1x1 image rather than a zero-sized
         // one, which no PNG decoder accepts.
         width: width.max(1),
-        height: (y + row_height).max(1),
+        height: height.max(1),
         pixel_ratio: ratio,
     }
 }

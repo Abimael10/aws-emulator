@@ -415,15 +415,22 @@ pub enum IconShape {
     Pin,
 }
 
-/// One icon in a sprite sheet: the name a style layer references, the box it
-/// occupies at `pixelRatio` 1, its shape and its colour.
+/// One icon of a published sprite sheet's index: the name a style layer
+/// references, the rectangle the icon occupies in that sheet at `pixelRatio` 1,
+/// its shape and its colour.
 ///
-/// The box is a width AND a height because a published sheet's icons are not
-/// square: a map pin is taller than it is wide and a route shield is wider than
-/// it is tall, and the index a client reads reports each icon's own rectangle.
+/// The rectangle is a width AND a height because a published sheet's icons are
+/// not square: a map pin is taller than it is wide, a route shield is wider than
+/// it is tall, and several icons have a footprint of their own inside their
+/// family. It carries an `x`/`y` as well because an icon's offset in the sheet
+/// is part of the published index rather than something a request recomputes.
 #[derive(Debug, Clone)]
 pub struct IconSpec {
     pub name: String,
+    /// The icon's left edge in the sheet, in style pixels.
+    pub x: u32,
+    /// The icon's top edge in the sheet, in style pixels.
+    pub y: u32,
     pub width: u32,
     pub height: u32,
     pub shape: IconShape,
@@ -431,10 +438,13 @@ pub struct IconSpec {
 }
 
 impl IconSpec {
-    /// One icon of a family: its name, its box and how it is drawn.
+    /// One icon of a family, not yet placed on a sheet: its name, its box and
+    /// how it is drawn. [`place_icons_in_rows`] gives it its offset.
     fn new(name: &str, width: u32, height: u32, shape: IconShape, tint: Rgba) -> Self {
         Self {
             name: name.to_string(),
+            x: 0,
+            y: 0,
             width,
             height,
             shape,
@@ -443,17 +453,20 @@ impl IconSpec {
     }
 }
 
-/// A sprite sheet: the icons it holds and how they are laid out on it.
+/// A published sprite sheet: the icons it holds, each at its own place on it.
+///
+/// [`Self::icons`] IS the published index: `GetSprites` reports each icon's
+/// stored rectangle rather than laying the sheet out again per request, and the
+/// PNG is drawn from those same rectangles, so the index always describes the
+/// sheet it is paired with.
 #[derive(Debug, Clone)]
 pub struct SpriteSheetRecord {
     pub style: MapStyleKind,
     pub color_scheme: ColorSchemeKind,
     pub variant: VariantKind,
-    /// Every icon the sheet carries, in the order it is laid out.
+    /// Every icon the sheet carries, in the order the published index lists
+    /// them, each with the rectangle it occupies.
     pub icons: Vec<IconSpec>,
-    /// How wide the sheet may grow, in style pixels: an icon that does not fit
-    /// the current row starts the next one.
-    pub max_width: u32,
     pub cache_control: String,
 }
 
@@ -1038,33 +1051,38 @@ fn style_source(name: &str, tileset: &str) -> StyleSource {
 }
 
 /// The sprite sheet for one (style, colour scheme, variant) triple: the
-/// published iconography, tinted from that pair's palette — so the `Dark` sheet
+/// iconography that sheet publishes, each icon at the rectangle the published
+/// index reports for it, tinted from that pair's palette — so the `Dark` sheet
 /// really is a different sheet rather than the same bytes under another key.
+///
+/// The sheet's geometry is catalog data: it is fixed here, once, from each
+/// icon's own published footprint and the published listing order, so a request
+/// never invents an atlas. The icon NAMES are read per sheet too, because two
+/// published sheets of this catalog do not carry the same shield name set.
 fn seed_sprite_sheet(
     style: MapStyleKind,
     scheme: ColorSchemeKind,
     variant: VariantKind,
 ) -> SpriteSheetRecord {
     let p = palette(style, scheme);
-    let mut icons = Vec::with_capacity(
-        PLACE_ICONS.len()
-            + INCIDENT_ICONS.len()
-            + CITY_DOT_ICONS.len()
-            + MARKER_ICONS.len()
-            + ROUTE_SHIELD_ICONS.len()
-            + RESTRICTION_SHIELD_ICONS.len(),
+    // The sheet's first row: the symbol iconography — places, traffic
+    // incidents, city dots and map pins — in the order the published index
+    // lists it.
+    let mut symbols = Vec::with_capacity(
+        PLACE_ICONS.len() + INCIDENT_ICONS.len() + CITY_DOT_ICONS.len() + MARKER_ICONS.len(),
     );
     for name in PLACE_ICONS {
-        icons.push(IconSpec::new(
+        let (width, height) = place_icon_box(name);
+        symbols.push(IconSpec::new(
             name,
-            PLACE_ICON_BOX,
-            PLACE_ICON_BOX,
+            width,
+            height,
             IconShape::Disc,
             p.label.rgba(),
         ));
     }
     for name in INCIDENT_ICONS {
-        icons.push(IconSpec::new(
+        symbols.push(IconSpec::new(
             name,
             INCIDENT_ICON_BOX,
             INCIDENT_ICON_BOX,
@@ -1074,7 +1092,7 @@ fn seed_sprite_sheet(
     }
     for name in CITY_DOT_ICONS {
         let box_size = city_dot_box(name);
-        icons.push(IconSpec::new(
+        symbols.push(IconSpec::new(
             name,
             box_size,
             box_size,
@@ -1083,7 +1101,7 @@ fn seed_sprite_sheet(
         ));
     }
     for name in MARKER_ICONS {
-        icons.push(IconSpec::new(
+        symbols.push(IconSpec::new(
             name,
             MARKER_WIDTH,
             MARKER_HEIGHT,
@@ -1091,58 +1109,133 @@ fn seed_sprite_sheet(
             p.marker.rgba(),
         ));
     }
-    for name in ROUTE_SHIELD_ICONS {
-        icons.push(IconSpec::new(
-            name,
-            route_shield_width(name),
-            SHIELD_HEIGHT,
-            IconShape::Square,
-            p.building.rgba(),
-        ));
-    }
-    for name in RESTRICTION_SHIELD_ICONS {
-        icons.push(IconSpec::new(
-            name,
-            RESTRICTION_SHIELD_BOX,
-            RESTRICTION_SHIELD_BOX,
-            IconShape::Square,
-            p.road.rgba(),
-        ));
-    }
-    // One sheet is laid out in one order: by icon name, so the rectangle a
-    // client is handed for an icon does not depend on the order the families
-    // happen to be listed in above.
-    icons.sort_by(|left, right| left.name.cmp(&right.name));
+    symbols.sort_by(|left, right| published_symbol_order(left).cmp(&published_symbol_order(right)));
+
+    // The route shields, and then the heavy-goods-vehicle restriction signs:
+    // each of those families starts a row of its own on the published sheet.
+    let mut shields: Vec<IconSpec> = route_shield_icons(style, scheme, variant)
+        .into_iter()
+        .map(|name| {
+            IconSpec::new(
+                name,
+                route_shield_width(name),
+                SHIELD_HEIGHT,
+                IconShape::Square,
+                p.building.rgba(),
+            )
+        })
+        .collect();
+    shields.sort_by(|left, right| left.name.cmp(&right.name));
+    let mut restrictions: Vec<IconSpec> = RESTRICTION_SHIELD_ICONS
+        .iter()
+        .map(|name| {
+            IconSpec::new(
+                name,
+                RESTRICTION_SHIELD_BOX,
+                RESTRICTION_SHIELD_BOX,
+                IconShape::Square,
+                p.road.rgba(),
+            )
+        })
+        .collect();
+    restrictions.sort_by(|left, right| left.name.cmp(&right.name));
+
     SpriteSheetRecord {
         style,
         color_scheme: scheme,
         variant,
-        icons,
-        max_width: SHEET_MAX_WIDTH,
+        icons: place_icons_in_rows(vec![symbols, shields, restrictions]),
         cache_control: "max-age=86400".to_string(),
     }
+}
+
+/// Give every icon its offset on the sheet, one row per family.
+///
+/// Within a row the icons abut from the sheet's left edge, and a row sits
+/// directly below the one before it and is as tall as its tallest icon — which
+/// is what the published index reports: the entries of a row share a `y`, and
+/// each entry's `x` is the previous one's `x` plus that entry's width.
+fn place_icons_in_rows(rows: Vec<Vec<IconSpec>>) -> Vec<IconSpec> {
+    let mut placed = Vec::new();
+    let mut y = 0;
+    for row in rows {
+        let mut x = 0;
+        let mut row_height = 0;
+        for mut icon in row {
+            icon.x = x;
+            icon.y = y;
+            x += icon.width;
+            row_height = row_height.max(icon.height);
+            placed.push(icon);
+        }
+        y += row_height;
+    }
+    placed
+}
+
+/// Where the published index lists one symbol icon inside the sheet's first
+/// row: at its FAMILY's place in the row — a city dot is listed where the
+/// family name sorts, whichever of the four dots it is — then widest box first
+/// within a family, then by name.
+fn published_symbol_order(icon: &IconSpec) -> (&str, std::cmp::Reverse<u32>, &str) {
+    let family = if icon.name.starts_with(CITY_DOT_FAMILY) {
+        CITY_DOT_FAMILY
+    } else {
+        icon.name.as_str()
+    };
+    (family, std::cmp::Reverse(icon.width), icon.name.as_str())
 }
 
 // ---------------------------------------------------------------------------
 // The published sprite-sheet iconography
 // ---------------------------------------------------------------------------
 
-/// How wide a sheet may grow, in style pixels, before an icon starts a new row.
-pub const SHEET_MAX_WIDTH: u32 = 512;
-
-/// The box a place (point-of-interest) icon occupies at `pixelRatio` 1. The
-/// manifest the asset endpoint serves reports this size for every place icon
-/// (`accommodation` and `airport` come back as 21x21).
+/// The box most place (point-of-interest) icons occupy at `pixelRatio` 1: the
+/// published index reports this square for every place icon that does not
+/// appear in [`PLACE_ICON_BOXES`] (`accommodation` and `airport` are 21x21).
 pub const PLACE_ICON_BOX: u32 = 21;
+
+/// The place icons the published index reports at a footprint of their own
+/// rather than at the family's square [`PLACE_ICON_BOX`]: a published sheet's
+/// icons are drawn art, so an icon is as wide and as tall as its own artwork.
+///
+/// Source for these, as for every name in this section: the `sprites.json`
+/// index the Maps asset endpoint serves for a sheet — the icon catalog
+/// `GetSprites`' own model documentation points at ("Style iconography with
+/// sprites" in the Amazon Location Service Developer Guide).
+const PLACE_ICON_BOXES: &[(&str, u32, u32)] = &[
+    ("bicycle", 22, 20),
+    ("bus", 20, 20),
+    ("entrance", 20, 20),
+];
+
+/// The box the place icon `name` occupies at `pixelRatio` 1: its own published
+/// footprint where [`PLACE_ICON_BOXES`] gives it one, otherwise the family's
+/// square [`PLACE_ICON_BOX`].
+fn place_icon_box(name: &str) -> (u32, u32) {
+    PLACE_ICON_BOXES
+        .iter()
+        .find(|(icon, _, _)| *icon == name)
+        .map_or((PLACE_ICON_BOX, PLACE_ICON_BOX), |(_, width, height)| {
+            (*width, *height)
+        })
+}
 
 /// The box a traffic-incident icon occupies: bigger than a place icon, because
 /// an incident is drawn over the road it blocks (`accident` is 32x32).
 pub const INCIDENT_ICON_BOX: u32 = 32;
 
-/// The box a city dot occupies, and the smaller one its `_lowrank` variant
-/// gets — a lower-ranked place is drawn with a smaller dot.
-pub const CITY_DOT_BOX: u32 = 12;
-pub const CITY_DOT_LOWRANK_BOX: u32 = 8;
+/// The name every city-dot icon starts with — the family the published index
+/// lists the four dots under.
+pub const CITY_DOT_FAMILY: &str = "citydot";
+
+/// The box a filled city dot occupies, and the box the open ring occupies: the
+/// ring is drawn a pixel wider and taller than the filled dot. A dot's RANK
+/// (`_lowrank`) does not change its box — the published index reports
+/// `citydot` and `citydot_lowrank` at the same size, and likewise both open
+/// dots.
+pub const CITY_DOT_BOX: u32 = 5;
+pub const CITY_DOT_OPEN_BOX: u32 = 6;
 
 /// The box a map pin (`marker`, `marker_*`) occupies: a pin is taller than it
 /// is wide, head plus stem.
@@ -1163,10 +1256,10 @@ pub const SHIELD_MAX_DIGITS: u32 = 4;
 /// a regulatory sign, square and larger than a route shield.
 pub const RESTRICTION_SHIELD_BOX: u32 = 24;
 
-/// The city-dot box for one dot name: a `_lowrank` dot is the smaller one.
+/// The city-dot box for one dot name: the open ring is the wider one.
 fn city_dot_box(name: &str) -> u32 {
-    if name.ends_with("_lowrank") {
-        CITY_DOT_LOWRANK_BOX
+    if name.starts_with("citydot-open") {
+        CITY_DOT_OPEN_BOX
     } else {
         CITY_DOT_BOX
     }
@@ -1292,40 +1385,58 @@ const MARKER_ICONS: &[&str] = &[
     "marker_transit",
 ];
 
-/// The route shields a published sheet carries.
+/// The route shields every published sheet of this catalog carries, except the
+/// Trans-Canada shield, whose name differs per sheet ([`route_shield_icons`]).
+///
+/// A shield's published name is the road NETWORK it belongs to, written as that
+/// network's own namespaced identifier (`shield-AU:NH`, `shield-JP:prefectural`,
+/// `shield-ch:national`) where the network has one, and the shield's shape or
+/// route family (`shield-rectangle-blue`, `shield-US-Hwy-1-2`) where it does
+/// not.
 const ROUTE_SHIELD_ICONS: &[&str] = &[
-    "shield-AE",
-    "shield-AU",
-    "shield-BAB",
+    "shield-AE:E-route",
+    "shield-AU:MR",
+    "shield-AU:NH",
+    "shield-AU:S",
+    "shield-AU:T",
     "shield-BR",
     "shield-CA",
-    "shield-CA-TransCanada",
-    "shield-CN",
-    "shield-CR",
-    "shield-DE",
+    "shield-CN:expressway",
+    "shield-CN:expressway-long",
+    "shield-CR:CR",
+    "shield-CR:national",
+    "shield-DE:BAB",
     "shield-Emirates routes",
-    "shield-HU",
+    "shield-HU:national",
     "shield-IN-National",
     "shield-IN-National-wide",
     "shield-IN-State",
-    "shield-JP",
-    "shield-KR",
+    "shield-JP:JP",
+    "shield-JP:national",
+    "shield-JP:prefectural",
+    "shield-KR:expressway",
+    "shield-KR:expressway-long",
+    "shield-KR:national",
     "shield-MX-Federal-1-2",
     "shield-MX-Federal-3-4",
     "shield-MY",
     "shield-NL",
-    "shield-NL-ring",
-    "shield-PH",
-    "shield-PK",
+    "shield-NL:binnenstedelijke_ring",
+    "shield-PH:E",
+    "shield-PK:motorway",
+    "shield-PK:national",
     "shield-Qatar motorways",
-    "shield-SA",
-    "shield-TR",
-    "shield-TW",
+    "shield-SA:national",
+    "shield-TR:motorway",
+    "shield-TR:motorway-long",
+    "shield-TW:expressway",
+    "shield-TW:freeway",
+    "shield-TW:provincial",
     "shield-US-Hwy-1-2",
     "shield-US-Hwy-3",
     "shield-US-state",
     "shield-UY",
-    "shield-VE",
+    "shield-VE:T",
     "shield-ZM-roads",
     "shield-autostrade-2-3",
     "shield-autostrade-4-5",
@@ -1333,8 +1444,8 @@ const ROUTE_SHIELD_ICONS: &[&str] = &[
     "shield-blue-pentagon-long",
     "shield-blue-red-kite",
     "shield-blue-red-kite-3",
-    "shield-ch",
-    "shield-cy",
+    "shield-ch:national",
+    "shield-cy:national",
     "shield-green-hexagon",
     "shield-green-red-kite",
     "shield-green-red-kite-long",
@@ -1342,7 +1453,7 @@ const ROUTE_SHIELD_ICONS: &[&str] = &[
     "shield-kite-white",
     "shield-kite-white-long",
     "shield-mashreq",
-    "shield-md",
+    "shield-md:national",
     "shield-na",
     "shield-rectangle-blue",
     "shield-rectangle-blue-long",
@@ -1357,6 +1468,41 @@ const ROUTE_SHIELD_ICONS: &[&str] = &[
     "shield-sadc",
     "shield-white-red-square-kite",
 ];
+
+/// The Trans-Canada shield, under the two names published sheets of this
+/// catalog carry it: after the ROUTE it signs, and after the NETWORK it belongs
+/// to, as every other networked shield is named.
+const TRANSCANADA_SHIELD_BY_ROUTE: &str = "shield-CA-TransCanada";
+const TRANSCANADA_SHIELD_BY_NETWORK: &str = "shield-CA:transcanada";
+
+/// The sheet whose published index names the Trans-Canada shield after its
+/// route, addressed the way `GetSprites` addresses a sheet.
+const TRANSCANADA_BY_ROUTE_SHEET: (MapStyleKind, ColorSchemeKind, VariantKind) = (
+    MapStyleKind::Standard,
+    ColorSchemeKind::Light,
+    VariantKind::Default,
+);
+
+/// The route shields the sheet addressed by `(style, scheme, variant)` carries.
+///
+/// The iconography is not one shared list: the published sheets of this catalog
+/// do not all carry the same shield names, so the name set is read per sheet.
+/// [`TRANSCANADA_BY_ROUTE_SHEET`]'s index names the Trans-Canada shield after
+/// the route it signs, where the catalog's other sheets name it after its
+/// network.
+fn route_shield_icons(
+    style: MapStyleKind,
+    scheme: ColorSchemeKind,
+    variant: VariantKind,
+) -> Vec<&'static str> {
+    let mut names = ROUTE_SHIELD_ICONS.to_vec();
+    names.push(if (style, scheme, variant) == TRANSCANADA_BY_ROUTE_SHEET {
+        TRANSCANADA_SHIELD_BY_ROUTE
+    } else {
+        TRANSCANADA_SHIELD_BY_NETWORK
+    });
+    names
+}
 
 /// The heavy-goods-vehicle restriction signs a published sheet carries.
 const RESTRICTION_SHIELD_ICONS: &[&str] = &[
