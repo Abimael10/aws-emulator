@@ -32,6 +32,7 @@ use crate::email_contacts::{
 };
 use crate::resource_tags::{
     create_tagged, pair, tag_map, tags_ok, MAX_TAGS, MAX_TAG_KEY_LEN, MAX_TAG_VALUE_LEN,
+    TAGGING_NOT_FOUND_CODE, TAGGING_NOT_FOUND_STATUS,
 };
 
 /// Percent-encode one `@httpQuery` value: every byte outside the unreserved set
@@ -420,7 +421,7 @@ async fn a_tag_write_lands_on_the_named_contact_only() {
 }
 
 #[tokio::test]
-async fn a_tag_write_on_an_arn_naming_no_contact_is_a_modelled_404() {
+async fn a_tag_write_on_an_arn_naming_no_contact_is_a_tagging_frontend_404() {
     let em = emulator();
     let survivor = create_tagged(&em, "survivor", Some(&tag_map([pair("keep", "me")]))).await;
     let deleted = create_ok(&em, "doomed", "doomed@example.com").await;
@@ -442,14 +443,14 @@ async fn a_tag_write_on_an_arn_naming_no_contact_is_a_modelled_404() {
             ("UntagResource", untag(&em, &arn, &keys(&["team"])).await),
         ] {
             assert_eq!(
-                status, 404,
-                "case {case:?}/{operation}: an arn naming nothing must answer 404, \
-                 got {status} / {body:?}"
+                status, TAGGING_NOT_FOUND_STATUS,
+                "case {case:?}/{operation}: an arn naming nothing must answer \
+                 {TAGGING_NOT_FOUND_STATUS}, got {status} / {body:?}"
             );
             assert_eq!(
                 error_code(&body),
-                "ResourceNotFoundException",
-                "case {case:?}/{operation}: expected ResourceNotFoundException, got {body:?}"
+                TAGGING_NOT_FOUND_CODE,
+                "case {case:?}/{operation}: expected {TAGGING_NOT_FOUND_CODE}, got {body:?}"
             );
         }
     }

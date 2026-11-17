@@ -9,8 +9,8 @@
 //! The rule under test: `ListTagsForResource` reports exactly the tag set persisted
 //! on the email contact its `arn` names, whatever that set is — a contact carrying no
 //! tags reports an EMPTY map rather than an absent one — a well-formed ARN naming no
-//! stored contact is the modelled 404, and the read leaves the record exactly as it
-//! was.
+//! stored contact is the tagging frontend's 404 ([`TAGGING_NOT_FOUND_CODE`]), and the
+//! read leaves the record exactly as it was.
 
 use std::collections::BTreeMap;
 
@@ -29,6 +29,16 @@ pub(crate) const MAX_TAG_KEY_LEN: usize = 128;
 /// The most characters a `TagValue` may carry, from
 /// `smithy_query(query="shape",shape="TagValue")` (`len 0..256`).
 pub(crate) const MAX_TAG_VALUE_LEN: usize = 256;
+
+/// The error SHAPE the ARN-addressed tag operations answer for an ARN that names no
+/// resource — the shared tagging frontend's own, which is NOT the `ResourceNotFoundException`
+/// this model declares for them and the contact operations answer. Transcribed here, so every
+/// suite driving the tag plane states the same identity. `pub(crate)` for the same reason the
+/// request builders are.
+pub(crate) const TAGGING_NOT_FOUND_CODE: &str = "NotFoundException";
+
+/// The status that refusal carries.
+pub(crate) const TAGGING_NOT_FOUND_STATUS: u16 = 404;
 
 /// `GET /tags/{arn}` — `ListTagsForResource`. `pub(crate)` so the sibling suite that
 /// owns the tag WRITES reads them back through this same reader.
@@ -221,7 +231,7 @@ async fn an_arn_naming_no_stored_contact_is_a_modelled_404() {
     let tagged = create_tagged(&em, "survivor", Some(&tag_map([pair("keep", "me")]))).await;
 
     // A well-formed ARN the store never minted, and one whose contact has since been
-    // deleted: both are the modelled 404, never an empty 200.
+    // deleted: both are the tagging frontend's 404, never an empty 200.
     let deleted = create_tagged(&em, "doomed", Some(&tag_map([pair("gone", "soon")]))).await;
     assert_eq!(
         delete(&em, &deleted).await.0,
@@ -235,13 +245,14 @@ async fn an_arn_naming_no_stored_contact_is_a_modelled_404() {
     ] {
         let (status, body) = list_tags(&em, &arn).await;
         assert_eq!(
-            status, 404,
-            "case {case:?}: an arn naming nothing must answer 404, got {status} / {body:?}"
+            status, TAGGING_NOT_FOUND_STATUS,
+            "case {case:?}: an arn naming nothing must answer {TAGGING_NOT_FOUND_STATUS}, got \
+             {status} / {body:?}"
         );
         assert_eq!(
             error_code(&body),
-            "ResourceNotFoundException",
-            "case {case:?}: expected ResourceNotFoundException, got {body:?}"
+            TAGGING_NOT_FOUND_CODE,
+            "case {case:?}: expected {TAGGING_NOT_FOUND_CODE}, got {body:?}"
         );
     }
 

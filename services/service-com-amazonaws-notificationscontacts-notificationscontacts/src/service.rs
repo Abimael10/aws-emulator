@@ -60,11 +60,21 @@
 //! An answer served over HTTP/1.1 reaches the client without the framing header: the HTTP
 //! writer the vendored transport uses drops `content-length` from a `204`, which is below
 //! anything this crate decides.
+//!
+//! ## How a failure NAMES its error shape
+//!
+//! One further fact about this service's wire is stated beside those seams: the FORM it names
+//! an error shape in, in the `x-amzn-errortype` response header — the shape's NAME, with no
+//! namespace before it and no locator after it ([`error_type_locator`]). That header belongs
+//! to the RESPONSE rather than to any modelled shape — no error shape of this model declares
+//! it — and it is what the framework's `restJson1` renderers already write for every failure
+//! this service answers, so no seam below rewrites it.
 
-use smithy_server_runtime::{
-    http, ErasedOperation, Refusal, Refused, Service,
-};
+use smithy_server_runtime::{http, ErasedOperation, Refusal, Refused, Service};
 use std::sync::Arc;
+
+/// How this service names, in `x-amzn-errortype`, the error shape a failure is refused with.
+pub mod error_type_locator;
 
 /// Which of the cross-service refusal renderings this service states a boundary refusal
 /// in. See [`Service::override_refusal`] below.

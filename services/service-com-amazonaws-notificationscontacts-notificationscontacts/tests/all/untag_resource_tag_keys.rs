@@ -25,7 +25,10 @@ use std::collections::BTreeMap;
 
 use crate::email_contacts::{emulator, error_code, get_ok, unknown_arn};
 use crate::resource_tag_writes::{untag, TAG_MUTATION_SUCCESS_STATUS};
-use crate::resource_tags::{create_tagged, pair, tag_map, tags_ok, MAX_TAG_KEY_LEN};
+use crate::resource_tags::{
+    create_tagged, pair, tag_map, tags_ok, MAX_TAG_KEY_LEN, TAGGING_NOT_FOUND_CODE,
+    TAGGING_NOT_FOUND_STATUS,
+};
 
 /// The prefix the pattern's leading `(?!aws:)` look-ahead excludes.
 const RESERVED_PREFIX: &str = "aws:";
@@ -411,15 +414,15 @@ async fn a_refused_element_is_judged_before_the_contact_is_resolved() {
 
     let (status, body) = untag(&em, &unknown, &keys(&["team", "env"])).await;
     assert_eq!(
-        status, 404,
-        "case \"a list of legal elements on an unknown arn\": expected 404, got \
-         {status} / {body:?}"
+        status, TAGGING_NOT_FOUND_STATUS,
+        "case \"a list of legal elements on an unknown arn\": expected \
+         {TAGGING_NOT_FOUND_STATUS}, got {status} / {body:?}"
     );
     assert_eq!(
         error_code(&body),
-        "ResourceNotFoundException",
+        TAGGING_NOT_FOUND_CODE,
         "case \"a list of legal elements on an unknown arn\": expected \
-         ResourceNotFoundException, got {body:?}"
+         {TAGGING_NOT_FOUND_CODE}, got {body:?}"
     );
 
     let reported = tags_ok(&em, &survivor).await;

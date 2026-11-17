@@ -22,7 +22,10 @@ use serde_json::{json, Map, Value};
 
 use crate::email_contacts::{call, create, emulator, error_code, list, Emulator};
 use crate::resource_tag_writes::{tag, untag, TAG_MUTATION_SUCCESS_STATUS};
-use crate::resource_tags::{create_tagged, pair, tag_map, tags_ok, MAX_TAG_KEY_LEN};
+use crate::resource_tags::{
+    create_tagged, pair, tag_map, tags_ok, MAX_TAG_KEY_LEN, TAGGING_NOT_FOUND_CODE,
+    TAGGING_NOT_FOUND_STATUS,
+};
 
 /// The fewest characters the modelled pattern's `.{1,128}` admits — `TagKey` carries no
 /// separate `@length`, so the bound lives only inside the pattern
@@ -400,19 +403,19 @@ async fn a_refused_tag_key_is_judged_before_the_resource_is_resolved() {
          ValidationException, got {body:?}"
     );
 
-    // A well-formed key on that same unknown ARN is still the modelled 404, so the
-    // refusal above came from the key and not from the ARN.
+    // A well-formed key on that same unknown ARN is still the tagging frontend's 404, so
+    // the refusal above came from the key and not from the ARN.
     let (status, body) = tag(&em, &unknown, &tag_map([pair("team", "v")])).await;
     assert_eq!(
-        status, 404,
-        "case \"TagResource on an unknown arn with a legal key\": expected 404, got \
-         {status} / {body:?}"
+        status, TAGGING_NOT_FOUND_STATUS,
+        "case \"TagResource on an unknown arn with a legal key\": expected \
+         {TAGGING_NOT_FOUND_STATUS}, got {status} / {body:?}"
     );
     assert_eq!(
         error_code(&body),
-        "ResourceNotFoundException",
+        TAGGING_NOT_FOUND_CODE,
         "case \"TagResource on an unknown arn with a legal key\": expected \
-         ResourceNotFoundException, got {body:?}"
+         {TAGGING_NOT_FOUND_CODE}, got {body:?}"
     );
 }
 

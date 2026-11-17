@@ -663,28 +663,41 @@ pub fn contact_not_found(arn: &str) -> ResourceNotFoundException {
     resource_not_found(CONTACT_RESOURCE_TITLE, arn, CONTACT_RESOURCE_TYPE)
 }
 
+/// The wire error CODE the ARN-addressed TAG operations of this service answer for an ARN
+/// that names no resource.
+///
+/// It is NOT the `ResourceNotFoundException` the rest of this service answers and the model
+/// declares for those three operations: a tag call addresses ANY taggable resource through
+/// one ARN member and is served by the shared tagging frontend in front of this service, so
+/// the refusal a tag call gets for an ARN that resolves to nothing is that frontend's own
+/// `NotFoundException`. That shape is in no operation's modelled error set, so the refusal
+/// travels through [`crate::scaffolded::Scaffolded::unmodeled`].
+pub const TAGGING_NOT_FOUND_CODE: &str = "NotFoundException";
+
+/// The HTTP status that refusal carries.
+pub const TAGGING_NOT_FOUND_STATUS: u16 = 404;
+
 /// What the tag plane states for a resource it holds no record of: FIXED text, naming
 /// neither the resource it looked for nor the ARN the request asked about.
 ///
-/// The requested ARN is still reported, through the member the shape has for it
-/// (`ResourceNotFoundException$resourceId`, "the ID of the resource that wasn't found"),
-/// so nothing a caller needs is lost by a sentence that carries no parameter.
+/// The frontend addresses every taggable resource type through the one ARN member, so its
+/// sentence names no resource type and carries nothing the request sent.
 const TAGGED_RESOURCE_NOT_FOUND: &str = "Resource was not found";
 
-/// The modelled 404 the TAG PLANE answers for a resource this store does not hold — the
-/// one lookup `TagResource`, `UntagResource` and `ListTagsForResource` share.
+/// The refusal the TAG PLANE answers for a resource this store does not hold — the one
+/// lookup `TagResource`, `UntagResource` and `ListTagsForResource` share.
 ///
-/// A tag-plane operation takes the ARN of ANY taggable resource of this service rather
-/// than of the email contact alone (`TagResource`: "a resource, as identified by its
-/// Amazon Resource Name"), so its refusal states that a resource was not found and names
-/// no resource kind; the readers and writers of the contact itself keep their own
-/// sentence, which names the contact they were asked for.
-pub fn tagged_resource_not_found(arn: &str) -> ResourceNotFoundException {
-    ResourceNotFoundException {
-        message: TAGGED_RESOURCE_NOT_FOUND.to_string(),
-        resource_id: arn.to_string(),
-        resource_type: CONTACT_RESOURCE_TYPE.to_string(),
-    }
+/// Shared by every operation that resolves a resource by tag ARN, so the three cannot answer
+/// it differently. The code is not the modelled shape's, which is why this goes out through
+/// the unmodelled channel rather than through [`contact_not_found`] — whose sentence, and
+/// whose `resourceId` / `resourceType` members, belong to the refusal the CONTACT operations
+/// of this service answer.
+pub fn tagged_resource_not_found<E>() -> crate::scaffolded::Scaffolded<E> {
+    crate::scaffolded::Scaffolded::unmodeled(
+        TAGGING_NOT_FOUND_CODE,
+        TAGGING_NOT_FOUND_STATUS,
+        TAGGED_RESOURCE_NOT_FOUND,
+    )
 }
 
 /// The modelled 404 for an email contact that holds no outstanding activation token.

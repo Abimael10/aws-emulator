@@ -17,8 +17,11 @@
 //!   shape against the schema rather than of a member's own value, and is stated in that
 //!   family's words with the count the request sent and the maximum the schema allows;
 //! * the tag plane states a FIXED sentence for a resource it holds no record of, naming
-//!   neither the ARN the request asked about nor the kind of resource it looked for; that
-//!   ARN is reported through `ResourceNotFoundException$resourceId`.
+//!   neither the ARN the request asked about nor the kind of resource it looked for, under
+//!   the error shape the shared tagging frontend in front of this service answers with;
+//! * every failure names its error shape in the error-type response header by that shape's
+//!   NAME and nothing else, whichever operation answered and whichever layer rendered the
+//!   failure, while the body names the same shape and a success names none at all.
 //!
 //! Each expectation is TRANSCRIBED here rather than rendered by the code under test, so
 //! the suite states AWS's wording independently of what produces it.
@@ -26,12 +29,15 @@
 use std::collections::BTreeMap;
 
 use serde_json::{json, Value};
+use service_com_amazonaws_notificationscontacts_notificationscontacts::service::error_type_locator::header_shape_named;
 
 use crate::email_contacts::{
     activate, call, create, create_ok, delete, emulator, error_code, label, unknown_arn,
 };
 use crate::resource_tag_writes::{tag, untag, TAG_MUTATION_SUCCESS_STATUS};
-use crate::resource_tags::{create_tagged, list_tags, pair, tag_map, tags_ok, MAX_TAGS};
+use crate::resource_tags::{
+    create_tagged, list_tags, pair, tag_map, tags_ok, MAX_TAGS, TAGGING_NOT_FOUND_CODE,
+};
 
 /// The envelope's separator between its count and the clauses it carries.
 const ENVELOPE_SEPARATOR: &str = ": ";
@@ -274,8 +280,8 @@ async fn the_tag_plane_states_a_fixed_sentence_for_a_resource_it_holds_no_record
             );
             assert_eq!(
                 error_code(&body),
-                "ResourceNotFoundException",
-                "case {case:?}: expected ResourceNotFoundException, got {body:?}"
+                TAGGING_NOT_FOUND_CODE,
+                "case {case:?}: expected {TAGGING_NOT_FOUND_CODE}, got {body:?}"
             );
             let stated = message(&body);
             assert_eq!(
@@ -286,11 +292,15 @@ async fn the_tag_plane_states_a_fixed_sentence_for_a_resource_it_holds_no_record
                 !stated.contains(&arn),
                 "case {case:?}: the sentence must carry no ARN, got {stated:?}"
             );
+            // The frontend's shape carries the sentence alone: no resource members, which
+            // belong to the modelled refusal the CONTACT operations answer.
             assert_eq!(
-                body.get("resourceId").and_then(Value::as_str),
-                Some(arn.as_str()),
-                "case {case:?}: the ARN asked about must be reported through resourceId, got \
-                 {body:?}"
+                (
+                    body.get("resourceId").and_then(Value::as_str),
+                    body.get("resourceType").and_then(Value::as_str),
+                ),
+                (None, None),
+                "case {case:?}: expected no resource members, got {body:?}"
             );
         }
     }
@@ -404,6 +414,9 @@ async fn a_refused_tag_call_changes_nothing() {
 
 /// Every refusal of this service names its shape where a restJson1 client reads it: in
 /// the error body's `__type`, and in the error-type response header beside it.
+///
+/// The FORM that header carries it in — the shape's name and nothing else — and the shape the
+/// TAG PLANE names are owned by [`every_failure_names_its_shape_by_name_alone`].
 #[tokio::test]
 async fn every_refusal_names_its_shape() {
     let em = emulator();
@@ -414,7 +427,7 @@ async fn every_refusal_names_its_shape() {
     let raw = crate::email_contacts::call_http(
         &em,
         "GET",
-        &format!("/tags/{}", label(&unknown_arn('0'))),
+        &format!("/emailcontacts/{}", label(&unknown_arn('0'))),
         None,
     )
     .await;
@@ -422,8 +435,9 @@ async fn every_refusal_names_its_shape() {
         .headers()
         .get("x-amzn-errortype")
         .map(|value| value.to_str().unwrap_or("<not utf-8>").to_string());
+    let resolved = header.as_deref().map(header_shape_named);
     assert_eq!(
-        header.as_deref(),
+        resolved,
         Some("ResourceNotFoundException"),
         "case \"a modelled failure a handler returned\": the error-type header must name the \
          shape, got {header:?}"
@@ -436,11 +450,22 @@ async fn every_refusal_names_its_shape() {
             call(
                 &em,
                 "GET",
-                &format!("/tags/{}", label(&unknown_arn('0'))),
+                &format!("/emailcontacts/{}", label(&unknown_arn('0'))),
                 None,
             )
             .await,
             "ResourceNotFoundException",
+        ),
+        (
+            "the failure the tag plane's frontend answers",
+            call(
+                &em,
+                "GET",
+                &format!("/tags/{}", label(&unknown_arn('0'))),
+                None,
+            )
+            .await,
+            TAGGING_NOT_FOUND_CODE,
         ),
         (
             "a refusal of the values the request carried",
@@ -458,6 +483,220 @@ async fn every_refusal_names_its_shape() {
             body.get("__type").and_then(Value::as_str),
             Some(shape),
             "case {case:?}: the body must name the shape, got {body:?}"
+        );
+    }
+}
+
+/// One failure to read the error-type header off: the request that provokes it, the status
+/// it answers and the error shape it names.
+struct ShapeCase {
+    what: String,
+    method: &'static str,
+    uri: String,
+    body: Option<Value>,
+    status: u16,
+    shape: &'static str,
+}
+
+/// The error-type header of one answer, or `None` when it carries none.
+fn error_type_header(response: &http::Response<bytes::Bytes>) -> Option<String> {
+    response
+        .headers()
+        .get("x-amzn-errortype")
+        .map(|value| value.to_str().unwrap_or("<not utf-8>").to_string())
+}
+
+/// Every failure this service renders names its error shape in the error-type header by that
+/// shape's NAME and nothing else — no namespace before it and no locator after it — whichever
+/// operation answered and whichever layer rendered it, and the body names the same shape.
+///
+/// The ARN-addressed TAG operations are the rows that name the shared tagging frontend's own
+/// shape rather than the `ResourceNotFoundException` this model declares for them, because
+/// that frontend is what refuses an ARN resolving to no resource.
+///
+/// The rows differ along what the rule generalises over: the operation and its HTTP method
+/// (POST, GET, DELETE, PUT), the plane it belongs to (the tag plane and the contact plane),
+/// the shape named (the tagging frontend's, `ResourceNotFoundException`,
+/// `ValidationException`), the status (404, 400), and the LAYER that rendered the failure (a
+/// handler's modelled error, a handler's unmodelled one, the pre-handler constraint walk, and
+/// the schema layer's property-count finding).
+#[tokio::test]
+async fn every_failure_names_its_shape_by_name_alone() {
+    let em = emulator();
+    let arn = create_ok(&em, "qualified", "qualified@example.com").await;
+    let writes = json!({ "tags": { "team": "infra" } });
+    let over_full = json!({
+        "tags": Value::Object(
+            generated(MAX_TAGS + 1)
+                .into_iter()
+                .map(|(key, value)| (key, json!(value)))
+                .collect(),
+        )
+    });
+
+    let cases = vec![
+        ShapeCase {
+            what: "TagResource naming no stored contact".to_string(),
+            method: "POST",
+            uri: format!("/tags/{}", label(&unknown_arn('0'))),
+            body: Some(writes.clone()),
+            status: 404,
+            shape: TAGGING_NOT_FOUND_CODE,
+        },
+        ShapeCase {
+            what: "ListTagsForResource naming no stored contact".to_string(),
+            method: "GET",
+            uri: format!("/tags/{}", label(&unknown_arn('z'))),
+            body: None,
+            status: 404,
+            shape: TAGGING_NOT_FOUND_CODE,
+        },
+        ShapeCase {
+            what: "UntagResource naming no stored contact".to_string(),
+            method: "DELETE",
+            uri: format!("/tags/{}?tagKeys=team", label(&unknown_arn('a'))),
+            body: None,
+            status: 404,
+            shape: TAGGING_NOT_FOUND_CODE,
+        },
+        ShapeCase {
+            what: "GetEmailContact naming no stored contact".to_string(),
+            method: "GET",
+            uri: format!("/emailcontacts/{}", label(&unknown_arn('q'))),
+            body: None,
+            status: 404,
+            shape: "ResourceNotFoundException",
+        },
+        ShapeCase {
+            what: "DeleteEmailContact naming no stored contact".to_string(),
+            method: "DELETE",
+            uri: format!("/emailcontacts/{}", label(&unknown_arn('7'))),
+            body: None,
+            status: 404,
+            shape: "ResourceNotFoundException",
+        },
+        ShapeCase {
+            what: "SendActivationCode naming no stored contact".to_string(),
+            method: "POST",
+            uri: format!(
+                "/2022-10-31/emailcontacts/{}/activate/send",
+                label(&unknown_arn('b'))
+            ),
+            body: None,
+            status: 404,
+            shape: "ResourceNotFoundException",
+        },
+        ShapeCase {
+            what: "ActivateEmailContact carrying a code outside its modelled expression"
+                .to_string(),
+            method: "PUT",
+            uri: format!("/emailcontacts/{}/activate/ABC1234", label(&arn)),
+            body: None,
+            status: 400,
+            shape: "ValidationException",
+        },
+        ShapeCase {
+            what: format!("TagResource carrying {} tag entries", MAX_TAGS + 1),
+            method: "POST",
+            uri: format!("/tags/{}", label(&arn)),
+            body: Some(over_full),
+            status: 400,
+            shape: "ValidationException",
+        },
+    ];
+
+    for case in &cases {
+        let what = &case.what;
+        let raw =
+            crate::email_contacts::call_http(&em, case.method, &case.uri, case.body.as_ref()).await;
+        let status = raw.status().as_u16();
+        assert_eq!(
+            status, case.status,
+            "case {what:?}: expected status {}, got {status}",
+            case.status
+        );
+
+        let header = error_type_header(&raw);
+        assert_eq!(
+            header.as_deref(),
+            Some(case.shape),
+            "case {what:?}: expected the error-type header {:?}, got {header:?}",
+            case.shape
+        );
+
+        // Nothing beside the name: no namespace before it, and no locator after it.
+        let resolved = header.as_deref().map(header_shape_named);
+        assert_eq!(
+            resolved,
+            Some(case.shape),
+            "case {what:?}: expected the header to name {:?} and nothing else, got {resolved:?}",
+            case.shape
+        );
+
+        // The body names the same shape, so a client reading either reaches one error.
+        let parsed: Value = serde_json::from_slice(raw.body())
+            .unwrap_or_else(|e| panic!("case {what:?}: the failure body must be JSON: {e}"));
+        assert_eq!(
+            parsed.get("__type").and_then(Value::as_str),
+            Some(case.shape),
+            "case {what:?}: the body must name the same shape, got {parsed:?}"
+        );
+    }
+}
+
+/// A SUCCESS names no error shape at all: the header is a failure's, so nothing that
+/// succeeded carries it — whatever the status and whether the answer has a body.
+#[tokio::test]
+async fn a_successful_answer_names_no_error_shape() {
+    let em = emulator();
+    let arn = create_ok(&em, "succeeding", "succeeding@example.com").await;
+    let writes = json!({ "tags": { "team": "infra" } });
+
+    // (case, method, uri, body)
+    let cases: Vec<(&str, &str, String, Option<Value>)> = vec![
+        (
+            "the create that minted the contact",
+            "POST",
+            "/2022-09-19/emailcontacts".to_string(),
+            Some(json!({ "name": "another", "emailAddress": "another@example.com" })),
+        ),
+        (
+            "a tag write that answers no content",
+            "POST",
+            format!("/tags/{}", label(&arn)),
+            Some(writes),
+        ),
+        (
+            "a tag removal that answers no content",
+            "DELETE",
+            format!("/tags/{}?tagKeys=team", label(&arn)),
+            None,
+        ),
+        (
+            "a read of the tag set",
+            "GET",
+            format!("/tags/{}", label(&arn)),
+            None,
+        ),
+        (
+            "a read of the contact",
+            "GET",
+            format!("/emailcontacts/{}", label(&arn)),
+            None,
+        ),
+    ];
+
+    for (case, method, uri, body) in cases {
+        let raw = crate::email_contacts::call_http(&em, method, &uri, body.as_ref()).await;
+        let status = raw.status().as_u16();
+        assert!(
+            (200..300).contains(&status),
+            "case {case:?}: expected a success, got {status}"
+        );
+        let header = error_type_header(&raw);
+        assert_eq!(
+            header, None,
+            "case {case:?}: a success names no error shape, got {header:?}"
         );
     }
 }

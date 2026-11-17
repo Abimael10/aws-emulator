@@ -147,7 +147,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         // `arn`'s own pattern is modelled, so the centralized walk has already
         // refused a malformed one with a 400 before this body runs; a well-formed ARN
-        // naming no stored contact is this handler's 404.
+        // naming no stored contact is the tag plane's 404.
         let _ = ctx;
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             ListTagsForResourceErrorModeled::InternalServerException(InternalServerException {
@@ -156,11 +156,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
 
         let store = state.lock();
-        let contact = store.contact(&input.arn).ok_or_else(|| {
-            ListTagsForResourceErrorModeled::ResourceNotFoundException(
-                crate::state::tagged_resource_not_found(&input.arn),
-            )
-        })?;
+        // An ARN that resolves to no resource is refused by the shared tagging frontend in
+        // front of this service, under ITS error shape rather than this operation's modelled
+        // `ResourceNotFoundException` (see `crate::state::tagged_resource_not_found`).
+        let contact = store
+            .contact(&input.arn)
+            .ok_or_else(crate::state::tagged_resource_not_found)?;
 
         // A contact carrying no tags has an EMPTY tag set, not an absent one, so the
         // member is always present and one accessor reads either case.

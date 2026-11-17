@@ -173,11 +173,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
 
         let mut store = state.lock();
-        let contact = store.contact_mut(&input.arn).ok_or_else(|| {
-            UntagResourceErrorModeled::ResourceNotFoundException(
-                crate::state::tagged_resource_not_found(&input.arn),
-            )
-        })?;
+        // An ARN that resolves to no resource is refused by the shared tagging frontend in
+        // front of this service, under ITS error shape rather than this operation's modelled
+        // `ResourceNotFoundException` (see `crate::state::tagged_resource_not_found`).
+        let contact = store
+            .contact_mut(&input.arn)
+            .ok_or_else(crate::state::tagged_resource_not_found)?;
 
         // Removing a key the contact never carried is a no-op success, which is what
         // makes repeating the same request answer the same thing.

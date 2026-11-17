@@ -37,7 +37,9 @@ use crate::email_contacts::{
     unknown_arn, Emulator,
 };
 use crate::resource_tag_writes::{tag, untag};
-use crate::resource_tags::{create_tagged, list_tags, pair, tag_map, MAX_TAGS};
+use crate::resource_tags::{
+    create_tagged, list_tags, pair, tag_map, MAX_TAGS, TAGGING_NOT_FOUND_CODE,
+};
 
 /// How AWS NAMES the two resources this service's not-founds are about, and the
 /// `resourceType` each reports. Transcribed as literal text — the resource wording is
@@ -451,19 +453,21 @@ const CONTACT_OPERATIONS: [&str; 4] = [
 ];
 
 /// The TAG-PLANE operations, which take the ARN of any taggable resource of this service
-/// rather than of the contact alone, and so name no resource kind in their refusal.
+/// rather than of the contact alone, and are served by the shared tagging frontend in front
+/// of this service — so their refusal is that frontend's own, naming neither a resource kind
+/// nor the ARN.
 const TAG_PLANE_OPERATIONS: [&str; 3] =
     ["ListTagsForResource", "TagResource", "UntagResource"];
 
-/// What the tag plane states for a resource it holds no record of: fixed text, naming
-/// neither the resource kind nor the ARN, which it reports through `resourceId` instead.
+/// What the tag plane states for a resource it holds no record of: fixed text, naming neither
+/// the resource kind nor the ARN the request carried.
 const TAGGED_RESOURCE_NOT_FOUND: &str = "Resource was not found";
 
 /// RULE: an email contact this service cannot resolve is a 404 naming the resource, the
 /// ARN the request carried and that nothing resolves it — whichever operation resolved the
 /// CONTACT, and whether the ARN never named one or named one since deleted; the tag plane,
-/// which takes the ARN of any taggable resource, states that a resource was not found and
-/// reports the ARN through `resourceId`.
+/// which takes the ARN of any taggable resource, is refused by the tagging frontend's own
+/// `NotFoundException` stating that a resource was not found and carrying nothing else.
 #[tokio::test]
 async fn an_unresolvable_contact_is_reported_with_the_not_found_template() {
     for operation in CONTACT_OPERATIONS.iter().chain(&TAG_PLANE_OPERATIONS) {
@@ -480,19 +484,24 @@ async fn an_unresolvable_contact_is_reported_with_the_not_found_template() {
 
         for (origin, arn) in [("never created", &never_minted), ("deleted", &deleted)] {
             let case = format!("{operation} on an arn {origin}");
+            let on_the_tag_plane = TAG_PLANE_OPERATIONS.contains(operation);
             let (status, body) = resolve(&em, operation, arn).await;
             assert_eq!(
                 status, 404,
-                "case {case:?}: an unresolvable contact must be the modelled 404, got {status} \
-                 / {body:?}"
+                "case {case:?}: an unresolvable contact must be a 404, got {status} / {body:?}"
             );
+            let expected_code = if on_the_tag_plane {
+                TAGGING_NOT_FOUND_CODE
+            } else {
+                "ResourceNotFoundException"
+            };
             assert_eq!(
                 error_code(&body),
-                "ResourceNotFoundException",
-                "case {case:?}: expected ResourceNotFoundException, got {body:?}"
+                expected_code,
+                "case {case:?}: expected {expected_code}, got {body:?}"
             );
             let stated = message(&body);
-            let expected = if TAG_PLANE_OPERATIONS.contains(operation) {
+            let expected = if on_the_tag_plane {
                 TAGGED_RESOURCE_NOT_FOUND.to_string()
             } else {
                 not_found_message(CONTACT_TITLE, arn)
@@ -501,16 +510,30 @@ async fn an_unresolvable_contact_is_reported_with_the_not_found_template() {
                 stated, expected,
                 "case {case:?}: expected {expected:?}, got {stated:?}"
             );
-            assert_eq!(
-                body.get("resourceId").and_then(Value::as_str),
-                Some(arn.as_str()),
-                "case {case:?}: resourceId must name the arn the request carried, got {body:?}"
-            );
-            assert_eq!(
-                body.get("resourceType").and_then(Value::as_str),
-                Some(CONTACT_TYPE),
-                "case {case:?}: resourceType must name the missing resource, got {body:?}"
-            );
+            // The contact operations report the ARN and the kind through the members their
+            // modelled shape has for them; the tagging frontend's shape has neither, so its
+            // refusal carries the sentence alone.
+            let reported_id = body.get("resourceId").and_then(Value::as_str);
+            let reported_type = body.get("resourceType").and_then(Value::as_str);
+            if on_the_tag_plane {
+                assert_eq!(
+                    (reported_id, reported_type),
+                    (None, None),
+                    "case {case:?}: the tagging frontend's refusal carries no resource members, \
+                     got {body:?}"
+                );
+            } else {
+                assert_eq!(
+                    reported_id,
+                    Some(arn.as_str()),
+                    "case {case:?}: resourceId must name the arn the request carried, got {body:?}"
+                );
+                assert_eq!(
+                    reported_type,
+                    Some(CONTACT_TYPE),
+                    "case {case:?}: resourceType must name the missing resource, got {body:?}"
+                );
+            }
         }
     }
 }
