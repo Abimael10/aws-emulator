@@ -16079,6 +16079,7 @@ dependencies = [
  "service-com-amazonaws-rdsdata-rdsdataservice",
  "service-com-amazonaws-rekognition-rekognitionservice",
  "service-com-amazonaws-s3-amazons3",
+ "service-com-amazonaws-s3vectors-s3vectors",
  "service-com-amazonaws-secretsmanager-secretsmanager",
  "service-com-amazonaws-sesv2-simpleemailservice-v2",
  "service-com-amazonaws-sfn-awsstepfunctions",

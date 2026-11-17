@@ -915,6 +915,27 @@ pub const APIS: &[Api] = &[
         },
         answer_model: Some(&OPENSEARCHSERVERLESS_ANSWERS),
     },
+    // `services/service-com-amazonaws-s3vectors-s3vectors/smithy-model/
+    // com-amazonaws-s3vectors-s3vectors.json`: restJson1, sigv4Name `s3vectors`,
+    // endpointPrefix `s3vectors`, sdkId `S3Vectors`. Its requests are bound per operation out
+    // of that same model ([`S3VECTORS`]).
+    //
+    // THE VECTOR STORE a function writes and searches: the embeddings a handler computed for
+    // the event it just processed are written into an index (`PutVectors`), the nearest ones to
+    // a query vector are read back (`QueryVectors`, `GetVectors`, `ListVectors`), and the bucket
+    // and index they live in are created and listed here — so a handler that cannot reach this
+    // service can neither store nor retrieve a vector, and the two faults an operator has to
+    // tell apart, a missing GRANT (`AccessDeniedException`) and a wrong NAME
+    // (`NotFoundException`), are this service's own answers, observable from inside a function
+    // only once the call is made.
+    Api {
+        sdk_token: "s3vectors",
+        signing_name: "s3vectors",
+        endpoint_prefix: "s3vectors",
+        model: Some(S3VECTORS_MODEL),
+        protocol: Protocol::RestJson(&S3VECTORS),
+        answer_model: Some(&S3VECTORS_ANSWERS),
+    },
     // `services/service-com-amazonaws-kinesis-kinesis-20131202/smithy-model/
     // com-amazonaws-kinesis-kinesis-20131202.json`: awsJson1_1, sigv4Name `kinesis`,
     // endpointPrefix `kinesis`, sdkId `Kinesis`, service shape `Kinesis_20131202`.
@@ -1255,6 +1276,10 @@ pub(super) const IOT_DATA_MODEL: &str = include_str!(
     "../../../../service-com-amazonaws-iotdataplane-iotmoonrakerservice/smithy-model/\
      com-amazonaws-iotdataplane-iotmoonrakerservice.json"
 );
+pub(super) const S3VECTORS_MODEL: &str = include_str!(
+    "../../../../service-com-amazonaws-s3vectors-s3vectors/smithy-model/\
+     com-amazonaws-s3vectors-s3vectors.json"
+);
 pub(super) const TRANSFER_MODEL: &str = include_str!(
     "../../../../service-com-amazonaws-transfer-transferservice/smithy-model/\
      com-amazonaws-transfer-transferservice.json"
@@ -1427,6 +1452,10 @@ static TRANSFER: super::blob_members::ServiceModel = super::blob_members::Servic
     source: TRANSFER_MODEL,
     plan: ::std::sync::OnceLock::new(),
 };
+static S3VECTORS_ANSWERS: super::blob_members::ServiceModel = super::blob_members::ServiceModel {
+    source: S3VECTORS_MODEL,
+    plan: ::std::sync::OnceLock::new(),
+};
 
 /// The Bedrock Agent runtime plane's own model, which a call to it is bound by — embedded
 /// exactly as [`APIGATEWAY`] is, and for the same reason: the wire facts of each operation are
@@ -1543,6 +1572,15 @@ static IOT: super::rest_json::RestApi = super::rest_json::RestApi {
 static IOT_DATA: super::rest_json::RestApi = super::rest_json::RestApi {
     model: IOT_DATA_MODEL,
     namespace: "com.amazonaws.iotdataplane",
+    parsed: ::std::sync::OnceLock::new(),
+};
+
+/// The vector store's own model, which a call to it is bound by — embedded exactly as the
+/// models above are and for the same reason: the wire facts of each of its operations are that
+/// model's, so this seam states none of them.
+static S3VECTORS: super::rest_json::RestApi = super::rest_json::RestApi {
+    model: S3VECTORS_MODEL,
+    namespace: "com.amazonaws.s3vectors",
     parsed: ::std::sync::OnceLock::new(),
 };
 

@@ -415,6 +415,11 @@ service-com-amazonaws-opensearchserverless-opensearchserverless = { workspace = 
 # retrieves — are created and ingested through this plane's own API, so what the handler gets
 # back is read out of the records those creates really wrote.
 service-com-amazonaws-bedrockagent-amazonbedrockagentbuildtimelambda = { workspace = true }
+# The VECTOR STORE a handler's own embedding writes and nearest-neighbour searches reach,
+# mounted beside lambda on ONE engine: the bucket, index and vectors a handler created are
+# asserted where a client reads them — through that service's own GetIndex, ListVectorBuckets
+# and GetVectors.
+service-com-amazonaws-s3vectors-s3vectors = { workspace = true }
 # The USER POOL a handler's own Amazon Cognito calls administer, mounted beside lambda on ONE
 # engine: the user a handler created, read, listed or disabled is asserted where a client reads
 # it — through that service's own AdminGetUser and ListUsers.
