@@ -8,11 +8,11 @@
 //!
 //! 1. a cache operation that finds no cache to address is refused 404
 //!    `NotFoundException` whose message names the CALL that met the absence and WHICH
-//!    absence it met: a teardown still removing the instance is a cache that HAS BEEN
-//!    DELETED, while an API past that removal — one whose removal the clock finished or a
-//!    later teardown completed, and one that never had a cache — holds none.
-//!    The teardown is not one of them — it asks for the absence itself, so an empty cache
-//!    slot already satisfies it and it is served;
+//!    absence it met: a cache a teardown removed HAS BEEN DELETED, for as long as the slot
+//!    stays empty, while an API that never had one — including one a redundant teardown
+//!    returned to that state — holds none. The teardown words the same two absences: it
+//!    completes a deletion an earlier one recorded and is served, and it is refused where
+//!    there is no cache of this API to remove at all;
 //! 2. a create on an API that already has a cache is refused 400 `BadRequestException`
 //!    with AppSync's fixed sentence for that class, and the stored cache is untouched;
 //! 3. a teardown's precondition is the CREATION of the instance, not the status it is
@@ -67,9 +67,8 @@ const HEALTH_METRICS: &[&str] = &["ENABLED", "DISABLED"];
 /// address — one for an API that never had a cache and one for an API whose cache was
 /// torn down.
 ///
-/// `DeleteApiCache` is not one of them: a teardown asks for the absence of the cache, so
-/// an empty slot already satisfies it and it renders no absent-cache refusal at all (its
-/// served no-op is asserted on its own below).
+/// `DeleteApiCache` is not one of them: what it answers on an empty slot depends on
+/// whether there is a deletion for it to complete, so it is asserted on its own below.
 ///
 /// Source for the method and path of each: `smithy_query(query="digest")` — `GET`/`POST
 /// …/ApiCaches`, `POST …/ApiCaches/update`, `DELETE …/ApiCaches`, `DELETE
@@ -125,9 +124,20 @@ const CACHE_OPS: &[CacheOp] = &[
 const ABSENT_MESSAGE: &str =
     "Unable to get the cache as it doesn't exist, please create the cache first.";
 
-/// AWS's sentence for a read taken while a teardown is still removing the instance.
+/// AWS's sentence for a read of an API whose cache a teardown removed.
 const DELETED_MESSAGE: &str =
     "Unable to get the cache as it has been deleted, please re-create the cache.";
+
+/// AWS's sentence for a teardown aimed at an API that has no cache for it to remove.
+const DELETE_ABSENT_MESSAGE: &str =
+    "Unable to delete the cache as it doesn't exist, please create the cache first.";
+
+/// How long a poll below keeps looking for the condition it waits on. Generous on
+/// purpose: the condition, not this bound, is what a case is about.
+const POLL_DEADLINE: Duration = Duration::from_secs(60);
+
+/// How long a poll waits between two looks.
+const POLL_INTERVAL: Duration = Duration::from_millis(20);
 
 /// AWS's fixed sentence for a create on an API that already has a cache.
 const ALREADY_ENABLED_MESSAGE: &str = "The API has already enabled caching.";
@@ -246,6 +256,43 @@ fn carries_no_members(body: &Value) -> bool {
     }
 }
 
+/// Poll `GetApiCache` until the instance reports `status`, and answer that reply.
+async fn poll_until_status(
+    router: &MultiServiceRouter,
+    api_id: &str,
+    status: &str,
+    case: &str,
+) -> Answer {
+    let deadline = std::time::Instant::now() + POLL_DEADLINE;
+    loop {
+        let read = get_cache(router, api_id).await;
+        if read.body["apiCache"]["status"].as_str() == Some(status) {
+            return read;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "case {case:?}: expected the instance to reach {status}, last answer {read:?}"
+        );
+        tokio::time::sleep(POLL_INTERVAL).await;
+    }
+}
+
+/// Poll `GetApiCache` until it reports no instance at all, and answer that refusal.
+async fn poll_until_no_instance(router: &MultiServiceRouter, api_id: &str, case: &str) -> Answer {
+    let deadline = std::time::Instant::now() + POLL_DEADLINE;
+    loop {
+        let read = get_cache(router, api_id).await;
+        if read.status != 200 {
+            return read;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "case {case:?}: expected the instance to be removed, last answer {read:?}"
+        );
+        tokio::time::sleep(POLL_INTERVAL).await;
+    }
+}
+
 /// Fire two `UpdateApiCache` calls at one cache at the same time, and assert both are
 /// served — the arbitration the deletes below must survive.
 async fn two_racing_updates(
@@ -278,8 +325,9 @@ enum Absence {
 }
 
 /// Rule 1: an absent cache's refusal names the call that met it and which absence it met —
-/// a teardown still removing the instance, or an API that holds no cache — while the
-/// teardown, which asks for that absence, is served instead of refused.
+/// a cache a teardown removed, or an API that holds no cache at all — while the teardown
+/// words those same two absences: served where it has a deletion to complete, refused
+/// where this API has no cache for it to remove.
 ///
 /// The rows differ along what the rule generalises over: why the cache is absent, the
 /// settings the deleted cache was created with, and which of the four cache operations
@@ -310,16 +358,23 @@ async fn an_absent_caches_refusal_names_the_call_that_met_it() {
                 "case {case:?}: expected the seed create to be accepted, got {created:?}"
             );
             // The instance has to have been created before it can be torn down.
-            tokio::time::sleep(CACHE_SPAN + SLACK).await;
+            poll_until_status(&router, &api_id, "AVAILABLE", &case).await;
             let deleted = delete_cache(&router, &api_id).await;
             assert_eq!(
                 deleted.status, 200,
                 "case {case:?}: expected the seed delete to be served, got {deleted:?}"
             );
-            // STRAIGHT AFTER the teardown the removal of the instance is still being
-            // carried out, which every cache operation reports as a cache that has been
-            // deleted and asks the caller to re-create.
-            for operation in CACHE_OPS {
+            // STRAIGHT AFTER the teardown the instance is still being removed, which the
+            // read reports as the instance itself in the `DELETING` status while both
+            // calls that would CHANGE the cache report a cache that has been deleted.
+            let read = get_cache(&router, &api_id).await;
+            assert_eq!(
+                (read.status, read.body["apiCache"]["status"].as_str()),
+                (200, Some("DELETING")),
+                "case {case:?} during the teardown: expected the instance to be reported as \
+                 being removed, got {read:?}"
+            );
+            for operation in CACHE_OPS.iter().filter(|op| op.name != "GetApiCache") {
                 let answer = send(&router, operation, &api_id, *ttl, behavior, cache_type).await;
                 assert_eq!(
                     (answer.status, answer.message.as_str()),
@@ -329,14 +384,19 @@ async fn an_absent_caches_refusal_names_the_call_that_met_it() {
                     operation.deleted_message
                 );
             }
-            // And once the removal is done the API simply holds no cache.
-            tokio::time::sleep(CACHE_SPAN + SLACK).await;
+            // And the removal has to be done before the row reads an API whose slot is
+            // empty rather than one still holding the instance.
+            poll_until_no_instance(&router, &api_id, &case).await;
         }
 
         for operation in CACHE_OPS {
             let answer = send(&router, operation, &api_id, *ttl, behavior, cache_type).await;
-            // The sentence is the operation's own, for an API that holds no cache.
-            let expected = operation.absent_message;
+            // The sentence is the operation's own, for the absence THIS row built: a cache
+            // the row's teardown removed, or an API that never had one.
+            let expected = match absence {
+                Absence::NeverConfigured => operation.absent_message,
+                Absence::Deleted => operation.deleted_message,
+            };
             assert_eq!(
                 answer.status, 404,
                 "case {case:?} {}: expected status 404, got {answer:?}",
@@ -354,31 +414,41 @@ async fn an_absent_caches_refusal_names_the_call_that_met_it() {
             );
         }
 
-        // The teardown meets the same absence and is SERVED: it asked for exactly what
-        // it found, so it answers the modelled empty response rather than a refusal. It
-        // removed no instance, so it changes nothing a later reader sees: the API reports
-        // the same absence afterwards as before.
-        let no_op = delete_cache(&router, &api_id).await;
-        assert_eq!(
-            no_op.status, 200,
-            "case {case:?} DeleteApiCache: expected the teardown of an absent cache to be \
-             served, got {no_op:?}"
-        );
-        assert!(
-            carries_no_members(&no_op.body),
-            "case {case:?} DeleteApiCache: expected a response with no members, got {no_op:?}"
-        );
-        let after_no_op = get_cache(&router, &api_id).await;
-        assert_eq!(
-            after_no_op.status, 404,
-            "case {case:?}: expected the cache to still be absent, got {after_no_op:?}"
-        );
-        let after_expected = ABSENT_MESSAGE;
-        assert_eq!(
-            after_no_op.message, after_expected,
-            "case {case:?}: expected {after_expected:?} after a teardown that removed \
-             nothing, got {after_no_op:?}"
-        );
+        // The teardown words the same two absences. Where a deletion of this API's cache
+        // is standing it has that removal to complete, so it is SERVED with the modelled
+        // empty response and the API holds no cache at all afterwards; where the API never
+        // had a cache there is nothing for it to remove and it is refused, naming itself.
+        match absence {
+            Absence::Deleted => {
+                let completing = delete_cache(&router, &api_id).await;
+                assert_eq!(
+                    completing.status, 200,
+                    "case {case:?} DeleteApiCache: expected the teardown that completes the \
+                     deletion to be served, got {completing:?}"
+                );
+                assert!(
+                    carries_no_members(&completing.body),
+                    "case {case:?} DeleteApiCache: expected a response with no members, \
+                     got {completing:?}"
+                );
+                let after = get_cache(&router, &api_id).await;
+                assert_eq!(
+                    (after.status, after.message.as_str()),
+                    (404, ABSENT_MESSAGE),
+                    "case {case:?}: expected {ABSENT_MESSAGE:?} once the deletion is \
+                     completed, got {after:?}"
+                );
+            }
+            Absence::NeverConfigured => {
+                let refused = delete_cache(&router, &api_id).await;
+                assert_eq!(
+                    (refused.status, refused.error_type.as_str(), refused.message.as_str()),
+                    (404, "NotFoundException", DELETE_ABSENT_MESSAGE),
+                    "case {case:?} DeleteApiCache: expected 404 NotFoundException \
+                     {DELETE_ABSENT_MESSAGE:?} where there is no cache to remove, got {refused:?}"
+                );
+            }
+        }
 
         // None of those refusals wrote anything: a create is still accepted, and once
         // it has run the read reports a cache rather than either absence.
@@ -526,7 +596,7 @@ async fn a_cache_is_deletable_while_its_new_settings_are_being_applied() {
             "case {case:?}: expected the create to be accepted, got {created:?}"
         );
         // The instance has to exist before it accepts new settings.
-        tokio::time::sleep(CACHE_SPAN + SLACK).await;
+        poll_until_status(&router, &api_id, "AVAILABLE", &case).await;
 
         for round in 1..=*updates {
             let updated = update_cache(&router, &api_id, *ttl, behavior, cache_type).await;
@@ -550,9 +620,16 @@ async fn a_cache_is_deletable_while_its_new_settings_are_being_applied() {
             "case {case:?}: expected the delete to be served, got {deleted:?}"
         );
 
-        // And the cache is gone: read straight after the teardown, that absence is the
-        // instance still being removed.
-        let gone = get_cache(&router, &api_id).await;
+        // And the instance is on its way out: read straight after the teardown it is
+        // reported as being removed, and once it is gone the API reports the cache it
+        // HAD and lost.
+        let going = get_cache(&router, &api_id).await;
+        assert_eq!(
+            (going.status, going.body["apiCache"]["status"].as_str()),
+            (200, Some("DELETING")),
+            "case {case:?}: expected the instance to be reported as being removed, got {going:?}"
+        );
+        let gone = poll_until_no_instance(&router, &api_id, &case).await;
         assert_eq!(
             gone.status, 404,
             "case {case:?}: expected the cache to be gone, got {gone:?}"
@@ -560,13 +637,6 @@ async fn a_cache_is_deletable_while_its_new_settings_are_being_applied() {
         assert_eq!(
             gone.message, DELETED_MESSAGE,
             "case {case:?}: expected {DELETED_MESSAGE:?}, got {gone:?}"
-        );
-        // Once the removal is done the API holds no cache at all.
-        tokio::time::sleep(CACHE_SPAN + SLACK).await;
-        let gone = get_cache(&router, &api_id).await;
-        assert_eq!(
-            gone.message, ABSENT_MESSAGE,
-            "case {case:?}: expected {ABSENT_MESSAGE:?}, got {gone:?}"
         );
     }
 }
@@ -616,9 +686,10 @@ async fn a_cache_whose_create_has_not_completed_is_not_deletable() {
     }
 }
 
-/// Rule 3's arbitration: when two deletes race on one cache the cache is removed once
-/// and BOTH callers are served — the teardown asks for the absence of the cache, so the
-/// racer that arrives second finds what it asked for. Asserted after concurrent updates
+/// Rule 3's arbitration: when two deletes race on one cache BOTH callers are served —
+/// the instance lingers in `DELETING` while it is being removed, so the racer that
+/// arrives second finds an instance of its own to remove — and the API reports the cache
+/// it had and lost afterwards, not one it never had. Asserted after concurrent updates
 /// too, so a reconfigured cache is removable by the same rule.
 #[tokio::test]
 async fn two_racing_deletes_remove_the_cache_once_and_both_are_served() {
@@ -642,7 +713,7 @@ async fn two_racing_deletes_remove_the_cache_once_and_both_are_served() {
             created.status, 200,
             "case {case:?}: expected the create to be accepted, got {created:?}"
         );
-        tokio::time::sleep(CACHE_SPAN + SLACK).await;
+        poll_until_status(&router, &api_id, "AVAILABLE", &case).await;
 
         // The racing updates: each is served, and none of them leaves the cache in a
         // state the delete below cannot remove.
@@ -666,17 +737,17 @@ async fn two_racing_deletes_remove_the_cache_once_and_both_are_served() {
             );
         }
 
-        // The cache is gone for every later caller, whichever racer removed it — and the
-        // racer that arrived second found no instance to remove, so it finished the removal
-        // the first one started: the API holds no cache at all.
-        let gone = get_cache(&router, &api_id).await;
+        // The cache is gone for every later caller, whichever racer removed it — and no
+        // racer erased what another did: the API reports a cache that HAS BEEN DELETED
+        // until something resolves that deletion.
+        let gone = poll_until_no_instance(&router, &api_id, &case).await;
         assert_eq!(
             gone.status, 404,
             "case {case:?}: expected the cache to be gone, got {gone:?}"
         );
         assert_eq!(
-            gone.message, ABSENT_MESSAGE,
-            "case {case:?}: expected {ABSENT_MESSAGE:?}, got {gone:?}"
+            gone.message, DELETED_MESSAGE,
+            "case {case:?}: expected {DELETED_MESSAGE:?}, got {gone:?}"
         );
     }
 }

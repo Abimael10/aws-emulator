@@ -175,13 +175,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
         // An API that holds no cache has none to report, and the refusal names both this
-        // call and WHICH absence it met: a teardown still removing the instance is a cache
-        // that has been deleted, and anything else is an API that holds none.
+        // call and WHY the slot is empty: a cache a teardown removed has been deleted, and
+        // an API that never had one holds none. An instance still being torn down is
+        // reported as itself, in the `DELETING` status a caller waiting for the teardown
+        // reads.
         let Some(cache) = api.api_cache.as_ref() else {
             return Err(GetApiCacheErrorModeled::NotFoundException(NotFoundException {
                 message: Some(crate::state::absent_cache_message(
                     crate::state::CacheCall::Get,
-                    api.api_cache_is_being_removed(now),
+                    api.api_cache_was_deleted(),
                 )),
             })
             .into());

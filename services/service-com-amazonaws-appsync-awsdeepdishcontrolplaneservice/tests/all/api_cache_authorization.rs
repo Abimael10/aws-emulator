@@ -117,9 +117,9 @@ fn calls() -> Vec<Call> {
             method: "DELETE",
             cache_path: Some("ApiCaches"),
             absolute_path: "",
-            // A teardown asks for the absence it finds, so it is served.
+            // The API never had a cache, so an authorized teardown has none to remove.
             body: None,
-            served_status: 200,
+            served_status: 404,
         },
         Call {
             operation: "FlushApiCache",

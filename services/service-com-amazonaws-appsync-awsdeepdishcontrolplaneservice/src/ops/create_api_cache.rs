@@ -244,8 +244,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             status: crate::state::CACHE_CREATING.to_string(),
             available_at: now.checked_add(crate::state::CACHE_SPAN),
             // A fresh instance holds no entries yet, so nothing has been discarded
-            // from it.
+            // from it, and no teardown of it has been asked for.
             last_flushed_at: None,
+            removal_due: None,
         });
 
         // Answer from the STORED cache, so this body is the one `GetApiCache` answers
