@@ -26,6 +26,10 @@
 //! indices are written and in which order, and the FORM the integrity failure takes (the
 //! checksum of other bytes of the same length, a payload truncated in flight, and no payload
 //! at all against a full block's checksum).
+//!
+//! The two wires this suite drives — the EBS direct-API restJson1 requests and the ec2Query
+//! read of a snapshot — are `pub(crate)` here, so a sibling suite over the same two services
+//! reuses them instead of keeping a second copy of the same request builders.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -45,20 +49,20 @@ const EC2_API_VERSION: &str = "2016-11-15";
 
 /// The only block size the EBS direct APIs support: `PutSnapshotBlockRequest$DataLength`
 /// documents "Currently, the only supported size is `524288` bytes".
-const BLOCK_SIZE: i32 = 524_288;
+pub(crate) const BLOCK_SIZE: i32 = 524_288;
 
 /// The checksum algorithm every write below presents, the one value the modelled
 /// `ChecksumAlgorithm` enum declares.
-const CHECKSUM_ALGORITHM: &str = "SHA256";
+pub(crate) const CHECKSUM_ALGORITHM: &str = "SHA256";
 
 /// A snapshot still being written: the `pending` member of EC2's `SnapshotState`.
-const STATE_PENDING: &str = "pending";
+pub(crate) const STATE_PENDING: &str = "pending";
 
 /// A snapshot whose content is final: the `completed` member of EC2's `SnapshotState`.
-const STATE_COMPLETED: &str = "completed";
+pub(crate) const STATE_COMPLETED: &str = "completed";
 
 /// `Snapshot$Progress` for a snapshot that has completed, as a percentage.
-const PROGRESS_COMPLETED: &str = "100%";
+pub(crate) const PROGRESS_COMPLETED: &str = "100%";
 
 /// EC2's error code for a snapshot id the account holds no snapshot for.
 const SNAPSHOT_NOT_FOUND_CODE: &str = "InvalidSnapshot.NotFound";
@@ -68,7 +72,7 @@ const SNAPSHOT_NOT_FOUND_CODE: &str = "InvalidSnapshot.NotFound";
 const INTEGRITY_ERROR_CODE: &str = "InvalidSignatureException";
 
 /// The class the EBS direct APIs answer a read of a snapshot they hold none of with.
-const EBS_NOT_FOUND_CODE: &str = "ResourceNotFoundException";
+pub(crate) const EBS_NOT_FOUND_CODE: &str = "ResourceNotFoundException";
 
 /// How the integrity refusal states the two checksums: the one computed over the payload
 /// that arrived, then the one the request presented for it. Written out here, so the wording
@@ -87,7 +91,7 @@ fn snapshot_absent_message(snapshot_id: &str) -> String {
 
 /// Amazon EC2 and the EBS direct APIs over ONE shared engine, which is what makes the two
 /// sides of a snapshot the same snapshot.
-fn emulator() -> MultiServiceRouter {
+pub(crate) fn emulator() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     // Nothing here signs: the `Authorization` header carries only the credential scope,
@@ -109,21 +113,21 @@ fn authorization(signing_name: &str) -> String {
 }
 
 /// One EBS direct-API answer, reduced to what this suite asserts on.
-struct Reply {
-    status: u16,
-    headers: http::HeaderMap,
-    body: Vec<u8>,
+pub(crate) struct Reply {
+    pub(crate) status: u16,
+    pub(crate) headers: http::HeaderMap,
+    pub(crate) body: Vec<u8>,
 }
 
 impl Reply {
     /// The body parsed as JSON, or `Null` when it is not JSON.
-    fn json(&self) -> Value {
+    pub(crate) fn json(&self) -> Value {
         serde_json::from_slice(&self.body).unwrap_or(Value::Null)
     }
 
     /// The wire error code: the `x-amzn-errortype` header restJson1 sets, falling back to
     /// the body's `__type` discriminator.
-    fn error_code(&self) -> String {
+    pub(crate) fn error_code(&self) -> String {
         let header = self.header("x-amzn-errortype");
         if !header.is_empty() {
             return header;
@@ -136,7 +140,7 @@ impl Reply {
     }
 
     /// A response header, or the empty string when it is absent.
-    fn header(&self, name: &str) -> String {
+    pub(crate) fn header(&self, name: &str) -> String {
         self.headers
             .get(name)
             .and_then(|value| value.to_str().ok())
@@ -147,7 +151,7 @@ impl Reply {
     /// The `message` member of a refusal body. The integrity class is not one of the EBS
     /// service's modelled shapes, so its message travels in the lower-case member every AWS
     /// framework error carries; a modelled refusal carries `Message`.
-    fn message(&self) -> String {
+    pub(crate) fn message(&self) -> String {
         let body = self.json();
         for member in ["message", "Message"] {
             if let Some(text) = body.get(member).and_then(Value::as_str) {
@@ -158,13 +162,13 @@ impl Reply {
     }
 
     /// The body as text, for a report that has to quote whatever came back.
-    fn text(&self) -> String {
+    pub(crate) fn text(&self) -> String {
         String::from_utf8_lossy(&self.body).to_string()
     }
 }
 
 /// One EBS direct-API request on its restJson1 wire.
-async fn ebs(
+pub(crate) async fn ebs(
     router: &MultiServiceRouter,
     method: &str,
     uri: &str,
@@ -214,7 +218,7 @@ async fn ec2(router: &MultiServiceRouter, action: &str, params: &[(String, Strin
 }
 
 /// `ec2:DescribeSnapshots` narrowed to one snapshot id.
-async fn describe(router: &MultiServiceRouter, snapshot_id: &str) -> (u16, String) {
+pub(crate) async fn describe(router: &MultiServiceRouter, snapshot_id: &str) -> (u16, String) {
     ec2(
         router,
         "DescribeSnapshots",
@@ -225,13 +229,13 @@ async fn describe(router: &MultiServiceRouter, snapshot_id: &str) -> (u16, Strin
 
 /// Base64 SHA-256, the form `Checksum` carries on the wire. Computed here independently of
 /// the service, so the service's value is compared against a second implementation.
-fn checksum(data: &[u8]) -> String {
+pub(crate) fn checksum(data: &[u8]) -> String {
     aws_smithy_types::base64::encode(Sha256::digest(data))
 }
 
 /// `BLOCK_SIZE` bytes that differ for every `seed`, so a block read back from the wrong
 /// index cannot pass as the right one.
-fn block_bytes(seed: u8) -> Vec<u8> {
+pub(crate) fn block_bytes(seed: u8) -> Vec<u8> {
     let length = usize::try_from(BLOCK_SIZE).expect("the block size fits a usize");
     (0..length)
         .map(|offset| {
@@ -244,7 +248,7 @@ fn block_bytes(seed: u8) -> Vec<u8> {
 }
 
 /// The bytes block `index` of a row's snapshot carries: one distinct payload per index.
-fn payload_for(index: i32) -> Vec<u8> {
+pub(crate) fn payload_for(index: i32) -> Vec<u8> {
     block_bytes(u8::try_from(index.rem_euclid(200)).unwrap_or_default())
 }
 
@@ -277,7 +281,11 @@ fn mismatched_write(kind: Mismatch, index: i32) -> (Vec<u8>, String) {
 }
 
 /// `ebs:StartSnapshot`, answering the id it minted.
-async fn start_snapshot(router: &MultiServiceRouter, case: &str, volume_size: i64) -> String {
+pub(crate) async fn start_snapshot(
+    router: &MultiServiceRouter,
+    case: &str,
+    volume_size: i64,
+) -> String {
     let reply = ebs(
         router,
         "POST",
@@ -333,7 +341,7 @@ async fn put_block(
 }
 
 /// `ebs:CompleteSnapshot`, declaring `changed_blocks_count` writes.
-async fn complete_snapshot(
+pub(crate) async fn complete_snapshot(
     router: &MultiServiceRouter,
     snapshot_id: &str,
     changed_blocks_count: usize,
@@ -352,7 +360,7 @@ async fn complete_snapshot(
 }
 
 /// `ebs:ListSnapshotBlocks`.
-async fn list_blocks(router: &MultiServiceRouter, snapshot_id: &str) -> Reply {
+pub(crate) async fn list_blocks(router: &MultiServiceRouter, snapshot_id: &str) -> Reply {
     ebs(
         router,
         "GET",
@@ -364,7 +372,7 @@ async fn list_blocks(router: &MultiServiceRouter, snapshot_id: &str) -> Reply {
 }
 
 /// The `BlockIndex` -> `BlockToken` map a listing reported.
-fn listed_blocks(reply: &Reply) -> BTreeMap<i32, String> {
+pub(crate) fn listed_blocks(reply: &Reply) -> BTreeMap<i32, String> {
     reply
         .json()
         .get("Blocks")
@@ -383,7 +391,7 @@ fn listed_blocks(reply: &Reply) -> BTreeMap<i32, String> {
 }
 
 /// `ebs:GetSnapshotBlock` of the block `token` names.
-async fn get_block(
+pub(crate) async fn get_block(
     router: &MultiServiceRouter,
     snapshot_id: &str,
     index: i32,
@@ -406,7 +414,7 @@ async fn get_block(
 /// undone, or the empty string when the answer carries it empty or not at all — `Progress` is
 /// answered with no text at all for a snapshot nothing has been transferred for, which is a
 /// different answer from a percentage.
-fn member(body: &str, name: &str) -> String {
+pub(crate) fn member(body: &str, name: &str) -> String {
     elements(body, name).into_iter().next().unwrap_or_default()
 }
 
