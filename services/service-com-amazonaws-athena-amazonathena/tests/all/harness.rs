@@ -68,6 +68,20 @@ pub async fn call_as(
     operation: &str,
     body: &Value,
 ) -> (u16, Value) {
+    let (status, _headers, parsed) = call_reported(router, access_key_id, operation, body).await;
+    (status, parsed)
+}
+
+/// The same ONE request builder, answering the response's HEADERS beside its status and
+/// body — for a suite whose subject is something a response reports in a header rather than
+/// in its document, as the request a response names itself with is
+/// (`tests/all/response_request_id.rs`).
+pub async fn call_reported(
+    router: &MultiServiceRouter,
+    access_key_id: &str,
+    operation: &str,
+    body: &Value,
+) -> (u16, smithy_server_runtime::http::HeaderMap, Value) {
     let request = http::Request::builder()
         .method("POST")
         .uri("/")
@@ -82,12 +96,13 @@ pub async fn call_as(
 
     let response = router.dispatch(request).await;
     let status = response.status().as_u16();
+    let headers = response.headers().clone();
     let parsed = if response.body().is_empty() {
         Value::Null
     } else {
         serde_json::from_slice(response.body()).unwrap_or(Value::Null)
     };
-    (status, parsed)
+    (status, headers, parsed)
 }
 
 /// Start one query and return the `QueryExecutionId` it minted.

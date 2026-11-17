@@ -46,11 +46,42 @@
 //! AWS's validation sentence, and `override_operation` hands back the wrapper that completes
 //! the body the framework renders from them — the seam that sees a whole rendered response,
 //! which is the only one that can.
+//!
+//! ## Naming the request a response answers
+//!
+//! Every response this service sends names the request it answered, in the response header
+//! this protocol reports that id in (`x-amzn-RequestId`) — a success and a failure alike. It
+//! is a property of the RESPONSE, not of any modelled shape: no output or error shape of
+//! this model declares it, so no handler can set it, and the framework's awsJson1_1
+//! renderers do not write it. A client reads it as the failed call's request id, and a layer
+//! that RELAYS such a failure (a Step Functions `Task` state reporting an SDK exception as
+//! its `cause`) carries that id through into the sentence it reports.
+//!
+//! That rule is not stated here: `service_common::query_error_envelope` owns it for every
+//! emulated service, and this file only chooses the report this protocol takes (the header
+//! alone — awsJson1_1 has no envelope element for the id) and wires it at the two layers
+//! every response of this service passes through:
+//!
+//! * [`RequestIdReportingOperation::header`] composed AROUND the refusal-body wrapper, which
+//!   is what `override_operation` hands the router in place of each modelled operation, so
+//!   the report covers everything an operation answers — a success, a modelled error, the
+//!   scaffold's 501, and a constraint refusal raised while that operation was being served;
+//! * [`RequestIdEnvelopeDefinition::header_only`], the definition wrapper
+//!   [`Service::definition`] hands back, covers a response NO operation produced: a routing
+//!   failure, a transport failure detected up front, and a pre-dispatch authentication
+//!   refusal.
+//!
+//! Nothing else about a response changes: the status, the other headers and every byte of
+//! the body stay as the renderer wrote them.
 
 pub mod input_validation;
 
+use service_common::query_error_envelope::{
+    RequestIdEnvelopeDefinition, RequestIdReportingOperation,
+};
+use service_common::restated_refusal::RestatedRefusalOperation;
 use smithy_server_runtime::{
-    http, ErasedOperation, Refusal, Refused, Service,
+    http, ErasedOperation, ErasedServiceDefinition, Refusal, Refused, Service,
 };
 use std::sync::Arc;
 
@@ -60,7 +91,14 @@ use std::sync::Arc;
 /// Generic over the engine type `Eng` so this file names no concrete engine; the
 /// router builds one shared engine and hands it to `new`.
 pub struct EmulatedService<Eng: Send + Sync + 'static> {
-    entry: crate::ServiceDefinition<Eng>,
+    /// The generated entry, with its framework-level error renderers wrapped so a response
+    /// no operation produced still names the request it answers.
+    entry: RequestIdEnvelopeDefinition<crate::ServiceDefinition<Eng>>,
+    /// Serves every modelled operation: the refusal-body wrapper this service's own rule
+    /// needs ([`input_validation::REFUSAL_BODY`]), composed inside the request-id report so
+    /// whatever that wrapper answered names the request it answered. Held, not built per
+    /// request: `override_operation` returns a reference to it.
+    refusal_body: RequestIdReportingOperation<RestatedRefusalOperation>,
 }
 
 impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
@@ -69,7 +107,8 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     /// operation's behaviour lives in that operation's own `impl Operation`.
     pub fn new(engine: Arc<Eng>) -> Self {
         Self {
-            entry: crate::ServiceDefinition::new(engine),
+            entry: RequestIdEnvelopeDefinition::header_only(crate::ServiceDefinition::new(engine)),
+            refusal_body: RequestIdReportingOperation::header(input_validation::REFUSAL_BODY),
         }
     }
 }
@@ -78,7 +117,10 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     fn definition(&self) -> &dyn smithy_server_runtime::ErasedServiceDefinition {
         // The model-derived half of this service — identity, protocol, routing
         // table, and the default error renderers — lives in the generated entry.
-        // The router reads it through this one accessor. Do not edit the entry.
+        // The router reads it through this one accessor. Do not edit the entry: what is
+        // handed back is the shared `RequestIdEnvelopeDefinition`, which reads identity,
+        // protocol and the routing table straight off that entry and names the request on
+        // the answers no operation produced (see the module docs).
         &self.entry
     }
 
@@ -103,8 +145,11 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // code it answers with, and only the BODY of a refusal the framework rendered is
         // completed afterwards. A request the table cannot serve is declined here, so
         // the router answers it as the unroutable request it is.
+        //
+        // That wrapper is served INSIDE the shared request-id report, so no operation can
+        // answer without naming the request it answered (see the module docs).
         if service_common::restated_refusal::routes(self.definition(), req) {
-            return Some(&input_validation::REFUSAL_BODY);
+            return Some(&self.refusal_body);
         }
         None
     }
@@ -128,8 +173,9 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // modeled operation — neither `override_operation` nor the generated
         // routing table resolved it. Returning `None` renders the protocol-correct
         // default for this service's envelope (query -> 400 InvalidAction text/xml,
-        // awsJson -> 404, rpcv2Cbor -> 404, rest -> 501). Return `Some(resp)` to
-        // word that routing failure in your own envelope instead.
+        // awsJson -> 404, rpcv2Cbor -> 404, rest -> 501) through the shared
+        // `RequestIdEnvelopeDefinition`, which names the request that failure answers.
+        // Return `Some(resp)` to word that routing failure in your own envelope instead.
         let _ = req;
         None
     }
