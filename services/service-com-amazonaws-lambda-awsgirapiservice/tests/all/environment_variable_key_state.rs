@@ -27,6 +27,7 @@
 use std::sync::Arc;
 
 use serde_json::{json, Value};
+use service_com_amazonaws_lambda_awsgirapiservice::state::ComAmazonawsLambdaAwsgirapiserviceState;
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::durable_execution_completion::kms_call;
@@ -569,6 +570,26 @@ async fn an_invocation_after_an_update_settles_follows_the_key() {
     );
 }
 
+/// Point the stored function `name` at the key `key_arn`, through the store the reads below
+/// project from.
+///
+/// A function CAN hold a reference to a key the key service resolves nothing for — the key was
+/// there when the configuration was applied and went away afterwards — but no REQUEST can put
+/// it in that state: a `CreateFunction` or `UpdateFunctionConfiguration` naming a key the key
+/// service holds no record of is refused outright, with nothing written (pinned by
+/// `core/router/tests/all/lambda_environment_key_resolves_in_kms.rs`, where both services are
+/// mounted). So the row that needs a function in that state puts it there through the store
+/// rather than through a request the service is right to refuse.
+fn point_at_key(engine: &Arc<engine::InMemoryEngine>, name: &str, key_arn: &str) {
+    let state = engine.state::<ComAmazonawsLambdaAwsgirapiserviceState>();
+    let mut store = state.lock();
+    let function = store
+        .functions
+        .get_mut(name)
+        .unwrap_or_else(|| panic!("case {name:?}: the function this row created is stored"));
+    function.config.kms_key_arn = Some(key_arn.to_string());
+}
+
 /// One row: what the function's key reference and environment are, and what the configuration
 /// and an invocation must therefore report.
 struct Reference {
@@ -630,11 +651,11 @@ async fn only_a_key_that_covers_variables_decides_what_is_reported() {
 
     for (index, row) in rows.iter().enumerate() {
         let name = format!("env-key-reference-{index}");
-        let key = match row.key {
-            Some("held") => Some(held.clone()),
-            Some(named) => Some(named.to_string()),
-            None => None,
-        };
+        // Every row that names a key is CREATED under the key the key service holds: a
+        // configuration naming a key it holds no record of is refused outright (see
+        // [`point_at_key`]), so the row that needs that reference is pointed at it after the
+        // function is stored.
+        let key = row.key.map(|_| held.clone());
         created_function(
             &engine,
             &router,
@@ -643,6 +664,9 @@ async fn only_a_key_that_covers_variables_decides_what_is_reported() {
             row.variables.then(|| json!({ VARIABLE: MARKER })),
         )
         .await;
+        if let Some(absent) = row.key.filter(|named| *named != "held") {
+            point_at_key(&engine, &name, absent);
+        }
 
         for (read, configuration) in projections(&router, &name).await {
             let case = format!("{} read by {read}", row.case);

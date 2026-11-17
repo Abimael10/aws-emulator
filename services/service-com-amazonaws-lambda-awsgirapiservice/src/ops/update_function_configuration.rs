@@ -448,6 +448,33 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
+        // A request that SETS or REPLACES the function's environment key resolves that key
+        // exactly as creation resolves the first one: the variables are stored ENCRYPTED
+        // under it, so a key the key service holds no record of is refused with the
+        // function's configuration left exactly as it was (see
+        // [`crate::state::absent_environment_key_refusal`], including the answers that
+        // establish nothing about the key and refuse nothing). The function has to exist for
+        // its configuration to be updated at all, so that is settled first, under a guard
+        // scoped to the read so none is held across the in-process hop to the key service.
+        if let Some(kms_key_arn) = input.kms_key_arn.as_deref() {
+            let held = {
+                let store = state.lock();
+                store.functions.contains_key(&reference.name)
+            };
+            if !held {
+                return Err(not_found(&region, &reference.name));
+            }
+            if let Some(message) = crate::state::absent_environment_key_refusal(
+                ctx.callback(),
+                &region,
+                Some(kms_key_arn),
+            )
+            .await
+            {
+                return Err(invalid_parameter(message));
+            }
+        }
+
         let mut store = state.lock();
 
         // A request naming no stored function is refused for THAT before any of its

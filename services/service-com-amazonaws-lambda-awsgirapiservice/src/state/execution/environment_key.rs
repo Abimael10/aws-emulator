@@ -249,7 +249,7 @@ fn default_code(class: FaultClass) -> &'static str {
 /// sentence it stated about the key.
 ///
 /// `separator` is what stands between the class and the relayed sentence, which differs
-/// between the two places AWS states this clause (see [`invocation_message`] and
+/// between the two places AWS states this clause (see [`relayed_call_message`] and
 /// [`report_message`]).
 fn relay_clause(answer: &RelayedKeyAnswer, separator: &str) -> String {
     match &answer.reason {
@@ -266,7 +266,7 @@ fn relay_clause(answer: &RelayedKeyAnswer, separator: &str) -> String {
 /// states around it — the service it was made to, the status that service answered with,
 /// that call's own request id and the attempts it took
 /// (`service_common::relayed_refusal`).
-fn invocation_message(sentence: &str, answer: &RelayedKeyAnswer) -> String {
+fn relayed_call_message(sentence: &str, answer: &RelayedKeyAnswer) -> String {
     format!(
         "{sentence}{clause}{envelope}",
         clause = relay_clause(answer, ""),
@@ -279,11 +279,24 @@ fn invocation_message(sentence: &str, answer: &RelayedKeyAnswer) -> String {
     )
 }
 
-/// The message a configuration READ reports on `EnvironmentError`: the same two parts
-/// without the relay envelope, because the control plane reports the error it recorded about
-/// the environment rather than one call's own answer.
+/// The message a CONTROL-PLANE statement of this failure carries — what a configuration read
+/// reports on `EnvironmentError`, and what a request that configures the key is refused with:
+/// the same two parts without the relay envelope, because the control plane states the error
+/// about the environment itself rather than one call's own answer.
 fn report_message(sentence: &str, answer: &RelayedKeyAnswer) -> String {
     format!("{sentence}{clause}", clause = relay_clause(answer, " "))
+}
+
+/// The key a `KMSKeyArn` member NAMES, or `None` when it names none.
+///
+/// `KMSKeyArn`'s own pattern admits the empty string beside a key ARN
+/// (`smithy_query(query="operation",operation="CreateFunction")` reports
+/// `^(arn:(aws[a-zA-Z-]*)?:[a-z0-9-.]+:.*)|()$`), and a function holding it is a function
+/// encrypted under no customer managed key: there is nothing to ask the key service about,
+/// and nothing it could answer. One reading for every entry point here, so the configure
+/// path and the use paths cannot judge the same stored value differently.
+fn named_key(kms_key_arn: Option<&str>) -> Option<&str> {
+    kms_key_arn.filter(|arn| !arn.is_empty())
 }
 
 /// Why the environment variables of a function configured with `kms_key_arn` cannot be
@@ -302,7 +315,7 @@ pub async fn environment_key_fault(
     kms_key_arn: Option<&str>,
     variables: &BTreeMap<String, String>,
 ) -> Option<EnvironmentKeyFault> {
-    let key_arn = kms_key_arn?;
+    let key_arn = named_key(kms_key_arn)?;
     if variables.is_empty() {
         return None;
     }
@@ -311,7 +324,7 @@ pub async fn environment_key_fault(
     // between services, and an SDK client's future is large enough that carrying it inside
     // every such future grows the stack frame of every link in those chains.
     let answer = Box::pin(relayed_key_answer(callback, region, key_arn)).await?;
-    let message = invocation_message(invocation_sentence(answer.class), &answer);
+    let message = relayed_call_message(invocation_sentence(answer.class), &answer);
     Some(key_fault(answer.class, message))
 }
 
@@ -335,6 +348,49 @@ fn invocation_sentence(class: FaultClass) -> &'static str {
         FaultClass::NotFound => NOT_FOUND_MESSAGE,
         FaultClass::AccessDenied => ACCESS_DENIED_MESSAGE,
     }
+}
+
+/// The sentence a request that CONFIGURES a function's environment key is refused with when
+/// the key service holds no record of that key.
+///
+/// Storing the variables under a customer managed key ENCRYPTS them, which is the operation
+/// this refusal names — the counterpart of the decrypt [`report_sentence`] words for a read
+/// of the same configuration, said of the caller's own environment and the caller's own key
+/// settings, which is how AWS words what a control-plane call could not do.
+const ENCRYPT_NOT_FOUND_MESSAGE: &str = "Lambda was unable to encrypt your environment \
+                                         variables because the KMS key was not found. Please \
+                                         check your KMS key settings.";
+
+/// Why a request that configures `kms_key_arn` as a function's environment key cannot be
+/// applied, or `None` when nothing says it cannot.
+///
+/// A key the key service holds NO RECORD of — an ARN it answers `NotFoundException` for, and
+/// one it rejects as no key ARN at all — is a key nothing could be encrypted under, so the
+/// configuration is refused before anything is written and the function's state is left
+/// exactly as it was. The refusal RELAYS the key service's own answer — the exception class it
+/// stated and the sentence it stated about the key — inside Lambda's own sentence for the
+/// encryption it could not perform, in the form every control-plane statement of this failure
+/// takes ([`report_message`]).
+///
+/// The key's STATE is deliberately not a configure-time refusal: a function whose key is
+/// disabled stays configurable and has its INVOCATIONS refused instead
+/// ([`environment_key_fault`]), which is what makes re-enabling the key restore it. Neither
+/// is an answer that establishes nothing about whether the key is there — a denial of this
+/// call, or no answer at all.
+pub async fn absent_environment_key_refusal(
+    callback: &smithy_server_runtime::EmbeddedEmulator,
+    region: &str,
+    kms_key_arn: Option<&str>,
+) -> Option<String> {
+    // `KMSKeyArn`'s own pattern admits the empty string, which names no key and asks for
+    // none ([`named_key`]).
+    let key_arn = named_key(kms_key_arn)?;
+    // Boxed for the reason [`environment_key_fault`] states.
+    let answer = Box::pin(relayed_key_answer(callback, region, key_arn)).await?;
+    if !matches!(answer.class, FaultClass::NotFound) {
+        return None;
+    }
+    Some(report_message(ENCRYPT_NOT_FOUND_MESSAGE, &answer))
 }
 
 /// The sentence a configuration READ states on `EnvironmentError$Message`, for each class of
@@ -385,7 +441,7 @@ pub async fn report_environment_key_fault(
     kms_key_arn: Option<&str>,
     environment: &mut Option<EnvironmentResponse>,
 ) {
-    let Some(key_arn) = kms_key_arn else {
+    let Some(key_arn) = named_key(kms_key_arn) else {
         return;
     };
     let Some(reported) = environment.as_mut() else {
@@ -468,7 +524,7 @@ pub async fn durable_data_key_fault(
     region: &str,
     kms_key_arn: Option<&str>,
 ) -> Option<EnvironmentKeyFault> {
-    let key_arn = kms_key_arn?;
+    let key_arn = named_key(kms_key_arn)?;
     // Boxed for the reason [`environment_key_fault`] states.
     let answer = Box::pin(relayed_key_answer(callback, region, key_arn)).await?;
     // Every other answer about the key — including one about a key this key service holds
@@ -617,7 +673,7 @@ mod tests {
             ),
             "case \"a reported disabled key\": got {reported:?}"
         );
-        let refused = invocation_message(invocation_sentence(answered.class), &answered);
+        let refused = relayed_call_message(invocation_sentence(answered.class), &answered);
         assert!(
             refused.starts_with(&format!(
                 "{DISABLED_MESSAGE} KMS Exception: {KMS_DISABLED_CODE}KMS Message: {reason} \
@@ -635,6 +691,29 @@ mod tests {
             reported.ends_with(" KMS Exception: AccessDeniedException"),
             "case \"an answer with no sentence\": expected the class alone, got {reported:?}"
         );
+    }
+
+    /// A `KMSKeyArn` member names a key only when it carries one: the empty string its own
+    /// pattern admits names none, so every entry point here asks the key service nothing
+    /// about it — one row per form the member takes.
+    #[test]
+    fn only_a_non_empty_key_reference_names_a_key() {
+        let rows: &[(&str, Option<&str>, Option<&str>)] = &[
+            ("no member at all", None, None),
+            ("the empty string the pattern admits", Some(""), None),
+            (
+                "a key ARN",
+                Some("arn:aws:kms:us-east-1:000000000000:key/a-key"),
+                Some("arn:aws:kms:us-east-1:000000000000:key/a-key"),
+            ),
+        ];
+        for (case, member, expected) in rows {
+            let named = named_key(*member);
+            assert_eq!(
+                named, *expected,
+                "case {case:?}: expected {expected:?} to be asked about, got {named:?}"
+            );
+        }
     }
 
     /// A refusal of a read of a durable execution's DATA states Lambda's own sentence for

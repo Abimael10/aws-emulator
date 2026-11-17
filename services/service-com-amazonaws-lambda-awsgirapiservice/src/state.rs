@@ -401,7 +401,8 @@ pub use recursion::{
 /// module.
 pub mod execution;
 pub use execution::{
-    durable_data_key_fault, engine_for, environment_key_fault, function_sdk_access,
+    absent_environment_key_refusal, durable_data_key_fault, engine_for, environment_key_fault,
+    function_sdk_access,
     invocation_trace_context, layer_archives, log_target, mint_request_id,
     report_environment_key_fault, run_invocation, runs_handler, supplied_trace_header, AwsAccess,
     Engine, EnvironmentKeyFault, Invocation, Invoked, LogTarget, Unrunnable,

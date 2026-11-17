@@ -546,6 +546,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         }
 
+        // "The ARN of the Key Management Service (KMS) customer managed key that's used to
+        // encrypt your function's environment variables" (`KMSKeyArn`): storing them under
+        // that key ENCRYPTS them, so the key has to be one the key service resolves at this
+        // moment. A key it holds no record of is refused here, before anything is stored, and
+        // the refusal relays the key service's own answer — the same one reading of that
+        // answer every operation that configures or uses an environment key shares (see
+        // [`crate::state::absent_environment_key_refusal`], including the answers that
+        // establish nothing about the key and refuse nothing). Asked over the emulator's own
+        // in-process seam with no store guard held, exactly as the role above is.
+        if let Some(message) = crate::state::absent_environment_key_refusal(
+            ctx.callback(),
+            &region,
+            input.kms_key_arn.as_deref(),
+        )
+        .await
+        {
+            return Err(invalid_parameter(message));
+        }
+
         // "To connect a function to a VPC, Lambda creates an elastic network interface for
         // each subnet in your function's VPC configuration" (`VpcConfig`) — created by Lambda
         // acting as the function's OWN execution role, so a function whose role could never
