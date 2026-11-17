@@ -144,6 +144,18 @@ impl ApplicationVersion {
         }
     }
 
+    /// Whether this version's source bundle "was successfully pre-processed and
+    /// validated" — the one `ApplicationVersionStatus` that says the manifest
+    /// and the configuration files inside the bundle have been read and passed.
+    ///
+    /// Every other status says they have not: `Processing` while the work is
+    /// still owed, `Failed` for a bundle that did not pass, and `Unprocessed`
+    /// for one nothing validated at all. An operation that needs what
+    /// pre-processing produces cannot work from a version in any of them.
+    pub fn is_successfully_processed(&self) -> bool {
+        self.status == VERSION_STATUS_PROCESSED
+    }
+
     /// Materialise the pre-processing this version owes, if the clock has made it
     /// due by `at`.
     ///
@@ -162,6 +174,21 @@ impl ApplicationVersion {
         // The record CHANGED, and it changed when the move came due.
         self.date_updated = pending.due_date;
     }
+}
+
+/// The sentence a request is refused with when it names an application version
+/// that has not been successfully pre-processed (see
+/// [`ApplicationVersion::is_successfully_processed`]).
+///
+/// The fixed text is the service's own statement for that class; the variable
+/// parts are the `version_label` the request supplied and the `status` the
+/// stored version is in, reported in the form every reader of an application
+/// version puts a status on the wire in ([`version_status_on_the_wire`]).
+pub fn unprocessed_version_refusal(version_label: &str, status: &str) -> String {
+    format!(
+        "ApplicationVersion {version_label} has not been successfully processed. Current status: {}",
+        version_status_on_the_wire(status)
+    )
 }
 
 impl ComAmazonawsElasticbeanstalkAwselasticbeanstalkserviceState {

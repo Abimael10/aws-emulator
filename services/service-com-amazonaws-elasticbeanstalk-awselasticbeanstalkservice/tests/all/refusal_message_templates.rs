@@ -34,7 +34,12 @@
 //! application '<ApplicationName>'` — both halves named, no trailing period.
 //!
 //! RULE 6 (a compose that resolves no usable version): `ComposeEnvironments`
-//! refuses it with the fixed sentence `No valid application version found.`
+//! refuses a request none of whose labels names a version of the application
+//! with the fixed sentence `No valid application version found.`, and one that
+//! names a version of it that has not been successfully pre-processed with
+//! `ApplicationVersion <VersionLabel> has not been successfully processed.
+//! Current status: <Status>` — the label is the request's and the status is the
+//! version's own.
 //!
 //! The templates are written out HERE rather than imported from the service, so a
 //! change to the handlers' wording fails this suite instead of moving with it.
@@ -79,8 +84,19 @@ fn version_not_found(application_name: &str, version_label: &str) -> String {
     format!("Application version with label '{version_label}' not found in application '{application_name}'")
 }
 
-/// RULE 6's sentence: wholly fixed text.
+/// RULE 6's sentence for a request that resolves no version of the application:
+/// wholly fixed text.
 const NO_VALID_VERSION_SENTENCE: &str = "No valid application version found.";
+
+/// RULE 6's template for a version of the application that has not been
+/// successfully pre-processed: the label the request supplied and the status the
+/// version is in, as the service puts an `ApplicationVersionStatus` on the wire.
+fn not_successfully_processed(version_label: &str, status: &str) -> String {
+    format!(
+        "ApplicationVersion {version_label} has not been successfully processed. Current status: \
+         {status}"
+    )
+}
 
 /// Create the application every fixture of a test belongs to.
 async fn application(emulator: &Emulator, name: &str) {
@@ -787,60 +803,90 @@ async fn a_compose_that_resolves_no_usable_version_is_refused_with_one_fixed_sen
         );
     }
 
-    // Rows span how many labels the request carries and where each one lives: a
+    // Rows span how many labels the request carries, where each one lives — a
     // label of another application, a label nothing carries, a label of the named
-    // application, and two labels at once.
-    let cases: Vec<(&str, Vec<(&str, &str)>)> = vec![
-        (
-            "a label that belongs to another application",
-            vec![
+    // application — and whether the request also names a group. The versions
+    // these fixtures create ask for no pre-processing, so the application's own
+    // version sits at the status a version nothing validated reports.
+    const UNPROCESSED: &str = "UNPROCESSED";
+    const NOT_RESOLVED: &str = "MissingParameter";
+    const NOT_PROCESSED: &str = "ConfigurationValidationException";
+    /// One request this rule refuses, and the refusal it must carry.
+    struct Case {
+        case: &'static str,
+        params: Vec<(&'static str, &'static str)>,
+        code: &'static str,
+        message: String,
+    }
+    let cases: Vec<Case> = vec![
+        Case {
+            case: "a label that belongs to another application",
+            params: vec![
                 ("ApplicationName", APPLICATION),
                 ("VersionLabels.member.1", "v-foreign"),
             ],
-        ),
-        (
-            "a label nothing carries",
-            vec![
+            code: NOT_RESOLVED,
+            message: NO_VALID_VERSION_SENTENCE.to_string(),
+        },
+        Case {
+            case: "a label nothing carries",
+            params: vec![
                 ("ApplicationName", APPLICATION),
                 ("VersionLabels.member.1", "v-never"),
             ],
-        ),
-        (
-            "a label of the named application",
-            vec![
+            code: NOT_RESOLVED,
+            message: NO_VALID_VERSION_SENTENCE.to_string(),
+        },
+        Case {
+            case: "a label of the named application",
+            params: vec![
                 ("ApplicationName", APPLICATION),
                 ("VersionLabels.member.1", "v-own"),
             ],
-        ),
-        (
-            "two labels at once",
-            vec![
+            code: NOT_PROCESSED,
+            message: not_successfully_processed("v-own", UNPROCESSED),
+        },
+        Case {
+            case: "two labels at once",
+            params: vec![
                 ("ApplicationName", APPLICATION),
                 ("VersionLabels.member.1", "v-own"),
                 ("VersionLabels.member.2", "v-foreign"),
             ],
-        ),
-        (
-            "a group name beside the labels",
-            vec![
+            code: NOT_PROCESSED,
+            message: not_successfully_processed("v-own", UNPROCESSED),
+        },
+        Case {
+            case: "a group name beside the labels",
+            params: vec![
                 ("ApplicationName", APPLICATION),
                 ("GroupName", "dev"),
                 ("VersionLabels.member.1", "v-own"),
             ],
-        ),
+            code: NOT_PROCESSED,
+            message: not_successfully_processed("v-own", UNPROCESSED),
+        },
     ];
 
-    for (case, params) in cases {
+    for Case {
+        case,
+        params,
+        code,
+        message,
+    } in cases
+    {
         let refused = emulator.call("ComposeEnvironments", &params).await;
-        assert_refused(&refused, case, "MissingParameter", NO_VALID_VERSION_SENTENCE);
-        // Fixed text: no label, no application and no diagnosis of a source
-        // bundle appears in it.
-        for (_, value) in &params {
-            assert!(
-                !refused.error_message().contains(value),
-                "case {case:?}: the fixed sentence must not quote {value:?}, got {:?}",
-                refused.error_message()
-            );
+        assert_refused(&refused, case, code, &message);
+        if message == NO_VALID_VERSION_SENTENCE {
+            // Fixed text: no label, no application and no diagnosis of a source
+            // bundle appears in it.
+            for (_, value) in &params {
+                assert!(
+                    !refused.error_message().contains(value),
+                    "case {case:?}: the fixed sentence must not quote {value:?}, got {:?}",
+                    refused.error_message()
+                );
+            }
         }
     }
 

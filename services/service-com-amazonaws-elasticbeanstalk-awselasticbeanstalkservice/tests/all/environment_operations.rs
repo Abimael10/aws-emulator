@@ -809,11 +809,13 @@ async fn describe_instances_health_reports_the_instances_an_environment_has() {
 // ---------------------------------------------------------------------------
 
 /// RULE: ComposeEnvironments names each environment from the `env.yaml` manifest
-/// inside the version's source bundle; this emulator holds a source bundle only
-/// as the S3 reference the caller passed and never reads its content, so no
-/// environment can be named and the request is refused with the service's
-/// `MissingParameter` — for every version label, whichever application it
-/// belongs to, and no environment is created either way.
+/// inside the version's source bundle, and that manifest is what a version's
+/// PRE-PROCESSING reads — so a version of the named application that has not
+/// been successfully pre-processed is refused with its own status, while a
+/// request whose labels name no version of that application at all resolves no
+/// application version and is refused with the service's `MissingParameter`. The
+/// versions this fixture creates ask for no pre-processing, so each one of the
+/// application sits at `Unprocessed`; no environment is created either way.
 #[tokio::test]
 async fn compose_environments_refuses_what_no_manifest_can_name() {
     let emulator = Emulator::new();
@@ -823,11 +825,31 @@ async fn compose_environments_refuses_what_no_manifest_can_name() {
     struct Case {
         name: &'static str,
         params: Vec<(&'static str, &'static str)>,
+        code: &'static str,
+        message: &'static str,
     }
+    // The fixture's version label, and the sentence each class of refusal
+    // carries. `UNPROCESSED` is the status an application version whose create
+    // asked for no pre-processing reports.
+    const NO_VALID_VERSION: &str = "No valid application version found.";
+    const UNPROCESSED_V1: &str =
+        "ApplicationVersion v1 has not been successfully processed. Current status: UNPROCESSED";
     let cases = [
         Case {
             name: "no version labels",
             params: vec![("ApplicationName", "compose-app")],
+            code: "MissingParameter",
+            message: "Specify at least one VersionLabel: each one names the source bundle of an \
+                      environment to compose.",
+        },
+        Case {
+            name: "a label no version of the application carries",
+            params: vec![
+                ("ApplicationName", "compose-app"),
+                ("VersionLabels.member.1", "v-never"),
+            ],
+            code: "MissingParameter",
+            message: NO_VALID_VERSION,
         },
         Case {
             name: "a version of the named application",
@@ -835,6 +857,8 @@ async fn compose_environments_refuses_what_no_manifest_can_name() {
                 ("ApplicationName", "compose-app"),
                 ("VersionLabels.member.1", "v1"),
             ],
+            code: "ConfigurationValidationException",
+            message: UNPROCESSED_V1,
         },
         Case {
             name: "a version of another application",
@@ -843,6 +867,8 @@ async fn compose_environments_refuses_what_no_manifest_can_name() {
                 ("VersionLabels.member.1", "v1"),
                 ("GroupName", "group-1"),
             ],
+            code: "ConfigurationValidationException",
+            message: UNPROCESSED_V1,
         },
         Case {
             name: "several version labels",
@@ -851,6 +877,8 @@ async fn compose_environments_refuses_what_no_manifest_can_name() {
                 ("VersionLabels.member.1", "v1"),
                 ("VersionLabels.member.2", "v2"),
             ],
+            code: "ConfigurationValidationException",
+            message: UNPROCESSED_V1,
         },
     ];
 
@@ -864,8 +892,14 @@ async fn compose_environments_refuses_what_no_manifest_can_name() {
         );
         assert_eq!(
             refused.error_code(),
-            "MissingParameter",
+            case.code,
             "case {name:?}: unexpected error code in {}",
+            refused.body
+        );
+        assert_eq!(
+            refused.error_message(),
+            case.message,
+            "case {name:?}: unexpected message in {}",
             refused.body
         );
     }

@@ -16,12 +16,19 @@
 //! launch like any other: it starts `Launching` and reaches `Ready`. A label
 //! that describes no environment composes none.
 //!
+//! A manifest is what a version's PRE-PROCESSING reads and validates, so only a
+//! version that "was successfully pre-processed and validated" can be composed
+//! from: a version of the application in any other processing status is refused
+//! with that status, and a request none of whose labels names a version of the
+//! application at all is refused with the service's fixed sentence for that
+//! class. Both refusals are the subject of the suites at the end of this file.
+//!
 //! The table spans what that rule generalises over: how many labels one call
 //! names, whether a manifest's name is completed by a group name, which tier it
 //! declares and whether it declares one at all, which published solution stack
 //! it names, the configuration and the links it carries, a second composition of
-//! the same group (the UPDATE half of the rule), and each way a label can
-//! describe no environment at all.
+//! the same group (the UPDATE half of the rule), each way a label can describe no
+//! environment at all, and each processing status a version can be in.
 //!
 //! The harness (the router, the form encoder, the XML reader, the object-storage
 //! upload and the poll for a settled status) is the one `lifecycle.rs` owns in
@@ -30,11 +37,22 @@
 
 use crate::application_version_processing::zip_of;
 use crate::harness::{wait_for_status, Answer, Emulator, SOLUTION_STACK};
+use crate::lifecycle::{POLL_INTERVAL, STATUS_DEADLINE};
 
 use service_com_amazonaws_elasticbeanstalk_awselasticbeanstalkservice as eb;
 
 /// The application every group below is composed under.
 const APPLICATION: &str = "composed-app";
+
+/// A SECOND application, so a composition can name a version label that exists
+/// but belongs to another application than the one the request names.
+const OTHER_APPLICATION: &str = "composed-other-app";
+
+/// The version label that second application carries.
+const FOREIGN_LABEL: &str = "v-foreign";
+
+/// The version label the refusal suites create under [`APPLICATION`].
+const VERSION_LABEL: &str = "v1";
 
 /// The bucket a version's source bundle is uploaded into: one per version, so
 /// each upload creates the bucket it writes into and no suite depends on the
@@ -135,8 +153,61 @@ async fn given_application(emulator: &Emulator, case: &str) {
     );
 }
 
-/// Upload a source bundle carrying `files` and create the application version
-/// `version_label` from it, the way a client that is about to compose does.
+/// Create [`OTHER_APPLICATION`] with one version `version_label` under it: a
+/// label that names a real application version, but not one of the composed
+/// application's.
+async fn given_foreign_version(emulator: &Emulator, case: &str, version_label: &str) {
+    let created = emulator
+        .call("CreateApplication", &[("ApplicationName", OTHER_APPLICATION)])
+        .await;
+    assert_eq!(
+        created.status, 200,
+        "case {case:?}: expected 200 from CreateApplication for {OTHER_APPLICATION}, got {} and \
+         body {}",
+        created.status, created.body
+    );
+    let version = emulator
+        .call(
+            "CreateApplicationVersion",
+            &[
+                ("ApplicationName", OTHER_APPLICATION),
+                ("VersionLabel", version_label),
+            ],
+        )
+        .await;
+    assert_eq!(
+        version.status, 200,
+        "case {case:?}: expected 200 from CreateApplicationVersion for {version_label:?}, got {} \
+         and body {}",
+        version.status, version.body
+    );
+}
+
+/// Create a version of the composed application that nothing pre-processed: no
+/// source bundle and no `Process`, so it sits at `Unprocessed`.
+async fn given_sampled_version(emulator: &Emulator, case: &str, version_label: &str) {
+    let created = emulator
+        .call(
+            "CreateApplicationVersion",
+            &[
+                ("ApplicationName", APPLICATION),
+                ("VersionLabel", version_label),
+            ],
+        )
+        .await;
+    assert_eq!(
+        created.status, 200,
+        "case {case:?}: expected 200 from CreateApplicationVersion for {version_label:?}, got {} \
+         and body {}",
+        created.status, created.body
+    );
+}
+
+/// Upload a source bundle carrying `files`, create the application version
+/// `version_label` from it with pre-processing turned on, and wait until the
+/// version has been successfully processed — the way a client that is about to
+/// compose does, since a composition reads the manifest that pre-processing
+/// validated.
 async fn given_version(
     emulator: &Emulator,
     case: &str,
@@ -155,6 +226,7 @@ async fn given_version(
                 ("VersionLabel", version_label),
                 ("SourceBundle.S3Bucket", &bucket),
                 ("SourceBundle.S3Key", BUNDLE_KEY),
+                ("Process", "true"),
             ],
         )
         .await;
@@ -164,6 +236,54 @@ async fn given_version(
          and body {}",
         created.status, created.body
     );
+    wait_for_version_status(
+        emulator,
+        case,
+        version_label,
+        eb::state::VERSION_STATUS_PROCESSED,
+    )
+    .await;
+}
+
+/// Look again until the version `version_label` reports `expected` — the
+/// CONDITION the caller waits on, never a fixed wait for the clock — or until
+/// the harness's generous [`STATUS_DEADLINE`] has passed.
+///
+/// `expected` is a modelled `ApplicationVersionStatus`; what a reader reports is
+/// the wire form of it, which is what this compares.
+async fn wait_for_version_status(
+    emulator: &Emulator,
+    case: &str,
+    version_label: &str,
+    expected: &str,
+) {
+    let expected = eb::state::version_status_on_the_wire(expected);
+    let started = std::time::Instant::now();
+    loop {
+        let described = emulator
+            .call(
+                "DescribeApplicationVersions",
+                &[
+                    ("ApplicationName", APPLICATION),
+                    ("VersionLabels.member.1", version_label),
+                ],
+            )
+            .await;
+        let status = described
+            .value("ApplicationVersions/member/Status")
+            .unwrap_or_default()
+            .to_string();
+        if status == expected {
+            return;
+        }
+        assert!(
+            started.elapsed() < STATUS_DEADLINE,
+            "case {case:?}: version {version_label:?} never reached {expected}, last status \
+             {status:?} in body {}",
+            described.body
+        );
+        tokio::time::sleep(POLL_INTERVAL).await;
+    }
 }
 
 /// Compose the group the `version_labels` describe, with `group_name` when the
@@ -706,13 +826,45 @@ async fn a_version_label_that_describes_no_environment_composes_nothing() {
     }
 }
 
-/// A manifest past the bounds this emulator parses caller content within
-/// describes no environment either: both bounds are taken BEFORE a tree is
-/// built from the text, so the request is refused with the same sentence and
-/// the emulator keeps serving. The rows differ along which bound the manifest
-/// is past — its nesting, and the alias expansion a loader would perform.
+/// One version a composition names that has NOT been successfully
+/// pre-processed.
+struct Unready {
+    case: &'static str,
+    /// The `env.yaml` the version's source bundle carries, or `None` for a
+    /// version created with no source bundle at all — "if neither SourceBundle
+    /// nor SourceBuildInformation are provided, Elastic Beanstalk uses a sample
+    /// application", which is no archive this emulator holds.
+    manifest: Option<Vec<u8>>,
+    /// Whether the create asks for the pre-processing of that bundle.
+    process: bool,
+    /// The modelled `ApplicationVersionStatus` the version is in when the
+    /// composition names it, taken from the service's own constants so the wait
+    /// cannot drift from what the service reports.
+    status: &'static str,
+    /// The same status as the service puts an application version's status on
+    /// the wire, which is the text the refusal must carry.
+    reported: &'static str,
+}
+
+/// A version of the application that has not been successfully pre-processed
+/// composes nothing: pre-processing is what reads and validates the `env.yaml`
+/// manifest a composition is described by, so the request is refused with the
+/// service's configuration refusal naming the label the request supplied and
+/// the status the version is in — a transient state a client waits out, told
+/// apart from a label that names no version of the application at all — and no
+/// environment is created.
+///
+/// The rows span every status that is not the successfully processed one and
+/// each way a version gets into it: a create that asked for no pre-processing at
+/// all, a bundle past the bounds this emulator parses caller content within (so
+/// nothing validated it, and the emulator keeps serving), a bundle that failed
+/// validation, and pre-processing the clock still owes.
 #[tokio::test]
-async fn a_manifest_past_the_parse_bounds_composes_nothing() {
+async fn a_version_that_was_not_successfully_processed_composes_nothing() {
+    let good = manifest("c-ready+", Some(SOLUTION_STACK.as_str()), None, &[], &[]);
+    // One level past the nesting bound, and a kilobyte of alias amplification:
+    // both bounds are taken BEFORE a tree is built from the text, so neither
+    // file is ever loaded and nothing pre-processed the version.
     let deep = format!(
         "EnvironmentName: c-deep+\nOptionSettings: {}",
         "[".repeat(eb::state::MAX_VALIDATED_NESTING + 1)
@@ -725,73 +877,279 @@ async fn a_manifest_past_the_parse_bounds_composes_nothing() {
             level - 1
         ));
     }
-    for (case, manifest) in [
-        ("a manifest nesting past the bound", deep),
-        ("a manifest whose aliases would expand exponentially", aliases),
-    ] {
+    // A manifest that is text but no YAML document: a flow sequence that is
+    // never closed, so the pre-processing of it FAILS.
+    let broken = b"EnvironmentName: c-broken+\nOptionSettings: [\n".to_vec();
+    let rows = vec![
+        Unready {
+            case: "a version created with no source bundle",
+            manifest: None,
+            process: false,
+            status: eb::state::VERSION_STATUS_UNPROCESSED,
+            reported: "UNPROCESSED",
+        },
+        Unready {
+            case: "a version whose create asked for no pre-processing",
+            manifest: Some(good.clone()),
+            process: false,
+            status: eb::state::VERSION_STATUS_UNPROCESSED,
+            reported: "UNPROCESSED",
+        },
+        Unready {
+            case: "a version whose manifest nests past the bound this emulator parses",
+            manifest: Some(deep.into_bytes()),
+            process: true,
+            status: eb::state::VERSION_STATUS_UNPROCESSED,
+            reported: "UNPROCESSED",
+        },
+        Unready {
+            case: "a version whose manifest would expand its aliases exponentially",
+            manifest: Some(aliases.into_bytes()),
+            process: true,
+            status: eb::state::VERSION_STATUS_UNPROCESSED,
+            reported: "UNPROCESSED",
+        },
+        Unready {
+            case: "a version whose manifest failed validation",
+            manifest: Some(broken),
+            process: true,
+            status: eb::state::VERSION_STATUS_FAILED,
+            reported: "FAILED",
+        },
+        Unready {
+            case: "a version whose pre-processing is still owed",
+            manifest: Some(good.clone()),
+            process: true,
+            status: eb::state::VERSION_STATUS_PROCESSING,
+            reported: "PROCESSING",
+        },
+    ];
+
+    for Unready {
+        case,
+        manifest,
+        process,
+        status,
+        reported,
+    } in rows
+    {
         let emulator = Emulator::with_object_storage();
         given_application(&emulator, case).await;
-        given_version(&emulator, case, "v1", &[("env.yaml", manifest.as_bytes())]).await;
+        let mut params: Vec<(String, String)> = vec![
+            ("ApplicationName".to_string(), APPLICATION.to_string()),
+            ("VersionLabel".to_string(), VERSION_LABEL.to_string()),
+        ];
+        if let Some(text) = &manifest {
+            let bucket = bundle_bucket(VERSION_LABEL);
+            emulator
+                .put_object(
+                    &bucket,
+                    BUNDLE_KEY,
+                    &zip_of(&[("env.yaml", text.as_slice())]),
+                )
+                .await;
+            params.push(("SourceBundle.S3Bucket".to_string(), bucket));
+            params.push(("SourceBundle.S3Key".to_string(), BUNDLE_KEY.to_string()));
+        }
+        if process {
+            params.push(("Process".to_string(), "true".to_string()));
+        }
+        let borrowed: Vec<(&str, &str)> = params
+            .iter()
+            .map(|(name, value)| (name.as_str(), value.as_str()))
+            .collect();
+        let created = emulator.call("CreateApplicationVersion", &borrowed).await;
+        assert_eq!(
+            created.status, 200,
+            "case {case:?}: expected 200 from CreateApplicationVersion, got {} and body {}",
+            created.status, created.body
+        );
+        if status == eb::state::VERSION_STATUS_PROCESSING {
+            // The transient status is the one the create itself reports — the
+            // version settles one status-transition span later — so the
+            // composition that must observe it follows straight away, with
+            // nothing between the two calls.
+            assert_eq!(
+                created.value("ApplicationVersion/Status"),
+                Some(reported),
+                "case {case:?}: expected the create to report {reported}, got body {}",
+                created.body
+            );
+        } else {
+            wait_for_version_status(&emulator, case, VERSION_LABEL, status).await;
+        }
 
-        let refused = compose(&emulator, Some(GROUP_NAME), &["v1"]).await;
+        let refused = compose(&emulator, Some(GROUP_NAME), &[VERSION_LABEL]).await;
         assert_eq!(
             refused.status, 400,
             "case {case:?}: expected HTTP 400 from ComposeEnvironments, got {} and body {}",
             refused.status, refused.body
         );
         assert_eq!(
+            refused.error_code(),
+            "ConfigurationValidationException",
+            "case {case:?}: expected the configuration refusal, got body {}",
+            refused.body
+        );
+        assert_eq!(
             refused.error_message(),
-            "No valid application version found.",
-            "case {case:?}: expected the service's sentence for a label that composes nothing, \
-             got {:?}",
+            format!(
+                "ApplicationVersion {VERSION_LABEL} has not been successfully processed. Current \
+                 status: {reported}"
+            ),
+            "case {case:?}: expected the refusal to name the label and the version's status, got \
+             {:?}",
             refused.error_message()
         );
         // And the emulator is still serving: the next call is answered from the
-        // same process.
+        // same process, and the refused composition left nothing behind.
         let (described, answer) = described_environments(&emulator, case).await;
         assert!(
             described.is_empty(),
-            "case {case:?}: nothing may be composed from a manifest nothing parsed, got body {}",
+            "case {case:?}: a refused composition must leave no environment behind, got body {}",
             answer.body
         );
     }
 }
 
-/// A version created with NO source bundle carries no manifest either — "if
-/// neither SourceBundle nor SourceBuildInformation are provided, Elastic
-/// Beanstalk uses a sample application", which is no archive this emulator holds
-/// — so it describes no environment and composes none.
-#[tokio::test]
-async fn a_version_with_no_source_bundle_composes_nothing() {
-    let case = "a version created without a source bundle";
-    let emulator = Emulator::with_object_storage();
-    given_application(&emulator, case).await;
-    let created = emulator
-        .call(
-            "CreateApplicationVersion",
-            &[
-                ("ApplicationName", APPLICATION),
-                ("VersionLabel", "sampled"),
-            ],
-        )
-        .await;
-    assert_eq!(
-        created.status, 200,
-        "case {case:?}: expected 200 from CreateApplicationVersion, got {} and body {}",
-        created.status, created.body
-    );
+/// What a composition answers for the labels one row of
+/// [`version_labels_are_scoped_to_the_named_applications_versions`] names.
+enum Composed {
+    /// Refused with this error code and message, composing nothing.
+    Refused {
+        code: &'static str,
+        message: String,
+    },
+    /// Composed exactly these environments, in this order.
+    Environments(&'static [&'static str]),
+}
 
-    let refused = compose(&emulator, Some(GROUP_NAME), &["sampled"]).await;
-    assert_eq!(
-        refused.status, 400,
-        "case {case:?}: expected HTTP 400 from ComposeEnvironments, got {} and body {}",
-        refused.status, refused.body
-    );
-    assert_eq!(
-        refused.error_message(),
-        "No valid application version found.",
-        "case {case:?}: expected the service's sentence for a label that composes nothing, got \
-         {:?}",
-        refused.error_message()
-    );
+/// One request's version labels, and what the composition must answer for them.
+struct Scoped {
+    case: &'static str,
+    version_labels: Vec<&'static str>,
+    expected: Composed,
+}
+
+/// "A list of version labels, specifying one or more application source bundles
+/// that belong to the TARGET APPLICATION": the labels are scoped to the versions
+/// of the application the request names, so a label that names no version of it
+/// — one of another application, or one nothing carries — is not a version this
+/// call composes from. A request left with no version by that scoping resolves
+/// no application version at all and is refused with the service's fixed
+/// sentence for that class; a request left with one composes it, and a request
+/// left with one that has not been successfully pre-processed is refused with
+/// that version's label and status instead.
+///
+/// The rows span where each label lives, how many a request carries, and which
+/// of them is the one the scoping keeps.
+#[tokio::test]
+async fn version_labels_are_scoped_to_the_named_applications_versions() {
+    let ready = manifest("c-api+", Some(SOLUTION_STACK.as_str()), None, &[], &[]);
+    let no_valid_version = Composed::Refused {
+        code: "MissingParameter",
+        message: "No valid application version found.".to_string(),
+    };
+    let rows = vec![
+        Scoped {
+            case: "a label of another application's version alone",
+            version_labels: vec![FOREIGN_LABEL],
+            expected: no_valid_version,
+        },
+        Scoped {
+            case: "a label no version carries alone",
+            version_labels: vec!["v-never"],
+            expected: Composed::Refused {
+                code: "MissingParameter",
+                message: "No valid application version found.".to_string(),
+            },
+        },
+        Scoped {
+            case: "a foreign label beside a processed version of the application",
+            version_labels: vec![FOREIGN_LABEL, "v-ready"],
+            expected: Composed::Environments(&["c-api-dev"]),
+        },
+        Scoped {
+            case: "a label no version carries beside a processed version of the application",
+            version_labels: vec!["v-never", "v-ready"],
+            expected: Composed::Environments(&["c-api-dev"]),
+        },
+        Scoped {
+            case: "a foreign label beside an unprocessed version of the application",
+            version_labels: vec![FOREIGN_LABEL, "v-raw"],
+            expected: Composed::Refused {
+                code: "ConfigurationValidationException",
+                message: "ApplicationVersion v-raw has not been successfully processed. Current \
+                          status: UNPROCESSED"
+                    .to_string(),
+            },
+        },
+    ];
+
+    for Scoped {
+        case,
+        version_labels,
+        expected,
+    } in rows
+    {
+        let emulator = Emulator::with_object_storage();
+        given_application(&emulator, case).await;
+        given_foreign_version(&emulator, case, FOREIGN_LABEL).await;
+        given_version(&emulator, case, "v-ready", &[("env.yaml", &ready)]).await;
+        given_sampled_version(&emulator, case, "v-raw").await;
+
+        let answer = compose(&emulator, Some(GROUP_NAME), &version_labels).await;
+        match expected {
+            Composed::Refused { code, message } => {
+                assert_eq!(
+                    answer.status, 400,
+                    "case {case:?}: expected HTTP 400 from ComposeEnvironments, got {} and body {}",
+                    answer.status, answer.body
+                );
+                assert_eq!(
+                    answer.error_code(),
+                    code,
+                    "case {case:?}: expected {code}, got body {}",
+                    answer.body
+                );
+                assert_eq!(
+                    answer.error_message(),
+                    message,
+                    "case {case:?}: expected the refusal {message:?}, got {:?}",
+                    answer.error_message()
+                );
+                let (described, body) = described_environments(&emulator, case).await;
+                assert!(
+                    described.is_empty(),
+                    "case {case:?}: a refused composition must leave no environment behind, got \
+                     body {}",
+                    body.body
+                );
+            }
+            Composed::Environments(names) => {
+                assert_eq!(
+                    answer.status, 200,
+                    "case {case:?}: expected 200 from ComposeEnvironments, got {} and body {}",
+                    answer.status, answer.body
+                );
+                assert_eq!(
+                    answer.values_at("Environments/member/EnvironmentName"),
+                    names.to_vec(),
+                    "case {case:?}: expected the scoped version's environment, got body {}",
+                    answer.body
+                );
+                let (described, body) = described_environments(&emulator, case).await;
+                assert_eq!(
+                    described
+                        .iter()
+                        .map(|environment| environment.value("EnvironmentName").unwrap_or_default())
+                        .collect::<Vec<_>>(),
+                    names.to_vec(),
+                    "case {case:?}: the stored group must hold exactly that environment, got body \
+                     {}",
+                    body.body
+                );
+            }
+        }
+    }
 }

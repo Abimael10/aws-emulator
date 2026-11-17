@@ -1,20 +1,26 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ComposeEnvironments
-//! Implemented: resolves each version label to the application version it names, reads
-//! the environment manifest (`env.yaml`) out of that version's source bundle, and
-//! launches one environment per manifest — or deploys the version to the environment
-//! the group already runs under that name, since this operation "creates or updates a
-//! group of environments". Each composed environment carries the manifest's name
-//! (completed by `GroupName`), solution stack, tier, option settings and links to the
-//! other environments of the group, starts `Launching` and reaches `Ready` the way every
-//! other launch does, and is answered as an `EnvironmentDescription`. A label that
-//! resolves to no version, or to a bundle with no readable manifest, describes no
-//! environment, so the request is refused with the service's `MissingParameter` and its
-//! fixed sentence for that class instead of composing an environment whose name was
-//! invented. The application the request names is resolved FIRST, so a name no
-//! application exists under is reported as that rather than as a version that cannot be
-//! composed. This is the ONLY file to touch for this operation.
+//! Implemented: scopes the requested version labels to the versions of the application
+//! the request names, reads the environment manifest (`env.yaml`) out of each of those
+//! versions' source bundles, and launches one environment per manifest — or deploys the
+//! version to the environment the group already runs under that name, since this
+//! operation "creates or updates a group of environments". Each composed environment
+//! carries the manifest's name (completed by `GroupName`), solution stack, tier, option
+//! settings and links to the other environments of the group, starts `Launching` and
+//! reaches `Ready` the way every other launch does, and is answered as an
+//! `EnvironmentDescription`. A request none of whose labels names a version of the
+//! application resolves no version at all, so it is refused with the service's
+//! `MissingParameter` and its fixed sentence for that class; a version that IS the
+//! application's but whose pre-processing has not finished successfully carries no
+//! validated manifest yet, so it is refused with the configuration refusal naming that
+//! label and the status the version is in, which is the transient state a client waits
+//! out rather than a parameter it got wrong. A resolved and processed version whose
+//! bundle holds no readable manifest describes no environment either, so it is refused
+//! rather than composing an environment whose name was invented. The application the
+//! request names is resolved FIRST, so a name no application exists under is reported as
+//! that rather than as a version that cannot be composed. This is the ONLY file to touch
+//! for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -228,6 +234,53 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // "A list of version labels, specifying one or more application source
+        // bundles that BELONG TO THE TARGET APPLICATION": the labels are scoped
+        // to the versions of the application the request names, so a label
+        // naming a version of another application (or no version at all) names
+        // nothing this call can compose from.
+        //
+        // What a composition needs out of a version — the environment manifest
+        // and the configuration files beside it — is what the version's
+        // PRE-PROCESSING reads, so a version of this application whose
+        // pre-processing has not finished successfully cannot be composed from
+        // either: it carries no validated manifest yet. Both are decided in the
+        // one pass that resolves each label, in the order the request listed
+        // them.
+        let mut scoped: Vec<String> = Vec::new();
+        let mut unprocessed: Option<(String, String)> = None;
+        for version_label in &version_labels {
+            let Some(version) = store
+                .application_versions
+                .get(&(application_name.clone(), version_label.clone()))
+            else {
+                continue;
+            };
+            if unprocessed.is_none() && !version.is_successfully_processed() {
+                unprocessed = Some((version_label.clone(), version.status.clone()));
+            }
+            scoped.push(version_label.clone());
+        }
+        // When the scoping leaves no version, there is no application version to
+        // compose at all, which is what the service's fixed sentence for that
+        // class reports.
+        if scoped.is_empty() {
+            return Err(ComposeEnvironmentsError::missing_parameter(
+                NO_VALID_APPLICATION_VERSION_MESSAGE,
+            ));
+        }
+        // A version that is the application's but not yet processed is a
+        // statement about the VERSION's state rather than about a parameter the
+        // request got wrong, so it is reported as the configuration refusal
+        // naming the label and the status the version is in — the transient
+        // state a client waits out and retries, told apart from a label that
+        // names no version of the application at all.
+        if let Some((version_label, status)) = unprocessed {
+            return Err(ComposeEnvironmentsError::configuration_validation(
+                crate::state::unprocessed_version_refusal(&version_label, &status),
+            ));
+        }
+
         // "Each source bundle must include an environment manifest that
         // specifies the name of the environment and the name of the solution
         // stack to use, and optionally can specify environment links to
@@ -235,17 +288,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // request one of whose labels describes no environment composes none of
         // them rather than half the group.
         let mut composing: Vec<ComposedManifest> = Vec::new();
-        for version_label in &version_labels {
+        for version_label in &scoped {
             let manifest = store
                 .application_versions
                 .get(&(application_name.clone(), version_label.clone()))
                 .and_then(|version| version.bundle.as_ref())
                 .and_then(crate::state::environment_manifest);
-            // A label this application has no version for, a version whose
-            // source bundle this emulator holds no files of, a bundle with no
-            // readable environment manifest, and a manifest that names no
-            // environment all leave this call with no environment to compose
-            // for that label.
+            // A version whose source bundle this emulator holds no files of, a
+            // bundle with no readable environment manifest, and a manifest that
+            // names no environment all leave this call with no environment to
+            // compose for that label.
             let manifest_name = manifest
                 .as_ref()
                 .and_then(|manifest| manifest.environment_name.clone());

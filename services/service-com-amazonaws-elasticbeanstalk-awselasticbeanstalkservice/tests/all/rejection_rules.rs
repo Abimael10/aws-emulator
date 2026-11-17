@@ -552,8 +552,9 @@ async fn composing_environments_resolves_the_application_before_the_source_bundl
     }
 
     // The application exists, so the refusal is the one about the version the
-    // request names — the precondition that comes AFTER the application, and the
-    // service's fixed sentence for it.
+    // request names — the precondition that comes AFTER the application. The
+    // version was created without pre-processing, so it is the one that reports
+    // the status the version is in.
     let existing = emulator
         .call(
             "ComposeEnvironments",
@@ -570,7 +571,7 @@ async fn composing_environments_resolves_the_application_before_the_source_bundl
     );
     assert_eq!(
         existing.error_message(),
-        "No valid application version found.",
+        "ApplicationVersion v1 has not been successfully processed. Current status: UNPROCESSED",
         "case \"existing application\": expected the version precondition, got {}",
         existing.body
     );
