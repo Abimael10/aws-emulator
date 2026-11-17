@@ -231,6 +231,132 @@ async fn get_transcript(
     (items, next)
 }
 
+/// How many items the transcript of the session `connection_token` authenticates holds.
+///
+/// Read back through `GetTranscript` with the largest page the model allows, so the count
+/// is the whole transcript rather than one page of it.
+async fn transcript_len(router: &MultiServiceRouter, connection_token: &str) -> usize {
+    let (items, _) = get_transcript(
+        router,
+        connection_token,
+        &json!({"MaxResults": 100, "SortOrder": "ASCENDING", "ScanDirection": "FORWARD"}),
+    )
+    .await;
+    items.len()
+}
+
+/// Which record the service answers a repeated request from.
+///
+/// A repeat carrying a `ClientToken` is answered with what the FIRST call wrote, so a case
+/// names where that value is kept: `SendMessage` keeps it on the chat item it appended, a
+/// transient `SendEvent` keeps the answer it reported on the session, and a message receipt
+/// keeps its timestamp on the message it acknowledges, under the acknowledging
+/// participant's own entry (`Receipt$DeliveredTimestamp` / `Receipt$ReadTimestamp`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Answered {
+    /// The chat item `SendMessage` appended.
+    Item,
+    /// The transient event the session remembers for a `ClientToken`.
+    Event,
+    /// `Receipt$DeliveredTimestamp` on the acknowledged message.
+    DeliveredReceipt,
+    /// `Receipt$ReadTimestamp` on the acknowledged message.
+    ReadReceipt,
+}
+
+/// The `AbsoluteTime` the store holds for the answer `id` names, or `None` when no record
+/// of that kind holds it.
+///
+/// Every assertion about a repeat is made against THIS value rather than against the other
+/// answer: the stored record is one reference, the same on every host, so the check has a
+/// single outcome however long the two calls are apart and however fast the host runs.
+fn stored_absolute_time(
+    harness: &Harness,
+    participant_token: &str,
+    answered: Answered,
+    id: &str,
+) -> Option<String> {
+    let store = harness.store();
+    let state = store.lock();
+    let contact_id = state.participant_tokens.get(participant_token)?;
+    let session = state.sessions.get(contact_id)?;
+    match answered {
+        Answered::Item => Some(session.item(id)?.absolute_time.clone()),
+        Answered::Event => session
+            .events
+            .values()
+            .find(|event| event.id == id)
+            .map(|event| event.absolute_time.clone()),
+        Answered::DeliveredReceipt | Answered::ReadReceipt => {
+            let recipient = session.participant_id.as_str();
+            let receipt = session
+                .item(id)?
+                .receipts
+                .iter()
+                .find(|receipt| receipt.recipient_participant_id == recipient)?;
+            if answered == Answered::ReadReceipt {
+                receipt.read_timestamp.clone()
+            } else {
+                receipt.delivered_timestamp.clone()
+            }
+        }
+    }
+}
+
+/// Overwrite the `AbsoluteTime` the store holds for the answer `id` names with `at`.
+///
+/// Pins a stored answer to an instant no clock read in this run can produce, so a repeat
+/// that reports it can only have read the record the first call wrote.
+fn pin_stored_absolute_time(
+    harness: &Harness,
+    participant_token: &str,
+    answered: Answered,
+    id: &str,
+    at: &str,
+) {
+    let store = harness.store();
+    let mut state = store.lock();
+    let contact_id = state
+        .participant_tokens
+        .get(participant_token)
+        .cloned()
+        .expect("the chat the participant token names");
+    let session = state
+        .sessions
+        .get_mut(&contact_id)
+        .expect("the session the started chat registered");
+    let recipient = session.participant_id.clone();
+    if answered == Answered::Event {
+        let event = session
+            .events
+            .values_mut()
+            .find(|event| event.id == id)
+            .expect("the remembered event the answer names");
+        event.absolute_time = at.to_string();
+        return;
+    }
+    let item = session
+        .transcript
+        .iter_mut()
+        .find(|item| item.id == id)
+        .expect("the chat item the answer names");
+    match answered {
+        Answered::Item => item.absolute_time = at.to_string(),
+        _ => {
+            let receipt = item
+                .receipts
+                .iter_mut()
+                .find(|receipt| receipt.recipient_participant_id == recipient)
+                .expect("this participant's receipt entry on the acknowledged message");
+            if answered == Answered::ReadReceipt {
+                receipt.read_timestamp = Some(at.to_string());
+            } else {
+                receipt.delivered_timestamp = Some(at.to_string());
+            }
+        }
+    }
+}
+
 #[tokio::test]
 async fn a_sent_message_comes_back_from_the_transcript_that_stored_it() {
     let router = router();
@@ -648,43 +774,66 @@ async fn re_using_a_participant_token_resolves_to_the_same_session() {
 
 #[tokio::test]
 async fn repeating_a_client_token_returns_the_stored_item_and_appends_nothing() {
+    /// The chat these cases connect to. Named, because the stored record each answer is
+    /// compared with is read back through it.
+    const PARTICIPANT: &str = "participant-token-idempotent";
+
     let router = router();
-    let token = connect(&router, "participant-token-idempotent").await;
+    let token = connect(&router, PARTICIPANT).await;
     let acknowledged = send_message(&router, &token, "a message to acknowledge").await;
 
-    // Rows differ in the operation, the client token, the content type and the content.
-    let cases: Vec<(&str, &str, &str, String)> = vec![
-        ("/participant/message", "ct-1", "text/plain", "hello".to_string()),
+    // Rows differ in the operation, the client token, the content type, the content and
+    // which record the answer is kept on. The two receipt content types and
+    // `…event.typing` are `SendEvent`'s own documented values.
+    let cases: Vec<(&str, &str, &str, String, Answered)> = vec![
+        (
+            "/participant/message",
+            "ct-1",
+            "text/plain",
+            "hello".to_string(),
+            Answered::Item,
+        ),
         (
             "/participant/message",
             "ct-2",
             "text/plain",
             "a second message".to_string(),
+            Answered::Item,
         ),
         (
             "/participant/message",
             "a-much-longer-client-token-0123456789",
             "text/markdown",
             "# heading".to_string(),
+            Answered::Item,
         ),
         (
             "/participant/event",
             "ct-1",
             "application/vnd.amazonaws.connect.event.typing",
             String::new(),
+            Answered::Event,
         ),
         (
             "/participant/event",
             "ct-3",
             "application/vnd.amazonaws.connect.event.message.delivered",
             receipt_content(&acknowledged),
+            Answered::DeliveredReceipt,
+        ),
+        (
+            "/participant/event",
+            "ct-4",
+            "application/vnd.amazonaws.connect.event.message.read",
+            receipt_content(&acknowledged),
+            Answered::ReadReceipt,
         ),
     ];
 
     // Only a message is an item of the conversation: a typing event is transient and a
     // receipt is recorded on the message it names, so neither grows the transcript.
     let mut expected_items = 1usize;
-    for (path, client_token, content_type, content) in &cases {
+    for (path, client_token, content_type, content, answered) in &cases {
         let case = format!("{path} {client_token}");
         let mut body = json!({"ContentType": content_type, "ClientToken": client_token});
         if !content.is_empty() {
@@ -696,6 +845,18 @@ async fn repeating_a_client_token_returns_the_stored_item_and_appends_nothing() 
             expected_items += 1;
         }
 
+        // What the call STORED for this answer. Every assertion below is made against it,
+        // so none of them turns on how much of the clock passed between the two calls.
+        let id = first["Id"].as_str().unwrap_or_default().to_string();
+        let stored = stored_absolute_time(&router, PARTICIPANT, *answered, &id).unwrap_or_else(
+            || panic!("case {case}: the call stored no {answered:?} record for {first:?}"),
+        );
+        assert_eq!(
+            first["AbsoluteTime"].as_str(),
+            Some(stored.as_str()),
+            "case {case}: expected the AbsoluteTime it stored ({stored}), got {first:?}"
+        );
+
         let (status, again) = post(&router, path, Some(&token), &body).await;
         assert_eq!(status, 200, "case {case} repeated: got {again:?}");
         assert_eq!(
@@ -706,43 +867,140 @@ async fn repeating_a_client_token_returns_the_stored_item_and_appends_nothing() 
             again["AbsoluteTime"], first["AbsoluteTime"],
             "case {case}: expected the same AbsoluteTime on the repeat, got {again:?}"
         );
-
-        let (items, _) = get_transcript(
-            &router,
-            &token,
-            &json!({"MaxResults": 100, "SortOrder": "ASCENDING", "ScanDirection": "FORWARD"}),
-        )
-        .await;
         assert_eq!(
-            items.len(),
-            expected_items,
-            "case {case}: the repeat must not append a second item, got {items:?}"
+            again["AbsoluteTime"].as_str(),
+            Some(stored.as_str()),
+            "case {case}: expected the repeat answered from the stored {answered:?} record \
+             ({stored}), got {again:?}"
+        );
+
+        let items = transcript_len(&router, &token).await;
+        assert_eq!(
+            items, expected_items,
+            "case {case}: the repeat must not append a second item, got {items} item(s)"
         );
     }
 
     // The same client token on SendMessage and on SendEvent is two distinct requests.
     let message_case = cases
         .iter()
-        .find(|(path, client_token, _, _)| *path == "/participant/message" && *client_token == "ct-1")
+        .find(|(path, client_token, ..)| {
+            *path == "/participant/message" && *client_token == "ct-1"
+        })
         .expect("the SendMessage ct-1 row");
-    let (_, message) = post(
+    let (status, message) = post(
         &router,
         message_case.0,
         Some(&token),
         &json!({"ContentType": message_case.2, "Content": message_case.3, "ClientToken": "ct-1"}),
     )
     .await;
-    let (_, event) = post(
+    assert_eq!(
+        status, 200,
+        "case cross-operation ct-1 message: got {message:?}"
+    );
+    let (status, event) = post(
         &router,
         "/participant/event",
         Some(&token),
         &json!({"ContentType": "application/vnd.amazonaws.connect.event.typing", "ClientToken": "ct-1"}),
     )
     .await;
+    assert_eq!(status, 200, "case cross-operation ct-1 event: got {event:?}");
     assert_ne!(
         message["Id"], event["Id"],
         "case cross-operation ct-1: a client token scopes one operation, got {message:?} and {event:?}"
     );
+}
+
+#[tokio::test]
+async fn a_repeated_request_is_answered_from_the_stored_record_not_from_the_clock() {
+    /// The chat these cases connect to.
+    const PARTICIPANT: &str = "participant-token-replay-from-state";
+    /// An `Instant` in the form the model documents for a chat item's `AbsoluteTime`
+    /// (`yyyy-MM-ddThh:mm:ss.SSSZ`), written into the store so that no clock read in this
+    /// run can have produced it: an answer carrying it was read from the record.
+    const PINNED: &str = "2019-11-08T02:41:28.172Z";
+    const TYPING: &str = "application/vnd.amazonaws.connect.event.typing";
+    const DELIVERED: &str = "application/vnd.amazonaws.connect.event.message.delivered";
+    const READ: &str = "application/vnd.amazonaws.connect.event.message.read";
+
+    let router = router();
+    let token = connect(&router, PARTICIPANT).await;
+    let acknowledged = send_message(&router, &token, "a message to acknowledge").await;
+
+    // Rows differ in the operation, the content type, the content and which record holds
+    // the answer — every kind of record a repeat can be answered from.
+    let cases: Vec<(&str, &str, Value, Answered)> = vec![
+        (
+            "a message",
+            "/participant/message",
+            json!({"ContentType": "text/plain", "Content": "hello", "ClientToken": "pin-1"}),
+            Answered::Item,
+        ),
+        (
+            "a message carrying markdown",
+            "/participant/message",
+            json!({"ContentType": "text/markdown", "Content": "# heading", "ClientToken": "pin-2"}),
+            Answered::Item,
+        ),
+        (
+            "a transient event",
+            "/participant/event",
+            json!({"ContentType": TYPING, "ClientToken": "pin-3"}),
+            Answered::Event,
+        ),
+        (
+            "a delivered receipt",
+            "/participant/event",
+            json!({"ContentType": DELIVERED, "Content": receipt_content(&acknowledged),
+                   "ClientToken": "pin-4"}),
+            Answered::DeliveredReceipt,
+        ),
+        (
+            "a read receipt",
+            "/participant/event",
+            json!({"ContentType": READ, "Content": receipt_content(&acknowledged),
+                   "ClientToken": "pin-5"}),
+            Answered::ReadReceipt,
+        ),
+    ];
+
+    for (case, path, body, answered) in &cases {
+        let (status, first) = post(&router, path, Some(&token), body).await;
+        assert_eq!(status, 200, "case {case:?}: got {first:?}");
+        let id = first["Id"].as_str().unwrap_or_default().to_string();
+        assert!(
+            !id.is_empty(),
+            "case {case:?}: expected an Id to be answered, got {first:?}"
+        );
+        let before = transcript_len(&router, &token).await;
+
+        // Pin the stored answer to an instant the clock cannot read, then repeat the
+        // request: an answer carrying the pinned instant came from the record, so a
+        // repeat's answer never depends on when the repeat arrives.
+        pin_stored_absolute_time(&router, PARTICIPANT, *answered, &id, PINNED);
+
+        let (status, again) = post(&router, path, Some(&token), body).await;
+        assert_eq!(status, 200, "case {case:?} repeated: got {again:?}");
+        assert_eq!(
+            again["Id"].as_str(),
+            Some(id.as_str()),
+            "case {case:?}: expected the stored record's Id {id}, got {again:?}"
+        );
+        assert_eq!(
+            again["AbsoluteTime"].as_str(),
+            Some(PINNED),
+            "case {case:?}: expected the stored AbsoluteTime {PINNED}, got {again:?}"
+        );
+
+        let after = transcript_len(&router, &token).await;
+        assert_eq!(
+            after, before,
+            "case {case:?}: the repeat must append nothing, transcript went from {before} \
+             to {after} item(s)"
+        );
+    }
 }
 
 #[tokio::test]
