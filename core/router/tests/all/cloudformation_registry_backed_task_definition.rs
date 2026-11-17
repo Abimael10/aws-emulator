@@ -31,6 +31,13 @@
 //! deployment re-points such a value to the identifier the owning service assigned — so that
 //! image addresses the registry that exists rather than a host nothing here answers for.
 //!
+//! The harness here — the three-service router, the deploy-and-poll, each service's wire call,
+//! the reader of the name the repository was created under and the address the registry is
+//! served at — is `pub(crate)` because the sibling
+//! [`super::cloudformation_registry_uri_reaches_every_consumed_property`] reads the same rule
+//! in the other property positions a declaration can carry that URI in: this target is one
+//! crate root, so the wiring is stated once rather than copied.
+//!
 //! The rows differ along what the rule generalises over: how the declaration composes the
 //! image from the repository (an `Fn::Sub` over the repository's `RepositoryUri` attribute, an
 //! `Fn::Join` over it, and an `Fn::Sub` over the pseudo parameters and the repository's name),
@@ -73,7 +80,7 @@ const ECS_TARGET_PREFIX: &str = "AmazonEC2ContainerServiceV20141113";
 /// `core/router/src/lib.rs` mounts them. Request authentication is off, as in every other
 /// suite here; the in-process callback CloudFormation makes signs its request either way (the
 /// credential scope is what routes it).
-fn build_router() -> MultiServiceRouter {
+pub(crate) fn build_router() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
@@ -153,11 +160,19 @@ async fn json_rpc(
     (status, payload)
 }
 
-async fn ecr(router: &MultiServiceRouter, operation: &str, request: &Value) -> (u16, Value) {
+pub(crate) async fn ecr(
+    router: &MultiServiceRouter,
+    operation: &str,
+    request: &Value,
+) -> (u16, Value) {
     json_rpc(router, "ecr", ECR_TARGET_PREFIX, operation, request).await
 }
 
-async fn ecs(router: &MultiServiceRouter, operation: &str, request: &Value) -> (u16, Value) {
+pub(crate) async fn ecs(
+    router: &MultiServiceRouter,
+    operation: &str,
+    request: &Value,
+) -> (u16, Value) {
     json_rpc(router, "ecs", ECS_TARGET_PREFIX, operation, request).await
 }
 
@@ -228,7 +243,12 @@ fn failure_reason(events: &str, logical_id: &str, resource_status: &str) -> Opti
 
 /// Create a stack from `template` and read it to a terminal status that must be
 /// `CREATE_COMPLETE`. The answer is that read's body.
-async fn deploy(router: &MultiServiceRouter, case: &str, stack: &str, template: &str) -> String {
+pub(crate) async fn deploy(
+    router: &MultiServiceRouter,
+    case: &str,
+    stack: &str,
+    template: &str,
+) -> String {
     let described = create(router, case, stack, template).await;
     assert_eq!(
         opt_element(&described, "StackStatus").as_deref(),
@@ -289,7 +309,7 @@ fn task_definition_arn(family: &str, revision: i64) -> String {
 /// CloudFormation derived for that attribute before the create answered, which the deployment
 /// re-points to the value the owning service assigned — so either way the image addresses the
 /// registry this emulator serves, which is the only address the image can be pulled from here.
-fn published_repository_uri(repository: &str) -> String {
+pub(crate) fn published_repository_uri(repository: &str) -> String {
     let base = ::smithy_server_runtime::UNSERVED_URL_BASE;
     let authority = base
         .split_once("://")
@@ -462,6 +482,42 @@ const ROWS: &[Row] = &[
     },
 ];
 
+/// The name the stack created its declared repository under, read from its `RepositoryName`
+/// output — which is the resource's physical id, since "Ref returns the repository name" — and
+/// checked against what the declaration asked for: the name the template STATED, or the
+/// `<stack>-<logical id>-` form CloudFormation generates for a declaration that names none.
+///
+/// `pub(crate)` for the same reason the rest of this harness is: the sibling
+/// [`super::cloudformation_registry_uri_reaches_every_consumed_property`] reads the same rule
+/// on the same two resources, so the generated-name rule is stated once and the two suites
+/// cannot drift on it.
+pub(crate) fn created_repository_name(
+    case: &str,
+    stack: &str,
+    registry: &str,
+    declared: Option<&str>,
+    outputs: &std::collections::BTreeMap<String, String>,
+) -> String {
+    let repository = outputs.get("RepositoryName").cloned().unwrap_or_else(|| {
+        panic!("case {case:?}: no RepositoryName output with a value, got {outputs:?}")
+    });
+    match declared {
+        Some(named) => assert_eq!(
+            repository, named,
+            "case {case:?}: expected the declared repository name, got {repository:?}"
+        ),
+        None => {
+            let prefix = format!("{stack}-{}-", registry.to_ascii_lowercase());
+            assert!(
+                repository.starts_with(&prefix),
+                "case {case:?}: expected a generated repository name starting {prefix:?}, got \
+                 {repository:?}"
+            );
+        }
+    }
+    repository
+}
+
 /// Every row's repository exists in Amazon ECR and every row's revision is registered in
 /// Amazon ECS, carrying the image the declaration composed from that repository.
 #[tokio::test]
@@ -475,27 +531,13 @@ async fn a_stacks_registry_and_its_task_definition_exist_in_the_services_that_ow
         // The repository: the name the template stated, or the one CloudFormation generated
         // for the resource — which is also the physical resource id the stack reports, since
         // "Ref returns the repository name".
-        let repository = outputs.get("RepositoryName").cloned().unwrap_or_else(|| {
-            panic!(
-                "case {:?}: no RepositoryName output with a value, got {outputs:?}",
-                row.case
-            )
-        });
-        if let Some(named) = row.repository_name {
-            assert_eq!(
-                repository, named,
-                "case {:?}: expected the declared repository name, got {repository:?}",
-                row.case
-            );
-        } else {
-            let prefix = format!("{}-{}-", row.stack, row.registry.to_ascii_lowercase());
-            assert!(
-                repository.starts_with(&prefix),
-                "case {:?}: expected a generated repository name starting {prefix:?}, got \
-                 {repository:?}",
-                row.case
-            );
-        }
+        let repository = created_repository_name(
+            row.case,
+            row.stack,
+            row.registry,
+            row.repository_name,
+            &outputs,
+        );
         assert_eq!(
             resources.get(row.registry).map(String::as_str),
             Some(repository.as_str()),
