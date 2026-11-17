@@ -135,7 +135,9 @@ use crate::service::validation;
 /// `createdAt` is reported through [`crate::state::priority_created_at`], which
 /// applies the scoping the model states for it — present for a prioritized
 /// recommendation, absent for an automated one — so a summary and the single
-/// read of the same recommendation agree.
+/// read of the same recommendation agree. `lifecycleStage`, which the model
+/// sources from Trusted Advisor Priority as well, goes through
+/// [`crate::state::priority_scoped`] for the same reason.
 ///
 /// `pillarSpecificAggregates` is the same aggregate `GetRecommendation` reports
 /// — computed from the recommendation's own resources by
@@ -153,7 +155,7 @@ fn recommendation_summary(
         r#type: entry.r#type.clone(),
         check_arn: entry.check_arn.clone(),
         status: entry.status.clone(),
-        lifecycle_stage: entry.lifecycle_stage.clone(),
+        lifecycle_stage: crate::state::priority_scoped(&entry.r#type, &entry.lifecycle_stage),
         pillars: entry.pillars.clone(),
         source: entry.source.clone(),
         aws_services: Some(entry.aws_services.clone()),

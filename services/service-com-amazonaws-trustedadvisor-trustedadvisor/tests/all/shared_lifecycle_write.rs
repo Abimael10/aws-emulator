@@ -130,6 +130,48 @@ fn lifecycle_of(recommendation: &Value) -> (Option<&str>, Option<&str>, Option<&
     )
 }
 
+/// The lifecycle members one STORED recommendation carries at `level`, as
+/// `(lifecycleStage, updateReason, updateReasonCode, resolvedAt)`.
+///
+/// Read out of the store rather than off a response because the members the
+/// model sources from Trusted Advisor Priority are REPORTED only for a
+/// prioritized recommendation: what a refusal must leave alone is what the store
+/// holds, whatever the entry's current `type` lets a read report of it.
+fn stored_lifecycle(
+    engine: &engine::InMemoryEngine,
+    case: &str,
+    level: Level,
+    arn: &str,
+) -> (Option<String>, Option<String>, Option<String>, Option<i64>) {
+    let state = service_state(engine).expect("this service's state");
+    let state = state.lock();
+    match level {
+        Level::Account => {
+            let entry = state
+                .recommendations
+                .get(arn)
+                .unwrap_or_else(|| panic!("case {case}: no stored recommendation {arn}"));
+            (
+                entry.lifecycle_stage.clone(),
+                entry.update_reason.clone(),
+                entry.update_reason_code.clone(),
+                entry.resolved_at_millis,
+            )
+        }
+        Level::Organization => {
+            let entry = state.organization_recommendations.get(arn).unwrap_or_else(|| {
+                panic!("case {case}: no stored organization recommendation {arn}")
+            });
+            (
+                entry.lifecycle_stage.clone(),
+                entry.update_reason.clone(),
+                entry.update_reason_code.clone(),
+                entry.resolved_at_millis,
+            )
+        }
+    }
+}
+
 #[tokio::test]
 async fn both_lifecycle_updates_apply_the_same_write() {
     // Rows differ along the new stage, along whether the request carries each
@@ -345,6 +387,10 @@ async fn both_lifecycle_updates_refuse_an_entry_of_another_type() {
                 }
             }
 
+            // The lifecycle the store holds now that the entry is no longer a
+            // prioritized one: what the refused update must not have replaced.
+            let stored_before = stored_lifecycle(&engine, &case, *level, &arn);
+
             let (status, body) = call(
                 &router,
                 "PUT",
@@ -377,11 +423,14 @@ async fn both_lifecycle_updates_refuse_an_entry_of_another_type() {
             );
 
             // And the refusal wrote nothing: every lifecycle member the update
-            // would have replaced still reports what it did before.
+            // would have replaced still holds what it held before. Compared in
+            // the STORE, because a read of an entry whose `type` is not the
+            // prioritized one reports none of those members — the scoping
+            // pinned in `tests/all/priority_scoped_created_at.rs`.
             let after = read(&router, &case, *level, check_id).await;
             assert_eq!(
-                lifecycle_of(&after),
-                lifecycle_of(&before),
+                stored_lifecycle(&engine, &case, *level, &arn),
+                stored_before,
                 "case {case}: expected the refusal to leave the lifecycle members alone, got \
                  {after}"
             );
@@ -389,11 +438,6 @@ async fn both_lifecycle_updates_refuse_an_entry_of_another_type() {
                 after["lastUpdatedAt"], before["lastUpdatedAt"],
                 "case {case}: expected lastUpdatedAt to be unchanged by the refusal, got {:?}",
                 after["lastUpdatedAt"]
-            );
-            assert_eq!(
-                after["resolvedAt"], before["resolvedAt"],
-                "case {case}: expected resolvedAt to be unchanged by the refusal, got {:?}",
-                after["resolvedAt"]
             );
         }
     }

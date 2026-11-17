@@ -112,6 +112,12 @@ use crate::service::validation;
 /// and `lastUpdatedAt` are the ones a caller last wrote through
 /// `UpdateRecommendationLifecycle` on it.
 ///
+/// `lifecycleStage`, `updateReason` and `updateReasonCode` go through
+/// [`crate::state::priority_scoped`]: the model sources all three from Trusted
+/// Advisor Priority, so a member account's recommendation the service produced
+/// automatically reports none of them, exactly as the account-level read of that
+/// same recommendation does. `lastUpdatedAt` carries no such scoping.
+///
 /// `updatedOnBehalfOf`/`updatedOnBehalfOfJobTitle` are documented as "only
 /// available when a Technical Account Manager takes an action on a
 /// recommendation" managed for the account
@@ -124,11 +130,11 @@ fn account_lifecycle_summary(
     AccountRecommendationLifecycleSummary {
         account_id: crate::state::arn_account_id(&entry.arn),
         account_recommendation_arn: Some(entry.arn.clone()),
-        lifecycle_stage: entry.lifecycle_stage.clone(),
+        lifecycle_stage: crate::state::priority_scoped(&entry.r#type, &entry.lifecycle_stage),
         updated_on_behalf_of: None,
         updated_on_behalf_of_job_title: None,
-        update_reason: entry.update_reason.clone(),
-        update_reason_code: entry.update_reason_code.clone(),
+        update_reason: crate::state::priority_scoped(&entry.r#type, &entry.update_reason),
+        update_reason_code: crate::state::priority_scoped(&entry.r#type, &entry.update_reason_code),
         last_updated_at: Some(crate::state::date_time(entry.last_updated_at_millis)),
     }
 }

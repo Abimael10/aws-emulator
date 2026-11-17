@@ -109,6 +109,12 @@ use super::types::*;
 /// recommendation, absent for an automated one. `lastUpdatedAt` carries no such
 /// scoping and is reported for either.
 ///
+/// The lifecycle members the model sources from Priority as well —
+/// `lifecycleStage`, the two reason members that describe the change of that
+/// stage, and `resolvedAt` — go through [`crate::state::priority_scoped`],
+/// which applies that same scoping: a recommendation the service produced
+/// automatically went through no Priority lifecycle and reports none of them.
+///
 /// `pillarSpecificAggregates` is computed from the recommendation's own
 /// resources by
 /// [`crate::state::ComAmazonawsTrustedadvisorTrustedadvisorState::pillar_aggregates_for`],
@@ -125,7 +131,7 @@ fn recommendation(
         r#type: entry.r#type.clone(),
         check_arn: entry.check_arn.clone(),
         status: entry.status.clone(),
-        lifecycle_stage: entry.lifecycle_stage.clone(),
+        lifecycle_stage: crate::state::priority_scoped(&entry.r#type, &entry.lifecycle_stage),
         pillars: entry.pillars.clone(),
         source: entry.source.clone(),
         aws_services: Some(entry.aws_services.clone()),
@@ -140,9 +146,10 @@ fn recommendation(
         created_by: None,
         updated_on_behalf_of: None,
         updated_on_behalf_of_job_title: None,
-        update_reason: entry.update_reason.clone(),
-        update_reason_code: entry.update_reason_code.clone(),
-        resolved_at: entry.resolved_at_millis.map(crate::state::date_time),
+        update_reason: crate::state::priority_scoped(&entry.r#type, &entry.update_reason),
+        update_reason_code: crate::state::priority_scoped(&entry.r#type, &entry.update_reason_code),
+        resolved_at: crate::state::priority_scoped(&entry.r#type, &entry.resolved_at_millis)
+            .map(crate::state::date_time),
     }
 }
 

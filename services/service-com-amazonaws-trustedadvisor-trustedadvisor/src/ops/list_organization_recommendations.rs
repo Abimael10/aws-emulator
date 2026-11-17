@@ -125,7 +125,10 @@ use crate::service::validation;
 /// `createdAt` is reported through [`crate::state::priority_created_at`], the
 /// one place the scoping the model states for that member is applied; the store
 /// holds an organization recommendation only for a prioritized recommendation,
-/// so every organization summary carries one.
+/// so every organization summary carries one. `lifecycleStage`, which the model
+/// sources from Priority as well, goes through
+/// [`crate::state::priority_scoped`] for the same reason, so a summary and the
+/// single read of one organization recommendation agree on it.
 fn organization_recommendation_summary(
     entry: &crate::state::OrganizationRecommendationEntry,
     resources_aggregates: RecommendationResourcesAggregates,
@@ -139,7 +142,7 @@ fn organization_recommendation_summary(
         r#type: entry.r#type.clone(),
         check_arn: entry.check_arn.clone(),
         status: entry.status.clone(),
-        lifecycle_stage: entry.lifecycle_stage.clone(),
+        lifecycle_stage: crate::state::priority_scoped(&entry.r#type, &entry.lifecycle_stage),
         pillars: entry.pillars.clone(),
         source: entry.source.clone(),
         aws_services: Some(entry.aws_services.clone()),
