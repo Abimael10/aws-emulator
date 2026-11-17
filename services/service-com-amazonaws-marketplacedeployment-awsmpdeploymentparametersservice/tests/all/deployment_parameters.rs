@@ -122,17 +122,17 @@ pub(crate) fn holds_target(
         .holds_target(catalog, product_id, agreement_id)
 }
 
-/// Whether this service's store holds `product_id` in `catalog` at all: some
-/// agreement of the account covers it, whichever one.
-pub(crate) fn holds_product(
+/// Whether this service's store holds `agreement_id` in `catalog` at all,
+/// whatever products that agreement covers.
+pub(crate) fn holds_agreement(
     engine: &engine::InMemoryEngine,
     catalog: &str,
-    product_id: &str,
+    agreement_id: &str,
 ) -> bool {
     service_state(engine)
         .expect("the shared engine holds this service's store")
         .lock()
-        .holds_product(catalog, product_id)
+        .holds_agreement(catalog, agreement_id)
 }
 
 /// How many deployment parameters the store holds.

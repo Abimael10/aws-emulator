@@ -712,31 +712,33 @@ impl ComAmazonawsMarketplacedeploymentAwsmpdeploymentparametersserviceState {
             .is_some_and(|agreement| agreement.covers(product_id))
     }
 
-    /// Whether this account holds `product_id` in `catalog` at all: some
-    /// agreement of the account covers it, whichever one.
+    /// Whether this account holds `agreement_id` in `catalog` at all, whatever
+    /// products that agreement covers.
     ///
-    /// This is the PATH-addressed resource of a deployment-parameter write
-    /// (`productId` is the operation's `@httpLabel`), resolved on its own —
-    /// independently of the `agreementId` a particular request happens to name.
-    pub fn holds_product(&self, catalog: &str, product_id: &str) -> bool {
-        self.agreements.iter().any(|((held_catalog, _), agreement)| {
-            held_catalog == catalog && agreement.covers(product_id)
-        })
+    /// This is the resource a deployment-parameter write is TARGETED by —
+    /// `PutDeploymentParameter` "creates or updates a deployment parameter and is
+    /// targeted by `catalog` and `agreementId`"
+    /// (`smithy_query(query="doc",shape="PutDeploymentParameter")`) — resolved on
+    /// its own, independently of the product a particular request addresses.
+    pub fn holds_agreement(&self, catalog: &str, agreement_id: &str) -> bool {
+        self.agreements
+            .contains_key(&(catalog.to_string(), agreement_id.to_string()))
     }
 
     /// Which segment of the target `(catalog, productId, agreementId)` this
     /// account does not hold, or `None` when the whole target resolves.
     ///
-    /// The resource the URI PATH addresses is judged FIRST and the one a body
-    /// member names second: a targeted write resolves the resource its path
-    /// addresses before the resource its payload refers to, so `productId` —
-    /// this operation's `@httpLabel`
-    /// (`smithy_query(query="operation",operation="PutDeploymentParameter")`) —
-    /// is the unresolved segment whenever no agreement of this account in the
-    /// catalog covers that product, which is the case a request naming neither a
-    /// held product nor a held agreement falls in. `agreementId`, the body
-    /// member, is the unresolved segment only once the product itself resolves
-    /// and the named agreement does not cover it.
+    /// ONE order, for every request: the resource the operation is TARGETED BY is
+    /// resolved first and the resource that target has to cover second, so
+    /// `agreementId` is the segment reported whenever this account holds no
+    /// agreement of that id in the catalog — the case a request naming neither a
+    /// held agreement nor a held product falls in — and `productId` only once the
+    /// agreement itself resolves and does not cover the product the URI
+    /// addresses. The operation "creates or updates a deployment parameter and is
+    /// targeted by `catalog` and `agreementId`"
+    /// (`smithy_query(query="doc",shape="PutDeploymentParameter")`), and
+    /// `agreementId` is the one target segment its response reports back, while
+    /// `productId` is the resource its URI path addresses (the `@httpLabel`).
     ///
     /// The returned name is the member as [`target_not_found`] states it.
     pub fn unresolved_target(
@@ -745,13 +747,14 @@ impl ComAmazonawsMarketplacedeploymentAwsmpdeploymentparametersserviceState {
         product_id: &str,
         agreement_id: &str,
     ) -> Option<&'static str> {
-        if !self.holds_product(catalog, product_id) {
-            return Some("ProductId");
+        if self.holds_target(catalog, product_id, agreement_id) {
+            return None;
         }
-        if !self.holds_target(catalog, product_id, agreement_id) {
-            return Some("AgreementId");
-        }
-        None
+        Some(if self.holds_agreement(catalog, agreement_id) {
+            "ProductId"
+        } else {
+            "AgreementId"
+        })
     }
 
     /// Materialise the expiry the clock has already made due at `now`: drop every
