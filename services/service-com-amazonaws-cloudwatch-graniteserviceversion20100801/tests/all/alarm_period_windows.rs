@@ -81,7 +81,8 @@ struct Row {
     /// The whole `StateReason` the evaluation must report, with `{instants}` standing for the
     /// bracketed datapoint list the row cannot know the instants of.
     reason: &'static str,
-    /// The values the reason must name as graded, newest first.
+    /// The values the reason must name, newest first: the datapoints on the side of the
+    /// comparison the state stands for, which are the ones the sentence states the comparison for.
     graded: &'static [&'static str],
 }
 
@@ -264,7 +265,10 @@ const ROWS: &[Row] = &[
         graded: &["1.0"],
     },
     Row {
-        // Two periods, one of them breaching, and one breaching datapoint is enough.
+        // Two periods, one of them breaching, and one breaching datapoint is enough. The
+        // sentence states the comparison as the ALARM direction reads it, so the datapoint it
+        // names is the breaching one: the clean datapoint of the other period is counted in the
+        // window of two but is no part of the explanation of a state it did not decide.
         case: "one of two periods breaches and one datapoint is enough",
         period: 10,
         statistic: "Maximum",
@@ -277,7 +281,7 @@ const ROWS: &[Row] = &[
         reason: "Threshold Crossed: 1 out of the last 2 datapoints {instants} was greater than \
                  the threshold (50.0) (minimum 1 datapoint for OK -> ALARM \
                  transition).",
-        graded: &["1.0", "211.0"],
+        graded: &["211.0"],
     },
     Row {
         // Both periods breach, so the counts and the verbs are plural and the minimum is the

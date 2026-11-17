@@ -55,10 +55,11 @@ const THRESHOLD: f64 = 90.0;
 ///
 /// Nothing in the emulator sleeps for a movement: the poll is the TEST waiting for the
 /// evaluation the clock owes the published datapoint and for the policy execution that follows
-/// it, so a row whose capacity never moves fails on the value it last read. Generous: an
-/// alarm's rolling range ends one evaluation cadence behind the instant it runs, which for
-/// these periods is at most ten seconds.
-const CLOCK_WAIT: Duration = Duration::from_secs(15);
+/// it, so a row whose capacity never moves fails on the value it last read. Generous: an alarm
+/// grades a period only once that period has CLOSED, and a datapoint stamped at the instant of
+/// the call lands in the span the clock is in — at most a minute wide for a series stored at the
+/// regular resolution — so the verdict it decides is at most that span and one evaluation away.
+const CLOCK_WAIT: Duration = Duration::from_secs(90);
 /// See [`CLOCK_WAIT`].
 const CLOCK_POLL: Duration = Duration::from_millis(100);
 

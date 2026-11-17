@@ -5,10 +5,12 @@
 //!
 //! ONE rule, asserted over a table: **an alarm whose `EvaluationWindow` is a `WallClockWindow`
 //! is evaluated over periods that begin at the clock boundaries its own `Period` repeats at in
-//! the window's time zone, and only over periods that have CLOSED — so it reports no verdict
-//! over the period the clock is in until that period's end has passed, and the instants its
-//! decision record names are those boundaries** — while an alarm that names a `SlidingWindow`,
-//! or no window at all, keeps the rolling range that advances each time it is evaluated.
+//! the window's time zone, and the instants its decision record names are those boundaries** —
+//! while an alarm that names a `SlidingWindow`, or no window at all, keeps the rolling range
+//! that advances each time it is evaluated, whose periods are counted back from the newest
+//! instant the series it grades has a value at. Only periods that have CLOSED are graded on
+//! either grid: the period the clock is in is still being published into, so no verdict is
+//! reported over it.
 //!
 //! "The evaluation window that an alarm uses to select the range of metric data that it
 //! evaluates each time it runs. This is a union type. Set exactly one of its members,
@@ -33,16 +35,18 @@
 //! `smithy_query(query="shape",shape="WallClockWindow")` publishes), the form the zone is
 //! stated in (absent, an IANA name, a fixed offset ahead of UTC, a fixed offset behind it, and
 //! an offset-prefixed identifier), whether that zone's offset shifts the boundaries off the ones
-//! UTC would put them at, and how many periods the alarm evaluates. The second test is the
-//! other half of the rule, which only the clock can show: a datapoint published into the period
-//! the clock is IN decides an aligned alarm's state only once that period has closed, while the
-//! sliding twin over the very same series has already decided on it. The third is the zone half:
-//! a window naming a zone in one of the documented forms is created and aligned on that zone's
-//! clock, and one naming a value in none of them — including an offset the documented
+//! UTC would put them at, and how many periods the alarm evaluates. The second test is the half
+//! of the rule the two windows SHARE, which only the clock can show: a datapoint published into
+//! the period the clock is IN decides neither alarm until that period has closed. The third is
+//! the half that tells them apart: a rolling range's periods are counted back from the newest
+//! instant the series has a value at, so it grades a closed minute that lies inside the aligned
+//! period the clock is still in — which the aligned grid has not reached. The fourth is the zone
+//! half: a window naming a zone in one of the documented forms is created and aligned on that
+//! zone's clock, and one naming a value in none of them — including an offset the documented
 //! five-minute step rules out — is refused with HTTP 400 `ValidationError` and stores nothing,
 //! rather than being evaluated on boundaries nothing resolved.
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use ::chrono::{DateTime, Datelike, NaiveDateTime, Offset, TimeDelta, TimeZone, Timelike, Weekday};
 use ::chrono_tz::Tz;
@@ -51,7 +55,7 @@ use smithy_server_runtime::MultiServiceRouter;
 
 use crate::harness::{
     alarm_stamp, build_router, call, document_instant_secs, error_code, error_message, now_secs,
-    ok, same_json_value, wait_for_evaluation, wait_for_period_room, PAST_EVALUATION_DELAY,
+    ok, same_json_value, wait_for_evaluation, wait_for_period_room,
 };
 
 /// The customer namespace every alarm of this suite watches.
@@ -558,25 +562,36 @@ async fn an_aligned_alarm_grades_the_closed_periods_of_its_own_clock_boundaries(
     }
 }
 
-/// How far into the minute the second test publishes at the earliest, and at the latest.
-///
-/// The sliding twin's range ends one evaluation cadence behind the clock, so the period the
-/// clock is in is on its rolling range once that period has been open that long: the publish
-/// waits until then, which is what makes the twin decide on the datapoint while the aligned
-/// window over the same series is still open. The upper bound leaves enough of the minute for
-/// the reading that observes the difference.
-const PHASE_FROM_SECS: f64 = 15.0;
+/// How long a case waits for a verdict the clock owes before calling it a hang rather than a
+/// wait: the close of the period the datapoint was published into and the evaluation that
+/// follows it, with generous room, because what a case asserts is the verdict and never how long
+/// it took.
+const VERDICT_DEADLINE: Duration = Duration::from_secs(180);
 
-/// The late end of that phase.
-const PHASE_UNTIL_SECS: f64 = 40.0;
+/// How often a case looks again while waiting for one.
+const LOOK_AGAIN: Duration = Duration::from_millis(100);
 
-/// Wait until the clock is between [`PHASE_FROM_SECS`] and [`PHASE_UNTIL_SECS`] into the minute.
-async fn wait_for_minute_phase() {
-    let minute = f64::from(MINUTE_PERIOD);
-    while !(PHASE_FROM_SECS..=PHASE_UNTIL_SECS).contains(&now_secs().rem_euclid(minute)) {
-        tokio::time::sleep(Duration::from_millis(100)).await;
+/// Look at the alarm `name` until it reports `ALARM`, and answer it as it then reads — a wait on
+/// the CONDITION, so the assertions that follow are about the state and not about a span.
+async fn awaited_alarm(router: &MultiServiceRouter, case: &str, name: &str) -> Value {
+    let deadline = Instant::now() + VERDICT_DEADLINE;
+    loop {
+        let reported = described(router, case, name).await;
+        if state_of(&reported) == Some("ALARM") || Instant::now() >= deadline {
+            return reported;
+        }
+        tokio::time::sleep(LOOK_AGAIN).await;
     }
 }
+
+/// How much of the minute must be LEFT when the second test publishes.
+///
+/// Its datapoint is stamped inside the minute the clock is in, and the reading that shows no
+/// verdict over it has to happen while that minute is still open: this is the room the publish,
+/// the evaluation it makes due and the two reads have inside it. Nothing is asserted about how
+/// long they take — a crossed boundary only closes the period, which is the next thing the test
+/// waits for anyway.
+const OPEN_MINUTE_ROOM_SECS: f64 = 20.0;
 
 /// The row the second test configures its two alarms from: one breaching datapoint of its own
 /// period is enough to decide it, and a period with no datapoint at all leaves it undecided.
@@ -607,10 +622,9 @@ async fn an_aligned_alarm_holds_its_state_until_the_period_the_clock_is_in_close
         .await;
     }
 
-    // A breaching datapoint stamped inside the period the clock is IN, published far enough into
-    // that period for the sliding twin's rolling range to have reached it and far enough from
-    // its end for the reading below to happen while the aligned window is still open.
-    wait_for_minute_phase().await;
+    // A breaching datapoint stamped inside the period the clock is IN, published with enough of
+    // that period left for the readings below to happen while it is still open.
+    wait_for_period_room(period, OPEN_MINUTE_ROOM_SECS).await;
     let published_at = now_secs();
     let open_start = open_window_start(published_at, MINUTE_PERIOD, 0.0);
     let closes_at = open_start + period;
@@ -632,75 +646,172 @@ async fn an_aligned_alarm_holds_its_state_until_the_period_the_clock_is_in_close
     }
     wait_for_evaluation();
 
-    // The sliding twin has decided on the datapoint: its range is the rolling one, which has
-    // already reached the period the clock is in.
-    let case = "the sliding twin, while the aligned period is open";
-    let twin_reported = described(&router, case, twin).await;
+    // NEITHER alarm has decided: the period the datapoint was published into is still being
+    // published into, so no window of either grid grades it yet. At this width the two grids put
+    // their boundaries at the same instants, which is what lets the half of the rule they SHARE be
+    // shown on one period.
+    for (name, case) in [
+        (aligned, "the aligned alarm, while its period is open"),
+        (twin, "the sliding twin, while the same period is open"),
+    ] {
+        let reported = described(&router, case, name).await;
+        // Read while that period is still OPEN. A host so loaded that the period closed between
+        // the publish and this read has already shown the other half of the rule below, so there
+        // is nothing for this half to say about it — what is never admitted is a verdict over a
+        // period that had NOT closed.
+        if now_secs() >= closes_at {
+            continue;
+        }
+        assert_eq!(
+            state_of(&reported),
+            Some("INSUFFICIENT_DATA"),
+            "case {case:?}: no verdict is reported over the period the clock is in ({open_start} \
+             .. {closes_at}), got {reported}"
+        );
+    }
+
+    // Once that period has closed, the same datapoint decides both alarms — looked for in a
+    // loop until each reports it, so what the case waits on is the verdict rather than a span of
+    // this host's clock — and each record names the boundary the period began at, not the
+    // instant the datapoint was published at.
+    for (name, case) in [
+        (aligned, "the aligned alarm, once its period has closed"),
+        (twin, "the sliding twin, once the same period has closed"),
+    ] {
+        let reported = awaited_alarm(&router, case, name).await;
+        assert_eq!(
+            state_of(&reported),
+            Some("ALARM"),
+            "case {case:?}: the datapoint is graded by the evaluation that follows the close of \
+             its period, got {reported}"
+        );
+        let record = reason_data(case, &reported);
+        assert_eq!(
+            graded_instants(&record),
+            vec![open_start],
+            "case {case:?}: the verdict rests on the datapoint of the period that closed \
+             ({open_start}), got {record}"
+        );
+        let start_date = instant_of(case, &record, "startDate");
+        assert!(
+            (start_date - open_start).abs() < DOCUMENT_INSTANT_TOLERANCE_SECS,
+            "case {case:?}: the record opens its span at the boundary the period began at \
+             ({open_start}), got {start_date} in {record}"
+        );
+        let query_date = instant_of(case, &record, "queryDate");
+        assert!(
+            query_date >= closes_at,
+            "case {case:?}: the verdict was reached only after the period closed, so the query \
+             instant ({query_date}) must be at or after {closes_at}, got {record}"
+        );
+        let updated = alarm_stamp(&reported, "StateUpdatedTimestamp").unwrap_or_else(|| {
+            panic!("case {case:?}: expected a StateUpdatedTimestamp, got {reported}")
+        });
+        assert!(
+            updated >= closes_at,
+            "case {case:?}: the state was written after the period closed, so {updated} must be \
+             at or after {closes_at}, got {reported}"
+        );
+    }
+}
+
+/// The period the twins of the third test are evaluated on: the shortest an aligned window may
+/// carry that is WIDER than the minute a regular-resolution series has values at, so the two
+/// grids put their boundaries at different instants at all.
+const CONTRAST_PERIOD: i32 = 300;
+
+/// How far into the aligned period the third test publishes at the earliest: far enough that a
+/// minute of it has CLOSED, which is the minute its datapoint is stamped in.
+const CONTRAST_PHASE_FROM_SECS: f64 = 60.0;
+
+/// How much of that period must be LEFT when it publishes and reads: the room the two writes, the
+/// evaluation and the two reads have inside the same aligned period.
+const CONTRAST_ROOM_SECS: f64 = 20.0;
+
+/// The row the third test configures its two alarms from.
+const CONTRAST_ROW: Row = Row {
+    case: "a datapoint of a closed minute inside the open aligned period",
+    period: CONTRAST_PERIOD,
+    timezone: Some("UTC"),
+    shift: Shift::Stated(0.0),
+    evaluation_periods: 1,
+    breaching_periods_back: &[0],
+};
+
+/// Wait until the clock is at least `from` seconds into the `period`-second window it is in and
+/// at least `room` seconds short of that window's end — a wait for the CONDITION, so a test
+/// driving the service meanwhile still runs.
+async fn wait_for_window_phase(period: f64, from: f64, room: f64) {
+    while !(from..=period - room).contains(&now_secs().rem_euclid(period)) {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+#[tokio::test]
+async fn a_rolling_range_grades_a_closed_period_the_aligned_grid_has_not_reached() {
+    let router = build_router();
+    let period = f64::from(CONTRAST_PERIOD);
+    let aligned = "aligned-contrast-period";
+    let twin = "sliding-contrast-period";
+    for (name, window) in [
+        (aligned, wall_clock_window(&CONTRAST_ROW)),
+        (twin, json!({"SlidingWindow": {}})),
+    ] {
+        ok(
+            &router,
+            "PutMetricAlarm",
+            &alarm_of(&CONTRAST_ROW, name, &window),
+        )
+        .await;
+    }
+
+    // One breaching datapoint stamped in the newest minute that has CLOSED, which — the clock
+    // being a minute or more into the aligned period — lies INSIDE that open aligned period.
+    wait_for_window_phase(period, CONTRAST_PHASE_FROM_SECS, CONTRAST_ROOM_SECS).await;
+    let minute = f64::from(MINUTE_PERIOD);
+    let open_aligned_start = open_window_start(now_secs(), CONTRAST_PERIOD, 0.0);
+    let closed_minute_start = open_window_start(now_secs(), MINUTE_PERIOD, 0.0) - minute;
+    for name in [aligned, twin] {
+        publish_breaching(&router, name, minute, &[closed_minute_start]).await;
+    }
+    wait_for_evaluation();
+
+    // The rolling range's periods are counted back from the newest instant the series has a value
+    // at, so it has already reached that closed minute and graded the period holding it. Looked
+    // for in a loop, so the case waits on the verdict rather than on a span of this host's clock.
+    let case = "the sliding twin, over a closed minute inside the open aligned period";
+    let reported = awaited_alarm(&router, case, twin).await;
     assert_eq!(
-        state_of(&twin_reported),
+        state_of(&reported),
         Some("ALARM"),
-        "case {case:?}: a rolling range reaches the period the clock is in, got {twin_reported}"
+        "case {case:?}: a rolling range grades the closed minute at {closed_minute_start}, got \
+         {reported}"
     );
-    // And it decided BEFORE the aligned period closed, which is the difference the two windows
-    // are for.
-    let twin_record = reason_data(case, &twin_reported);
-    let twin_query = instant_of(case, &twin_record, "queryDate");
+    let record = reason_data(case, &reported);
+    let graded = graded_instants(&record);
     assert!(
-        twin_query < closes_at,
-        "case {case:?}: the sliding twin must decide while the aligned period ({open_start} .. \
-         {closes_at}) is still open, got a query instant of {twin_query} in {twin_record}"
+        graded.iter().any(|instant| *instant <= closed_minute_start
+            && closed_minute_start < instant + period
+            && instant + period > open_aligned_start),
+        "case {case:?}: the period it graded must hold the closed minute at \
+         {closed_minute_start} and reach past the boundary at {open_aligned_start} the aligned \
+         grid stops at, got {graded:?} in {record}"
     );
 
-    // The aligned alarm has not: the period its range would start at has not closed, so it is
-    // still the state its creation left it in.
-    let case = "the aligned alarm, while its period is open";
+    // The aligned twin has not: its range covers only the aligned periods that have closed, and
+    // the datapoint is in the one the clock is still in. Read while the clock is still inside
+    // that same aligned period, since a host loaded enough to cross its boundary meanwhile would
+    // be reading an aligned range that has since reached the datapoint.
+    let case = "the aligned twin, over the same datapoint";
     let reported = described(&router, case, aligned).await;
+    if open_window_start(now_secs(), CONTRAST_PERIOD, 0.0) != open_aligned_start {
+        return;
+    }
     assert_eq!(
         state_of(&reported),
         Some("INSUFFICIENT_DATA"),
-        "case {case:?}: an aligned window reports no verdict over the period the clock is in \
-         ({open_start} .. {closes_at}), got {reported}"
-    );
-
-    // Once that period has closed, the same datapoint decides the alarm — and the record names
-    // the boundary the period began at, not the instant the datapoint was published at.
-    std::thread::sleep(
-        Duration::from_secs_f64((closes_at - now_secs()).max(0.0)) + PAST_EVALUATION_DELAY,
-    );
-    let case = "the aligned alarm, once its period has closed";
-    let reported = described(&router, case, aligned).await;
-    assert_eq!(
-        state_of(&reported),
-        Some("ALARM"),
-        "case {case:?}: the datapoint is graded by the evaluation that follows the close of its \
-         aligned period, got {reported}"
-    );
-    let record = reason_data(case, &reported);
-    assert_eq!(
-        graded_instants(&record),
-        vec![open_start],
-        "case {case:?}: the verdict rests on the datapoint of the aligned period that closed \
-         ({open_start}), got {record}"
-    );
-    let start_date = instant_of(case, &record, "startDate");
-    assert!(
-        (start_date - open_start).abs() < DOCUMENT_INSTANT_TOLERANCE_SECS,
-        "case {case:?}: the record opens its span at the clock boundary the aligned period began \
-         at ({open_start}), got {start_date} in {record}"
-    );
-    let query_date = instant_of(case, &record, "queryDate");
-    assert!(
-        query_date >= closes_at,
-        "case {case:?}: the verdict was reached only after the period closed, so the query \
-         instant ({query_date}) must be at or after {closes_at}, got {record}"
-    );
-    let updated = alarm_stamp(&reported, "StateUpdatedTimestamp").unwrap_or_else(|| {
-        panic!("case {case:?}: expected a StateUpdatedTimestamp, got {reported}")
-    });
-    assert!(
-        updated >= closes_at,
-        "case {case:?}: the state was written after the aligned period closed, so {updated} must \
-         be at or after {closes_at}, got {reported}"
+        "case {case:?}: an aligned range reaches no datapoint of the period the clock is in (from \
+         {open_aligned_start}), got {reported}"
     );
 }
 

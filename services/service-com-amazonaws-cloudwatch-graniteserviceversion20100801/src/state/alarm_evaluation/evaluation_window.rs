@@ -12,16 +12,22 @@
 //! chooses neither is read over the rolling one:
 //!
 //! * a SLIDING window "advances each time the alarm is evaluated, forming a rolling time
-//!   window" (`SlidingWindow`), so its range ends one evaluation cadence behind the clock
+//!   window" (`SlidingWindow`), so its range ends where the clock has carried it
 //!   ([`rolling_range_end`]) and its period boundaries are counted BACK from that end — they lie
-//!   wherever the clock has carried them rather than on the calendar — and the period the clock
-//!   is in is graded while it is still open: "the fastest detection";
+//!   wherever the clock has carried them rather than on the calendar, which is why such a range
+//!   reaches back ACROSS the boundary the alarm's period repeats at: "the fastest detection";
 //! * a WALL CLOCK window "aligns the evaluated range to fixed clock boundaries that match the
 //!   alarm's period, such as the top of the hour, midnight, or the start of the calendar week,
 //!   optionally in a specific time zone" (`WallClockWindow`), so its range begins at the
-//!   boundary the alarm's own period repeats at and covers only periods that have CLOSED: the
-//!   period the clock is in decides nothing until its own end has passed, which is why such an
-//!   alarm reports no verdict over a partial period at all.
+//!   boundary the alarm's own period repeats at.
+//!
+//! What the two windows share is which periods of their grid an evaluation GRADES: only the ones
+//! that have CLOSED. An alarm "re-evaluates once per period" over the periods the metric is
+//! aggregated into — "CloudWatch aggregates all data points with time stamps that fall within
+//! each one-hour period" — so the period the clock is in is still being published into and
+//! decides nothing until its own end has passed, whichever window selected the range it belongs
+//! to ([`EvaluationGrid::newest_graded_period`]). Where the two differ is where that end falls,
+//! and so which span the periods counted back from it cover.
 //!
 //! The zone the boundaries are the clock's own in is the one the window names, and it shifts
 //! them "for all periods, including periods of one hour or shorter"
@@ -94,8 +100,10 @@ pub struct EvaluationGrid {
     /// window, whose boundaries are the ones a metric is aggregated into
     /// ([`Self::boundary_shift_secs`]).
     shift_secs: f64,
-    /// Whether only a period that has CLOSED is graded.
-    closed_only: bool,
+    /// Whether the boundaries between the periods are the CALENDAR's own — the clock boundaries
+    /// an aligned window's period repeats at — rather than counted back from the end the range
+    /// has rolled to.
+    aligned: bool,
 }
 
 impl EvaluationGrid {
@@ -110,20 +118,19 @@ impl EvaluationGrid {
         match alarm.evaluation_window.as_ref() {
             Some(EvaluationWindow::WallClockWindow(window)) => Self {
                 shift_secs: zone_shift_secs(window.timezone.as_deref(), now_secs),
-                closed_only: true,
+                aligned: true,
             },
             _ => Self::rolling(),
         }
     }
 
     /// The grid an alarm with no aligned window is graded on: the rolling one, whose boundaries
-    /// are counted back from the end its range has rolled to and whose newest period is graded
-    /// while it is still open.
+    /// are counted back from the end its range has rolled to rather than laid on the calendar.
     #[must_use]
     pub fn rolling() -> Self {
         Self {
             shift_secs: UTC_SHIFT_SECS,
-            closed_only: false,
+            aligned: false,
         }
     }
 
@@ -143,7 +150,7 @@ impl EvaluationGrid {
     /// aggregated into — "CloudWatch aggregates all data points with time stamps that fall within
     /// each one-hour period" — so nothing is moved for a one-minute or high-resolution alarm.
     fn boundary_shift_secs(self, now_secs: f64, period: f64) -> f64 {
-        if !self.closed_only {
+        if !self.aligned {
             return -rolling_range_end(now_secs, period).rem_euclid(period);
         }
         if period == WEEK_SECS {
@@ -174,27 +181,15 @@ impl EvaluationGrid {
     /// The newest period of this grid an evaluation running at `now_secs` GRADES, as a count of
     /// whole periods.
     ///
-    /// On the ROLLING grid that is the period the end of the evaluation's rolling range falls in
-    /// ([`super::evaluation_lag_secs`]): the period the clock is in once that period has been
-    /// open for a whole evaluation cadence, and the period before it until then.
-    ///
-    /// On an ALIGNED grid it is the newest period that has CLOSED — the one before the period
-    /// the clock is in — because an aligned window "aligns the evaluated range to fixed clock
-    /// boundaries that match the alarm's period" (`WallClockWindow`): the range starts at the
-    /// boundary the clock has last passed and is not evaluated before the next boundary, so the
-    /// verdict over a period is reported only once every datapoint of it could have been
-    /// published.
+    /// The newest period that has CLOSED — the one before the period the clock is in — on either
+    /// grid: a period is aggregated into one datapoint out of every observation stamped inside
+    /// it, so the period the clock is in is still being published into and the verdict over it is
+    /// reported only once every datapoint of it could have been published. What the alarm's
+    /// window decides is where the boundaries between those periods fall
+    /// ([`Self::boundary_shift_secs`]), not whether a partial one is graded.
     #[must_use]
     pub fn newest_graded_period(self, now_secs: f64, period: f64) -> f64 {
-        if self.closed_only {
-            self.period_index(now_secs, now_secs, period) - 1.0
-        } else {
-            self.period_index(
-                now_secs,
-                now_secs - super::evaluation_lag_secs(period),
-                period,
-            )
-        }
+        self.period_index(now_secs, now_secs, period) - 1.0
     }
 
     /// The instant the range an evaluation running at `now_secs` grades ENDS at, the range being
@@ -258,17 +253,11 @@ impl EvaluationGrid {
     /// instant, for periods `period` seconds wide — the span the evaluation range has to reach
     /// back over on top of the look-back ([`super::evaluation_range_periods`]).
     ///
-    /// On the rolling grid that is one evaluation cadence
-    /// ([`super::evaluation_lag_secs`]). On an aligned grid it is however long the period the
-    /// clock is in has been open, since nothing of that period is graded yet: nothing at the
-    /// boundary, and almost a whole period just before the next one.
+    /// However long the period the clock is in has been open, since nothing of that period is
+    /// graded yet: nothing at the boundary, and almost a whole period just before the next one.
     #[must_use]
     pub fn lag_secs(self, now_secs: f64, period: f64) -> f64 {
-        if self.closed_only {
-            (now_secs - self.range_end(now_secs, period)).max(0.0)
-        } else {
-            super::evaluation_lag_secs(period)
-        }
+        (now_secs - self.range_end(now_secs, period)).max(0.0)
     }
 }
 
@@ -277,25 +266,23 @@ impl EvaluationGrid {
 /// ([`EvaluationGrid::boundary_shift_secs`]).
 ///
 /// A rolling range "advances each time the alarm is evaluated, forming a rolling time window"
-/// (`SlidingWindow`), so where it ends is decided by the clock: one evaluation cadence behind
-/// this instant ([`super::evaluation_lag_secs`]), read at the granularity the series it grades
-/// has values at — the minute a regular-resolution datapoint is aggregated into
-/// ([`REGULAR_RESOLUTION_SECS`]), or the alarm's own period where that is finer, which is the
-/// granularity a high-resolution series is folded at. A range ending between two of those
-/// instants would open its span at a boundary no series this store holds has a value at.
+/// (`SlidingWindow`), so where it ends is decided by the clock: the newest instant the series it
+/// grades has a value at, which is the granularity that series is stored at — the minute a
+/// regular-resolution datapoint is aggregated into ([`REGULAR_RESOLUTION_SECS`]), or the alarm's
+/// own period where that is finer, which is the granularity a high-resolution series is folded
+/// at. A range ending between two of those instants would open its span at a boundary no series
+/// this store holds has a value at.
 ///
-/// The granule that end falls in is INCLUDED rather than waited out — the end is where that
-/// granule itself ends — so the period the clock is in is graded while it is still open, which
-/// is what a rolling window is for: "the fastest detection" (`SlidingWindow`). That compression
-/// is the choice; which periods a range of that width covers, and what the statistic over each of
-/// them is, stay a pure function of the stored datapoints and the clock. Where the period is no
-/// wider than that granularity — a one-minute or high-resolution alarm — this end is a multiple
-/// of the period itself, so such an alarm's grid is exactly the one its metric is aggregated into.
+/// The granule the clock is IN is left out: it is still being published into, so the end is where
+/// that granule began rather than where it will end. The end therefore MOVES with the clock,
+/// a granule at a time, and the boundaries counted back from it move with it — which is what
+/// makes a rolling range reach back across the boundary the alarm's period repeats at, and what
+/// tells it apart from an aligned one. Where the period is no wider than that granularity — a
+/// one-minute or high-resolution alarm — this end is a multiple of the period itself, so such an
+/// alarm's grid is exactly the one its metric is aggregated into.
 fn rolling_range_end(now_secs: f64, period: f64) -> f64 {
     let granularity = period.clamp(1.0, REGULAR_RESOLUTION_SECS);
-    let open_granule =
-        ((now_secs - super::evaluation_lag_secs(period)) / granularity).floor() * granularity;
-    open_granule + granularity
+    (now_secs / granularity).floor() * granularity
 }
 
 /// The zone an ALIGNED window lays its boundaries on the clock of.

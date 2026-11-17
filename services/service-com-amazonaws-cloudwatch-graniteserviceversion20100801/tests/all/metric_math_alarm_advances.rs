@@ -32,12 +32,13 @@
 //! window ... Choose a sliding window when you need the fastest detection and the calendar
 //! boundaries of the data don't matter" (`smithy_query(query="doc",shape="SlidingWindow")`,
 //! the window an alarm whose configuration names none uses —
-//! `smithy_query(query="doc",shape="EvaluationWindow")`). So a datapoint is graded within one
-//! evaluation cadence of the write that stored it rather than after the calendar boundary of
-//! its period: an alarm whose period is longer than that cadence reaches its verdicts while
-//! the period the datapoint landed in is still OPEN (the third test, over two period widths),
-//! while a high-resolution alarm — whose period is no longer than the cadence — still grades
-//! only periods that have closed (the second test).
+//! `smithy_query(query="doc",shape="EvaluationWindow")`). So a datapoint of a period that has
+//! CLOSED is graded within one evaluation cadence of the write that stored it rather than after
+//! the calendar boundary of the alarm's own period: an alarm whose period is longer than that
+//! cadence reaches its verdicts over the newest closed period inside one session (the third
+//! test, over two period widths), while a datapoint of the period the clock is still in decides
+//! nothing until that period closes (the second test, over a high-resolution alarm whose period
+//! is a span a test can wait out).
 
 use std::time::Duration;
 
@@ -566,10 +567,13 @@ fn assert_verdict(case: &str, stage: &str, alarm: &Value, verdict: &Verdict) {
         .and_then(Value::as_str)
         .unwrap_or_default()
         .to_string();
-    for value in verdict.recent {
+    // The explanation cites the datapoints the verdict RESTS ON: the sentence states the
+    // comparison as the direction the state stands for reads it, so the values it names are the
+    // ones on that side of it. The whole window it graded is in the decision document below.
+    for value in verdict.rests_on {
         assert!(
             reason.contains(&format!("{} (", decimal(*value))),
-            "case {case:?}: expected {stage} to cite the graded value {} in its StateReason, \
+            "case {case:?}: expected {stage} to cite the deciding value {} in its StateReason, \
              got {reason:?}",
             decimal(*value)
         );
@@ -948,7 +952,8 @@ const CADENCE_BUDGET: Duration = Duration::from_secs(15);
 const POLL_INTERVAL: Duration = Duration::from_millis(200);
 
 /// How much of the period must still be ahead when the third test starts publishing: enough for
-/// both of its verdicts to be reached while the period the datapoints land in is OPEN.
+/// both of its verdicts to be reached while the minute its datapoints are stamped in is still
+/// the newest one that has closed.
 const OPEN_PERIOD_ROOM_SECS: f64 = 20.0;
 
 /// The granularity a regular-resolution series has values at, in seconds: "Setting this to 60
@@ -985,12 +990,13 @@ async fn await_state(
 }
 
 #[tokio::test]
-async fn a_metrics_array_alarm_grades_the_open_period_within_the_evaluation_cadence() {
+async fn a_metrics_array_alarm_grades_its_closed_period_within_the_evaluation_cadence() {
     let router = build_router();
 
     // The rows differ in the width of the period the datapoints land in — the recorded
     // one-minute window and a five-minute one — both wider than the store's evaluation
-    // cadence, which is what makes the verdicts observable inside the open period.
+    // cadence, which is what makes a verdict over the newest CLOSED period observable inside
+    // one session.
     let rows: [(&str, i32); 2] = [
         ("a one-minute period", 60),
         ("a five-minute period", 300),
@@ -1000,11 +1006,13 @@ async fn a_metrics_array_alarm_grades_the_open_period_within_the_evaluation_cade
         let name = format!("open-period-math-alarm-{period_secs}");
         let series = format!("open-{period_secs}");
         let metric = "Load";
-        // Enough of the period ahead that both verdicts land inside it.
-        wait_for_period_room(period, OPEN_PERIOD_ROOM_SECS).await;
-        let published_at = now_secs();
-        let open_window_start = (published_at / period).floor() * period;
-        let closes_at = open_window_start + period;
+        // Enough of the minute ahead that both verdicts are reached while the minute the
+        // datapoints are stamped in is still the newest one that has closed.
+        wait_for_period_room(MINUTE_SECS, OPEN_PERIOD_ROOM_SECS).await;
+        // The datapoints go into the newest minute that has CLOSED: an evaluation grades the
+        // periods that are complete, and the minute is the granularity a regular-resolution
+        // series has values at.
+        let published_at = now_secs() - now_secs().rem_euclid(MINUTE_SECS) - MINUTE_SECS / 2.0;
         let publish = |value: f64| {
             let router = &router;
             let series = series.clone();
@@ -1019,7 +1027,7 @@ async fn a_metrics_array_alarm_grades_the_open_period_within_the_evaluation_cade
                             "Dimensions": [{"Name": "Case", "Value": series}],
                             "Value": value,
                             "Unit": "Count",
-                            "Timestamp": now_secs(),
+                            "Timestamp": published_at,
                         }],
                     }),
                 )
@@ -1027,8 +1035,8 @@ async fn a_metrics_array_alarm_grades_the_open_period_within_the_evaluation_cade
             }
         };
 
-        // A datapoint in the period the clock is IN, and an alarm over the conditional that
-        // grades it as a value under the threshold.
+        // A datapoint in that closed minute, and an alarm over the conditional that grades it as
+        // a value under the threshold.
         publish(700.0).await;
         ok(
             &router,
@@ -1046,14 +1054,9 @@ async fn a_metrics_array_alarm_grades_the_open_period_within_the_evaluation_cade
         )
         .await;
 
-        // The first verdict is reached from the data of that still-open period, within the
+        // The first verdict is reached from the data of that closed period, within the
         // evaluation cadence of the write that stored it.
-        let (alarm, at) = await_state(&router, &name, "OK", case).await;
-        assert!(
-            at < closes_at,
-            "case {case:?}: expected the first verdict while the period starting \
-             {open_window_start} was still open (before {closes_at}), read it at {at}"
-        );
+        let (alarm, _at) = await_state(&router, &name, "OK", case).await;
         assert_verdict(
             case,
             "the first verdict",
@@ -1066,9 +1069,9 @@ async fn a_metrics_array_alarm_grades_the_open_period_within_the_evaluation_cade
         );
         let document = reason_data(&alarm, case);
         // The period the verdict names is the one the alarm's own grid laid over the datapoint it
-        // graded: a rolling range's periods are counted back from the end that range has advanced
-        // to, so the instant it reports is the start of the period the published datapoint falls
-        // in on THAT grid rather than a multiple of the period.
+        // graded: a rolling range's periods are counted back from the newest instant the series
+        // has a value at, so the instant it reports is the start of the period the published
+        // datapoint falls in on THAT grid rather than a multiple of the period.
         let graded = graded_instants(&document);
         let graded_start = match graded.as_slice() {
             [only] => *only,
@@ -1083,9 +1086,10 @@ async fn a_metrics_array_alarm_grades_the_open_period_within_the_evaluation_cade
              published at {published_at} falls in, got {graded_start} in {document}"
         );
         // And WHERE that period was laid is pinned too: its start is a minute granule — the
-        // granularity a regular-resolution series has values at — and it opens no more than one
-        // period before the instant the evaluation queried the series at, so a range reaching
-        // further back than the alarm's own look-back would be reported here.
+        // granularity a regular-resolution series has values at — the period it opens has CLOSED
+        // by the instant the evaluation queried the series at, and it opens no more than one
+        // look-back and one granule before that instant, so a range reaching further back than
+        // the alarm's own look-back would be reported here.
         let query_date = document
             .get("queryDate")
             .and_then(Value::as_str)
@@ -1098,22 +1102,22 @@ async fn a_metrics_array_alarm_grades_the_open_period_within_the_evaluation_cade
              {graded_start} in {document}"
         );
         assert!(
-            graded_start < query_date && query_date - graded_start <= period + MINUTE_SECS,
+            graded_start + period <= query_date,
+            "case {case:?}: expected the graded {period}-second period ({graded_start}) to have \
+             closed by the query instant ({query_date}), got {document}"
+        );
+        assert!(
+            query_date - graded_start <= period + MINUTE_SECS,
             "case {case:?}: expected the graded period ({graded_start}) to open at most one \
              {period}-second look-back before the query instant ({query_date}), got {document}"
         );
         let first_updated = alarm_stamp(&alarm, "StateUpdatedTimestamp")
             .unwrap_or_else(|| panic!("case {case:?}: no state stamp in {alarm}"));
 
-        // A later datapoint of the SAME open period takes the conditional's output across the
-        // threshold, and the alarm moves on it — still inside that period.
+        // A later datapoint of the SAME closed period takes the conditional's output across the
+        // threshold, and the alarm moves on it.
         publish(50.0).await;
-        let (alarm, at) = await_state(&router, &name, "ALARM", case).await;
-        assert!(
-            at < closes_at,
-            "case {case:?}: expected the transition while the period starting \
-             {open_window_start} was still open (before {closes_at}), read it at {at}"
-        );
+        let (alarm, _at) = await_state(&router, &name, "ALARM", case).await;
         assert_verdict(
             case,
             "the verdict after the later datapoint",

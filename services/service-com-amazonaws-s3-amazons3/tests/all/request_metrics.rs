@@ -60,8 +60,14 @@ const ALARM_PERIOD_SECS: i64 = 60;
 /// How long the alarm test waits for an evaluation the clock owes, and how often it looks: an
 /// alarm's state is not written by the call that configures it, so a reader polls for it the
 /// way a client does.
+///
+/// The budget covers the CLOSE of the period a published observation lands in — an alarm grades
+/// a period only once it has closed, and S3 publishes these observations at the minute
+/// ([`ALARM_PERIOD_SECS`]) — for each of the two verdicts the test waits on, with room to spare.
+/// Nothing here measures how long a verdict took: a budget that runs out means the state was
+/// never reached.
 const ALARM_POLL_INTERVAL: Duration = Duration::from_millis(100);
-const ALARM_POLL_ATTEMPTS: usize = 100;
+const ALARM_POLL_ATTEMPTS: usize = 1_500;
 
 /// One request a row's client makes.
 #[derive(Debug)]

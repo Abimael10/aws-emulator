@@ -20,8 +20,8 @@
 //!   ([`EvaluationGrid`]): a rolling one that "advances each time the alarm is evaluated"
 //!   (`SlidingWindow`), which is also the window an alarm naming none uses and whose periods are
 //!   counted back from the end that range has advanced to, or one aligned to the clock
-//!   boundaries the alarm's period repeats at, which grades only the periods that have CLOSED
-//!   (`WallClockWindow`);
+//!   boundaries the alarm's period repeats at (`WallClockWindow`) — and either way only the
+//!   periods that have CLOSED are graded, the period the clock is in still being published into;
 //! * each window yields one datapoint — the alarm's `Statistic` or `ExtendedStatistic` over
 //!   the datapoints in it — or no datapoint at all when the window holds none;
 //! * the evaluation looks over a RANGE of windows wider than `EvaluationPeriods`, and
@@ -313,28 +313,6 @@ impl EvaluationBudget {
     }
 }
 
-/// How long after a force the SCHEDULED evaluation that takes the state back is owed, for an
-/// alarm with NO datapoint arriving to trigger one.
-///
-/// This span is the emulator's OWN choice, and it is deliberately outside the 250-750 ms window
-/// a transition this store's clock usually owes. "Metric alarms returns to their actual state
-/// quickly, often within seconds. Because the metric alarm state change happens quickly, it is
-/// typically only visible in the alarm's History tab […] or through DescribeAlarmHistory"
-/// (`SetAlarmState`) is the only thing CloudWatch states about the latency, and the recorded
-/// behaviour of a force on an alarm over a metric nothing writes pins it from both sides: a
-/// caller's own reads right after the call still report the state it forced, which a sub-second
-/// span could not show at all, and the state is nevertheless taken back with no further call.
-/// So the span has to be SECONDS.
-///
-/// Ten of them: the shortest period CloudWatch evaluates an alarm on at all ("Valid values are
-/// 10, 20, 30, and any multiple of 60", `PutMetricAlarmInput$Period`) — so it is the alarm's own
-/// period for a high-resolution alarm, and for a longer-period alarm it is that alarm's
-/// scheduled pass brought FORWARD, which keeps the reclaim observable inside one client's
-/// session rather than minutes after it. The COMPRESSION is the choice; nothing else about the
-/// evaluation is compressed, since what the pass computes stays a pure function of the stored
-/// datapoints and the clock.
-const SCHEDULED_EVALUATION_SECS: f64 = 10.0;
-
 /// How long a state `SetAlarmState` forces on a metric alarm STANDS before the alarm's own
 /// evaluation takes it back.
 ///
@@ -354,8 +332,7 @@ const SCHEDULED_EVALUATION_SECS: f64 = 10.0;
 /// evaluation a span after the force ([`super::COMPOSITE_EVALUATION_DELAY_SECS`]), so a force
 /// an arriving datapoint could reclaim at once would be a state nothing could ever read —
 /// and short enough that a client WAITING for the alarm to come back to its actual state, so
-/// that the transition it asks for next is a transition at all, gets there inside one session
-/// rather than after a scheduled pass of its own ([`SCHEDULED_EVALUATION_SECS`]).
+/// that the transition it asks for next is a transition at all, gets there inside one session.
 const FORCED_STATE_SECS: f64 = 3.0;
 
 /// How one evaluated window's datapoint stands against the alarm's threshold.
@@ -725,31 +702,6 @@ fn evaluation_range_periods(
     evaluation_periods
         .saturating_mul(EVALUATION_RANGE_FACTOR)
         .max(covering_one_storage_span)
-}
-
-/// How long the end of the ROLLING range an evaluation grades LAGS the instant that evaluation
-/// runs, for an alarm whose periods are `period` seconds wide: one evaluation cadence, which is
-/// the alarm's own period for a high-resolution alarm and the store's scheduled pass
-/// ([`SCHEDULED_EVALUATION_SECS`]) for a longer one. An alarm graded on an ALIGNED grid lags by
-/// however long the period the clock is in has been open instead
-/// ([`EvaluationGrid::lag_secs`]).
-///
-/// An alarm's evaluated range "advances each time the alarm is evaluated, forming a rolling time
-/// window" (`SlidingWindow`, the window "the alarm uses" when its configuration names none —
-/// `EvaluationWindow`), and one evaluation runs per period — "the length, in seconds, used each
-/// time the metric specified in MetricName is evaluated" (`PutMetricAlarmInput$Period`) — so the
-/// range the next evaluation advances to ends one cadence after the last one did, and the data
-/// an evaluation has is the data the series held a cadence ago.
-///
-/// The cadence is the alarm's own period, COMPRESSED to the store's scheduled pass where the
-/// period is longer than it: an alarm whose period is minutes or hours is the one a client
-/// publishes into and then waits on, and "the fastest detection" is what a sliding window is for
-/// (`SlidingWindow`), so the detection a longer-period alarm owes is brought forward to that
-/// pass rather than to the next calendar boundary. The COMPRESSION is the choice; which periods
-/// a range of that width covers, and what the statistic over each of them is, stay a pure
-/// function of the stored datapoints and the clock.
-fn evaluation_lag_secs(period: f64) -> f64 {
-    period.min(SCHEDULED_EVALUATION_SECS)
 }
 
 /// The names of `alarms` in the order their evaluations came DUE: oldest first, and by name
@@ -1303,12 +1255,11 @@ impl State {
         // decided state from the treatment alone, over an EMPTY window, while a client was
         // publishing into the very series it watches.
         //
-        // On the rolling grid the wait is at most ONE evaluation cadence, so a period the series
-        // really holds no datapoint for is still decided by the treatment: the datapoint is
-        // already in the past, and the period it belongs to enters the range a cadence after
-        // that period opened ([`evaluation_lag_secs`]). On an ALIGNED grid the wait is until the
-        // boundary the period the datapoint was published into ends at, which is exactly what an
-        // aligned window asks for: no verdict over a period that has not closed.
+        // The wait is until the end of the period the datapoint was published into has passed,
+        // on either grid: no verdict is reported over a period that has not closed
+        // ([`EvaluationGrid::newest_graded_period`]), so a period the series really holds no
+        // datapoint for is decided by the treatment as soon as the period a newer datapoint
+        // landed in has itself closed.
         let range_end = grid.range_end(now_secs, graded.period);
         if evaluated.is_empty() && watched.newest_instant.is_some_and(|at| at >= range_end) {
             return None;
@@ -1791,7 +1742,7 @@ impl State {
                 missing_data_arm(treat_missing),
                 phrase,
                 &thresholds,
-                &cited_datapoints(&evaluated, grid, now_secs, period),
+                &cited_datapoints(&evaluated, verdict, grid, now_secs, period),
             ),
             reason_data: state_reason_data(
                 graded.statistic.as_ref(),
@@ -1867,6 +1818,17 @@ impl State {
                 notification.actions.clear();
             }
         }
+        self.queue_notification(notification);
+    }
+
+    /// Put one record on the queue the settle delivers from, within
+    /// [`MAX_PENDING_NOTIFICATIONS`].
+    ///
+    /// The one place a record is queued, so the capacity bound is applied to every record
+    /// whatever made it due: a transition's ([`Self::enqueue_notification`]) and the actions a
+    /// deleted mute rule released
+    /// ([`super::ComAmazonawsCloudwatchGraniteserviceversion20100801State::delete_alarm_mute_rule`]).
+    pub(crate) fn queue_notification(&mut self, notification: AlarmNotification) {
         while self.pending_notifications.len() >= MAX_PENDING_NOTIFICATIONS {
             let Some(dropped) = self.pending_notifications.pop_front() else {
                 break;
@@ -2367,21 +2329,38 @@ fn transition_minimum(minimum: usize, state: &str) -> String {
 /// every evaluated datapoint anyway.
 const MAX_CITED_DATAPOINT_CHARS: usize = 700;
 
-/// The datapoints an evaluation GRADED, newest first, each as the value the statistic took over
-/// its window and the instant that window ends: ` [137.0 (25/10/26 02:02:00), …]`.
+/// The datapoints an evaluation's verdict RESTS ON, newest first, each as the value the
+/// statistic took over its window and the instant that window ends: ` [137.0 (25/10/26
+/// 02:02:00), …]`.
 ///
-/// Empty when the evaluation graded no real datapoint at all — a slot the missing-data
-/// treatment substituted stands for a window that held nothing, so there is no measured value
-/// to name for it — which is also why the list is prefixed with its own space and can be
-/// dropped from the sentence without leaving a gap.
+/// Only the datapoints on the side of the comparison the state stands for are named, because the
+/// sentence around the list states the comparison the way THAT direction reads it — "`<n>` out of
+/// the last `<m>` datapoints `[…]` were not greater than the threshold" for `OK`, and "were
+/// greater than the threshold" for `ALARM` — so a datapoint on the other side would be cited as
+/// having read the way it did not. The count the sentence opens with is of those same datapoints
+/// ([`state_reason`]), and `StateReasonData` carries every datapoint the window held
+/// ([`state_reason_data`]), so nothing the evaluation graded is lost by naming only these.
+///
+/// Empty when the verdict rests on no measured datapoint at all — a slot the missing-data
+/// treatment substituted stands for a window that held nothing, so there is no measured value to
+/// name for it, and a state no direction decided (insufficient data) rests on none — which is
+/// also why the list is prefixed with its own space and can be dropped from the sentence without
+/// leaving a gap.
 fn cited_datapoints(
     evaluated: &[Evaluated],
+    verdict: Option<Verdict>,
     grid: EvaluationGrid,
     now_secs: f64,
     period: f64,
 ) -> String {
     let mut cited = String::new();
+    let Some(verdict) = verdict else {
+        return cited;
+    };
     for slot in evaluated {
+        if slot.datapoint != verdict.satisfying {
+            continue;
+        }
         let (Some(index), Some(value)) = (slot.window, slot.value) else {
             continue;
         };

@@ -11649,6 +11649,7 @@ dependencies = [
 name = "service-com-amazonaws-cloudwatch-graniteserviceversion20100801"
 version = "0.1.0"
 dependencies = [
+ "automod",
  "aws-emulator-build-support",
  "aws-emulator-emulator-telemetry",
  "aws-emulator-engine",

@@ -49,10 +49,9 @@ const NAMESPACE: &str = "Custom/HeldVerdicts";
 /// multiple of 60", `smithy_query(query="doc",shape="PutMetricAlarmInput",member="Period")`).
 ///
 /// Every row of the table is evaluated on it, because a HIGH-RESOLUTION alarm's rolling range
-/// lags the clock by its own period (`crate::state::alarm_evaluation`'s `evaluation_lag_secs`):
-/// the period the clock is in is therefore always past the end of that range, so a datapoint
-/// published into it is one no evaluation running now has reached — the table needs no phase of
-/// the clock to arrange that.
+/// ends at the newest granule boundary its series has a value at: the period the clock is in is
+/// therefore always past the end of that range, so a datapoint published into it is one no
+/// evaluation running now has reached — the table needs no phase of the clock to arrange that.
 const SHORT_PERIOD_SECS: i32 = 10;
 
 /// How much of the period must still be ahead when a row publishes: enough for the publish, the
@@ -62,7 +61,11 @@ const OPEN_WINDOW_ROOM_SECS: f64 = 6.0;
 
 /// How long a row's datapoint may take to be graded once its period closes, and how often a
 /// poll looks.
-const GRADED_WITHIN: Duration = Duration::from_secs(30);
+///
+/// The wait covers the CLOSE of the period the datapoint was published into — a minute for the
+/// recorded case below — plus the evaluation that follows it, with room to spare: what the tests
+/// assert is the verdict, never how long it took.
+const GRADED_WITHIN: Duration = Duration::from_secs(120);
 /// See [`GRADED_WITHIN`].
 const LOOK_AGAIN: Duration = Duration::from_millis(100);
 
@@ -464,10 +467,9 @@ const MINUTE_PERIOD_SECS: i32 = 60;
 
 /// How far into a minute the recorded leg may start.
 ///
-/// A one-minute alarm's rolling range lags the clock by the store's scheduled pass
-/// (`crate::state::alarm_evaluation`'s `evaluation_lag_secs`), so the minute the clock is in is
-/// outside that range for its first seconds — which is the phase in which a client publishing
-/// into that minute and polling at once reads a verdict nothing graded.
+/// A one-minute alarm's rolling range ends at the newest minute boundary the clock has passed, so
+/// the minute the clock is in is outside that range until it closes — which is the phase in which
+/// a client publishing into that minute and polling at once reads a verdict nothing graded.
 const FRESH_MINUTE_SECS: f64 = 2.0;
 
 /// Wait until the clock is inside the first [`FRESH_MINUTE_SECS`] of a minute.

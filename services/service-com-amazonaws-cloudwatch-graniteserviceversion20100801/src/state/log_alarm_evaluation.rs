@@ -544,12 +544,21 @@ impl Verdict {
         } else {
             not_breaching
         };
+        // The values the sentence NAMES: the ones on the side of the comparison the state stands
+        // for, because the sentence states that comparison the way that direction reads it. The
+        // whole window is in the decision record beside it.
+        let deciding = state == ALARM_STATE_ALARM;
+        let cited: Vec<f64> = window
+            .iter()
+            .filter(|result| (comparison.breaches)(result.value, threshold) == deciding)
+            .map(|result| result.value)
+            .collect();
         Some(Self {
             state: state.to_string(),
             reason: state_reason(
                 state,
                 counted,
-                window,
+                &cited,
                 evaluate,
                 minimum,
                 comparison.phrase,
@@ -577,7 +586,7 @@ const MISSING_MISSING: &str = "missing";
 const MAX_CITED_VALUE_CHARS: usize = 700;
 
 /// The `StateReason` an evaluated log alarm reports: how many of the query results it evaluated
-/// read the way the state says against the threshold, the values themselves, the minimum the
+/// read the way the state says against the threshold, those results themselves, the minimum the
 /// transition needed and the direction it was decided in.
 ///
 /// UNVERIFIED WORDING: CloudWatch publishes no sentence for a log alarm's state reason, so this
@@ -589,7 +598,7 @@ const MAX_CITED_VALUE_CHARS: usize = 700;
 fn state_reason(
     state: &str,
     counted: usize,
-    window: &[LogQueryResult],
+    cited: &[f64],
     evaluate: usize,
     minimum: usize,
     comparison: &str,
@@ -615,31 +624,33 @@ fn state_reason(
         "Threshold Crossed: {counted} out of the last {evaluate} query result{results_suffix}{} \
          {verb} {negation}{comparison} the threshold ({}) (minimum {minimum} query \
          result{minimum_suffix} for {transition} transition).",
-        cited_values(window),
+        cited_values(cited),
         decimal_text(threshold)
     )
 }
 
 /// The query results an explanation CITES, newest first: ` [7.0, 2.0]`.
 ///
-/// Empty — and so droppable from the sentence without leaving a gap — when the evaluation had no
-/// result at all.
-fn cited_values(window: &[LogQueryResult]) -> String {
-    let mut cited = String::new();
-    for result in window.iter().rev() {
-        let entry = decimal_text(result.value);
-        if cited.len() + entry.len() + 2 > MAX_CITED_VALUE_CHARS {
+/// Only the results on the side of the comparison the state stands for are named
+/// ([`state_reason`]). Empty — and so droppable from the sentence without leaving a gap — when
+/// the evaluation had no result of its own on that side, which is every state a missing-data arm
+/// alone decided.
+fn cited_values(cited: &[f64]) -> String {
+    let mut text = String::new();
+    for value in cited.iter().rev() {
+        let entry = decimal_text(*value);
+        if text.len() + entry.len() + 2 > MAX_CITED_VALUE_CHARS {
             break;
         }
-        if !cited.is_empty() {
-            cited.push_str(", ");
+        if !text.is_empty() {
+            text.push_str(", ");
         }
-        cited.push_str(&entry);
+        text.push_str(&entry);
     }
-    if cited.is_empty() {
-        return cited;
+    if text.is_empty() {
+        return text;
     }
-    format!(" [{cited}]")
+    format!(" [{text}]")
 }
 
 /// The plural suffix and the verb a count takes.

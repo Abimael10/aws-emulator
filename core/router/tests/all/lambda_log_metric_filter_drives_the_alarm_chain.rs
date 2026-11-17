@@ -46,7 +46,7 @@ use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::cloudformation_firehose_stream_stabilisation::wait_for_stack_status;
-use crate::cloudwatch_alarm_action_reaches_its_subscribed_queue::{cw, drain, drain_until};
+use crate::cloudwatch_alarm_action_reaches_its_subscribed_queue::{cw, drain};
 use crate::query_wire::{element, form_encode, outputs_of};
 
 /// The Region every request below is signed for and every ARN names.
@@ -93,6 +93,30 @@ const LOOK_AGAIN: Duration = Duration::from_millis(200);
 /// How long a row watches the quiet alarm for a transition it must NOT make, once the subject
 /// has fired: long enough to span several of the alarm clock's own wake-ups.
 const QUIET_WATCH: Duration = Duration::from_secs(3);
+
+/// Read the queue at `url` until `wanted` notifications have arrived on it or
+/// [`CHAIN_DEADLINE`] passes, and answer every notification that did arrive.
+///
+/// The chain's last leg waits for the evaluation that follows the CLOSE of the period the
+/// printed lines landed in — an alarm grades only periods that have closed, and the lines are
+/// printed into the one the clock is in — so the wait is on the DELIVERY, with the deadline only
+/// deciding when one that never comes is a failure rather than a hang.
+async fn chain_delivered(
+    router: &MultiServiceRouter,
+    case: &str,
+    url: &str,
+    wanted: usize,
+) -> Vec<Value> {
+    let deadline = Instant::now() + CHAIN_DEADLINE;
+    let mut arrived: Vec<Value> = Vec::new();
+    loop {
+        arrived.extend(drain(router, case, REGION, url).await);
+        if arrived.len() >= wanted || Instant::now() >= deadline {
+            return arrived;
+        }
+        tokio::time::sleep(LOOK_AGAIN).await;
+    }
+}
 
 /// The handler every row deploys: it prints one `ERROR` document per line the event asks for
 /// and one `INFO` document, each carrying the event's marker, and answers how many of the
@@ -972,7 +996,7 @@ async fn what_an_invocation_prints_drives_the_metric_filter_alarm_and_subscripti
         // 7. The chain: the evaluation the clock owes moves the alarm, its action publishes to
         //    the topic, and the queue still subscribed receives the notification — with no call
         //    forcing any of it.
-        let delivered = drain_until(&router, case, REGION, &subscribed_url, 1).await;
+        let delivered = chain_delivered(&router, case, &subscribed_url, 1).await;
         assert_eq!(
             delivered.len(),
             1,

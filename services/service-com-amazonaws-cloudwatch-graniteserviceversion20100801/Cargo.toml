@@ -135,6 +135,9 @@ sqlparser = "0.59"
 emulator-core-build-support = { workspace = true }
 
 [dev-dependencies]
+# One integration-test target rooted at `tests/all/main.rs`: `automod` declares one module per
+# `tests/all/<name>.rs`, so a new suite is a new file and nothing else.
+automod = { workspace = true }
 # The OpenTelemetry protocol's own message definitions, used ONLY by the unit test that decodes
 # an exported `opentelemetry1.0` record with them: that is what holds the records this crate
 # renders (`state::metric_stream_export::open_telemetry`) to the published field numbers and wire

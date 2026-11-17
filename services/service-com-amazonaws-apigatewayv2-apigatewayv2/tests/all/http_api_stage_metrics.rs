@@ -83,13 +83,24 @@ const HANDLER_SOURCE: &str = "import json\n\
 
 /// How long a row waits for the state its traffic implies, and how often it looks again.
 ///
-/// An alarm's evaluation is owed a span after the datapoints that make it due arrive, and its
-/// evaluated range ends one cadence behind the instant it runs, so the transition is not
-/// immediate. The deadline is far above either span, so a row that never reaches its state
-/// fails on what it last read instead of hanging.
+/// An alarm's evaluation is owed a span after the datapoints that make it due arrive, and it
+/// grades a period only once that period has CLOSED — the traffic's datapoints land in the
+/// period the clock is in, so the verdict they decide is one of the alarm's own periods
+/// ([`ALARM_PERIOD_SECONDS`]) and one evaluation away at most. The deadline is far above that
+/// span, so a row that never reaches its state fails on what it last read instead of hanging;
+/// nothing here measures how long it took.
 const SETTLES_WITHIN: Duration = Duration::from_secs(60);
 /// See [`SETTLES_WITHIN`].
 const LOOK_AGAIN: Duration = Duration::from_millis(100);
+
+/// The `Period` every row's alarm is evaluated on, in seconds.
+///
+/// The shortest an alarm may be evaluated on ("Valid values are 10, 20, 30, and any multiple of
+/// 60", `smithy_query(query="doc",shape="PutMetricAlarmInput",member="Period")`), because what
+/// these rows are about is WHICH traffic the stage's series carries and not how wide the window
+/// folding it is: the narrowest window is the one whose close — the instant a verdict over it
+/// becomes due — a row waits the least for.
+const ALARM_PERIOD_SECONDS: i64 = 10;
 
 /// The window every metric read covers, in seconds, and the period it is read at: generous on
 /// both sides, so no row depends on where in a minute the suite runs.
@@ -477,7 +488,7 @@ async fn the_traffic_a_stage_serves_decides_the_alarm_declared_over_its_series()
                     {"Name": STAGE_DIMENSION, "Value": STAGE},
                 ],
                 "Statistic": "Sum",
-                "Period": 60,
+                "Period": ALARM_PERIOD_SECONDS,
                 "EvaluationPeriods": 1,
                 "DatapointsToAlarm": 1,
                 "Threshold": THRESHOLD,

@@ -150,6 +150,14 @@ pub struct AlarmNotification {
     /// function is handed it. It is owed by the transition rather than by [`Self::actions`], so
     /// a record carrying no action at all still carries this.
     pub state_change: state_change_events::AlarmStateChange,
+    /// Whether delivering this record also PUBLISHES that state change onto the event bus.
+    ///
+    /// True for the record of a transition, which is what the event reports. False for a record
+    /// of actions that are executed without the alarm having moved — the ones a mute rule
+    /// withheld and whose deletion releases them ([`crate::state::ComAmazonawsCloudwatchGraniteserviceversion20100801State::delete_alarm_mute_rule`]) — because no
+    /// state change happened for a bus consumer to be told about; the payload is still carried,
+    /// since an action that is handed the transition (a Lambda function) is handed this one.
+    pub publishes_state_change: bool,
 }
 
 impl AlarmNotification {
@@ -439,6 +447,8 @@ impl Transition<'_> {
             subject,
             message: Value::Object(document).to_string(),
             state_change: self.state_change,
+            // This record IS a transition's, so the state change it carries is published.
+            publishes_state_change: true,
         })
     }
 }
@@ -527,12 +537,17 @@ async fn settle<Eng: Send + Sync + 'static>(
 
     // The EVENT every one of these transitions publishes goes out first, because it is owed by
     // the transition rather than by any action: a consumer of the bus sees a state change this
-    // settle materialised whether or not the alarm carries an action at all.
+    // settle materialised whether or not the alarm carries an action at all. A record of actions
+    // nothing moved the alarm for — the ones a deleted mute rule had withheld — announces no
+    // state change, because none happened.
     let changes: Vec<state_change_events::AlarmStateChange> = owed
         .iter()
+        .filter(|notification| notification.publishes_state_change)
         .map(|notification| notification.state_change.clone())
         .collect();
-    state_change_events::publish(callback, &changes).await;
+    if !changes.is_empty() {
+        state_change_events::publish(callback, &changes).await;
+    }
 
     let mut client: Option<(String, ::aws_sdk_sns::Client)> = None;
     // Every authorization decision this request has already taken. One pass settles the

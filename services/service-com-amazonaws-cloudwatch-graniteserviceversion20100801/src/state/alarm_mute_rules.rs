@@ -59,6 +59,17 @@ pub fn alarm_mute_rule_arn(region: &str, name: &str) -> String {
 /// is unaffected.
 pub const MAX_ALARM_MUTE_RULES: usize = 10_000;
 
+/// The most alarms ONE `DeleteAlarmMuteRule` releases the withheld actions of.
+///
+/// What one request does is bounded by the number of alarms the deleted rule names, and that is a
+/// value an EARLIER request chose, so the bound is applied here rather than left to the stored
+/// list's length: "You can specify up to 100 alarm names"
+/// (`smithy_query(query="shape",shape="MuteTargets")`, whose `AlarmNames` is modelled
+/// `@length 0..100`) is the published maximum, so a rule a caller can store names no more than
+/// this many and the cap costs a compliant request nothing. A list past it — which no write this
+/// service accepts can produce — releases this many and says so in the log.
+pub const MAX_ALARMS_RELEASED_PER_DELETE: usize = 100;
+
 /// A mute rule that is configured and will become active in the future:
 /// "SCHEDULED: The mute rule is configured and will become active in the future"
 /// (`GetAlarmMuteRule`).
@@ -240,6 +251,179 @@ impl super::ComAmazonawsCloudwatchGraniteserviceversion20100801State {
             .map(|(key, _)| key.name.clone())
             .min()
     }
+
+    /// DELETE the mute rule `name` holds in `region`, and release the actions it was muting.
+    ///
+    /// "Deletes a specific alarm mute rule. When you delete a mute rule, any alarms that are
+    /// currently being muted by that rule are immediately unmuted. If those alarms are in an
+    /// ALARM state, their configured actions will trigger. This operation is idempotent. If you
+    /// delete a mute rule that does not exist, the operation succeeds without returning an
+    /// error." (`DeleteAlarmMuteRule`) — so the delete is the whole of it:
+    ///
+    /// * the rule is GONE, so nothing it targeted is muted by it any more: the mute question is
+    ///   answered from the rules the store holds ([`Self::muting_alarm_mute_rule`]), which is why
+    ///   removing the record is all the unmuting there is to do, and a name no rule of this
+    ///   Region carries removes nothing and is no error;
+    /// * an alarm the rule WAS muting that stands in `ALARM` has the actions configured for that
+    ///   state executed now — the ones the mute withheld — queued for the settle that delivers
+    ///   them ([`super::alarm_actions::settle_alarms`]). Only a rule that was ACTIVE was muting
+    ///   anything ("ACTIVE: The mute rule is currently muting alarm actions",
+    ///   `GetAlarmMuteRule`), and an alarm another rule still mutes stays muted, so the question
+    ///   is asked again once this rule is out of the store.
+    ///
+    /// The alarm does not MOVE: it was already in `ALARM` and still is, so no history item
+    /// records a transition and no state-change event announces one
+    /// ([`super::alarm_actions::AlarmNotification::publishes_state_change`]). What is released is
+    /// the execution of the actions.
+    pub fn delete_alarm_mute_rule(&mut self, region: &str, name: &str, now: f64) {
+        let Some(removed) = self
+            .alarm_mute_rules
+            .remove(&alarm_mute_rule_key(region, name))
+        else {
+            return;
+        };
+        if alarm_mute_rule_status(&removed.configuration, now) != ALARM_MUTE_RULE_ACTIVE {
+            return;
+        }
+        let named = removed
+            .configuration
+            .mute_targets
+            .as_ref()
+            .map_or(0, |targets| targets.alarm_names.len());
+        if named > MAX_ALARMS_RELEASED_PER_DELETE {
+            ::tracing::warn!(
+                rule = %name,
+                targeted = named,
+                released = MAX_ALARMS_RELEASED_PER_DELETE,
+                "this alarm mute rule names more alarms than one delete releases the actions \
+                 of; the rest keep the actions the mute withheld"
+            );
+        }
+        let targeted: Vec<String> = removed
+            .configuration
+            .mute_targets
+            .as_ref()
+            .map(|targets| {
+                targets
+                    .alarm_names
+                    .iter()
+                    .take(MAX_ALARMS_RELEASED_PER_DELETE)
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default();
+        // Which alarms the rules LEFT in the store still mute, read ONCE: the question is asked
+        // for every alarm this delete releases, and answering it from the store per alarm would
+        // re-read every rule it holds and re-parse that rule's schedule for each of them
+        // ([`MuteWindows::of`]), so the work would grow with the product of the two.
+        let still_muting = self.active_mute_targets(now);
+        let released: Vec<super::alarm_actions::AlarmNotification> = targeted
+            .iter()
+            .filter_map(|alarm_name| self.released_alarm_actions(alarm_name, now, &still_muting))
+            .collect();
+        for notification in released {
+            self.queue_notification(notification);
+        }
+    }
+
+    /// The ACTIVE mute rules this store holds, each as the Region it lives in beside the alarm
+    /// names it targets ([`StoredAlarmMuteRule::targets`]).
+    ///
+    /// Read in ONE pass over the rules, so a caller asking the mute question about several alarms
+    /// reads the store — and reads each rule's schedule — once rather than once per alarm.
+    fn active_mute_targets(&self, now: f64) -> Vec<(String, Vec<String>)> {
+        self.alarm_mute_rules
+            .iter()
+            .filter(|(_, stored)| {
+                alarm_mute_rule_status(&stored.configuration, now) == ALARM_MUTE_RULE_ACTIVE
+            })
+            .map(|(key, stored)| {
+                let targets = stored
+                    .configuration
+                    .mute_targets
+                    .as_ref()
+                    .map(|targets| targets.alarm_names.clone())
+                    .unwrap_or_default();
+                (key.region.clone(), targets)
+            })
+            .collect()
+    }
+
+    /// The record of the actions a released alarm executes now: the ones configured for the
+    /// `ALARM` state it stands in, for an alarm that no longer has a mute rule withholding them.
+    ///
+    /// `None` for an alarm in any other state (there is nothing configured for a state it is not
+    /// in), for one no store holds under that name, for one an ACTIVE rule of `still_muting`
+    /// mutes, and for one that carries no action for `ALARM` at all — a record of no action is a
+    /// delivery with nothing to deliver.
+    fn released_alarm_actions(
+        &self,
+        alarm_name: &str,
+        now: f64,
+        still_muting: &[(String, Vec<String>)],
+    ) -> Option<super::alarm_actions::AlarmNotification> {
+        let released = if let Some(stored) = self.alarms.get(alarm_name) {
+            super::alarm_actions::AlarmNotification::of_transition(
+                &stored.alarm,
+                // The state the alarm stands in is the state it moved to: the actions released
+                // are the ones that state was configured with, and nothing moved.
+                &super::AlarmStateSnapshot::of_metric_alarm(&stored.alarm),
+                now,
+            )
+        } else if let Some(stored) = self.composite_alarms.get(alarm_name) {
+            super::alarm_actions::AlarmNotification::of_composite_transition(
+                &stored.alarm,
+                &self.child_alarm_states(&stored.child_names),
+                &super::AlarmStateSnapshot::of_composite_alarm(&stored.alarm),
+                now,
+            )
+        } else if let Some(stored) = self.log_alarms.get(alarm_name) {
+            // A log alarm's record names the EXECUTION whose aggregate decided the state it is
+            // in, which is its newest run.
+            stored.query_executions.last().and_then(|execution| {
+                super::alarm_actions::AlarmNotification::of_log_transition(
+                    &stored.alarm,
+                    &execution.query_id,
+                    &super::AlarmStateSnapshot::of_log_alarm(&stored.alarm),
+                    now,
+                )
+            })
+        } else {
+            None
+        };
+        released
+            .filter(|released| released.new_state_value == super::ALARM_STATE_ALARM)
+            .filter(|released| !released.actions.is_empty())
+            .filter(|released| {
+                !muted_by(still_muting, alarm_name, released.alarm_arn.as_deref())
+            })
+            .map(|released| super::alarm_actions::AlarmNotification {
+                // No state change happened, so none is announced.
+                publishes_state_change: false,
+                ..released
+            })
+    }
+}
+
+/// Whether one of the ACTIVE rules `still_muting` names mutes the alarm `alarm_name`, whose own
+/// ARN is `alarm_arn`.
+///
+/// The same question [`super::ComAmazonawsCloudwatchGraniteserviceversion20100801State::muting_alarm_mute_rule`]
+/// answers, over rules already read: a rule is a resource of ONE Region and so is an alarm, so
+/// only the rules of the alarm's own Region can mute it, and an alarm whose ARN names no Region
+/// is matched against every rule.
+fn muted_by(
+    still_muting: &[(String, Vec<String>)],
+    alarm_name: &str,
+    alarm_arn: Option<&str>,
+) -> bool {
+    let region = alarm_arn
+        .and_then(::service_common::arn::parse)
+        .map(|arn| arn.region.to_string());
+    still_muting
+        .iter()
+        .filter(|(rule_region, _)| region.as_ref().is_none_or(|region| rule_region == region))
+        .any(|(_, targets)| targets.iter().any(|targeted| targeted == alarm_name))
 }
 
 /// The `HistoryItemType` a muted transition is recorded under: `Action` is the type every record

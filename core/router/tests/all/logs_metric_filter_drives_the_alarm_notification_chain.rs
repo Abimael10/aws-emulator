@@ -573,9 +573,13 @@ async fn an_ingested_log_event_drives_its_metric_filters_alarm_to_the_subscribed
              got {before:?}"
         );
 
-        // 4. The ingest: one batch carrying the row's messages, matching and not.
+        // 4. The ingest: one batch carrying the row's messages, matching and not, each stamped
+        //    inside the period that has already CLOSED — an alarm grades only the periods that
+        //    have, the one the clock is in being still open to further events, so a batch stamped
+        //    in the open period would be graded by the evaluation that follows its close rather
+        //    than by the next one.
         let at = now_secs();
-        let timestamp = now_ms();
+        let timestamp = now_ms() - ALARM_PERIOD * 1_000;
         let events: Vec<Value> = row
             .messages
             .iter()

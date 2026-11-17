@@ -20,7 +20,9 @@
 //! `smithy_query(query="doc",shape="MetricDatum",member="Timestamp")`) — decides the alarm that
 //! watches it, whatever `Period` that alarm is evaluated on and whatever phase of its storage
 //! span the call lands in. It decides it in the direction the datapoint really is on: a value
-//! the comparison does not breach leaves the alarm in `OK`.
+//! the comparison does not breach leaves the alarm in `OK`. It decides it once the period the
+//! datapoint landed in has CLOSED — a period still being published into grades nothing — which
+//! for a datapoint stamped at the instant of the call is at most one storage span away.
 //!
 //! The rows differ along what the rule generalises over: the alarm's `Period` (each
 //! sub-minute cadence `PutMetricAlarm` admits — "Valid values are 10, 20, 30, and any multiple
@@ -46,13 +48,13 @@ const THRESHOLD: f64 = 50.0;
 
 /// How long a row waits for the state its one datapoint implies, and how often it looks.
 ///
-/// An alarm's rolling range ends one evaluation cadence behind the instant it runs
-/// (`crate::state::alarm_evaluation`'s `evaluation_lag_secs`), which for a high-resolution alarm
-/// is its own period — the longest any row here waits for its datapoint to be inside the range
-/// at all — and the evaluation itself is owed a sub-second span after the write. The deadline is
-/// that cadence with room to spare, so a row that never grades the datapoint fails instead of
-/// hanging.
-const GRADED_WITHIN: Duration = Duration::from_secs(14);
+/// A datapoint is graded by the evaluation that follows the CLOSE of the period it landed in,
+/// and a datapoint stamped at the instant of the call lands in the storage span the clock is in
+/// — a minute for a regular-resolution series, the longest any row here waits — so the deadline
+/// is that span and the sub-second evaluation delay behind it, with room to spare. A row that
+/// never grades the datapoint fails on what it last read instead of hanging; nothing is asserted
+/// about how long the grading took.
+const GRADED_WITHIN: Duration = Duration::from_secs(90);
 /// See [`GRADED_WITHIN`].
 const LOOK_AGAIN: Duration = Duration::from_millis(100);
 
@@ -175,24 +177,40 @@ const ROWS: &[Row] = &[
     },
 ];
 
-/// The state `DescribeAlarms` reports for `name`, once it is the state `wanted` or once the
-/// deadline is up — so a row that never grades its datapoint fails on what it last read.
-async fn awaited_state(
+/// The state `DescribeAlarms` reports for each row's alarm, once it is the state that row
+/// expects or once the deadline is up — so a row that never grades its datapoint fails on what
+/// it last read.
+///
+/// Every row is looked at on EVERY pass rather than one row being waited out before the next is
+/// looked at: each row's datapoint is graded by the evaluation that follows the close of the
+/// period it landed in, and the evaluation range an alarm searches is only a few periods wide,
+/// so a row waited out after another's whole wait could have its one datapoint fall out of the
+/// range before it was ever read.
+async fn awaited_states(
     router: &smithy_server_runtime::MultiServiceRouter,
-    name: &str,
-    wanted: &str,
-) -> String {
+    names: &[String],
+) -> Vec<String> {
     let deadline = ::std::time::Instant::now() + GRADED_WITHIN;
+    let mut last: Vec<String> = vec![String::new(); names.len()];
     loop {
-        let described = crate::harness::described_alarm(router, AlarmKind::Metric, name).await;
-        let state = described
-            .as_ref()
-            .and_then(|alarm| alarm.get("StateValue"))
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_string();
-        if state == wanted || ::std::time::Instant::now() >= deadline {
-            return state;
+        let mut all_reached = true;
+        for (index, (row, name)) in ROWS.iter().zip(names).enumerate() {
+            if last[index] == row.state {
+                continue;
+            }
+            let described = crate::harness::described_alarm(router, AlarmKind::Metric, name).await;
+            last[index] = described
+                .as_ref()
+                .and_then(|alarm| alarm.get("StateValue"))
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            if last[index] != row.state {
+                all_reached = false;
+            }
+        }
+        if all_reached || ::std::time::Instant::now() >= deadline {
+            return last;
         }
         tokio::time::sleep(LOOK_AGAIN).await;
     }
@@ -200,9 +218,12 @@ async fn awaited_state(
 
 #[tokio::test]
 async fn one_just_published_datapoint_decides_the_alarm_that_watches_it() {
+    // Every row watches its own series — its `Case` dimension is its own — so all of them are
+    // configured on ONE emulator and the close of the storage span they publish into is waited
+    // out once rather than per row.
+    let router = build_router();
+    let mut names: Vec<String> = Vec::with_capacity(ROWS.len());
     for row in ROWS {
-        let router = build_router();
-        // One series per row, told apart by its dimension, so no row grades another's data.
         let dimension = row.case.replace(' ', "-");
         let name = format!("just-published-{dimension}");
 
@@ -246,12 +267,15 @@ async fn one_just_published_datapoint_decides_the_alarm_that_watches_it() {
             &json!({"Namespace": NAMESPACE, "MetricData": [datum]}),
         )
         .await;
+        names.push(name);
+    }
 
-        let reached = awaited_state(&router, &name, row.state).await;
+    let reached = awaited_states(&router, &names).await;
+    for ((row, name), reached) in ROWS.iter().zip(&names).zip(&reached) {
         assert_eq!(
-            reached, row.state,
-            "case {:?}: expected the alarm to reach {} from the one datapoint published for it, \
-             got {reached:?}",
+            reached.as_str(), row.state,
+            "case {:?}: expected the alarm {name} to reach {} from the one datapoint published \
+             for it, got {reached:?}",
             row.case, row.state
         );
     }

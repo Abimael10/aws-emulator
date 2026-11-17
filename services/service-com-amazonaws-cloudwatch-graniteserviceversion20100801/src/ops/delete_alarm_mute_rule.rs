@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteAlarmMuteRule
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteAlarmMuteRule`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteAlarmMuteRule::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The DELETE half of the alarm mute rule store: it removes the rule `PutAlarmMuteRule` wrote
+//! and releases the alarm actions that rule was muting.
 //!
 //! ## Shape of an operation
 //!
@@ -94,9 +88,16 @@ impl ::aws_smithy_schema::serde::SerializableStruct for DeleteAlarmMuteRuleOutpu
 // here — hence the `DeleteAlarmMuteRuleError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.cloudwatch#DeleteAlarmMuteRule")]
+#[smithy_macros::operation_error(
+    "com.amazonaws.cloudwatch#DeleteAlarmMuteRule",
+    extra_errors = ["InternalServiceFault"]
+)]
 #[derive(Debug)]
 pub enum DeleteAlarmMuteRuleErrorModeled {
+    // `InternalServiceFault` is widened in through `extra_errors`: this SERVICE models it and
+    // other operations declare it, so an unreachable store has a modelled server failure to
+    // answer with rather than the scaffold's 501.
+    InternalServiceFault(InternalServiceFault),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -150,18 +151,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteAlarmMuteRule` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteAlarmMuteRuleErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteAlarmMuteRule"))
+        // A mute rule is a REGIONAL resource — its name "must be unique within your Amazon Web
+        // Services account and region" (`PutAlarmMuteRuleInput$Name`) — so the rule this request
+        // deletes is the one of the Region it was signed for, and the same name in another
+        // Region is another rule this call leaves alone.
+        let region = crate::state::request_region(ctx.parts());
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DeleteAlarmMuteRuleErrorModeled::InternalServiceFault(InternalServiceFault {
+                message: Some("the CloudWatch alarm mute rule store is unavailable".into()),
+            })
+        })?;
+
+        let now = crate::state::now_secs();
+        {
+            // "This operation is idempotent. If you delete a mute rule that does not exist, the
+            // operation succeeds without returning an error." — so there is no not-found arm
+            // here. The whole of the delete, including the actions the rule was muting and which
+            // its removal releases, is the one rule the store applies.
+            let mut store = state.lock();
+            store.delete_alarm_mute_rule(&region, &input.alarm_mute_rule_name, now);
+        }
+        // "If those alarms are in an ALARM state, their configured actions will trigger." — the
+        // released actions go out here, together with every evaluation the clock has already
+        // made due, exactly as a transition's own actions do.
+        crate::state::alarm_actions::settle_alarms(&*self.engine, ctx).await;
+
+        Ok(DeleteAlarmMuteRuleOutput)
     }
 }
