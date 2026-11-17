@@ -30,8 +30,8 @@ use crate::ops::types::{
     IndonesiaAdditionalInfo, MalaysiaAdditionalInfo,
     InternalServerException, Jurisdiction, ResourceNotFoundException, SupplementalTaxRegistration,
     SupplementalTaxRegistrationEntry, TaxDocumentMetadata, TaxExemption, TaxExemptionDetails,
-    TaxExemptionType, TaxRegistration, TaxRegistrationEntry, TaxRegistrationWithJurisdiction,
-    ValidationException, ValidationExceptionField,
+    TaxExemptionType, TaxRegistration, TaxRegistrationEntry, TaxRegistrationStatusReason,
+    TaxRegistrationWithJurisdiction, ValidationException, ValidationExceptionField,
 };
 
 /// The `TaxRegistrationStatus` values, from the model's enum
@@ -44,11 +44,11 @@ pub const STATUS_PENDING: &str = "Pending";
 /// See [`STATUS_PENDING`]: the validation of the submitted TRN found no fault,
 /// which is what a stored registration whose number its jurisdiction's authority
 /// CONFIRMS reaches once that validation falls due — see
-/// [`trn_validation_status`].
+/// [`trn_validation_outcome`].
 pub const STATUS_VERIFIED: &str = "Verified";
 /// See [`STATUS_PENDING`]: the validation of the submitted TRN failed, which is
 /// what a stored registration whose number that authority's own rule does NOT
-/// confirm reaches — see [`trn_validation_status`]. Being WRITTEN the way such a
+/// confirm reaches — see [`trn_validation_outcome`]. Being WRITTEN the way such a
 /// number is written and being CONFIRMED by the authority's rule are separate
 /// facts, answered at separate times: the write refuses a value that is not
 /// written that way at all ([`check_registration_number`]) and the validation
@@ -61,8 +61,68 @@ pub const STATUS_REJECTED: &str = "Rejected";
 /// in this status.
 pub const STATUS_DELETED: &str = "Deleted";
 
-/// The status the validation of a stored TRN reaches: what the submitted number
-/// is judged to be once the validation the write started falls due.
+/// The reason a settled TRN validation reports beside the status it reached.
+///
+/// A registration a validation did not verify is reported with the class of that
+/// outcome and the sentence worded for the class, which is the only channel a
+/// client learns WHY its registration is in that status by: one value per class,
+/// so the code a caller routes on and the message it displays cannot drift apart,
+/// and a status that has no reason to report (an outstanding validation, a
+/// verified registration) carries none.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TrnValidationReason {
+    /// The validation could not verify the stored number: its jurisdiction's
+    /// authority does not confirm it ([`STATUS_REJECTED`]). No more specific
+    /// class is published for it, so it is reported under the general reason code
+    /// ([`REASON_CODE_OTHER`]).
+    Unverified,
+}
+
+impl TrnValidationReason {
+    /// The reason `code`: the closed token a client routes on.
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::Unverified => REASON_CODE_OTHER,
+        }
+    }
+
+    /// The reason `message`: the sentence worded for this class, fixed text that
+    /// interpolates nothing from the request or from the store, because the class
+    /// is what it explains.
+    pub const fn message(self) -> &'static str {
+        match self {
+            Self::Unverified => UNVERIFIED_REGISTRATION_MESSAGE,
+        }
+    }
+
+    /// The `statusReason` a reported registration carries for this class — the
+    /// one place the reported pair is built, so `GetTaxRegistration` and
+    /// `ListTaxRegistrations` report one reason the same way.
+    pub fn to_status_reason(self) -> TaxRegistrationStatusReason {
+        TaxRegistrationStatusReason {
+            code: self.code().to_string(),
+            message: self.message().to_string(),
+        }
+    }
+}
+
+/// The reason `code` of an outcome no narrower reason class is published for.
+pub const REASON_CODE_OTHER: &str = "OTHER";
+
+/// The message of [`TrnValidationReason::Unverified`]: what a client is told
+/// about a registration the validation of its TRN did not verify, and what to do
+/// about it. Fixed text for the class — it names no account, registration,
+/// jurisdiction or instant, because every registration of the class is told the
+/// same thing.
+pub const UNVERIFIED_REGISTRATION_MESSAGE: &str =
+    "Your tax registration could not be verified. Please review your information and resubmit.";
+
+/// The outcome the validation of a stored TRN reaches: the status the submitted
+/// number is judged to, and the reason it reached it where that status has one to
+/// report.
+///
+/// The reason is decided HERE, beside the status, so a reader of a settled record
+/// never re-derives why it settled and the two cannot disagree.
 ///
 /// The model documents the status as the outcome of "the validation occurring on
 /// the TRN", and what is left for that validation to establish is whether the
@@ -80,19 +140,19 @@ pub const STATUS_DELETED: &str = "Deleted";
 /// the jurisdiction the registration is held in — and of nothing else, so every
 /// reader of one record settles it the same way and no read can move a record
 /// the previous read did not.
-pub fn trn_validation_status(
+pub fn trn_validation_outcome(
     country_code: &str,
     registration_type: &str,
     registration_id: &str,
-) -> &'static str {
+) -> (&'static str, Option<TrnValidationReason>) {
     if registration_number::confirmed_by_its_authority(
         country_code,
         registration_type,
         registration_id,
     ) {
-        STATUS_VERIFIED
+        (STATUS_VERIFIED, None)
     } else {
-        STATUS_REJECTED
+        (STATUS_REJECTED, Some(TrnValidationReason::Unverified))
     }
 }
 
@@ -137,9 +197,9 @@ fn outstanding_trn_validation(written_at: Instant) -> (String, Option<Instant>) 
 /// [`ComAmazonawsTaxsettingsTaxsettingsState::settle_due`] drives it for every
 /// stored registration.
 pub trait TrnValidation {
-    /// The status the validation of this registration's stored number reaches —
-    /// see [`trn_validation_status`].
-    fn validation_outcome(&self) -> &'static str;
+    /// The status the validation of this registration's stored number reaches,
+    /// and the reason it reached it — see [`trn_validation_outcome`].
+    fn validation_outcome(&self) -> (&'static str, Option<TrnValidationReason>);
 
     /// When this registration's validation falls due, `None` once it has
     /// settled.
@@ -151,6 +211,13 @@ pub trait TrnValidation {
     /// The registration's `TaxRegistrationStatus`.
     fn status_mut(&mut self) -> &mut String;
 
+    /// Record the reason the validation settled this registration on its status.
+    ///
+    /// The default discards it: a registration whose reported shape carries no
+    /// reason has nowhere to hold one, and a reason nothing reports is not a fact
+    /// this store keeps. A record whose readers report one overrides this.
+    fn record_validation_reason(&mut self, _reason: Option<TrnValidationReason>) {}
+
     /// Move this registration to the status its validation reached, if that
     /// validation was already due at `now`. Answers whether it moved.
     ///
@@ -160,8 +227,9 @@ pub trait TrnValidation {
     fn settle(&mut self, now: Instant) -> bool {
         match self.validation_due_at() {
             Some(due) if due <= now => {
-                let outcome = self.validation_outcome();
-                *self.status_mut() = outcome.to_string();
+                let (status, reason) = self.validation_outcome();
+                *self.status_mut() = status.to_string();
+                self.record_validation_reason(reason);
                 *self.validation_due_at_mut() = None;
                 true
             }
@@ -1442,9 +1510,13 @@ impl StoredSupplementalRegistration {
 impl TrnValidation for StoredSupplementalRegistration {
     /// What the validation of this supplemental TRN reaches: the number it was
     /// stored with, judged against the rule the jurisdiction it is held in
-    /// publishes for confirming one — see [`trn_validation_status`].
-    fn validation_outcome(&self) -> &'static str {
-        trn_validation_status(
+    /// publishes for confirming one — see [`trn_validation_outcome`].
+    ///
+    /// `SupplementalTaxRegistration` reports a status and no reason beside it, so
+    /// the reason this outcome carries is not recorded (the default
+    /// [`TrnValidation::record_validation_reason`]).
+    fn validation_outcome(&self) -> (&'static str, Option<TrnValidationReason>) {
+        trn_validation_outcome(
             &self.address.country_code,
             &self.registration_type,
             &self.registration_id,
@@ -1497,6 +1569,11 @@ pub struct StoredTaxRegistration {
     pub certified_email_id: Option<String>,
     /// The registration's `TaxRegistrationStatus`.
     pub status: String,
+    /// Why the validation settled this record on [`Self::status`], recorded
+    /// beside that status by [`TrnValidation::settle`] and reported as the
+    /// registration's `statusReason`. `None` where there is no reason to report:
+    /// a validation still outstanding, or one that verified the number.
+    pub status_reason: Option<TrnValidationReason>,
     /// When the validation of this TRN falls due, after which
     /// [`TrnValidation::settle`] moves [`Self::status`] to what that validation
     /// reached ([`TrnValidation::validation_outcome`]). `None` once it has been
@@ -1586,6 +1663,9 @@ impl StoredTaxRegistration {
                 .map(additional_info_response),
             certified_email_id: entry.certified_email_id.clone(),
             status,
+            // The validation this write started has reached nothing yet, so the
+            // record has no reason to report for the status it is stored in.
+            status_reason: None,
             validation_due_at,
             revision,
             tax_document_metadatas: document_metadatas(entry, account_id, revision),
@@ -1614,6 +1694,7 @@ impl StoredTaxRegistration {
             registration_type: self.registration_type.clone(),
             legal_name: self.legal_name.clone(),
             status: self.status.clone(),
+            status_reason: self.reported_status_reason(),
             sector: self.sector.clone(),
             tax_document_metadatas: self.reported_document_metadatas(),
             certified_email_id: self.certified_email_id.clone(),
@@ -1632,6 +1713,7 @@ impl StoredTaxRegistration {
             registration_type: self.registration_type.clone(),
             legal_name: self.legal_name.clone(),
             status: self.status.clone(),
+            status_reason: self.reported_status_reason(),
             sector: self.sector.clone(),
             tax_document_metadatas: self.reported_document_metadatas(),
             certified_email_id: self.certified_email_id.clone(),
@@ -1681,6 +1763,18 @@ impl StoredTaxRegistration {
         }
     }
 
+    /// `statusReason` as the reads report it: the code and message of the reason
+    /// the validation recorded ([`Self::status_reason`]), and absent for a record
+    /// that has no reason to report — the member is optional, so a registration
+    /// no reason is attached to carries none rather than an empty one.
+    ///
+    /// One projection for every shape that reports this record's status, so
+    /// `GetTaxRegistration` and `ListTaxRegistrations` report one reason the same
+    /// way.
+    fn reported_status_reason(&self) -> Option<TaxRegistrationStatusReason> {
+        self.status_reason.map(TrnValidationReason::to_status_reason)
+    }
+
     /// `taxDocumentMetadatas` as the reads report it: absent rather than an
     /// empty list, because the model constrains `TaxDocumentMetadatas` to
     /// 1..=5 entries.
@@ -1696,12 +1790,12 @@ impl StoredTaxRegistration {
 impl TrnValidation for StoredTaxRegistration {
     /// What the validation of this TRN reaches: the number it was stored with,
     /// judged against the rule the jurisdiction it is held in publishes for
-    /// confirming one — see [`trn_validation_status`].
+    /// confirming one — see [`trn_validation_outcome`].
     ///
     /// Read from the stored record, so the outcome was fixed by the write and
     /// every reader of this record settles it identically.
-    fn validation_outcome(&self) -> &'static str {
-        trn_validation_status(
+    fn validation_outcome(&self) -> (&'static str, Option<TrnValidationReason>) {
+        trn_validation_outcome(
             &self.legal_address.country_code,
             &self.registration_type,
             &self.registration_id,
@@ -1718,6 +1812,12 @@ impl TrnValidation for StoredTaxRegistration {
 
     fn status_mut(&mut self) -> &mut String {
         &mut self.status
+    }
+
+    /// Keep the reason beside the status, because every shape that reports this
+    /// record reports one with the other.
+    fn record_validation_reason(&mut self, reason: Option<TrnValidationReason>) {
+        self.status_reason = reason;
     }
 }
 
@@ -3670,7 +3770,7 @@ pub fn check_tax_registration_entry(
 /// the write refuses it as it reads the request rather than storing it. Whether
 /// a number of that layout is CONFIRMED by the authority's own rule (its check
 /// digit) is the separate question the validation a write starts answers
-/// ([`trn_validation_status`]): such a number is stored, and its validation
+/// ([`trn_validation_outcome`]): such a number is stored, and its validation
 /// reaches its own outcome. A jurisdiction and type this service publishes no
 /// layout for is not judged, so such an entry is admitted.
 ///

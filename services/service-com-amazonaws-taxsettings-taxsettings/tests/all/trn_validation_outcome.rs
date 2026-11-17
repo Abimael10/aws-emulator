@@ -22,6 +22,13 @@
 //! A jurisdiction and type this service publishes no structure for is judged by
 //! neither question.
 //!
+//! Beside the status, a settled registration reports WHY its validation settled
+//! there: a registration the validation did not verify carries a `statusReason`
+//! whose `code` names the reason class and whose `message` is the sentence worded
+//! for that class, and one with no reason to report — an outstanding validation,
+//! a verified registration — carries none. The last tests in this file assert
+//! that over the same table.
+//!
 //! The table spans the class the rule generalises over: each jurisdiction whose
 //! structure this service holds, with a number written the published way and
 //! confirmed, one written that way but not confirmed, and one not written that
@@ -43,7 +50,7 @@ use service_com_amazonaws_taxsettings_taxsettings::state::{
     STATUS_REJECTED, STATUS_VERIFIED,
 };
 
-use crate::fidelity_rules::read_status;
+use crate::fidelity_rules::{read_status, reported_registration};
 use crate::tax_registration_lifecycle::{
     call, emulator_with_engine, field_list, hold_validations_open, make_validations_due,
 };
@@ -548,5 +555,227 @@ async fn a_refused_number_leaves_the_stored_record_as_it_was() {
         reported.get("status").and_then(Value::as_str),
         Some(STATUS_VERIFIED),
         "the held record must still report its own status, got {reported:?}"
+    );
+}
+
+/// The reason `code` a registration whose validation did not verify it is
+/// reported under, and the sentence worded for that class — both as AWS answers
+/// `GetTaxRegistration` for a registration in the `Rejected` status (recorded;
+/// the checked-out model declares neither). The message is FIXED text for the
+/// class: it interpolates nothing from the request and nothing from the store,
+/// which `the_reason_of_one_class_is_the_same_text_for_every_registration` pins.
+const UNVERIFIED_REASON_CODE: &str = "OTHER";
+/// See [`UNVERIFIED_REASON_CODE`].
+const UNVERIFIED_REASON_MESSAGE: &str =
+    "Your tax registration could not be verified. Please review your information and resubmit.";
+
+/// The `statusReason` members a read reports for `account_id`, as
+/// `(code, message)`, or `None` when the reported registration carries no
+/// reason at all.
+async fn reported_reason(
+    router: &smithy_server_runtime::MultiServiceRouter,
+    reader: &str,
+    account_id: &str,
+) -> Option<(String, String)> {
+    let reported = reported_registration(router, reader, account_id)
+        .await
+        .unwrap_or_else(|| panic!("{reader} must report a registration for {account_id}"));
+    let reason = reported.get("statusReason")?;
+    let member = |name: &str| {
+        reason
+            .get(name)
+            .and_then(Value::as_str)
+            .unwrap_or_else(|| {
+                panic!("the reported reason must carry {name:?}, got {reason:?}")
+            })
+            .to_string()
+    };
+    Some((member("code"), member("message")))
+}
+
+/// RULE: a registration reported in a status its validation did not verify
+/// carries a `statusReason` whose `code` names the reason class and whose
+/// `message` is the sentence worded for that class; a registration with no reason
+/// to report — one whose validation is still outstanding, or one it verified —
+/// carries none. Every read path reports the one record the same way, and a
+/// repeated read reports it again.
+///
+/// Driven over the same table as the status rule above, so every jurisdiction
+/// whose numbers this service judges is covered on both sides of the outcome.
+#[tokio::test]
+async fn a_settled_registration_reports_why_its_validation_settled_there() {
+    for row in rows() {
+        let Outcome::Settles(settles_to) = row.outcome else {
+            // A number the write refuses stores no registration, so there is
+            // nothing for a reader to report a reason about; the status rule
+            // above pins that refusal.
+            continue;
+        };
+        let (router, engine) = emulator_with_engine();
+        let account_id = "000000000001";
+        let put = call(
+            &router,
+            "PutTaxRegistration",
+            &json!({ "accountId": account_id, "taxRegistrationEntry": row.entry }),
+        )
+        .await;
+        assert_eq!(
+            put.status, 200,
+            "case {:?}: the entry must be accepted, got {put:?}",
+            row.case
+        );
+
+        // A validation that is still outstanding has reached no outcome, so
+        // there is nothing to explain yet.
+        hold_validations_open(&engine);
+        for reader in TRN_READERS {
+            let reason = reported_reason(&router, reader, account_id).await;
+            assert_eq!(
+                reason, None,
+                "case {:?}: {reader} must report no reason while the validation is \
+                 outstanding, got {reason:?}",
+                row.case
+            );
+        }
+
+        // Once the clock has made it due, the reason beside the status is the one
+        // the outcome has — and stays it, for either read path.
+        make_validations_due(&engine);
+        let expected = (settles_to == STATUS_REJECTED).then(|| {
+            (
+                UNVERIFIED_REASON_CODE.to_string(),
+                UNVERIFIED_REASON_MESSAGE.to_string(),
+            )
+        });
+        for reader in TRN_READERS.iter().chain(TRN_READERS.iter()) {
+            let status = read_status(&router, reader, account_id).await;
+            assert_eq!(
+                status.as_deref(),
+                Some(settles_to),
+                "case {:?}: {reader} must report {settles_to:?}, got {status:?}",
+                row.case
+            );
+            let reason = reported_reason(&router, reader, account_id).await;
+            assert_eq!(
+                reason, expected,
+                "case {:?}: {reader} must report the reason {expected:?} beside \
+                 {settles_to:?}, got {reason:?}",
+                row.case
+            );
+        }
+    }
+}
+
+/// One rejected registration, written under its own account with its own number
+/// and its own legal name — the values a message that interpolated anything would
+/// carry.
+struct ReasonRow {
+    case: &'static str,
+    account_id: &'static str,
+    registration_id: &'static str,
+    /// The name the entry carries, or the one the service fills in for a
+    /// jurisdiction that supplies it.
+    legal_name: &'static str,
+    entry: Value,
+}
+
+/// A registration of each jurisdiction whose confirming rule this service holds,
+/// each failing that rule for its own reason, each held by a different account
+/// under a different name.
+fn reason_rows() -> Vec<ReasonRow> {
+    vec![
+        ReasonRow {
+            case: "a German VAT number whose check digit is not the published one",
+            account_id: "000000000011",
+            registration_id: "DE123456789",
+            legal_name: "Beispiel GmbH",
+            entry: german_vat("DE123456789"),
+        },
+        ReasonRow {
+            case: "a French VAT number whose key does not match its SIREN",
+            account_id: "000000000222",
+            registration_id: "FR12345678901",
+            legal_name: "Exemple SARL",
+            entry: french_vat("FR12345678901"),
+        },
+        ReasonRow {
+            case: "a CNPJ whose second check digit is wrong",
+            account_id: "000000003333",
+            registration_id: "12345678000196",
+            // Brazil is a jurisdiction whose legal name the service fills in.
+            legal_name: "CNPJ",
+            entry: brazilian_cnpj("12345678000196"),
+        },
+        ReasonRow {
+            case: "a CPF whose check digits are not the published ones",
+            account_id: "000000044444",
+            registration_id: "111.444.777-36",
+            legal_name: "Exemplo da Silva",
+            entry: brazilian_cpf("111.444.777-36"),
+        },
+    ]
+}
+
+/// RULE: the reason reported for one class is the same `code` and the same
+/// `message` for every registration of that class — the message is the class's
+/// own text, so it carries no account id, no registration number, no legal name
+/// and no jurisdiction of the registration it explains.
+#[tokio::test]
+async fn the_reason_of_one_class_is_the_same_text_for_every_registration() {
+    let mut reported: Vec<(String, String)> = Vec::new();
+    for row in reason_rows() {
+        let (router, engine) = emulator_with_engine();
+        let put = call(
+            &router,
+            "PutTaxRegistration",
+            &json!({ "accountId": row.account_id, "taxRegistrationEntry": row.entry }),
+        )
+        .await;
+        assert_eq!(
+            put.status, 200,
+            "case {:?}: the entry must be accepted, got {put:?}",
+            row.case
+        );
+        make_validations_due(&engine);
+        let status = read_status(&router, "GetTaxRegistration", row.account_id).await;
+        assert_eq!(
+            status.as_deref(),
+            Some(STATUS_REJECTED),
+            "case {:?}: the number must settle to {STATUS_REJECTED:?}, got {status:?}",
+            row.case
+        );
+        let (code, message) = reported_reason(&router, "GetTaxRegistration", row.account_id)
+            .await
+            .unwrap_or_else(|| {
+                panic!(
+                    "case {:?}: a registration in {STATUS_REJECTED:?} must report a reason, got \
+                     none",
+                    row.case
+                )
+            });
+        assert_eq!(
+            (code.as_str(), message.as_str()),
+            (UNVERIFIED_REASON_CODE, UNVERIFIED_REASON_MESSAGE),
+            "case {:?}: expected the class's own reason, got {:?}",
+            row.case,
+            (&code, &message)
+        );
+        // Nothing of this registration appears in the text that explains its
+        // class.
+        for value in [row.account_id, row.registration_id, row.legal_name] {
+            assert!(
+                !message.contains(value),
+                "case {:?}: the message must interpolate nothing of the registration, but it \
+                 carries {value:?}: {message:?}",
+                row.case
+            );
+        }
+        reported.push((code, message));
+    }
+    reported.dedup();
+    assert_eq!(
+        reported.len(),
+        1,
+        "every registration of the class must report one reason, got {reported:?}"
     );
 }

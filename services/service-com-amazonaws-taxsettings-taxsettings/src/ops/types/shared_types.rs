@@ -360,6 +360,17 @@ pub struct TaxDocumentMetadata {
     pub tax_document_name: String,
 }
 
+// The reason reported beside a registration's `TaxRegistrationStatus`. Both members
+// are present on every reason this service reports: a reason with no code names no
+// class a client can route on, and one with no message explains nothing — which is
+// why the shape declares both as required.
+#[smithy_macros::smithy(shape = "com.amazonaws.taxsettings#TaxRegistrationStatusReason")]
+#[derive(Debug, Clone, Default)]
+pub struct TaxRegistrationStatusReason {
+    pub code: String,
+    pub message: String,
+}
+
 #[smithy_macros::smithy(shape = "com.amazonaws.taxsettings#AdditionalInfoResponse")]
 #[derive(Debug, Clone, Default)]
 pub struct AdditionalInfoResponse {

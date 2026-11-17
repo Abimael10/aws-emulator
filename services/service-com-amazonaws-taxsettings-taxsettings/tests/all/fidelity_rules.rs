@@ -424,6 +424,29 @@ pub(crate) async fn read_status(
     operation: &str,
     account_id: &str,
 ) -> Option<String> {
+    reported_registration(router, operation, account_id)
+        .await
+        .and_then(|reported| {
+            reported
+                .get("status")
+                .and_then(Value::as_str)
+                .map(std::string::ToString::to_string)
+        })
+}
+
+/// The whole registration `operation` reports for `account_id` — the
+/// `taxRegistration` object of a `GetTaxRegistration` answer, or the one in the
+/// `ListTaxRegistrations` page that carries the account — or `None` when it
+/// reports no registration for it.
+///
+/// One reader for every suite that asserts on a reported MEMBER of the record,
+/// so the two read paths are reached the same way and a member asserted on one
+/// is asserted on the same object as on the other.
+pub(crate) async fn reported_registration(
+    router: &smithy_server_runtime::MultiServiceRouter,
+    operation: &str,
+    account_id: &str,
+) -> Option<Value> {
     if operation == "ListTaxRegistrations" {
         let listed = call(router, operation, &json!({})).await;
         return listed
@@ -435,18 +458,10 @@ pub(crate) async fn read_status(
                     .find(|detail| detail.get("accountId").and_then(Value::as_str) == Some(account_id))
                     .cloned()
             })
-            .and_then(|detail| {
-                detail
-                    .pointer("/taxRegistration/status")
-                    .and_then(Value::as_str)
-                    .map(std::string::ToString::to_string)
-            });
+            .and_then(|detail| detail.get("taxRegistration").cloned());
     }
     let got = call(router, operation, &json!({ "accountId": account_id })).await;
-    got.body
-        .pointer("/taxRegistration/status")
-        .and_then(Value::as_str)
-        .map(std::string::ToString::to_string)
+    got.body.get("taxRegistration").cloned()
 }
 
 /// RULE: `GetTaxInheritance` reports an enum value for the account's election,

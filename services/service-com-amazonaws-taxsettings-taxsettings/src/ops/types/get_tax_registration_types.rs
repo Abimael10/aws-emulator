@@ -35,5 +35,6 @@ pub struct TaxRegistration {
     pub certified_email_id: Option<String>,
     pub additional_tax_information: Option<AdditionalInfoResponse>,
     pub legal_address: Address,
+    pub status_reason: Option<TaxRegistrationStatusReason>,
 }
 

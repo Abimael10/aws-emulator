@@ -46,6 +46,7 @@ pub struct TaxRegistrationWithJurisdiction {
     pub certified_email_id: Option<String>,
     pub additional_tax_information: Option<AdditionalInfoResponse>,
     pub jurisdiction: Jurisdiction,
+    pub status_reason: Option<TaxRegistrationStatusReason>,
 }
 
 #[smithy_macros::smithy(shape = "com.amazonaws.taxsettings#Jurisdiction")]

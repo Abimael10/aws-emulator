@@ -16,7 +16,7 @@
 //!   not confirm is a well-formed number the register does not know, which is
 //!   what validating the submitted TRN establishes — so the write stores it and
 //!   the validation that follows reaches its own outcome
-//!   ([`confirmed_by_its_authority`], [`super::trn_validation_status`]).
+//!   ([`confirmed_by_its_authority`], [`super::trn_validation_outcome`]).
 //!
 //! A jurisdiction and registration type this module publishes NO structure for
 //! is not judged at all: there is nothing to contradict the submitted number
