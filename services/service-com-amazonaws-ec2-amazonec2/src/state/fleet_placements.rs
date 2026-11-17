@@ -271,6 +271,14 @@ pub struct LaunchOverrides<'a> {
 /// lost by that: a fleet that names one of those override members is refused rather than
 /// answered with an instance that does not carry it.
 ///
+/// The SECURITY GROUPS a version declares are carried whichever of the two places it declares
+/// them in, read through the one reading of that pair this crate has
+/// ([`crate::state::launch_template_security_groups`]): a version that declares network
+/// interfaces names its groups on the primary one of them — "if you specify a network
+/// interface, you must specify any security groups as part of the network interface instead of
+/// using this parameter" (`RequestLaunchTemplateData$SecurityGroupIds`) — so the placement's
+/// instance comes up in the declared groups rather than in its VPC's default group.
+///
 /// "The block device mapping" (`RequestLaunchTemplateData$BlockDeviceMappings`) a version
 /// carries IS applied, read through the one conversion of a version's entries
 /// ([`template_block_device_mapping`]): the placement's root volume is the one that version
@@ -284,23 +292,12 @@ pub fn launch_from_template_data(
             .as_ref()
             .and_then(|placement| placement.availability_zone.clone())
     });
-    let groups: Vec<GroupIdentifier> = data
-        .security_group_ids
-        .iter()
-        .flatten()
-        .map(|group_id| GroupIdentifier {
-            group_id: Some(group_id.clone()),
-            group_name: None,
+    let groups: Vec<GroupIdentifier> = crate::state::launch_template_security_groups(data)
+        .into_iter()
+        .map(|(group_id, group_name)| GroupIdentifier {
+            group_id,
+            group_name,
         })
-        .chain(
-            data.security_groups
-                .iter()
-                .flatten()
-                .map(|group_name| GroupIdentifier {
-                    group_id: None,
-                    group_name: Some(group_name.clone()),
-                }),
-        )
         .collect();
     LaunchSpecification {
         image_id: over

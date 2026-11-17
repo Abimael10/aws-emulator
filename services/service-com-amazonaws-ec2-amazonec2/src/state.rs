@@ -2254,6 +2254,13 @@ pub use launched_root_volumes::{
 pub mod launch_template_instance_tags;
 pub use launch_template_instance_tags::*;
 
+/// The security groups a launch-template VERSION declares — on its own members, or on the
+/// network interfaces it declares, which is where a version that declares them names its
+/// groups. The reading every launch from that version shares, this service's own and the one
+/// Amazon EC2 Auto Scaling makes for a group. Everything it declares is re-exported below.
+pub mod launch_template_security_groups;
+pub use launch_template_security_groups::*;
+
 /// The PRIMARY network interface a LAUNCH creates for the instance it stores, in the subnet
 /// the launch places it in — one method on the state, in a module of its own, beside the
 /// root volume the same launch creates.

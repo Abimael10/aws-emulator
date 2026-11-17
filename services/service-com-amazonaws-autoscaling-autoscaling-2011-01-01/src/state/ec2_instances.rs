@@ -804,21 +804,18 @@ fn launch_parameters(
             .and_then(|entry| entry.instance_type.clone())
             .or_else(|| data.as_ref().and_then(|data| data.instance_type.clone())),
         key_name: data.as_ref().and_then(|data| data.key_name.clone()),
+        // The security groups the version declares, wherever it declares them: a version that
+        // names its network interfaces names its groups on the primary one of them — "if you
+        // specify a network interface, you must specify any security groups as part of the
+        // network interface instead of using this parameter"
+        // (`RequestLaunchTemplateData$SecurityGroupIds`) — and one that names no interface
+        // names them on its own two members. Read through the ONE reading of that member pair
+        // Amazon EC2 has ([`ec2::launch_template_security_groups`]), so the groups an instance
+        // of a group comes up in are the groups a launch naming the same version comes up in,
+        // instead of the VPC's default group a launch that named none would get.
         security_groups: data
             .as_ref()
-            .map(|data| {
-                data.security_group_ids
-                    .iter()
-                    .flatten()
-                    .map(|group_id| (Some(group_id.clone()), None))
-                    .chain(
-                        data.security_groups
-                            .iter()
-                            .flatten()
-                            .map(|group_name| (None, Some(group_name.clone()))),
-                    )
-                    .collect()
-            })
+            .map(ec2::launch_template_security_groups)
             .unwrap_or_default(),
         user_data: data.as_ref().and_then(|data| data.user_data.clone()),
         ebs_optimized: data
