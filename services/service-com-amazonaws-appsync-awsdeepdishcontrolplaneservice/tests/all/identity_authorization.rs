@@ -578,6 +578,16 @@ pub fn default_deny_message(principal: &str, operation: &str, resource: &str) ->
     )
 }
 
+/// The refusal IAM words for a request an explicit `Deny` in an identity-based document
+/// covers — the sibling of [`default_deny_message`], so both sentences this gate can answer
+/// with are spelled in one place.
+pub fn explicit_deny_message(principal: &str, operation: &str, resource: &str) -> String {
+    format!(
+        "User: {principal} is not authorized to perform: {ACTION_PREFIX}:{operation} on \
+         resource: {resource} with an explicit deny in an identity-based policy"
+    )
+}
+
 /// Assert `reply` is the modelled refusal of `request` for `principal`.
 fn assert_refused(case: &str, principal: &Principal, request: &Gated, reply: &Reply) {
     assert_eq!(
