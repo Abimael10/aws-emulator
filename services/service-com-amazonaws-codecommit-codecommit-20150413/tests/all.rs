@@ -215,6 +215,8 @@ mod repository_lifecycle;
 mod repository_name_and_system_tag_message_text;
 #[path = "all/repository_rename.rs"]
 mod repository_rename;
+#[path = "all/repository_trigger_test_notifications.rs"]
+mod repository_trigger_test_notifications;
 #[path = "all/repository_triggers.rs"]
 mod repository_triggers;
 #[path = "all/required_member_refusal_text.rs"]

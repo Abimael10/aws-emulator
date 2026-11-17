@@ -165,70 +165,13 @@ impl<Eng> PutRepositoryTriggers<Eng> {
 
 /// The modelled error for a trigger configuration this repository cannot hold.
 ///
-/// [`crate::state::TriggerProblem`] names the member at fault; this is the one
-/// place this operation turns each into the error the model declares for that
-/// member, with the wording the problem itself carries.
+/// [`crate::state::TriggerProblem`] names the member at fault, and
+/// `crate::trigger_refusal!` is the ONE mapping from that to the error the model
+/// declares for it, with the wording the problem itself carries — shared with
+/// `TestRepositoryTriggers`, which takes the same list and models the same errors for
+/// it, so the two cannot classify or word one refusal differently.
 fn refusal(problem: crate::state::TriggerProblem) -> PutRepositoryTriggersError {
-    use crate::state::TriggerProblem;
-    let message = Some(problem.message());
-    match problem {
-        TriggerProblem::TooManyTriggers => {
-            PutRepositoryTriggersErrorModeled::MaximumRepositoryTriggersExceededException(
-                MaximumRepositoryTriggersExceededException { message },
-            )
-        }
-        TriggerProblem::NameMissing => {
-            PutRepositoryTriggersErrorModeled::RepositoryTriggerNameRequiredException(
-                RepositoryTriggerNameRequiredException { message },
-            )
-        }
-        TriggerProblem::NameInvalid | TriggerProblem::NameNotUnique => {
-            PutRepositoryTriggersErrorModeled::InvalidRepositoryTriggerNameException(
-                InvalidRepositoryTriggerNameException { message },
-            )
-        }
-        TriggerProblem::DestinationArnMissing => {
-            PutRepositoryTriggersErrorModeled::RepositoryTriggerDestinationArnRequiredException(
-                RepositoryTriggerDestinationArnRequiredException { message },
-            )
-        }
-        TriggerProblem::DestinationArnInvalid => {
-            PutRepositoryTriggersErrorModeled::InvalidRepositoryTriggerDestinationArnException(
-                InvalidRepositoryTriggerDestinationArnException { message },
-            )
-        }
-        TriggerProblem::DestinationRegion => {
-            PutRepositoryTriggersErrorModeled::InvalidRepositoryTriggerRegionException(
-                InvalidRepositoryTriggerRegionException { message },
-            )
-        }
-        TriggerProblem::EventsMissing => {
-            PutRepositoryTriggersErrorModeled::RepositoryTriggerEventsListRequiredException(
-                RepositoryTriggerEventsListRequiredException { message },
-            )
-        }
-        TriggerProblem::EventsInvalid | TriggerProblem::EventsAllCombined => {
-            PutRepositoryTriggersErrorModeled::InvalidRepositoryTriggerEventsException(
-                InvalidRepositoryTriggerEventsException { message },
-            )
-        }
-        TriggerProblem::TooManyBranches => {
-            PutRepositoryTriggersErrorModeled::MaximumBranchesExceededException(
-                MaximumBranchesExceededException { message },
-            )
-        }
-        TriggerProblem::BranchNameInvalid => {
-            PutRepositoryTriggersErrorModeled::InvalidRepositoryTriggerBranchNameException(
-                InvalidRepositoryTriggerBranchNameException { message },
-            )
-        }
-        TriggerProblem::CustomDataInvalid => {
-            PutRepositoryTriggersErrorModeled::InvalidRepositoryTriggerCustomDataException(
-                InvalidRepositoryTriggerCustomDataException { message },
-            )
-        }
-    }
-    .into()
+    crate::trigger_refusal!(PutRepositoryTriggersErrorModeled, problem).into()
 }
 
 impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_runtime::Operation

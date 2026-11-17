@@ -35,6 +35,12 @@ service-common = { path = "../common" }
 # (`src/state/pull_request_events.rs`). Only the generated client is needed — the
 # emulator supplies the transport.
 aws-sdk-eventbridge = { version = "1", default-features = false }
+# The AWS SDK for Lambda, driven over the same in-process callback: a repository
+# trigger whose destination is a function is tested by INVOKING it with the record as
+# its payload (`src/state/trigger_notifications.rs`). A trigger whose destination is a
+# topic is published to through `service_common::sns_client`, the one construction of
+# that client this workspace holds.
+aws-sdk-lambda = { version = "1", default-features = false }
 smithy-macros = { workspace = true }
 aws-smithy-schema = { workspace = true }
 aws-smithy-schema-server = { workspace = true }
@@ -87,6 +93,15 @@ tokio = { workspace = true, features = ["io-util", "net", "sync", "time"] }
 # path — `src/` reaches EventBridge through the SDK client above.
 service-com-amazonaws-eventbridge-awsevents = { workspace = true }
 service-com-amazonaws-sqs-amazonsqs = { workspace = true }
+# Mounted BESIDE this one for the trigger suites: Amazon SNS and Lambda are the two
+# destinations a repository trigger names, so a test that a trigger really reaches its
+# destination reads the record off a queue subscribed to the topic, and invokes a
+# function this emulator holds.
+service-com-amazonaws-sns-amazonsimplenotificationservice = { workspace = true }
+service-com-amazonaws-lambda-awsgirapiservice = { workspace = true }
+# RFC 3986 percent-encoding for the `application/x-www-form-urlencoded` body the
+# trigger suite's Amazon SNS `awsQuery` calls travel in.
+percent-encoding = "2"
 
 [lints]
 workspace = true
