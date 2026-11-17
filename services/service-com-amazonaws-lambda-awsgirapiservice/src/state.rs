@@ -278,6 +278,13 @@ pub use event_source_authorization::unreadable_event_source;
 pub mod event_source_resource_policy;
 pub use event_source_resource_policy::SourcePolicies;
 
+/// WHEN a record a poller read was WRITTEN — the instant the age of a batch is measured from,
+/// which a source that publishes its records' creation stamps rounded down to the second does
+/// not report — lives in [`event_source_arrival`], beside the reading above that it is the
+/// counterpart of.
+pub mod event_source_arrival;
+pub use event_source_arrival::SourceArrivals;
+
 /// Whether a function's execution role may do what attaching it to a VPC takes lives in
 /// [`vpc_attachment_authorization`], beside the reading above, and is re-exported for the
 /// same reason: a handler names it as `crate::state::…`.

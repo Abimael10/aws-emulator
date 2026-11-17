@@ -405,6 +405,14 @@ pub struct StoredRecord {
     /// When the change was published, floored to a whole second by
     /// [`floor_to_second`] — the granularity the member it feeds is reported at.
     pub approximate_creation_date_time: SystemTime,
+    /// The instant of the WRITE itself, at the resolution the clock gave it.
+    ///
+    /// The member above is an APPROXIMATION of this instant, "rounded down to the
+    /// closest second", so it names a moment up to a second BEFORE the write: a span
+    /// measured from it — the age of a record — is that much too long, which is what
+    /// this field is for. It is never reported: what a consumer reads is the member,
+    /// at the resolution the model documents.
+    pub written_at: SystemTime,
     pub keys: AttributeMap,
     pub new_image: Option<AttributeMap>,
     pub old_image: Option<AttributeMap>,
@@ -642,6 +650,37 @@ impl ComAmazonawsDynamodbstreamsDynamodbstreams20120810State {
     #[must_use]
     pub fn stream(&self, stream_arn: &str) -> Option<&StoredStream> {
         self.streams.get(stream_arn)
+    }
+
+    /// WHEN the write that produced the record `sequence_number` names in the stream
+    /// `stream_arn` was made, at the resolution the clock gave it — `None` for a stream
+    /// this service does not hold and for a record it no longer retains.
+    ///
+    /// What a consumer READS for that record is
+    /// `StreamRecord.ApproximateCreationDateTime`, "rounded down to the closest second",
+    /// which names a moment up to a second before the write. A span measured from that
+    /// member is that much too long, so anything in this emulator that meters how long a
+    /// record has been in the shard asks here instead
+    /// ([`StoredRecord::written_at`]).
+    ///
+    /// A shard's retained records are in APPEND order, which is ascending sequence number
+    /// ([`compare_sequence_numbers`]), so the record is found by halving each shard's run
+    /// rather than by walking it: this is read once per batch a consumer meters.
+    #[must_use]
+    pub fn record_written_at(
+        &self,
+        stream_arn: &str,
+        sequence_number: &str,
+    ) -> Option<SystemTime> {
+        for shard in &self.streams.get(stream_arn)?.shards {
+            let found = shard.records.binary_search_by(|record| {
+                compare_sequence_numbers(&record.sequence_number, sequence_number)
+            });
+            if let Ok(at) = found {
+                return shard.records.get(at).map(|record| record.written_at);
+            }
+        }
+        None
     }
 
     /// How many iterators are LIVE — the figure [`MAX_LIVE_ITERATORS`] caps.
@@ -905,6 +944,7 @@ impl ComAmazonawsDynamodbstreamsDynamodbstreams20120810State {
             // down to the closest second" ([`floor_to_second`]), and the stamp is the
             // instant of the WRITE rather than of a later read.
             approximate_creation_date_time: floor_to_second(at),
+            written_at: at,
             keys: event.keys.clone(),
             new_image,
             old_image,

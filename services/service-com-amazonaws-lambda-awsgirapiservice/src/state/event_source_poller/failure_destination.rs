@@ -603,11 +603,14 @@ mod tests {
         }
     }
 
-    /// One record of a batch, by the sequence number the shard names it by.
+    /// One record of a batch, by the sequence number the shard names it by. What the record is
+    /// REPORTED with is the stamp its source published, which is what this module writes; the
+    /// write instant it is also stamped with decides its age and nothing here.
     fn record(sequence_number: &str, arrived_at: Option<SystemTime>) -> ShardRecord {
         ShardRecord {
             sequence_number: sequence_number.to_string(),
             arrived_at: arrived_at.map(::aws_smithy_types::DateTime::from),
+            written_at: arrived_at.map(::aws_smithy_types::DateTime::from),
             envelope: json!({ "eventID": sequence_number }),
         }
     }

@@ -14,14 +14,15 @@
 //!   `StreamDescription$Shards`), paged by `ExclusiveStartShardId` until the description
 //!   reports no `LastEvaluatedShardId` — unlike a Kinesis data stream, which lists its
 //!   shards through a call of their own.
-//! * A POSITION STATED AS AN INSTANT IS READ AT THE SECOND IT FALLS IN. This source stamps
+//! * A POSITION STATED AS AN INSTANT IS READ AT THE SECOND IT FALLS IN. This source reports
 //!   a record's creation instant in whole Unix seconds
 //!   (`StreamRecord$ApproximateCreationDateTime`), so a position stated any finer is
 //!   floored to that second rather than placing the reader past every record stamped inside
-//!   it (see [`shard_iterator`]). The same stamp is the only arrival instant this source
-//!   reports, so the `IteratorAge` the poller meters for a batch of these records is that
-//!   second's worth coarse — up to one second older than the record really is — rather than
-//!   accurate to the millisecond.
+//!   it (see [`shard_iterator`]). That stamp is an APPROXIMATION of the write — "rounded
+//!   down to the closest second" — so the instant the age of one of these records is
+//!   measured from is the write itself, which the service that holds the record keeps beside
+//!   the stamp ([`super::super::event_source_arrival`]) and
+//!   [`super::stamped_with_the_write`] puts on every record a pass read.
 //! * A RECORD IS HANDED OVER AS A STREAM RECORD. The envelope carries the change itself —
 //!   which mutation it was and the item's keys and the images the stream's view type
 //!   captures — rather than an opaque payload, and is rendered by the one reading of a
@@ -159,6 +160,11 @@ pub(super) async fn read_batch(
         batch.push(ShardRecord {
             sequence_number,
             arrived_at: body.and_then(|body| body.approximate_creation_date_time),
+            // The stamp this source publishes is the write "rounded down to the closest
+            // second", so it stands in for the write only until the instant the owning service
+            // kept for the record replaces it ([`super::stamped_with_the_write`]) — which
+            // leaves it as the measure for a record that service no longer retains.
+            written_at: body.and_then(|body| body.approximate_creation_date_time),
             envelope: ::service_common::dynamodb_stream_event::record_envelope(
                 record,
                 &run.stream_arn,

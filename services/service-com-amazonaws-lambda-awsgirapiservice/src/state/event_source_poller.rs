@@ -31,7 +31,9 @@
 //!   the batch was read off the shard, is published as this function's
 //!   `IteratorAge` ([`crate::state::metrics`]) — so a batch that sat in the
 //!   shard while the mapping was paused meters that whole wait, and a batch read as its
-//!   records arrive meters almost nothing.
+//!   records arrive meters almost nothing. The age is measured from the WRITE of that record
+//!   ([`stamped_with_the_write`]), never from a stamp a source publishes rounded down to a
+//!   coarser resolution than the write, which would meter longer than the record ever waited.
 //! * THE CRITERIA DECIDE WHICH RECORDS ARE HANDED OVER. `FilterCriteria` is "an object that
 //!   defines the filter criteria that determine whether Lambda should process an event", so
 //!   of the records a pass read off a shard exactly those at least one of the mapping's
@@ -315,14 +317,15 @@ pub fn drive_mapping<Eng: Send + Sync + 'static>(
         }
     }
     let callback = ctx.callback().clone();
-    // The CloudWatch store this mapping's work is published to, resolved once per poller
-    // because the handle does not change.
-    let metrics = FunctionMetrics::new(super::metrics::cloudwatch_state(&**engine));
-    // The stores the decision about each pass's reads is made from, resolved once per poller
-    // because the handles do not change.
-    let policies = PolicyStores {
-        iam: super::event_source_authorization::iam_state(&**engine),
-        sources: super::event_source_resource_policy::SourcePolicies::of(&**engine),
+    // The stores this poller reads and publishes through, resolved once because none of the
+    // handles changes while it runs ([`PollerStores`]).
+    let stores = PollerStores {
+        metrics: FunctionMetrics::new(super::metrics::cloudwatch_state(&**engine)),
+        policies: PolicyStores {
+            iam: super::event_source_authorization::iam_state(&**engine),
+            sources: super::event_source_resource_policy::SourcePolicies::of(&**engine),
+        },
+        arrivals: super::event_source_arrival::SourceArrivals::of(&**engine),
     };
     let claim = PollerClaim {
         state: ::engine::ServiceState::clone(&state),
@@ -330,8 +333,22 @@ pub fn drive_mapping<Eng: Send + Sync + 'static>(
         held: true,
     };
     runtime.spawn(async move {
-        poll_mapping(&callback, claim, metrics, policies).await;
+        poll_mapping(&callback, claim, stores).await;
     });
+}
+
+/// The engine-resolved stores ONE poller holds for as long as it runs: where the work it does
+/// is published, what each pass's reads are decided against, and where the instant a record was
+/// written is read from.
+///
+/// Resolved once per poller, because none of the handles changes while it runs.
+struct PollerStores {
+    /// The CloudWatch store this mapping's work is published to.
+    metrics: FunctionMetrics,
+    /// The stores each pass's reads are decided against.
+    policies: PolicyStores,
+    /// The store the instant a record was WRITTEN is read from.
+    arrivals: super::event_source_arrival::SourceArrivals,
 }
 
 /// The stores the decision about a pass's reads is made from: the IAM store the invoked
@@ -392,9 +409,19 @@ struct ShardRecord {
     /// "the sequence number of the data record in the shard": how a report of this source
     /// names one record, and what the mapping's cursor reads on from.
     sequence_number: String,
-    /// When the source stamped the record, which is what the age of a batch is measured
-    /// from; `None` for a record the source reports no instant for.
+    /// The stamp the SOURCE published for the record, which is what a report OF the record
+    /// carries ([`failure_destination`]) — the member that source's own data plane answers,
+    /// at the resolution it answers it at; `None` for a record it reports no instant for.
     arrived_at: Option<::aws_smithy_types::DateTime>,
+    /// When the record was WRITTEN to the shard — the one instant its age is measured from,
+    /// for the age a pass meters and for the age the mapping discards a record past
+    /// ([`stamped_with_the_write`], [`record_age::age_of`]).
+    ///
+    /// The stamp above is an APPROXIMATION of this instant for a source that publishes it
+    /// rounded down to a coarser resolution than the write, so the two are the same instant
+    /// for one source and apart by less than that resolution for the other. `None` for a
+    /// record no instant could be read for.
+    written_at: Option<::aws_smithy_types::DateTime>,
     /// The envelope the function is handed for this record.
     envelope: Value,
 }
@@ -527,8 +554,7 @@ pub(crate) struct Answered {
 async fn poll_mapping(
     callback: &smithy_server_runtime::EmbeddedEmulator,
     mut claim: PollerClaim,
-    metrics: FunctionMetrics,
-    policies: PolicyStores,
+    stores: PollerStores,
 ) {
     let uuid = claim.uuid.clone();
     // A handle of its own, so the store can be locked while the claim is borrowed.
@@ -565,7 +591,9 @@ async fn poll_mapping(
                 // cursor moves — and the mapping resumes where it left off once the grant is
                 // back (see [`super::event_source_authorization`], including the cases that
                 // show nothing about a role and withhold nothing).
-                if let Some(detail) = withheld_shard_read(&policies, &run, SystemTime::now()) {
+                if let Some(detail) =
+                    withheld_shard_read(&stores.policies, &run, SystemTime::now())
+                {
                     failures = failures.saturating_add(1);
                     if failures == 1 || failures.is_multiple_of(FAILURE_LOG_INTERVAL) {
                         ::tracing::warn!(
@@ -580,16 +608,7 @@ async fn poll_mapping(
                     ::tokio::time::sleep(retry_backoff(failures)).await;
                     continue;
                 }
-                match move_batches(
-                    callback,
-                    &mut work,
-                    &state,
-                    &metrics,
-                    &policies,
-                    &uuid,
-                    &run,
-                )
-                .await
+                match move_batches(callback, &mut work, &state, &stores, &uuid, &run).await
                 {
                     Outcome::Delivered => failures = 0,
                     Outcome::Idle => {
@@ -935,8 +954,7 @@ async fn move_batches(
     callback: &smithy_server_runtime::EmbeddedEmulator,
     work: &mut PollerWork,
     state: &::engine::ServiceState<ComAmazonawsLambdaAwsgirapiserviceState>,
-    metrics: &FunctionMetrics,
-    policies: &PolicyStores,
+    stores: &PollerStores,
     uuid: &str,
     run: &ShardSourcedMapping,
 ) -> Outcome {
@@ -972,7 +990,16 @@ async fn move_batches(
             .get(shard)
             .cloned()
             .unwrap_or_else(|| run.initial_cursor.clone());
-        let read = match read_window(callback, &mut work.clients, run, shard, &cursor).await {
+        let read = match read_window(
+            callback,
+            &mut work.clients,
+            &stores.arrivals,
+            run,
+            shard,
+            &cursor,
+        )
+        .await
+        {
             // "If the shard has been closed, the shard iterator can't return more data":
             // such a shard has no position left to read from.
             Ok(None) => continue,
@@ -993,7 +1020,7 @@ async fn move_batches(
         // at the instant it started: a grant taken away while this pass was reading means
         // nothing is handed over, nothing is metered and the shard's position does not move,
         // so the records stay for the pass that follows the grant coming back.
-        if let Some(detail) = withheld_shard_read(policies, run, SystemTime::now()) {
+        if let Some(detail) = withheld_shard_read(&stores.policies, run, SystemTime::now()) {
             failure = Some(detail);
             continue;
         }
@@ -1007,12 +1034,13 @@ async fn move_batches(
         // with: what the attempts spent on that batch, and a split of it, are keyed by.
         let position: &str = sequence_numbers.first().map_or("", String::as_str);
         // One age per BATCH read, because the age is a property of that read: a pass that
-        // took several batches off one shard meters each of them.
+        // took several batches off one shard meters each of them, from the instant its newest
+        // record was WRITTEN ([`stamped_with_the_write`]).
         for batch in &read {
             if let Some(last) = batch.last() {
-                metrics.publish_iterator_age(
+                stores.metrics.publish_iterator_age(
                     &run.function_name,
-                    iterator_age_millis(last.arrived_at.as_ref(), SystemTime::now()),
+                    iterator_age_millis(last.written_at.as_ref(), SystemTime::now()),
                 );
             }
         }
@@ -1219,7 +1247,7 @@ async fn move_batches(
             failure_destination::discard_batch(
                 callback,
                 &mut work.clients,
-                policies,
+                &stores.policies,
                 &failure_destination::FailedBatch {
                     run,
                     shard,
@@ -1264,6 +1292,7 @@ fn batch_records(run: &ShardSourcedMapping) -> usize {
 async fn read_window(
     callback: &smithy_server_runtime::EmbeddedEmulator,
     clients: &mut Clients,
+    arrivals: &super::event_source_arrival::SourceArrivals,
     run: &ShardSourcedMapping,
     shard: &str,
     cursor: &ShardCursor,
@@ -1272,7 +1301,7 @@ async fn read_window(
     let mut held = 0usize;
     let mut at = cursor.clone();
     for _ in 0..run.in_flight_batches.max(ONE_BATCH_PER_SHARD) {
-        let Some(batch) = read_batch(callback, clients, run, shard, &at).await? else {
+        let Some(batch) = read_batch(callback, clients, arrivals, run, shard, &at).await? else {
             // "If the shard has been closed, the shard iterator can't return more data":
             // such a shard has no position left to read from.
             return Ok((!read.is_empty()).then_some(read));
@@ -1614,22 +1643,72 @@ pub(super) struct StreamShards {
 
 
 /// The records one batch holds: what `shard` has at `cursor`, up to the mapping's batch
-/// size, each already rendered as the envelope its own source hands a record over as.
+/// size, each already rendered as the envelope its own source hands a record over as and
+/// stamped with the instant it was WRITTEN ([`stamped_with_the_write`]).
 ///
 /// `None` for a shard that has no position left to read from.
 async fn read_batch(
     callback: &smithy_server_runtime::EmbeddedEmulator,
     clients: &mut Clients,
+    arrivals: &super::event_source_arrival::SourceArrivals,
     run: &ShardSourcedMapping,
     shard: &str,
     cursor: &ShardCursor,
 ) -> Result<Option<Vec<ShardRecord>>, String> {
-    match run.source {
+    let read = match run.source {
         ShardSource::Kinesis => {
-            kinesis_stream::read_batch(callback, clients, run, shard, cursor).await
+            kinesis_stream::read_batch(callback, clients, run, shard, cursor).await?
         }
         ShardSource::DynamoDbStream => {
-            dynamodb_stream::read_batch(callback, clients, run, shard, cursor).await
+            dynamodb_stream::read_batch(callback, clients, run, shard, cursor).await?
+        }
+    };
+    Ok(read.map(|batch| stamped_with_the_write(arrivals, run, batch)))
+}
+
+/// `batch` with every record carrying the instant it was WRITTEN to the shard, which is the
+/// one instant a record's age is measured from ([`record_age::age_of`]) — both the
+/// `IteratorAge` a pass meters and the age `MaximumRecordAgeInSeconds` discards a record for.
+///
+/// Which instant that is belongs to the SOURCE, and the stamp the read carried is it for one
+/// of the two:
+///
+/// * an Amazon Kinesis record's `ApproximateArrivalTimestamp` is "the approximate time that
+///   the record was inserted into the stream" at the resolution that service stamped it, so
+///   the batch is taken as read;
+/// * a DynamoDB stream record's `ApproximateCreationDateTime` is "rounded down to the closest
+///   second", so it names a moment up to a second BEFORE the write and an age measured from it
+///   is that much too long. The instant of the write is read out of the store of the service
+///   that holds the record ([`super::event_source_arrival`]), in one lock for the batch, and
+///   the stamp the read carried stands for a record that service no longer retains.
+///
+/// Only what the age is measured FROM moves: the stamp each record was read with is left as
+/// the source published it, so what a report of the record carries — its envelope, and the
+/// arrival members of the record written to the mapping's failure destination — is the member
+/// that source answers, at the resolution it answers it at.
+fn stamped_with_the_write(
+    arrivals: &super::event_source_arrival::SourceArrivals,
+    run: &ShardSourcedMapping,
+    batch: Vec<ShardRecord>,
+) -> Vec<ShardRecord> {
+    match run.source {
+        ShardSource::Kinesis => batch,
+        ShardSource::DynamoDbStream => {
+            let sequence_numbers: Vec<String> = batch
+                .iter()
+                .map(|record| record.sequence_number.clone())
+                .collect();
+            let written = arrivals.table_stream_writes(&run.stream_arn, &sequence_numbers);
+            batch
+                .into_iter()
+                .zip(written)
+                .map(|(mut record, written)| {
+                    if let Some(written) = written {
+                        record.written_at = Some(::aws_smithy_types::DateTime::from(written));
+                    }
+                    record
+                })
+                .collect()
         }
     }
 }
@@ -1666,16 +1745,16 @@ fn checkpoint(
 }
 
 /// How long the newest record of a batch had been in the shard when the batch was read,
-/// in milliseconds: never negative, and 0 for a record this emulator holds no arrival
+/// in milliseconds: never negative, and 0 for a record this emulator holds no write
 /// instant for.
 fn iterator_age_millis(
-    arrived_at: Option<&::aws_smithy_types::DateTime>,
+    written_at: Option<&::aws_smithy_types::DateTime>,
     read_at: SystemTime,
 ) -> f64 {
     // The age itself is the ONE reading of how old a record is ([`record_age::age_of`]) —
     // the same one the mapping's own record age is decided by — so the figure a client
     // reads and the decision the poller takes cannot drift apart.
-    record_age::age_of(arrived_at, read_at).map_or(0.0, |age| age.as_secs_f64() * 1_000.0)
+    record_age::age_of(written_at, read_at).map_or(0.0, |age| age.as_secs_f64() * 1_000.0)
 }
 
 /// Hand one batch to the function and read what became of the records it held: the ones the
@@ -1871,14 +1950,43 @@ impl Clients {
 mod tests {
     use std::time::{Duration, SystemTime};
 
-    use super::{batch_event, checkpointed_through, iterator_age_millis, ShardRecord};
+    use super::{
+        batch_event, checkpointed_through, iterator_age_millis, stamped_with_the_write,
+        ShardCursor, ShardRecord, ShardSource, ShardSourcedMapping,
+    };
 
     /// A record carrying `sequence_number`, as the poller routes one.
     fn record(sequence_number: &str) -> ShardRecord {
         ShardRecord {
             sequence_number: sequence_number.to_string(),
             arrived_at: None,
+            written_at: None,
             envelope: ::serde_json::json!({ "eventID": sequence_number }),
+        }
+    }
+
+    /// A pass over `stream_arn` of `source`, with everything a pass carries beside those two
+    /// left at what a mapping configuring nothing has: the one thing the stamping reads off a
+    /// pass is WHICH source it is over.
+    fn run_over(source: ShardSource, stream_arn: &str) -> ShardSourcedMapping {
+        ShardSourcedMapping {
+            source,
+            stream_arn: stream_arn.to_string(),
+            region: "us-east-1".to_string(),
+            function_arn: "arn:aws:lambda:us-east-1:000000000000:function:metered".to_string(),
+            function_name: "metered".to_string(),
+            invoke_identity_arn: None,
+            batch_size: 1,
+            in_flight_batches: 1,
+            filters: Vec::new(),
+            reports_batch_item_failures: false,
+            attempts_allowed: None,
+            bisects_on_function_error: false,
+            on_failure_destination: None,
+            maximum_record_age: None,
+            tumbling_window: None,
+            cursors: ::std::collections::BTreeMap::new(),
+            initial_cursor: ShardCursor::TrimHorizon,
         }
     }
 
@@ -2087,18 +2195,139 @@ mod tests {
         }
     }
 
+    /// RULE: a record a pass read carries the instant it was WRITTEN to the shard, which is
+    /// the one instant its age is measured from — read out of the store of the service that
+    /// holds the record where the stamp that service PUBLISHES for it is rounded down to a
+    /// coarser resolution than the write, and taken as read where that stamp is the write
+    /// instant itself.
+    ///
+    /// The rows differ along what the rule generalises over: the sub-second phase the write
+    /// fell on (the second's boundary, a millisecond in, the middle, a recorded phase, and
+    /// the last nanosecond before the next second), which is exactly what rounding a stamp
+    /// down to the second discards. Each row asserts BOTH sources, so the choice is the
+    /// source's own rather than one arm's.
+    #[test]
+    fn a_record_a_pass_read_carries_the_instant_it_was_written() {
+        use ::service_com_amazonaws_dynamodbstreams_dynamodbstreams_20120810::ops::types::{
+            AttributeValue, KeySchemaElement,
+        };
+        use ::service_com_amazonaws_dynamodbstreams_dynamodbstreams_20120810::state as streams;
+
+        let base = SystemTime::UNIX_EPOCH + Duration::from_secs(1_800_000_000);
+        // (case, the sub-second phase the write fell on)
+        let rows: Vec<(&str, Duration)> = vec![
+            ("on-the-second", Duration::ZERO),
+            ("one-millisecond-in", Duration::from_millis(1)),
+            ("mid-second", Duration::from_millis(500)),
+            ("403-milliseconds-in", Duration::from_millis(403)),
+            ("the-last-nanosecond", Duration::new(0, 999_999_999)),
+        ];
+        for (case, phase) in rows {
+            let engine = ::engine::InMemoryEngine::new();
+            let store = engine
+                .state::<streams::ComAmazonawsDynamodbstreamsDynamodbstreams20120810State>();
+            let stream_arn = store
+                .lock()
+                .register_stream(
+                    &streams::StreamRegistration {
+                        table_name: "metered".to_string(),
+                        stream_view_type: streams::StreamViewType::NewImage,
+                        key_schema: vec![KeySchemaElement {
+                            attribute_name: "Id".to_string(),
+                            key_type: "HASH".to_string(),
+                        }],
+                        region: "us-east-1".to_string(),
+                    },
+                    base,
+                )
+                .expect("the registry takes the registration");
+            let keys: streams::AttributeMap = [(
+                "Id".to_string(),
+                AttributeValue::S("metered".to_string()),
+            )]
+            .into_iter()
+            .collect();
+            let written = base + Duration::from_secs(10) + phase;
+            let sequence_number = store
+                .lock()
+                .append_record(
+                    &stream_arn,
+                    &streams::RecordAppend {
+                        event_name: streams::OperationType::Insert,
+                        keys: keys.clone(),
+                        new_image: Some(keys),
+                        old_image: None,
+                    },
+                    written,
+                )
+                .expect("the registry takes the record");
+            // The stamp a READ of this source carries: the write instant "rounded down to
+            // the closest second", which is the member `GetRecords` reports.
+            let stamp = ::aws_smithy_types::DateTime::from(streams::floor_to_second(written));
+            let read = vec![ShardRecord {
+                sequence_number,
+                arrived_at: Some(stamp),
+                written_at: Some(stamp),
+                envelope: ::serde_json::json!({ "eventID": "metered" }),
+            }];
+            let arrivals = super::super::event_source_arrival::SourceArrivals::of(&engine);
+
+            let stamped = stamped_with_the_write(
+                &arrivals,
+                &run_over(ShardSource::DynamoDbStream, &stream_arn),
+                read.clone(),
+            );
+            let measured = stamped.first().and_then(|record| record.written_at);
+            assert_eq!(
+                measured,
+                Some(::aws_smithy_types::DateTime::from(written)),
+                "case {case:?}: expected a table-stream record to carry the write {written:?}, \
+                 got {measured:?}"
+            );
+            // What the record REPORTS is left as its source published it, so nothing a client
+            // reads about the record moves with the instant its age is measured from.
+            let reported = stamped.first().and_then(|record| record.arrived_at);
+            assert_eq!(
+                reported,
+                Some(stamp),
+                "case {case:?}: expected the published stamp {stamp:?} to be left as read, got \
+                 {reported:?}"
+            );
+            // Measured from the write, a batch read two seconds later waited exactly those two
+            // seconds — whatever phase the write fell on.
+            let aged = iterator_age_millis(measured.as_ref(), written + Duration::from_secs(2));
+            assert!(
+                (aged - 2_000.0).abs() < 1.0,
+                "case {case:?}: expected an age of 2000 ms, got {aged:?} ms"
+            );
+
+            let stamped = stamped_with_the_write(
+                &arrivals,
+                &run_over(ShardSource::Kinesis, &stream_arn),
+                read,
+            );
+            let measured = stamped.first().and_then(|record| record.written_at);
+            assert_eq!(
+                measured,
+                Some(stamp),
+                "case {case:?}: expected a data-stream record to keep the stamp the read \
+                 carried {stamp:?}, got {measured:?}"
+            );
+        }
+    }
+
     /// RULE: the age one batch meters is how long the NEWEST record of that batch had been
     /// in the shard when the batch was read — never negative, and 0 for a record with no
-    /// arrival instant to measure from.
+    /// write instant to measure from.
     ///
-    /// The rows differ along what the rule generalises over: how long ago the record
-    /// arrived (now, a second ago, a minute and a half ago — above one CloudWatch period),
-    /// a record whose arrival is ahead of the read, and one carrying no arrival instant at
+    /// The rows differ along what the rule generalises over: how long ago the record was
+    /// written (now, a second ago, a minute and a half ago — above one CloudWatch period),
+    /// a record whose write is ahead of the read, and one carrying no write instant at
     /// all.
     #[test]
     fn the_age_a_batch_meters_is_the_wait_of_its_newest_record() {
         let read_at = SystemTime::UNIX_EPOCH + Duration::from_secs(1_800_000_000);
-        // (case, when the newest record arrived, the age in milliseconds)
+        // (case, when the newest record was written, the age in milliseconds)
         let rows: Vec<(&str, Option<SystemTime>, f64)> = vec![
             ("read-as-it-arrives", Some(read_at), 0.0),
             (
@@ -2112,15 +2341,15 @@ mod tests {
                 90_000.0,
             ),
             (
-                "arrived-after-the-read",
+                "written-after-the-read",
                 Some(read_at + Duration::from_secs(5)),
                 0.0,
             ),
-            ("no-arrival-instant", None, 0.0),
+            ("no-write-instant", None, 0.0),
         ];
-        for (case, arrived_at, expected) in rows {
-            let arrived_at = arrived_at.map(::aws_smithy_types::DateTime::from);
-            let actual = iterator_age_millis(arrived_at.as_ref(), read_at);
+        for (case, written_at, expected) in rows {
+            let written_at = written_at.map(::aws_smithy_types::DateTime::from);
+            let actual = iterator_age_millis(written_at.as_ref(), read_at);
             assert!(
                 (actual - expected).abs() < 1.0,
                 "case {case:?}: expected an age of {expected} ms, got {actual:?} ms"
@@ -2159,6 +2388,7 @@ mod tests {
                 .map(|(index, envelope)| ShardRecord {
                     sequence_number: format!("1000000000000000000{index}"),
                     arrived_at: None,
+                    written_at: None,
                     envelope: envelope.clone(),
                 })
                 .collect();

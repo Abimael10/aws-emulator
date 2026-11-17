@@ -106,6 +106,10 @@ pub(super) async fn read_batch(
             .map(|record| ShardRecord {
                 sequence_number: record.sequence_number().to_string(),
                 arrived_at: record.approximate_arrival_timestamp().copied(),
+                // "The approximate time that the record was inserted into the stream", at the
+                // resolution this service stamped it: for this source the stamp a read carries
+                // IS the write, so a record's age is measured from the same instant it reports.
+                written_at: record.approximate_arrival_timestamp().copied(),
                 envelope: record_envelope(record, shard, run),
             })
             .collect(),
