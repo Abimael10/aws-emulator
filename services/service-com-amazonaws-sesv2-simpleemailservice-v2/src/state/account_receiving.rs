@@ -69,7 +69,7 @@ pub fn received_by_the_account<Eng: ::std::marker::Send + ::std::marker::Sync + 
             accepted.accepted_at,
         )
     };
-    receiving::inbound_delivery::deliver_accepted(ctx, accepted.region, &received);
+    receiving::inbound_delivery::deliver_accepted(ctx, engine, accepted.region, &received);
 }
 
 /// The RFC 5322 document Amazon SES assembles for a message a send handed it as PARTS — "you

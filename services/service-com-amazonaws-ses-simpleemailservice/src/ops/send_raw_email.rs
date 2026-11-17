@@ -652,7 +652,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The receive path runs behind the acceptance, on a task of its own: a
         // message is RECEIVED after it has been accepted, so nothing a caller is
         // told depends on it and nothing it does reaches this service's store.
-        crate::state::inbound_delivery::deliver_accepted(ctx, &region, &accepted);
+        crate::state::inbound_delivery::deliver_accepted(ctx, &*self.engine, &region, &accepted);
 
         Ok(SendRawEmailOutput { message_id })
     }

@@ -85,8 +85,11 @@ impl Emulator {
     }
 
     /// Put `content` in transit under `message_id` in `region`'s message flow, as
-    /// WorkMail delivery does. The only producer of an in-transit message, and not
-    /// an operation this API models.
+    /// WorkMail delivery does. Not an operation this API models: the producer a client
+    /// reaches is mail Amazon SES received for a mailbox of a WorkMail organization,
+    /// which this suite does not stand up (see
+    /// `workmail_email_flow_receives_mail.rs`) because what it is about is the object
+    /// an update resolves.
     fn seed_message(&self, region: &str, message_id: &str, content: &[u8]) {
         let state = service_com_amazonaws_workmailmessageflow_giraffemessageintransitservice::state::service_state(
             &*self.engine,

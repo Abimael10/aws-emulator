@@ -35,6 +35,14 @@
 //!   documented Amazon SES receipt event as its payload
 //!   ([`super::lambda_action_event`]), so a handler is handed the message's own `mail`
 //!   envelope, the `receipt` of it and the action that called it.
+//! * `WorkmailAction` "calls Amazon WorkMail and, optionally, publishes a notification to
+//!   Amazon Simple Notification Service (Amazon SNS)": the received message is handed to the
+//!   WorkMail organization the action's `OrganizationArn` names, so it enters that
+//!   organization's email flow and is in transit there — which is what makes it addressable
+//!   through WorkMail Message Flow's own two operations
+//!   ([`::service_com_amazonaws_workmailmessageflow_giraffemessageintransitservice::state::email_flow`]).
+//!   Whether that organization exists and holds a mailbox for the recipients is WorkMail's own
+//!   state, read there rather than decided here.
 //!
 //! And before the actions of a rule whose `ScanEnabled` is set — "if true, then messages that
 //! this receipt rule applies to are scanned for spam and viruses" — the results of the sender
@@ -42,8 +50,8 @@
 //! ([`super::received_scan`]), so the actions of that rule act on a message carrying them.
 //!
 //! Every other action addresses a resource this module does not act on (a bounce sent back to
-//! the sender, an Amazon SNS notification, a WorkMail organization, an Amazon Connect
-//! instance); nothing here reports one of them as carried out.
+//! the sender, an Amazon SNS notification, an Amazon Connect instance); nothing here reports
+//! one of them as carried out.
 //!
 //! Each call is made the way the framework documents a handler reaching another emulated
 //! service ([`smithy_server_runtime::OperationContext::callback`]): the AWS SDK driven over
@@ -53,9 +61,14 @@
 //! resolved by this same emulator's own services, and the only part of the client's
 //! addressing a request contributes is the signing Region, which is a Region LABEL by the time
 //! it reaches here ([`super::region_from_request`]) — so no text of a request can steer where
-//! a received message goes. A delivery that cannot be made leaves a line for an operator and
-//! nothing else: the message was already ACCEPTED, and Amazon SES does not un-accept a message
-//! because an action of a receipt rule failed.
+//! a received message goes. The one destination that is not an API call is the WorkMail
+//! organization an action hands the message to, which models no create at all: that delivery
+//! is a write into the message-flow store of this same emulator, over the one shared engine,
+//! through the seam that service states for it. A delivery that cannot be made leaves a line
+//! for an operator and nothing else: the message was already ACCEPTED, and Amazon SES does not
+//! un-accept a message because an action of a receipt rule failed.
+
+use ::service_com_amazonaws_workmailmessageflow_giraffemessageintransitservice::state::email_flow;
 
 /// How many STEPS of the active rule set ONE received message is carried out through — its
 /// actions, and the stamping of the authentication and scan results a rule asks for.
@@ -120,6 +133,15 @@ pub enum ReceiptStep {
         recipients: Vec<String>,
         /// The verdicts of the checks made on this message, which that receipt carries.
         verdicts: super::received_scan::Verdicts,
+    },
+    /// `WorkmailAction`: hand the received message to the WorkMail organization the action
+    /// names, whose email flow it then enters.
+    HandToWorkMail {
+        /// `WorkmailAction$OrganizationArn`.
+        organization_arn: String,
+        /// The recipients of this message the handing rule applied to: the organization takes
+        /// the message when it holds a mailbox for one of them.
+        recipients: Vec<String>,
     },
 }
 
@@ -256,13 +278,19 @@ pub fn accepted(
 ///
 /// Called once the accepting request has decided everything it answers with, which is after
 /// this service's store has been read: a message is RECEIVED behind its acceptance.
-pub fn deliver_accepted(
+///
+/// `engine` is the shared engine the accepting operation holds, which the ONE destination that
+/// is not an API call is reached through \u2014 the WorkMail organization an action hands the
+/// message to (see the module docs).
+pub fn deliver_accepted<Eng: ::std::marker::Send + ::std::marker::Sync + 'static>(
     ctx: &::smithy_server_runtime::OperationContext<'_>,
+    engine: &Eng,
     region: &str,
     accepted: &Accepted,
 ) {
     deliver(
         ctx,
+        engine,
         region,
         &AcceptedMessage {
             message_id: &accepted.message_id,
@@ -425,6 +453,12 @@ pub fn receipt_steps(
                     verdicts: carried,
                 });
             }
+            if let Some(workmail_action) = &action.workmail_action {
+                steps.push(ReceiptStep::HandToWorkMail {
+                    organization_arn: workmail_action.organization_arn.clone(),
+                    recipients: matched.clone(),
+                });
+            }
             // "This action terminates the evaluation of the receipt rule set": the actions
             // before it in this rule have been taken, and no later rule is evaluated.
             if action.stop_action.is_some() {
@@ -551,8 +585,13 @@ impl Drop for DeliveryPermit {
 /// `region` is the Region the accepting request was signed for, which is where this account's
 /// receipt rule set and the destinations its actions name live; no text of a request chooses
 /// the endpoint a write is made to.
-pub fn deliver(
+///
+/// `engine` is read ONCE here, for the owned message-flow handle a `WorkmailAction` step
+/// delivers through — the task outlives the request, so it carries the handle rather than a
+/// borrow of the engine.
+pub fn deliver<Eng: ::std::marker::Send + ::std::marker::Sync + 'static>(
     ctx: &::smithy_server_runtime::OperationContext<'_>,
+    engine: &Eng,
     region: &str,
     accepted: &AcceptedMessage<'_>,
     steps: &[ReceiptStep],
@@ -578,8 +617,15 @@ pub fn deliver(
         return;
     };
     // The callback is an owned handle into this same emulator, so the task that carries the
-    // actions out outlives the request that accepted the message.
+    // actions out outlives the request that accepted the message. The message flow a
+    // `WorkmailAction` delivers into is reached through an owned handle for the same reason,
+    // and only for a message some step really hands to an organization.
     let callback = ctx.callback().clone();
+    let email_flow = steps
+        .iter()
+        .any(|step| matches!(step, ReceiptStep::HandToWorkMail { .. }))
+        .then(|| email_flow::email_flow(engine))
+        .flatten();
     let region = region.to_string();
     let identifier = accepted.message_id.to_string();
     let delivered = DeliveredMessage {
@@ -596,7 +642,7 @@ pub fn deliver(
         let _permit = permit;
         if ::tokio::time::timeout(
             DELIVERY_DEADLINE,
-            carry_out(&callback, &region, &delivered, &steps),
+            carry_out(&callback, email_flow.as_ref(), &region, &delivered, &steps),
         )
         .await
         .is_err()
@@ -639,8 +685,14 @@ struct DeliveredMessage {
 
 /// Carry out `steps` for one received message, in order, against the services their actions
 /// address.
+///
+/// `email_flow` is the message flow a `WorkmailAction` step delivers into, and `None` when no
+/// step of this message has one — or when this emulator holds no message-flow store at all, in
+/// which case such a step leaves a line for an operator like any other delivery that could not
+/// be made.
 async fn carry_out(
     callback: &::smithy_server_runtime::EmbeddedEmulator,
+    email_flow: Option<&email_flow::EmailFlow>,
     region: &str,
     delivered: &DeliveredMessage,
     steps: &[ReceiptStep],
@@ -765,6 +817,46 @@ async fn carry_out(
                         error = %::aws_smithy_types::error::display::DisplayErrorContext(&failure),
                         "a received message could not be handed to the receipt rule's function"
                     );
+                }
+            }
+            ReceiptStep::HandToWorkMail {
+                organization_arn,
+                recipients,
+            } => {
+                // "This action calls Amazon WorkMail": the message as the steps so far leave
+                // it is handed to the organization the action names, which puts it in transit
+                // in that Region's message flow. Whether the organization exists and holds a
+                // mailbox for one of the matched recipients is WorkMail's own state, so the
+                // answer comes back from there rather than being decided here.
+                let entered = email_flow.map(|flow| {
+                    flow.receive(&email_flow::Delivery {
+                        region,
+                        organization_arn,
+                        recipients,
+                        message_id,
+                        content: &message,
+                    })
+                });
+                match entered {
+                    Some(email_flow::Entered::InTransit { organization_id }) => {
+                        ::tracing::info!(
+                            organization_id = ?organization_id,
+                            message_id,
+                            content_octets = message.len(),
+                            "a received message entered a WorkMail organization's email flow"
+                        );
+                    }
+                    // Every other outcome is a delivery that could not be made, which leaves a
+                    // line for an operator and nothing else. The outcome is recorded through
+                    // its `Debug`, like the ARN beside it, so no stored value can forge a
+                    // record.
+                    other => ::tracing::warn!(
+                        organization_arn = ?organization_arn,
+                        message_id,
+                        outcome = ?other,
+                        "a received message could not be handed to the receipt rule's WorkMail \
+                         organization"
+                    ),
                 }
             }
         }

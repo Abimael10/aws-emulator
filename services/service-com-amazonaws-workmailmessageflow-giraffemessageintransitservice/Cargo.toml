@@ -25,9 +25,16 @@ tracing = { workspace = true }
 # of the S3 object its `S3Reference` names, which S3 owns, so the reference is resolved
 # against S3's own state in the shared engine rather than against a copy kept here.
 service-com-amazonaws-s3-amazons3 = { workspace = true }
+# AMAZON WORKMAIL: an in-transit message is in the email flow of one WorkMail
+# organization, and that organization — with the mailboxes the arriving mail is for — is
+# WorkMail's resource, so the delivery that puts a message in transit (`state::email_flow`)
+# resolves it against WorkMail's own state in the shared engine rather than against a copy
+# kept here.
+service-com-amazonaws-workmail-workmailservice = { workspace = true }
 # The tree's one evaluation of IAM policy documents: whether the bucket holding the
 # referenced object grants WorkMail the read is a resource-policy decision, and two services
-# must not read one document differently.
+# must not read one document differently. Its `ses_identities` is also the one reading of a
+# mail address, which is how a delivery's recipient is matched to a mailbox.
 service-common = { path = "../common" }
 
 [build-dependencies]

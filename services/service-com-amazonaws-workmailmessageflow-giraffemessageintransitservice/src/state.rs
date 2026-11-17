@@ -6,13 +6,14 @@
 //! in-transit message exists because WorkMail delivery put it in transit, and the
 //! MIME content `PutRawMessageContent` installs comes out of an S3 object that S3
 //! holds. Both of those producers live outside this API, and they are owned in two
-//! different places: the in-transit messages are this module's store, with the seed
-//! helper that stands in for WorkMail delivery
-//! ([`ComAmazonawsWorkmailmessageflowGiraffemessageintransitserviceState::seed_in_transit_message`]),
-//! while an S3 object belongs to AMAZON S3 and is read out of S3's own store in the
-//! shared engine ([`referenced_object`]) — never out of a copy kept here, which no
-//! S3 client could write. Nothing here fabricates content: every byte a handler
-//! returns was written into the store by a seed, or installed by a successful
+//! different places: the in-transit messages are this module's store, which
+//! WorkMail delivery writes through the email-flow seam ([`email_flow`]) — mail that
+//! arrived for a mailbox of an organization, handed over by the service that received
+//! it, which is what makes a message in transit reachable to a client that only makes
+//! AWS calls — while an S3 object belongs to AMAZON S3 and is read out of S3's own
+//! store in the shared engine ([`referenced_object`]) — never out of a copy kept here,
+//! which no S3 client could write. Nothing here fabricates content: every byte a
+//! handler returns arrived with a delivered message, or was installed by a successful
 //! `PutRawMessageContent` out of the object S3 holds.
 //!
 //! Both sides are regional. A message is in transit in the message flow of one
@@ -26,6 +27,11 @@ use std::time::SystemTime;
 use crate::ops::types::S3Reference;
 
 pub mod bucket_policy;
+
+/// How a message gets INTO transit: the email flow of one WorkMail organization, which
+/// a message enters when mail that arrived for a mailbox of that organization is handed
+/// to it. The producer this API does not model, reached over the one shared engine.
+pub mod email_flow;
 
 /// The region a request is treated as having been made in when its SigV4
 /// credential scope does not name one (an unsigned or anonymous request).
@@ -235,6 +241,18 @@ impl MessageKey {
     }
 }
 
+/// How many messages this emulator holds in transit at once.
+///
+/// An EMULATOR ceiling, not an AWS quota: a message enters transit because mail arrived
+/// for a mailbox ([`email_flow`]), which a client drives by sending mail, and this store
+/// holds each message's whole MIME content. A message is in transit only until WorkMail
+/// has finished delivering it, so the store is kept bounded by treating the message that
+/// has been in transit longest as the one that has left it — and nothing is refused,
+/// because the mail was already accepted by the service that received it. What ONE
+/// message may hold is bounded where the update path states its own content ceiling
+/// ([`crate::ops::put_raw_message_content`]).
+pub const MAX_IN_TRANSIT_MESSAGES: usize = 64;
+
 /// One email message currently in transit through WorkMail's message flow.
 #[derive(Debug, Clone)]
 pub struct InTransitMessage {
@@ -256,17 +274,24 @@ pub struct InTransitMessage {
     pub last_s3_reference: Option<S3Ref>,
     /// When the content last changed.
     pub updated_at: SystemTime,
+    /// When the message entered transit, which orders the store's own ceiling
+    /// ([`MAX_IN_TRANSIT_MESSAGES`]): the message that entered first is the first to be
+    /// treated as no longer in transit. Unchanged by an update — an update does not put
+    /// the message back into the flow.
+    pub received_at: SystemTime,
 }
 
 impl InTransitMessage {
     fn new(region: String, message_id: String, content: Vec<u8>) -> Self {
+        let now = SystemTime::now();
         Self {
             message_id,
             region,
             content,
             frozen: false,
             last_s3_reference: None,
-            updated_at: SystemTime::now(),
+            updated_at: now,
+            received_at: now,
         }
     }
 }
@@ -281,25 +306,20 @@ pub struct ComAmazonawsWorkmailmessageflowGiraffemessageintransitserviceState {
 }
 
 impl ComAmazonawsWorkmailmessageflowGiraffemessageintransitserviceState {
-    /// Put a message into transit in [`DEFAULT_REGION`] with `content` as its MIME
-    /// body, as that region's WorkMail delivery does, and hand back the stored
-    /// record so a caller can mark it frozen.
+    /// Put a message into transit in `region`'s message flow with `content` as its MIME
+    /// body, as WorkMail delivery does when mail that arrived for a mailbox enters the
+    /// organization's email flow, and hand back the stored record.
     ///
-    /// This is the producer this API does not model; it is NOT an AWS operation.
-    pub fn seed_in_transit_message(
-        &mut self,
-        message_id: impl Into<String>,
-        content: impl Into<Vec<u8>>,
-    ) -> &mut InTransitMessage {
-        self.seed_in_transit_message_in_region(DEFAULT_REGION, message_id, content)
-    }
-
-    /// Put a message into transit in `region`, as that region's WorkMail delivery
-    /// does. The same id may be in transit in another region: the two are distinct
-    /// messages, each addressable only through its own region's endpoint.
+    /// The ONE insert into this store, so the store's ceiling is stated once: the
+    /// messages that entered transit first are treated as having left it until there is
+    /// room for this one ([`MAX_IN_TRANSIT_MESSAGES`]). An id already in transit in this
+    /// region is REPLACED rather than evicting anything — it is the same message
+    /// arriving again, not a second one.
     ///
-    /// This is the producer this API does not model; it is NOT an AWS operation.
-    pub fn seed_in_transit_message_in_region(
+    /// This is the producer this API does not model; it is NOT an AWS operation. It is
+    /// reached from outside this process through [`email_flow`], and directly from a
+    /// test standing in for a delivery.
+    pub fn receive_in_transit(
         &mut self,
         region: impl Into<String>,
         message_id: impl Into<String>,
@@ -311,7 +331,50 @@ impl ComAmazonawsWorkmailmessageflowGiraffemessageintransitserviceState {
             key.message_id.clone(),
             content.into(),
         );
+        while self.messages.len() >= MAX_IN_TRANSIT_MESSAGES && !self.messages.contains_key(&key) {
+            let Some(longest_in_transit) = self.longest_in_transit() else {
+                break;
+            };
+            self.messages.remove(&longest_in_transit);
+        }
         self.messages.entry(key).insert_entry(message).into_mut()
+    }
+
+    /// The address of the message that entered transit first, which is the one the
+    /// store's ceiling drops next. Ties are broken on the address, so the choice does
+    /// not depend on the order the map happens to hold its entries in.
+    fn longest_in_transit(&self) -> Option<MessageKey> {
+        self.messages
+            .iter()
+            .min_by(|(left_key, left), (right_key, right)| {
+                left.received_at
+                    .cmp(&right.received_at)
+                    .then_with(|| left_key.cmp(right_key))
+            })
+            .map(|(key, _)| key.clone())
+    }
+
+    /// Put a message into transit in [`DEFAULT_REGION`] with `content` as its MIME
+    /// body and hand back the stored record so a caller can mark it frozen
+    /// ([`Self::receive_in_transit`]).
+    pub fn seed_in_transit_message(
+        &mut self,
+        message_id: impl Into<String>,
+        content: impl Into<Vec<u8>>,
+    ) -> &mut InTransitMessage {
+        self.receive_in_transit(DEFAULT_REGION, message_id, content)
+    }
+
+    /// Put a message into transit in `region` ([`Self::receive_in_transit`]). The same
+    /// id may be in transit in another region: the two are distinct messages, each
+    /// addressable only through its own region's endpoint.
+    pub fn seed_in_transit_message_in_region(
+        &mut self,
+        region: impl Into<String>,
+        message_id: impl Into<String>,
+        content: impl Into<Vec<u8>>,
+    ) -> &mut InTransitMessage {
+        self.receive_in_transit(region, message_id, content)
     }
 
     /// The message `message_id` names in `region`'s message flow, or `None` when no
@@ -362,4 +425,98 @@ pub fn service_state<Eng: Send + Sync + 'static>(
     (engine as &dyn ::std::any::Any)
         .downcast_ref::<::engine::InMemoryEngine>()
         .map(::engine::InMemoryEngine::state::<ComAmazonawsWorkmailmessageflowGiraffemessageintransitserviceState>)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    /// Put `count` messages into transit in one region, each one having entered transit a
+    /// second after the one before it, and answer the ids in the order they entered.
+    fn arrivals(state: &mut ComAmazonawsWorkmailmessageflowGiraffemessageintransitserviceState, count: usize) -> Vec<String> {
+        let entered = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+        (0..count)
+            .map(|index| {
+                let message_id = format!("arrival-{index}");
+                let message =
+                    state.receive_in_transit(DEFAULT_REGION, message_id.clone(), b"content".to_vec());
+                // The instants a real arrival carries come from the clock; they are set
+                // here so the ORDER the rows reason about is the arrival order whatever
+                // the clock's resolution is.
+                message.received_at = entered + Duration::from_secs(index as u64);
+                message_id
+            })
+            .collect()
+    }
+
+    /// However much mail arrives, the store holds at most [`MAX_IN_TRANSIT_MESSAGES`]
+    /// messages, and what it drops is what entered transit first.
+    #[test]
+    fn the_store_holds_at_most_the_messages_it_keeps_in_transit() {
+        // (case, how many messages arrive)
+        let rows: [(&str, usize); 4] = [
+            ("fewer arrivals than the ceiling", MAX_IN_TRANSIT_MESSAGES / 2),
+            ("exactly the ceiling", MAX_IN_TRANSIT_MESSAGES),
+            ("one past the ceiling", MAX_IN_TRANSIT_MESSAGES + 1),
+            ("far past the ceiling", MAX_IN_TRANSIT_MESSAGES * 3),
+        ];
+
+        for (case, count) in rows {
+            let mut state =
+                ComAmazonawsWorkmailmessageflowGiraffemessageintransitserviceState::default();
+            let arrived = arrivals(&mut state, count);
+            let held = count.min(MAX_IN_TRANSIT_MESSAGES);
+            assert_eq!(
+                state.messages.len(),
+                held,
+                "case {case:?}: expected the store to hold {held} message(s) after {count} \
+                 arrival(s), got {}",
+                state.messages.len()
+            );
+            for (index, message_id) in arrived.iter().enumerate() {
+                let in_transit = state.message(DEFAULT_REGION, message_id).is_some();
+                let expected = index >= count - held;
+                assert_eq!(
+                    in_transit, expected,
+                    "case {case:?}: arrival {index} of {count} is {}in transit, expected it \
+                     {}to be",
+                    if in_transit { "" } else { "not " },
+                    if expected { "" } else { "not " }
+                );
+            }
+        }
+    }
+
+    /// The same id arriving again is the SAME message, so it replaces the record it had
+    /// rather than costing another message its place in the flow.
+    #[test]
+    fn an_id_already_in_transit_is_replaced_rather_than_evicting_anything() {
+        let mut state =
+            ComAmazonawsWorkmailmessageflowGiraffemessageintransitserviceState::default();
+        let arrived = arrivals(&mut state, MAX_IN_TRANSIT_MESSAGES);
+        let first = arrived.first().expect("the ceiling is not zero").clone();
+        state.receive_in_transit(DEFAULT_REGION, first.clone(), b"arrived again".to_vec());
+
+        assert_eq!(
+            state.messages.len(),
+            MAX_IN_TRANSIT_MESSAGES,
+            "expected the store to still hold {MAX_IN_TRANSIT_MESSAGES} message(s), got {}",
+            state.messages.len()
+        );
+        let content = state
+            .message(DEFAULT_REGION, &first)
+            .map(|message| message.content.clone());
+        assert_eq!(
+            content.as_deref(),
+            Some(b"arrived again".as_slice()),
+            "expected the re-arrival's own content for {first}, got {content:?}"
+        );
+        for message_id in &arrived {
+            assert!(
+                state.message(DEFAULT_REGION, message_id).is_some(),
+                "expected {message_id} to still be in transit after {first} arrived again"
+            );
+        }
+    }
 }
