@@ -185,9 +185,10 @@ fn catch_all_entry(egress: bool) -> ReportedEntry {
         ipv6_cidr_block: None,
         egress: egress.to_string(),
         // An IMPLICIT entry over every protocol: it carries no ports and no ICMP numbers,
-        // and each of those two members is reported as a present-but-empty element.
-        port_range: Some((None, None)),
-        icmp_type_code: Some((None, None)),
+        // so each of those two members is left out of it rather than reported as an empty
+        // element — the same shape a caller's rule over every protocol takes.
+        port_range: None,
+        icmp_type_code: None,
     }
 }
 

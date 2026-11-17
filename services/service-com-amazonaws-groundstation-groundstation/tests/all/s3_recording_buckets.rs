@@ -15,7 +15,7 @@
 use std::sync::Arc;
 
 use serde_json::{json, Value};
-use service_com_amazonaws_groundstation_groundstation::state::RECORDING_BUCKET_UNRESOLVABLE;
+use service_com_amazonaws_groundstation_groundstation::state::RECORDING_BUCKET_ABSENT;
 use service_com_amazonaws_groundstation_groundstation::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -214,7 +214,7 @@ async fn a_recording_config_is_refused_only_for_a_bucket_that_does_not_exist() {
         );
         assert_eq!(
             reply.string("message"),
-            RECORDING_BUCKET_UNRESOLVABLE,
+            RECORDING_BUCKET_ABSENT,
             "case {case}: wrong refusal text, got {}",
             reply.body
         );
@@ -253,7 +253,7 @@ async fn a_recording_config_is_refused_only_for_a_bucket_that_does_not_exist() {
     );
     assert_eq!(
         refused.string("message"),
-        RECORDING_BUCKET_UNRESOLVABLE,
+        RECORDING_BUCKET_ABSENT,
         "case update-to-an-absent-bucket: wrong refusal text, got {}",
         refused.body
     );

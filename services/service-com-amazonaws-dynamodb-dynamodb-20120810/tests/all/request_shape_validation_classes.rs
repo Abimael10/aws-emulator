@@ -76,10 +76,15 @@
 //! inside the ceiling commits.
 //!
 //! RULE 10 — an `UpdateItem` is sized against the documented 400 KB item ceiling over the
-//! item it leaves behind PLUS a frame for each clause it states, so the largest operand one
-//! write can carry moves with the clauses beside it. The rows span the clause kinds — a
-//! further assignment, an arithmetic operand, a function operand, `ADD`, `DELETE` and
-//! `REMOVE` (whose frame is the path it names) — each read off the boundary itself.
+//! item it leaves behind PLUS a frame for each FURTHER clause it states, so the largest
+//! operand one write can carry moves with the clauses beside it. The rows span the clause
+//! kinds — a further assignment, an arithmetic operand, a function operand, `ADD`, `DELETE`
+//! and `REMOVE` (whose frame is the path it names) — each read off the boundary itself.
+//!
+//! RULE 12 — and the boundary a SINGLE-clause update is held to is the ceiling itself: the
+//! item exactly at 400 KB is stored and one byte more is refused, the clause every update
+//! carries costing the operand nothing. The rows span the member the update travels in, the
+//! length of the attribute name written and whether the key already holds an item.
 //!
 //! RULE 11 — the class boundary IN FRONT of all of them: a body value whose JSON class the
 //! modelled type of its member cannot be read from never becomes a value, so it fails
@@ -2175,6 +2180,175 @@ async fn a_value_that_could_not_be_read_is_refused_as_a_serialization_failure() 
         assert_eq!(
             status, 200,
             "case {case:?}: expected the request to be served, got {status} with {answered}"
+        );
+    }
+}
+
+// ===========================================================================
+// RULE 12. The item ceiling ITSELF is where an update's boundary sits
+// ===========================================================================
+
+/// The table the ceiling rows write to.
+const CEILED: &str = "ItemCeiling";
+
+/// The documented item ceiling: "The maximum item size in DynamoDB is 400 KB" ("Service,
+/// Account, and Table Quotas"), which is 409 600 bytes.
+const MAX_ITEM_BYTES: usize = 400 * 1024;
+
+/// The name of the partition key the rows address their items by.
+const CEILED_KEY: &str = "pk";
+
+/// One row of the ceiling table: which key it writes to, the attribute the update writes,
+/// an attribute the item already holds before the update, and whether the update travels in
+/// the legacy `AttributeUpdates` map rather than in an `UpdateExpression`.
+struct Ceiling {
+    case: &'static str,
+    key: &'static str,
+    attribute: String,
+    /// `(name, value)` of an attribute a `PutItem` seeds the key's item with first, so the
+    /// row sizes an update of an item that is already there.
+    seeded: Option<(String, String)>,
+    legacy: bool,
+}
+
+impl Ceiling {
+    /// The bytes the stored item holds BESIDES the operand this row's update writes: the
+    /// partition key's own name and value, the written attribute's name, and anything the
+    /// item already holds — the sum "of the lengths of its attribute names and values"
+    /// ("Item sizes and formats") that the operand has to complete.
+    fn stored_besides_the_operand(&self) -> usize {
+        let seeded = self
+            .seeded
+            .as_ref()
+            .map_or(0, |(name, value)| name.len() + value.len());
+        CEILED_KEY.len() + self.key.len() + self.attribute.len() + seeded
+    }
+
+    /// The `UpdateItem` body that writes an operand of `operand` bytes, in whichever member
+    /// this row states its update through.
+    fn update(&self, operand: usize) -> Value {
+        let mut body = json!({
+            "TableName": CEILED,
+            "Key": {CEILED_KEY: {"S": self.key}},
+        });
+        let value = json!({"S": "x".repeat(operand)});
+        if self.legacy {
+            body["AttributeUpdates"] =
+                json!({self.attribute.clone(): {"Action": "PUT", "Value": value}});
+        } else {
+            body["UpdateExpression"] = json!("SET #a = :v");
+            body["ExpressionAttributeNames"] = json!({"#a": self.attribute.clone()});
+            body["ExpressionAttributeValues"] = json!({":v": value});
+        }
+        body
+    }
+}
+
+/// RULE: a single-clause `UpdateItem` is sized against the documented item ceiling over the
+/// bytes the item it leaves behind stores and nothing else, and the ceiling is a BOUND: the
+/// item exactly at 400 KB is stored and one byte more is refused with the update path's own
+/// sentence for that quota. The clause every update carries is the baseline the per-clause
+/// frames of RULE 10 are differences from, so it costs the operand nothing.
+///
+/// The rows differ along what the rule generalises over: the member the update travels in
+/// (`UpdateExpression` and the legacy `AttributeUpdates`), the length of the attribute name
+/// the bytes are written under, and whether the key already holds an item whose other
+/// attributes count towards the same ceiling.
+#[tokio::test]
+async fn an_item_exactly_at_the_documented_ceiling_is_stored_and_one_byte_more_is_refused() {
+    let router = emulator();
+    create_active_table(&router, CEILED, &[(CEILED_KEY, "HASH", "S")]).await;
+
+    let rows = [
+        Ceiling {
+            case: "an UpdateExpression writing a one-character attribute name",
+            key: "a",
+            attribute: "v".to_string(),
+            seeded: None,
+            legacy: false,
+        },
+        Ceiling {
+            case: "an UpdateExpression writing a 32-character attribute name",
+            key: "b",
+            attribute: "n".repeat(32),
+            seeded: None,
+            legacy: false,
+        },
+        Ceiling {
+            case: "an UpdateExpression over an item the key already holds",
+            key: "c",
+            attribute: "v".to_string(),
+            seeded: Some(("w".to_string(), "y".repeat(1024))),
+            legacy: false,
+        },
+        Ceiling {
+            case: "an AttributeUpdates PUT of a one-character attribute name",
+            key: "d",
+            attribute: "v".to_string(),
+            seeded: None,
+            legacy: true,
+        },
+        Ceiling {
+            case: "an AttributeUpdates PUT over an item the key already holds",
+            key: "e",
+            attribute: "v".to_string(),
+            seeded: Some(("w".to_string(), "y".repeat(4096))),
+            legacy: true,
+        },
+        Ceiling {
+            case: "an AttributeUpdates PUT of a 255-character attribute name",
+            key: "f",
+            attribute: "n".repeat(255),
+            seeded: None,
+            legacy: true,
+        },
+    ];
+
+    for row in rows {
+        if let Some((name, value)) = row.seeded.as_ref() {
+            ok(
+                &router,
+                "PutItem",
+                json!({"TableName": CEILED,
+                       "Item": {CEILED_KEY: {"S": row.key}, name.clone(): {"S": value}}}),
+            )
+            .await;
+        }
+        let at_the_ceiling = MAX_ITEM_BYTES - row.stored_besides_the_operand();
+
+        let (status, body) = call(&router, "UpdateItem", row.update(at_the_ceiling)).await;
+        assert_eq!(
+            status,
+            200,
+            "case {:?}: an item of exactly {MAX_ITEM_BYTES} bytes is stored, got {status} with \
+             {body}",
+            row.case
+        );
+        let (status, body) = call(&router, "UpdateItem", row.update(at_the_ceiling + 1)).await;
+        assert_eq!(
+            (status, message(&body).as_str()),
+            (
+                400,
+                "Item size to update has exceeded the maximum allowed size"
+            ),
+            "case {:?}: one byte past the ceiling is refused with the update path's sentence, \
+             got {status} with {body}",
+            row.case
+        );
+
+        // The refused update left the item as the accepted one stored it, which is what
+        // makes the boundary a bound rather than a rounding of it.
+        let read = ok(
+            &router,
+            "GetItem",
+            json!({"TableName": CEILED, "Key": {CEILED_KEY: {"S": row.key}}}),
+        )
+        .await;
+        assert_eq!(
+            read["Item"][row.attribute.as_str()]["S"].as_str().map(str::len),
+            Some(at_the_ceiling),
+            "case {:?}: the attribute keeps the length the ceiling admitted, got {read}",
+            row.case
         );
     }
 }

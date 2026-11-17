@@ -15,19 +15,57 @@
 //! So this suite mounts the S3 service beside Ground Station on ONE engine — what the
 //! assembled emulator does — and FOLLOWS each URL it is handed through S3's own front
 //! door, so what it asserts is an upload object storage really took rather than the shape
-//! of a string.
+//! of a string. The URL is one the agent DIALS, so it is addressed to the endpoint this
+//! emulator is published at and never to a host AWS serves: the suite publishes an endpoint
+//! for this emulator ([`SERVING_BASE`]) and expects the URL under it.
 
 use serde_json::{json, Value};
 use service_com_amazonaws_groundstation_groundstation::state::{
     service_state, AGENT_TASK_RESPONSE_URL_VALIDITY,
 };
-use smithy_server_runtime::MultiServiceRouter;
+use smithy_server_runtime::{EndpointUrl, MultiServiceRouter};
 
 use crate::agent_lifecycle::{capability_arn, get_configuration, register, uuid_from};
 use crate::s3_recording_buckets::{
     harness_with_object_storage, harness_with_object_storage_and_engine,
 };
 use crate::scheduling_loop::{send, Reply, ABSENT_UUID, REGION};
+
+/// The base URL this suite's emulator is published at, the way the data port publishes the
+/// URL it bound, and the authority a client dials it on — which is where every presigned URL
+/// this suite is handed has to lead.
+const SERVING_BASE: &str = "https://127.0.0.1:34567";
+const SERVING_AUTHORITY: &str = "127.0.0.1:34567";
+
+/// The DNS zones AWS publishes its OWN endpoints in, none of which a reported upload URL may
+/// be named in: an agent that followed such a URL would PUT its log, and the credential
+/// signing it, to genuine AWS infrastructure instead of to this emulator.
+const AWS_ENDPOINT_ZONES: [&str; 4] = [
+    "amazonaws.com",
+    "amazonaws.com.cn",
+    "api.aws",
+    "on.aws",
+];
+
+/// This suite's harness, published at [`SERVING_BASE`].
+fn served_harness() -> MultiServiceRouter {
+    published(harness_with_object_storage())
+}
+
+/// The same, with the engine the store is read through.
+fn served_harness_and_engine(
+) -> (MultiServiceRouter, std::sync::Arc<engine::InMemoryEngine>) {
+    let (router, engine) = harness_with_object_storage_and_engine();
+    (published(router), engine)
+}
+
+/// `router`, published at [`SERVING_BASE`].
+fn published(mut router: MultiServiceRouter) -> MultiServiceRouter {
+    router.set_url_base(
+        EndpointUrl::parse(SERVING_BASE).expect("the suite's endpoint URL is a usable one"),
+    );
+    router
+}
 
 /// A SigV4 `Authorization` header in the `s3` scope: the routing signal that picks the S3
 /// service for a request this suite sends to object storage in its OWN name (reading an
@@ -87,13 +125,14 @@ fn query_field(url: &str, name: &str) -> Option<String> {
 
 /// Where AWS Ground Station takes this account's agent task response logs: one bucket per
 /// account per region under this service's ARN namespace, and one object per agent per
-/// task under it.
+/// task under it — at the endpoint this emulator is published at, which is the address the
+/// agent dials.
 ///
 /// Written out here rather than taken from the crate's own helpers, so this asserts the
 /// layout a client sees instead of echoing whatever the handler computed.
 fn expected_object_url(agent_id: &str, task_id: &str) -> String {
     format!(
-        "https://s3.{REGION}.amazonaws.com/groundstation-agent-logs-{REGION}-{}\
+        "{SERVING_BASE}/groundstation-agent-logs-{REGION}-{}\
          /agent/{agent_id}/task/{task_id}/agent-task-response.log",
         engine::emulator_account_id()
     )
@@ -106,7 +145,7 @@ async fn put_url(router: &MultiServiceRouter, url: &str, body: &[u8]) -> u16 {
     let request = http::Request::builder()
         .method("PUT")
         .uri(url)
-        .header("host", format!("s3.{REGION}.amazonaws.com"))
+        .header("host", SERVING_AUTHORITY)
         .body(bytes::Bytes::copy_from_slice(body))
         .expect("build the upload request");
     router.dispatch(request).await.status().as_u16()
@@ -118,7 +157,7 @@ async fn get_object(router: &MultiServiceRouter, object_url: &str) -> (u16, Vec<
     let request = http::Request::builder()
         .method("GET")
         .uri(object_url)
-        .header("host", format!("s3.{REGION}.amazonaws.com"))
+        .header("host", SERVING_AUTHORITY)
         .header("authorization", S3_AUTH)
         .body(bytes::Bytes::new())
         .expect("build the GetObject request");
@@ -171,7 +210,7 @@ fn task_ids() -> Vec<(&'static str, String)> {
 
 #[tokio::test]
 async fn every_agent_task_is_handed_a_presigned_upload_url_for_its_own_log_object() {
-    let router = harness_with_object_storage();
+    let router = served_harness();
 
     // Two agents, so what the URL carries varies with the agent as well as with the task.
     let mut agents: Vec<String> = Vec::new();
@@ -210,7 +249,9 @@ async fn every_agent_task_is_handed_a_presigned_upload_url_for_its_own_log_objec
                 reply.body
             );
 
-            // The URL addresses THIS agent's log object for THIS task.
+            // The URL addresses THIS agent's log object for THIS task, at the endpoint this
+            // emulator is published at — never in a zone AWS publishes its own endpoints in,
+            // which is where an agent following it would leave the emulated environment.
             let url = reply.string("presignedLogUrl");
             assert_eq!(
                 object_url(&url),
@@ -218,6 +259,23 @@ async fn every_agent_task_is_handed_a_presigned_upload_url_for_its_own_log_objec
                 "case {case}: the URL must address this agent's log object for this task, \
                  got {url}"
             );
+            let host = object_url(&url)
+                .split_once("://")
+                .map(|(_scheme, rest)| rest.split('/').next().unwrap_or_default())
+                .unwrap_or_default()
+                .to_string();
+            assert_eq!(
+                host, SERVING_AUTHORITY,
+                "case {case}: the agent dials the URL, so it names the address this emulator \
+                 is published at, got {host}"
+            );
+            for zone in AWS_ENDPOINT_ZONES {
+                assert!(
+                    !host.ends_with(zone),
+                    "case {case}: a reported upload URL is never named in a zone AWS \
+                     publishes its own endpoints in, but {host} ends in {zone}"
+                );
+            }
 
             // And it is presigned: the query-string credential scope, validity and
             // signature a client needs to upload with it.
@@ -296,7 +354,7 @@ async fn every_agent_task_is_handed_a_presigned_upload_url_for_its_own_log_objec
 
 #[tokio::test]
 async fn a_tasks_url_is_reported_again_and_outlives_the_signing_of_another_tasks() {
-    let (router, engine) = harness_with_object_storage_and_engine();
+    let (router, engine) = served_harness_and_engine();
     let registered = register(&router, registration(0)).await;
     let agent_id = registered.string("agentId");
 
@@ -430,7 +488,7 @@ async fn a_tasks_url_is_reported_again_and_outlives_the_signing_of_another_tasks
 
 #[tokio::test]
 async fn an_upload_url_is_refused_for_an_agent_that_was_never_registered() {
-    let router = harness_with_object_storage();
+    let router = served_harness();
     // One agent IS registered, so the refusal below is about the agent the request names
     // rather than about an account that has registered nothing.
     let registered = register(&router, registration(0)).await;

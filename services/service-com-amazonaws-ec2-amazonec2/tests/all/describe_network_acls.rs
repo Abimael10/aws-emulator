@@ -248,11 +248,11 @@ fn default_entries() -> Vec<ReportedEntry> {
                 ipv6_cidr_block: None,
                 egress: egress.to_string(),
                 // An IMPLICIT entry — one the service itself wrote onto the ACL its VPC came
-                // with — reports both containers present and EMPTY: it is over every
-                // protocol, so it has no ICMP numbers and no ports, and each member is
-                // written as an empty element rather than left out.
-                port_range: Some((String::new(), String::new())),
-                icmp_type_code: Some((String::new(), String::new())),
+                // with — is over every protocol, so it has no ICMP numbers and no ports, and
+                // each of those two members is LEFT OUT of it rather than reported empty,
+                // exactly as it is for a rule a caller wrote over every protocol.
+                port_range: None,
+                icmp_type_code: None,
             })
         })
         .collect()
@@ -1497,7 +1497,7 @@ async fn acl_of_subnet(router: &MultiServiceRouter, case: &str, subnet_id: &str)
 /// Built through the service's own one definition of an IMPLICIT entry
 /// ([`implicit_network_acl_entry`]) rather than spelled out here, so this expectation cannot
 /// drift from the entries a create actually writes — including the `portRange` and
-/// `icmpTypeCode` containers such an entry reports present and empty.
+/// `icmpTypeCode` containers such an entry leaves out.
 fn created_entries() -> Vec<NetworkAclEntry> {
     [false, true]
         .into_iter()

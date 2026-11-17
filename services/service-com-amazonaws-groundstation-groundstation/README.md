@@ -168,12 +168,12 @@ An `s3RecordingConfig`'s recording bucket needs NO setting: Ground Station resol
 bucket the `bucketArn` names against the emulator's own S3 (`HeadBucket` over the
 in-process callback), so a bucket created through the emulator's S3 is accepted and a
 `bucketArn` whose bucket the service cannot locate is refused with
-`InvalidParameterException` in the one wording the service has for that: "Unable to create
-new S3 endpoint config - unable to get location of bucket. Ensure that Ground Station has
-s3:GetBucketLocation permissions on the bucket." That covers a bucket S3 reports is not
-there, a bucket whose read S3 refuses and a `bucketArn` naming no bucket at all, because
-the read that fails is Ground Station's own. With no S3 mounted to ask, nothing is known
-about the bucket and the config is created.
+`InvalidParameterException` in the wording the condition earns: a bucket S3 reports is not
+there, and a `bucketArn` naming no bucket at all, get "Unable to create new S3 endpoint
+config - bucket does not exist."; a bucket S3 answers about while withholding where it is
+gets "Unable to create new S3 endpoint config - unable to get location of bucket. Ensure
+that Ground Station has s3:GetBucketLocation permissions on the bucket." With no S3 mounted
+to ask, nothing is known about the bucket and the config is created.
 
 An agent's task response log needs no setting either: `GetAgentTaskResponseUrl` hands the
 agent a presigned Amazon S3 `PutObject` URL of the object that holds its response log for

@@ -11,10 +11,10 @@
 //! ascending rule number — and every reported entry carries the members its RULE has beside
 //! the rule number, protocol, action, direction and range it was written with: "the ICMP type
 //! and code" (`NetworkAclEntry$IcmpTypeCode`) for a rule written with one and "the range of
-//! ports the rule applies to" (`$PortRange`) for a rule written with one, NEITHER for a
-//! CALLER's rule whose protocol has no ports and no ICMP numbers, and BOTH present-but-empty
-//! for an IMPLICIT entry — one the service itself wrote onto an ACL it created, which is over
-//! every protocol and whose two containers the recorded responses carry as empty elements.
+//! ports the rule applies to" (`$PortRange`) for a rule written with one, and NEITHER for a
+//! rule whose protocol has no ports and no ICMP numbers — whether a caller wrote it or the
+//! service itself did onto an ACL it created, since what decides whether a member is there is
+//! the rule and not who wrote it.
 //!
 //! So the list `CreateNetworkAcl` answers, the list `DescribeNetworkAcls` answers for that
 //! same ACL — named by id, selected by a filter, or listed with the whole store — and the
@@ -53,7 +53,8 @@ const REGION: &str = "us-east-1";
 /// One entry of a reported network ACL, with every member of the modelled `NetworkAclEntry`
 /// told apart from an ABSENT one: `None` is a member the response left out, and
 /// `Some((None, None))` one it wrote as a present-but-empty element — which is what this suite
-/// pins the readers against writing for a rule that has no such member.
+/// pins the readers against writing for a rule that has no such member, whoever wrote the
+/// rule.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ReportedEntry {
     rule_number: String,
@@ -236,8 +237,8 @@ impl Rule {
 }
 
 /// One rule-32767 entry every network ACL ends with, in the direction `egress` names: the
-/// catch-all deny over every protocol and every IPv4 address, an IMPLICIT entry whose port
-/// range and ICMP type and code are reported present and empty.
+/// catch-all deny over every protocol and every IPv4 address, an IMPLICIT entry that carries
+/// neither a port range nor an ICMP type and code.
 fn catch_all(egress: bool) -> ReportedEntry {
     every_protocol_entry(DEFAULT_NETWORK_ACL_DENY_RULE_NUMBER, egress, RULE_ACTION_DENY)
 }
@@ -253,8 +254,9 @@ fn allow_everything(egress: bool) -> ReportedEntry {
 }
 
 /// An IMPLICIT entry over every protocol and every IPv4 address — the shape both entries a
-/// network ACL is created with take. Each of the two members such an entry carries no value
-/// for is reported as a present-but-empty element, which is `Some((None, None))` here.
+/// network ACL is created with take. Such an entry has no ports and no ICMP numbers, so each
+/// of those two members is left out of it rather than reported as an empty element, which is
+/// `None` here — the same shape a rule a caller wrote over every protocol takes.
 fn every_protocol_entry(rule_number: i32, egress: bool, rule_action: &str) -> ReportedEntry {
     ReportedEntry {
         rule_number: rule_number.to_string(),
@@ -263,8 +265,8 @@ fn every_protocol_entry(rule_number: i32, egress: bool, rule_action: &str) -> Re
         cidr_block: Some(ALL_IPV4_ADDRESSES.to_string()),
         ipv6_cidr_block: None,
         egress: egress.to_string(),
-        port_range: Some((None, None)),
-        icmp_type_code: Some((None, None)),
+        port_range: None,
+        icmp_type_code: None,
     }
 }
 
@@ -405,7 +407,7 @@ async fn assert_every_reader(
 /// Every reader projects the entries a network ACL is CREATED with the same way: the two
 /// rules of a VPC's own default ACL in each direction, and the catch-all deny in each
 /// direction for an ACL a caller created — egress first, each by ascending rule number, each
-/// over every protocol and so reporting an empty port range and an empty ICMP type and code.
+/// over every protocol and so reporting neither a port range nor an ICMP type and code.
 #[tokio::test]
 async fn every_reader_projects_the_entries_an_acl_is_created_with_the_same_way() {
     let (router, _engine) = super::ec2_query::emulator();
@@ -647,4 +649,123 @@ async fn removing_and_replacing_a_rule_leaves_the_one_reported_order() {
     expected.extend(left.iter().map(Rule::reported));
     let expected = in_report_order(expected);
     assert_every_reader(&router, case, &network_acl_id, &vpc_id, &expected).await;
+}
+
+// ---------------------------------------------------------------------------
+// Which members an entry carries at all
+// ---------------------------------------------------------------------------
+
+/// RULE: whether a reported entry carries `portRange` and `icmpTypeCode` is decided by the
+/// RULE and by nothing else — present only for a rule that names ports, respectively an ICMP
+/// type and code — so a rule over every protocol carries neither, whether a caller wrote it
+/// or the service itself wrote it onto an ACL it created. Neither member is ever reported as
+/// a present-but-empty element.
+///
+/// The rows differ along everything that decides it: the protocol (TCP and UDP, which require
+/// ports; ICMP, which requires a type and code; a protocol with neither; and every protocol),
+/// the direction, and who wrote the rule — the two implicit entries an ACL is created with
+/// and the four rules the caller then adds.
+#[tokio::test]
+async fn an_entry_carries_a_port_range_only_where_its_rule_names_ports() {
+    let (router, _engine) = super::ec2_query::emulator();
+    let vpc_id = create_vpc(&router, "10.64.0.0/16").await;
+    let case = "which members an entry carries";
+    let (network_acl_id, _) = create_acl(&router, case, &vpc_id).await;
+
+    let authored = vec![
+        Rule::new(100, false, RULE_ACTION_DENY, protocol(NETWORK_ACL_PROTOCOL_TCP))
+            .cidr(ALL_IPV4_ADDRESSES)
+            .ports(22, 22),
+        Rule::new(200, false, RULE_ACTION_ALLOW, ALL_IP_PROTOCOLS.to_string())
+            .cidr(ALL_IPV4_ADDRESSES),
+        Rule::new(100, true, RULE_ACTION_ALLOW, protocol(NETWORK_ACL_PROTOCOL_UDP))
+            .cidr(ALL_IPV4_ADDRESSES)
+            .ports(0, 65535),
+        Rule::new(200, true, RULE_ACTION_ALLOW, protocol(NETWORK_ACL_PROTOCOL_ICMP))
+            .cidr(ALL_IPV4_ADDRESSES)
+            .icmp(-1, -1),
+        // A protocol that has neither ports nor ICMP numbers (47 is GRE), so a rule over it
+        // names neither member.
+        Rule::new(300, true, RULE_ACTION_ALLOW, protocol(47)).cidr("10.0.0.0/8"),
+    ];
+    for rule in &authored {
+        create_entry(&router, case, &network_acl_id, rule).await;
+    }
+
+    let (status, body) = describe(&router, &indexed("NetworkAclId", &[network_acl_id.as_str()])).await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: expected HTTP 200, got {status} with body {body}"
+    );
+    let reported = entries_of(case, "DescribeNetworkAcls by id", &body, &network_acl_id);
+
+    // One row per reported entry: the rule it is, and whether the rule names ports and an
+    // ICMP type and code. The implicit catch-all pair is in each direction at 32767.
+    let mut rows: Vec<(String, i32, bool, bool, bool)> = vec![
+        (
+            "the implicit catch-all deny, ingress".to_string(),
+            DEFAULT_NETWORK_ACL_DENY_RULE_NUMBER,
+            false,
+            false,
+            false,
+        ),
+        (
+            "the implicit catch-all deny, egress".to_string(),
+            DEFAULT_NETWORK_ACL_DENY_RULE_NUMBER,
+            true,
+            false,
+            false,
+        ),
+    ];
+    rows.extend(authored.iter().map(|rule| {
+        (
+            format!(
+                "a caller's rule over protocol {} (egress {})",
+                rule.protocol, rule.egress
+            ),
+            rule.rule_number,
+            rule.egress,
+            rule.port_range.is_some(),
+            rule.icmp_type_code.is_some(),
+        )
+    }));
+    assert_eq!(
+        reported.len(),
+        rows.len(),
+        "case {case:?}: expected one reported entry per rule, got {reported:?}"
+    );
+
+    for (row, rule_number, egress, names_ports, names_icmp) in rows {
+        let entry = reported
+            .iter()
+            .find(|entry| {
+                entry.rule_number == rule_number.to_string()
+                    && entry.egress == egress.to_string()
+            })
+            .unwrap_or_else(|| panic!("case {row:?}: no entry {rule_number} in {reported:?}"));
+        assert_eq!(
+            entry.port_range.is_some(),
+            names_ports,
+            "case {row:?}: portRange is reported only for a rule that names ports, got {:?}",
+            entry.port_range
+        );
+        assert_eq!(
+            entry.icmp_type_code.is_some(),
+            names_icmp,
+            "case {row:?}: icmpTypeCode is reported only for a rule that names an ICMP type \
+             and code, got {:?}",
+            entry.icmp_type_code
+        );
+        // ...and never as a present-but-empty element, whichever member it is.
+        for (member, reported) in [
+            ("portRange", entry.port_range.clone()),
+            ("icmpTypeCode", entry.icmp_type_code.clone()),
+        ] {
+            assert_ne!(
+                reported,
+                Some((None, None)),
+                "case {row:?}: {member} is left out rather than reported empty, got {reported:?}"
+            );
+        }
+    }
 }

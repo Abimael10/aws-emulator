@@ -3,34 +3,43 @@
 //! WHICH answer Ground Station gives when an `s3RecordingConfig`'s bucket cannot be
 //! resolved.
 //!
-//! The RULE under test: Ground Station reads the recording bucket's location in its OWN
-//! name, so every condition that leaves it without that location — S3 reporting no such
-//! bucket, S3 refusing the read, and a `bucketArn` that names no bucket at all, which is
-//! the same thing settled without asking — is refused with ONE answer: the modelled
-//! `InvalidParameterException` (HTTP 431), `parameterName`
-//! `configData.s3RecordingConfig.bucketArn`, and the single sentence that says the
-//! location could not be obtained and names the permission such a read needs. The caller
-//! is never told which of the conditions it was. The sentence is FIXED text: it
-//! interpolates no bucket name, ARN, account or region, so every row — differing along the
-//! form of the ARN, the kind of ARN, the bucket name's length and characters, whether a
-//! trailing key is carried, the partition, and whether S3 holds the bucket at all — gets a
-//! byte-identical sentence.
+//! The RULE under test: Ground Station resolves the recording bucket in its OWN name before
+//! it stores the config, and the answer it gives says WHICH condition stopped that
+//! resolution, because the two are what a caller can act on differently:
 //!
-//! The sentence is written out HERE as well as exported from the crate, so a drift in the
-//! crate's constant fails this suite rather than passing it unnoticed, and the rows run
+//! * a bucket that is NOT THERE — S3 reporting no such bucket, and a `bucketArn` that names
+//!   no bucket at all, which is the same thing settled without asking — is refused with the
+//!   sentence that says the bucket does not exist, whose remedy is to create it or correct
+//!   the ARN;
+//! * a bucket S3 ANSWERS about while withholding where it is — the read refused — is refused
+//!   with the sentence that names the permission such a read needs.
+//!
+//! Both carry the modelled `InvalidParameterException` (HTTP 431) and `parameterName`
+//! `configData.s3RecordingConfig.bucketArn`. Each sentence is FIXED text: it interpolates no
+//! bucket name, ARN, account or region, so every row of a condition — differing along the
+//! form of the ARN, the kind of ARN, the bucket name's length and characters, whether a
+//! trailing key is carried, and the partition — gets a byte-identical sentence.
+//!
+//! Each sentence is written out HERE as well as exported from the crate, so a drift in the
+//! crate's constants fails this suite rather than passing it unnoticed, and the rows run
 //! through both writers (`CreateConfig` and `UpdateConfig`) of the one resolution path.
 
 use serde_json::json;
-use service_com_amazonaws_groundstation_groundstation::state::RECORDING_BUCKET_UNRESOLVABLE;
+use service_com_amazonaws_groundstation_groundstation::state::{
+    RECORDING_BUCKET_ABSENT, RECORDING_BUCKET_UNRESOLVABLE,
+};
 
 use crate::s3_recording_buckets::{
     create, create_bucket, harness_with_object_storage, put_bucket_policy, recording_config,
 };
 use crate::scheduling_loop::send;
 
-/// The refusal text, as the service words it for a recording bucket it cannot locate.
-/// Spelled out in full rather than composed, because the whole point of the rule is that
-/// it is FIXED text.
+/// The refusal text for a bucket that is not there. Spelled out in full rather than
+/// composed, because the whole point of the rule is that it is FIXED text.
+const ABSENT_BUCKET_MESSAGE: &str = "Unable to create new S3 endpoint config - bucket does \
+     not exist.";
+
+/// The refusal text for a bucket S3 answers about while withholding where it is.
 const UNRESOLVABLE_BUCKET_MESSAGE: &str = "Unable to create new S3 endpoint config - \
      unable to get location of bucket. Ensure that Ground Station has s3:GetBucketLocation \
      permissions on the bucket.";
@@ -46,18 +55,13 @@ const HELD_BUCKET: &str = "aws-groundstation-downlink";
 /// without handing over where it is.
 const DENIED_BUCKET: &str = "aws-groundstation-denied";
 
-/// Recording buckets Ground Station cannot locate, differing along what the rule
-/// generalises over.
-///
-/// Buckets that are NOT THERE: an S3 bucket ARN whose bucket S3 does not hold (by itself,
-/// as a near miss of the held name, in another case, with a trailing key, in another
-/// partition, with a three-character and with a 63-character name, with dots), an ARN of
-/// another service, an S3 resource that is not a bucket, an ARN with no bucket in its
-/// resource part, an ARN naming no service, and a string that is no ARN at all. And
-/// buckets S3 ANSWERS about while withholding the location: the held-but-denied bucket
-/// alone, a key under it, and the same bucket named in another partition — all of which
-/// name that one bucket (`state::bucket_name_of`).
-fn unresolvable_bucket_rows() -> Vec<(&'static str, String)> {
+/// Recording buckets that are NOT THERE, differing along what the rule generalises over: an
+/// S3 bucket ARN whose bucket S3 does not hold (by itself, as a near miss of the held name,
+/// in another case, with a trailing key, in another partition, with a three-character and
+/// with a 63-character name, with dots), an ARN of another service, an S3 resource that is
+/// not a bucket, an ARN with no bucket in its resource part, an ARN naming no service, and a
+/// string that is no ARN at all.
+fn absent_bucket_rows() -> Vec<(&'static str, String)> {
     vec![
         (
             "a bucket name nothing holds",
@@ -112,6 +116,14 @@ fn unresolvable_bucket_rows() -> Vec<(&'static str, String)> {
             "a string that is not an ARN",
             "absent-recording-bucket".to_string(),
         ),
+    ]
+}
+
+/// Recording buckets S3 ANSWERS about while withholding the location: the held-but-denied
+/// bucket alone, a key under it, and the same bucket named in another partition — all of
+/// which name that one bucket (`state::bucket_name_of`).
+fn location_withheld_rows() -> Vec<(&'static str, String)> {
+    vec![
         (
             "a bucket whose read S3 refuses",
             format!("arn:aws:s3:::{DENIED_BUCKET}"),
@@ -125,6 +137,19 @@ fn unresolvable_bucket_rows() -> Vec<(&'static str, String)> {
             format!("arn:aws-us-gov:s3:::{DENIED_BUCKET}"),
         ),
     ]
+}
+
+/// Every unresolvable bucket, each with the sentence its condition earns.
+fn unresolvable_bucket_rows() -> Vec<(&'static str, String, &'static str)> {
+    absent_bucket_rows()
+        .into_iter()
+        .map(|(case, bucket_arn)| (case, bucket_arn, ABSENT_BUCKET_MESSAGE))
+        .chain(
+            location_withheld_rows()
+                .into_iter()
+                .map(|(case, bucket_arn)| (case, bucket_arn, UNRESOLVABLE_BUCKET_MESSAGE)),
+        )
+        .collect()
 }
 
 /// A bucket policy denying the read of `bucket` to every principal — the state that makes
@@ -160,11 +185,16 @@ async fn harness_with_held_and_denied_buckets() -> smithy_server_runtime::MultiS
     router
 }
 
-/// The crate's exported constant and the sentence this suite pins are the same text: the
-/// other suites assert a refusal through that constant, so pinning it once here is what
+/// The crate's exported constants and the sentences this suite pins are the same text: the
+/// other suites assert a refusal through those constants, so pinning them once here is what
 /// ties them to AWS's wording.
 #[test]
-fn the_exported_refusal_text_is_the_sentence_aws_answers() {
+fn the_exported_refusal_texts_are_the_sentences_aws_answers() {
+    assert_eq!(
+        RECORDING_BUCKET_ABSENT, ABSENT_BUCKET_MESSAGE,
+        "case exported-constant: expected the bucket-does-not-exist sentence, got \
+         {RECORDING_BUCKET_ABSENT:?}"
+    );
     assert_eq!(
         RECORDING_BUCKET_UNRESOLVABLE, UNRESOLVABLE_BUCKET_MESSAGE,
         "case exported-constant: expected the unobtainable-location sentence, got \
@@ -172,16 +202,21 @@ fn the_exported_refusal_text_is_the_sentence_aws_answers() {
     );
     assert!(
         RECORDING_BUCKET_UNRESOLVABLE.contains("s3:GetBucketLocation"),
-        "case exported-constant: the refusal must name the permission the read needs, got \
-         {RECORDING_BUCKET_UNRESOLVABLE:?}"
+        "case exported-constant: the withheld-location refusal must name the permission the \
+         read needs, got {RECORDING_BUCKET_UNRESOLVABLE:?}"
+    );
+    assert!(
+        !RECORDING_BUCKET_ABSENT.contains("s3:GetBucketLocation"),
+        "case exported-constant: a bucket that is not there names no permission the caller \
+         failed on, got {RECORDING_BUCKET_ABSENT:?}"
     );
 }
 
 #[tokio::test]
-async fn every_recording_bucket_that_cannot_be_located_is_refused_with_the_one_sentence() {
+async fn each_recording_bucket_that_cannot_be_located_is_refused_for_its_own_condition() {
     let router = harness_with_held_and_denied_buckets().await;
 
-    for (case, bucket_arn) in unresolvable_bucket_rows() {
+    for (case, bucket_arn, expected) in unresolvable_bucket_rows() {
         let reply = create(&router, "recording-refused", &recording_config(&bucket_arn)).await;
         assert_eq!(
             reply.status, 431,
@@ -196,8 +231,8 @@ async fn every_recording_bucket_that_cannot_be_located_is_refused_with_the_one_s
         );
         assert_eq!(
             reply.string("message"),
-            UNRESOLVABLE_BUCKET_MESSAGE,
-            "case {case:?}: expected the unobtainable-location sentence, got {}",
+            expected,
+            "case {case:?}: expected {expected:?}, got {}",
             reply.body
         );
         assert_eq!(
@@ -225,8 +260,7 @@ async fn every_recording_bucket_that_cannot_be_located_is_refused_with_the_one_s
     );
 
     // The bucket the account DOES hold and may read is accepted, so the rows above are
-    // refused for the location Ground Station could not obtain and not because every
-    // recording config is.
+    // refused for the condition each names and not because every recording config is.
     let held = create(
         &router,
         "recording-held",
@@ -244,7 +278,7 @@ async fn every_recording_bucket_that_cannot_be_located_is_refused_with_the_one_s
 async fn an_update_answers_the_same_sentence_as_a_create() {
     let router = harness_with_held_and_denied_buckets().await;
 
-    // A bucket that DOES resolve is accepted — so the sentence below is the answer to a
+    // A bucket that DOES resolve is accepted — so the sentences below are the answers to a
     // bucket that cannot be located, not a blanket refusal of every recording config.
     let held_data = recording_config(&format!("arn:aws:s3:::{HELD_BUCKET}"));
     let created = create(&router, "recording-held", &held_data).await;
@@ -255,7 +289,7 @@ async fn an_update_answers_the_same_sentence_as_a_create() {
     );
     let path = format!("/config/s3-recording/{}", created.string("configId"));
 
-    for (case, bucket_arn) in unresolvable_bucket_rows() {
+    for (case, bucket_arn, expected) in unresolvable_bucket_rows() {
         let refused = send(
             &router,
             "PUT",
@@ -279,8 +313,8 @@ async fn an_update_answers_the_same_sentence_as_a_create() {
         );
         assert_eq!(
             refused.string("message"),
-            UNRESOLVABLE_BUCKET_MESSAGE,
-            "case update to {case:?}: expected {UNRESOLVABLE_BUCKET_MESSAGE:?}, got {}",
+            expected,
+            "case update to {case:?}: expected {expected:?}, got {}",
             refused.body
         );
         assert_eq!(

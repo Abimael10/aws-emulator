@@ -472,17 +472,13 @@ pub fn bucket_name_of(bucket_arn: &str) -> Option<&str> {
     (!name.is_empty()).then_some(name)
 }
 
-/// What `s3RecordingConfig`'s bucket resolution answers when the bucket cannot be
-/// resolved, whatever stopped the resolution: the service's ONE fixed refusal text for an
-/// unresolvable recording bucket.
+/// What `s3RecordingConfig`'s bucket resolution answers when S3 holds the bucket but would
+/// not hand Ground Station its location: the read was ANSWERED and the location withheld, so
+/// the remedy is the permission that read needs, which this text names.
 ///
-/// Ground Station reads the bucket's location in its OWN name rather than the caller's, so
-/// every way that read can fail to hand over a location — S3 reporting no such bucket, S3
-/// refusing the read, and a `bucketArn` that names no bucket at all, which is the same
-/// thing settled without asking — reaches the caller as the single answer "the location
-/// could not be obtained", whose remedy is the permission this text names. The caller is
-/// never told which of them it was, because the caller cannot see the difference: it is
-/// not the caller's read that failed.
+/// Ground Station reads the bucket's location in its OWN name rather than the caller's, and
+/// this is the wording for the condition where that read was refused — not for a bucket that
+/// is not there, which is [`RECORDING_BUCKET_ABSENT`].
 ///
 /// Entirely fixed text: it interpolates no bucket, ARN, account or region. As with every
 /// other refusal here the status (431) and the error code (`InvalidParameterException`)
@@ -490,6 +486,18 @@ pub fn bucket_name_of(bucket_arn: &str) -> Option<&str> {
 pub const RECORDING_BUCKET_UNRESOLVABLE: &str =
     "Unable to create new S3 endpoint config - unable to get location of bucket. Ensure \
      that Ground Station has s3:GetBucketLocation permissions on the bucket.";
+
+/// What the same resolution answers when the bucket is NOT THERE: S3 reporting no such
+/// bucket, and a `bucketArn` that names no bucket at all — which is the same thing settled
+/// without asking.
+///
+/// The remedy for this condition is to create the bucket or correct the ARN, which is a
+/// different thing to tell the caller than a missing permission on a bucket that exists, so
+/// it is a refusal of its own: the two conditions a caller can act on differently are told
+/// apart. Fixed text in full, like the one beside it, under the same status (431) and error
+/// code (`InvalidParameterException`).
+pub const RECORDING_BUCKET_ABSENT: &str =
+    "Unable to create new S3 endpoint config - bucket does not exist.";
 
 /// Refuse a `configData` whose recording bucket cannot be resolved — and only then.
 ///
@@ -499,11 +507,13 @@ pub const RECORDING_BUCKET_UNRESOLVABLE: &str =
 /// modelled `InvalidParameterException` (HTTP 431) instead of being stored, so a caller
 /// never holds a recording config that cannot record. A bucket that RESOLVES is accepted.
 ///
-/// There is ONE refusal, [`RECORDING_BUCKET_UNRESOLVABLE`], for every condition that
-/// stops the resolution: a bucket S3 reports is not there, a bucket S3 answers about while
-/// withholding its location, and a `bucketArn` that names no bucket at all. The read is
-/// Ground Station's own, so a failed read is reported to the caller as exactly that and
-/// nothing finer.
+/// There are TWO refusals, told apart by WHICH answer came back about the bucket: a bucket
+/// that is not there — S3 reporting no such bucket, and a `bucketArn` that names no bucket at
+/// all, which is the same thing settled without asking — is [`RECORDING_BUCKET_ABSENT`],
+/// while a bucket S3 answers about while WITHHOLDING its location is
+/// [`RECORDING_BUCKET_UNRESOLVABLE`]. The two are what a caller can act on differently (create
+/// the bucket or fix the ARN, against grant the read the permission it needs), so they are not
+/// collapsed into one sentence.
 ///
 /// S3 is reached the way the framework documents a handler reaching another emulated
 /// service ([`smithy_server_runtime::OperationContext::callback`]): an AWS SDK client
@@ -529,18 +539,17 @@ pub async fn unresolvable_recording_bucket(
     let ConfigTypeData::s3RecordingConfig(recording) = config_data else {
         return None;
     };
-    let refusal = || {
+    let refusal = |message: &str| {
         invalid_parameter(
             "configData.s3RecordingConfig.bucketArn",
-            RECORDING_BUCKET_UNRESOLVABLE.to_string(),
+            message.to_string(),
         )
     };
     // A value that is not an S3 bucket ARN names no bucket, and that is settled without
-    // asking S3: there is nothing to ask about, so there is no location to be had. An ARN
-    // of any other service names no bucket either, however its resource part is spelled
-    // (see [`bucket_name_of`]).
+    // asking S3: there is no bucket there to record to. An ARN of any other service names no
+    // bucket either, however its resource part is spelled (see [`bucket_name_of`]).
     let Some(bucket) = bucket_name_of(&recording.bucket_arn) else {
-        return Some(refusal());
+        return Some(refusal(RECORDING_BUCKET_ABSENT));
     };
     let answer = s3_client(ctx, region, ctx.callback().aws_credentials_provider())
         .head_bucket()
@@ -550,7 +559,14 @@ pub async fn unresolvable_recording_bucket(
     match answer {
         // S3 holds the bucket and reported where it is, so the config can record to it.
         Ok(_) => None,
-        Err(error) if s3_answered_about_bucket(&error) => Some(refusal()),
+        // S3 answered that it holds no such bucket.
+        Err(error) if s3_reported_no_such_bucket(&error) => {
+            Some(refusal(RECORDING_BUCKET_ABSENT))
+        }
+        // S3 answered about the bucket and withheld where it is.
+        Err(error) if s3_withheld_the_location(&error) => {
+            Some(refusal(RECORDING_BUCKET_UNRESOLVABLE))
+        }
         Err(error) => {
             ::tracing::warn!(
                 bucket_arn = %recording.bucket_arn,
@@ -562,26 +578,79 @@ pub async fn unresolvable_recording_bucket(
     }
 }
 
-/// The S3 client this service reaches object storage through: the AWS SDK driven over the
-/// emulator's own in-process transport, signing in the name of `credentials`.
+/// The S3 client this service CALLS object storage with: the AWS SDK driven over the
+/// emulator's own in-process transport, signing in the name of `credentials`, addressing
+/// the regional endpoint name of object storage.
 ///
-/// Whose name that is differs by caller, which is why it is a parameter. A bucket this
-/// service RESOLVES is read in the emulator's own name
-/// ([`unresolvable_recording_bucket`]), while an upload URL this service hands a caller is
-/// signed with the credential minted for that one upload
-/// ([`presign_agent_task_response_upload`]), so the URL carries that credential's id and
-/// nothing else.
+/// Every request it makes is served in this process by the callback's own transport, so the
+/// endpoint it names is never resolved or dialled — which is why it may be the endpoint
+/// NAME of the service it talks to. A URL handed to a CALLER is the other question: nothing
+/// serves such an endpoint for the caller, so an upload URL is signed against the endpoint
+/// this emulator is reached at instead ([`presigning_s3_client`]).
+///
+/// Whose name the call is made in differs by caller, which is why it is a parameter: a
+/// bucket this service RESOLVES is read in the emulator's own name
+/// ([`unresolvable_recording_bucket`]).
 fn s3_client(
     ctx: &smithy_server_runtime::OperationContext<'_>,
     region: &str,
     credentials: ::aws_sdk_s3::config::SharedCredentialsProvider,
+) -> ::aws_sdk_s3::Client {
+    s3_client_for(
+        ctx,
+        region,
+        credentials,
+        format!(
+            "https://{}",
+            ::service_common::data_plane_addressing::service_endpoint_host(
+                S3_ENDPOINT_PREFIX,
+                region
+            )
+        ),
+    )
+}
+
+/// The first label of Amazon S3's own regional endpoint name, which an in-process call of
+/// this service's addresses: its `endpointPrefix`.
+const S3_ENDPOINT_PREFIX: &str = "s3";
+
+/// The S3 client an upload URL this service hands a CALLER is signed with: the same client,
+/// addressing the endpoint THIS EMULATOR is reached at
+/// ([`smithy_server_runtime::OperationContext::endpoint`], "the base URL a later request
+/// addresses… Callers send normally signed requests to it").
+///
+/// Presigning sends nothing: it renders the URL a caller is to send later, out of the
+/// endpoint and the signature. So the endpoint a presigning client names is the endpoint the
+/// caller will dial, and it has to be one this emulator answers — a name in a zone AWS
+/// publishes its own endpoints in would send the agent's log, and the credential signing it,
+/// off this machine to genuine AWS infrastructure.
+fn presigning_s3_client(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    credentials: ::aws_sdk_s3::config::SharedCredentialsProvider,
+) -> ::aws_sdk_s3::Client {
+    s3_client_for(
+        ctx,
+        region,
+        credentials,
+        ctx.endpoint().as_str().trim_end_matches('/').to_string(),
+    )
+}
+
+/// The one S3 client builder both of the readings above are made from, over the endpoint
+/// each of them names.
+fn s3_client_for(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    credentials: ::aws_sdk_s3::config::SharedCredentialsProvider,
+    endpoint_url: String,
 ) -> ::aws_sdk_s3::Client {
     let config = ::aws_sdk_s3::Config::builder()
         .behavior_version(::aws_sdk_s3::config::BehaviorVersion::latest())
         .http_client(ctx.callback().http_client())
         .credentials_provider(credentials)
         .region(::aws_sdk_s3::config::Region::new(region.to_string()))
-        .endpoint_url(format!("https://s3.{region}.amazonaws.com"))
+        .endpoint_url(endpoint_url)
         // The emulator serves one endpoint for every service, so the bucket travels in
         // the path rather than in a per-bucket host the router could not resolve.
         .force_path_style(true)
@@ -602,26 +671,35 @@ fn s3_client(
 /// S3 holds the bucket for.
 const BUCKET_READ_DENIED_STATUS: u16 = 403;
 
-/// Whether an S3 `HeadBucket` failure is S3 ANSWERING about the recording bucket — the
-/// answer that settles that no location for it was obtained, and so grounds the one
-/// refusal.
-///
-/// S3 answering `NotFound` (the only error that operation models) and S3 REFUSING the read
-/// (the access denial a missing permission on the bucket earns) are both answers from S3,
-/// and either leaves Ground Station without the bucket's location. Anything else settles
-/// nothing: the call may never have reached S3 (a deployment with no object storage behind
-/// it answers the request itself), and a refusal has to be grounded in what S3 said.
-fn s3_answered_about_bucket(
+/// Whether an S3 `HeadBucket` failure is S3 answering that it holds NO SUCH BUCKET —
+/// `NotFound`, the only error that operation models, which settles that there is no bucket to
+/// record to.
+fn s3_reported_no_such_bucket(
     error: &::aws_sdk_s3::error::SdkError<
         ::aws_sdk_s3::operation::head_bucket::HeadBucketError,
         ::aws_smithy_runtime_api::client::orchestrator::HttpResponse,
     >,
 ) -> bool {
-    let Some(answered) = error.as_service_error() else {
-        return false;
-    };
-    ::aws_sdk_s3::operation::head_bucket::HeadBucketError::is_not_found(answered)
-        || error
+    error
+        .as_service_error()
+        .is_some_and(::aws_sdk_s3::operation::head_bucket::HeadBucketError::is_not_found)
+}
+
+/// Whether an S3 `HeadBucket` failure is S3 ANSWERING about the bucket while withholding
+/// where it is: the access denial a missing permission on the bucket earns, which leaves
+/// Ground Station without the location of a bucket that is there.
+///
+/// Anything else settles nothing: the call may never have reached S3 (a deployment with no
+/// object storage behind it answers the request itself), and a refusal has to be grounded in
+/// what S3 said.
+fn s3_withheld_the_location(
+    error: &::aws_sdk_s3::error::SdkError<
+        ::aws_sdk_s3::operation::head_bucket::HeadBucketError,
+        ::aws_smithy_runtime_api::client::orchestrator::HttpResponse,
+    >,
+) -> bool {
+    error.as_service_error().is_some()
+        && error
             .raw_response()
             .is_some_and(|answer| answer.status().as_u16() == BUCKET_READ_DENIED_STATUS)
 }
@@ -709,12 +787,14 @@ pub fn withdraw_credential(ctx: &smithy_server_runtime::OperationContext<'_>, cr
 /// credential it is signed with — `None` when nothing could be signed.
 ///
 /// The URL is a presigned Amazon S3 `PutObject` of the object [`agent_task_response_log_key`]
-/// names in the bucket [`agent_log_bucket_name`] names, so an agent that PUTs its log to
-/// the URL stores it in the emulator's OWN object storage and a URL this service reports
-/// names a destination that accepts the upload. Object storage is reached the way the
-/// framework documents a handler reaching another emulated service
+/// names in the bucket [`agent_log_bucket_name`] names, addressed to the endpoint THIS
+/// EMULATOR is reached at, so an agent that PUTs its log to the URL stores it in the
+/// emulator's OWN object storage and a URL this service reports names a destination that
+/// accepts the upload. Object storage is reached the way the framework documents a handler
+/// reaching another emulated service
 /// ([`smithy_server_runtime::OperationContext::callback`]), so the bucket is created in
-/// this same emulator and nothing leaves the process.
+/// this same emulator and nothing leaves the process — and neither does the upload the URL
+/// authorises.
 ///
 /// It is signed with a credential the emulator's credential store MINTS for it, never with
 /// the emulator's own: a presigned URL carries the signer's key id, and this one carries a
@@ -783,9 +863,10 @@ async fn presigned_upload(
             return None;
         }
     };
-    // The client sends no request — presigning only signs — but it is given the same
-    // in-process transport anyway, so the URL it signs addresses the endpoint the
-    // emulator's own object storage answers on.
+    // Presigning sends no request: it renders the URL the AGENT will send later, out of the
+    // endpoint and the signature. So it is signed against the endpoint this emulator is
+    // reached at ([`presigning_s3_client`]) — the one address the agent can dial to store
+    // its log — rather than against the endpoint name an in-process call may use.
     let signer = ::aws_sdk_s3::config::SharedCredentialsProvider::new(
         ::aws_sdk_s3::config::Credentials::new(
             access_key_id,
@@ -795,7 +876,7 @@ async fn presigned_upload(
             AGENT_LOG_UPLOAD_SIGNER,
         ),
     );
-    match s3_client(ctx, region, signer)
+    match presigning_s3_client(ctx, region, signer)
         .put_object()
         .bucket(bucket)
         .key(key)

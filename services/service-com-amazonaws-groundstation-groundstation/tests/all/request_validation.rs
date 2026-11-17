@@ -24,7 +24,7 @@
 use serde_json::{json, Value};
 use service_com_amazonaws_groundstation_groundstation::state::{
     parse_approved_uplink_bands, service_state, BAD_REQUEST_ERROR_CODE, INVALID_REQUEST_BODY,
-    RECORDING_BUCKET_UNRESOLVABLE, UNAPPROVED_UPLINK_FREQUENCY,
+    RECORDING_BUCKET_ABSENT, UNAPPROVED_UPLINK_FREQUENCY,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -951,8 +951,8 @@ fn the_uplink_approval_setting_parses_as_documented() {
 
 /// A `bucketArn` that is not an S3 BUCKET ARN names no bucket, whatever its resource
 /// part spells, so an `s3RecordingConfig` carrying one is refused with HTTP 431
-/// `InvalidParameterException` and the service's fixed sentence for the condition —
-/// settled here without anything being asked of S3, because there is nothing to ask
+/// `InvalidParameterException` and the service's fixed sentence for a bucket that is not
+/// there — settled here without anything being asked of S3, because there is nothing to ask
 /// about. (A `bucketArn` that IS a bucket ARN is resolved against S3; that is
 /// `tests/all/s3_recording_buckets.rs`'s subject, and this router mounts no S3.)
 #[tokio::test]
@@ -998,7 +998,7 @@ async fn an_arn_that_names_no_bucket_is_refused_without_resolving_anything() {
         );
         assert_eq!(
             reply.string("message"),
-            RECORDING_BUCKET_UNRESOLVABLE,
+            RECORDING_BUCKET_ABSENT,
             "case {label}: wrong refusal text, got {}",
             reply.body
         );

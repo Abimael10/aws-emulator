@@ -6,8 +6,8 @@
 //! **The rules every case here holds the service to:**
 //!
 //! 1. A stack identifier a request carries is checked against CloudFormation's own
-//!    constraints for it — at least one character, and the name-or-ARN expression, beside
-//!    which the form a stack's unique id takes is admitted — BEFORE
+//!    constraints for it — at least one character, and the name-or-ARN expression, SEARCHED
+//!    for in the value rather than matched against the whole of it — BEFORE
 //!    the stack is resolved, and a value that breaks them is refused with the aggregated
 //!    `<n> validation errors detected: …` envelope naming the member path the operation
 //!    states, one clause per constraint broken, rather than with a stack-not-found message.
@@ -21,14 +21,13 @@
 //!    request is refused, even though the stack itself stays readable by its own id.
 //!
 //! The tables span the class rather than one recorded request: the malformed-identifier side
-//! over EIGHTEEN values differing along what the rule generalises over (an empty value,
-//! characters the expression does not admit in the positions it does not admit them, values
-//! carrying no name run at all — digits, hyphens, punctuation and spaces alone — and five
-//! values NEAR the form a stack's unique id takes without being it, that form itself being
-//! resolved rather than refused and pinned on its own by `stack_unique_id_identifiers.rs`)
-//! crossed with
+//! over EIGHT values differing along what the rule generalises over (an empty value, and
+//! values carrying no name run at all — digits, hyphens, punctuation and spaces alone, and
+//! combinations of them) crossed with
 //! every operation whose identifier member this service checks itself; the admitted side over
-//! the values the check admits that no stack carries, a stack's unique id included; the
+//! the values the check admits that no stack carries — names, names carrying a character a
+//! stack name may not, and the form a stack's unique id takes, which is pinned on its own by
+//! `stack_unique_id_identifiers.rs`; the
 //! absent-member side over four operations and three different required members; and the
 //! physical-id side over a live stack, the same stack once deleted, and an id nothing ever
 //! created.
@@ -188,10 +187,8 @@ const IDENTIFIER_ROWS: &[IdentifierRow] = &[
     },
 ];
 
-/// The identifiers no stack could ever carry: an empty value, values whose characters — or the
-/// position of them — the check does not admit, values carrying no name run at all, and the
-/// form a stack's unique id takes, which addresses no stack and is refused for its own shape
-/// (`stack_unique_id_identifiers.rs` pins that form on its own).
+/// The identifiers the expression is not FOUND in, which is every value carrying no name run
+/// at all: an empty value, and digits, hyphens, punctuation and spaces alone or together.
 const MALFORMED: &[(&str, &str)] = &[
     ("an empty identifier", ""),
     ("digits alone", "1234567890"),
@@ -201,26 +198,24 @@ const MALFORMED: &[(&str, &str)] = &[
     ("punctuation alone", "._+:/"),
     ("a single space", " "),
     ("digits either side of a space", "12 34"),
+];
+
+/// Identifiers the check DOES admit — so each one reaches the lookup — that no stack of the
+/// Region carries: names nothing created in the forms the expression's name alternative
+/// admits, and values the expression is only FOUND in (a name run led by a character a stack
+/// name may not start with, or carrying one a stack name may not hold, and the form a stack's
+/// unique id takes).
+const ADMITTED_BUT_ABSENT: &[(&str, &str)] = &[
+    ("a name nothing created", "identifier-absent"),
+    ("a one-character name", "z"),
+    ("a name of letters, digits and hyphens", "Stack-9-absent"),
     ("a name with an underscore", "identifier_stack"),
     ("a name with a dot", "identifier.stack"),
     ("a name starting with a digit", "9identifier"),
     ("a name starting with a hyphen", "-identifier"),
-    ("a name with a space", "identifier stack"),
     (
         "the unique id a stack id ends in",
         "0e81d159-090a-7b61-9856-04d0999cb465",
-    ),
-    (
-        "a unique id a group short",
-        "0e81d159-090a-7b61-04d0999cb465",
-    ),
-    (
-        "a unique id with a short last group",
-        "0e81d159-090a-7b61-9856-04d0999cb46",
-    ),
-    (
-        "a unique id with a group too many",
-        "0e81d159-090a-7b61-9856-04d0999cb465-9856",
     ),
     (
         "a unique id with a non-hexadecimal digit",
@@ -230,15 +225,6 @@ const MALFORMED: &[(&str, &str)] = &[
         "a unique id with no groups at all",
         "0e81d159090a7b61985604d0999cb465",
     ),
-];
-
-/// Identifiers the check DOES admit — so each one reaches the lookup — that no stack of the
-/// Region carries: names nothing created, in the forms the expression's name alternative
-/// admits.
-const ADMITTED_BUT_ABSENT: &[(&str, &str)] = &[
-    ("a name nothing created", "identifier-absent"),
-    ("a one-character name", "z"),
-    ("a name of letters, digits and hyphens", "Stack-9-absent"),
 ];
 
 fn members_of(row: &IdentifierRow, identifier: &str) -> Vec<(String, String)> {

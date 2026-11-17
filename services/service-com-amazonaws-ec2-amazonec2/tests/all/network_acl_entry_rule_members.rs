@@ -271,8 +271,8 @@ async fn an_entry_reports_only_the_optional_members_its_rule_carries() {
     }
 
     // And the catch-all deny the ACL was created with — an IMPLICIT entry over every
-    // protocol, so each of the two members is reported present and EMPTY — is reported the
-    // same way by the same read.
+    // protocol, so neither member is reported for it either — is reported the same way by the
+    // same read.
     let described = ok(
         "the catch-all deny",
         &router,
@@ -293,10 +293,9 @@ async fn an_entry_reports_only_the_optional_members_its_rule_carries() {
                 children,
             );
             assert_eq!(
-                reported,
-                Some((None, None)),
-                "case {case:?} (egress {egress}): an implicit rule over every protocol reports \
-                 an empty {member}, got {reported:?}"
+                reported, None,
+                "case {case:?} (egress {egress}): an implicit rule over every protocol leaves \
+                 {member} out, got {reported:?}"
             );
         }
     }

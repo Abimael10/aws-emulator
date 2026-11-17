@@ -27,9 +27,13 @@
 //! stores.
 //!
 //! What this does NOT settle is where the boundary sits in ABSOLUTE terms for a plain
-//! single-assignment update: that is the item ceiling's own accounting, the frames are
-//! differences and are invariant under it, and the recorded units still show the emulator
-//! accepting an operand a byte or more past where AWS stops one.
+//! single-assignment update: that is the item ceiling's own accounting, and the frames are
+//! differences invariant under it. Each is read off the boundary of a write that already
+//! carries ONE assignment, so that assignment is the baseline the differences are counted
+//! from and costs nothing of its own ([`BASELINE_CLAUSE_CHARGE`]): a single-clause update is
+//! sized against the item ceiling over the bytes its item stores alone, which is where the
+//! recorded units show AWS stopping one — the item exactly at the ceiling stored and one byte
+//! past it refused.
 //!
 //! Nothing of the request's text is read for a frame, so two requests stating the same
 //! clauses are sized alike; the one exception is a `REMOVE`, whose ask IS the path it names
@@ -44,6 +48,14 @@ use super::*;
 /// attribute stores. An assignment whose target reaches INSIDE an attribute carries the
 /// same frame; what moves the boundary further there is the document it builds.
 pub(super) const SET_CLAUSE_CHARGE: i64 = 19;
+
+/// The frame the ONE clause every measured write already carried: a plain assignment, the
+/// baseline each of the frames here is a difference FROM.
+///
+/// It is taken back out of an update's charge ([`ParsedUpdate::request_shape_charge`]), so
+/// the frames stay the differences they were read as and the absolute boundary of a
+/// single-clause update is the item ceiling itself.
+pub(super) const BASELINE_CLAUSE_CHARGE: i64 = SET_CLAUSE_CHARGE;
 
 /// The frame an assignment whose operand is ARITHMETIC costs: `+` or `-` over two
 /// operands, each of which the write has to read before it can store anything. The
