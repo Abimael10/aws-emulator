@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListNetworkMigrationMappings
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListNetworkMigrationMappings`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListNetworkMigrationMappings::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Lists the mapping jobs recorded for ONE execution of ONE network migration
+//! definition of the caller's account, in the order they were started: the jobs
+//! `StartNetworkMigrationMapping` recorded, each reported with the status its stored
+//! instants give it. A definition or an execution the account holds no record of is
+//! refused with 404 `ResourceNotFoundException` rather than answered with an empty page,
+//! and the listing changes nothing a later caller sees.
 //!
 //! ## Shape of an operation
 //!
@@ -95,9 +92,16 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-mgn-applicationmigratio
 // here — hence the `ListNetworkMigrationMappingsError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.mgn#ListNetworkMigrationMappings")]
+// `extra_errors` widens the accepted set with a shape the SERVICE models but this
+// operation does not list: `InternalServerException` (HTTP 500) is the only honest
+// answer when the engine carries no store for this service.
+#[smithy_macros::operation_error(
+    "com.amazonaws.mgn#ListNetworkMigrationMappings",
+    extra_errors = ["InternalServerException"]
+)]
 #[derive(Debug)]
 pub enum ListNetworkMigrationMappingsErrorModeled {
+    InternalServerException(InternalServerException),
     AccessDeniedException(AccessDeniedException),
     ResourceNotFoundException(ResourceNotFoundException),
     ThrottlingException(ThrottlingException),
@@ -155,18 +159,151 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListNetworkMigrationMappings` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListNetworkMigrationMappingsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListNetworkMigrationMappings"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListNetworkMigrationMappingsErrorModeled::InternalServerException(
+                crate::state::state_unavailable(),
+            )
+        })?;
+        // The operation models no `accountID` member, so it reads only the records of
+        // the account the request is signed for — the same account key every other
+        // network-migration operation uses.
+        let account = crate::state::account_key(None);
+        // The status a job carries is read from its stored instants, so every job on
+        // this page is reported as of ONE instant: the one this request was served at.
+        let now = ::std::time::SystemTime::now();
+
+        // `nextToken` is this service's own cursor, and only a string this service
+        // issued is a token: the marker below plus the `jobID` the previous page ended
+        // on. A resume-after key rather than a positional offset, so the cursor keeps its
+        // meaning when the selection changes between pages.
+        let resume_after = match input.next_token.as_deref() {
+            None | Some("") => None,
+            Some(token) => Some(
+                token
+                    .strip_prefix(PAGE_TOKEN_PREFIX)
+                    .ok_or_else(|| unresumable_token(token))?,
+            ),
+        };
+        let page_size = usize::try_from(input.max_results.unwrap_or(MAX_PAGE_SIZE))
+            .unwrap_or(MAX_PAGE_SIZE as usize)
+            // A `maxResults` past the list's own bound asks for more items than the
+            // model lets one page carry, so the page is capped at that bound; the
+            // modelled `MaxResultsType` range 1..1000 is already refused at the
+            // boundary, so no out-of-range value reaches this handler.
+            .clamp(1, MAX_PAGE_SIZE as usize);
+
+        let store = state.lock();
+        // The jobs are an execution's, and the execution is a definition's: a request
+        // naming either one this account holds no record of asked about a resource that
+        // does not exist, which is a refusal rather than an empty page. The definition is
+        // checked first, because the execution is only addressable within it.
+        if store
+            .network_migration_definition_of(&account, &input.network_migration_definition_id)
+            .is_none()
+        {
+            return Err(
+                ListNetworkMigrationMappingsErrorModeled::ResourceNotFoundException(
+                    crate::state::network_migration_definition_not_found(
+                        &input.network_migration_definition_id,
+                    ),
+                )
+                .into(),
+            );
+        }
+        if store
+            .network_migration_execution_of(
+                &account,
+                &input.network_migration_definition_id,
+                &input.network_migration_execution_id,
+            )
+            .is_none()
+        {
+            return Err(
+                ListNetworkMigrationMappingsErrorModeled::ResourceNotFoundException(
+                    crate::state::network_migration_execution_not_found(
+                        &input.network_migration_execution_id,
+                    ),
+                )
+                .into(),
+            );
+        }
+
+        let matching: Vec<&crate::state::NetworkMigrationMappingJob> = store
+            .network_migration_mapping_jobs_of(
+                &account,
+                &input.network_migration_definition_id,
+                &input.network_migration_execution_id,
+            )
+            .into_iter()
+            .filter(|job| matches_filters(job, input.filters.as_ref()))
+            .collect();
+        // The page starts after the job the token names. A token naming a job this
+        // selection does not hold cannot be resumed — it is a token for a selection that
+        // no longer exists — so it is refused rather than served as some other page.
+        let start = match resume_after {
+            None => 0usize,
+            Some(last_returned) => matching
+                .iter()
+                .position(|job| job.job_id == last_returned)
+                .map(|index| index.saturating_add(1))
+                .ok_or_else(|| {
+                    unresumable_token(input.next_token.as_deref().unwrap_or_default())
+                })?,
+        };
+        let page: Vec<&crate::state::NetworkMigrationMappingJob> =
+            matching.iter().copied().skip(start).take(page_size).collect();
+        // A token only when jobs remain after this page, so a caller that follows tokens
+        // sees every job exactly once.
+        let next_token = if start.saturating_add(page.len()) < matching.len() {
+            page.last()
+                .map(|job| format!("{PAGE_TOKEN_PREFIX}{}", job.job_id))
+        } else {
+            None
+        };
+        let items: Vec<NetworkMigrationMappingJobDetails> =
+            page.iter().map(|job| job.to_shape(now)).collect();
+
+        Ok(ListNetworkMigrationMappingsOutput {
+            items: Some(items),
+            next_token,
+        })
     }
+}
+
+/// The most jobs one page holds, and the page size used when the request names none: the
+/// model bounds `NetworkMigrationMappingsList` at 0..100 items, so a page never exceeds
+/// that however large a `maxResults` the caller asks for (the modelled `MaxResultsType`
+/// range is 1..1000).
+const MAX_PAGE_SIZE: i32 = 100;
+
+/// The marker every `nextToken` this operation issues carries, ahead of the `jobID` the
+/// page ended on, so a string the service never issued cannot be mistaken for a cursor.
+const PAGE_TOKEN_PREFIX: &str = "mgn-network-migration-mappings-";
+
+/// The refusal for a `nextToken` this operation cannot resume from: a string it never
+/// issued, or one whose anchor job the current selection no longer holds.
+/// `ListNetworkMigrationMappings` models `ValidationException` for client input, and
+/// this is that 400.
+fn unresumable_token(token: &str) -> ListNetworkMigrationMappingsError {
+    crate::scaffolded::Scaffolded::validation(format!(
+        "nextToken '{token}' cannot be resumed: it is not a token this service issued, or the network migration mapping job it continues from is no longer in this selection"
+    ))
+}
+
+/// Whether `job` satisfies every filter the request set. An absent filter, and a
+/// present-but-empty list, select everything.
+fn matches_filters(
+    job: &crate::state::NetworkMigrationMappingJob,
+    filters: Option<&ListNetworkMigrationMappingsFilters>,
+) -> bool {
+    let Some(filters) = filters else {
+        return true;
+    };
+    if let Some(ids) = filters.job_i_ds.as_ref() {
+        if !ids.is_empty() && !ids.contains(&job.job_id) {
+            return false;
+        }
+    }
+    true
 }

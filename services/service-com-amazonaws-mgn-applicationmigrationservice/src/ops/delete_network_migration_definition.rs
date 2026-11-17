@@ -182,15 +182,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
-        // Work in flight under the definition blocks its removal: a mapping job that is
-        // still running runs under an execution of this definition, which this removal
-        // would drop, so the request conflicts with the definition's current state. Once
-        // that job's work is due to have finished nothing is in flight any more and the
-        // removal proceeds.
+        // Work in flight under the definition blocks its removal: a job of ANY pipeline
+        // stage that is still running runs under an execution of this definition, which
+        // this removal would drop, so the request conflicts with the definition's current
+        // state. Once that job's work is due to have finished nothing is in flight any
+        // more and the removal proceeds.
         if let Some(running) =
-            store.running_network_migration_mapping_job_of_definition(&account, &definition_id, now)
+            store.running_network_migration_job_of_definition(&account, &definition_id, now)
         {
-            let job_id = running.job_id.clone();
             crate::state::audit(
                 ctx.parts(),
                 Self::NAME,
@@ -200,9 +199,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
             return Err(
                 DeleteNetworkMigrationDefinitionErrorModeled::ConflictException(
-                    crate::state::network_migration_definition_mapping_in_progress(
+                    crate::state::network_migration_definition_job_in_progress(
                         &definition_id,
-                        &job_id,
+                        running.kind,
+                        &running.job_id,
                     ),
                 )
                 .into(),

@@ -42,7 +42,8 @@ use crate::ops::types::{
     CreateApplicationOutput, CreateConnectorOutput, CreateNetworkMigrationDefinitionOutput,
     CreateReplicationConfigurationTemplateOutput, CreateWaveOutput, DataReplicationInfo,
     InternalServerException, LaunchedInstance, LifeCycle,
-    NetworkMigrationExecution as NetworkMigrationExecutionShape, ResourceNotFoundException,
+    NetworkMigrationExecution as NetworkMigrationExecutionShape,
+    NetworkMigrationMappingJobDetails, ResourceNotFoundException,
     ServiceQuotaExceededException, SourceConfiguration, SourceProperties,
     SourceServerConnectorAction, StorageConfiguration, TargetNetwork, TargetS3Configuration,
     UninitializedAccountException, UpdateSourceServerOutput, ValidationException,
@@ -170,6 +171,16 @@ pub const EXECUTION_STAGE_MAPPING: &str = "MAPPING";
 /// `ANALYZE`).
 pub const EXECUTION_ACTIVITY_MAPPING: &str = "MAPPING";
 
+/// The `ExecutionStage` value an execution carries once its analysis run is the stage
+/// in flight: the pipeline's analysis stage (one of the `ExecutionStage` values listed
+/// on [`EXECUTION_STAGE_MAPPING`]).
+pub const EXECUTION_STAGE_ANALYZE: &str = "ANALYZE";
+
+/// The `ExecutionStageActivity` value an execution carries while its analysis run is
+/// the work in flight (one of the `ExecutionStageActivity` values listed on
+/// [`EXECUTION_ACTIVITY_MAPPING`]).
+pub const EXECUTION_ACTIVITY_ANALYZE: &str = "ANALYZE";
+
 /// The most network migration executions this store holds at a time — per account AND
 /// in total.
 ///
@@ -210,6 +221,11 @@ pub struct ComAmazonawsMgnApplicationmigrationserviceState {
     /// The `jobID`s in creation order, so a listing pages in a stable order and the
     /// job a retry replays is the last one started.
     pub network_migration_mapping_job_order: Vec<String>,
+    /// Every network migration analysis job, by `jobID`.
+    pub network_migration_analysis_jobs: HashMap<String, NetworkMigrationAnalysisJob>,
+    /// The `jobID`s in creation order, so a listing pages in a stable order and the
+    /// job a retry replays is the last one started.
+    pub network_migration_analysis_job_order: Vec<String>,
     /// Every wave, by `waveID`.
     pub waves: HashMap<String, Wave>,
     /// The `waveID`s in creation order, so `ListWaves` pages in a stable order and a
@@ -512,6 +528,21 @@ impl ComAmazonawsMgnApplicationmigrationserviceState {
         }
         self.network_migration_mapping_job_order
             .retain(|id| !jobs.contains(id));
+
+        let analyses: Vec<String> = self
+            .network_migration_analysis_jobs
+            .values()
+            .filter(|job| {
+                job.account_id == account_id
+                    && job.network_migration_definition_id == definition_id
+            })
+            .map(|job| job.job_id.clone())
+            .collect();
+        for job_id in &analyses {
+            self.network_migration_analysis_jobs.remove(job_id);
+        }
+        self.network_migration_analysis_job_order
+            .retain(|id| !analyses.contains(id));
 
         let executions: Vec<String> = self
             .network_migration_executions

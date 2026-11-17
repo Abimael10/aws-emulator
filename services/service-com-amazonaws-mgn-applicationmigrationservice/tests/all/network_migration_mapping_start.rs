@@ -34,6 +34,7 @@ use service_com_amazonaws_mgn_applicationmigrationservice::state::{
 };
 
 use crate::application_lifecycle::{error_code, Mgn, OTHER_ACCOUNT, REGION};
+use crate::network_migration_analysis_start::JOB_IN_PROGRESS_MESSAGE;
 
 /// The modelled `http.uri` of `CreateNetworkMigrationDefinition`
 /// (`smithy_query(query="operation",operation="CreateNetworkMigrationDefinition")`),
@@ -41,7 +42,7 @@ use crate::application_lifecycle::{error_code, Mgn, OTHER_ACCOUNT, REGION};
 const CREATE_DEFINITION: &str = "network-migration/CreateNetworkMigrationDefinition";
 
 /// The modelled `http.uri` of `ListNetworkMigrationExecutions`, likewise.
-const LIST_EXECUTIONS: &str = "network-migration/ListNetworkMigrationExecutions";
+pub(crate) const LIST_EXECUTIONS: &str = "network-migration/ListNetworkMigrationExecutions";
 
 /// The modelled `http.uri` of `StartNetworkMigrationMapping`, likewise.
 const START_MAPPING: &str = "network-migration/StartNetworkMigrationMapping";
@@ -49,15 +50,15 @@ const START_MAPPING: &str = "network-migration/StartNetworkMigrationMapping";
 /// The model's `SecurityGroupMappingStrategy` values, in the order the model lists them.
 /// Source: `smithy_query(query="shape",shape="SecurityGroupMappingStrategy")` →
 /// `values`.
-const STRATEGIES: [&str; 3] = ["MAP", "SKIP", "MAP_DHCP"];
+pub(crate) const STRATEGIES: [&str; 3] = ["MAP", "SKIP", "MAP_DHCP"];
 
 /// The `ExecutionStatus` an execution carries once a stage of it is running. Source:
 /// `smithy_query(query="shape",shape="ExecutionStatus")` → `values`.
-const EXECUTION_STATUS_STARTED: &str = "STARTED";
+pub(crate) const EXECUTION_STATUS_STARTED: &str = "STARTED";
 
 /// The `ExecutionStage` the mapping run belongs to. Source:
 /// `smithy_query(query="shape",shape="ExecutionStage")` → `values`.
-const EXECUTION_STAGE_MAPPING: &str = "MAPPING";
+pub(crate) const EXECUTION_STAGE_MAPPING: &str = "MAPPING";
 
 /// The `ExecutionStageActivity` of a mapping run. Source:
 /// `smithy_query(query="shape",shape="ExecutionStageActivity")` → `values`.
@@ -66,8 +67,8 @@ const EXECUTION_ACTIVITY_MAPPING: &str = "MAPPING";
 /// The `NetworkMigrationJobStatus` values a mapping job moves through. Source:
 /// `smithy_query(query="shape",shape="NetworkMigrationJobStatus")` → `values`
 /// (`PENDING`, `STARTED`, `SUCCEEDED`, `FAILED`).
-const JOB_STATUS_STARTED: &str = "STARTED";
-const JOB_STATUS_SUCCEEDED: &str = "SUCCEEDED";
+pub(crate) const JOB_STATUS_STARTED: &str = "STARTED";
+pub(crate) const JOB_STATUS_SUCCEEDED: &str = "SUCCEEDED";
 
 /// The group lengths of the modelled `NetworkMigrationJobID` pattern
 /// `^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$` (length 36..36),
@@ -75,7 +76,7 @@ const JOB_STATUS_SUCCEEDED: &str = "SUCCEEDED";
 const UUID_GROUPS: [usize; 5] = [8, 4, 4, 4, 12];
 
 /// Whether `id` is in the modelled `NetworkMigrationJobID` shape.
-fn is_uuid_shaped(id: &str) -> bool {
+pub(crate) fn is_uuid_shaped(id: &str) -> bool {
     let groups: Vec<&str> = id.split('-').collect();
     id.len() == 36
         && groups.len() == UUID_GROUPS.len()
@@ -92,13 +93,13 @@ fn is_uuid_shaped(id: &str) -> bool {
 
 /// An id in the modelled `NetworkMigrationJobID`/`NetworkMigrationExecutionID` shape
 /// derived from `seed`, for naming a resource the store holds no record of.
-fn uuid_shaped(seed: u32) -> String {
+pub(crate) fn uuid_shaped(seed: u32) -> String {
     format!("{seed:08x}-0000-4000-8000-{seed:012x}")
 }
 
 /// A minimal valid `CreateNetworkMigrationDefinition` body: the required members only
 /// (`smithy_query(query="closure",operation="CreateNetworkMigrationDefinition")`).
-fn definition_request(name: &str) -> Value {
+pub(crate) fn definition_request(name: &str) -> Value {
     json!({
         "name": name,
         "targetS3Configuration": {
@@ -110,7 +111,7 @@ fn definition_request(name: &str) -> Value {
 }
 
 /// `CreateNetworkMigrationDefinition`, answering the minted `networkMigrationDefinitionID`.
-async fn create_definition(mgn: &Mgn, case: &str, name: &str) -> String {
+pub(crate) async fn create_definition(mgn: &Mgn, case: &str, name: &str) -> String {
     let (status, created) = mgn.call(CREATE_DEFINITION, &definition_request(name)).await;
     assert_eq!(
         status, 201,
@@ -123,7 +124,7 @@ async fn create_definition(mgn: &Mgn, case: &str, name: &str) -> String {
 }
 
 /// Every execution `ListNetworkMigrationExecutions` reports for `definition_id`.
-async fn executions(mgn: &Mgn, case: &str, definition_id: &str) -> Vec<Value> {
+pub(crate) async fn executions(mgn: &Mgn, case: &str, definition_id: &str) -> Vec<Value> {
     let (status, listed) = mgn
         .call(
             LIST_EXECUTIONS,
@@ -142,7 +143,7 @@ async fn executions(mgn: &Mgn, case: &str, definition_id: &str) -> Vec<Value> {
 
 /// The execution a created definition is staged with: the one execution the listing
 /// reports for it.
-async fn staged_execution(mgn: &Mgn, case: &str, definition_id: &str) -> Value {
+pub(crate) async fn staged_execution(mgn: &Mgn, case: &str, definition_id: &str) -> Value {
     let items = executions(mgn, case, definition_id).await;
     assert_eq!(
         items.len(),
@@ -152,7 +153,7 @@ async fn staged_execution(mgn: &Mgn, case: &str, definition_id: &str) -> Value {
     items[0].clone()
 }
 
-fn execution_id_of(case: &str, execution: &Value) -> String {
+pub(crate) fn execution_id_of(case: &str, execution: &Value) -> String {
     execution["networkMigrationExecutionID"]
         .as_str()
         .unwrap_or_else(|| panic!("case {case:?}: no networkMigrationExecutionID in {execution:?}"))
@@ -161,7 +162,7 @@ fn execution_id_of(case: &str, execution: &Value) -> String {
 
 /// `StartNetworkMigrationMapping` for `definition_id`/`execution_id`, under `strategy`
 /// when one is named.
-async fn start_mapping(
+pub(crate) async fn start_mapping(
     mgn: &Mgn,
     definition_id: &str,
     execution_id: &str,
@@ -177,7 +178,7 @@ async fn start_mapping(
     mgn.call(START_MAPPING, &request).await
 }
 
-fn job_id_of(case: &str, body: &Value) -> String {
+pub(crate) fn job_id_of(case: &str, body: &Value) -> String {
     body["jobID"]
         .as_str()
         .unwrap_or_else(|| panic!("case {case:?}: no jobID in {body:?}"))
@@ -581,13 +582,8 @@ async fn a_second_mapping_strategy_conflicts_while_the_job_runs_and_is_accepted_
         );
         assert_eq!(
             body["message"].as_str(),
-            Some(
-                format!(
-                    "Network migration execution {execution_id} is already running mapping job {first_job}."
-                )
-                .as_str()
-            ),
-            "case {strategy:?}: message must name the execution and the running job, got {:?}",
+            Some(JOB_IN_PROGRESS_MESSAGE),
+            "case {strategy:?}: message must be the service's job-in-progress wording, got {:?}",
             body["message"]
         );
         assert_eq!(

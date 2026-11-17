@@ -8,8 +8,9 @@
 //! than starting work on a resource that does not exist. `@idempotent` with no
 //! idempotency token, so a repeat of the same request while that job is still running
 //! answers the job it started instead of starting a second one, and a start that would
-//! run a different mapping strategy on an execution whose mapping job is still running
-//! is refused with 409 `ConflictException`.
+//! run a different mapping strategy on an execution a job is still running for, or one
+//! whose execution is running another stage's job, is refused with 409
+//! `ConflictException`: one execution runs one job at a time.
 //!
 //! ## Shape of an operation
 //!
@@ -221,8 +222,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
-        // One execution runs one mapping job at a time. While that job is running, the
-        // same request again is the `@idempotent` retry of the call that started it — the
+        // One execution runs one job at a time. While that job is running, the same
+        // request again is the `@idempotent` retry of the call that started it — the
         // operation models no idempotency token, so the request's own members are the
         // only thing a retry can be recognised by — and answers that job's id. A request
         // that would run the mapping under another `securityGroupMappingStrategy`
@@ -248,7 +249,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 "refused: ConflictException",
             );
             return Err(StartNetworkMigrationMappingErrorModeled::ConflictException(
-                crate::state::network_migration_mapping_job_in_progress(&execution_id, &job_id),
+                crate::state::network_migration_job_in_progress(&execution_id),
+            )
+            .into());
+        }
+        // A job of ANOTHER stage of the same execution is work in flight too: this start
+        // is the retry of nothing, and one execution does not run two jobs at once.
+        if store
+            .running_network_migration_job(&account, &definition_id, &execution_id, now)
+            .is_some()
+        {
+            crate::state::audit(
+                ctx.parts(),
+                Self::NAME,
+                &account,
+                &execution_id,
+                "refused: ConflictException",
+            );
+            return Err(StartNetworkMigrationMappingErrorModeled::ConflictException(
+                crate::state::network_migration_job_in_progress(&execution_id),
             )
             .into());
         }
