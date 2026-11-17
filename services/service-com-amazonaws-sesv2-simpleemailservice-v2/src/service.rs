@@ -68,6 +68,16 @@
 //! handed the request whose media type decides it: the transport-level failure
 //! (`override_framework_error`) and the authentication refusal, which the router renders
 //! before this service is asked anything.
+//!
+//! ## The authorization layer every handler runs under
+//!
+//! AWS decides authorization at the IAM layer, in front of the service: a caller whose
+//! identity-based policies do not grant the action is refused HTTP 403 under the error code
+//! `AccessDeniedException` and the call performs nothing. That decision is a property of the
+//! request's identity, the action it names and the resource it addresses rather than of what
+//! a handler goes on to do, so it is taken ONCE here, in [`AuthorizedRoute`], for every API
+//! call this service serves, and nowhere else; [`authorization`] holds the store lookups, the
+//! resource the decision is taken against and the sentence a refusal carries.
 
 use service_common::response_media_type::ResponseMediaType;
 use smithy_server_runtime::{
@@ -78,6 +88,10 @@ use std::sync::Arc;
 use aws_smithy_runtime_api::http::{Request as RtRequest, Response as RtResponse};
 
 pub mod wire;
+
+/// Whether IAM lets a request to this service perform the action it asks for: the decision
+/// [`AuthorizedRoute`] takes in front of every operation.
+pub mod authorization;
 
 /// The route that serves the export file of an export job at the pre-signed URL
 /// `GetExportJob` hands out for it — a path the model binds no operation to, so it is
@@ -329,6 +343,106 @@ const SDK_COLLECTION_LISTINGS: [SdkCollectionListingRoute; 2] = [
     },
 ];
 
+/// Every API call this service serves, served behind the decision AWS takes in FRONT of a
+/// service: IAM's authorization of the action the request asks for.
+///
+/// AWS decides authorization at the IAM layer, ahead of the service looking at what the
+/// request names, so a caller whose policies do not allow the action is refused `403
+/// AccessDeniedException` and the call performs nothing. That decision is a property of the
+/// request's identity, the action it names and the resource it addresses rather than of what
+/// a handler goes on to do, so it is taken ONCE here, for every operation of this service
+/// ([`authorization`] holds the lookups and the sentence), and nowhere else.
+///
+/// It holds no operation of its own: a request it does not refuse is handed to the route that
+/// would have served it — the media-type wrapper over the model's own routing table, or the
+/// listing row that claims the GET-over-the-collection form — so every status, code, message
+/// and body byte of an authorized call stays exactly what it was.
+struct AuthorizedRoute<Eng: Send + Sync + 'static> {
+    /// The shared engine: the IAM and STS stores the decision is read from live there.
+    engine: Arc<Eng>,
+    /// The wrapper every request the model's routing table resolves is served through, so the
+    /// media type this service announces is on the responses the framework renders inside the
+    /// request walk too (see the module header).
+    media_type: AnnouncedMediaTypeRoute,
+    /// Serves each listing of [`SDK_COLLECTION_LISTINGS`] on the method and URI real clients
+    /// send it on.
+    sdk_collection_listings: [SdkCollectionListingRoute; 2],
+}
+
+impl<Eng: Send + Sync + 'static> AuthorizedRoute<Eng> {
+    fn new(engine: Arc<Eng>) -> Self {
+        Self {
+            engine,
+            media_type: AnnouncedMediaTypeRoute,
+            sdk_collection_listings: SDK_COLLECTION_LISTINGS,
+        }
+    }
+
+    /// The operation `req` asks for and the route that serves it, or `None` for a request
+    /// this service serves no API call for.
+    ///
+    /// The routing stays the model's: the key is the one the GENERATED definition's own
+    /// protocol resolves, and the only request claimed beside it is a listing's
+    /// GET-over-the-collection form, whose modelled operation the row names.
+    fn claims<'a>(
+        &'a self,
+        definition: &dyn smithy_server_runtime::ErasedServiceDefinition,
+        req: &'a RtRequest,
+    ) -> Option<(&'a str, &'a dyn ErasedOperation)> {
+        if service_common::response_media_type::routes(definition, req) {
+            let key = definition.protocol().routing_key(req).ok()?;
+            return Some((key, &self.media_type as &dyn ErasedOperation));
+        }
+        self.sdk_collection_listings
+            .iter()
+            .find(|listing| listing.claims(req))
+            .map(|listing| (listing.operation, listing as &dyn ErasedOperation))
+    }
+}
+
+impl<Eng: Send + Sync + 'static> ErasedOperation for AuthorizedRoute<Eng> {
+    fn run<'r>(
+        &'r self,
+        svc: &'r dyn Service,
+        req: &'r RtRequest,
+        ctx: &'r OperationContext<'r>,
+    ) -> BoxFuture<'r, RtResponse> {
+        Box::pin(async move {
+            // The route is resolved inside ONE statement: `&dyn ErasedServiceDefinition` is
+            // not `Sync`, so holding one across the await below would make this future
+            // non-`Send`.
+            let claimed = self.claims(svc.definition(), req);
+            let Some((operation, inner)) = claimed else {
+                // Unreachable through an `override_operation` that claims a request only when
+                // this same method does; answered as the framework answers an unroutable
+                // request rather than guessed at.
+                return announced(req, svc.definition().routing_error_response(req));
+            };
+            // IAM's decision, taken before the operation reads or writes anything: the action
+            // is this operation's own name under this service's namespace, and the resource is
+            // the one the REQUEST addresses. A refused request never reaches the route below,
+            // so it stores nothing, sends nothing and reports nothing.
+            let resource = authorization::addressed_resource(
+                req.uri(),
+                &crate::state::request_region(ctx.parts()),
+            );
+            if let Some(message) =
+                authorization::refusal(&*self.engine, ctx, operation, &resource)
+            {
+                return announced(req, authorization::refusal_response(&message));
+            }
+            inner.run(svc, req, ctx).await
+        })
+    }
+
+    fn auth_schemes(&self) -> Option<&'static [&'static str]> {
+        // `None` is "defer to the modelled operation the routing key names": gating a call
+        // must not change which credentials sign it, and this wrapper is not an operation of
+        // its own.
+        None
+    }
+}
+
 /// The value of the query parameter `name`, percent-decoded, or `None` when the query
 /// string does not carry it.
 ///
@@ -372,15 +486,11 @@ pub struct EmulatedService<Eng: Send + Sync + 'static> {
     /// document of [`wire`]. Built once here because [`Service::override_protocol`]
     /// hands back a borrow of it.
     protocol: wire::NullMessageRestJson,
-    /// Serves each listing of [`SDK_COLLECTION_LISTINGS`] on the method and URI real
-    /// clients send it on; [`Service::override_operation`] hands such a request to the
-    /// row that claims it.
-    sdk_collection_listings: [SdkCollectionListingRoute; 2],
-    /// The wrapper every routable request is served through, so the media type this
-    /// service announces is on the responses the framework renders inside the request
-    /// walk too. Held in a field because [`Service::override_operation`] hands back a
-    /// borrow of it.
-    media_type: AnnouncedMediaTypeRoute,
+    /// Every API call this service serves, behind IAM's authorization of the action
+    /// ([`AuthorizedRoute`]): the media-type wrapper over the model's own routing table and
+    /// the listings of [`SDK_COLLECTION_LISTINGS`]. Held in a field because
+    /// [`Service::override_operation`] hands back a borrow of it.
+    authorized: AuthorizedRoute<Eng>,
     /// Serves a download of an export job's file; [`Service::override_operation`]
     /// hands it the requests it claims. Held in a field for the same reason.
     export_file: export_download::ExportFileRoute<Eng>,
@@ -394,8 +504,7 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
         Self {
             entry: crate::ServiceDefinition::new(Arc::clone(&engine)),
             protocol: wire::NullMessageRestJson::new(),
-            sdk_collection_listings: SDK_COLLECTION_LISTINGS,
-            media_type: AnnouncedMediaTypeRoute,
+            authorized: AuthorizedRoute::new(Arc::clone(&engine)),
             export_file: export_download::ExportFileRoute::new(engine),
         }
     }
@@ -436,31 +545,23 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         &self,
         req: &aws_smithy_runtime_api::http::Request,
     ) -> Option<&dyn ErasedOperation> {
-        // Every request the model's own routing table resolves is served through the
-        // shared media-type wrapper, which delegates to that same table entry and then
-        // announces the media type of what it answered — reaching the responses the
-        // framework renders inside the request walk (see the module header). The routing
-        // stays the model's.
-        if service_common::response_media_type::routes(&self.entry, req) {
-            return Some(&self.media_type);
+        // Every API call this service serves is served through the authorization wrapper,
+        // which takes IAM's decision about the action and then hands the request to the route
+        // that would have served it (see [`AuthorizedRoute`]): the shared media-type wrapper
+        // for every request the model's own routing table resolves — which delegates to that
+        // same table entry and then announces the media type of what it answered, reaching the
+        // responses the framework renders inside the request walk (see the module header) —
+        // and, for what the table cannot resolve, the listings of `SDK_COLLECTION_LISTINGS`.
+        // The checked-in model binds each of those to a POST on a route beside the collection,
+        // while the wire form the service answers — the one every AWS SDK and the CLI send, and
+        // the only one a paginator can follow — is a GET over the collection with the paging
+        // members in the query string. The routing itself stays the model's.
+        if self.authorized.claims(&self.entry, req).is_some() {
+            return Some(&self.authorized as &dyn ErasedOperation);
         }
-        // What it cannot: the listings of `SDK_COLLECTION_LISTINGS`. The checked-in
-        // model binds each of them to a POST on a route beside the collection, while
-        // the wire form the service answers — the one every AWS SDK and the CLI send,
-        // and the only one a paginator can follow — is a GET over the collection with
-        // the paging members in the query string. The route table resolves such a
-        // request to no operation at all, so it is claimed here and served by the
-        // modelled operation itself.
-        if let Some(listing) = self
-            .sdk_collection_listings
-            .iter()
-            .find(|listing| listing.claims(req))
-        {
-            return Some(listing as &dyn ErasedOperation);
-        }
-        // Nor the download of an export job's export file, which is not an API call at
-        // all: it is the artifact `GetExportJob` hands out a pre-signed URL for, served
-        // by the route that owns it (see [`export_download`]).
+        // Not an API call at all: the download of an export job's export file is the artifact
+        // `GetExportJob` hands out a pre-signed URL for, served by the route that owns it (see
+        // [`export_download`]) and authorized by that URL's own signature.
         self.export_file
             .claims(req)
             .map(|_| &self.export_file as &dyn ErasedOperation)

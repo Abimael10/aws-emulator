@@ -15,7 +15,9 @@
 //! Five crates have to agree for that to hold — CloudFormation deploys, IAM answers for the
 //! execution role, Amazon SES holds the set, AWS Lambda runs the handler, and the SES v2 API
 //! serves the handler's own call — so the suite lives here: a crate-local test can only ever
-//! see one side of it.
+//! see one side of it. The handler's call is made BY the execution role, and the email API
+//! decides it against the policies in force on that role, so each row's template grants the
+//! role exactly the two reads its handler makes.
 //!
 //! The rows differ along what the rule generalises over: whether the template NAMES the
 //! configuration set or leaves the name to CloudFormation, and which intrinsic the function's
@@ -253,7 +255,27 @@ fn template(row: &Row) -> String {
                             "Principal": { "Service": "lambda.amazonaws.com" },
                             "Action": "sts:AssumeRole"
                         }]
-                    }
+                    },
+                    // The handler's own call is made BY this role, and the email API decides
+                    // it against the policies in force on it, so the template grants the two
+                    // reads the handler makes and nothing else — without them the function
+                    // reads a `403 AccessDeniedException` instead of the configuration set,
+                    // which is what the API answers an execution role that was never granted
+                    // the action.
+                    "Policies": [{
+                        "PolicyName": "read-configuration-sets",
+                        "PolicyDocument": {
+                            "Version": "2012-10-17",
+                            "Statement": [{
+                                "Effect": "Allow",
+                                "Action": [
+                                    "ses:GetConfigurationSet",
+                                    "ses:ListConfigurationSets"
+                                ],
+                                "Resource": "*"
+                            }]
+                        }
+                    }]
                 }
             },
             "ConfigSet": {

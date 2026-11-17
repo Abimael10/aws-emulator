@@ -87,6 +87,14 @@ base64 = "0.22"
 # not re-derived here. The same crate the other emulated services that publish a CSV
 # artifact write theirs with.
 csv = "1.3"
+# IAM and the token service: a request to this service is decided at the IAM layer before a
+# handler runs (`service::authorization`), which reads WHO the request's credential speaks
+# for out of the token service's session registry and WHAT that principal may do out of
+# IAM's own policy store — each through that service's own accessors, so the documents this
+# gate decides on are the ones `iam:PutRolePolicy` wrote and the principal a refusal blames
+# is the one `sts:GetCallerIdentity` reports.
+service-com-amazonaws-iam-awsidentitymanagementv20100508 = { workspace = true }
+service-com-amazonaws-sts-awssecuritytokenservicev20110615 = { workspace = true }
 # The classic Amazon SES surface, whose store owns what the ACCOUNT does with mail it
 # RECEIVES — its receipt rule sets, the active one, and the actions a matching rule carries
 # out — and which composes the RFC 5322 document a send assembles. Email receiving is one
@@ -106,10 +114,6 @@ hex = { workspace = true }
 # authorization suite, because the topic an event destination names is created and given
 # its access policy through the SNS API the handler reads it through.
 service-com-amazonaws-sns-amazonsimplenotificationservice = { workspace = true }
-# IAM is mounted beside this service on one engine in the Firehose event-destination role
-# suite, because the role an event destination names is created and given its trust policy
-# through the IAM API the handler reads it through.
-service-com-amazonaws-iam-awsidentitymanagementv20100508 = { workspace = true }
 # The AWS SDK for IAM, used by that suite's setup to create those roles over the same
 # in-process hop the handler asks IAM about them through.
 aws-sdk-iam = { version = "1", default-features = false }
@@ -135,10 +139,9 @@ service-com-amazonaws-eventbridge-awsevents = { workspace = true }
 service-com-amazonaws-sqs-amazonsqs = { workspace = true }
 # The whole pipeline a client wires over email events — SES publishes onto the bus, a rule
 # invokes its Lambda target, and the RUNNING handler relays what it was handed onto a queue
-# — is asserted end to end, so Lambda and the token service that mints the handler's role
-# session are mounted beside this service on one engine too.
+# — is asserted end to end, so Lambda is mounted beside this service on one engine too (the
+# token service that mints the handler's role session is a dependency of this crate already).
 service-com-amazonaws-lambda-awsgirapiservice = { workspace = true }
-service-com-amazonaws-sts-awssecuritytokenservicev20110615 = { workspace = true }
 # The deployment package that suite uploads is a .zip archive it writes in memory.
 zip = { version = "9", default-features = false, features = ["deflate"] }
 # `uuid`: the ONE reader of a UUID in this crate's suites — the identifiers this service
