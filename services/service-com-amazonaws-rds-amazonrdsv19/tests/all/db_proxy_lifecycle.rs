@@ -21,18 +21,25 @@
 //! * a delete is ACCEPTED rather than instantaneous: the proxy reports `deleting` from the
 //!   answer onwards and this service takes it away a moment later, after which every read
 //!   of the name is the proxy's own not-found fault, while a proxy no delete resolves and a
-//!   proxy in a state no delete acts on are the two faults that operation models — and a
-//!   delete touches no other proxy.
+//!   proxy whose delete is already running are the two faults that operation models — and a
+//!   delete touches no other proxy. The delete acts on the proxy in WHATEVER status it
+//!   reports, one still coming up and one applying a change included, which the second
+//!   table below spans.
+//!
+//! A transition this service owes is waited for by polling a REPORTING call through the poll
+//! loop this test target shares (`lifecycle_poll_loops::poll_until`), so the CONDITION is
+//! what ends every wait below.
 
 use service_com_amazonaws_rds_amazonrdsv19::state::{
-    DB_PROXY_STATUS_AVAILABLE, DB_PROXY_STATUS_CREATING, DB_PROXY_STATUS_DELETING,
-    DEFAULT_CONNECTION_BORROW_TIMEOUT, DEFAULT_DB_PROXY_TARGET_GROUP,
-    DEFAULT_MAX_CONNECTIONS_PERCENT,
+    db_proxy_not_found_message, DB_PROXY_STATUS_AVAILABLE, DB_PROXY_STATUS_CREATING,
+    DB_PROXY_STATUS_DELETING, DB_PROXY_STATUS_MODIFYING, DEFAULT_CONNECTION_BORROW_TIMEOUT,
+    DEFAULT_DB_PROXY_TARGET_GROUP, DEFAULT_MAX_CONNECTIONS_PERCENT,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::db_instances::{call, emulator, expect_error, expect_ok, text, wait_for_settle};
 use crate::db_proxy_target_groups::create_proxy;
+use crate::lifecycle_poll_loops::poll_until;
 
 /// One row of the modification table: the parameters the call carries beyond the proxy and
 /// the group, and the settings the group must report afterwards.
@@ -100,6 +107,34 @@ async fn read_target_group(router: &MultiServiceRouter, case: &str, proxy: &str)
 /// `DescribeDBProxies` for `proxy`, answered with the status and the body.
 async fn describe_proxy(router: &MultiServiceRouter, proxy: &str) -> (u16, String) {
     call(router, "DescribeDBProxies", &[("DBProxyName", proxy)]).await
+}
+
+/// `DeleteDBProxy` for `proxy`, answered with the status and the body.
+async fn delete_proxy(router: &MultiServiceRouter, proxy: &str) -> (u16, String) {
+    call(router, "DeleteDBProxy", &[("DBProxyName", proxy)]).await
+}
+
+/// Poll the report of `proxy` until it says the proxy is `available`.
+async fn poll_until_available(router: &MultiServiceRouter, case: &str, proxy: &str) {
+    poll_until(
+        case,
+        "the proxy",
+        || describe_proxy(router, proxy),
+        |status, body| status == 200 && text(body, "Status") == DB_PROXY_STATUS_AVAILABLE,
+    )
+    .await;
+}
+
+/// Poll the report of `proxy` until the name resolves no proxy, answering the refusal.
+async fn poll_until_gone(router: &MultiServiceRouter, case: &str, proxy: &str) -> String {
+    let (body, _polls) = poll_until(
+        case,
+        "the deleted proxy",
+        || describe_proxy(router, proxy),
+        |status, _| status == 404,
+    )
+    .await;
+    body
 }
 
 #[tokio::test]
@@ -345,29 +380,10 @@ async fn deleting_a_proxy_puts_it_in_deleting_and_then_takes_it_away() {
         "DBProxyNotFoundFault",
     );
 
-    // A proxy that has not finished coming up is in a state no delete acts on.
-    create_proxy(&router, "emu-del-creating", "MYSQL").await;
-    let creating = expect_error(
-        "a proxy that is still coming up",
-        call(
-            &router,
-            "DeleteDBProxy",
-            &[("DBProxyName", "emu-del-creating")],
-        )
-        .await,
-        400,
-        "InvalidDBProxyStateFault",
-    );
-    assert!(
-        creating.contains(DB_PROXY_STATUS_CREATING),
-        "case \"a proxy that is still coming up\": expected the refusal to name the state \
-         the proxy is in, got {creating}"
-    );
-
     // Two proxies, so the delete of one is shown to leave the other alone.
     create_proxy(&router, "emu-del-target", "MYSQL").await;
     create_proxy(&router, "emu-del-bystander", "POSTGRESQL").await;
-    wait_for_settle();
+    poll_until_available(&router, "the delete of an available proxy", "emu-del-target").await;
 
     let answered = expect_ok(
         "the delete of an available proxy",
@@ -416,7 +432,9 @@ async fn deleting_a_proxy_puts_it_in_deleting_and_then_takes_it_away() {
         "InvalidDBProxyStateFault",
     );
 
-    wait_for_settle();
+    // The removal this service owes the proxy is waited for by polling its report until
+    // the name resolves nothing.
+    poll_until_gone(&router, "the delete of an available proxy", "emu-del-target").await;
 
     // Once the removal is due every read of the name is the proxy's own not-found fault —
     // the report of its target groups included, since the group goes with the proxy.
@@ -444,4 +462,183 @@ async fn deleting_a_proxy_puts_it_in_deleting_and_then_takes_it_away() {
         DB_PROXY_STATUS_AVAILABLE,
         "the other proxy must still be available, got {bystander}"
     );
+}
+
+/// Where in its lifecycle the proxy of a [`DeleteStateCase`] is when its delete arrives.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Stage {
+    /// Nothing but the create has been called, so the proxy is still coming up.
+    JustCreated,
+    /// The proxy has been polled until it reported `available`.
+    Ready,
+    /// The proxy was ready and then given a modification, which it is applying.
+    Modifying,
+}
+
+/// One row of the delete-state table: a proxy, the stage its delete arrives at, and the
+/// statuses it may report at that moment.
+struct DeleteStateCase {
+    case: &'static str,
+    proxy: &'static str,
+    engine_family: &'static str,
+    stage: Stage,
+    /// The statuses the proxy may report immediately before the delete. More than one
+    /// wherever this service's clock is entitled to have settled a transition it owes
+    /// already: what the rule under test says is that the delete is accepted WHATEVER of
+    /// them the proxy reports, so no row depends on how fast the host runs.
+    admissible: &'static [&'static str],
+}
+
+/// The stages a delete can arrive at, each on a proxy of a different `EngineFamily`
+/// (`smithy_query(query="shape", shape="EngineFamily")`: `MYSQL | POSTGRESQL | SQLSERVER`),
+/// so the rows differ along both of the things the rule generalises over: the status the
+/// proxy is in, and what it was created as.
+const DELETE_STATE_CASES: &[DeleteStateCase] = &[
+    DeleteStateCase {
+        case: "a MySQL proxy that is still coming up",
+        proxy: "emu-delstate-creating",
+        engine_family: "MYSQL",
+        stage: Stage::JustCreated,
+        admissible: &[DB_PROXY_STATUS_CREATING, DB_PROXY_STATUS_AVAILABLE],
+    },
+    DeleteStateCase {
+        case: "a PostgreSQL proxy that is ready",
+        proxy: "emu-delstate-ready",
+        engine_family: "POSTGRESQL",
+        stage: Stage::Ready,
+        admissible: &[DB_PROXY_STATUS_AVAILABLE],
+    },
+    DeleteStateCase {
+        case: "a SQL Server proxy that is applying a modification",
+        proxy: "emu-delstate-modifying",
+        engine_family: "SQLSERVER",
+        stage: Stage::Modifying,
+        admissible: &[DB_PROXY_STATUS_MODIFYING, DB_PROXY_STATUS_AVAILABLE],
+    },
+    DeleteStateCase {
+        case: "a SQL Server proxy that is still coming up",
+        proxy: "emu-delstate-creating-sqlserver",
+        engine_family: "SQLSERVER",
+        stage: Stage::JustCreated,
+        admissible: &[DB_PROXY_STATUS_CREATING, DB_PROXY_STATUS_AVAILABLE],
+    },
+];
+
+/// Stand the proxy of `row` up and bring it to the stage its delete arrives at, answering
+/// the status this service reports for it immediately before that delete.
+async fn arrive_at_stage(router: &MultiServiceRouter, row: &DeleteStateCase) -> String {
+    create_proxy(router, row.proxy, row.engine_family).await;
+    match row.stage {
+        Stage::JustCreated => {}
+        Stage::Ready => poll_until_available(router, row.case, row.proxy).await,
+        Stage::Modifying => {
+            poll_until_available(router, row.case, row.proxy).await;
+            let modified = expect_ok(
+                row.case,
+                call(
+                    router,
+                    "ModifyDBProxy",
+                    &[("DBProxyName", row.proxy), ("IdleClientTimeout", "900")],
+                )
+                .await,
+            );
+            let reported = text(&modified, "Status");
+            assert!(
+                row.admissible.contains(&reported.as_str()),
+                "case {:?}: expected the accepted modification to report one of {:?}, got \
+                 {reported:?} in {modified}",
+                row.case,
+                row.admissible
+            );
+        }
+    }
+    let (status, reported) = describe_proxy(router, row.proxy).await;
+    assert_eq!(
+        status, 200,
+        "case {:?}: the proxy must be reported before its delete, got {status} {reported}",
+        row.case
+    );
+    let reported_status = text(&reported, "Status");
+    assert!(
+        row.admissible.contains(&reported_status.as_str()),
+        "case {:?}: expected the proxy to report one of {:?} before its delete, got \
+         {reported_status:?} in {reported}",
+        row.case,
+        row.admissible
+    );
+    reported_status
+}
+
+#[tokio::test]
+async fn a_delete_is_accepted_whatever_status_the_proxy_is_in() {
+    let router = emulator();
+    // A bystander, so every delete below is shown to take only the proxy it named.
+    create_proxy(&router, "emu-delstate-bystander", "MYSQL").await;
+
+    for row in DELETE_STATE_CASES {
+        let before = arrive_at_stage(&router, row).await;
+        let answered = expect_ok(row.case, delete_proxy(&router, row.proxy).await);
+        for (member, expected) in [
+            ("DBProxyName", row.proxy),
+            // The delete is ACCEPTED, not instantaneous: the proxy reports the status it
+            // is leaving in from this answer onwards.
+            ("Status", DB_PROXY_STATUS_DELETING),
+        ] {
+            let actual = text(&answered, member);
+            assert_eq!(
+                actual, expected,
+                "case {:?}: a delete arriving on a proxy reporting {before:?} must be \
+                 accepted with {member} {expected:?}, got {actual:?} in {answered}",
+                row.case
+            );
+        }
+
+        // The proxy leaves this service a moment later, and the name is then the proxy's
+        // own not-found fault — worded as every operation that resolves a `DBProxyName`
+        // words it, with the requested name as the sentence's only variable part.
+        let gone = poll_until_gone(&router, row.case, row.proxy).await;
+        let expected_message = db_proxy_not_found_message(row.proxy);
+        let reported_message = text(&gone, "Message");
+        assert_eq!(
+            reported_message, expected_message,
+            "case {:?}: expected the report of the removed proxy to carry \
+             {expected_message:?}, got {reported_message:?} in {gone}",
+            row.case
+        );
+
+        // And a FURTHER delete of that name is that same not-found fault rather than a
+        // second accepted deletion: a name this service no longer holds names no proxy a
+        // delete could answer with.
+        let refused = expect_error(
+            row.case,
+            delete_proxy(&router, row.proxy).await,
+            404,
+            "DBProxyNotFoundFault",
+        );
+        let message = text(&refused, "Message");
+        assert_eq!(
+            message, expected_message,
+            "case {:?}: expected the delete of a removed proxy to carry \
+             {expected_message:?}, got {message:?} in {refused}",
+            row.case
+        );
+
+        // The one target group the proxy was created with went with it, so the group's own
+        // report is the same not-found fault.
+        expect_error(
+            row.case,
+            call(
+                &router,
+                "DescribeDBProxyTargetGroups",
+                &[("DBProxyName", row.proxy)],
+            )
+            .await,
+            404,
+            "DBProxyNotFoundFault",
+        );
+    }
+
+    // Every delete above took only the proxy it named: the bystander is still there, and
+    // reaches the status this service owes it.
+    poll_until_available(&router, "the bystander proxy", "emu-delstate-bystander").await;
 }

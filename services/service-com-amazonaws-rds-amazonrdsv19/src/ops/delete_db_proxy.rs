@@ -3,7 +3,9 @@
 //! @op DeleteDBProxy
 //! Deletes an RDS proxy: the proxy goes into `deleting` and this service takes it away a
 //! moment later, together with the one target group it was created with and every target
-//! registered in it. This is the ONLY file to touch for this operation.
+//! registered in it. The delete acts on the proxy whatever status it is in — only a delete
+//! that is already running refuses a further one. This is the ONLY file to touch for this
+//! operation.
 //!
 //! ## Shape of an operation
 //!
@@ -158,14 +160,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
-        // "The requested operation can't be performed while the proxy is in this state": a
-        // proxy that has not finished coming up, or whose deletion was already accepted, is
-        // in a state no delete acts on — the state the clock has yet to settle is real.
-        if proxy.status != crate::state::DB_PROXY_STATUS_AVAILABLE {
+        // "The requested operation can't be performed while the proxy is in this state":
+        // the one state a delete cannot be performed in is a delete that is already
+        // running, because the proxy is on its way out of this service and a second delete
+        // has nothing left to accept.
+        //
+        // Every OTHER status accepts the delete, a proxy still coming up or applying a
+        // change included. `DBProxy$Status` documents a status other than `available` as
+        // meaning "you must wait for the proxy to be ready, or take some action to resolve
+        // an issue", and taking the proxy away IS that action: were being ready a
+        // precondition, a proxy that never becomes ready could not be removed at all. It is
+        // also the rule the crate's other deletes follow (`DeleteDBInstance`,
+        // `DeleteDBCluster`, `DeleteDBShardGroup`, `DeleteTenantDatabase`) — a delete does
+        // not need the resource to be up, so a transient status this emulator's clock has
+        // yet to settle does not refuse one.
+        if proxy.is_deleting() {
             return Err(DeleteDBProxyErrorModeled::InvalidDBProxyStateFault(
                 InvalidDBProxyStateFault {
                     message: Some(format!(
-                        "DB proxy {} is in state {} and cannot be deleted",
+                        "DB proxy {} is already being deleted (status {})",
                         input.db_proxy_name, proxy.status
                     )),
                 },
