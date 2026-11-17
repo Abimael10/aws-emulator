@@ -126,8 +126,12 @@ pub enum MembershipRefusal {
     MissingThing(String),
     /// The group is dynamic, so its membership is derived; carries the name.
     DynamicThingGroup(String),
-    /// The thing already belongs to [`MAX_THING_GROUPS_PER_THING`] groups; carries
-    /// the thing's name.
+    /// The same fact, for a request that asked to REMOVE a membership from a dynamic
+    /// group; carries the name. One rule, two directions, so the refusal states the
+    /// direction the request asked for ([`dynamic_group_removal_message`]).
+    DynamicThingGroupRemoval(String),
+    /// The update would leave the thing in more than
+    /// [`MAX_THING_GROUPS_PER_THING`] groups; carries the thing's name.
     TooManyGroupsForThing(String),
     /// The group already holds [`MAX_THINGS_PER_THING_GROUP`] things; carries the
     /// group's name.
@@ -148,8 +152,11 @@ impl MembershipRefusal {
             Self::DynamicThingGroup(thing_group_name) => {
                 dynamic_group_membership_message(thing_group_name)
             }
+            Self::DynamicThingGroupRemoval(thing_group_name) => {
+                dynamic_group_removal_message(thing_group_name)
+            }
             Self::TooManyGroupsForThing(thing_name) => format!(
-                "Thing {thing_name} already belongs to the maximum of \
+                "Thing {thing_name} cannot belong to more than \
                  {MAX_THING_GROUPS_PER_THING} thing groups"
             ),
             Self::ThingGroupFull(thing_group_name) => format!(
@@ -291,12 +298,99 @@ impl super::ComAmazonawsIotAwsiotserviceState {
             ));
         };
         if group.dynamic_query.is_some() {
-            return Err(MembershipRefusal::DynamicThingGroup(
+            return Err(MembershipRefusal::DynamicThingGroupRemoval(
                 thing_group_name.to_string(),
             ));
         }
         if let Some(group) = self.thing_groups.get_mut(thing_group_name) {
             group.members.remove(thing_name);
+        }
+        Ok(())
+    }
+
+    /// Update the groups the thing `thing_name` belongs to in ONE step: leave the
+    /// groups in `thing_groups_to_remove`, then join the groups in
+    /// `thing_groups_to_add`.
+    ///
+    /// The relation written is the one [`Self::add_thing_to_thing_group`] and
+    /// [`Self::remove_thing_from_thing_group`] write, under the same rules: both ends
+    /// have to exist, every group named has to be a STATIC one, and the thing may end
+    /// up in at most [`MAX_THING_GROUPS_PER_THING`] groups. The whole update is checked
+    /// BEFORE any of it is applied, so a request this refuses leaves the membership it
+    /// found — a bulk update is one update, not a sequence of independent ones.
+    ///
+    /// The removals are applied before the additions, so the groups the thing belongs
+    /// to afterwards are exactly `(before - to_remove) + to_add`; a group named by both
+    /// lists therefore holds the thing when the call returns. A group the thing is
+    /// already in, or is already out of, is left as it is: the update names no new
+    /// identity, so repeating it leaves the same memberships.
+    pub fn update_thing_groups_for_thing(
+        &mut self,
+        thing_name: &str,
+        thing_groups_to_add: &[String],
+        thing_groups_to_remove: &[String],
+    ) -> Result<(), MembershipRefusal> {
+        if !self.things.contains_key(thing_name) {
+            return Err(MembershipRefusal::MissingThing(thing_name.to_string()));
+        }
+        for thing_group_name in thing_groups_to_remove {
+            let Some(group) = self.thing_groups.get(thing_group_name) else {
+                return Err(MembershipRefusal::MissingThingGroup(
+                    thing_group_name.clone(),
+                ));
+            };
+            if group.dynamic_query.is_some() {
+                return Err(MembershipRefusal::DynamicThingGroupRemoval(
+                    thing_group_name.clone(),
+                ));
+            }
+        }
+        for thing_group_name in thing_groups_to_add {
+            let Some(group) = self.thing_groups.get(thing_group_name) else {
+                return Err(MembershipRefusal::MissingThingGroup(
+                    thing_group_name.clone(),
+                ));
+            };
+            if group.dynamic_query.is_some() {
+                return Err(MembershipRefusal::DynamicThingGroup(
+                    thing_group_name.clone(),
+                ));
+            }
+            if !group.members.contains(thing_name)
+                && group.members.len() >= MAX_THINGS_PER_THING_GROUP
+            {
+                return Err(MembershipRefusal::ThingGroupFull(thing_group_name.clone()));
+            }
+        }
+
+        // What the update would leave, decided before anything is written: the group
+        // limit is a limit on the membership the thing ENDS UP with, so an update that
+        // leaves as many groups as it joins is within it however many groups it names.
+        let mut groups: std::collections::BTreeSet<String> = self
+            .static_thing_groups_of(thing_name)
+            .into_iter()
+            .collect();
+        for thing_group_name in thing_groups_to_remove {
+            groups.remove(thing_group_name);
+        }
+        for thing_group_name in thing_groups_to_add {
+            groups.insert(thing_group_name.clone());
+        }
+        if groups.len() > MAX_THING_GROUPS_PER_THING {
+            return Err(MembershipRefusal::TooManyGroupsForThing(
+                thing_name.to_string(),
+            ));
+        }
+
+        for thing_group_name in thing_groups_to_remove {
+            if let Some(group) = self.thing_groups.get_mut(thing_group_name) {
+                group.members.remove(thing_name);
+            }
+        }
+        for thing_group_name in thing_groups_to_add {
+            if let Some(group) = self.thing_groups.get_mut(thing_group_name) {
+                group.members.insert(thing_name.to_string());
+            }
         }
         Ok(())
     }

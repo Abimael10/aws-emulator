@@ -21,7 +21,11 @@
 //!   execution, and a group the registry does not hold is a 404;
 //! * a dynamic thing group IS its query: an unparsable `queryString` is
 //!   `InvalidQueryException` (400) with nothing created, and a created one reports the
-//!   query that decides its membership.
+//!   query that decides its membership;
+//! * a BULK update of the groups one thing belongs to
+//!   (`UpdateThingGroupsForThing`) leaves the thing in exactly the groups it belonged
+//!   to, minus the ones it left, plus the ones it joined, under the same rules one add
+//!   or one removal follows — and a refused update applies none of itself.
 //!
 //! Each table spans what the rule generalises over — which end is named by name and
 //! which by ARN, how many members a group has, how deep the hierarchy goes, and the
@@ -31,7 +35,9 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use serde_json::{json, Value};
-use service_com_amazonaws_iot_awsiotservice::state::UNPARSABLE_QUERY_MESSAGE;
+use service_com_amazonaws_iot_awsiotservice::state::{
+    MAX_THING_GROUPS_PER_THING, UNPARSABLE_QUERY_MESSAGE,
+};
 use service_com_amazonaws_iot_awsiotservice::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -106,6 +112,37 @@ impl Emulator {
     async fn add_thing_to_group(&self, body: &Value) -> Reply {
         self.dispatch("PUT", "/thing-groups/addThingToThingGroup", Some(body))
             .await
+    }
+
+    async fn update_thing_groups_for_thing(&self, body: &Value) -> Reply {
+        self.dispatch("PUT", "/thing-groups/updateThingGroupsForThing", Some(body))
+            .await
+    }
+
+    /// The groups a thing reports belonging to, in the order the listing reported them
+    /// (`ListThingGroupsForThing`, `GET /things/{thingName}/thing-groups`).
+    async fn groups_of(&self, case: &str, thing_name: &str) -> Vec<String> {
+        let reply = self
+            .dispatch("GET", &format!("/things/{thing_name}/thing-groups"), None)
+            .await;
+        assert_eq!(
+            reply.status,
+            200,
+            "case {case}: expected the listing to answer 200, got {} body {}",
+            reply.status,
+            reply.text()
+        );
+        reply.json()["thingGroups"]
+            .as_array()
+            .unwrap_or_else(|| panic!("case {case}: no thingGroups in {}", reply.text()))
+            .iter()
+            .map(|group| {
+                group["groupName"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string()
+            })
+            .collect()
     }
 
     async fn list_things_in_group(&self, group_name: &str, query: &str) -> Reply {
@@ -736,5 +773,363 @@ async fn a_dynamic_thing_group_is_its_query() {
     assert!(
         still_static.get("queryString").is_none_or(Value::is_null),
         "case a name a static group holds: the static group must be untouched, got {still_static}"
+    );
+}
+
+/// RULE: a bulk update of one thing's group memberships leaves the thing in exactly the
+/// groups it belonged to, minus the ones the request names to leave, plus the ones it
+/// names to join.
+#[tokio::test]
+async fn a_bulk_update_leaves_the_thing_in_the_groups_the_update_names() {
+    let emulator = Emulator::new();
+    for group_name in ["alpha", "beta", "gamma", "delta"] {
+        assert_eq!(
+            emulator.create_group(group_name, &json!({})).await.status,
+            200,
+            "the group {group_name} a case names must be creatable"
+        );
+    }
+    assert_eq!(emulator.create_thing("sensor-a").await.status, 200);
+    assert_eq!(
+        emulator
+            .add_thing_to_group(&json!({ "thingGroupName": "alpha", "thingName": "sensor-a" }))
+            .await
+            .status,
+        200,
+        "the membership the first case starts from must be writable"
+    );
+
+    // The rows span what the rule generalises over: how many groups are joined and
+    // left in one call, whether a list is absent, whether the same update is repeated,
+    // a group named by both lists, a group the thing is not in being left, and the
+    // `overrideDynamicGroups` flag being set. Each row is applied to the membership the
+    // row before it left, and names the memberships that must hold afterwards.
+    let rows: Vec<(&str, Value, Vec<&str>)> = vec![
+        (
+            "two groups joined at once",
+            json!({ "thingName": "sensor-a", "thingGroupsToAdd": ["beta", "gamma"] }),
+            vec!["alpha", "beta", "gamma"],
+        ),
+        (
+            "one group joined and one left in the same call",
+            json!({
+                "thingName": "sensor-a",
+                "thingGroupsToAdd": ["delta"],
+                "thingGroupsToRemove": ["alpha"],
+            }),
+            vec!["beta", "delta", "gamma"],
+        ),
+        (
+            "a repeat of that same update",
+            json!({
+                "thingName": "sensor-a",
+                "thingGroupsToAdd": ["delta"],
+                "thingGroupsToRemove": ["alpha"],
+            }),
+            vec!["beta", "delta", "gamma"],
+        ),
+        (
+            "removals only",
+            json!({ "thingName": "sensor-a", "thingGroupsToRemove": ["beta", "gamma"] }),
+            vec!["delta"],
+        ),
+        (
+            "a group named by both lists",
+            json!({
+                "thingName": "sensor-a",
+                "thingGroupsToAdd": ["delta"],
+                "thingGroupsToRemove": ["delta"],
+            }),
+            vec!["delta"],
+        ),
+        (
+            "neither list",
+            json!({ "thingName": "sensor-a" }),
+            vec!["delta"],
+        ),
+        (
+            "a group the thing is not in, named to be left",
+            json!({ "thingName": "sensor-a", "thingGroupsToRemove": ["alpha"] }),
+            vec!["delta"],
+        ),
+        (
+            "every group left",
+            json!({ "thingName": "sensor-a", "thingGroupsToRemove": ["delta"] }),
+            vec![],
+        ),
+        (
+            "a static group joined with overrideDynamicGroups set",
+            json!({
+                "thingName": "sensor-a",
+                "thingGroupsToAdd": ["alpha"],
+                "overrideDynamicGroups": true,
+            }),
+            vec!["alpha"],
+        ),
+    ];
+
+    for (case, body, expected) in &rows {
+        let reply = emulator.update_thing_groups_for_thing(body).await;
+        assert_eq!(
+            reply.status,
+            200,
+            "case {case}: expected 200, got {} body {}",
+            reply.status,
+            reply.text()
+        );
+        let groups = emulator.groups_of(case, "sensor-a").await;
+        let expected: Vec<String> = expected.iter().map(|name| (*name).to_string()).collect();
+        assert_eq!(
+            groups, expected,
+            "case {case}: expected the thing in {expected:?}, got {groups:?}"
+        );
+        // The relation has ONE record, so the group's own reader agrees with the
+        // thing's: a group the thing is in reports it, and one it is not in does not.
+        for group_name in ["alpha", "beta", "gamma", "delta"] {
+            let members = emulator.things_in(case, group_name, "").await;
+            let holds = expected.iter().any(|name| name == group_name);
+            assert_eq!(
+                members.contains(&"sensor-a".to_string()),
+                holds,
+                "case {case}: group {group_name} must {} the thing, got {members:?}",
+                if holds { "hold" } else { "not hold" }
+            );
+        }
+    }
+}
+
+/// RULE: a bulk update is ONE update — it is refused whole, under the rules a single
+/// add or removal follows, and a refused update applies none of itself.
+#[tokio::test]
+async fn a_refused_bulk_update_changes_no_membership() {
+    let emulator = Emulator::new();
+    for group_name in ["alpha", "beta"] {
+        assert_eq!(
+            emulator.create_group(group_name, &json!({})).await.status,
+            200
+        );
+    }
+    assert_eq!(
+        emulator
+            .create_dynamic_group("derived", &json!({ "queryString": "attributes.zone:north" }))
+            .await
+            .status,
+        200,
+        "the dynamic group a case names must be creatable"
+    );
+    assert_eq!(emulator.create_thing("sensor-a").await.status, 200);
+    assert_eq!(
+        emulator
+            .add_thing_to_group(&json!({ "thingGroupName": "alpha", "thingName": "sensor-a" }))
+            .await
+            .status,
+        200
+    );
+
+    let rows: Vec<(&str, Value, u16, &str, String)> = vec![
+        (
+            "a thing the registry does not hold",
+            json!({ "thingName": "no-such-sensor", "thingGroupsToAdd": ["beta"] }),
+            404,
+            "ResourceNotFoundException",
+            format!("Thing {ACCOUNT_ID}:no-such-sensor not found."),
+        ),
+        (
+            "a group to join the registry does not hold, beside one it does",
+            json!({ "thingName": "sensor-a", "thingGroupsToAdd": ["beta", "no-such-fleet"] }),
+            404,
+            "ResourceNotFoundException",
+            format!("ThingGroup {ACCOUNT_ID}:no-such-fleet not found."),
+        ),
+        (
+            "a group to leave the registry does not hold",
+            json!({
+                "thingName": "sensor-a",
+                "thingGroupsToAdd": ["beta"],
+                "thingGroupsToRemove": ["no-such-fleet"],
+            }),
+            404,
+            "ResourceNotFoundException",
+            format!("ThingGroup {ACCOUNT_ID}:no-such-fleet not found."),
+        ),
+        (
+            "a group to join whose membership is its query's",
+            json!({ "thingName": "sensor-a", "thingGroupsToAdd": ["beta", "derived"] }),
+            400,
+            "InvalidRequestException",
+            "Cannot add a thing to the dynamic thing group derived: a dynamic thing group's \
+             membership is defined by its query"
+                .to_string(),
+        ),
+        (
+            "a group to leave whose membership is its query's",
+            json!({
+                "thingName": "sensor-a",
+                "thingGroupsToAdd": ["beta"],
+                "thingGroupsToRemove": ["derived"],
+            }),
+            400,
+            "InvalidRequestException",
+            "Cannot remove a thing from the dynamic thing group derived: a dynamic thing group's \
+             membership is defined by its query"
+                .to_string(),
+        ),
+        (
+            "no thing named at all",
+            json!({ "thingGroupsToAdd": ["beta"] }),
+            400,
+            "InvalidRequestException",
+            "thingName must name the thing whose group memberships will be updated".to_string(),
+        ),
+    ];
+
+    for (case, body, status, code, message) in &rows {
+        let reply = emulator.update_thing_groups_for_thing(body).await;
+        assert_eq!(
+            reply.status, *status,
+            "case {case}: expected {status}, got {} body {}",
+            reply.status,
+            reply.text()
+        );
+        assert_eq!(
+            &reply.error_code(),
+            code,
+            "case {case}: got {}",
+            reply.text()
+        );
+        assert_eq!(
+            &reply.error_message(),
+            message,
+            "case {case}: got {}",
+            reply.text()
+        );
+        // None of the update was applied: the group every refused row also named is
+        // still not one the thing belongs to, and the one it started in still is.
+        let groups = emulator.groups_of(case, "sensor-a").await;
+        assert_eq!(
+            groups,
+            vec!["alpha".to_string()],
+            "case {case}: a refused update must leave the membership it found, got {groups:?}"
+        );
+    }
+}
+
+/// RULE: a thing may belong to at most the published number of thing groups (AWS IoT's
+/// "Maximum number of thing groups a thing can belong to"), and the limit is on the
+/// membership the update LEAVES — so an update that leaves as many groups as it joins
+/// is within it.
+#[tokio::test]
+async fn a_bulk_update_is_bounded_by_the_group_limit_for_a_thing() {
+    let emulator = Emulator::new();
+    // One group more than the limit, so the table covers the bound exactly and one
+    // past it.
+    let group_names: Vec<String> = (0..=MAX_THING_GROUPS_PER_THING)
+        .map(|index| format!("limit-{index:02}"))
+        .collect();
+    for group_name in &group_names {
+        assert_eq!(
+            emulator.create_group(group_name, &json!({})).await.status,
+            200,
+            "the group {group_name} must be creatable"
+        );
+    }
+    assert_eq!(emulator.create_thing("sensor-a").await.status, 200);
+
+    let over_the_limit =
+        format!("Thing sensor-a cannot belong to more than {MAX_THING_GROUPS_PER_THING} thing groups");
+
+    // One past the bound, in one call: refused, and nothing joined.
+    let refused = emulator
+        .update_thing_groups_for_thing(
+            &json!({ "thingName": "sensor-a", "thingGroupsToAdd": group_names }),
+        )
+        .await;
+    assert_eq!(
+        refused.status,
+        400,
+        "case one group past the limit at once: expected 400, got {} body {}",
+        refused.status,
+        refused.text()
+    );
+    assert_eq!(
+        refused.error_message(),
+        over_the_limit,
+        "case one group past the limit at once: got {}",
+        refused.text()
+    );
+    let groups = emulator
+        .groups_of("one group past the limit at once", "sensor-a")
+        .await;
+    assert!(
+        groups.is_empty(),
+        "case one group past the limit at once: expected no membership written, got {groups:?}"
+    );
+
+    // Exactly the bound: accepted.
+    let at_the_bound: Vec<String> = group_names[..MAX_THING_GROUPS_PER_THING].to_vec();
+    assert_eq!(
+        emulator
+            .update_thing_groups_for_thing(
+                &json!({ "thingName": "sensor-a", "thingGroupsToAdd": at_the_bound }),
+            )
+            .await
+            .status,
+        200,
+        "case exactly the limit: the update must be accepted"
+    );
+    let groups = emulator.groups_of("exactly the limit", "sensor-a").await;
+    assert_eq!(
+        groups, at_the_bound,
+        "case exactly the limit: expected {at_the_bound:?}, got {groups:?}"
+    );
+
+    // One more group on top of the bound: refused, membership untouched.
+    let last = group_names[MAX_THING_GROUPS_PER_THING].clone();
+    let refused = emulator
+        .update_thing_groups_for_thing(
+            &json!({ "thingName": "sensor-a", "thingGroupsToAdd": [last.clone()] }),
+        )
+        .await;
+    assert_eq!(
+        refused.status,
+        400,
+        "case one group past a full membership: expected 400, got {} body {}",
+        refused.status,
+        refused.text()
+    );
+    assert_eq!(
+        refused.error_message(),
+        over_the_limit,
+        "case one group past a full membership: got {}",
+        refused.text()
+    );
+    let groups = emulator
+        .groups_of("one group past a full membership", "sensor-a")
+        .await;
+    assert_eq!(
+        groups, at_the_bound,
+        "case one group past a full membership: expected {at_the_bound:?}, got {groups:?}"
+    );
+
+    // Leaving one group and joining another in the same call stays within the bound.
+    let swapped = emulator
+        .update_thing_groups_for_thing(&json!({
+            "thingName": "sensor-a",
+            "thingGroupsToAdd": [last.clone()],
+            "thingGroupsToRemove": [group_names[0].clone()],
+        }))
+        .await;
+    assert_eq!(
+        swapped.status,
+        200,
+        "case one group swapped for another: expected 200, got {} body {}",
+        swapped.status,
+        swapped.text()
+    );
+    let expected: Vec<String> = group_names[1..].to_vec();
+    let groups = emulator.groups_of("one group swapped for another", "sensor-a").await;
+    assert_eq!(
+        groups, expected,
+        "case one group swapped for another: expected {expected:?}, got {groups:?}"
     );
 }

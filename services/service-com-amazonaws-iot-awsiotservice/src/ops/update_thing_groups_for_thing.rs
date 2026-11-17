@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateThingGroupsForThing
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateThingGroupsForThing`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateThingGroupsForThing::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -145,18 +136,81 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateThingGroupsForThing` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateThingGroupsForThingErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            UpdateThingGroupsForThingErrorModeled::InternalFailureException(
+                InternalFailureException {
+                    message: Some("the IoT emulator has no state store attached".to_string()),
+                },
+            )
+        })?;
+        let _ = ctx;
+
+        // "The thing whose group memberships will be updated": the update is about ONE
+        // thing, and `thingName` is the only member that names it — the two group lists
+        // hold `ThingGroupName`s and not ARNs
+        // (`smithy_query(query="shape",shape="ThingGroupList")`). A request that names no
+        // thing asks for no membership change at all: the modelled
+        // `InvalidRequestException` (HTTP 400).
+        let Some(thing_name) = input
+            .thing_name
+            .as_deref()
+            .filter(|thing_name| !thing_name.is_empty())
+        else {
+            return Err(
+                UpdateThingGroupsForThingErrorModeled::InvalidRequestException(
+                    InvalidRequestException {
+                        message: Some(
+                            "thingName must name the thing whose group memberships will be \
+                             updated"
+                                .to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // One membership update
+        // ([`crate::state::ComAmazonawsIotAwsiotserviceState::update_thing_groups_for_thing`]),
+        // over the same relation `AddThingToThingGroup` and `RemoveThingFromThingGroup`
+        // write and under the same rules: both ends have to exist, every group named has
+        // to be a static one, and the thing ends up in at most the published number of
+        // groups. The whole update is checked BEFORE any of it is applied, so a refused
+        // bulk update leaves the memberships it found — one call is one update.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateThingGroupsForThing"))
+        // `overrideDynamicGroups` is "Override dynamic thing groups with static thing
+        // groups when 10-group limit is reached": it only applies where a thing is at the
+        // group limit BECAUSE of dynamic groups, and a dynamic group's membership is
+        // never written here, so there is no dynamic membership for it to override.
+        let _ = input.override_dynamic_groups;
+        let thing_groups_to_add = input.thing_groups_to_add.unwrap_or_default();
+        let thing_groups_to_remove = input.thing_groups_to_remove.unwrap_or_default();
+        let refusal = state.lock().update_thing_groups_for_thing(
+            thing_name,
+            &thing_groups_to_add,
+            &thing_groups_to_remove,
+        );
+        match refusal {
+            Ok(()) => Ok(UpdateThingGroupsForThingOutput {}),
+            Err(
+                refusal @ (crate::state::MembershipRefusal::MissingThing(_)
+                | crate::state::MembershipRefusal::MissingThingGroup(_)),
+            ) => Err(
+                UpdateThingGroupsForThingErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(refusal.message()),
+                    },
+                )
+                .into(),
+            ),
+            Err(refusal) => Err(
+                UpdateThingGroupsForThingErrorModeled::InvalidRequestException(
+                    InvalidRequestException {
+                        message: Some(refusal.message()),
+                    },
+                )
+                .into(),
+            ),
+        }
     }
 }

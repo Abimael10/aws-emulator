@@ -206,18 +206,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )
                 .into(),
             ),
-            Err(crate::state::MembershipRefusal::DynamicThingGroup(dynamic_group)) => Err(
-                RemoveThingFromThingGroupErrorModeled::InvalidRequestException(
-                    InvalidRequestException {
-                        message: Some(
-                            crate::state::thing_group_membership::dynamic_group_removal_message(
-                                &dynamic_group,
-                            ),
-                        ),
-                    },
-                )
-                .into(),
-            ),
+            // A DYNAMIC group states the rule in the direction the request asked for —
+            // the refusal itself carries that wording
+            // ([`crate::state::MembershipRefusal::DynamicThingGroupRemoval`]) — so every
+            // other refusal of a deletion is the modelled `InvalidRequestException`
+            // (HTTP 400) with the refusal's own message.
             Err(refusal) => Err(
                 RemoveThingFromThingGroupErrorModeled::InvalidRequestException(
                     InvalidRequestException {
