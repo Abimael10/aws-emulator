@@ -84,7 +84,10 @@ async fn source_cluster(
 }
 
 /// `DescribeDBClusters` naming one cluster, polled until it reports `available`.
-async fn poll_cluster_until_available(
+///
+/// `pub(crate)` so the sibling suites of this one test target wait for that CONDITION through
+/// this loop rather than growing a second copy of it.
+pub(crate) async fn poll_cluster_until_available(
     router: &MultiServiceRouter,
     case: &str,
     identifier: &str,
@@ -100,7 +103,9 @@ async fn poll_cluster_until_available(
 }
 
 /// `DescribeDBClusters` for one cluster, as the HTTP status and the body.
-async fn read_cluster(router: &MultiServiceRouter, identifier: &str) -> (u16, String) {
+///
+/// `pub(crate)` for the same reason as [`poll_cluster_until_available`].
+pub(crate) async fn read_cluster(router: &MultiServiceRouter, identifier: &str) -> (u16, String) {
     call(
         router,
         "DescribeDBClusters",

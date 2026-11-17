@@ -1,15 +1,22 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op RestoreDBClusterToPointInTime
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `RestoreDBClusterToPointInTime`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`RestoreDBClusterToPointInTime::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Creates a NEW DB cluster from a LIVE source DB cluster: "the target DB cluster is created
+//! from the source DB cluster with the same configuration as the original DB cluster, except
+//! that the new DB cluster is created with the default DB security group", with every member
+//! this request names overriding that configuration, and the DATA the source held at the
+//! point asked for is loaded into the restored cluster's own storage before its endpoint is
+//! published. The restored cluster is a resource of its own — its own resource id, endpoint
+//! and creation time — and is answered `creating`, reaching `available` on the clock, exactly
+//! as `CreateDBCluster`'s is.
+//!
+//! WHICH point: `UseLatestRestorableTime` restores the newest point the source can be
+//! restored to, which is its volume as it stands; `RestoreToTime` restores a time inside the
+//! window the source's automated backup covers; and `RestoreType` `copy-on-write` CLONES the
+//! source — "the new DB cluster is restored as a clone of the source DB cluster" — which is
+//! the source's volume as it stands, after which the two diverge, because the clone's storage
+//! is its own.
 //!
 //! ## Shape of an operation
 //!
@@ -359,18 +366,1323 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `RestoreDBClusterToPointInTime` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(RestoreDBClusterToPointInTimeErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("RestoreDBClusterToPointInTime"))
+        let mut input = input;
+        let region = crate::state::request_region(ctx)
+            .map_err(RestoreDBClusterToPointInTimeError::validation)?;
+
+        // The cluster this call CREATES, keyed the way every other cluster is: the member is
+        // "stored as a lowercase string", so the folded identifier is the key, held here to
+        // the grammar every DB cluster identifier is assigned under. The per-cluster-type
+        // LENGTH bound is applied once the source is resolved, because this operation
+        // publishes no `Engine` at all: the restored cluster is of the SOURCE cluster's type.
+        crate::state::check_identifier(
+            crate::state::DB_CLUSTER_IDENTIFIER_MEMBER,
+            &input.db_cluster_identifier,
+            crate::state::MAX_DB_CLUSTER_LOOKUP_IDENTIFIER_LEN,
+        )
+        .map_err(RestoreDBClusterToPointInTimeError::invalid_parameter_value)?;
+        let identifier = input.db_cluster_identifier.to_ascii_lowercase();
+        let key = (region.clone(), identifier.clone());
+
+        // WHICH cluster this restore reads, and WHICH point of it: the two halves of this
+        // operation's own contract, read off the request before any record is.
+        let reference = source_reference(&input)?;
+        let point = restore_point(&input)?;
+
+        // Every stored list and every stored free-form value is BOUNDED before anything is
+        // resolved or stored, under the caps `CreateDBCluster` writes one under: these
+        // members publish no bound of their own and all of them enter the store.
+        let requested_tags = input.tags.take().unwrap_or_default();
+        crate::state::check_tags(&requested_tags)
+            .map_err(RestoreDBClusterToPointInTimeError::invalid_parameter_value)?;
+        let vpc_security_group_ids = input.vpc_security_group_ids.take().unwrap_or_default();
+        crate::state::check_security_group_memberships(
+            "VpcSecurityGroupIds",
+            &vpc_security_group_ids,
+        )
+        .map_err(RestoreDBClusterToPointInTimeError::invalid_parameter_value)?;
+        let cloudwatch_logs_exports = input
+            .enable_cloudwatch_logs_exports
+            .take()
+            .unwrap_or_default();
+        crate::state::check_request_list_len(
+            "EnableCloudwatchLogsExports",
+            cloudwatch_logs_exports.len(),
+            crate::state::MAX_CLUSTER_LIST_ENTRIES,
+        )
+        .map_err(RestoreDBClusterToPointInTimeError::invalid_parameter_value)?;
+        for value in &cloudwatch_logs_exports {
+            crate::state::check_free_form("EnableCloudwatchLogsExports", value)
+                .map_err(RestoreDBClusterToPointInTimeError::invalid_parameter_value)?;
+        }
+        // `AssociatedRoles` and both strings each entry carries are STORED on the restored
+        // cluster, so each is bounded here: `RoleArn`'s length is the model's
+        // ([`crate::state::MAX_IAM_ROLE_ARN_LEN`]) while `FeatureName` publishes none at all.
+        let associated_roles = input.associated_roles.take().unwrap_or_default();
+        crate::state::check_request_list_len(
+            "AssociatedRoles",
+            associated_roles.len(),
+            crate::state::MAX_CLUSTER_LIST_ENTRIES,
+        )
+        .map_err(RestoreDBClusterToPointInTimeError::invalid_parameter_value)?;
+        for role in &associated_roles {
+            crate::state::check_stored_text(
+                "AssociatedRoles.RoleArn",
+                &role.role_arn,
+                crate::state::MAX_IAM_ROLE_ARN_LEN,
+            )
+            .map_err(RestoreDBClusterToPointInTimeError::invalid_parameter_value)?;
+            if let Some(feature_name) = &role.feature_name {
+                crate::state::check_free_form("AssociatedRoles.FeatureName", feature_name)
+                    .map_err(RestoreDBClusterToPointInTimeError::invalid_parameter_value)?;
+            }
+        }
+        for (member, value) in [
+            ("DBClusterInstanceClass", input.db_cluster_instance_class.as_deref()),
+            ("DBClusterParameterGroupName", input.db_cluster_parameter_group_name.as_deref()),
+            ("Domain", input.domain.as_deref()),
+            ("DomainIAMRoleName", input.domain_iam_role_name.as_deref()),
+            ("KmsKeyId", input.kms_key_id.as_deref()),
+            ("MonitoringRoleArn", input.monitoring_role_arn.as_deref()),
+            ("OptionGroupName", input.option_group_name.as_deref()),
+            ("PerformanceInsightsKMSKeyId", input.performance_insights_kms_key_id.as_deref()),
+            ("PreferredBackupWindow", input.preferred_backup_window.as_deref()),
+        ] {
+            if let Some(value) = value {
+                crate::state::check_free_form(member, value)
+                    .map_err(RestoreDBClusterToPointInTimeError::invalid_parameter_value)?;
+            }
+        }
+
+        // The documented constraints of the values this request carries that hold whatever
+        // the source cluster turns out to be, each refused with the Query API error code the
+        // real service answers it with — a value outside what a parameter accepts is
+        // `InvalidParameterValue`, parameters that cannot hold together are
+        // `InvalidParameterCombination` — never with a 501.
+        if let Some(port) = input.port {
+            // "Constraints: A value from 1150-65535."
+            if !crate::state::PORT_RANGE.contains(&port) {
+                return Err(
+                    RestoreDBClusterToPointInTimeError::invalid_parameter_value(format!(
+                        "invalid value {port} for Port: must be a value from {} to {}",
+                        crate::state::PORT_RANGE.start(),
+                        crate::state::PORT_RANGE.end()
+                    )),
+                );
+            }
+        }
+        if let Some(period) = input.backup_retention_period {
+            // "Must be a value from 1 to 35."
+            crate::state::check_backup_retention_period(
+                period,
+                &crate::state::CLUSTER_BACKUP_RETENTION_RANGE,
+            )
+            .map_err(RestoreDBClusterToPointInTimeError::invalid_parameter_value)?;
+        }
+        if let Some(period) = input.performance_insights_retention_period {
+            crate::state::check_performance_insights_retention_period(period)
+                .map_err(RestoreDBClusterToPointInTimeError::invalid_parameter_value)?;
+        }
+        if let Some(window) = input.backtrack_window {
+            // "If specified, this value must be set to a number from 0 to 259,200 (72
+            // hours)"; whether the restored cluster's engine can backtrack at all is settled
+            // below, once the source names that engine.
+            if !crate::state::BACKTRACK_WINDOW_RANGE.contains(&window) {
+                return Err(
+                    RestoreDBClusterToPointInTimeError::invalid_parameter_value(format!(
+                        "invalid value {window} for BacktrackWindow: must be a value from {} \
+                         to {} seconds",
+                        crate::state::BACKTRACK_WINDOW_RANGE.start(),
+                        crate::state::BACKTRACK_WINDOW_RANGE.end()
+                    )),
+                );
+            }
+        }
+        if let Some(network_type) = &input.network_type {
+            // "Valid Values: IPV4 | DUAL"; which cluster TYPE may be given one is settled
+            // below, with the rest of the per-type members.
+            if !crate::state::NETWORK_TYPES
+                .iter()
+                .any(|known| known.eq_ignore_ascii_case(network_type))
+            {
+                return Err(
+                    RestoreDBClusterToPointInTimeError::invalid_parameter_value(format!(
+                        "invalid value {network_type} for NetworkType: must be one of {}",
+                        crate::state::NETWORK_TYPES.join(" | ")
+                    )),
+                );
+            }
+        }
+        crate::state::check_engine_lifecycle_support(
+            input
+                .engine_lifecycle_support
+                .as_deref()
+                .unwrap_or(crate::state::DEFAULT_ENGINE_LIFECYCLE_SUPPORT),
+        )
+        .map_err(RestoreDBClusterToPointInTimeError::invalid_parameter_value)?;
+        // `EngineMode`: "Specify provisioned or serverless" — the value's own DOMAIN is the
+        // two the member publishes, checked here against the request alone; whether the
+        // engine VERSION the restored cluster runs serves that mode is a capability of the
+        // version, answered under the store below.
+        if let Some(mode) = &input.engine_mode {
+            if !crate::state::DB_CLUSTER_ENGINE_MODES
+                .iter()
+                .any(|known| known.eq_ignore_ascii_case(mode))
+            {
+                return Err(
+                    RestoreDBClusterToPointInTimeError::invalid_parameter_value(format!(
+                        "invalid value {mode} for EngineMode: must be one of {}",
+                        crate::state::DB_CLUSTER_ENGINE_MODES.join(" | ")
+                    )),
+                );
+            }
+        }
+        // The two members that restore a cluster WITHOUT its VPC network interface: "These
+        // two parameters must always be specified together", "EnableInternetAccessGateway …
+        // must be used together with EnableVPCNetworking set to false" and "When both
+        // parameters are specified, IAM database authentication is required. You must also
+        // specify EnableIAMDatabaseAuthentication". The cluster TYPE both are valid for is
+        // checked below, where the source names it.
+        let networking = match (input.enable_vpc_networking, input.enable_internet_access_gateway) {
+            (None, None) => None,
+            (Some(_), None) | (None, Some(_)) => {
+                return Err(
+                    RestoreDBClusterToPointInTimeError::invalid_parameter_combination(
+                        "EnableVPCNetworking and EnableInternetAccessGateway must always be \
+                         specified together",
+                    ),
+                )
+            }
+            (Some(vpc_networking), Some(internet_access_gateway)) => {
+                if input.enable_iam_database_authentication != Some(true) {
+                    return Err(
+                        RestoreDBClusterToPointInTimeError::invalid_parameter_combination(
+                            "EnableVPCNetworking and EnableInternetAccessGateway require IAM \
+                             database authentication: specify \
+                             EnableIAMDatabaseAuthentication as well",
+                        ),
+                    );
+                }
+                if internet_access_gateway && vpc_networking {
+                    return Err(
+                        RestoreDBClusterToPointInTimeError::invalid_parameter_combination(
+                            "EnableInternetAccessGateway must be used together with \
+                             EnableVPCNetworking set to false",
+                        ),
+                    );
+                }
+                Some((vpc_networking, internet_access_gateway))
+            }
+        };
+        // `TagSpecifications` assigns tags to "resources associated with the DB cluster", and
+        // the one resource type this member publishes for it is `cluster-auto-backup`, "the
+        // DB cluster's automated backup". This service holds no DB cluster automated backup
+        // as a resource of its own, so there is nothing here for those tags to be assigned
+        // TO; the restored cluster's own tags are `Tags`, which this member is not. The same
+        // goes for `RdsCustomClusterConfiguration`, which configures an RDS Custom cluster
+        // this service hosts no engine for, exactly as `CreateDBCluster` leaves it.
+        let _ = (&input.tag_specifications, &input.rds_custom_cluster_configuration);
+
+        // No store means this service was mounted on an engine it has no state in, so it
+        // cannot serve the operation at all. Unreachable with the engine the router builds;
+        // 501 is the honest answer, never a fabricated cluster.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(Self::NAME));
+        };
+
+        // What this restore READS and what it is REFUSED for, decided under the store's
+        // guard — which is then released, because copying the source's volume, opening the
+        // restored cluster's engine endpoint and loading that data into it are awaited work.
+        let resolved = {
+            let mut store = state.lock();
+            store.settle_due_transitions(&region);
+
+            // The SOURCE is resolved first: a restore of a cluster that does not exist is
+            // the modelled `DBClusterNotFoundFault`, whatever the other members say.
+            let source = {
+                let Some(record) = resolve_source(&store, &region, &reference) else {
+                    return Err(source_cluster_not_found(reference.as_requested()));
+                };
+                // The request may name the source by EITHER member, so a request that names
+                // it by both must name ONE cluster: two references to two clusters name no
+                // single source to restore.
+                if let Some(resource_id) = named_resource_id(&input) {
+                    if resource_id != record.resource_id {
+                        return Err(
+                            RestoreDBClusterToPointInTimeError::invalid_parameter_combination(
+                                format!(
+                                    "SourceDBClusterIdentifier and SourceDbClusterResourceId \
+                                     must name the same DB cluster: {} has the resource id {}",
+                                    record.identifier, record.resource_id
+                                ),
+                            ),
+                        );
+                    }
+                }
+                // A point-in-time restore reads a cluster that is UP: one still being
+                // created, stopped, failing over, modifying or on its way out is the
+                // modelled cluster state fault rather than a restore of a cluster that was
+                // not there to read. The status the clock has yet to settle is real, so a
+                // restore asked for immediately after the create is refused exactly as the
+                // real service refuses it.
+                if record.status != crate::state::DB_CLUSTER_STATUS_AVAILABLE {
+                    return Err(
+                        RestoreDBClusterToPointInTimeErrorModeled::InvalidDBClusterStateFault(
+                            InvalidDBClusterStateFault {
+                                message: Some(crate::state::cluster_state_message(
+                                    &record.identifier,
+                                    &record.status,
+                                    crate::state::DB_CLUSTER_STATUS_AVAILABLE,
+                                )),
+                            },
+                        )
+                        .into(),
+                    );
+                }
+                // The restored cluster is of the source's TYPE, so the identifier it is
+                // given is held to that type's own length bound — "1 to 63 (for Aurora DB
+                // clusters) or 1 to 52 (for Multi-AZ DB clusters)" — and so are the members
+                // documented for one cluster type only.
+                crate::state::check_identifier(
+                    crate::state::DB_CLUSTER_IDENTIFIER_MEMBER,
+                    &input.db_cluster_identifier,
+                    crate::state::db_cluster_identifier_max_len(&record.engine),
+                )
+                .map_err(RestoreDBClusterToPointInTimeError::invalid_parameter_value)?;
+                check_members_of_source_type(&input, &record.engine, networking)?;
+
+                // WHICH data the restored cluster starts from. "Users can restore to any
+                // point in time before LatestRestorableTime for up to BackupRetentionPeriod
+                // days": the window is the one the source's automated backup covers
+                // ([`crate::state::DbClusterRecord::restore_window`]), and a time outside it
+                // is a value the parameter does not accept.
+                let volume = match point {
+                    // A clone is of the source volume as it stands, so it needs no backup
+                    // to read: "copy-on-write — the new DB cluster is restored as a clone of
+                    // the source DB cluster."
+                    RestorePoint::Clone => SourceVolume::AsItStands,
+                    RestorePoint::Latest => {
+                        if record.restore_window().is_none() {
+                            return Err(no_restorable_time(&record.identifier));
+                        }
+                        SourceVolume::AsItStands
+                    }
+                    RestorePoint::At(at) => {
+                        let Some((earliest, latest)) = record.restore_window() else {
+                            return Err(no_restorable_time(&record.identifier));
+                        };
+                        if at.as_secs_f64() < earliest.as_secs_f64()
+                            || at.as_secs_f64() > latest.as_secs_f64()
+                        {
+                            return Err(
+                                RestoreDBClusterToPointInTimeError::invalid_parameter_value(
+                                    outside_the_restore_window_message(at, earliest, latest),
+                                ),
+                            );
+                        }
+                        // The consistent points this service holds for a cluster are the
+                        // ones it kept the data of ([`crate::state::BacktrackPoint`]), so a
+                        // restore inside the window starts from the newest point at or
+                        // before the time asked for, and from the volume as it stands where
+                        // the source kept no earlier point at all.
+                        match record.backtrack_point_at(at) {
+                            Some(kept) => SourceVolume::Kept(kept.storage.clone()),
+                            None => SourceVolume::AsItStands,
+                        }
+                    }
+                };
+
+                SourceCluster {
+                    identifier: record.identifier.clone(),
+                    engine: record.engine.clone(),
+                    engine_version: record.engine_version.clone(),
+                    engine_mode: record.engine_mode.clone(),
+                    database_name: record.database_name.clone(),
+                    master_username: record.master_username.clone(),
+                    master_user_password: record.master_user_password.clone(),
+                    port: record.port,
+                    availability_zones: record.availability_zones.clone(),
+                    backup_retention_period: record.backup_retention_period,
+                    preferred_backup_window: record.preferred_backup_window.clone(),
+                    preferred_maintenance_window: record.preferred_maintenance_window.clone(),
+                    db_cluster_parameter_group_name: record
+                        .db_cluster_parameter_group_name
+                        .clone(),
+                    db_subnet_group_name: record.db_subnet_group_name.clone(),
+                    option_group_name: record.option_group_name.clone(),
+                    character_set_name: record.character_set_name.clone(),
+                    storage_encrypted: record.storage_encrypted,
+                    kms_key_id: record.kms_key_id.clone(),
+                    storage_type: record.storage_type.clone(),
+                    iops: record.iops,
+                    allocated_storage: record.allocated_storage,
+                    db_cluster_instance_class: record.db_cluster_instance_class.clone(),
+                    publicly_accessible: record.publicly_accessible,
+                    auto_minor_version_upgrade: record.auto_minor_version_upgrade,
+                    http_endpoint_enabled: record.http_endpoint_enabled,
+                    serverless_v2_scaling: record.serverless_v2_scaling.clone(),
+                    scaling_configuration: record.scaling_configuration.clone(),
+                    cluster_scalability_type: record.cluster_scalability_type.clone(),
+                    db_system_id: record.db_system_id.clone(),
+                    local_write_forwarding_enabled: record.local_write_forwarding_enabled,
+                    tags: record.tags.clone(),
+                    volume,
+                }
+            };
+
+            // The mode the restored cluster runs: the request's, else the source's. Which
+            // modes a version runs is the DOMAIN of the member FOR that version, so a mode
+            // outside it is a value this parameter does not accept — how RDS refuses
+            // `serverless` (Aurora Serverless v1) on a current engine version.
+            let engine_mode = input
+                .engine_mode
+                .clone()
+                .unwrap_or_else(|| source.engine_mode.clone());
+            let resolved_version = crate::ops::describe_db_engine_versions::resolve_version(
+                &source.engine,
+                source.engine_version.as_deref(),
+            )
+            .ok()
+            .flatten();
+            if let Some(entry) = resolved_version {
+                if !entry
+                    .profile
+                    .engine_modes
+                    .iter()
+                    .any(|known| known.eq_ignore_ascii_case(&engine_mode))
+                {
+                    return Err(
+                        RestoreDBClusterToPointInTimeError::invalid_parameter_value(
+                            crate::state::unavailable_engine_mode_message(&engine_mode),
+                        ),
+                    );
+                }
+            }
+            // A scaling configuration is held to the capacity range the restored cluster's
+            // engine version publishes, else the one the service publishes overall: the rule
+            // `CreateDBCluster` creates one by and `ModifyDBCluster` rescales one by.
+            if let Some(asked) = &input.serverless_v2_scaling_configuration {
+                crate::state::check_serverless_v2_scaling(
+                    resolved_version.and_then(|entry| entry.profile.serverless_v2_scaling_range()),
+                    asked.min_capacity,
+                    asked.max_capacity,
+                    asked.seconds_until_auto_pause,
+                )
+                .map_err(|rejection| match rejection {
+                    crate::state::ServerlessV2Rejection::Value(message) => {
+                        RestoreDBClusterToPointInTimeError::invalid_parameter_value(message)
+                    }
+                    crate::state::ServerlessV2Rejection::Combination(message) => {
+                        RestoreDBClusterToPointInTimeError::invalid_parameter_combination(message)
+                    }
+                })?;
+            }
+            // The two resources the request REFERENCES BY NAME that this service holds
+            // records of are resolved before the cluster is inserted, and a name that
+            // resolves to nothing is that resource type's modelled not-found fault: a restore
+            // AWS would never have accepted must leave no cluster behind for a later call to
+            // find. A request that names neither places the restored cluster in the groups the
+            // SOURCE is in, which exist already.
+            let named_subnet_group_name = input
+                .db_subnet_group_name
+                .as_ref()
+                .map(|name| name.to_ascii_lowercase());
+            if let Some(name) = &named_subnet_group_name {
+                let Some(group) = store.resolve_db_subnet_group(&region, name) else {
+                    return Err(
+                        RestoreDBClusterToPointInTimeErrorModeled::DBSubnetGroupNotFoundFault(
+                            DBSubnetGroupNotFoundFault {
+                                message: Some(
+                                    crate::state::db_subnet_group_does_not_exist_message(name),
+                                ),
+                            },
+                        )
+                        .into(),
+                    );
+                };
+                // A Multi-AZ DB cluster is placed across the zones its DB subnet group
+                // covers, so a group that cannot cover enough of them is the modelled
+                // network-state fault — the one rule `CreateDBCluster` places a cluster of
+                // this type by.
+                if crate::state::is_multi_az_db_cluster(&source.engine) {
+                    if let Err(message) =
+                        crate::ops::create_db_cluster::check_multi_az_subnet_coverage(
+                            &region, &group,
+                        )
+                    {
+                        return Err(
+                            RestoreDBClusterToPointInTimeErrorModeled::InvalidVPCNetworkStateFault(
+                                InvalidVPCNetworkStateFault {
+                                    message: Some(message),
+                                },
+                            )
+                            .into(),
+                        );
+                    }
+                }
+            }
+            // `DBClusterParameterGroupName`: "If supplied, must match the name of an existing
+            // DB cluster parameter group." The groups RDS provides itself are there without
+            // any request having created them, so a name of that form resolves even though
+            // this store holds no record of it.
+            if let Some(named) = &input.db_cluster_parameter_group_name {
+                if !store.db_cluster_parameter_group_exists(&region, named) {
+                    return Err(
+                        RestoreDBClusterToPointInTimeErrorModeled::DBClusterParameterGroupNotFoundFault(
+                            DBClusterParameterGroupNotFoundFault {
+                                message: Some(
+                                    crate::state::db_cluster_parameter_group_not_found_message(
+                                        named,
+                                    ),
+                                ),
+                            },
+                        )
+                        .into(),
+                    );
+                }
+            }
+            // "The user already has a DB cluster with the given identifier": a restore onto
+            // an identifier this region holds would otherwise overwrite a live cluster.
+            if store.db_clusters.contains_key(&key) {
+                return Err(
+                    RestoreDBClusterToPointInTimeErrorModeled::DBClusterAlreadyExistsFault(
+                        DBClusterAlreadyExistsFault {
+                            message: Some(
+                                crate::state::DB_CLUSTER_ALREADY_EXISTS_MESSAGE.to_string(),
+                            ),
+                        },
+                    )
+                    .into(),
+                );
+            }
+            // The region's DB cluster quota, and the number of regions this store keeps
+            // records for at all: a restore adds a DB cluster, so it is bounded exactly as a
+            // create is, and the modelled fault says so.
+            if store.clusters_in(&region).len() >= crate::state::DB_CLUSTER_QUOTA_PER_REGION
+                || !store.has_room_for_region(&region)
+            {
+                return Err(
+                    RestoreDBClusterToPointInTimeErrorModeled::DBClusterQuotaExceededFault(
+                        DBClusterQuotaExceededFault {
+                            message: Some(format!(
+                                "the request would exceed the allowed number of DB clusters \
+                                 ({} per region, in at most {} regions)",
+                                crate::state::DB_CLUSTER_QUOTA_PER_REGION,
+                                crate::state::MAX_REGIONS
+                            )),
+                        },
+                    )
+                    .into(),
+                );
+            }
+            Resolved {
+                engine_mode,
+                db_subnet_group_name: Some(
+                    named_subnet_group_name
+                        .or_else(|| source.db_subnet_group_name.clone())
+                        .unwrap_or_else(|| crate::state::DEFAULT_DB_SUBNET_GROUP.to_string()),
+                ),
+                default_ca_certificate: store.default_ca_certificate(&region).to_string(),
+                // The mint the restored cluster's own identities are drawn from, taken last
+                // so a restore this scope refused draws none.
+                mint: store.next_mint(),
+                source,
+            }
+        };
+        let Resolved {
+            source,
+            mint,
+            engine_mode,
+            db_subnet_group_name,
+            default_ca_certificate,
+        } = resolved;
+
+        // `KmsKeyId`: "the Amazon Web Services KMS key identifier to use when restoring an
+        // encrypted DB cluster from an encrypted DB cluster", so the restored cluster is
+        // encrypted only under a key KMS ANSWERS for — resolved against this emulator's own
+        // KMS over the in-process callback, which cannot be done under the store's guard, and
+        // a key KMS will not encrypt under is the modelled `KMSKeyNotAccessibleFault`.
+        if let Some(key_id) = input.kms_key_id.as_deref() {
+            if crate::state::kms_key_is_inaccessible(ctx, &region, key_id).await {
+                return Err(
+                    RestoreDBClusterToPointInTimeErrorModeled::KMSKeyNotAccessibleFault(
+                        KMSKeyNotAccessibleFault {
+                            message: Some(crate::state::kms_key_not_accessible_message(key_id)),
+                        },
+                    )
+                    .into(),
+                );
+            }
+        }
+        // "You can restore to a new DB cluster and encrypt the new DB cluster with a KMS key
+        // that is different from the KMS key used to encrypt the source DB cluster", and
+        // where the request names none the restored cluster is encrypted exactly as the
+        // source is: under the source's key when it is encrypted, and not at all when it is
+        // not.
+        let storage_encrypted = input.kms_key_id.is_some() || source.storage_encrypted;
+        let kms_key_id = crate::state::storage_encryption_key_id(
+            ctx,
+            &region,
+            input.kms_key_id.clone().or_else(|| source.kms_key_id.clone()),
+            storage_encrypted,
+        )
+        .await;
+        // "A list of VPC security groups that the new DB cluster belongs to" are Amazon EC2's
+        // resources, so each one the request names is resolved against EC2 over the
+        // in-process callback — also impossible under the store's guard — and a group the
+        // account does not hold is refused for the value it carried rather than stored as a
+        // membership nothing could resolve.
+        let unresolved =
+            crate::state::unresolved_vpc_security_groups(ctx, &region, &vpc_security_group_ids)
+                .await;
+        if let Some(group_id) = unresolved.first() {
+            return Err(
+                RestoreDBClusterToPointInTimeError::invalid_parameter_value(
+                    crate::state::invalid_security_group_message(group_id),
+                ),
+            );
+        }
+
+        // THE DATA the restored cluster starts from, taken with no state guard held and on a
+        // blocking task, because it is engine work: a copy of the consistent point the source
+        // kept for the time asked for, else a copy of the source's volume as it stands, which
+        // is both the latest restorable point and what a clone is made of. It is taken AFTER
+        // every refusal above has been answered, so nothing is copied for a restore that was
+        // going to fail.
+        let source_volume = match source.volume {
+            SourceVolume::Kept(storage) => Some(storage),
+            SourceVolume::AsItStands => crate::state::capture_cluster_storage(
+                &state,
+                &(region.clone(), source.identifier.clone()),
+            )
+            .await
+            .map_err(RestoreDBClusterToPointInTimeError::internal_failure)?,
+        };
+
+        let multi_az_cluster = crate::state::is_multi_az_db_cluster(&source.engine);
+        let resource_id = crate::state::mint_db_cluster_resource_id(mint);
+        let mut record = crate::state::DbClusterRecord {
+            identifier: identifier.clone(),
+            region: region.clone(),
+            // The restored cluster is a NEW resource: its own resource id and its own
+            // endpoint host, never the source's.
+            resource_id: resource_id.clone(),
+            endpoint_host: crate::state::mint_endpoint_host(mint),
+            // Filled in below from the cluster's own engine listener, for a cluster whose
+            // engine speaks a wire this emulator serves.
+            served_endpoint: None,
+            served_reader_endpoint: None,
+            // A restored DB cluster is not usable the instant the call returns: RDS answers
+            // `creating` and the cluster reaches `available` on its own — "You can create DB
+            // instances only after the RestoreDBClusterToPointInTime operation has completed
+            // and the DB cluster is available."
+            status: crate::state::DB_CLUSTER_STATUS_CREATING.to_string(),
+            pending_status: Some(crate::state::PendingStatus::in_a_moment(
+                crate::state::DB_CLUSTER_STATUS_AVAILABLE,
+            )),
+            // This operation publishes no `Engine`, `EngineVersion`, `DatabaseName`,
+            // `PreferredMaintenanceWindow`, `CharacterSetName`, `AllocatedStorage`,
+            // `AutoMinorVersionUpgrade`, `EnableHttpEndpoint`, `ClusterScalabilityType` or
+            // `DBSystemId`: the restored cluster is "created from the source DB cluster with
+            // the same configuration as the original DB cluster", so each of them is the
+            // source's.
+            engine: source.engine.clone(),
+            engine_version: source.engine_version.clone(),
+            engine_mode,
+            database_name: source.database_name.clone(),
+            // The restored cluster keeps the SOURCE's master credential — the username, and
+            // the digests a login on its engine endpoint is verified against — because the
+            // restore mints no new one: this operation publishes neither `MasterUsername`,
+            // `MasterUserPassword` nor `ManageMasterUserPassword`, so there is no secret of
+            // its own to report either, and the source's managed secret stays the source's.
+            master_username: source.master_username.clone(),
+            master_user_secret: None,
+            master_user_password: source.master_user_password.clone(),
+            // "Default: The default port for the engine" — the port the source listens on
+            // where the source runs an engine this emulator serves, which is that default.
+            port: input.port.unwrap_or(if source.port > 0 {
+                source.port
+            } else {
+                crate::state::default_port(&source.engine)
+            }),
+            // The zones the source cluster spans, since this operation names none of its own,
+            // and the zones RDS picks for a cluster whose source recorded none.
+            availability_zones: if source.availability_zones.is_empty() {
+                crate::state::region_availability_zones(&region)
+            } else {
+                source.availability_zones.clone()
+            },
+            // `BackupRetentionPeriod`: "Default: Uses existing setting" — the source's, as
+            // is the backup window this operation's own member overrides.
+            backup_retention_period: input
+                .backup_retention_period
+                .unwrap_or(source.backup_retention_period),
+            preferred_backup_window: input
+                .preferred_backup_window
+                .clone()
+                .unwrap_or_else(|| source.preferred_backup_window.clone()),
+            preferred_maintenance_window: source.preferred_maintenance_window.clone(),
+            db_cluster_parameter_group_name: input
+                .db_cluster_parameter_group_name
+                .clone()
+                .or_else(|| source.db_cluster_parameter_group_name.clone()),
+            db_subnet_group_name,
+            option_group_name: input
+                .option_group_name
+                .clone()
+                .or_else(|| source.option_group_name.clone()),
+            character_set_name: source.character_set_name.clone(),
+            // "except that the new DB cluster is created with the default DB security group":
+            // the restored cluster takes the VPC security groups this request names and NOT
+            // the source's memberships, so a restore that names none is reached through the
+            // account's default security group, which this service records as no membership
+            // of its own.
+            vpc_security_group_ids,
+            storage_encrypted,
+            kms_key_id,
+            // "Specifies the storage type to be associated with the DB cluster": the
+            // request's, else the source's. Only a type the cluster was really given — rather
+            // than the one its engine would have given it anyway — is stored, because that
+            // default "isn't returned" by the member.
+            storage_type: input
+                .storage_type
+                .clone()
+                .or_else(|| source.storage_type.clone())
+                .filter(|storage_type| {
+                    crate::state::default_db_cluster_storage_type(&source.engine)
+                        .is_none_or(|default| !storage_type.eq_ignore_ascii_case(default))
+                }),
+            // "The amount of Provisioned IOPS … to be initially allocated for each DB
+            // instance in the Multi-AZ DB cluster … Valid for: Multi-AZ DB clusters only", so
+            // an Aurora cluster reports none, exactly as it reports no instance class.
+            iops: input.iops.or(source.iops).filter(|_| multi_az_cluster),
+            allocated_storage: source.allocated_storage,
+            // "The compute and memory capacity of the each DB instance in the Multi-AZ DB
+            // cluster … Valid for: Multi-AZ DB clusters only", which an Aurora cluster has
+            // none of.
+            db_cluster_instance_class: input
+                .db_cluster_instance_class
+                .clone()
+                .or_else(|| source.db_cluster_instance_class.clone())
+                .filter(|_| multi_az_cluster),
+            publicly_accessible: input.publicly_accessible.or(source.publicly_accessible),
+            auto_minor_version_upgrade: source.auto_minor_version_upgrade,
+            // `DeletionProtection` / `CopyTagsToSnapshot` /
+            // `EnableIAMDatabaseAuthentication` / `EnablePerformanceInsights` each turn
+            // something ON that the request asks for, so a cluster restored without them has
+            // it off: "By default, deletion protection isn't enabled", "The default is not to
+            // copy them", "By default, mapping isn't enabled".
+            deletion_protection: input.deletion_protection.unwrap_or(false),
+            copy_tags_to_snapshot: input.copy_tags_to_snapshot.unwrap_or(false),
+            http_endpoint_enabled: source.http_endpoint_enabled,
+            iam_database_authentication_enabled: input
+                .enable_iam_database_authentication
+                .unwrap_or(false),
+            // `BacktrackWindow`: "Default: 0" — backtracking disabled.
+            backtrack_window: input.backtrack_window.unwrap_or(0),
+            enabled_cloudwatch_logs_exports: cloudwatch_logs_exports,
+            // "The network type is determined by the DBSubnetGroup specified for the DB
+            // cluster … Valid for: Aurora DB clusters only": an Aurora cluster the request
+            // named none for keeps the source's network, and a Multi-AZ DB cluster reports no
+            // network type at all.
+            network_type: (!multi_az_cluster).then(|| {
+                input
+                    .network_type
+                    .clone()
+                    .unwrap_or_else(|| crate::state::DEFAULT_NETWORK_TYPE.to_string())
+            }),
+            // `MonitoringInterval`: "Default: 0" — Enhanced Monitoring off.
+            monitoring_interval: input
+                .monitoring_interval
+                .unwrap_or(crate::state::DEFAULT_MONITORING_INTERVAL),
+            monitoring_role_arn: input.monitoring_role_arn.clone(),
+            // `DatabaseInsightsMode` is not a member of this operation, so the restored
+            // cluster carries the mode a new one gets.
+            database_insights_mode: crate::state::DEFAULT_DATABASE_INSIGHTS_MODE.to_string(),
+            performance_insights_enabled: input.enable_performance_insights.unwrap_or(false),
+            performance_insights_kms_key_id: input.performance_insights_kms_key_id.clone(),
+            performance_insights_retention_period: input.performance_insights_retention_period,
+            serverless_v2_scaling: input
+                .serverless_v2_scaling_configuration
+                .as_ref()
+                .map(|asked| ServerlessV2ScalingConfigurationInfo {
+                    min_capacity: asked.min_capacity,
+                    max_capacity: asked.max_capacity,
+                    seconds_until_auto_pause: asked.seconds_until_auto_pause,
+                })
+                .or_else(|| source.serverless_v2_scaling.clone()),
+            // The Aurora Serverless v1 scaling configuration, reported as the
+            // `ScalingConfigurationInfo` of a cluster in the `serverless` engine mode: the
+            // request's, else the source's.
+            scaling_configuration: input
+                .scaling_configuration
+                .clone()
+                .map(|asked| ScalingConfigurationInfo {
+                    min_capacity: asked.min_capacity,
+                    max_capacity: asked.max_capacity,
+                    auto_pause: asked.auto_pause,
+                    seconds_until_auto_pause: asked.seconds_until_auto_pause,
+                    timeout_action: asked.timeout_action,
+                    seconds_before_timeout: asked.seconds_before_timeout,
+                })
+                .or_else(|| source.scaling_configuration.clone()),
+            // "A list of Amazon Web Services Identity and Access Management (IAM) roles to
+            // associate with the DB cluster when it's restored to a point in time": each is
+            // in place from the restore onwards, so each reports the `ACTIVE` status of an
+            // association that holds. The source's own associations are NOT carried over:
+            // each one is made against the cluster that carries it.
+            associated_roles: associated_roles
+                .into_iter()
+                .map(|role| DBClusterRole {
+                    role_arn: Some(role.role_arn),
+                    feature_name: role.feature_name,
+                    status: Some(crate::state::DB_CLUSTER_ROLE_STATUS_ACTIVE.to_string()),
+                })
+                .collect(),
+            domain: input.domain.clone(),
+            domain_iam_role_name: input.domain_iam_role_name.clone(),
+            // The points the restored cluster can be backtracked to are its OWN, kept from
+            // the moment its storage exists: the first one is recorded below, once the data
+            // it starts from is in place.
+            backtrack_points: Vec::new(),
+            // A restored cluster joins no global database and replicates nothing: it is a new
+            // cluster of the source's data, and this operation names neither.
+            global_cluster_identifier: None,
+            replication_source_arn: None,
+            // The restored cluster is created under the CA that is the default for new
+            // launches in this region, which this operation publishes no member to override.
+            ca_certificate_identifier: default_ca_certificate,
+            engine_lifecycle_support: input
+                .engine_lifecycle_support
+                .clone()
+                .unwrap_or_else(|| crate::state::DEFAULT_ENGINE_LIFECYCLE_SUPPORT.to_string()),
+            cluster_scalability_type: source.cluster_scalability_type.clone(),
+            db_system_id: source.db_system_id.clone(),
+            local_write_forwarding_enabled: source.local_write_forwarding_enabled,
+            // Write forwarding to a global database's primary is a property of a global
+            // database membership, which a restored cluster has none of.
+            global_write_forwarding_requested: false,
+            // The two settings the VPC-networking pair turns on; a restore that names neither
+            // reaches its VPC's network and nothing else, like a created cluster.
+            vpc_networking_enabled: networking.is_none_or(|(vpc_networking, _)| vpc_networking),
+            internet_access_gateway_enabled: networking
+                .is_some_and(|(_, internet_access_gateway)| internet_access_gateway),
+            // The restored cluster was created NOW; the source keeps its own creation time.
+            cluster_create_time: crate::state::now_as_wire_timestamp(),
+            // Nothing has moved the writer of a cluster this call has just restored.
+            writer_identifier: None,
+            // "The tags to be assigned to the restored DB cluster" — and a restore that names
+            // none takes the source's, the rule the sibling restore states: "RDS checks
+            // whether you specify new tags. If yes, the new tags are added to the restored DB
+            // instance. If there are no new tags, RDS looks for the tags from the source."
+            tags: if requested_tags.is_empty() {
+                source.tags.clone()
+            } else {
+                requested_tags
+            },
+        };
+
+        // The restored cluster's own ENGINE ENDPOINT, opened with the state lock released,
+        // exactly as a create opens one: binding is asynchronous and the core owns the
+        // socket, the bind interface and the port. It is opened AFTER every refusal above has
+        // been answered — so nothing binds for a restore that was going to fail — and before
+        // the record is admitted to the store, so a cluster this service holds is one whose
+        // endpoint is already listening.
+        let endpoint = match crate::state::cluster_engine_wire(&record.engine) {
+            Some(wire) => Some(
+                crate::state::open_engine_endpoint(
+                    &*self.engine,
+                    &state,
+                    crate::state::EngineEndpointPlan {
+                        target: crate::state::SessionTarget::DbCluster {
+                            region: region.clone(),
+                            resource_id: record.resource_id.clone(),
+                        },
+                        wire,
+                        role: crate::state::EndpointRole::Writer,
+                        // A DB cluster publishes a READER endpoint beside its writer one, so
+                        // both are opened: see `open_engine_endpoint`.
+                        reader: true,
+                        storage: None,
+                        // The in-process callback this restore was served with, which every
+                        // session on the restored cluster's endpoints is served with too: a
+                        // session carries no request context of its own.
+                        callback: ctx.callback().clone(),
+                    },
+                )
+                .await
+                .map_err(RestoreDBClusterToPointInTimeError::internal_failure)?,
+            ),
+            // An engine whose native wire this emulator does not speak: no listener is opened
+            // and the cluster keeps the DNS-form endpoint this service reports for it, rather
+            // than publishing a port that would answer nothing.
+            None => None,
+        };
+        record.served_endpoint = endpoint.as_ref().map(|endpoint| endpoint.endpoint.clone());
+        record.served_reader_endpoint =
+            endpoint.as_ref().and_then(|endpoint| endpoint.reader.clone());
+        // An engine whose data plane this emulator serves as an API rather than as a native
+        // wire (Amazon Neptune's graph API) publishes this emulator's own endpoint, the
+        // address that API answers on ([`crate::state::api_plane_endpoint`]).
+        if record.served_endpoint.is_none() {
+            record.served_endpoint = crate::state::api_plane_endpoint(&record.engine, ctx);
+        }
+
+        // THE RESTORE ITSELF: the data the source held at the point asked for is loaded into
+        // the new cluster's own storage, by the engine, before the endpoint is published — so
+        // the first session a client opens on it finds those rows and not an empty database,
+        // and every write either cluster takes afterwards is its own, because the two volumes
+        // are two volumes. On a blocking task and with no state lock held: the copy is engine
+        // work, bounded by the engine's own copy deadline, exactly as the capture was.
+        if let (Some(endpoint), Some(storage)) = (endpoint.as_ref(), source_volume) {
+            let destination = endpoint.database();
+            ::tokio::task::spawn_blocking(move || destination.load_from(&storage))
+                .await
+                .map_err(|error| {
+                    RestoreDBClusterToPointInTimeError::internal_failure(format!(
+                        "the source DB cluster's data could not be restored: {error}"
+                    ))
+                })?
+                .map_err(|error| {
+                    RestoreDBClusterToPointInTimeError::internal_failure(format!(
+                        "the source DB cluster's data could not be restored: {}",
+                        error.message
+                    ))
+                })?;
+        }
+        // A cluster restored with backtracking ON keeps the consistent point it starts from,
+        // exactly as a created one does: the restored data, as the engine has just loaded it.
+        if record.backtracking_enabled() {
+            if let Some(endpoint) = &endpoint {
+                let initial = crate::state::capture_endpoint_storage(endpoint)
+                    .await
+                    .map_err(RestoreDBClusterToPointInTimeError::internal_failure)?;
+                if let Some(storage) = initial {
+                    record.record_backtrack_point(storage);
+                }
+            }
+        }
+
+        // Another request may have taken this identifier while this one was binding, so the
+        // conflict is answered again here rather than overwriting a stored cluster. Deciding
+        // it and admitting the record happen under ONE guard, so no third request can take
+        // the identifier in between, and the state it is decided against is the state AFTER
+        // the transitions the clock has made due.
+        let created = {
+            let mut store = state.lock();
+            store.settle_due_transitions(&region);
+            if store.db_clusters.contains_key(&key) {
+                None
+            } else {
+                let db_cluster = store.cluster_to_wire(&record);
+                let engine = record.engine.clone();
+                let monitoring = ::service_common::db_data_sources::MonitoringConfiguration {
+                    performance_insights_enabled: record.performance_insights_enabled,
+                    database_insights_mode: Some(record.database_insights_mode.clone()),
+                };
+                let cluster_arn = record.arn();
+                store.db_clusters.insert(key.clone(), record);
+                // The listener is the cluster's: the store holds it, so it stays open for as
+                // long as the cluster does and closes with it.
+                if let Some(endpoint) = endpoint {
+                    store.db_cluster_engine_endpoints.insert(key, endpoint);
+                }
+                // A DB cluster came to exist, so the region's event log records it: the
+                // restore is how this one came to be, and `DescribeEvents` reports that entry
+                // for it from now on.
+                store.record_event(
+                    &region,
+                    crate::state::events::DB_CLUSTER_CREATED,
+                    &identifier,
+                    cluster_arn,
+                );
+                // The id just minted is recorded in the SHARED data-source directory, exactly
+                // as `CreateDBCluster` records one, so a service that monitors this cluster
+                // can tell that THIS service owns the id. The RDS store is already locked here
+                // and the directory is taken second, the order its doc fixes.
+                if let Some(directory) = crate::state::data_source_directory(&*self.engine) {
+                    let mut directory = directory.lock();
+                    directory.register(
+                        &resource_id,
+                        ::service_common::db_data_sources::SERVICE_TYPE_RDS,
+                        &engine,
+                    );
+                    directory.record_monitoring(&resource_id, monitoring);
+                }
+                Some(db_cluster)
+            }
+        };
+        let Some(db_cluster) = created else {
+            return Err(
+                RestoreDBClusterToPointInTimeErrorModeled::DBClusterAlreadyExistsFault(
+                    DBClusterAlreadyExistsFault {
+                        message: Some(crate::state::DB_CLUSTER_ALREADY_EXISTS_MESSAGE.to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        Ok(RestoreDBClusterToPointInTimeOutput {
+            db_cluster: Some(db_cluster),
+        })
     }
+}
+
+/// The two values `RestoreType` publishes: "full-copy — the new DB cluster is restored as a
+/// full copy of the source DB cluster" and "copy-on-write — the new DB cluster is restored as
+/// a clone of the source DB cluster".
+const RESTORE_TYPES: [&str; 2] = [RESTORE_TYPE_FULL_COPY, RESTORE_TYPE_COPY_ON_WRITE];
+
+/// `RestoreType`'s documented default: "If you don't specify a `RestoreType` value, then the
+/// new DB cluster is restored as a full copy of the source DB cluster."
+const RESTORE_TYPE_FULL_COPY: &str = "full-copy";
+
+/// The `RestoreType` that CLONES the source cluster rather than copying a point of it.
+const RESTORE_TYPE_COPY_ON_WRITE: &str = "copy-on-write";
+
+/// The engine whose clusters support backtracking, the one member of this operation that is
+/// documented for a single engine ("Currently, Backtrack is only supported for Aurora MySQL DB
+/// clusters").
+const AURORA_MYSQL_ENGINE: &str = "aurora-mysql";
+
+/// The engine whose clusters the VPC-networking pair is documented for: `EnableVPCNetworking`
+/// and `EnableInternetAccessGateway` are both "Valid for Cluster Type: Aurora PostgreSQL
+/// clusters".
+const AURORA_POSTGRESQL_ENGINE: &str = "aurora-postgresql";
+
+/// HOW the request names the DB cluster this restore reads.
+enum SourceReference {
+    /// `SourceDBClusterIdentifier`: "the identifier of the source DB cluster from which to
+    /// restore", which every member that names a DB cluster takes as an identifier or an ARN.
+    Named(String),
+    /// `SourceDbClusterResourceId`: "the resource ID of the source DB cluster from which to
+    /// restore" — the source's immutable, server-minted id.
+    ResourceId(String),
+}
+
+impl SourceReference {
+    /// The reference exactly as the request spelled it, which is what a refusal names the
+    /// source by.
+    fn as_requested(&self) -> &str {
+        match self {
+            Self::Named(named) => named,
+            Self::ResourceId(resource_id) => resource_id,
+        }
+    }
+}
+
+/// WHICH point of the source cluster the restore starts from.
+enum RestorePoint {
+    /// `RestoreType` `copy-on-write`: "the new DB cluster is restored as a clone of the source
+    /// DB cluster", which is the source's volume as it stands.
+    Clone,
+    /// `UseLatestRestorableTime`: "restore the DB cluster to the latest restorable backup
+    /// time".
+    Latest,
+    /// `RestoreToTime`: "the date and time to restore the DB cluster to".
+    At(::aws_smithy_types::DateTime),
+}
+
+/// The data the restored cluster starts from, as the store decided it.
+enum SourceVolume {
+    /// A consistent point the source KEPT the data of, for a restore to a time at or before
+    /// it ([`crate::state::BacktrackPoint`]).
+    Kept(::std::sync::Arc<crate::state::data_plane::sql_engine::InstanceDatabase>),
+    /// The source's volume as it stands, which is both its latest restorable point and what a
+    /// clone is made of. Copied once the store's guard is released.
+    AsItStands,
+}
+
+/// What this restore read out of the store, decided under its guard: the source cluster's
+/// configuration, the values resolving the request produced, and the mint the restored
+/// cluster's identities are drawn from.
+struct Resolved {
+    source: SourceCluster,
+    mint: u64,
+    /// The engine mode the restored cluster runs, resolved against the request and the source.
+    engine_mode: String,
+    /// The DB subnet group it is placed in: the request's, else the source's, else the group
+    /// RDS provides alongside the account's VPC.
+    db_subnet_group_name: Option<String>,
+    /// The CA new launches in this region are made under.
+    default_ca_certificate: String,
+}
+
+/// The source cluster's configuration, which a point-in-time restore starts from — "the same
+/// configuration as the original DB cluster" — and the data the restore loads into the new
+/// cluster's storage. The request's own members then override it, member by member.
+struct SourceCluster {
+    identifier: String,
+    engine: String,
+    engine_version: Option<String>,
+    engine_mode: String,
+    database_name: Option<String>,
+    master_username: Option<String>,
+    master_user_password: Option<crate::state::data_plane::wire_session::MasterPasswordHash>,
+    /// The port the source's engine listens on; zero where nothing was listening at all.
+    port: i32,
+    availability_zones: Vec<String>,
+    backup_retention_period: i32,
+    preferred_backup_window: String,
+    preferred_maintenance_window: String,
+    db_cluster_parameter_group_name: Option<String>,
+    db_subnet_group_name: Option<String>,
+    option_group_name: Option<String>,
+    character_set_name: Option<String>,
+    storage_encrypted: bool,
+    kms_key_id: Option<String>,
+    storage_type: Option<String>,
+    iops: Option<i32>,
+    allocated_storage: Option<i32>,
+    db_cluster_instance_class: Option<String>,
+    publicly_accessible: Option<bool>,
+    auto_minor_version_upgrade: bool,
+    http_endpoint_enabled: bool,
+    serverless_v2_scaling: Option<ServerlessV2ScalingConfigurationInfo>,
+    scaling_configuration: Option<ScalingConfigurationInfo>,
+    cluster_scalability_type: String,
+    db_system_id: Option<String>,
+    local_write_forwarding_enabled: bool,
+    tags: Vec<crate::ops::types::Tag>,
+    volume: SourceVolume,
+}
+
+/// How this request names the source cluster, or the refusal a request that names none — or
+/// names one no DB cluster identifier could be — is answered with.
+fn source_reference(
+    input: &RestoreDBClusterToPointInTimeInput,
+) -> Result<SourceReference, RestoreDBClusterToPointInTimeError> {
+    // An empty value names nothing: the Query API carries an omitted member as no pair at
+    // all, and a client that sends one as an empty string has named no source either.
+    let named = input
+        .source_db_cluster_identifier
+        .as_deref()
+        .filter(|named| !named.is_empty());
+    if let Some(named) = named {
+        // A reference outside the grammar every DB cluster identifier is assigned under names
+        // no cluster that exists and none that ever could, so it is refused for its VALUE
+        // rather than reported as a cluster that is merely absent.
+        crate::state::db_cluster_lookup_identifier(named)
+            .map_err(RestoreDBClusterToPointInTimeError::invalid_parameter_value)?;
+        return Ok(SourceReference::Named(named.to_string()));
+    }
+    if let Some(resource_id) = named_resource_id(input) {
+        return Ok(SourceReference::ResourceId(resource_id.to_string()));
+    }
+    Err(
+        RestoreDBClusterToPointInTimeError::invalid_parameter_combination(
+            "either SourceDBClusterIdentifier or SourceDbClusterResourceId must be specified: \
+             a point-in-time restore reads a source DB cluster",
+        ),
+    )
+}
+
+/// The `SourceDbClusterResourceId` this request carries, if it carries one.
+fn named_resource_id(input: &RestoreDBClusterToPointInTimeInput) -> Option<&str> {
+    input
+        .source_db_cluster_resource_id
+        .as_deref()
+        .filter(|resource_id| !resource_id.is_empty())
+}
+
+/// WHICH point of the source the restore starts from, or the refusal a request whose restore
+/// members cannot hold together is answered with.
+///
+/// `RestoreToTime` publishes the constraints: "Must be specified if `UseLatestRestorableTime`
+/// parameter isn't provided", "Can't be specified if the `UseLatestRestorableTime` parameter
+/// is enabled" and "Can't be specified if the `RestoreType` parameter is `copy-on-write`" — so
+/// a clone, which is the one restore that may name no time at all, is of the source volume as
+/// it stands.
+fn restore_point(
+    input: &RestoreDBClusterToPointInTimeInput,
+) -> Result<RestorePoint, RestoreDBClusterToPointInTimeError> {
+    let restore_type = input
+        .restore_type
+        .as_deref()
+        .filter(|restore_type| !restore_type.is_empty())
+        .unwrap_or(RESTORE_TYPE_FULL_COPY);
+    if !RESTORE_TYPES
+        .iter()
+        .any(|known| known.eq_ignore_ascii_case(restore_type))
+    {
+        return Err(
+            RestoreDBClusterToPointInTimeError::invalid_parameter_value(format!(
+                "invalid value {restore_type} for RestoreType: must be one of {}",
+                RESTORE_TYPES.join(" | ")
+            )),
+        );
+    }
+    let clone = restore_type.eq_ignore_ascii_case(RESTORE_TYPE_COPY_ON_WRITE);
+    let latest = input.use_latest_restorable_time.unwrap_or(false);
+    match (input.restore_to_time, latest) {
+        (Some(_), true) => Err(
+            RestoreDBClusterToPointInTimeError::invalid_parameter_combination(
+                "RestoreToTime can't be specified if the UseLatestRestorableTime parameter is \
+                 enabled",
+            ),
+        ),
+        (Some(_), false) if clone => Err(
+            RestoreDBClusterToPointInTimeError::invalid_parameter_combination(format!(
+                "RestoreToTime can't be specified if the RestoreType parameter is \
+                 {RESTORE_TYPE_COPY_ON_WRITE}"
+            )),
+        ),
+        (Some(at), false) => Ok(RestorePoint::At(at)),
+        (None, _) if clone => Ok(RestorePoint::Clone),
+        (None, true) => Ok(RestorePoint::Latest),
+        (None, false) => Err(
+            RestoreDBClusterToPointInTimeError::invalid_parameter_combination(
+                "RestoreToTime must be specified if the UseLatestRestorableTime parameter isn't \
+                 provided",
+            ),
+        ),
+    }
+}
+
+/// The DB cluster `reference` names in `region`, under whichever of the two members named it.
+///
+/// Both forms resolve against the clusters this region HOLDS, which is also the whole set of
+/// clusters it holds an automated backup of: this service keeps a cluster's automated backup
+/// as a projection of the cluster itself
+/// ([`crate::state::DbClusterRecord::automated_backup_to_wire`], which
+/// `DescribeDBClusterAutomatedBackups` reports), so a resource id naming no cluster here names
+/// no backup either and the source is simply absent.
+fn resolve_source<'store>(
+    store: &'store crate::state::ComAmazonawsRdsAmazonrdsv19State,
+    region: &str,
+    reference: &SourceReference,
+) -> Option<&'store crate::state::DbClusterRecord> {
+    match reference {
+        SourceReference::Named(named) => store.resolve_db_cluster(region, named),
+        SourceReference::ResourceId(resource_id) => {
+            store.cluster_by_resource_id(region, resource_id)
+        }
+    }
+}
+
+/// Refuse the members this operation documents for ONE cluster type against the type the
+/// source cluster gives the restored one: the restored cluster is of the source's engine, so a
+/// member valid for the other type names something that cluster does not have.
+fn check_members_of_source_type(
+    input: &RestoreDBClusterToPointInTimeInput,
+    engine: &str,
+    networking: Option<(bool, bool)>,
+) -> Result<(), RestoreDBClusterToPointInTimeError> {
+    let multi_az_cluster = crate::state::is_multi_az_db_cluster(engine);
+    if input.backtrack_window.is_some_and(|window| window != 0)
+        && !engine.eq_ignore_ascii_case(AURORA_MYSQL_ENGINE)
+    {
+        // Zero IS backtracking disabled, which every cluster can be.
+        return Err(
+            RestoreDBClusterToPointInTimeError::invalid_parameter_combination(format!(
+                "BacktrackWindow is valid for Aurora MySQL DB clusters only: engine {engine} \
+                 does not support backtracking"
+            )),
+        );
+    }
+    if input.network_type.is_some() && multi_az_cluster {
+        // "Valid for: Aurora DB clusters only".
+        return Err(
+            RestoreDBClusterToPointInTimeError::invalid_parameter_combination(format!(
+                "NetworkType is valid for Aurora DB clusters only: engine {engine} restores a \
+                 Multi-AZ DB cluster"
+            )),
+        );
+    }
+    if let Some(class) = &input.db_cluster_instance_class {
+        // "The compute and memory capacity of the each DB instance in the Multi-AZ DB cluster
+        // … Valid for: Multi-AZ DB clusters only": an Aurora cluster has no instance class of
+        // its own, so naming one names something it does not have.
+        if !multi_az_cluster {
+            return Err(
+                RestoreDBClusterToPointInTimeError::invalid_parameter_combination(format!(
+                    "DBClusterInstanceClass is valid for Multi-AZ DB clusters only: engine \
+                     {engine} restores an Aurora DB cluster"
+                )),
+            );
+        }
+        crate::state::check_db_instance_class(class)
+            .map_err(RestoreDBClusterToPointInTimeError::invalid_parameter_value)?;
+    }
+    if let Some(storage_type) = &input.storage_type {
+        // "Valid Values: aurora, aurora-iopt1 (Aurora DB clusters); io1 (Multi-AZ DB
+        // clusters)" — the per-cluster-type value list
+        // [`crate::state::db_cluster_storage_types`] publishes, refused with the modelled
+        // fault for a storage type the engine cannot be given.
+        let published = crate::state::db_cluster_storage_types(engine);
+        if !published
+            .iter()
+            .any(|known| known.eq_ignore_ascii_case(storage_type))
+        {
+            return Err(
+                RestoreDBClusterToPointInTimeErrorModeled::StorageTypeNotSupportedFault(
+                    StorageTypeNotSupportedFault {
+                        message: Some(format!(
+                            "Invalid storage type {storage_type} for engine {engine}: must be \
+                             one of {}",
+                            published.join(" | ")
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+    }
+    if networking.is_some() && !engine.eq_ignore_ascii_case(AURORA_POSTGRESQL_ENGINE) {
+        // Both members are "Valid for Cluster Type: Aurora PostgreSQL clusters".
+        return Err(
+            RestoreDBClusterToPointInTimeError::invalid_parameter_combination(format!(
+                "EnableVPCNetworking and EnableInternetAccessGateway are valid for Aurora \
+                 PostgreSQL clusters only: engine {engine} restores no such cluster"
+            )),
+        );
+    }
+    Ok(())
+}
+
+/// The modelled 404 for the source DB cluster `requested` names, in the wording this front
+/// door gives the fault where the cluster is the SOURCE a call reads
+/// ([`crate::state::db_cluster_cannot_be_accessed_message`]).
+fn source_cluster_not_found(requested: &str) -> RestoreDBClusterToPointInTimeError {
+    RestoreDBClusterToPointInTimeErrorModeled::DBClusterNotFoundFault(DBClusterNotFoundFault {
+        message: Some(crate::state::db_cluster_cannot_be_accessed_message(
+            requested,
+        )),
+    })
+    .into()
+}
+
+/// The modelled `InvalidRestoreFault` for a source cluster there is no point in time to
+/// restore: one that retains no automated backup at all, which has no restorable window
+/// ([`crate::state::DbClusterRecord::restore_window`]).
+fn no_restorable_time(identifier: &str) -> RestoreDBClusterToPointInTimeError {
+    RestoreDBClusterToPointInTimeErrorModeled::InvalidRestoreFault(InvalidRestoreFault {
+        message: Some(format!(
+            "DB cluster {identifier} can't be restored to a point in time: it retains no \
+             automated backup"
+        )),
+    })
+    .into()
+}
+
+/// The sentence a `RestoreToTime` outside the source's restorable window is refused with: the
+/// value, and the two ends of the window the source publishes as `EarliestRestorableTime` and
+/// `LatestRestorableTime`.
+fn outside_the_restore_window_message(
+    at: ::aws_smithy_types::DateTime,
+    earliest: ::aws_smithy_types::DateTime,
+    latest: ::aws_smithy_types::DateTime,
+) -> String {
+    let rendered = |instant: ::aws_smithy_types::DateTime| {
+        instant
+            .fmt(::aws_smithy_types::date_time::Format::DateTime)
+            .unwrap_or_else(|_| instant.as_secs_f64().to_string())
+    };
+    format!(
+        "invalid value {} for RestoreToTime: must be a time from {} to {}",
+        rendered(at),
+        rendered(earliest),
+        rendered(latest)
+    )
 }
