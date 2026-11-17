@@ -1583,6 +1583,20 @@ async fn health_checks_can_be_disabled_only_for_a_lambda_target_group() {
             reply.status,
             reply.body
         );
+        // The refusal states the requirement the member has for that kind of target group,
+        // naming the target type the request asked for — the same sentence whichever of
+        // them it is.
+        let expected = format!(
+            "Health check enabled must be true for target groups with target type \
+             '{target_type}'"
+        );
+        let message = crate::target_group_attributes_and_modification::unescaped(
+            &reply.text("Message").unwrap_or_default(),
+        );
+        assert_eq!(
+            message, expected,
+            "case {target_type}: expected the message {expected:?}, got {message:?}"
+        );
     }
 
     // A lambda target group may turn them on.

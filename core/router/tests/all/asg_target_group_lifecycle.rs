@@ -63,9 +63,21 @@ const IMAGE_ID: &str = "ami-0abcdef1234567890";
 const INSTANCE_TYPE: &str = "t3.micro";
 
 /// How long a leg waits for the clock-owed moves it depends on — an instance's launch, its
-/// registration, and the checks the emulator's accelerated schedule performs — and how often
-/// it looks. The deadline is only here so a failure is a failure rather than a hang.
-const DEADLINE: Duration = Duration::from_secs(30);
+/// registration, and the health checks of it, which come the target group's own
+/// `HealthCheckIntervalSeconds` apart ([`CHECK_INTERVAL_SECONDS`]) so that a verdict is a
+/// threshold of them away — and how often it looks. A few multiples of the longest verdict
+/// span a row configures, because the deadline is only here so a failure is a failure rather
+/// than a hang: the waits below look for their condition, so machine load decides when a leg
+/// finishes and never whether it passes.
+const DEADLINE: Duration = Duration::from_secs(60);
+
+/// The `HealthCheckIntervalSeconds` and `UnhealthyThresholdCount` every target group of this
+/// suite is created with: the shortest spacing and the fewest consecutive checks the two
+/// members' own ranges allow (5-300 and 2-10), because a verdict about a registration is that
+/// many checks at that spacing away. What this suite asserts is WHICH registrations a scaling
+/// group makes and what their checks then decide, not how long the load balancer takes.
+const CHECK_INTERVAL_SECONDS: &str = "5";
+const CHECK_THRESHOLD: &str = "2";
 const POLL: Duration = Duration::from_millis(100);
 
 /// How long a leg keeps re-reading a state that must NOT change (a registration that must
@@ -354,6 +366,9 @@ async fn an_asg_registers_its_instance_only_where_it_could_be_registered() {
                 ("Port", "80"),
                 ("VpcId", network.vpc.as_str()),
                 ("TargetType", "instance"),
+                ("HealthCheckIntervalSeconds", CHECK_INTERVAL_SECONDS),
+                ("UnhealthyThresholdCount", CHECK_THRESHOLD),
+                ("HealthyThresholdCount", CHECK_THRESHOLD),
             ],
         )
         .await,
@@ -369,6 +384,9 @@ async fn an_asg_registers_its_instance_only_where_it_could_be_registered() {
                 ("Port", "80"),
                 ("VpcId", elsewhere.vpc.as_str()),
                 ("TargetType", "instance"),
+                ("HealthCheckIntervalSeconds", CHECK_INTERVAL_SECONDS),
+                ("UnhealthyThresholdCount", CHECK_THRESHOLD),
+                ("HealthyThresholdCount", CHECK_THRESHOLD),
             ],
         )
         .await,

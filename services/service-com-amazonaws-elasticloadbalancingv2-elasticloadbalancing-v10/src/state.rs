@@ -180,7 +180,8 @@ pub use hosted_zones::*;
 pub mod target_type_protocol;
 
 pub use target_type_protocol::{
-    check_target_type_protocol, protocols_for_target_type, LOAD_BALANCER_TARGET_TYPE,
+    check_target_type_protocol, protocols_for_target_type, LAMBDA_TARGET_TYPE,
+    LOAD_BALANCER_TARGET_TYPE,
 };
 
 /// The ADDRESS a load balancer publishes as its `DNSName`, and the socket of this
@@ -331,7 +332,10 @@ pub const TARGETS_PER_SINGLETON_TARGET_GROUP: usize = 1;
 /// [`TARGETS_PER_TARGET_GROUP`], [`TARGETS_PER_NETWORK_TARGET_GROUP`],
 /// [`TARGETS_PER_GATEWAY_TARGET_GROUP`] and [`TARGETS_PER_SINGLETON_TARGET_GROUP`].
 pub fn targets_per_target_group(group: &TargetGroupRecord) -> usize {
-    if matches!(group.target_type.as_str(), "lambda" | "alb") {
+    if matches!(
+        group.target_type.as_str(),
+        LAMBDA_TARGET_TYPE | LOAD_BALANCER_TARGET_TYPE
+    ) {
         return TARGETS_PER_SINGLETON_TARGET_GROUP;
     }
     match group.family() {
@@ -2989,7 +2993,17 @@ pub static TARGET_GROUP_ATTRIBUTES: &[AttributeSpec] = &[
     },
     AttributeSpec {
         key: "target_group_health.dns_failover.minimum_healthy_targets.count",
-        domain: AttributeDomain::IntegerOrOff { min: 1, max: i64::MAX },
+        // "The minimum number of targets that must be healthy. If the number of healthy
+        // targets is below this value, mark the zone as unhealthy in DNS, so that traffic is
+        // routed only to healthy zones. The possible values are off or an integer from 1 to
+        // the maximum number of targets" — so the ceiling is the number of targets a group
+        // can hold at all ([`targets_per_target_group`]'s largest quota), which is also what
+        // bounds any span or count a reader derives from this value
+        // ([`AttributeDomain::integer_ceiling`]).
+        domain: AttributeDomain::IntegerOrOff {
+            min: 1,
+            max: TARGETS_PER_TARGET_GROUP as i64,
+        },
         applies: TargetGroupRecord::carries_connection_attributes,
         default: |_| Some("1".to_string()),
     },
@@ -3001,7 +3015,12 @@ pub static TARGET_GROUP_ATTRIBUTES: &[AttributeSpec] = &[
     },
     AttributeSpec {
         key: "target_group_health.unhealthy_state_routing.minimum_healthy_targets.count",
-        domain: AttributeDomain::Integer { min: 1, max: i64::MAX },
+        // "The minimum number of targets that must be healthy" for this routing too, bounded
+        // by the same maximum number of targets as its DNS-failover counterpart above.
+        domain: AttributeDomain::Integer {
+            min: 1,
+            max: TARGETS_PER_TARGET_GROUP as i64,
+        },
         applies: TargetGroupRecord::carries_connection_attributes,
         default: |_| Some("1".to_string()),
     },
@@ -3235,7 +3254,7 @@ impl TargetGroupRecord {
     /// Whether this target group's targets are Lambda functions, which is what several
     /// defaults and one whole attribute family key on.
     pub fn is_lambda(&self) -> bool {
-        self.target_type == "lambda"
+        self.target_type == LAMBDA_TARGET_TYPE
     }
 
     /// Whether this target group's target is a LOAD BALANCER of this very store: "alb -

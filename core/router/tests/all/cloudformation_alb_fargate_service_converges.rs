@@ -43,9 +43,12 @@ const REGION: &str = "us-east-1";
 
 /// How long a row waits for the clock-owed moves it depends on — the stack's resources coming
 /// up, its service's rollout reaching a steady state, the registration that rollout owes and
-/// the health checks of it — and how often it looks again. The deadline is only here so a
-/// failure is a failure rather than a hang.
-const DEADLINE: Duration = Duration::from_secs(60);
+/// the health checks of it, which come the target group's own `HealthCheckIntervalSeconds`
+/// apart (the template below configures the shortest the member allows, so a verdict is a
+/// threshold of checks and a few tens of seconds away) — and how often it looks again.
+/// Several times that span: the deadline is only here so a failure is a failure rather than a
+/// hang, and every wait looks for its condition rather than for a span to pass.
+const DEADLINE: Duration = Duration::from_secs(90);
 const POLL: Duration = Duration::from_millis(100);
 
 /// How many of those looks a row that wants NO task takes at its group before judging it
@@ -331,6 +334,9 @@ fn template(row: &Row) -> String {
       VpcId: !Ref Vpc
       HealthCheckProtocol: HTTP
       HealthCheckPath: /
+      HealthCheckIntervalSeconds: 5
+      UnhealthyThresholdCount: 2
+      HealthyThresholdCount: 2
   Listener:
     Type: AWS::ElasticLoadBalancingV2::Listener
     Properties:

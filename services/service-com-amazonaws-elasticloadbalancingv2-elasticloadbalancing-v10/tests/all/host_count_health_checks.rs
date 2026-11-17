@@ -116,7 +116,8 @@ fn seed_inventory(engine: &std::sync::Arc<engine::InMemoryEngine>) {
         .expect("the inventory holds the interface");
 }
 
-/// Create an `ip` target group in `vpc` and answer its ARN.
+/// Create an `ip` target group in `vpc`, checked at this suite's own cadence, and answer its
+/// ARN.
 async fn ip_target_group(router: &MultiServiceRouter, name: &str, vpc: &str) -> String {
     let mut form = action("CreateTargetGroup");
     form.push(p("Name", name));
@@ -251,9 +252,9 @@ fn published(
 
 /// The last datapoint of one host-count series, once it reports `wanted`.
 ///
-/// A series is published on the emulator's own accelerated schedule, so the datapoint that
-/// carries a verdict the checks have just reached is the next one due rather than the one
-/// already stored.
+/// The datapoint that carries a verdict the checks have just reached is the next one DUE
+/// rather than the one already stored, and the series keeps the one-minute spacing the real
+/// one has — which is what [`DEADLINE`] has to cover here as well as the verdict itself.
 async fn published_reaching(
     engine: &std::sync::Arc<engine::InMemoryEngine>,
     case: &str,

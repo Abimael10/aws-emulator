@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! Which target-group PROTOCOLS a given `TargetType` can be routed to over.
+//! Which target-group PROTOCOLS a given `TargetType` can be routed to over, and the
+//! `TargetTypeEnum` values the rules below and their callers name.
 //!
 //! `TargetType` says what a target group's members ARE — "`instance` - Register targets by
 //! instance ID … `ip` - Register targets by IP address … `lambda` - Register a single
@@ -30,6 +31,11 @@ use super::Refusal;
 /// The target type that holds "a single Application Load Balancer as a target", from
 /// `TargetTypeEnum`'s own values.
 pub const LOAD_BALANCER_TARGET_TYPE: &str = "alb";
+
+/// The target type that holds "a single Lambda function as a target", from the same values:
+/// the one target type whose target is INVOKED rather than connected to, which is what
+/// several members and one whole attribute family key on.
+pub const LAMBDA_TARGET_TYPE: &str = "lambda";
 
 /// The protocols a target group of `target_type` may carry, or `None` when the target type
 /// puts no bound of its own on the protocol — which is every target type whose targets are

@@ -193,6 +193,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         .map_err(crate::scaffolded::Scaffolded::validation_error)?;
 
         let mut guard = state.lock();
+        // ONE clock reading for the whole write, so every instant this call stores is the
+        // same moment.
+        let now = ::std::time::SystemTime::now();
         let Some(group) = guard.target_groups.get_mut(&input.target_group_arn) else {
             return Err(ModifyTargetGroupErrorModeled::TargetGroupNotFoundException(
                 TargetGroupNotFoundException {
@@ -328,6 +331,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
         if let Some(interval) = input.health_check_interval_seconds {
             group.health_check.interval_seconds = interval;
+            // The spacing of the checks is what decides when each registration's next one
+            // comes due, and the one this modify stores applies from now on: a registration
+            // whose pending check was scheduled under the OLD spacing is re-based, so a
+            // caller that shortens the interval does not have to wait out the longer span it
+            // replaced ([`crate::state::target_health`]).
+            group.reschedule_checks(now);
         }
         if let Some(timeout) = input.health_check_timeout_seconds {
             group.health_check.timeout_seconds = timeout;
@@ -342,9 +351,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             group.health_check.matcher = Some(matcher);
         }
         group.settle_health_check_http_members();
+        let modified = group.to_shape();
+
+        // The checks of this group's registrations are what the stored health check TIMES,
+        // so the write that changed it also makes due what the new schedule already owes —
+        // the same driving the writes that change a load balancer's routing or its
+        // registrations perform ([`crate::state::host_counts`]). Nothing a read did.
+        drop(guard);
+        crate::state::drive_host_count_metrics(&self.engine);
 
         Ok(ModifyTargetGroupOutput {
-            target_groups: Some(vec![group.to_shape()]),
+            target_groups: Some(vec![modified]),
         })
     }
 }

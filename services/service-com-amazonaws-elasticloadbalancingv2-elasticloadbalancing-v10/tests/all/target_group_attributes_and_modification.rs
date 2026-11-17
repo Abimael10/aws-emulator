@@ -544,6 +544,52 @@ async fn an_attribute_write_is_accepted_on_its_documented_bounds_and_refused_pas
             "101",
             false,
         ),
+        // "The possible values are off or an integer from 1 to the maximum number of
+        // targets", so the ceiling is the number of targets a target group holds at all
+        // (`crate::state::TARGETS_PER_TARGET_GROUP`, the figure `DescribeAccountLimits`
+        // reports as `targets-per-application-load-balancer`).
+        (
+            "target_group_health.dns_failover.minimum_healthy_targets.count",
+            "off",
+            true,
+        ),
+        (
+            "target_group_health.dns_failover.minimum_healthy_targets.count",
+            "1",
+            true,
+        ),
+        (
+            "target_group_health.dns_failover.minimum_healthy_targets.count",
+            "1000",
+            true,
+        ),
+        (
+            "target_group_health.dns_failover.minimum_healthy_targets.count",
+            "0",
+            false,
+        ),
+        (
+            "target_group_health.dns_failover.minimum_healthy_targets.count",
+            "1001",
+            false,
+        ),
+        // "The value is an integer from 1 to the maximum number of targets" — the same
+        // ceiling, and this one takes no `off`.
+        (
+            "target_group_health.unhealthy_state_routing.minimum_healthy_targets.count",
+            "1",
+            true,
+        ),
+        (
+            "target_group_health.unhealthy_state_routing.minimum_healthy_targets.count",
+            "1000",
+            true,
+        ),
+        (
+            "target_group_health.unhealthy_state_routing.minimum_healthy_targets.count",
+            "1001",
+            false,
+        ),
         // "Names that start with the following prefixes are not allowed: AWSALB,
         // AWSALBAPP, and AWSALBTG."
         ("stickiness.app_cookie.cookie_name", "session", true),

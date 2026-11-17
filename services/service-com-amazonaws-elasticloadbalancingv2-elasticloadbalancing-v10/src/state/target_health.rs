@@ -395,6 +395,23 @@ impl TargetGroupRecord {
         }
     }
 
+    /// Re-base every pending check of this group on the interval it NOW carries: no
+    /// registration waits longer than one of them from `now`.
+    ///
+    /// Called where `ModifyTargetGroup` stores a new `HealthCheckIntervalSeconds`. The
+    /// cadence a caller configures applies from the moment it is configured, so a check
+    /// already scheduled under a longer one is brought forward to one new interval from now;
+    /// a check due sooner than that keeps its instant, because the interval is how far apart
+    /// checks come at most and a modify does not postpone one the group already owes.
+    pub fn reschedule_checks(&mut self, now: SystemTime) {
+        let due = due_at(now, health_check_interval(self));
+        for target in self.targets.values_mut() {
+            if target.draining_until.is_none() {
+                target.checks_due_at = target.checks_due_at.min(due);
+            }
+        }
+    }
+
     /// Fold what ONE look at the registration `key` names observed into its probe, and move
     /// that registration on to its next check.
     ///
@@ -731,5 +748,72 @@ mod tests {
             Duration::ZERO,
             "case a lambda target group: the attribute is not supported for it, got {delay:?}"
         );
+    }
+
+    /// RULE: the cadence a caller CHANGES applies from the moment it is changed — a check
+    /// scheduled under a longer interval is brought forward to one new interval from now, and
+    /// one already due sooner than that keeps the instant the group owes it.
+    ///
+    /// The rows span what the re-basing generalises over: a pending check further off than the
+    /// new interval, one exactly one new interval off, one already due, and a draining
+    /// registration, which is not checked again at all. Each row states the span the next
+    /// check must end up at, so the assertion does not re-derive what the code does.
+    #[test]
+    fn a_changed_interval_rebases_the_pending_checks_and_postpones_none() {
+        let now = SystemTime::now();
+        let was = Duration::from_secs(300);
+        let rows: [(&str, Duration, bool, Duration); 4] = [
+            // The old interval put it five minutes off; the new one is five seconds.
+            (
+                "a check the old interval put five minutes off",
+                was,
+                false,
+                Duration::from_secs(5),
+            ),
+            (
+                "a check one new interval off",
+                Duration::from_secs(5),
+                false,
+                Duration::from_secs(5),
+            ),
+            ("a check already due", Duration::ZERO, false, Duration::ZERO),
+            // Not re-based at all: it is leaving the group.
+            ("a draining registration", was, true, was),
+        ];
+        for (case, pending, draining, expected) in rows {
+            let mut group = group_with(None);
+            group.health_check.interval_seconds = 300;
+            let key: TargetKey = ("10.0.0.7".to_string(), Some(80));
+            group.targets.insert(
+                key.clone(),
+                RegisteredTarget {
+                    id: key.0.clone(),
+                    port: key.1,
+                    availability_zone: None,
+                    registered_at: now,
+                    healthy_at: now,
+                    draining_until: draining.then(|| due_at(now, was)),
+                    checks_due_at: due_at(now, pending),
+                    probe: TargetProbe::default(),
+                    registered_for: None,
+                    serves_ports: Vec::new().into(),
+                    guarded_by: Vec::new().into(),
+                },
+            );
+            // The modify stores the new interval, then re-bases what is pending.
+            group.health_check.interval_seconds = 5;
+            group.reschedule_checks(now);
+
+            let due = group
+                .targets
+                .get(&key)
+                .expect("the registration is held")
+                .checks_due_at;
+            let expected = due_at(now, expected);
+            assert_eq!(
+                due, expected,
+                "case {case:?}: expected the next check at {expected:?}, got {due:?}"
+            );
+        }
     }
 }

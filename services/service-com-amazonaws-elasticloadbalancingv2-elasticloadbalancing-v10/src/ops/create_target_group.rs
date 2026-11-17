@@ -250,7 +250,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .target_type
             .clone()
             .unwrap_or_else(|| "instance".to_string());
-        let lambda = target_type == "lambda";
+        let lambda = target_type == crate::state::LAMBDA_TARGET_TYPE;
         // `VpcId` is optional in the model and REQUIRED for every target type whose
         // targets live in a VPC — an `instance`, `ip` or `alb` target is addressed inside
         // one, while "if the target type is lambda, this parameter does not apply". The
@@ -540,7 +540,7 @@ fn validate_protocol_version(
     if protocol_version.is_none() {
         return Ok(());
     }
-    let lambda = target_type == "lambda";
+    let lambda = target_type == crate::state::LAMBDA_TARGET_TYPE;
     if !lambda && crate::state::is_http_protocol(protocol) {
         return Ok(());
     }
@@ -583,7 +583,7 @@ fn health_check_config(
     target_type: &str,
     family: crate::state::LoadBalancerFamily,
 ) -> HealthCheckConfig {
-    let lambda = target_type == "lambda";
+    let lambda = target_type == crate::state::LAMBDA_TARGET_TYPE;
     let protocol = input.protocol.as_deref().filter(|_| !lambda);
     let geneve = protocol == Some("GENEVE");
 

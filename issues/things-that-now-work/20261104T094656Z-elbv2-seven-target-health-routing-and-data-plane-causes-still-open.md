@@ -29,6 +29,8 @@ Issue-Commit: 7fd8acd3be042b6d00a1996e0a0d05df0b6f87ae
 
 > _Split out of `issues/things-that-now-work/20261104T094656Z-elbv2-ten-target-health-routing-and-lifecycle-root.md`, whose causes 1 and 5, the `initial` half of cause 2 and the message half of cause 6 are fixed. The causes below are NOT fixed; they kept the original report's numbering, trace ids and Issue-Keys so they stay filed and replayable. They were identified against the code base at commit `7fd8acd3be042b6d00a1996e0a0d05df0b6f87ae`, so trace each one back to the current code base._
 
+> _RESOLVED in turn, and split again: causes 3, 6, 8 and 10 are fixed (their recorded checks pass), and so is the SCHEDULE half of cause 2 — a verdict about a registration is now as many of the target group's own `HealthCheckIntervalSeconds` away as its threshold takes checks, including after a `ModifyTargetGroup` that changes that interval, and the refusal of a health check turned off for an `instance`/`ip`/`alb` target group carries the sentence Elastic Load Balancing states. What is left of causes 2, 4, 7 and 9 is re-filed, with everything learned about each, as `issues/things-that-do-not-work/20261116T120000Z-elbv2-four-target-health-alpn-listener-lifecycle-and-data-plane-causes-still-open.md`._
+
 ## Operation
 DescribeTargetHealth
 

@@ -71,14 +71,14 @@
 //!
 //! An Application Load Balancer publishes these counts once a MINUTE
 //! ([`PUBLISH_INTERVAL`]), so the run-up an alarm over several evaluation periods needs is
-//! minutes long, and the first flip of a target the load balancer cannot reach is
-//! `UnhealthyThresholdCount` health-check intervals away — neither of which a client is going
-//! to sit through against an emulator. So the series is published on an ACCELERATED
-//! schedule: its checks come due [`ACCELERATED_SPACING`] apart until the series reaches the
-//! present, and one publish interval apart from then on, while every datapoint keeps the
-//! one-minute SPACING the real series has. A series therefore opens with
-//! [`RUN_UP_PERIODS`] datapoints stamped BEFORE the instant routing began, and an alarm
-//! whose evaluation periods reach back over them sees a series that has been running.
+//! minutes long — which a client is not going to sit through against an emulator. So the
+//! series is published on an ACCELERATED schedule: its datapoints come due
+//! [`ACCELERATED_SPACING`] apart until the series reaches the present, and one publish
+//! interval apart from then on, while every datapoint keeps the one-minute SPACING the real
+//! series has. A series therefore opens with [`RUN_UP_PERIODS`] datapoints stamped BEFORE the
+//! instant routing began, and an alarm whose evaluation periods reach back over them sees a
+//! series that has been running. What each datapoint COUNTS is the health the checks have
+//! reached by then, on their own schedule above.
 //!
 //! What makes that observable without any further call is [`drive_host_count_metrics`]: the
 //! write that changes what a load balancer routes to, or which targets are registered,
@@ -155,12 +155,15 @@ const STORAGE_RESOLUTION_SECS: i32 = 60;
 /// datapoints carry the verdicts the checks really reached, in the order they reached them.
 const RUN_UP_PERIODS: u32 = 5;
 
-/// How far apart the checks of one series come DUE while its series is still catching up with
-/// the present.
+/// How far apart the DATAPOINTS of one series come due while that series is still catching up
+/// with the present.
 ///
-/// The emulator's own span: at this spacing the run-up of a series opened with the default
-/// `UnhealthyThresholdCount` of two takes 500 ms, so a caller reading straight after the
-/// write that started the routing still sees the `initial` state and not the verdict.
+/// The emulator's own span, and the publish schedule's alone: how often a registration is
+/// CHECKED is the target group's own `HealthCheckIntervalSeconds`
+/// ([`super::target_health::health_check_interval`]), which this never shortens — a series
+/// that catches up faster than the checks run reports the same verdict in several of its
+/// datapoints, which is what a series of a metric published more often than its subject
+/// changes reports.
 const ACCELERATED_SPACING: Duration = Duration::from_millis(250);
 
 /// The shortest a publisher-clock wake-up waits, so a check already past its due instant
@@ -227,10 +230,10 @@ pub fn target_group_dimension_value(arn: &str) -> Option<String> {
 #[derive(Debug)]
 struct SeriesClock {
     /// The time stamp the next datapoint carries. Advances by [`PUBLISH_INTERVAL`] per
-    /// check, so the series keeps the spacing the real one has.
+    /// datapoint, so the series keeps the spacing the real one has.
     next_stamp: SystemTime,
-    /// The instant the next check comes due; see [`ACCELERATED_SPACING`].
-    next_check_at: Instant,
+    /// The instant the next datapoint comes due; see [`ACCELERATED_SPACING`].
+    next_datapoint_at: Instant,
 }
 
 /// Where every host-count series of this store has got to, and the one in-process clock that
@@ -425,6 +428,11 @@ fn release_clock(store: &mut ElbState, generation: u64) {
 /// How long the clock waits before its next pass, or `None` — having RELEASED its claim —
 /// when the store holds no series to publish.
 ///
+/// The earliest thing the stored due instants owe: the next datapoint of a series, and the
+/// next CHECK of a registration a load balancer of this store health-checks
+/// ([`earliest_check_due`]) — which is the one that decides how long a registration keeps its
+/// current verdict, so the clock wakes for it rather than for the publish schedule alone.
+///
 /// Observing "nothing is owed" and standing down happen in ONE critical section, which is
 /// what makes the hand-over race-free: a write holds this same lock to store the routing
 /// BEFORE it tries to claim the clock, so either this call sees that series and the running
@@ -435,7 +443,7 @@ fn next_wait_or_release(store: &mut ElbState, generation: u64) -> Option<Duratio
         .host_counts
         .series
         .values()
-        .map(|series| series.next_check_at)
+        .map(|series| series.next_datapoint_at)
         .min();
     // The next CHECK of a registration, which is a different schedule from the next datapoint
     // of the series it is counted into: a verdict is a number of checks away, each one
@@ -470,8 +478,9 @@ fn earliest_check_due(store: &ElbState, now: SystemTime) -> Option<Duration> {
         .min()
 }
 
-/// Check every registration of a routed target group, fold what the checks observed into the
-/// store, and publish the datapoint each due series is reported as.
+/// Check every registration of a routed target group whose own next check is due, fold what
+/// those checks observed into the store, and publish the datapoint each due series is
+/// reported as.
 ///
 /// Four steps, so no store guard is held over another service's lock and the stores are never
 /// locked at once:
@@ -506,9 +515,9 @@ fn publish_due_checks<Eng: Send + Sync + 'static>(engine: &Eng) {
 /// Open a series for every `(load balancer, target group)` pair the store now routes, and
 /// close the series of every pair it no longer does.
 ///
-/// A series opens with its run-up already behind it ([`RUN_UP_PERIODS`]) and its first check
-/// due at once, so the write that started the routing publishes the series' first datapoints
-/// itself.
+/// A series opens with its run-up already behind it ([`RUN_UP_PERIODS`]) and its first
+/// datapoint due at once, so the write that started the routing publishes the series' first
+/// datapoints itself.
 fn sync_series(store: &mut ElbState, now: SystemTime, instant: Instant) {
     let mut routed: HashSet<(String, String)> = HashSet::new();
     for (target_group_arn, group) in &store.target_groups {
@@ -530,13 +539,17 @@ fn sync_series(store: &mut ElbState, now: SystemTime, instant: Instant) {
             .entry(pair)
             .or_insert_with(|| SeriesClock {
                 next_stamp: now.checked_sub(run_up).unwrap_or(now),
-                next_check_at: instant,
+                next_datapoint_at: instant,
             });
     }
 }
 
 /// Every registration of a target group some load balancer of this store routes to, up to
 /// [`MAX_CHECKS_PER_PASS`].
+///
+/// Every one of them is LOOKED at; whether that look counts as one of the group's own
+/// scheduled checks is decided per registration, against the cadence it is checked at
+/// ([`super::TargetGroupRecord::observed_check`]).
 fn registrations_to_check(store: &ElbState) -> Vec<Checked> {
     let mut checked: Vec<Checked> = Vec::new();
     for (target_group_arn, group) in &store.target_groups {
@@ -559,7 +572,7 @@ fn registrations_to_check(store: &ElbState) -> Vec<Checked> {
     checked
 }
 
-/// The registrations `registrations` names, as the checks of them this store would run: one
+/// The registrations `registrations` names, as the looks at them this store would take: one
 /// per `(target group ARN, key)` that is still held by a target group a load balancer
 /// forwards to, and up to [`MAX_CHECKS_PER_PASS`] of them.
 ///
@@ -933,7 +946,7 @@ fn due_datapoints(
         .host_counts
         .series
         .iter()
-        .filter(|(_, series)| instant >= series.next_check_at)
+        .filter(|(_, series)| instant >= series.next_datapoint_at)
         .map(|(pair, _)| pair.clone())
         .collect();
     let mut published: Vec<(cloudwatch::MetricKey, cloudwatch::StoredDatum)> =
@@ -999,21 +1012,21 @@ fn due_datapoints(
     published
 }
 
-/// Take the time stamp of the check that is due and schedule the next one.
+/// Take the time stamp of the datapoint that is due and schedule the next one.
 fn advance(series: &mut SeriesClock) -> SystemTime {
     let stamp = series.next_stamp;
     series.next_stamp = stamp.checked_add(PUBLISH_INTERVAL).unwrap_or(stamp);
     // While the series is still behind the present it is published at the accelerated
-    // spacing; once it has caught up, the next check is due when the clock reaches its
+    // spacing; once it has caught up, the next datapoint is due when the clock reaches its
     // stamp, which is one publish interval apart. Never longer than one interval: that is
     // the most the schedule can owe, so a clock that has stepped backwards costs one slow
-    // check rather than an unbounded wait.
+    // datapoint rather than an unbounded wait.
     let wait = series
         .next_stamp
         .duration_since(SystemTime::now())
         .unwrap_or(ACCELERATED_SPACING)
         .min(PUBLISH_INTERVAL);
-    series.next_check_at = Instant::now()
+    series.next_datapoint_at = Instant::now()
         .checked_add(wait)
         .unwrap_or_else(Instant::now);
     stamp
