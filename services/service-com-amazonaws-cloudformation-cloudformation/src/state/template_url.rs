@@ -130,8 +130,13 @@ fn unsupported_url(member: &str) -> String {
 }
 
 /// The refusal for text that addresses an Amazon S3 endpoint but no object in it, so no
-/// object was even asked for.
-fn not_a_readable_object(member: &str) -> String {
+/// object was even asked for — and, for a member whose object this service RETRIEVES as part
+/// of accepting the request, the refusal for an object the retrieval could not be given
+/// either: both are the one thing the sentence states, that the member references no readable
+/// object. Parameterised by the member, so every member that carries such a reference is
+/// refused in the same words ([`crate::ops::register_type`] words `SchemaHandlerPackage`
+/// through it).
+pub fn not_a_readable_object(member: &str) -> String {
     format!("{member} must reference a valid S3 object to which you have access.")
 }
 

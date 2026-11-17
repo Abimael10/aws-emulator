@@ -66,6 +66,10 @@ percent-encoding = "2"
 # `versionId` query — rather than hand-rolling a URL parser over caller-supplied text
 # (`state::template_url`).
 url = "2"
+# Reads whether a `RegistrationToken` is spelled as the uuid CloudFormation generates for a
+# registration request, which is what the registry's refusal for an unresolved token turns on
+# (`state::registry::is_registration_token_form`).
+uuid = "1"
 # Applies a parameter declaration's own `AllowedPattern` to the value a stack operation
 # passes for it (`state::parameter_constraints`): the pattern is a regular expression the
 # template author wrote, matched by the maintained engine rather than by a hand-rolled one.

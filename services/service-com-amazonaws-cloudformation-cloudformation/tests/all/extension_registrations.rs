@@ -12,14 +12,14 @@
 //! request addresses in Amazon S3 — and answers the registration token the request is
 //! monitored by, which `DescribeTypeRegistration` reports as `IN_PROGRESS` until the clock
 //! makes the conclusion due and as `COMPLETE`, with the extension's and the version's ARNs,
-//! after; registering "includes validating the extension schema", so a package the
-//! registration can read no schema of the extension out of — an object Amazon S3 will not
-//! hand over, an object that is not a ZIP archive, an archive carrying no schema of this
-//! extension — registers nothing and its request concludes `FAILED` instead; a name in one of
-//! the organization namespaces AWS reserves, and text that addresses no Amazon S3 object at
-//! all, are each refused with the modelled `CFNRegistryException` (400) and start no
-//! registration; and a resubmission under one `ClientRequestToken` is that same registration
-//! rather than a second version.**
+//! after; registering "includes validating the extension schema", so an archive the
+//! registration can read no schema of the extension out of — an object that is not a ZIP
+//! archive, an archive carrying no schema of this extension — registers nothing and its
+//! request concludes `FAILED` instead; a name in one of the organization namespaces AWS
+//! reserves, text that addresses no Amazon S3 object at all, and an object Amazon S3 will not
+//! hand over are each refused with the modelled `CFNRegistryException` (400) and start no
+//! registration at all; and a resubmission under one `ClientRequestToken` is that same
+//! registration rather than a second version.**
 //!
 //! The rows differ along what the rule generalises over: the extension KINDS the model admits
 //! (`RESOURCE`, `MODULE`, `HOOK`), which handlers the package's schema declares (every
@@ -40,6 +40,7 @@ use serde_json::json;
 
 use crate::harness::{
     call, member, refusal, router_with_engine, store, xml_blocks, xml_text, xml_texts, REGION,
+    SETTLE_DEADLINE, SETTLE_POLL_INTERVAL,
 };
 use crate::stack_resource_provisioning::s3;
 use service_com_amazonaws_cloudformation_cloudformation::state::registry::{
@@ -277,6 +278,32 @@ async fn describe_registration(
         description: xml_text(&body, "Description"),
         type_arn: xml_text(&body, "TypeArn"),
         type_version_arn: xml_text(&body, "TypeVersionArn"),
+    }
+}
+
+/// Read the request under `token` until it has CONCLUDED — the condition a case waits on —
+/// giving up only past a deadline generous enough for any host.
+///
+/// The conclusion is owed at an instant and nothing in the service sleeps for it, so this
+/// looks again rather than waiting out a duration: what the case is about is the status the
+/// clock has made due, never how fast this host runs.
+async fn concluded_registration(
+    case: &str,
+    router: &MultiServiceRouter,
+    token: &str,
+) -> Monitored {
+    let deadline = SystemTime::now() + SETTLE_DEADLINE;
+    loop {
+        let monitored = describe_registration(case, router, token).await;
+        if monitored.progress != registration_status::IN_PROGRESS {
+            return monitored;
+        }
+        assert!(
+            SystemTime::now() < deadline,
+            "case {case:?}: expected the registration to conclude, it is still {:?}",
+            monitored.progress
+        );
+        tokio::time::sleep(SETTLE_POLL_INTERVAL).await;
     }
 }
 
@@ -967,8 +994,9 @@ async fn a_package_the_registration_cannot_use_registers_nothing() {
     create_package_bucket(&router).await;
     // Readable archives that carry no schema of the extension being registered: one with no
     // provider definition document at all, one whose document declares ANOTHER extension, and
-    // one carrying no entries whatever — beside objects that are no archive at all and keys
-    // Amazon S3 will not hand over.
+    // one carrying no entries whatever — beside objects Amazon S3 DOES hand over that are no
+    // archive at all. Each was retrieved, so the REQUEST was accepted and what is wrong is
+    // what the package carries.
     stage(&router, "schemaless.zip", &package_of(None)).await;
     stage(
         &router,
@@ -1012,28 +1040,12 @@ async fn a_package_the_registration_cannot_use_registers_nothing() {
             "s3://cfn-extension-packages/truncated.zip",
             "not a valid ZIP file",
         ),
-        (
-            "a key the bucket does not hold",
-            "My::Failing::Missing",
-            "s3://cfn-extension-packages/nothing-staged-here.zip",
-            "nothing-staged-here.zip",
-        ),
-        (
-            // A bucket that is not there establishes nothing about the object, so what the
-            // registration reports is what Amazon S3 answered the read with — the one
-            // wording every read of a caller-addressed object carries
-            // (`state::template_url`).
-            "a bucket Amazon S3 does not hold",
-            "My::Failing::Bucketless",
-            "s3://no-such-package-bucket/package.zip",
-            "The specified bucket does not exist",
-        ),
     ];
 
     let mut tokens: Vec<String> = Vec::new();
     for (case, type_name, package, _) in rows {
-        // The REQUEST is accepted — a registration is asynchronous, and validating the
-        // package is part of registering rather than of accepting the registration.
+        // The REQUEST is accepted — the package WAS retrieved, and validating the schema it
+        // carries is part of registering rather than of accepting the registration.
         let token = register_ok(
             case,
             &router,
@@ -1054,10 +1066,8 @@ async fn a_package_the_registration_cannot_use_registers_nothing() {
         tokens.push(token);
     }
 
-    wait_for_the_conclusion().await;
-
     for ((case, type_name, _, names_the_cause), token) in rows.iter().zip(tokens.iter()) {
-        let monitored = describe_registration(case, &router, token).await;
+        let monitored = concluded_registration(case, &router, token).await;
         assert_eq!(
             monitored.progress,
             registration_status::FAILED,
@@ -1108,6 +1118,218 @@ async fn a_package_the_registration_cannot_use_registers_nothing() {
             "case {case:?}: expected the listing to report the failed request, got {listed:?}"
         );
     }
+}
+
+#[tokio::test]
+async fn a_package_amazon_s3_will_not_hand_over_is_refused_on_the_request() {
+    let (router, _engine) = router_with_engine();
+    create_package_bucket(&router).await;
+
+    // "The user registering the extension must be able to access the package in the S3 bucket"
+    // (`RegisterTypeInput$SchemaHandlerPackage`): retrieving the package is part of accepting
+    // the registration, so an object this caller cannot be handed is refused on the REQUEST,
+    // with the registry's one sentence for a member that references no such object — written
+    // out here rather than read off the implementation, and carrying nothing of the request.
+    // The rows differ along what the rule generalises over: which Amazon S3 addressing style
+    // the text spells, what about the object cannot be retrieved (a key the bucket does not
+    // hold, a bucket that is not there at all), and the extension kinds the model admits.
+    let unretrievable = "SchemaHandlerPackage must reference a valid S3 object to which you \
+                         have access.";
+    let rows: &[(&str, &str, &str, String)] = &[
+        (
+            "a key the bucket does not hold, addressed as an s3 URI",
+            registry_type::RESOURCE,
+            "My::Unretrievable::Resource",
+            Style::S3Uri.url("nothing-staged-here.zip"),
+        ),
+        (
+            "a key the bucket does not hold, path-addressed",
+            registry_type::RESOURCE,
+            "My::Unretrievable::PathStyle",
+            Style::PathAddressed.url("also-not-staged.zip"),
+        ),
+        (
+            "a key the bucket does not hold, virtual-hosted",
+            registry_type::RESOURCE,
+            "My::Unretrievable::Hosted",
+            Style::VirtualHosted.url("neither-is-this.zip"),
+        ),
+        (
+            "a bucket Amazon S3 does not hold",
+            registry_type::RESOURCE,
+            "My::Unretrievable::Bucketless",
+            "s3://no-such-package-bucket/package.zip".to_string(),
+        ),
+        (
+            "a module whose package was never staged",
+            registry_type::MODULE,
+            "My::Unretrievable::Thing::MODULE",
+            Style::S3Uri.url("no-module-package.zip"),
+        ),
+        (
+            "a Hook whose package was never staged",
+            registry_type::HOOK,
+            "My::Unretrievable::Hook",
+            Style::S3Uri.url("no-hook-package.zip"),
+        ),
+    ];
+
+    for (case, type_kind, type_name, package) in rows {
+        let (status, body) = register(&router, Some(*type_kind), type_name, package, &[]).await;
+        assert_eq!(
+            status, 400,
+            "case {case:?}: expected the registration to be refused, got {status} {body}"
+        );
+        let (code, message) = refusal(&body);
+        assert_eq!(
+            code, REGISTRY_REFUSAL_CODE,
+            "case {case:?}: expected {REGISTRY_REFUSAL_CODE}, got {code:?} in {body}"
+        );
+        assert_eq!(
+            message, unretrievable,
+            "case {case:?}: expected the refusal {unretrievable:?}, got {message:?}"
+        );
+        // A refused request mints no token at all: there is no registration for a client to
+        // monitor, so the response carries none.
+        let token = xml_text(&body, "RegistrationToken");
+        assert_eq!(
+            token, None,
+            "case {case:?}: expected no registration token in a refusal, got {token:?}"
+        );
+        // Nor is there a request of this extension under ANY status the model admits: the
+        // refusal started nothing.
+        for progress in [
+            registration_status::IN_PROGRESS,
+            registration_status::COMPLETE,
+            registration_status::FAILED,
+        ] {
+            let listed = registration_tokens(&router, type_kind, type_name, progress).await;
+            assert!(
+                listed.is_empty(),
+                "case {case:?}: expected no {progress} request for a refused registration, got \
+                 {listed:?}"
+            );
+        }
+        // And nothing was registered: the name resolves no extension at all.
+        let (status, body) = describe_type(&router, type_kind, type_name, None).await;
+        assert_eq!(
+            status, 404,
+            "case {case:?}: expected no record for a refused registration, got {status} {body}"
+        );
+        let (code, _) = refusal(&body);
+        assert_eq!(
+            code, NOT_FOUND_CODE,
+            "case {case:?}: expected {NOT_FOUND_CODE}, got {code:?} in {body}"
+        );
+    }
+
+    // The control the refusals above must not reach: the SAME call, for a package this caller
+    // IS handed, is accepted with the token the request is monitored by — and that token
+    // resolves to the request it addresses.
+    let accepted = "My::Retrievable::Resource";
+    stage(
+        &router,
+        "retrievable.zip",
+        &package_of(Some(&schema_of(accepted, EVERY_HANDLER))),
+    )
+    .await;
+    let case = "a package Amazon S3 does hand over";
+    let token = register_ok(
+        case,
+        &router,
+        Some(registry_type::RESOURCE),
+        accepted,
+        &Style::S3Uri.url("retrievable.zip"),
+        &[],
+    )
+    .await;
+    let monitored = concluded_registration(case, &router, &token).await;
+    assert_eq!(
+        monitored.progress,
+        registration_status::COMPLETE,
+        "case {case:?}: expected the accepted registration to complete, got {:?}",
+        monitored.progress
+    );
+}
+
+#[tokio::test]
+async fn a_resubmission_is_answered_from_the_record_rather_than_by_retrieving_again() {
+    let (router, _engine) = router_with_engine();
+    create_package_bucket(&router).await;
+    let type_name = "My::Resubmitted::Resource";
+    stage(
+        &router,
+        "resubmitted.zip",
+        &package_of(Some(&schema_of(type_name, EVERY_HANDLER))),
+    )
+    .await;
+    let submitted = [member("ClientRequestToken", "registration-submitted-once")];
+    let package = Style::S3Uri.url("resubmitted.zip");
+    let first = register_ok(
+        "the first submission",
+        &router,
+        Some(registry_type::RESOURCE),
+        type_name,
+        &package,
+        &submitted,
+    )
+    .await;
+
+    // The staged object is gone by the time the request is submitted again. "Specifying a
+    // client request token prevents CloudFormation from generating more than one version of an
+    // extension from the same registration request, even if the request is submitted multiple
+    // times": the resubmission IS the registration this Region already holds, so it is
+    // answered from that record — the package is retrieved for a registration being accepted,
+    // and this one was accepted already.
+    let removed = s3(
+        &router,
+        "DELETE",
+        &format!("/{PACKAGE_BUCKET}/resubmitted.zip"),
+        b"",
+    )
+    .await;
+    assert!(
+        matches!(removed.status, 200 | 204),
+        "the staged package must be removable first, got {} {}",
+        removed.status,
+        removed.body
+    );
+    let again = register_ok(
+        "the same request submitted again, the package since removed",
+        &router,
+        Some(registry_type::RESOURCE),
+        type_name,
+        &package,
+        &submitted,
+    )
+    .await;
+    assert_eq!(
+        again, first,
+        "case \"the same request submitted again, the package since removed\": expected the \
+         registration token {first:?}, got {again:?}"
+    );
+
+    // A registration of the same extension that is NOT a resubmission has no record to be
+    // answered from, so the package it addresses has to be retrievable — and that one is gone.
+    let (status, body) = register(
+        &router,
+        Some(registry_type::RESOURCE),
+        type_name,
+        &package,
+        &[member("ClientRequestToken", "registration-submitted-later")],
+    )
+    .await;
+    assert_eq!(
+        status, 400,
+        "case \"a new registration whose package was removed\": expected the registration to \
+         be refused, got {status} {body}"
+    );
+    let (code, _) = refusal(&body);
+    assert_eq!(
+        code, REGISTRY_REFUSAL_CODE,
+        "case \"a new registration whose package was removed\": expected \
+         {REGISTRY_REFUSAL_CODE}, got {code:?} in {body}"
+    );
 }
 
 #[tokio::test]
@@ -1349,9 +1571,24 @@ async fn a_registration_past_the_account_version_quota_is_refused() {
 #[tokio::test]
 async fn a_registration_token_nothing_issued_resolves_no_request() {
     let (router, _engine) = router_with_engine();
-    for (case, token) in [
-        ("a token nothing issued", "not-a-token-this-service-issued"),
-        ("a token of the form this service mints", "0123abcd-4567-89ef-0123-456789abcdef"),
+    // The registry's own sentences for a token it resolves to no request, written out here
+    // rather than read off the implementation's constants, and WHICH one is due follows from
+    // the token's spelling: text that is no uuid is no identifier CloudFormation generated,
+    // while a uuid is one it could have generated and the account simply holds no request
+    // under. Neither quotes anything from the request, so the row's token is no part of it —
+    // `monitored_registrations.rs` is the suite that holds that wording across the token forms
+    // the model admits.
+    for (case, token, expected) in [
+        (
+            "a token nothing issued",
+            "not-a-token-this-service-issued",
+            "UUID is invalid",
+        ),
+        (
+            "a token of the form this service mints",
+            "0123abcd-4567-89ef-0123-456789abcdef",
+            "No registration token matches for account.",
+        ),
     ] {
         let (status, body) = call(
             &router,
@@ -1368,14 +1605,10 @@ async fn a_registration_token_nothing_issued_resolves_no_request() {
             code, REGISTRY_REFUSAL_CODE,
             "case {case:?}: expected {REGISTRY_REFUSAL_CODE}, got {code:?} in {body}"
         );
-        // The registry's own sentence for a token it resolves to no request, written out here
-        // rather than read off the implementation's constant. It quotes nothing from the
-        // request, so the row's token is not part of it — `monitored_registrations.rs` is the
-        // suite that holds that wording across the token forms the model admits.
         assert_eq!(
-            message, "UUID is invalid",
-            "case {case:?}: expected the registry's sentence for an unresolved token, got \
-             {message:?}"
+            message, expected,
+            "case {case:?}: expected the registry's sentence {expected:?} for an unresolved \
+             token, got {message:?}"
         );
     }
 }

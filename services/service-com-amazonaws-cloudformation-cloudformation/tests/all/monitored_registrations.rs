@@ -9,16 +9,18 @@
 //! and the extension's and the version's ARNs only once the request has COMPLETEd — and a
 //! token it resolves to no such request, whatever that token's spelling and whichever other
 //! Region holds a request under it, is refused with the registry's own modelled
-//! `CFNRegistryException` (400) whose sentence quotes nothing from the request; monitoring is a
-//! report, so a read leaves every record as it stands beyond the conclusion the clock had
-//! already made due.**
+//! `CFNRegistryException` (400) whose sentence quotes nothing from the request: the sentence
+//! for a uuid the account holds no request under where the token is spelled as one of the
+//! identifiers CloudFormation generates, and the sentence for text that is no such identifier
+//! at all where it is not; monitoring is a report, so a read leaves every record as it stands
+//! beyond the conclusion the clock had already made due.**
 //!
 //! The rows differ along what the rule generalises over: each status a request can hold,
 //! whether the clock has made its conclusion due, the extension kinds the model admits
 //! (`RESOURCE`, `MODULE`, `HOOK`), which version a request registers, the Region a token was
 //! issued in, and — for the refusal — the spellings the modelled `RegistrationToken`
 //! (`@length(1..128)`, `@pattern("^[a-zA-Z0-9][-a-zA-Z0-9]*$")`) admits, at each published
-//! bound.
+//! bound, on each side of the uuid form.
 //!
 //! `RegisterType` is the only writer that starts a registration, and it is driven end to end
 //! by `extension_registrations.rs`; the requests a case here monitors are seeded straight into
@@ -47,10 +49,13 @@ const OTHER_REGION: &str = "us-west-2";
 /// (`CFNRegistryException`'s `awsQueryError`).
 const REGISTRY_REFUSAL_CODE: &str = "CFNRegistryException";
 
-/// The sentence the registry answers a registration token it resolves to no request with,
+/// The sentences the registry answers a registration token it resolves to no request with,
 /// written out here rather than read off the implementation: the token the request named is no
-/// part of it.
-const UNRESOLVED_TOKEN: &str = "UUID is invalid";
+/// part of either. WHICH one is due follows from the token's spelling — a uuid is one of the
+/// identifiers CloudFormation generates for a registration request, so what is wrong is that
+/// the account holds no request under it; text that is no uuid is no such identifier at all.
+const NO_REGISTRATION_MATCHES: &str = "No registration token matches for account.";
+const NOT_A_REGISTRATION_TOKEN: &str = "UUID is invalid";
 
 /// Why a seeded request that could not register its version concluded `FAILED` — the sentence
 /// `Description` reports for it.
@@ -286,7 +291,7 @@ async fn a_token_the_region_holds_no_request_under_is_refused_with_the_registry_
     seed(&engine, &rows);
     // A request ANOTHER Region holds, under a token this Region's registry holds none under:
     // the registry is regional, so the Region the request is signed for decides.
-    let elsewhere = "monitored-elsewhere-running";
+    let elsewhere = "4b2c1d0e-8f9a-4b6c-9d1e-2f3a4b5c6d7e";
     store(&engine)
         .lock()
         .record_type_registration(StoredTypeRegistration::registering(
@@ -300,40 +305,57 @@ async fn a_token_the_region_holds_no_request_under_is_refused_with_the_registry_
     let seeded = store(&engine).lock().type_registrations.len();
 
     // The spellings differ along what the modelled `RegistrationToken` admits — length 1..128
-    // and pattern `^[a-zA-Z0-9][-a-zA-Z0-9]*$` — including each published length bound.
-    let unresolved: Vec<(&str, String)> = vec![
+    // and pattern `^[a-zA-Z0-9][-a-zA-Z0-9]*$` — including each published length bound, and
+    // each row names the sentence its spelling is due.
+    let unresolved: Vec<(&str, String, &str)> = vec![
         (
             "a token nothing issued",
             "not-a-token-this-service-issued".to_string(),
+            NOT_A_REGISTRATION_TOKEN,
         ),
         (
             "a one-character token, the shortest the model admits",
             "x".to_string(),
+            NOT_A_REGISTRATION_TOKEN,
         ),
         (
             "a token at the modelled maximum length",
             "t".repeat(128),
+            NOT_A_REGISTRATION_TOKEN,
         ),
         (
             "a token of the uuid form this service mints",
             "0123abcd-4567-89ef-0123-456789abcdef".to_string(),
+            NO_REGISTRATION_MATCHES,
         ),
         (
             "a version-4 uuid no registration was issued under",
             "9f3c1b2a-5d6e-4f70-8a91-b2c3d4e5f607".to_string(),
+            NO_REGISTRATION_MATCHES,
         ),
-        ("the all-zero uuid", "00000000-0000-0000-0000-000000000000".to_string()),
+        (
+            "a uuid spelled in upper-case hexadecimal",
+            "9F3C1B2A-5D6E-4F70-8A91-B2C3D4E5F607".to_string(),
+            NO_REGISTRATION_MATCHES,
+        ),
+        (
+            "the all-zero uuid",
+            "00000000-0000-0000-0000-000000000000".to_string(),
+            NO_REGISTRATION_MATCHES,
+        ),
         (
             "a mixed-case alphanumeric token",
             "NotARegistrationToken99".to_string(),
+            NOT_A_REGISTRATION_TOKEN,
         ),
         (
             "a token another Region holds a request under",
             elsewhere.to_string(),
+            NO_REGISTRATION_MATCHES,
         ),
     ];
 
-    for (case, token) in &unresolved {
+    for (case, token, expected) in &unresolved {
         let (status, body) = describe(&router, REGION, token).await;
         assert_eq!(
             status, 400,
@@ -345,8 +367,8 @@ async fn a_token_the_region_holds_no_request_under_is_refused_with_the_registry_
             "case {case:?}: expected {REGISTRY_REFUSAL_CODE}, got {code:?} in {body}"
         );
         assert_eq!(
-            message, UNRESOLVED_TOKEN,
-            "case {case:?}: expected {UNRESOLVED_TOKEN:?}, got {message:?}"
+            &message, expected,
+            "case {case:?}: expected {expected:?}, got {message:?}"
         );
     }
 

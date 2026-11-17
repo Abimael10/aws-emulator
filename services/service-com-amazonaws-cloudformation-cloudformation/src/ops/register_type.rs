@@ -16,17 +16,22 @@
 //! `SetTypeDefaultVersion` moves it.
 //!
 //! What the version carries is read out of the SCHEMA HANDLER PACKAGE the request addresses
-//! in Amazon S3 ([`handler_package`]), which is the only place the extension's own schema
-//! exists: the package is a ZIP archive, the schema is the provider definition document in
-//! it that declares the extension being registered, and the provisioning behaviour is the
-//! one that document's handlers give the type
-//! ([`crate::state::resource_schema::declared_provisioning_type`]). Validating that package
-//! is part of REGISTERING rather than of accepting the registration, so an object Amazon S3
-//! will not hand over, one that is not a ZIP archive, and an archive carrying no schema of
-//! this extension each leave the registration with nothing to register: the request is
-//! accepted, and it concludes `FAILED` with the reason instead of registering a version.
-//! Text that addresses no Amazon S3 object at all names no package, which is a rule about the
-//! REQUEST and is refused with the registry's own modelled `CFNRegistryException` (400).
+//! in Amazon S3 ([`schema_in`]), which is the only place the extension's own schema exists:
+//! the package is a ZIP archive, the schema is the provider definition document in it that
+//! declares the extension being registered, and the provisioning behaviour is the one that
+//! document's handlers give the type
+//! ([`crate::state::resource_schema::declared_provisioning_type`]).
+//!
+//! RETRIEVING that package is part of ACCEPTING the registration: "the user registering the
+//! extension must be able to access the package in the S3 bucket"
+//! (`RegisterTypeInput$SchemaHandlerPackage`), so text that addresses no Amazon S3 object at
+//! all and an object Amazon S3 will not hand over are both rules about the REQUEST — each
+//! refused with the registry's own modelled `CFNRegistryException` (400), recording no
+//! registration and minting no token. What the retrieved archive CARRIES is the
+//! REGISTRATION's own business, since registering "includes validating the extension schema":
+//! an object that is not a ZIP archive and an archive carrying no schema of this extension
+//! each leave the registration with nothing to register, so the request is accepted and it
+//! concludes `FAILED` with the reason instead of registering a version.
 //!
 //! Registration is ASYNCHRONOUS: the request is answered with a registration token, and the
 //! request itself is a record of its own ([`crate::state::registry::StoredTypeRegistration`])
@@ -37,7 +42,7 @@
 //! request is submitted multiple times", so a resubmission under a token this Region already
 //! holds a request for is answered with THAT request's token and adds no second version.
 //!
-//! Two rules of the registry refuse a registration before any of that: the organization
+//! Two rules of the registry itself refuse a registration before any of that: the organization
 //! namespaces AWS reserves ([`crate::state::registry::reserved_namespace`]) cannot be
 //! registered in, and an account may have "a maximum of 50 resource extension versions
 //! registered at a time" ([`crate::state::registry::MAX_REGISTERED_VERSIONS`]).
@@ -235,42 +240,89 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The member must address an Amazon S3 object at all — a request-shape rule, so it is
         // refused on the request like the namespace above.
         let object = crate::state::template_url::addressed_object(&input.schema_handler_package)
-            .ok_or_else(|| registry_exception(NOT_A_READABLE_PACKAGE.to_string()))?;
-        // The package is read BEFORE the store is reached: it is the one awaited call of this
-        // handler. Whatever that read finds decides whether the registration can register a
-        // version — it does not refuse the REQUEST, because validating the package is part of
-        // registering rather than of accepting the registration.
-        let schema = handler_package(&*self.engine, ctx, &region, &input.type_name, &object).await;
+            .ok_or_else(|| registry_exception(not_a_readable_package()))?;
+        // The package is RETRIEVED before the store is reached: it is the one awaited call of
+        // this handler, made through the in-process callback into this same emulator's Amazon
+        // S3 exactly as a `TemplateURL` is read ([`crate::state::template_url`]), so the
+        // package a client staged with its own `PutObject` is the one this reads and nothing
+        // here opens a socket. "The user registering the extension must be able to access the
+        // package in the S3 bucket": an object this caller cannot be handed is a rule about the
+        // REQUEST, exactly as text addressing no object at all is, so it is refused HERE —
+        // nothing recorded, no token minted — rather than deferred onto a registration that
+        // would then have nothing to register.
         let Some(state) = crate::state::service_state(&*self.engine) else {
             // Not the shared in-memory engine: there is no registry to register an extension
-            // in, so this answers 501 rather than a token nothing recorded.
+            // in, so this answers 501 rather than a token nothing recorded. Decided before the
+            // package is retrieved, so the seam is reported as the seam rather than as a
+            // refusal of the request.
             return Err(crate::scaffolded::Scaffolded::not_implemented("RegisterType"));
         };
-        let now = ::std::time::SystemTime::now();
-
-        let mut store = state.lock();
-        // The settle walk every operation makes first, so this call reads and writes a
-        // registry in which every transition the clock had already made due is installed.
-        store.settle(now);
-
         // "Specifying a client request token prevents CloudFormation from generating more
         // than one version of an extension from the same registration request, even if the
         // request is submitted multiple times": a resubmission of a registration this Region
-        // already holds IS that registration, answered with its own token.
+        // already holds IS that registration, answered with its own token. Resolved BEFORE the
+        // package is retrieved, so a resubmission is answered from the record the first
+        // request wrote rather than from a second read of an object that may have changed or
+        // gone since.
         if let Some(client_request_token) = input.client_request_token.as_deref() {
-            let held = store
-                .type_registrations_in(&region)
-                .find(|registration| {
-                    registration.client_request_token.as_deref() == Some(client_request_token)
-                        && registration.is_of_extension_named(&type_kind, &input.type_name)
-                })
-                .map(|registration| registration.registration_token.clone());
+            // The lock is taken for this read alone and dropped before the awaited retrieval
+            // below: nothing holds the shared store across an await.
+            let held = {
+                let mut store = state.lock();
+                // The settle walk every operation makes first, so this read sees a registry in
+                // which every transition the clock had already made due is installed.
+                store.settle(::std::time::SystemTime::now());
+                let held = store
+                    .type_registrations_in(&region)
+                    .find(|registration| {
+                        registration.client_request_token.as_deref() == Some(client_request_token)
+                            && registration.is_of_extension_named(&type_kind, &input.type_name)
+                    })
+                    .map(|registration| registration.registration_token.clone());
+                // Released here rather than at the end of the block: the token is owned, and
+                // the retrieval below awaits, so nothing of the store outlives this read.
+                drop(store);
+                held
+            };
             if let Some(registration_token) = held {
                 return Ok(RegisterTypeOutput {
                     registration_token: Some(registration_token),
                 });
             }
         }
+        let archive = crate::state::template_url::read_bytes(
+            &*self.engine,
+            ctx,
+            &region,
+            &object,
+            MAX_PACKAGE_BYTES,
+            PACKAGE_TOO_LONG,
+        )
+        .await
+        // A bucket that is not there, a key it does not hold and a read this caller may not
+        // make are all the one thing: the member references no Amazon S3 object this caller
+        // can be handed, which is what the registry says about each
+        // ([`not_a_readable_package`]) — entirely fixed text, with nothing of the request and
+        // nothing of Amazon S3's own answer quoted into it. An object past the ceiling this
+        // registration holds a package to was not retrieved for a different reason, and says
+        // so: that refusal is the one handed to the read, so it is the one it reports back.
+        .map_err(|refusal| {
+            registry_exception(if refusal == PACKAGE_TOO_LONG {
+                refusal
+            } else {
+                not_a_readable_package()
+            })
+        })?;
+        // What the retrieved archive CARRIES decides whether the registration can register a
+        // version — registering "includes validating the extension schema" — so whatever this
+        // finds leaves the REQUEST accepted.
+        let schema = schema_in(&archive, &input.type_name).await;
+        let now = ::std::time::SystemTime::now();
+
+        let mut store = state.lock();
+        // The settle walk every operation makes first, so this call reads and writes a
+        // registry in which every transition the clock had already made due is installed.
+        store.settle(now);
 
         // "You can have a maximum of 50 resource extension versions registered at a time.
         // This maximum is per account and per Region. Use DeregisterType to deregister
@@ -386,41 +438,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     }
 }
 
-/// The schema the handler package addressed by `object` carries for the extension
-/// `type_name`, or `Err(reason)` — the reason the REGISTRATION fails — for a package no schema
-/// of that extension can be read out of.
-///
-/// "A URL to the S3 bucket that contains the extension project package that contains the
-/// necessary files for the extension you want to register": the object is read through the
-/// in-process callback into this same emulator's Amazon S3, exactly as a `TemplateURL` is
-/// ([`crate::state::template_url`]), so the package a client staged with its own `PutObject`
-/// is the one the registration reads. NOTHING here opens a socket or leaves the host.
-///
-/// Every failure here is the registration's rather than the request's: an object Amazon S3
-/// will not hand over, an object that is not a ZIP archive, and an archive carrying no
-/// provider definition schema of the extension being registered all leave the registration
-/// with nothing to register, which is what "validating the extension schema" concludes.
-async fn handler_package<Eng: Send + Sync + 'static>(
-    engine: &Eng,
-    ctx: &smithy_server_runtime::OperationContext<'_>,
-    region: &str,
-    type_name: &str,
-    object: &crate::state::template_url::Object,
-) -> Result<String, String> {
-    let archive = crate::state::template_url::read_bytes(
-        engine,
-        ctx,
-        region,
-        object,
-        MAX_PACKAGE_BYTES,
-        PACKAGE_TOO_LONG,
-    )
-    .await?;
-    schema_in(&archive, type_name).await
-}
-
 /// The provider definition schema an extension's handler package carries for `type_name`, or
-/// `Err(reason)` for an archive none can be read out of.
+/// `Err(reason)` — the reason the REGISTRATION concludes failed — for an archive none can be
+/// read out of.
+///
+/// Every failure here is the registration's rather than the request's: an object that is not a
+/// ZIP archive and an archive carrying no provider definition schema of the extension being
+/// registered each leave the registration with nothing to register, which is what "validating
+/// the extension schema" concludes. Whether the object could be RETRIEVED at all is the
+/// request's own rule, settled before this is reached.
 ///
 /// Reading the archive FORMAT is the `zip` crate's job, not this emulator's: an object that is
 /// not a ZIP archive is not an extension project package, which is what the package being a
@@ -495,11 +521,12 @@ async fn schema_in(archive: &[u8], type_name: &str) -> Result<String, String> {
 /// The suffix the JSON documents of a handler package carry, which is where its schema is.
 const JSON_SUFFIX: &str = ".json";
 
-/// How many bytes of a schema handler package this registration reads.
+/// How many bytes of a schema handler package this registration retrieves.
 ///
 /// Chosen (CloudFormation publishes no ceiling on a package's size): the package is a
 /// caller-staged object, so the read of it is bounded like every other read of one, and this
-/// is well past the schema document and handler code a package carries.
+/// is well past the schema document and handler code a package carries. An object past it is
+/// not retrieved at all, and the request is refused for that ([`PACKAGE_TOO_LONG`]).
 const MAX_PACKAGE_BYTES: usize = 16 * 1024 * 1024;
 
 /// How many entries of the package the registration looks through for that schema, how many
@@ -509,14 +536,24 @@ const MAX_PACKAGE_ENTRIES: usize = 4_096;
 const MAX_SCHEMA_BYTES: usize = 1024 * 1024;
 const MAX_PACKAGE_READ_BYTES: usize = 8 * 1024 * 1024;
 
-/// The refusal for a `SchemaHandlerPackage` whose text addresses no Amazon S3 object at all,
-/// so no package was even named. Entirely fixed text: no part of it comes from the request or
-/// from the store.
-const NOT_A_READABLE_PACKAGE: &str =
-    "SchemaHandlerPackage must reference a valid S3 object to which you have access.";
+/// The refusal for a `SchemaHandlerPackage` that references no Amazon S3 object this caller
+/// can be handed: text that addresses no object at all, and an object the retrieval could not
+/// be given. Entirely fixed text: no part of it comes from the request, from the store or from
+/// Amazon S3's answer.
+///
+/// Worded by the ONE sentence this service answers a member that references no readable object
+/// with ([`crate::state::template_url::not_a_readable_object`], which is what `TemplateURL`
+/// carries), named for this member, so the two cannot drift apart.
+fn not_a_readable_package() -> String {
+    crate::state::template_url::not_a_readable_object(SCHEMA_HANDLER_PACKAGE)
+}
 
-/// The reason a registration whose package is past [`MAX_PACKAGE_BYTES`] fails: this
-/// registration will not read an object that large at all.
+/// The member that reference is carried on, as the model names it.
+const SCHEMA_HANDLER_PACKAGE: &str = "SchemaHandlerPackage";
+
+/// The refusal for a package past [`MAX_PACKAGE_BYTES`]: this registration will not retrieve
+/// an object that large at all, which is a different thing from not being given it, so it is a
+/// refusal of its own rather than the sentence above.
 const PACKAGE_TOO_LONG: &str = "SchemaHandlerPackage exceeds the maximum package size.";
 
 /// The reason a registration fails when the package's own documents decompress to more than
