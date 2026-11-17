@@ -2,7 +2,8 @@
 
 //! What a client READS ABOUT A TEMPLATE before it deploys one: the capabilities the
 //! template's own declarations require, the resource types it defines, and the properties an
-//! import of a resource of each of those types takes.
+//! import of a resource of each of those types takes ([`super::import_identifiers`] owns the
+//! per-type identifier records those properties come from).
 //!
 //! Two operations answer with exactly this reading — `ValidateTemplate` ("validates a
 //! specified template") and `GetTemplateSummary` ("returns information about a new or
@@ -74,9 +75,10 @@ pub fn required_capabilities(body: &str, declared: &Template) -> RequiredCapabil
 ///
 /// That is what makes this member and `ResourceIdentifierSummaries`
 /// ([`identifier_summaries`]) — the per-TYPE reading of the same section, which carries every
-/// logical id declared with each type IN DECLARED ORDER — two readings of one section rather
-/// than one: the summaries answer "which resources", so they follow the body, while this
-/// member answers "which types, how many of each".
+/// logical id declared with each type IN DECLARED ORDER and whose entries read back DESCENDING
+/// by type name — two readings of one section rather than one: the summaries answer "which
+/// resources", so their ids follow the body, while this member answers "which types, how many
+/// of each".
 pub fn resource_types(declared: &Template) -> Vec<String> {
     let mut types: Vec<String> = declared
         .resources
@@ -112,20 +114,33 @@ pub struct IdentifierSummary {
     /// ResourceType, as defined in the import template."
     pub logical_resource_ids: Vec<String>,
     /// `ResourceIdentifiers`: "the resource properties you can provide during the import to
-    /// identify your target resources" — this type's primary identifier
-    /// ([`super::primary_identifier`]).
+    /// identify your target resources" — one entry per identifier SET this type's own schema
+    /// states ([`super::import_identifiers`]).
     pub resource_identifiers: Vec<String>,
 }
 
 /// "A list of resource identifier summaries that describe the target resources of an import
 /// operation and the properties you can provide during the import to identify the target
-/// resources": one entry per resource TYPE the template declares, carrying the logical ids
-/// declared with that type and the properties that identify a resource of it.
+/// resources": one entry per resource TYPE the template declares AN IMPORT CAN IDENTIFY A
+/// RESOURCE OF, carrying the logical ids declared with that type and the identifier sets that
+/// type's own schema states ([`super::import_identifiers`]).
 ///
-/// Everything about the answer follows the order the BODY declares its resources in
-/// ([`super::declaration_order`]): "the logical IDs of the target resources of the specified
-/// ResourceType, AS DEFINED IN THE IMPORT TEMPLATE" are listed in that order, and the entries
-/// themselves follow the first resource declared with each type.
+/// A summary describes "the target resources of a specific type in your import template (for
+/// example, all AWS::S3::Bucket resources) and the properties you can provide during the
+/// import to identify resources of that type", so a type an import can identify NO resource of
+/// contributes none: a resource that exists only inside the stack that declares it — a custom
+/// resource, a record CloudFormation serves itself, a wait condition and its handle — is a
+/// resource no import could ever adopt, and a client reading such an entry would be told to
+/// plan an import that cannot be made.
+///
+/// Two orders, each of them observable:
+///
+/// * the ENTRIES are reported DESCENDING by resource type name — the reverse of the ascending
+///   order [`resource_types`] reports the same section's types in — so what a client reads back
+///   does not depend on where in the section each resource was declared;
+/// * the LOGICAL IDS inside one entry follow the body: "the logical IDs of the target resources
+///   of the specified ResourceType, AS DEFINED IN THE IMPORT TEMPLATE"
+///   ([`super::declaration_order`]), so a client pairs them with the resources it wrote.
 pub fn identifier_summaries(body: &str, declared: &Template) -> Vec<IdentifierSummary> {
     let mut summaries: Vec<IdentifierSummary> = Vec::new();
     for resource in resources_as_declared(body, declared) {
@@ -138,15 +153,23 @@ pub fn identifier_summaries(body: &str, declared: &Template) -> Vec<IdentifierSu
                     summary.logical_resource_ids.push(resource.logical_id.clone());
                 }
             }
-            None => summaries.push(IdentifierSummary {
-                resource_identifiers: super::primary_identifier::properties(
-                    &resource.resource_type,
-                ),
-                resource_type: resource.resource_type.clone(),
-                logical_resource_ids: vec![resource.logical_id.clone()],
-            }),
+            None => {
+                let resource_identifiers =
+                    super::import_identifiers::properties(&resource.resource_type);
+                if resource_identifiers.is_empty() {
+                    continue;
+                }
+                summaries.push(IdentifierSummary {
+                    resource_identifiers,
+                    resource_type: resource.resource_type.clone(),
+                    logical_resource_ids: vec![resource.logical_id.clone()],
+                });
+            }
         }
     }
+    // The entries themselves are reported by TYPE NAME, descending; the logical ids inside
+    // each of them keep the body's order, which is what the loop above collected them in.
+    summaries.sort_by(|left, right| right.resource_type.cmp(&left.resource_type));
     summaries
 }
 
@@ -242,13 +265,16 @@ mod tests {
         }
     }
 
-    /// One summary per type, carrying every logical id declared with it and that type's
-    /// primary identifier, in the order the BODY declares the resources.
+    /// One summary per type AN IMPORT CAN IDENTIFY A RESOURCE OF, carrying every logical id
+    /// declared with that type in the order the BODY declares them, and that type's own
+    /// identifier sets; the entries themselves descending by type name, whatever order the
+    /// body states its resources in.
     #[test]
-    fn one_identifier_summary_describes_each_type_the_template_declares() {
+    fn one_identifier_summary_describes_each_importable_type_the_template_declares() {
         let body = r#"{"Resources":{
             "Data":{"Type":"AWS::S3::Bucket"},
             "Notify":{"Type":"AWS::SNS::Topic"},
+            "Wait":{"Type":"AWS::CloudFormation::WaitConditionHandle"},
             "Archive":{"Type":"AWS::S3::Bucket"}}}"#;
         let declared = template::parse(body).expect("a readable template");
         let reported = identifier_summaries(body, &declared);
@@ -256,17 +282,18 @@ mod tests {
             reported,
             vec![
                 IdentifierSummary {
-                    resource_type: "AWS::S3::Bucket".to_string(),
-                    logical_resource_ids: vec!["Data".to_string(), "Archive".to_string()],
-                    resource_identifiers: vec!["BucketName".to_string()],
-                },
-                IdentifierSummary {
                     resource_type: "AWS::SNS::Topic".to_string(),
                     logical_resource_ids: vec!["Notify".to_string()],
                     resource_identifiers: vec!["TopicArn".to_string()],
                 },
+                IdentifierSummary {
+                    resource_type: "AWS::S3::Bucket".to_string(),
+                    logical_resource_ids: vec!["Data".to_string(), "Archive".to_string()],
+                    resource_identifiers: vec!["BucketName".to_string()],
+                },
             ],
-            "case \"a bucket, a topic and a second bucket\": got {reported:?}"
+            "case \"a bucket, a topic, a wait condition handle and a second bucket\": got \
+             {reported:?}"
         );
     }
 }

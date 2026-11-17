@@ -12,11 +12,12 @@
 //!   refusals. The rows differ along the operation whose input carries the three members and
 //!   along which combination the request states.
 //! * **What a summary reports about a template's resources**: `ResourceTypes` carries the
-//!   type of EACH resource the body declares, ascending by type name, while each
-//!   `ResourceIdentifierSummary` carries the logical ids declared with its type in the order
-//!   the body declares them — so one response reads the two members back in two orders. The
-//!   rows differ along the spelling of the body (JSON and YAML), whether the declared order
-//!   agrees with the alphabetical one, and whether a type is declared once or several times.
+//!   type of EACH resource the body declares, ascending by type name, while the
+//!   `ResourceIdentifierSummary` entries read back DESCENDING by type name, each carrying the
+//!   logical ids declared with its type in the order the body declares them — so one response
+//!   reads the two members back in two orders. The rows differ along the spelling of the body
+//!   (JSON and YAML), whether the declared order agrees with the alphabetical one, and whether
+//!   a type is declared once or several times.
 //! * **The size of a template an operation reads is the quota of the operation that takes
 //!   it**: a body submitted for DEPLOYMENT is held to the 51,200-byte inline quota, while an
 //!   operation that only REPORTS on a template reads one up to the size of the biggest
@@ -198,8 +199,8 @@ struct OrderRow {
     template: String,
     /// `ResourceTypes`, the type of each resource the body declares, ascending by type name.
     types: Vec<&'static str>,
-    /// Each `ResourceIdentifierSummary` as `(ResourceType, LogicalResourceIds)`, in the order
-    /// the body declares the resources.
+    /// Each `ResourceIdentifierSummary` as `(ResourceType, LogicalResourceIds)`, the entries
+    /// descending by type name and each one's ids in the order the body declares them.
     summaries: Vec<(&'static str, Vec<&'static str>)>,
 }
 
@@ -217,8 +218,8 @@ fn order_rows() -> Vec<OrderRow> {
                 .to_string(),
             types: vec!["AWS::S3::Bucket", "AWS::SNS::Topic", "AWS::SQS::Queue"],
             summaries: vec![
-                ("AWS::SNS::Topic", vec!["Zebra"]),
                 ("AWS::SQS::Queue", vec!["Alpha"]),
+                ("AWS::SNS::Topic", vec!["Zebra"]),
                 ("AWS::S3::Bucket", vec!["Mid"]),
             ],
         },
@@ -253,8 +254,8 @@ fn order_rows() -> Vec<OrderRow> {
                 .to_string(),
             types: vec!["AWS::SNS::Topic", "AWS::SQS::Queue"],
             summaries: vec![
-                ("AWS::SNS::Topic", vec!["Alpha"]),
                 ("AWS::SQS::Queue", vec!["Beta"]),
+                ("AWS::SNS::Topic", vec!["Alpha"]),
             ],
         },
     ]

@@ -17,8 +17,9 @@
 //! the template doesn't exist, a ValidationError is returned".
 //!
 //! One part of the surface is reported from what the template's TYPES are identified by:
-//! `ResourceIdentifierSummaries`, whose identifier properties are each resource type's
-//! primary identifier ([`crate::state::primary_identifier`]).
+//! `ResourceIdentifierSummaries`, whose entries are the import identifier sets each resource
+//! type's own schema states ([`crate::state::import_identifiers`]), and which therefore carries
+//! no entry for a type an import can identify no resource of.
 //!
 //! A `TemplateURL` says WHERE the body is rather than what it means, so the object it
 //! addresses is read from this emulator's own Amazon S3 and summarised exactly as an inline
@@ -235,10 +236,10 @@ fn summary_of(
             .then(|| declared.transforms.clone()),
         // `ResourceIdentifierSummaries` describes "the target resources of an import
         // operation and the properties you can provide during the import to identify the
-        // target resources": one entry per resource TYPE the template declares, carrying the
-        // logical ids declared with that type and that type's primary identifier — the
-        // properties whose values name an existing resource of it
-        // (`crate::state::primary_identifier`).
+        // target resources": one entry per resource TYPE the template declares AN IMPORT CAN
+        // IDENTIFY A RESOURCE OF, carrying the logical ids declared with that type and one
+        // entry per identifier SET that type's own schema states
+        // (`crate::state::import_identifiers`).
         resource_identifier_summaries: Some(
             crate::state::template_summary::identifier_summaries(body, declared)
                 .into_iter()

@@ -297,28 +297,21 @@ const UPDATE_HANDLER: &str = "update";
 /// `primaryIdentifier`, as far as this emulator RECORDS them — the empty list for a type
 /// whose identifier it does not.
 ///
-/// Two sources, both of them per-type records rather than conventions:
+/// The record itself is [`super::primary_identifier::recorded_identity`]: the parts of a
+/// COMPOSITE primary identifier, for a type whose resource IS a binding between others, or
+/// the published return value that carries the resource's IDENTITY, read out of each type's
+/// own "Return values" section. Both are per-type records rather than conventions, which is
+/// what a schema may declare.
 ///
-/// 1. the parts of a COMPOSITE primary identifier, for a type whose resource IS a binding
-///    between others ([`super::template::composite_identity_properties`]);
-/// 2. the published return value that carries the resource's IDENTITY, for a type whose
-///    `Ref` returns something other than the resource's name
-///    ([`super::primary_identifier::identifying_return_value`], read out of each type's own
-///    "Return values" section).
-///
-/// The NAME convention [`super::primary_identifier::properties`] falls back to for an import
-/// summary is deliberately NOT a source here. That answers "which property would a client
+/// The NAME convention [`super::primary_identifier::properties`] falls back to for a resource
+/// it has READ is deliberately NOT a source here. That answers "which property would a client
 /// state the resource's name in", which for a schema is a guess: `AWS::RDS::DBInstance` is
 /// identified by `DBInstanceIdentifier` and has no `DBInstanceName` at all, so a schema
-/// publishing the conventional name would send a client at a property the type does not have.
+/// publishing the conventional name would send a client at a property the type does not have —
+/// which is why the identifier an IMPORT summary reports is recorded per type
+/// ([`super::import_identifiers`]) wherever the convention would answer something else.
 fn declared_primary_identifier(type_name: &str) -> Vec<String> {
-    let composite = super::template::composite_identity_properties(type_name);
-    if !composite.is_empty() {
-        return composite.iter().map(|part| (*part).to_string()).collect();
-    }
-    super::primary_identifier::identifying_return_value(type_name)
-        .map(|published| vec![published.to_string()])
-        .unwrap_or_default()
+    super::primary_identifier::recorded_identity(type_name)
 }
 
 /// The JSON pointer a provider definition schema names one of its own properties by: the

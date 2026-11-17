@@ -6,10 +6,11 @@
 //! A resource type's primary identifier is what a client has to supply to name an EXISTING
 //! resource of that type — the `ResourceIdentifier` entries a `ResourceToImport` carries
 //! ("the key is the name of one of the primary identifiers for the resource … the value is
-//! the value of that primary identifier") — and it is therefore what `GetTemplateSummary`
-//! reports as `ResourceIdentifierSummary$ResourceIdentifiers`: "the properties you can
-//! provide during the import to identify the target resources. For example, BucketName is a
-//! possible identifier property for an AWS::S3::Bucket resource."
+//! the value of that primary identifier"). What an IMPORT SUMMARY reports for a type is the
+//! neighbouring question, and [`super::import_identifiers`] owns it: that answer adds the
+//! ALTERNATIVE identifiers a type publishes beside its primary one and reports nothing at all
+//! for a type that identifies no resource outside the stack, while this module always answers,
+//! because every resource this emulator has READ is identified by something.
 //!
 //! It is decided from the TYPE alone, since a summary is given for a template whose
 //! resources nothing has created yet. The reading is the one
@@ -31,17 +32,34 @@
 /// The properties whose values identify one resource of `resource_type`, in the order a
 /// summary reports them.
 pub fn properties(resource_type: &str) -> Vec<String> {
-    let composite = super::template::composite_identity_properties(resource_type);
-    if !composite.is_empty() {
-        return composite.iter().map(|part| (*part).to_string()).collect();
-    }
-    if let Some(published) = identifying_return_value(resource_type) {
-        return vec![published.to_string()];
+    let recorded = recorded_identity(resource_type);
+    if !recorded.is_empty() {
+        return recorded;
     }
     super::template::name_property_candidates(resource_type)
         .into_iter()
         .take(1)
         .collect()
+}
+
+/// The properties this emulator RECORDS as a type's identity, which is what the resource
+/// provider schema the registry serves declares as its `primaryIdentifier`: the parts of a
+/// COMPOSITE identifier ([`super::template::composite_identity_properties`]), or the published
+/// return value that carries the resource's identity ([`identifying_return_value`]); the EMPTY
+/// list for a type whose identity is its own NAME, which is a convention rather than a record.
+///
+/// The ONE reading of that question, so the three answers computed from it cannot drift apart:
+/// the identity a resource this emulator has READ is reported under ([`properties`]), the
+/// `primaryIdentifier` a type's schema declares ([`super::resource_schema`]) and the identifier
+/// set an IMPORT takes ([`super::import_identifiers`]) all start here.
+pub(crate) fn recorded_identity(resource_type: &str) -> Vec<String> {
+    let composite = super::template::composite_identity_properties(resource_type);
+    if !composite.is_empty() {
+        return composite.iter().map(|part| (*part).to_string()).collect();
+    }
+    identifying_return_value(resource_type)
+        .map(|published| vec![published.to_string()])
+        .unwrap_or_default()
 }
 
 /// The published return value a resource of `resource_type` is identified BY, for a type

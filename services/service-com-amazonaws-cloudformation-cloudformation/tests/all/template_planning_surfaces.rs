@@ -559,14 +559,14 @@ struct SummaryCase<'a> {
 fn summary_cases() -> Vec<SummaryCase<'static>> {
     // The bodies of the rows whose DECLARED ORDER is part of what they assert are written
     // out as text rather than built with `json!`, which states an object's members in
-    // whichever order the build's `serde_json` serialises them in: the order a summary
-    // follows is the order the body itself states, so each such row states it.
+    // whichever order the build's `serde_json` serialises them in: the logical ids a summary
+    // lists follow the order the body itself states, so each such row states it.
     vec![
         SummaryCase {
             // The identifier is the type's NAME property. Each resource contributes its own
-            // type entry and the entries ascend by type name, while the identifier summaries
-            // follow the order the body declares the resources in, one entry per type — so
-            // this row reads the two members back in two different orders.
+            // type entry and the type entries ASCEND by type name, while the identifier
+            // summaries read back DESCENDING by it — so this row reads the two members back in
+            // two different orders.
             case: "a bucket declared before a role",
             template: r#"{"AWSTemplateFormatVersion":"2010-09-09",
                 "Resources":{
@@ -593,8 +593,8 @@ fn summary_cases() -> Vec<SummaryCase<'static>> {
             version: "2010-09-09",
             resource_types: vec!["AWS::SNS::Topic", "AWS::SQS::Queue"],
             summaries: vec![
-                summary("AWS::SNS::Topic", &["Topic"], &["TopicArn"]),
                 summary("AWS::SQS::Queue", &["Queue"], &["QueueUrl"]),
+                summary("AWS::SNS::Topic", &["Topic"], &["TopicArn"]),
             ],
         },
         SummaryCase {

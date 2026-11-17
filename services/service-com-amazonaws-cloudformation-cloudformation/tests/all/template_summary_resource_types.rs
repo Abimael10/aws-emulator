@@ -7,9 +7,10 @@
 //! the type of EACH resource the body declares — so a type several resources share is
 //! reported once per resource and nothing is collapsed — reported ASCENDING BY TYPE NAME,
 //! whatever order the body declares its resources in. The per-TYPE reading of the same
-//! section is `ResourceIdentifierSummaries`, which carries one entry per type with the logical
-//! ids declared with it IN DECLARED ORDER, so the two members are two readings of one section
-//! and this suite asserts both of one response.
+//! section is `ResourceIdentifierSummaries`, which carries one entry per type AN IMPORT CAN
+//! IDENTIFY A RESOURCE OF, with the logical ids declared with it IN DECLARED ORDER and its own
+//! identifier sets, the entries themselves DESCENDING by type name — so the two members are two
+//! readings of one section and this suite asserts both of one response.
 //!
 //! The rows differ along what the rule generalises over: how many resources share a type,
 //! whether the declared order agrees with the ascending one, how many types the body
@@ -52,8 +53,25 @@ fn reported_summaries(xml: &str) -> Vec<(String, Vec<String>)> {
         .collect()
 }
 
+/// Each `ResourceIdentifierSummary` as `(ResourceType, ResourceIdentifiers)`, in wire order.
+fn reported_identifiers(xml: &str) -> Vec<(String, Vec<String>)> {
+    list_members(xml, "ResourceIdentifierSummaries")
+        .iter()
+        .map(|entry| {
+            let identifiers = xml_blocks(entry, "ResourceIdentifiers")
+                .first()
+                .map(|block| xml_texts(block, "member"))
+                .unwrap_or_default();
+            (
+                xml_text(entry, "ResourceType").unwrap_or_default(),
+                identifiers,
+            )
+        })
+        .collect()
+}
+
 /// One row: a body, the types its summary must report (ascending by type name), and the
-/// identifier summaries beside them (one per type, in the order the body declares them).
+/// identifier summaries beside them (one per importable type, descending by type name).
 struct Row {
     case: &'static str,
     template: String,
@@ -96,8 +114,8 @@ fn rows() -> Vec<Row> {
                 .to_string(),
             types: vec!["AWS::IAM::Role", "AWS::S3::Bucket"],
             summaries: vec![
-                ("AWS::IAM::Role", vec!["Access"]),
                 ("AWS::S3::Bucket", vec!["Store"]),
+                ("AWS::IAM::Role", vec!["Access"]),
             ],
         },
         Row {
@@ -170,10 +188,10 @@ async fn a_summary_reports_the_type_of_every_declared_resource_by_type_name() {
 }
 
 /// Every ordering of one `Resources` section is summarised with the SAME `ResourceTypes`
-/// list — ascending by type name — while the identifier summaries of that same response
-/// follow the order each body states. The invariant is asserted over every permutation of a
-/// four-resource section, which is the dimension the rule generalises over: the ORDER the
-/// body declares its resources in.
+/// list — ascending by type name — and with the same identifier summaries — descending by type
+/// name — while the logical ids inside each summary follow the order that body states them in.
+/// The invariant is asserted over every permutation of a four-resource section, which is the
+/// dimension the rule generalises over: the ORDER the body declares its resources in.
 #[tokio::test]
 async fn the_types_reported_do_not_depend_on_the_order_the_body_declares_resources_in() {
     // Four declarations of three types, two of them sharing one type, each needing no
@@ -223,9 +241,9 @@ async fn the_types_reported_do_not_depend_on_the_order_the_body_declares_resourc
              {reported:?}"
         );
 
-        // The per-TYPE member of the SAME response follows this body's own order: one entry
-        // per type, at the position of the first resource declared with it, carrying the
-        // logical ids in declared order.
+        // The per-TYPE member of the SAME response: one entry per type, descending by type
+        // name whatever order the body states, each carrying the logical ids in declared
+        // order.
         let mut expected_summaries: Vec<(String, Vec<String>)> = Vec::new();
         for (id, resource_type) in &stated {
             match expected_summaries
@@ -238,6 +256,7 @@ async fn the_types_reported_do_not_depend_on_the_order_the_body_declares_resourc
                 }
             }
         }
+        expected_summaries.sort_by(|(left, _), (right, _)| right.cmp(left));
         let summaries = reported_summaries(&response);
         assert_eq!(
             summaries, expected_summaries,
@@ -268,11 +287,12 @@ fn permutations(count: usize) -> Vec<Vec<usize>> {
     orders
 }
 
-/// A body declaring MANY resources of one type is summarised with as many entries as it
-/// declares resources: the list is as long as the `Resources` section, whatever that length
-/// is, while the identifier summary of that one type stays a single entry carrying every
-/// logical id. The rows differ along the COUNT, which is the dimension a client reads the
-/// list's length for.
+/// A body declaring MANY resources of one type is summarised with as many `ResourceTypes`
+/// entries as it declares resources: the list is as long as the `Resources` section, whatever
+/// that length is. The type here is one an import can identify NO resource of, so the same
+/// response carries no identifier summary at all — the two members answer different questions.
+/// The rows differ along the COUNT, which is the dimension a client reads the list's length
+/// for.
 #[tokio::test]
 async fn a_summary_reports_as_many_entries_as_the_body_declares_resources() {
     // `AWS::CloudFormation::WaitConditionHandle` is a type whose declaration needs no
@@ -300,13 +320,131 @@ async fn a_summary_reports_as_many_entries_as_the_body_declares_resources() {
             "case {case:?}: expected {count} entries of {TYPE:?}, got {reported:?}"
         );
 
-        let expected_ids: Vec<String> = (0..count).map(|index| format!("Handle{index}")).collect();
         let summaries = reported_summaries(&body);
+        assert!(
+            summaries.is_empty(),
+            "case {case:?}: expected no identifier summary for a type an import can identify \
+             no resource of, got {summaries:?}"
+        );
+    }
+}
+
+/// RULE: one `ResourceIdentifierSummary` per declared type AN IMPORT CAN IDENTIFY A RESOURCE
+/// OF, carrying one entry per identifier SET that type's own schema states — the properties of
+/// a composite identifier in ONE entry, because a caller supplies them together, and one entry
+/// per alternative a type publishes beside its primary identifier.
+///
+/// The rows differ along what the rule generalises over: the number of properties one identifier
+/// set has, the number of sets a type publishes, whether the identifier is a name, an ARN or a
+/// service-assigned id, and whether the type identifies a resource outside the stack at all.
+/// Source for each expected row: the type's own resource provider schema (`primaryIdentifier`
+/// and `additionalIdentifiers`), which is what the "Resources that support import operations"
+/// table of the CloudFormation User Guide publishes per type.
+/// One row of the identifier table: a body's declarations, and the entries the response must
+/// carry for them.
+struct IdentifierRow {
+    case: &'static str,
+    /// The `(logical id, resource type)` pairs the body declares, in that order.
+    declarations: &'static [(&'static str, &'static str)],
+    /// The `(ResourceType, ResourceIdentifiers)` entries the summary must report, descending
+    /// by type name.
+    expected: &'static [(&'static str, &'static [&'static str])],
+}
+
+#[tokio::test]
+async fn a_summary_reports_the_identifier_sets_each_declared_type_states() {
+    let rows: &[IdentifierRow] = &[
+        IdentifierRow {
+            case: "a composite identifier, whose parts are supplied together",
+            declarations: &[("Tbl", "AWS::Glue::Table"), ("Db", "AWS::Glue::Database")],
+            expected: &[
+                ("AWS::Glue::Table", &["CatalogId,DatabaseName,Name"]),
+                ("AWS::Glue::Database", &["DatabaseName"]),
+            ],
+        },
+        IdentifierRow {
+            case: "a type an import identifies by its ARN or by its name, and one by its ARN \
+                   alone",
+            declarations: &[
+                ("Vec", "AWS::S3Vectors::VectorBucket"),
+                ("Tab", "AWS::S3Tables::TableBucket"),
+            ],
+            expected: &[
+                (
+                    "AWS::S3Vectors::VectorBucket",
+                    &["VectorBucketArn", "VectorBucketName"],
+                ),
+                ("AWS::S3Tables::TableBucket", &["TableBucketARN"]),
+            ],
+        },
+        IdentifierRow {
+            case: "a parameter, identified by the Name its own schema states",
+            declarations: &[
+                ("Param", "AWS::SSM::Parameter"),
+                ("Log", "AWS::Logs::LogGroup"),
+            ],
+            expected: &[
+                ("AWS::SSM::Parameter", &["Name"]),
+                ("AWS::Logs::LogGroup", &["LogGroupName"]),
+            ],
+        },
+        IdentifierRow {
+            case: "a type identified by a service-assigned id, beside one identified by its \
+                   name",
+            declarations: &[("Topic", "AWS::SNS::Topic"), ("Store", "AWS::S3::Bucket")],
+            expected: &[
+                ("AWS::SNS::Topic", &["TopicArn"]),
+                ("AWS::S3::Bucket", &["BucketName"]),
+            ],
+        },
+        IdentifierRow {
+            case: "a metadata record and a wait condition handle, which identify no resource \
+                   at all",
+            declarations: &[
+                ("Meta", "AWS::CDK::Metadata"),
+                ("Handle", "AWS::CloudFormation::WaitConditionHandle"),
+                ("Param", "AWS::SSM::Parameter"),
+            ],
+            expected: &[("AWS::SSM::Parameter", &["Name"])],
+        },
+    ];
+    let router = router();
+
+    for IdentifierRow {
+        case,
+        declarations,
+        expected,
+    } in rows
+    {
+        // Written out as text: what the rows turn on is not the body's own order, but the
+        // bodies state one anyway, so the reported order is the rule's and not the body's.
+        let body = declarations
+            .iter()
+            .map(|(id, resource_type)| format!(r#""{id}":{{"Type":"{resource_type}"}}"#))
+            .collect::<Vec<String>>()
+            .join(",");
+        let template = format!(r#"{{"Resources":{{{body}}}}}"#);
+
+        let (status, response) = summarise(&router, &template).await;
         assert_eq!(
-            summaries,
-            vec![(TYPE.to_string(), expected_ids.clone())],
-            "case {case:?}: expected one identifier summary carrying every logical id, got \
-             {summaries:?}"
+            status, 200,
+            "case {case:?}: expected the body summarised, got {status} {response}"
+        );
+
+        let expected_identifiers: Vec<(String, Vec<String>)> = expected
+            .iter()
+            .map(|(resource_type, identifiers)| {
+                (
+                    (*resource_type).to_string(),
+                    identifiers.iter().map(|entry| (*entry).to_string()).collect(),
+                )
+            })
+            .collect();
+        let reported = reported_identifiers(&response);
+        assert_eq!(
+            reported, expected_identifiers,
+            "case {case:?}: expected the identifier summaries {expected_identifiers:?}, got \
+             {reported:?}"
         );
     }
 }

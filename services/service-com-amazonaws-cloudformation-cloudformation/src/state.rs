@@ -296,6 +296,10 @@ pub mod template_summary;
 /// resource of that type.
 pub mod primary_identifier;
 
+/// The import identifiers of a resource type: the properties a client supplies to identify an
+/// EXISTING resource of that type, and the types an import can identify no resource of.
+pub mod import_identifiers;
+
 /// The `AWS::Serverless-2016-10-31` (AWS SAM) transform: the resources that macro's
 /// expansion puts in place of a template's `AWS::Serverless::*` declarations, applied
 /// before anything reads the template.
