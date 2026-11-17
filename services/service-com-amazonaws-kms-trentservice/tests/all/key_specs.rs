@@ -629,7 +629,7 @@ async fn update_key_description_refuses_an_identifier_or_state_it_cannot_write()
         (
             "unknown alias",
             "alias/no-such-alias".to_string(),
-            "NotFoundException",
+            "InvalidArnException",
         ),
         (
             "ARN of another account",

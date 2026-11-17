@@ -21,8 +21,8 @@
 use serde_json::{json, Value};
 
 use super::harness::{
-    b64, call, create_alias, create_key, describe, error_code, is_lower_hex, ok, rotate_on_demand,
-    router, text, unb64,
+    b64, call, create_key, describe, error_code, is_lower_hex, ok, rotate_on_demand, router, text,
+    unb64,
 };
 
 /// The members of `KeyMetadata` that a key-material rotation must leave exactly as
@@ -45,7 +45,7 @@ const INVARIANT_METADATA: [&str; 9] = [
 ///
 /// The rows differ in how the key was created (the default symmetric encryption key,
 /// the same spec and usage stated explicitly, and a multi-Region primary key), in the
-/// form of the identifier the request names the key by (key id, key ARN, alias — the
+/// form of the identifier the request names the key by (key id, key ARN — the two
 /// forms `smithy_query(query="doc",shape="RotateKeyOnDemandRequest",member="KeyId")`
 /// accepts), and in how many rotations in a row the key gets.
 #[tokio::test]
@@ -62,20 +62,15 @@ async fn every_rotation_makes_a_new_key_material_version_current() {
     ];
 
     for (described, request) in creates {
-        for identifier_form in ["key id", "key ARN", "alias"] {
+        for identifier_form in ["key id", "key ARN"] {
             for rotations in [1usize, 2, 5] {
                 let case = format!("{described} named by {identifier_form}, {rotations} rotation(s)");
                 let created = create_key(&router, &request).await;
                 let key_id = text(&case, &created, "KeyId");
                 let arn = text(&case, &created, "Arn");
                 let identifier = match identifier_form {
-                    "key id" => key_id.clone(),
                     "key ARN" => arn.clone(),
-                    _ => {
-                        let alias = format!("alias/rotate-{key_id}");
-                        create_alias(&router, &case, &alias, &key_id).await;
-                        alias
-                    }
+                    _ => key_id.clone(),
                 };
 
                 let mut seen = vec![text(&case, &created, "CurrentKeyMaterialId")];
@@ -375,7 +370,7 @@ async fn rotation_is_refused_outside_an_enabled_symmetric_encryption_key() {
         (
             "an unknown alias",
             "alias/no-such-key".to_string(),
-            "NotFoundException",
+            "InvalidArnException",
         ),
         (
             "an ARN that is not a KMS key or alias ARN",

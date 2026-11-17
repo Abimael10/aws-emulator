@@ -737,12 +737,10 @@ fn invalid_arn(requested: &str) -> ImportKeyMaterialError {
 }
 
 /// Refuse an identifier that names an ALIAS, which this operation's `KeyId` does not
-/// accept ([`crate::state::ALIASES_NOT_SUPPORTED_MESSAGE`]).
+/// accept ([`crate::state::aliases_not_supported`]).
 fn aliases_not_supported() -> ImportKeyMaterialError {
-    ImportKeyMaterialErrorModeled::InvalidArnException(InvalidArnException {
-        message: Some(crate::state::ALIASES_NOT_SUPPORTED_MESSAGE.to_string()),
-    })
-    .into()
+    ImportKeyMaterialErrorModeled::InvalidArnException(crate::state::aliases_not_supported())
+        .into()
 }
 
 /// Refuse key material that is not what the key it is imported into needs.

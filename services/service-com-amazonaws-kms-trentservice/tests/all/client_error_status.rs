@@ -59,6 +59,18 @@ const WORDLESS_REFUSALS: &[&str] = &[
 /// (`super::key_policy` and `super::key_policy_lockout`).
 const WORDLESS_BY_OPERATION: &[(&str, &str)] = &[("ScheduleKeyDeletion", "ValidationException")];
 
+/// The operations of the `KeyId` table below whose own member documentation lists the
+/// alias forms beside the key ones ("To specify a KMS key, use its key ID, key ARN, alias
+/// name, or alias ARN" —
+/// `smithy_query(query="doc",shape="DescribeKeyRequest,EncryptRequest",member="KeyId")`),
+/// so they resolve an alias and report what the lookup found. Every other operation
+/// there takes a key id or key ARN only and refuses an alias for its KIND.
+const ACCEPTS_AN_ALIAS: &[&str] = &["DescribeKey", "Encrypt"];
+
+/// How KMS refuses an alias identifier to an operation whose `KeyId` does not take one:
+/// fixed text, with nothing of the request or of this endpoint's state in it.
+const ALIASES_NOT_SUPPORTED: &str = "Key Aliases are not supported for this operation.";
+
 /// Create a key with `description` and return its `KeyMetadata`.
 async fn described_key(
     router: &smithy_server_runtime::MultiServiceRouter,
@@ -372,7 +384,9 @@ async fn a_scaffolded_operation_still_answers_501() {
 /// that resolves to no key is reported AS an alias and a key as a key, each by its ARN —
 /// while a value that is no key identifier at all has no ARN to be named by and is
 /// reported as the invalid key id it is. An ARN pinned to ANOTHER Region is reported by
-/// naming that Region, because no endpoint of this one can serve it.
+/// naming that Region, because no endpoint of this one can serve it. An operation whose
+/// `KeyId` takes a key id or key ARN only never reaches that lookup for an alias: the
+/// identifier's KIND is refused first ([`ALIASES_NOT_SUPPORTED`]).
 ///
 /// The rows differ in the form of the identifier (bare name and ARN), in the alias
 /// name (the characters `AliasNameType`'s `^[a-zA-Z0-9:/_-]+$` pattern allows:
@@ -385,10 +399,10 @@ async fn a_failed_key_id_lookup_names_the_resource_the_request_asked_for() {
     let router = router();
     let account = engine::emulator_account_id();
 
-    // Rows: the case, the Region signed for, the identifier, and the message expected. An
-    // alias ARN in the request is reported verbatim; a bare `alias/<name>` is reported as
-    // the alias ARN of the endpoint it was sent to.
-    let mut cases: Vec<(String, &str, String, String)> = Vec::new();
+    // Rows: the case, the Region signed for, the identifier, whether it names an ALIAS,
+    // and the message expected. An alias ARN in the request is reported verbatim; a bare
+    // `alias/<name>` is reported as the alias ARN of the endpoint it was sent to.
+    let mut cases: Vec<(String, &str, String, bool, String)> = Vec::new();
     for (region, name) in [
         (REGION, "no-such-alias"),
         (REGION, "team/project/key"),
@@ -401,12 +415,14 @@ async fn a_failed_key_id_lookup_names_the_resource_the_request_asked_for() {
             format!("bare {alias} in {region}"),
             region,
             alias.clone(),
+            true,
             format!("Alias {alias_arn} is not found."),
         ));
         cases.push((
             format!("alias ARN {alias_arn}"),
             region,
             alias_arn.clone(),
+            true,
             format!("Alias {alias_arn} is not found."),
         ));
     }
@@ -418,6 +434,7 @@ async fn a_failed_key_id_lookup_names_the_resource_the_request_asked_for() {
         format!("alias ARN of another Region {foreign}"),
         REGION,
         foreign.clone(),
+        true,
         "Invalid arn ap-south-1".to_string(),
     ));
     // A key identifier is NOT an alias: it is reported as a key, by its key ARN.
@@ -431,12 +448,14 @@ async fn a_failed_key_id_lookup_names_the_resource_the_request_asked_for() {
             format!("bare key id {key_id} in {region}"),
             region,
             key_id.to_string(),
+            false,
             format!("Key '{key_arn}' does not exist"),
         ));
         cases.push((
             format!("key ARN {key_arn}"),
             region,
             key_arn.clone(),
+            false,
             format!("Key '{key_arn}' does not exist"),
         ));
     }
@@ -446,10 +465,11 @@ async fn a_failed_key_id_lookup_names_the_resource_the_request_asked_for() {
         format!("key ARN of another Region {foreign_key}"),
         REGION,
         foreign_key.clone(),
+        false,
         "Invalid arn ap-south-1".to_string(),
     ));
 
-    for (case, region, identifier, expected) in cases {
+    for (case, region, identifier, names_an_alias, expected) in cases {
         for operation in [
             "DescribeKey",
             "ScheduleKeyDeletion",
@@ -478,18 +498,28 @@ async fn a_failed_key_id_lookup_names_the_resource_the_request_asked_for() {
             let (status, payload) = call(&router, region, operation, &body).await;
             let code = error_code(&payload);
             let message = error_message(&payload);
+            // An operation whose `KeyId` takes a key id or key ARN only judges the KIND
+            // of identifier first, so for it an alias is refused before any lookup — the
+            // fixed `InvalidArnException` sentence — while the two operations whose
+            // member takes an alias as well report what the lookup found.
+            let (expected_code, expected_message) =
+                if names_an_alias && !ACCEPTS_AN_ALIAS.contains(&operation) {
+                    ("InvalidArnException", ALIASES_NOT_SUPPORTED.to_string())
+                } else {
+                    ("NotFoundException", expected.clone())
+                };
             assert_eq!(
                 status, 400,
                 "case {case:?} on {operation}: expected HTTP 400, got {status} with {payload}"
             );
             assert_eq!(
-                code, "NotFoundException",
-                "case {case:?} on {operation}: expected NotFoundException, got {code:?}"
+                code, expected_code,
+                "case {case:?} on {operation}: expected {expected_code}, got {code:?}"
             );
             assert_eq!(
-                message, expected,
+                message, expected_message,
                 "case {case:?} on {operation}: expected the message to name the resource the \
-                 request did ({expected:?}), got {message:?}"
+                 request did ({expected_message:?}), got {message:?}"
             );
         }
     }

@@ -261,11 +261,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // "Returns only grants for the specified KMS key. This parameter is required.
         // Specify the key ID or key ARN of the KMS key"
-        // (`smithy_query(query="doc",shape="ListGrantsRequest",member="KeyId")`). The
-        // listing is of the key the identifier RESOLVES to, so a key id, a key ARN and
-        // an alias of that key all report the same grants. Every key state can be
-        // listed: a grant outlives the key being disabled, and a reader must still be
-        // able to see it.
+        // (`smithy_query(query="doc",shape="ListGrantsRequest",member="KeyId")`): those
+        // two forms are the ones this member accepts, so an identifier that names an
+        // alias is refused for its KIND before anything is resolved
+        // (`crate::state::aliases_not_supported`). Every key state can be listed: a
+        // grant outlives the key being disabled, and a reader must still be able to see
+        // it.
+        if crate::state::names_an_alias(&input.key_id) {
+            return Err(ListGrantsErrorModeled::InvalidArnException(
+                crate::state::aliases_not_supported(),
+            )
+            .into());
+        }
+
         let key_id = match state.resolve(&region, &input.key_id) {
             crate::state::KeyRef::Found(key) => key.key_id.clone(),
             crate::state::KeyRef::UnauthorizedAccount => {

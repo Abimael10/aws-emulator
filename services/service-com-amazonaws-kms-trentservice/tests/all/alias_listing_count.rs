@@ -18,7 +18,7 @@
 use serde_json::{json, Value};
 
 use super::harness::{
-    alias_arn, call, create_alias, create_key, ok, ok_in, router, text, REGION,
+    alias_arn, call, create_alias, create_key, ok, ok_in, refused, router, text, REGION,
 };
 
 /// The member a listing reports the size of its page in.
@@ -80,11 +80,6 @@ async fn a_listing_reports_the_count_of_the_page_it_returns() {
         ("every alias of the Region", json!({}), 5),
         ("narrowed by key id", json!({"KeyId": first_id.clone()}), 3),
         ("narrowed by key ARN", json!({"KeyId": first_arn.clone()}), 3),
-        (
-            "narrowed by an alias of that key",
-            json!({"KeyId": "alias/count-one"}),
-            3,
-        ),
         ("narrowed to the other key", json!({"KeyId": second_id.clone()}), 2),
         ("a page of one", json!({"Limit": 1}), 1),
         ("a page of two", json!({"Limit": 2}), 2),
@@ -105,6 +100,19 @@ async fn a_listing_reports_the_count_of_the_page_it_returns() {
         let answer = ok(&router, "ListAliases", &request).await;
         assert_counted(case, &answer, expected);
     }
+
+    // A narrowing is by the KEY: "Specify the key ID or key ARN of the KMS key"
+    // (`smithy_query(query="doc",shape="ListAliasesRequest",member="KeyId")`), so an
+    // alias of that key is not an identifier this listing narrows by — it is refused for
+    // its kind, and reports no count at all.
+    let (status, code, message) =
+        refused(&router, REGION, "ListAliases", &json!({"KeyId": "alias/count-one"})).await;
+    assert_eq!(
+        (status, code.as_str(), message.as_str()),
+        (400, "InvalidArnException", "Key Aliases are not supported for this operation."),
+        "case narrowed by an alias of that key: expected 400 InvalidArnException with the \
+         fixed sentence, got {status} {code} ({message:?})"
+    );
 }
 
 /// Every page of a walk reports its OWN length, including the short last page — so the
@@ -217,7 +225,6 @@ async fn a_predefined_aws_alias_is_listed_under_its_managed_key_with_its_count()
         for (form, identifier) in [
             ("the key ARN the service published", key_arn.clone()),
             ("the key id", key_id.clone()),
-            ("the alias itself", alias.to_string()),
         ] {
             let case = format!("{case} read by {form}");
             let (status, answer) =
@@ -242,6 +249,25 @@ async fn a_predefined_aws_alias_is_listed_under_its_managed_key_with_its_count()
                     json!(false),
                 ),
                 "case {case}: expected the one predefined alias of that key, got {answer}"
+            );
+        }
+
+        // The chain runs from the KEY: the predefined alias itself, bare or as its ARN, is
+        // not an identifier this listing takes — "Specify the key ID or key ARN of the KMS
+        // key" (`smithy_query(query="doc",shape="ListAliasesRequest",member="KeyId")`) —
+        // so a client holding only the alias has to resolve it to the key first.
+        for (form, identifier) in [
+            ("the alias itself", alias.to_string()),
+            ("the alias ARN", alias_arn(REGION, alias)),
+        ] {
+            let case = format!("{case} read by {form}");
+            let (status, code, message) =
+                refused(&router, REGION, "ListAliases", &json!({"KeyId": identifier})).await;
+            assert_eq!(
+                (status, code.as_str(), message.as_str()),
+                (400, "InvalidArnException", "Key Aliases are not supported for this operation."),
+                "case {case}: expected 400 InvalidArnException with the fixed sentence, got \
+                 {status} {code} ({message:?})"
             );
         }
     }

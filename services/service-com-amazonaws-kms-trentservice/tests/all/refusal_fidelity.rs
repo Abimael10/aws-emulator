@@ -27,9 +27,27 @@
 use serde_json::{json, Value};
 
 use super::harness::{
-    b64, call, create_alias, create_key, describe, error_code, error_message, ok, refused, router,
-    text, unb64, wrap, REGION,
+    b64, call, create_alias, create_key, describe, error_code, error_message, ok, principal,
+    refused, router, text, unb64, wrap, REGION,
 };
+
+/// A key policy that allows the account root everything, for the rows that must carry a
+/// well-formed document so that what refuses them is the identifier and not the policy.
+fn policy_allowing_the_account() -> String {
+    let account = engine::emulator_account_id();
+    let root = format!("arn:aws:iam::{account}:root");
+    json!({
+        "Version": "2012-10-17",
+        "Statement": [{
+            "Sid": "Root",
+            "Effect": "Allow",
+            "Principal": {"AWS": root},
+            "Action": "kms:*",
+            "Resource": "*",
+        }],
+    })
+    .to_string()
+}
 
 /// `len` bytes of filler: what a row sends for a member whose LENGTH is what the row is
 /// about.
@@ -574,6 +592,10 @@ async fn the_valid_to_refusals_each_state_one_rule() {
 /// identifier that names an ALIAS for its KIND — `InvalidArnException` with the fixed
 /// sentence — and does so BEFORE it resolves anything, so an alias naming a key the
 /// operation could have served and one naming nothing are refused identically.
+///
+/// The rows span every operation of this service whose `KeyId` (or, for the import pair,
+/// whose own identifier member) documents the key id and key ARN forms alone, and, for
+/// each, both alias forms KMS accepts elsewhere, resolvable and not.
 #[tokio::test]
 async fn an_alias_identifier_is_refused_for_its_kind_before_anything_is_resolved() {
     let router = router();
@@ -634,6 +656,38 @@ async fn an_alias_identifier_is_refused_for_its_kind_before_anything_is_resolved
                    "ExpirationModel": "KEY_MATERIAL_DOES_NOT_EXPIRE"}),
         ),
         ("DeleteImportedKeyMaterial", json!({})),
+        // The key-policy, tagging, state, rotation and grant operations: every one of
+        // them documents its `KeyId` as "the key ID or key ARN of the KMS key" and lists
+        // no alias form, so the same judgement is theirs too.
+        ("ListAliases", json!({})),
+        ("GetKeyPolicy", json!({})),
+        (
+            "PutKeyPolicy",
+            json!({"Policy": policy_allowing_the_account()}),
+        ),
+        ("ListKeyPolicies", json!({})),
+        ("UpdateKeyDescription", json!({"Description": "through an alias"})),
+        (
+            "TagResource",
+            json!({"Tags": [{"TagKey": "owner", "TagValue": "sre"}]}),
+        ),
+        ("UntagResource", json!({"TagKeys": ["owner"]})),
+        ("ListResourceTags", json!({})),
+        ("EnableKey", json!({})),
+        ("DisableKey", json!({})),
+        ("ScheduleKeyDeletion", json!({"PendingWindowInDays": 7})),
+        ("CancelKeyDeletion", json!({})),
+        ("EnableKeyRotation", json!({})),
+        ("DisableKeyRotation", json!({})),
+        ("GetKeyRotationStatus", json!({})),
+        ("ListKeyRotations", json!({})),
+        ("RotateKeyOnDemand", json!({})),
+        (
+            "CreateGrant",
+            json!({"GranteePrincipal": principal("role/Grantee"), "Operations": ["Decrypt"]}),
+        ),
+        ("ListGrants", json!({})),
+        ("RevokeGrant", json!({"GrantId": "a".repeat(64)})),
     ];
 
     for (operation, rest) in operations {

@@ -279,9 +279,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // nothing about whether this endpoint holds such an alias.
         if crate::state::names_an_alias(&input.key_id) {
             return Err(ReplicateKeyErrorModeled::InvalidArnException(
-                InvalidArnException {
-                    message: Some(crate::state::ALIASES_NOT_SUPPORTED_MESSAGE.to_string()),
-                },
+                crate::state::aliases_not_supported(),
             )
             .into());
         }

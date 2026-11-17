@@ -552,12 +552,19 @@ async fn the_key_identifier_and_its_key_state_decide_the_answer() {
     .await;
 
     // (case, the identifier the request carries, the error code expected or `None` for
-    // success). Every accepted form names the same key, so a grant created through one
-    // is a grant on that key.
+    // success). The two accepted forms name the same key, so a grant created through one
+    // is a grant on that key; an alias is not an accepted form at all — "Specify the key
+    // ID or key ARN of the KMS key"
+    // (`smithy_query(query="doc",shape="CreateGrantRequest",member="KeyId")`) — so it is
+    // refused for its KIND, whether or not this endpoint holds it.
     let rows: Vec<(&str, String, Option<&str>)> = vec![
         ("a key id", enabled.clone(), None),
         ("a key ARN", enabled_arn, None),
-        ("an alias of the key", "alias/grantable".to_string(), None),
+        (
+            "an alias of the key",
+            "alias/grantable".to_string(),
+            Some("InvalidArnException"),
+        ),
         (
             "a key id nothing holds",
             "1234abcd-12ab-34cd-56ef-1234567890ab".to_string(),
@@ -566,7 +573,7 @@ async fn the_key_identifier_and_its_key_state_decide_the_answer() {
         (
             "an alias nothing holds",
             "alias/absent".to_string(),
-            Some("NotFoundException"),
+            Some("InvalidArnException"),
         ),
         (
             "an ARN that is not a KMS ARN",
@@ -1226,17 +1233,12 @@ async fn key_with_grant(
 async fn revoke_grant_deletes_the_grant_it_names() {
     let router = router();
 
-    // Every form a `KeyId` takes names the same key, so the grant is revoked through
-    // each of them.
-    for case in ["a key id", "a key ARN", "an alias of the key"] {
+    // Either form a `RevokeGrant` `KeyId` takes names the same key, so the grant is
+    // revoked through each of them.
+    for case in ["a key id", "a key ARN"] {
         let (key_id, key_arn, grant_id, grant_token) = key_with_grant(&router, case).await;
         let identifier = match case {
             "a key ARN" => key_arn,
-            "an alias of the key" => {
-                let alias = format!("alias/revoke-{}", &grant_id[..8]);
-                create_alias(&router, case, &alias, &key_id).await;
-                alias
-            }
             _ => key_id.clone(),
         };
         let request = json!({"KeyId": identifier, "GrantId": grant_id});
@@ -1281,6 +1283,9 @@ async fn revoke_grant_deletes_the_grant_it_names() {
     // Every refusal leaves the grant exactly as it was.
     let (key_id, _, grant_id, _) = key_with_grant(&router, "refusals").await;
     let (other_key, _, _, _) = key_with_grant(&router, "another key").await;
+    // An alias of the very key that holds the grant: the refusal below is about the KIND
+    // of identifier, so it does not depend on the alias naming nothing.
+    create_alias(&router, "refusals", "alias/revoke-through-an-alias", &key_id).await;
     let rows: Vec<(&str, Value, &str)> = vec![
         (
             "a grant id that is not one",
@@ -1305,6 +1310,11 @@ async fn revoke_grant_deletes_the_grant_it_names() {
         (
             "an ARN that is not a KMS ARN",
             json!({"KeyId": "arn:aws:kms:us-east-1", "GrantId": grant_id}),
+            "InvalidArnException",
+        ),
+        (
+            "an alias of the key",
+            json!({"KeyId": "alias/revoke-through-an-alias", "GrantId": grant_id}),
             "InvalidArnException",
         ),
         (

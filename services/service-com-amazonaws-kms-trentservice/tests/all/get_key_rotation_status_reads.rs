@@ -8,14 +8,15 @@
 //! it from the IDENTIFIER the request names the key by and from the endpoint the
 //! request reached, so the rules under test are the reader's own:
 //!
-//! 1. The report belongs to the key the `KeyId` member RESOLVES to, whatever form that
-//!    identifier takes (key id, key ARN, `alias/<name>`, alias ARN), and the key it
-//!    resolved to is reported back as that key's ARN rather than as the identifier the
-//!    request used.
+//! 1. The report belongs to the key the `KeyId` member RESOLVES to, in either form this
+//!    member takes (key id, key ARN — "Specify the key ID or key ARN of the KMS key"),
+//!    and the key it resolved to is reported back as that key's ARN rather than as the
+//!    identifier the request used. An identifier that names an ALIAS is not such a form
+//!    and is refused for its kind.
 //! 2. A KMS key is a regional resource, so the reader serves only the keys of the
 //!    endpoint's Region and account: an identifier that names no key there is
-//!    `NotFoundException`, and an ARN that is no KMS key or alias ARN at all is
-//!    `InvalidArnException`.
+//!    `NotFoundException`, and an identifier this member does not take at all — an ARN
+//!    that is no KMS key ARN, or an alias — is `InvalidArnException`.
 //! 3. The report is a REPORT: it is derived from the schedule the key carries, so it
 //!    does not move when the key is written for any other reason, and reading it
 //!    changes nothing a later caller sees.
@@ -231,12 +232,25 @@ async fn every_identifier_form_reports_the_resolved_key_by_its_arn() {
         let key_arn = text(described, &metadata, "Arn");
         let alias = format!("alias/rotation-reader-{index}");
         create_alias(&router, described, &alias, &key_id).await;
-        let forms = [
-            ("key id", key_id.clone()),
-            ("key ARN", key_arn.clone()),
+        let forms = [("key id", key_id.clone()), ("key ARN", key_arn.clone())];
+
+        // The alias forms are not forms this reader takes: "Specify the key ID or key ARN
+        // of the KMS key"
+        // (`smithy_query(query="doc",shape="GetKeyRotationStatusRequest",member="KeyId")`),
+        // so an alias of this very key is refused for its KIND rather than resolved.
+        for (form, identifier) in [
             ("alias name", alias.clone()),
             ("alias ARN", alias_arn(REGION, &alias)),
-        ];
+        ] {
+            let case = format!("{described} read by {form}");
+            let (status, code) =
+                failure(&router, "GetKeyRotationStatus", &json!({"KeyId": identifier})).await;
+            assert_eq!(
+                (status, code.as_str()),
+                (400, "InvalidArnException"),
+                "case {case:?}: expected 400 InvalidArnException, got {status} ({code})"
+            );
+        }
 
         // A key nothing configured is not rotating, by every form that names it.
         let mut reports = Vec::new();
@@ -329,13 +343,11 @@ async fn the_reader_serves_only_the_keys_of_its_own_region_and_account() {
 
     for key in &keys {
         let (before, after) = key.window;
-        // The schedule of the key this endpoint serves, by key id and by the alias the
-        // two Regions share.
-        for identifier in [key.key_id.as_str(), "alias/regional-rotation"] {
-            let case = format!("{} serves its own key, read by {identifier}", key.region);
-            let report = status_in(&router, key.region, identifier).await;
-            assert_rotating(&case, &report, &key.key_arn, key.period_in_days, before, after);
-        }
+        // The schedule of the key this endpoint serves, named by its key id — the alias
+        // the two Regions share is not a form this reader takes.
+        let case = format!("{} serves its own key", key.region);
+        let report = status_in(&router, key.region, &key.key_id).await;
+        assert_rotating(&case, &report, &key.key_arn, key.period_in_days, before, after);
 
         // And no other endpoint serves it.
         for other in &keys {
@@ -364,7 +376,7 @@ async fn the_reader_serves_only_the_keys_of_its_own_region_and_account() {
     let local_key_id = &keys[0].key_id;
 
     // Rows: a well-formed identifier that names no key of this account and Region.
-    let not_found: [(&str, String); 6] = [
+    let not_found: [(&str, String); 4] = [
         (
             "an unknown key id",
             "11111111-1111-4111-1111-111111111111".to_string(),
@@ -372,11 +384,6 @@ async fn the_reader_serves_only_the_keys_of_its_own_region_and_account() {
         (
             "an unknown key ARN",
             format!("arn:aws:kms:{REGION}:{account}:key/mrk-{}", "1".repeat(32)),
-        ),
-        ("an unknown alias", "alias/no-such-rotation".to_string()),
-        (
-            "an unknown alias ARN",
-            alias_arn(REGION, "alias/no-such-rotation"),
         ),
         (
             "this key's ARN in another Region",
@@ -400,9 +407,10 @@ async fn the_reader_serves_only_the_keys_of_its_own_region_and_account() {
         );
     }
 
-    // Rows: an ARN that is no KMS key or alias ARN at all, which this operation models
-    // its own error for.
-    let malformed: [(&str, String); 5] = [
+    // Rows: an ARN that is no KMS key or alias ARN at all, and the two alias forms,
+    // which this operation's `KeyId` does not take at all — both answered by the one
+    // error the model gives it for an identifier it will not read.
+    let malformed: [(&str, String); 7] = [
         (
             "an unknown resource type",
             format!("arn:aws:kms:{REGION}:{account}:thing/{local_key_id}"),
@@ -417,6 +425,8 @@ async fn the_reader_serves_only_the_keys_of_its_own_region_and_account() {
             format!("arn:aws:kms::{account}:key/{local_key_id}"),
         ),
         ("nothing but the prefix", "arn:".to_string()),
+        ("an alias name", "alias/no-such-rotation".to_string()),
+        ("an alias ARN", alias_arn(REGION, "alias/no-such-rotation")),
     ];
     for (case, identifier) in malformed {
         let (http_status, code) =

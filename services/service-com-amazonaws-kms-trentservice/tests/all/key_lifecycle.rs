@@ -962,7 +962,9 @@ async fn schedule_key_deletion_honours_the_documented_waiting_period() {
 
 /// An identifier that names no key is `NotFoundException`; an identifier that is an
 /// ARN but not a KMS key or alias ARN is `InvalidArnException` on the operations
-/// that model it.
+/// that model it; and an identifier that names an ALIAS is `InvalidArnException` on the
+/// operations whose `KeyId` takes a key id or key ARN only, whatever the alias resolves
+/// to.
 #[tokio::test]
 async fn unknown_and_malformed_key_identifiers_are_refused() {
     let router = router();
@@ -979,11 +981,6 @@ async fn unknown_and_malformed_key_identifiers_are_refused() {
         (
             "unknown key ARN",
             format!("arn:aws:kms:{REGION}:{account}:key/00000000-0000-0000-0000-000000000000"),
-        ),
-        ("unknown alias", "alias/no-such-alias".to_string()),
-        (
-            "unknown alias ARN",
-            format!("arn:aws:kms:{REGION}:{account}:alias/no-such-alias"),
         ),
         (
             "this key's ARN in another Region",
@@ -1021,6 +1018,42 @@ async fn unknown_and_malformed_key_identifiers_are_refused() {
             code, "NotFoundException",
             "case {case} on Encrypt: expected NotFoundException, got {code}"
         );
+    }
+
+    // The alias forms: `DescribeKey` and `Encrypt` take them and report what the lookup
+    // found, while `ScheduleKeyDeletion`, `DisableKey` and `EnableKey` take a key id or
+    // key ARN only and refuse the KIND of identifier first.
+    for (case, identifier) in [
+        ("unknown alias", "alias/no-such-alias".to_string()),
+        (
+            "unknown alias ARN",
+            format!("arn:aws:kms:{REGION}:{account}:alias/no-such-alias"),
+        ),
+    ] {
+        for operation in ["ScheduleKeyDeletion", "DisableKey", "EnableKey"] {
+            let (status, code) = failure(&router, operation, &json!({"KeyId": identifier})).await;
+            assert_eq!(
+                (status, code.as_str()),
+                (400, "InvalidArnException"),
+                "case {case} on {operation}: expected 400 InvalidArnException, got {status} \
+                 ({code})"
+            );
+        }
+        for (operation, body) in [
+            ("DescribeKey", json!({"KeyId": identifier})),
+            (
+                "Encrypt",
+                json!({"KeyId": identifier, "Plaintext": b64(b"hello kms")}),
+            ),
+        ] {
+            let (status, code) = failure(&router, operation, &body).await;
+            assert_eq!(
+                (status, code.as_str()),
+                (400, "NotFoundException"),
+                "case {case} on {operation}: expected 400 NotFoundException, got {status} \
+                 ({code})"
+            );
+        }
     }
 
     // ARNs that are not KMS key or alias ARNs at all.

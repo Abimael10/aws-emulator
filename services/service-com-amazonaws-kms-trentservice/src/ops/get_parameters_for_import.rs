@@ -393,12 +393,10 @@ fn invalid_arn(requested: &str) -> GetParametersForImportError {
 }
 
 /// Refuse an identifier that names an ALIAS, which this operation's `KeyId` does not
-/// accept ([`crate::state::ALIASES_NOT_SUPPORTED_MESSAGE`]).
+/// accept ([`crate::state::aliases_not_supported`]).
 fn aliases_not_supported() -> GetParametersForImportError {
-    GetParametersForImportErrorModeled::InvalidArnException(InvalidArnException {
-        message: Some(crate::state::ALIASES_NOT_SUPPORTED_MESSAGE.to_string()),
-    })
-    .into()
+    GetParametersForImportErrorModeled::InvalidArnException(crate::state::aliases_not_supported())
+        .into()
 }
 
 /// Answer a failure of this emulator itself, never a malformed request.

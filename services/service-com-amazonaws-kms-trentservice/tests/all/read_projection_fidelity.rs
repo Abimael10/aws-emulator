@@ -26,8 +26,8 @@
 use serde_json::{json, Value};
 
 use super::harness::{
-    alias_arn, create_alias, create_key, describe_in, ok, ok_in, reported_policy,
-    rotate_on_demand, router, settle_key_state, text, REGION,
+    create_key, describe_in, ok, ok_in, reported_policy, rotate_on_demand, router,
+    settle_key_state, text, REGION,
 };
 
 /// The Region a replica is created in, so the listing of a key whose id is shared by two
@@ -368,7 +368,7 @@ async fn a_replica_reports_its_policy_in_the_canonical_layout() {
 /// The rows differ in how many rotations the key has had (so in how many entries the
 /// listing holds), in whether the entry is a rotation or the material the key was created
 /// with (`ALL_KEY_MATERIAL`), and in the identifier the request names the key by (a key
-/// id, a key ARN, an alias name, an alias ARN).
+/// id, a key ARN — the two forms this listing's `KeyId` takes).
 #[tokio::test]
 async fn every_rotation_entry_names_its_key_by_the_key_arn() {
     let router = router();
@@ -378,18 +378,11 @@ async fn every_rotation_entry_names_its_key_by_the_key_arn() {
         let metadata = create_key(&router, &json!({"Description": case.clone()})).await;
         let key_id = text(&case, &metadata, "KeyId");
         let key_arn = text(&case, &metadata, "Arn");
-        let alias = format!("alias/rotation-arn-{rotations}");
-        create_alias(&router, &case, &alias, &key_id).await;
         for round in 1..=rotations {
             rotate_on_demand(&router, &format!("{case} rotation {round}"), &key_id).await;
         }
 
-        let forms = [
-            ("key id", key_id.clone()),
-            ("key ARN", key_arn.clone()),
-            ("alias name", alias.clone()),
-            ("alias ARN", alias_arn(REGION, &alias)),
-        ];
+        let forms = [("key id", key_id.clone()), ("key ARN", key_arn.clone())];
         for (form, identifier) in &forms {
             // `ALL_KEY_MATERIAL` adds the material the key was created with, so the
             // listing holds one entry more than the key has rotations.

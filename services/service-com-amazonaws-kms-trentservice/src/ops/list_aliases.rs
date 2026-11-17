@@ -6,8 +6,9 @@
 //!
 //! The page is computed from the alias store, in creation order, so a `Marker` resumes
 //! after the alias the previous page ended on and a newly created alias never
-//! reshuffles an earlier page. `KeyId` narrows the list to the aliases that resolve to
-//! one key.
+//! reshuffles an earlier page. `KeyId` narrows the list to the aliases of one key, named
+//! by its key id or key ARN — the only two forms this member accepts, so an identifier
+//! that names an alias is refused for its kind.
 //!
 //! The emulator mints no AWS managed keys, so it has no `aws/<service>` aliases and no
 //! predefined ones to report: every entry here is an alias a caller created.
@@ -217,10 +218,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // "To get only the aliases associated with a particular KMS key, use the KeyId
         // parameter"; "if you omit it, ListAliases returns all aliases in the account
-        // and Region." The filter is by the key the identifier RESOLVES to, so a key
-        // id, a key ARN and an alias of that key all narrow to the same list.
+        // and Region." The filter is by the key the identifier names, in the two forms
+        // this member accepts: "Specify the key ID or key ARN of the KMS key"
+        // (`smithy_query(query="doc",shape="ListAliasesRequest",member="KeyId")`), whose
+        // documented examples are a key id and a key ARN. An identifier that names an
+        // ALIAS is therefore not an identifier this operation accepts, however well
+        // formed it is — a judgement on the identifier's own grammar, made BEFORE
+        // anything is resolved, so the refusal reports the KIND of identifier and never
+        // whether this endpoint holds such an alias.
         let filter = match input.key_id.as_deref() {
             None => None,
+            Some(requested) if crate::state::names_an_alias(requested) => {
+                return Err(ListAliasesErrorModeled::InvalidArnException(
+                    crate::state::aliases_not_supported(),
+                )
+                .into());
+            }
             Some(requested) => match state.resolve(&region, requested) {
                 crate::state::KeyRef::Found(key) => Some(key.key_id.clone()),
                 crate::state::KeyRef::UnauthorizedAccount => {

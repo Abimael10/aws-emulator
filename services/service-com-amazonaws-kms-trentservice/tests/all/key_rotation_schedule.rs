@@ -29,8 +29,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde_json::{json, Value};
 
 use super::harness::{
-    assert_empty, call, create_alias, create_key, describe, error_code, error_message, ok,
-    replicate_into, router, settle_key_state, text, REGION,
+    assert_empty, call, create_key, describe, error_code, error_message, ok, replicate_into,
+    router, settle_key_state, text, REGION,
 };
 
 /// Seconds in a day: the unit `RotationPeriodInDays` counts in
@@ -173,7 +173,7 @@ fn assert_unscheduled(case: &str, status: &Value, arn: &str) {
 ///
 /// The rows differ in the rotation period ([`PERIOD_ROWS`], spanning both published
 /// bounds and a request that names none), in the form of the identifier the request
-/// names the key by (key id, key ARN, alias — the forms
+/// names the key by (key id, key ARN — the two forms
 /// `smithy_query(query="doc",shape="EnableKeyRotationRequest",member="KeyId")`
 /// accepts), and in how the key was created.
 #[tokio::test]
@@ -190,7 +190,7 @@ async fn enabling_rotation_schedules_one_period_after_the_call() {
     ];
 
     for (described, request) in creates {
-        for identifier_form in ["key id", "key ARN", "alias"] {
+        for identifier_form in ["key id", "key ARN"] {
             for (period, expected) in PERIOD_ROWS {
                 let case =
                     format!("{described} named by {identifier_form}, period {period:?} days");
@@ -198,13 +198,8 @@ async fn enabling_rotation_schedules_one_period_after_the_call() {
                 let key_id = text(&case, &created, "KeyId");
                 let arn = text(&case, &created, "Arn");
                 let identifier = match identifier_form {
-                    "key id" => key_id.clone(),
                     "key ARN" => arn.clone(),
-                    _ => {
-                        let alias = format!("alias/schedule-{key_id}");
-                        create_alias(&router, &case, &alias, &key_id).await;
-                        alias
-                    }
+                    _ => key_id.clone(),
                 };
 
                 // A key nothing has configured is not rotating.
@@ -598,7 +593,7 @@ async fn configuring_rotation_is_refused_outside_an_enabled_symmetric_kms_key() 
         (
             "an unknown alias",
             "alias/no-such-key".to_string(),
-            "NotFoundException",
+            "InvalidArnException",
         ),
         (
             "an ARN that is not a KMS key or alias ARN",

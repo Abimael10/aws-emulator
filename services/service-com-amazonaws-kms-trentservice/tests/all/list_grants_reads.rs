@@ -159,8 +159,11 @@ async fn listed(
         .collect()
 }
 
-/// A key's grants are reported for every identifier form that resolves to that key, and
-/// reading them changes nothing a later caller sees.
+/// A key's grants are reported for either identifier form that names that key, and
+/// reading them changes nothing a later caller sees. An alias of the key is not such a
+/// form — "Specify the key ID or key ARN of the KMS key"
+/// (`smithy_query(query="doc",shape="ListGrantsRequest",member="KeyId")`) — so it is
+/// refused for its kind before any grant is read.
 #[tokio::test]
 async fn the_reader_reports_a_key_s_grants_for_every_identifier_form() {
     let router = router();
@@ -171,8 +174,6 @@ async fn the_reader_reports_a_key_s_grants_for_every_identifier_form() {
     for (form, identifier) in [
         ("key id", seeded.key_id.clone()),
         ("key ARN", seeded.key_arn.clone()),
-        ("alias name", alias.to_string()),
-        ("alias ARN", alias_arn(REGION, alias)),
     ] {
         let reported = listed(&router, form, &seeded.key_arn, &json!({"KeyId": identifier})).await;
         assert_eq!(
@@ -181,6 +182,18 @@ async fn the_reader_reports_a_key_s_grants_for_every_identifier_form() {
             "case read by {form}: expected every grant of the key by ascending grant id {:?}, \
              got {reported:?}",
             ascending(&seeded.grants)
+        );
+    }
+
+    for (form, identifier) in [
+        ("alias name", alias.to_string()),
+        ("alias ARN", alias_arn(REGION, alias)),
+    ] {
+        let (status, code) = failure(&router, "ListGrants", &json!({"KeyId": identifier})).await;
+        assert_eq!(
+            (status, code.as_str()),
+            (400, "InvalidArnException"),
+            "case read by {form}: expected 400 InvalidArnException, got {status} ({code})"
         );
     }
 
@@ -506,11 +519,6 @@ async fn an_identifier_that_names_no_key_is_refused() {
             "an unknown key ARN",
             format!("arn:aws:kms:{REGION}:{account}:key/mrk-{}", "3".repeat(32)),
         ),
-        ("an unknown alias", "alias/no-such-grants".to_string()),
-        (
-            "an unknown alias ARN",
-            alias_arn(REGION, "alias/no-such-grants"),
-        ),
         (
             "this key's ARN in another Region",
             format!("arn:aws:kms:us-west-2:{account}:key/{key_id}"),
@@ -529,8 +537,9 @@ async fn an_identifier_that_names_no_key_is_refused() {
         );
     }
 
-    // Rows: an identifier that is an ARN but no KMS key or alias ARN at all, which this
-    // operation models its own error for.
+    // Rows: an identifier that is an ARN but no KMS key or alias ARN at all, and the two
+    // alias forms, which this operation's `KeyId` does not take at all — both answered
+    // by the one error the model gives it for an identifier it will not read.
     let malformed: Vec<(&str, String)> = vec![
         (
             "an unknown resource type",
@@ -546,6 +555,8 @@ async fn an_identifier_that_names_no_key_is_refused() {
             format!("arn:aws:kms::{account}:key/{key_id}"),
         ),
         ("nothing but the prefix", "arn:".to_string()),
+        ("an alias name", "alias/no-such-grants".to_string()),
+        ("an alias ARN", alias_arn(REGION, "alias/no-such-grants")),
     ];
     for (case, identifier) in malformed {
         let (status, code) = failure(&router, "ListGrants", &json!({"KeyId": identifier})).await;

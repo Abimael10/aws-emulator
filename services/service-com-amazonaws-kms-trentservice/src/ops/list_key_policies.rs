@@ -190,6 +190,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let region = crate::state::request_region(ctx);
         // A REPORTING operation: it reads one key record and writes nothing.
         let state = state.lock();
+
+        // "Specify the key ID or key ARN of the KMS key"
+        // (`smithy_query(query="doc",shape="ListKeyPoliciesRequest",member="KeyId")`): an
+        // alias is not one of the forms this member accepts, so it is refused for its
+        // KIND before anything is resolved
+        // (`crate::state::aliases_not_supported`).
+        if crate::state::names_an_alias(&input.key_id) {
+            return Err(ListKeyPoliciesErrorModeled::InvalidArnException(
+                crate::state::aliases_not_supported(),
+            )
+            .into());
+        }
+
         match state.resolve(&region, &input.key_id) {
             crate::state::KeyRef::Found(_) => {}
             crate::state::KeyRef::UnauthorizedAccount => {

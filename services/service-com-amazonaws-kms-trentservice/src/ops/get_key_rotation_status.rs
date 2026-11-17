@@ -211,6 +211,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A REPORTING operation: it reads the key's rotation schedule and writes
         // nothing, so two reads of an untouched key answer the same.
         let state = state.lock();
+
+        // "Specify the key ID or key ARN of the KMS key"
+        // (`smithy_query(query="doc",shape="GetKeyRotationStatusRequest",member="KeyId")`):
+        // an alias is not one of the forms this member accepts, so it is refused for its
+        // KIND before anything is resolved
+        // (`crate::state::aliases_not_supported`).
+        if crate::state::names_an_alias(&input.key_id) {
+            return Err(GetKeyRotationStatusErrorModeled::InvalidArnException(
+                crate::state::aliases_not_supported(),
+            )
+            .into());
+        }
+
         let key = match state.resolve(&region, &input.key_id) {
             crate::state::KeyRef::Found(key) => key,
             crate::state::KeyRef::UnauthorizedAccount => {

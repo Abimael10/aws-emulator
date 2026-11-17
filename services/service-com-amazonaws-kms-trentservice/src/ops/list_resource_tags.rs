@@ -190,6 +190,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let region = crate::state::request_region(ctx);
         let state = state.lock();
+
+        // "Specify the key ID or key ARN of the KMS key"
+        // (`smithy_query(query="doc",shape="ListResourceTagsRequest",member="KeyId")`):
+        // an alias is not one of the forms this member accepts, so it is refused for its
+        // KIND before anything is resolved
+        // (`crate::state::aliases_not_supported`).
+        if crate::state::names_an_alias(&input.key_id) {
+            return Err(ListResourceTagsErrorModeled::InvalidArnException(
+                crate::state::aliases_not_supported(),
+            )
+            .into());
+        }
+
         // Reporting a key's tags is reporting the key: an identifier that names no key
         // of this account and Region has no tag list at all. A key in any key state
         // has one — this operation models no state error, and "to confirm that the

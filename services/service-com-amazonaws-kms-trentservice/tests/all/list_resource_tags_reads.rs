@@ -132,9 +132,11 @@ fn create_rows() -> Vec<(&'static str, Value, BTreeMap<String, String>)> {
     ]
 }
 
-/// The tags a key is CREATED with are the tags the reader reports, for every
-/// identifier form that resolves to that key — and reading them changes nothing a
-/// later caller sees.
+/// The tags a key is CREATED with are the tags the reader reports, for either identifier
+/// form that names that key — and reading them changes nothing a later caller sees. An
+/// alias of the key is not such a form: "Specify the key ID or key ARN of the KMS key"
+/// (`smithy_query(query="doc",shape="ListResourceTagsRequest",member="KeyId")`), so it is
+/// refused for its kind before any tag is read.
 #[tokio::test]
 async fn tags_a_key_was_created_with_are_reported_for_every_identifier_form() {
     let router = router();
@@ -148,12 +150,7 @@ async fn tags_a_key_was_created_with_are_reported_for_every_identifier_form() {
         let alias = format!("alias/reader-{index}");
         create_alias(&router, case, &alias, &key_id).await;
 
-        for (form, identifier) in [
-            ("key id", key_id.clone()),
-            ("key ARN", key_arn.clone()),
-            ("alias name", alias.clone()),
-            ("alias ARN", alias_arn(REGION, &alias)),
-        ] {
+        for (form, identifier) in [("key id", key_id.clone()), ("key ARN", key_arn.clone())] {
             let answer = ok(&router, "ListResourceTags", &json!({"KeyId": identifier})).await;
             assert_eq!(
                 reported(case, &answer),
@@ -187,6 +184,21 @@ async fn tags_a_key_was_created_with_are_reported_for_every_identifier_form() {
             described, metadata,
             "case {case}: listing tags must leave the key untouched, got {described}"
         );
+
+        // The alias of that very key, bare and as its ARN, is refused for its KIND.
+        for (form, identifier) in [
+            ("alias name", alias.clone()),
+            ("alias ARN", alias_arn(REGION, &alias)),
+        ] {
+            let (status, code) =
+                failure(&router, "ListResourceTags", &json!({"KeyId": identifier})).await;
+            assert_eq!(
+                (status, code.as_str()),
+                (400, "InvalidArnException"),
+                "case {case} read by {form}: expected 400 InvalidArnException, got {status} \
+                 ({code})"
+            );
+        }
     }
 }
 

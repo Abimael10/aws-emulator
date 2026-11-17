@@ -374,7 +374,7 @@ async fn an_aws_managed_key_rotates_yearly_and_its_rotation_is_not_configurable(
     let report = ok(
         &router,
         "GetKeyRotationStatus",
-        &json!({"KeyId": alias.clone()}),
+        &json!({"KeyId": arn.clone()}),
     )
     .await;
     assert_eq!(
@@ -394,9 +394,11 @@ async fn an_aws_managed_key_rotates_yearly_and_its_rotation_is_not_configurable(
     );
 
     // Rows: the two operations that configure automatic rotation, neither of which a
-    // caller may use on a key Amazon Web Services manages.
+    // caller may use on a key Amazon Web Services manages. Each names the key by its key
+    // ARN, the form their own `KeyId` takes ("Specify the key ID or key ARN of the KMS
+    // key"), so what the refusal is about is the key and not the identifier's kind.
     for operation in ["EnableKeyRotation", "DisableKeyRotation"] {
-        let (status, code) = failure(&router, operation, &json!({"KeyId": alias.clone()})).await;
+        let (status, code) = failure(&router, operation, &json!({"KeyId": arn.clone()})).await;
         assert_eq!(
             status, 400,
             "case {operation}: expected HTTP 400, got {status} ({code})"
@@ -412,7 +414,7 @@ async fn an_aws_managed_key_rotates_yearly_and_its_rotation_is_not_configurable(
     let after = ok(
         &router,
         "GetKeyRotationStatus",
-        &json!({"KeyId": alias.clone()}),
+        &json!({"KeyId": arn.clone()}),
     )
     .await;
     assert_eq!(

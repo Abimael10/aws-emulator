@@ -6,15 +6,17 @@
 //! The sibling [`super::key_rotation_on_demand`] suite drives the WRITER of those
 //! records; this one drives the reader, so the rules under test are the reader's own:
 //!
-//! 1. The listing belongs to the key the `KeyId` member RESOLVES to, whatever form that
-//!    identifier takes (key id, key ARN, `alias/<name>`, alias ARN), and holds one entry
+//! 1. The listing belongs to the key the `KeyId` member RESOLVES to, in either form this
+//!    member takes (key id, key ARN — "Specify the key ID or key ARN of the KMS key"),
+//!    and holds one entry
 //!    per completed rotation of that key's material, oldest first, naming the material
 //!    each rotation made current — the newest of them being the one the key encrypts
-//!    under now.
+//!    under now. An identifier that names an ALIAS is not such a form and is refused for
+//!    its kind.
 //! 2. A KMS key is a regional resource, so the reader serves only the keys of the
 //!    endpoint's Region and account: an identifier that names no key there is
-//!    `NotFoundException`, and an ARN that is no KMS key or alias ARN at all is
-//!    `InvalidArnException`.
+//!    `NotFoundException`, and an identifier this member does not take at all — an ARN
+//!    that is no KMS key ARN, or an alias — is `InvalidArnException`.
 //! 3. The listing is paged by `Limit` and by a `Marker` the reader minted for that key:
 //!    no page is longer than the limit, `Truncated` says whether entries remain,
 //!    `NextMarker` is present only then, and the pages together hold every entry exactly
@@ -141,12 +143,25 @@ async fn every_identifier_form_lists_the_rotations_of_the_resolved_key() {
             create_alias(&router, &case, &alias, &key_id).await;
             let expected = rotate(&router, &case, &key_id, wanted).await;
 
-            let forms = [
-                ("key id", key_id.clone()),
-                ("key ARN", key_arn.clone()),
+            let forms = [("key id", key_id.clone()), ("key ARN", key_arn.clone())];
+
+            // The alias forms are not forms this listing takes: "Specify the key ID or
+            // key ARN of the KMS key"
+            // (`smithy_query(query="doc",shape="ListKeyRotationsRequest",member="KeyId")`),
+            // so an alias of this very key is refused for its KIND rather than resolved.
+            for (form, identifier) in [
                 ("alias name", alias.clone()),
                 ("alias ARN", alias_arn(REGION, &alias)),
-            ];
+            ] {
+                let case = format!("{case} read by {form}");
+                let (status, code) =
+                    failure(&router, "ListKeyRotations", &json!({"KeyId": identifier})).await;
+                assert_eq!(
+                    (status, code.as_str()),
+                    (400, "InvalidArnException"),
+                    "case {case:?}: expected 400 InvalidArnException, got {status} ({code})"
+                );
+            }
             let mut answers: Vec<(String, Value)> = Vec::new();
             for (form, identifier) in &forms {
                 let case = format!("{case} read by {form}");
@@ -288,21 +303,19 @@ async fn the_reader_serves_only_the_keys_of_its_own_region_and_account() {
     }
 
     for (region, key_id, rotations) in &keys {
-        for identifier in [key_id.as_str(), "alias/regional-rotations"] {
-            let case = format!("{region} serves its own key, read by {identifier}");
-            let answer = ok_in(
-                &router,
-                region,
-                "ListKeyRotations",
-                &json!({"KeyId": identifier}),
-            )
-            .await;
-            assert_eq!(
-                entries(&case, &answer).len(),
-                *rotations,
-                "case {case:?}: expected {rotations} rotation(s), got {answer}"
-            );
-        }
+        let case = format!("{region} serves its own key");
+        let answer = ok_in(
+            &router,
+            region,
+            "ListKeyRotations",
+            &json!({"KeyId": key_id}),
+        )
+        .await;
+        assert_eq!(
+            entries(&case, &answer).len(),
+            *rotations,
+            "case {case:?}: expected {rotations} rotation(s), got {answer}"
+        );
 
         for (other_region, _, _) in &keys {
             if other_region == region {
@@ -330,7 +343,7 @@ async fn the_reader_serves_only_the_keys_of_its_own_region_and_account() {
     let local_key_id = keys[0].1.clone();
 
     // Rows: a well-formed identifier that names no key of this account and Region.
-    let not_found: [(&str, String); 6] = [
+    let not_found: [(&str, String); 4] = [
         (
             "an unknown key id",
             "22222222-2222-4222-2222-222222222222".to_string(),
@@ -338,11 +351,6 @@ async fn the_reader_serves_only_the_keys_of_its_own_region_and_account() {
         (
             "an unknown key ARN",
             format!("arn:aws:kms:{REGION}:{account}:key/mrk-{}", "2".repeat(32)),
-        ),
-        ("an unknown alias", "alias/no-such-rotations".to_string()),
-        (
-            "an unknown alias ARN",
-            alias_arn(REGION, "alias/no-such-rotations"),
         ),
         (
             "this key's ARN in another Region",
@@ -366,9 +374,10 @@ async fn the_reader_serves_only_the_keys_of_its_own_region_and_account() {
         );
     }
 
-    // Rows: an ARN that is no KMS key or alias ARN at all, which this operation models
-    // its own error for.
-    let malformed: [(&str, String); 5] = [
+    // Rows: an ARN that is no KMS key or alias ARN at all, and the two alias forms,
+    // which this operation's `KeyId` does not take at all — both answered by the one
+    // error the model gives it for an identifier it will not read.
+    let malformed: [(&str, String); 7] = [
         (
             "an unknown resource type",
             format!("arn:aws:kms:{REGION}:{account}:thing/{local_key_id}"),
@@ -383,6 +392,8 @@ async fn the_reader_serves_only_the_keys_of_its_own_region_and_account() {
             format!("arn:aws:kms::{account}:key/{local_key_id}"),
         ),
         ("nothing but the prefix", "arn:".to_string()),
+        ("an alias name", "alias/no-such-rotations".to_string()),
+        ("an alias ARN", alias_arn(REGION, "alias/no-such-rotations")),
     ];
     for (case, identifier) in malformed {
         let (status, code) =

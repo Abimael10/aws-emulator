@@ -713,11 +713,13 @@ async fn a_key_policy_document_is_bounded_by_the_quota() {
 // R5: identifiers and key state
 // ---------------------------------------------------------------------------
 
-/// R5: both policy operations accept every `KeyId` form KMS does — a key id, a key ARN,
-/// `alias/<name>` and an alias ARN — so a document attached through one form is served
-/// through any other, while an identifier that names no key of this endpoint is refused
-/// (`NotFoundException`) and one that is an ARN but not a KMS key or alias ARN is
-/// refused as `InvalidArnException`.
+/// R5: both policy operations accept the `KeyId` forms their own member documents — a
+/// key id and a key ARN ("Specify the key ID or key ARN of the KMS key",
+/// `smithy_query(query="doc",shape="GetKeyPolicyRequest",member="KeyId")`) — so a
+/// document attached through one form is served through the other, while an identifier
+/// that names no key of this endpoint is refused (`NotFoundException`), one that is an
+/// ARN but not a KMS key or alias ARN is refused as `InvalidArnException`, and one that
+/// names an ALIAS is refused as `InvalidArnException` for its kind.
 #[tokio::test]
 async fn the_policy_operations_resolve_every_key_identifier_form() {
     let router = router();
@@ -732,7 +734,7 @@ async fn the_policy_operations_resolve_every_key_identifier_form() {
 
     // Rows: the identifier the write names, and the identifier the read names — every
     // pairing must reach the same key.
-    let forms = [key_id.clone(), key_arn.clone(), alias.to_string(), alias_arn];
+    let forms = [key_id.clone(), key_arn.clone()];
     for (index, written_through) in forms.iter().enumerate() {
         let document = policy(json!([statement(
             &format!("Form{index}"),
@@ -766,7 +768,17 @@ async fn the_policy_operations_resolve_every_key_identifier_form() {
         (
             "an unknown alias",
             "alias/no-such-alias".to_string(),
-            "NotFoundException",
+            "InvalidArnException",
+        ),
+        (
+            "an alias of this very key",
+            alias.to_string(),
+            "InvalidArnException",
+        ),
+        (
+            "the alias ARN of this very key",
+            alias_arn,
+            "InvalidArnException",
         ),
         (
             "a key ARN of another Region",

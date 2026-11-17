@@ -108,9 +108,11 @@ fn deletion_rows() -> Vec<(&'static str, String, Value)> {
     ]
 }
 
-/// A deleted alias resolves to nothing: every operation that takes a `KeyId` answers
-/// `NotFoundException` for the name and for its alias ARN, however often it is asked,
-/// while the key the alias used to name is still exactly where it was.
+/// A deleted alias resolves to nothing: an operation whose `KeyId` takes an alias
+/// answers `NotFoundException` for the name and for its alias ARN, however often it is
+/// asked, while an operation whose `KeyId` takes a key id or key ARN only refuses the
+/// identifier for its kind — and the key the alias used to name is still exactly where
+/// it was.
 #[tokio::test]
 async fn a_deleted_alias_resolves_to_nothing_for_every_key_id_member() {
     let router = router();
@@ -131,23 +133,29 @@ async fn a_deleted_alias_resolves_to_nothing_for_every_key_id_member() {
 
         delete_alias(&router, case, &alias).await;
 
-        // Rows: the identifier form, and the operation resolving it. Every one of
-        // these models `NotFoundException`, and a mutating one must refuse BEFORE it
-        // writes anything.
+        // Rows: the identifier form, the operation resolving it, and the refusal its own
+        // `KeyId` documentation earns. An operation whose member takes an alias
+        // ("key ID, key ARN, alias name, or alias ARN") reports the deleted name as a
+        // resource that is not there; one whose member takes a key id or key ARN only
+        // refuses the identifier for its KIND, before it resolves anything — so the
+        // deleted alias and a live one are refused alike. A mutating operation must
+        // refuse BEFORE it writes anything either way.
         for identifier in [alias.clone(), alias_arn(REGION, &alias)] {
-            let requests: Vec<(&str, Value)> = vec![
-                ("DescribeKey", json!({"KeyId": identifier})),
+            let requests: Vec<(&str, Value, &str)> = vec![
+                ("DescribeKey", json!({"KeyId": identifier}), "NotFoundException"),
                 (
                     "Encrypt",
                     json!({"KeyId": identifier, "Plaintext": b64(b"after the delete")}),
+                    "NotFoundException",
                 ),
                 (
                     "UpdateKeyDescription",
                     json!({"KeyId": identifier, "Description": "written through a dead alias"}),
+                    "InvalidArnException",
                 ),
-                ("ListAliases", json!({"KeyId": identifier})),
+                ("ListAliases", json!({"KeyId": identifier}), "InvalidArnException"),
             ];
-            for (operation, body) in requests {
+            for (operation, body, expected) in requests {
                 let (status, code) = failure(&router, operation, &body).await;
                 assert_eq!(
                     status, 400,
@@ -155,8 +163,8 @@ async fn a_deleted_alias_resolves_to_nothing_for_every_key_id_member() {
                      {status} ({code})"
                 );
                 assert_eq!(
-                    code, "NotFoundException",
-                    "case {case} / {operation} / {identifier}: expected NotFoundException, \
+                    code, expected,
+                    "case {case} / {operation} / {identifier}: expected {expected}, \
                      got {code}"
                 );
             }
@@ -738,12 +746,8 @@ async fn list_aliases_reports_every_binding_in_creation_order_and_pages() {
         "case first entry: expected a creation date, got {entry}"
     );
 
-    // `KeyId` narrows the list to one key's bindings, whatever form names it.
-    for (form, identifier) in [
-        ("key id", first_id.clone()),
-        ("key ARN", first_arn.clone()),
-        ("an alias of that key", all[0].clone()),
-    ] {
+    // `KeyId` narrows the list to one key's bindings, in either form that names a KEY.
+    for (form, identifier) in [("key id", first_id.clone()), ("key ARN", first_arn.clone())] {
         let answer = list_aliases(&router, &json!({"KeyId": identifier})).await;
         assert_eq!(
             listed_names(form, &answer),
@@ -751,6 +755,18 @@ async fn list_aliases_reports_every_binding_in_creation_order_and_pages() {
             "case filtered by {form}: expected only that key's aliases, got {answer}"
         );
     }
+
+    // An alias of that key is not such a form — "Specify the key ID or key ARN of the KMS
+    // key" (`smithy_query(query="doc",shape="ListAliasesRequest",member="KeyId")`) — so it
+    // narrows nothing and is refused for its kind.
+    let (status, code) =
+        failure(&router, "ListAliases", &json!({"KeyId": all[0].clone()})).await;
+    assert_eq!(
+        (status, code.as_str()),
+        (400, "InvalidArnException"),
+        "case filtered by an alias of that key: expected 400 InvalidArnException, got \
+         {status} ({code})"
+    );
 
     // Paging: every page size walks the same list in the same order, exactly once.
     for limit in [1usize, 2, 3, 5] {

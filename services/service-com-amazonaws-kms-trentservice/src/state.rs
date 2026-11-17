@@ -4555,6 +4555,19 @@ pub fn invalid_arn_message(requested: &str) -> String {
 /// differently.
 pub const ALIASES_NOT_SUPPORTED_MESSAGE: &str = "Key Aliases are not supported for this operation.";
 
+/// The refusal such an operation answers an alias identifier with: the modelled
+/// `InvalidArnException` carrying [`ALIASES_NOT_SUPPORTED_MESSAGE`].
+///
+/// Built here once for every operation, beside the sentence and beside
+/// [`names_an_alias`] — the predicate that decides it — so the class and the wording of
+/// this one refusal cannot drift from one operation to the next. Each operation lifts it
+/// onto its own modelled error enum, which is the only part that is per-operation.
+pub fn aliases_not_supported() -> crate::ops::types::InvalidArnException {
+    crate::ops::types::InvalidArnException {
+        message: Some(ALIASES_NOT_SUPPORTED_MESSAGE.to_string()),
+    }
+}
+
 /// How KMS refuses an operation on a key whose `KeyUsage` does not permit it: "the
 /// KeyUsage value of the KMS key is incompatible with the API operation"
 /// (`smithy_query(query="doc",shape="InvalidKeyUsageException")`).

@@ -42,19 +42,26 @@ const ATTEMPT_SUFFIX: &str = ") (SDK Attempt Count: 1)";
 /// What KMS ITSELF answers for the key identifier `key_id`: the HTTP status and the message
 /// of the refusal, read from that service's own endpoint over the same emulator.
 ///
-/// `ListResourceTags` is the operation asked, because it only READS the key the identifier
-/// names and reports a lookup that found nothing — an ARN it cannot read as a key or alias
-/// ARN included — exactly as the relayed key resolution does. That makes its answer the
-/// oracle for both halves of the envelope: the sentence the relay must carry and the status
-/// it must state.
-async fn kms_refusal(emulator: &MultiServiceRouter, region: &str, key_id: &str) -> (u16, String) {
+/// The operation asked is one that only READS the key the identifier names and reports a
+/// lookup that found nothing — exactly as the relayed key resolution does — which makes
+/// its answer the oracle for both halves of the envelope: the sentence the relay must carry
+/// and the status it must state. WHICH such operation fits depends on the identifier's
+/// form: `ListResourceTags` takes "the key ID or key ARN of the KMS key" and refuses an
+/// alias for its kind before any lookup, so an alias reference is read through
+/// `DescribeKey`, whose own `KeyId` takes the alias forms as well.
+async fn kms_refusal(
+    emulator: &MultiServiceRouter,
+    region: &str,
+    operation: &str,
+    key_id: &str,
+) -> (u16, String) {
     let body = json!({"KeyId": key_id}).to_string();
     let request = http::Request::builder()
         .method("POST")
         .uri("/")
         .header("host", "kms.amazonaws.com")
         .header("content-type", "application/x-amz-json-1.1")
-        .header("x-amz-target", "TrentService.ListResourceTags")
+        .header("x-amz-target", format!("TrentService.{operation}"))
         .header(
             "authorization",
             format!(
@@ -101,50 +108,64 @@ async fn a_relayed_key_refusal_carries_the_downstream_reason_and_the_relay_envel
     // Region with another key id, are refused by resolution rather than by the text.
     let held = create_kms_key(&emulator, REGION).await;
 
-    // (case, the value sent as EncryptionKeyArn). The rows differ in the FORM of the
+    // (case, the value sent as EncryptionKeyArn, the operation the oracle reads KMS's own
+    // answer through). The rows differ in the FORM of the
     // reference, which is what decides the sentence KMS answers with: the two key-id forms
     // KMS documents ("Key ID: 1234abcd-12ab-34cd-56ef-1234567890ab",
     // `smithy_query(query="doc",shape="TagResourceRequest",member="KeyId")`, and
     // `mrk-1234abcd12ab34cd56ef1234567890ab`,
     // `smithy_query(query="doc",shape="ReplicateKeyRequest",member="KeyId")`), the ARN forms
     // of each, and values in no identifier form at all.
-    let rows: Vec<(&str, String)> = vec![
-        ("a value that is no key identifier at all", "not-an-arn-at-all".to_string()),
+    let rows: Vec<(&str, String, &str)> = vec![
+        (
+            "a value that is no key identifier at all",
+            "not-an-arn-at-all".to_string(),
+            "ListResourceTags",
+        ),
         (
             "a single-Region key id that names no key",
             "11111111-2222-4333-8444-555555555555".to_string(),
+            "ListResourceTags",
         ),
         (
             "a multi-Region key id that names no key",
             format!("mrk-{}", "a".repeat(32)),
+            "ListResourceTags",
         ),
         (
             "a well-formed key ARN of a key nothing created",
             format!("arn:aws:kms:{REGION}:{account}:key/11111111-2222-4333-8444-555555555555"),
+            "ListResourceTags",
         ),
         (
             // A KMS key is regional: the same key at another Region's endpoint is absent.
             "a held key's ARN at another Region",
             held.replace(REGION, "eu-west-1"),
+            "ListResourceTags",
         ),
         (
+            // An alias is not a form `ListResourceTags` takes at all, so the oracle for
+            // this row is the reader whose `KeyId` does take it.
             "an alias ARN naming no alias",
             format!("arn:aws:kms:{REGION}:{account}:alias/nothing"),
+            "DescribeKey",
         ),
         (
             "an ARN of another service's resource",
             "arn:aws:s3:::some-bucket".to_string(),
+            "ListResourceTags",
         ),
         (
             "a key id in the right shape but not hexadecimal",
             "1111111z-2222-3333-4444-555555555555".to_string(),
+            "ListResourceTags",
         ),
     ];
 
     let mut request_ids: Vec<String> = Vec::new();
-    for (case, key_arn) in &rows {
+    for (case, key_arn, oracle) in &rows {
         // What KMS answers the same identifier with, which is what the relay must report.
-        let (kms_status, kms_reason) = kms_refusal(&emulator, REGION, key_arn).await;
+        let (kms_status, kms_reason) = kms_refusal(&emulator, REGION, oracle, key_arn).await;
 
         let refused = start_under_key(&emulator, REGION, Some(key_arn)).await;
         assert_eq!(
@@ -218,7 +239,8 @@ async fn only_a_relayed_refusal_carries_the_envelope_and_only_its_id_varies() {
     }
 
     let unresolvable = "not-an-arn-at-all";
-    let (kms_status, kms_reason) = kms_refusal(&emulator, REGION, unresolvable).await;
+    let (kms_status, kms_reason) =
+        kms_refusal(&emulator, REGION, "ListResourceTags", unresolvable).await;
     let mut ids: Vec<String> = Vec::new();
     for attempt in 0..2 {
         let refused = start_under_key(&emulator, REGION, Some(unresolvable)).await;

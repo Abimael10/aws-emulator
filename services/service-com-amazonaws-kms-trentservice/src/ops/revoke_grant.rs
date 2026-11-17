@@ -220,8 +220,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut state = state.lock();
 
         // "Specify the key ID or key ARN of the KMS key"
-        // (`smithy_query(query="doc",shape="RevokeGrantRequest",member="KeyId")`) —
-        // resolved the way every other operation resolves a `KeyId`.
+        // (`smithy_query(query="doc",shape="RevokeGrantRequest",member="KeyId")`): an
+        // alias is not one of the forms this member accepts, so it is refused for its
+        // KIND before anything is resolved
+        // (`crate::state::aliases_not_supported`).
+        if crate::state::names_an_alias(&input.key_id) {
+            return Err(RevokeGrantErrorModeled::InvalidArnException(
+                crate::state::aliases_not_supported(),
+            )
+            .into());
+        }
+
         let key_id = match state.resolve(&region, &input.key_id) {
             crate::state::KeyRef::Found(key) => {
                 // "The KMS key that you use for this operation must be in a compatible

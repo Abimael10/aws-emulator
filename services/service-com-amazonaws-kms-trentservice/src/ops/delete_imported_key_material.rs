@@ -337,10 +337,10 @@ fn invalid_arn(requested: &str) -> DeleteImportedKeyMaterialError {
 }
 
 /// Refuse an identifier that names an ALIAS, which this operation's `KeyId` does not
-/// accept ([`crate::state::ALIASES_NOT_SUPPORTED_MESSAGE`]).
+/// accept ([`crate::state::aliases_not_supported`]).
 fn aliases_not_supported() -> DeleteImportedKeyMaterialError {
-    DeleteImportedKeyMaterialErrorModeled::InvalidArnException(InvalidArnException {
-        message: Some(crate::state::ALIASES_NOT_SUPPORTED_MESSAGE.to_string()),
-    })
+    DeleteImportedKeyMaterialErrorModeled::InvalidArnException(
+        crate::state::aliases_not_supported(),
+    )
     .into()
 }
