@@ -2,10 +2,10 @@
 
 //! How this registry states a refused PARAMETER, end to end over the wire.
 //!
-//! Every refusal below already carries the right HTTP status (400) and error code
-//! (`InvalidParameterException`); what these suites pin is the clause, which ECR builds
-//! from the request and the model to one template — `Invalid parameter at '<parameter>'
-//! failed to satisfy constraint: '<constraint>'`. Two rules, one suite each:
+//! Every refusal below already carries the right HTTP status (400); what these suites pin
+//! is the error class and the clause, which ECR builds from the request and the model to
+//! one template — `Invalid parameter at '<parameter>' failed to satisfy constraint:
+//! '<constraint>'`. Six rules, one suite each:
 //!
 //! 1. a value this registry does not recognise, where the modelled shape declares NO
 //!    enum, fails a stable constraint phrase about the parameter — never a value set the
@@ -15,7 +15,18 @@
 //!    the request carries one) is named by its API label with the constraint in ECR's own
 //!    words, while a value the model-driven walk caught — a member of a NESTED structure,
 //!    or a parameter whose value the registry only RECORDS — keeps that walk's path and
-//!    the `@pattern` as the model declares it.
+//!    the `@pattern` as the model declares it;
+//! 3. a `repositoryName` the modelled expression ADMITS is a name to look up, so it is
+//!    the modelled not-found error and not a parameter failure — which is what a
+//!    registry-qualified image reference passed where a name belongs is;
+//! 4. a value outside an enumerated type states that type's whole value set in the order
+//!    the values' own hash table is walked, not the order the model declares;
+//! 5. whether the expression ECR publishes for a value class is DELIMITED inside the
+//!    clause belongs to the class: the account-id class is stated bare, the
+//!    repository-name classes delimited;
+//! 6. a list ECR reads no value out of is refused at the LIST member with the element's
+//!    requirement nested in the collection form, while a list whose values it resolves is
+//!    refused one value at a time under the singular of its name.
 //!
 //! Each suite is a TABLE whose rows differ along what its rule generalises over — the
 //! shape of the unrecognised value and the operation asked, which constraint failed and
@@ -375,4 +386,380 @@ async fn a_refused_parameter_is_stated_by_the_validator_that_caught_it() {
             answer.message()
         );
     }
+}
+
+/// Assert `operation` refuses `request` with HTTP 400, `InvalidParameterException` and
+/// exactly the clause `parameter` / `constraint` states.
+async fn assert_clause(
+    router: &smithy_server_runtime::MultiServiceRouter,
+    case: &str,
+    operation: &str,
+    request: &Value,
+    parameter: &str,
+    constraint: &str,
+) {
+    let answer = call(router, operation, request).await;
+    assert_eq!(
+        answer.status, 400,
+        "case {case:?}: expected HTTP 400 from {operation}, got {} with {:?}",
+        answer.status, answer.body
+    );
+    assert_eq!(
+        answer.error_code(),
+        INVALID_PARAMETER,
+        "case {case:?}: expected {INVALID_PARAMETER} from {operation}, got {:?}",
+        answer.body
+    );
+    let expected = clause(parameter, constraint);
+    assert_eq!(
+        answer.message(),
+        expected,
+        "case {case:?}: expected the clause {expected:?}, got {:?}",
+        answer.message()
+    );
+}
+
+/// The sentence ECR states a repository the registry does not hold with, written out
+/// literally for the same reason every other sentence in these suites is.
+fn repository_not_found(name: &str) -> String {
+    format!("The repository with name '{name}' does not exist in the registry with id '{REGISTRY_ID}'")
+}
+
+/// A `repositoryName` the model's `@pattern` ADMITS reaches the lookup, so a name no
+/// repository carries answers the modelled `RepositoryNotFoundException` — while a name
+/// the expression does not admit is refused as a parameter, before any lookup.
+///
+/// The row that matters for a caller is a registry-qualified image reference: the
+/// authority AWS publishes a registry under —
+/// `<account>.dkr.ecr.<region>.amazonaws.com/<repository>` — is lowercase letters, digits,
+/// dots and hyphens with a `/` before the repository, and `RepositoryName`'s `@pattern`
+/// admits every one of those (`smithy_query(query="shape", shape="RepositoryName")` gives
+/// `^[a-z0-9]+((\.|_|__|-+)[a-z0-9]+)*(\/[a-z0-9]+((\.|_|__|-+)[a-z0-9]+)*)*$`, where `.`,
+/// `_`, `-` and `/` are the separators). So passing such a reference where a repository
+/// name belongs names a repository that does not exist. An authority carrying a character
+/// the expression does NOT admit — a `:` before a port, an uppercase letter — is the other
+/// side of the same boundary and is a parameter failure.
+///
+/// The rows differ along what the rule generalises over: the shape of the name (a plain
+/// name, a namespaced one, a registry-qualified reference in two Regions and two accounts,
+/// a reference with a port, one with a tag, one with an uppercase letter) crossed with the
+/// operations that take the parameter.
+#[tokio::test]
+async fn a_name_the_expression_admits_is_looked_up_and_one_it_does_not_is_a_parameter() {
+    // (case, the repositoryName sent, whether the expression admits it)
+    let names: Vec<(&str, &str, bool)> = vec![
+        ("a plain name no repository carries", "absent-repository", true),
+        ("a namespaced name", "team/absent-repository", true),
+        (
+            "a registry-qualified image reference",
+            "000000000000.dkr.ecr.us-west-2.amazonaws.com/absent-repository",
+            true,
+        ),
+        (
+            "another account and Region's reference",
+            "111111111111.dkr.ecr.eu-west-1.amazonaws.com/team/absent-repository",
+            true,
+        ),
+        ("an authority carrying a port", "127.0.0.1:4566/absent", false),
+        ("a reference carrying a tag", "absent-repository:latest", false),
+        ("an uppercase letter", "Absent-Repository", false),
+    ];
+    let operations = ["ListImages", "DescribeImages", "GetRepositoryPolicy"];
+
+    let router = emulator();
+    let malformed = clause(
+        "repositoryName",
+        &format!("must satisfy regular expression '{REPOSITORY_NAME_EXPRESSION}'"),
+    );
+    for (shape, name, admitted) in &names {
+        for operation in operations {
+            let case = format!("{shape} on {operation}");
+            let answer = call(&router, operation, &json!({"repositoryName": name})).await;
+            assert_eq!(
+                answer.status, 400,
+                "case {case:?}: expected HTTP 400, got {} with {:?}",
+                answer.status, answer.body
+            );
+            let (code, expected) = if *admitted {
+                ("RepositoryNotFoundException", repository_not_found(name))
+            } else {
+                (INVALID_PARAMETER, malformed.clone())
+            };
+            assert_eq!(
+                answer.error_code(),
+                code,
+                "case {case:?}: expected {code}, got {:?}",
+                answer.body
+            );
+            assert_eq!(
+                answer.message(),
+                expected,
+                "case {case:?}: expected {expected:?}, got {:?}",
+                answer.message()
+            );
+        }
+    }
+}
+
+/// `TagStatus` as the clause states it. The type declares `[TAGGED, UNTAGGED, ANY]`
+/// (`smithy_query(query="shape", shape="TagStatus")`), and the stated set is NOT that
+/// order: the admissible values are held in a hash table keyed on each value's own text
+/// and the table is what is enumerated, so `UNTAGGED` is read from an earlier bucket than
+/// the two that share one, and of those two the later-declared `ANY` comes first.
+const TAG_STATUS_SET: &str = "[UNTAGGED, ANY, TAGGED]";
+
+/// The same for `ImageStatusFilter`, declared `[ACTIVE, ARCHIVED, ACTIVATING, ANY]`.
+const IMAGE_STATUS_SET: &str = "[ARCHIVED, ACTIVE, ANY, ACTIVATING]";
+
+/// The same for `ImageTagMutability`, declared
+/// `[MUTABLE, IMMUTABLE, IMMUTABLE_WITH_EXCLUSION, MUTABLE_WITH_EXCLUSION]`.
+const IMAGE_TAG_MUTABILITY_SET: &str =
+    "[IMMUTABLE, MUTABLE, MUTABLE_WITH_EXCLUSION, IMMUTABLE_WITH_EXCLUSION]";
+
+/// The same for `TargetStorageClass`, declared `[STANDARD, ARCHIVE]`.
+const TARGET_STORAGE_CLASS_SET: &str = "[ARCHIVE, STANDARD]";
+
+/// The same for `EncryptionType`, declared `[AES256, KMS, KMS_DSSE]`.
+const ENCRYPTION_TYPE_SET: &str = "[AES256, KMS_DSSE, KMS]";
+
+/// A value outside an enumerated type states the type's WHOLE value set, in the order the
+/// values' own hash table is walked — not the order the model declares them in.
+///
+/// The rows differ along what the rule generalises over: which enumerated type the member
+/// targets (five of them, of two, three and four values, one of which has two values
+/// sharing a bucket), where the member sits (a top-level member, a member of a nested
+/// structure), and which operation carries it — the order belongs to the TYPE, so the same
+/// type states the same set wherever it is carried. The recorded instance is
+/// `filter.tagStatus` on `ListImages`.
+#[tokio::test]
+async fn a_value_outside_an_enumerated_type_states_the_set_in_the_stated_order() {
+    // (case, operation, request, the parameter the clause names, the value set it states)
+    let rows: Vec<(&str, &str, Value, &str, &str)> = vec![
+        (
+            // The recorded instance.
+            "a nested filter's tag status",
+            "ListImages",
+            json!({"repositoryName": "well-formed", "filter": {"tagStatus": "NOT_A_STATUS"}}),
+            "filter.tagStatus",
+            TAG_STATUS_SET,
+        ),
+        (
+            // The same type through another operation, which is what makes the order the
+            // type's rather than one operation's.
+            "the same type on another operation",
+            "DescribeImages",
+            json!({"repositoryName": "well-formed", "filter": {"tagStatus": "SOMETIMES"}}),
+            "filter.tagStatus",
+            TAG_STATUS_SET,
+        ),
+        (
+            "a four-value type in the same filter",
+            "ListImages",
+            json!({"repositoryName": "well-formed", "filter": {"imageStatus": "FROZEN"}}),
+            "filter.imageStatus",
+            IMAGE_STATUS_SET,
+        ),
+        (
+            "a top-level member's four-value type",
+            "CreateRepository",
+            json!({"repositoryName": "well-formed", "imageTagMutability": "SOMETIMES"}),
+            "imageTagMutability",
+            IMAGE_TAG_MUTABILITY_SET,
+        ),
+        (
+            "a top-level member's two-value type",
+            "UpdateImageStorageClass",
+            json!({
+                "repositoryName": "well-formed",
+                "imageId": {"imageTag": "v1"},
+                "targetStorageClass": "GLACIER",
+            }),
+            "targetStorageClass",
+            TARGET_STORAGE_CLASS_SET,
+        ),
+        (
+            "a nested structure's three-value type",
+            "CreateRepository",
+            json!({
+                "repositoryName": "well-formed",
+                "encryptionConfiguration": {"encryptionType": "ROT13"},
+            }),
+            "encryptionConfiguration.encryptionType",
+            ENCRYPTION_TYPE_SET,
+        ),
+    ];
+
+    let router = emulator();
+    for (case, operation, request, parameter, set) in rows {
+        let constraint = format!("Member must satisfy enum value set: {set}");
+        assert_clause(&router, case, operation, &request, parameter, &constraint).await;
+    }
+}
+
+/// `RegistryId`'s expression as ECR publishes it: `smithy_query(query="shape",
+/// shape="RegistryId")` gives `^[0-9]{12}$`, and ECR states it without the anchors that
+/// make the match total.
+const REGISTRY_ID_EXPRESSION: &str = "[0-9]{12}";
+
+/// The expression ECR states for the account-id class is stated BARE, with nothing around
+/// it inside the clause's own quotes, while the repository-name classes' expression is
+/// delimited — the difference belongs to the value class and not to the member, the
+/// operation or the constraint.
+///
+/// The rows differ along what the rule generalises over: how the account id is malformed
+/// (too few digits, too many, a letter among them, a separator, no characters at all) and
+/// which operation carries the parameter, crossed against the two classes whose expression
+/// IS delimited. The recorded instance is an account id on `DescribeRepositories`.
+#[tokio::test]
+async fn the_account_id_expression_is_stated_bare_and_a_repository_name_delimited() {
+    // Every value here fails `^[0-9]{12}$` and nothing else in its request does.
+    let malformed: Vec<(&str, &str)> = vec![
+        ("eleven digits", "00000000000"),
+        ("thirteen digits", "0000000000000"),
+        ("twelve characters, one a letter", "00000000000a"),
+        ("twelve digits with a separator", "0000-00000000"),
+        ("no characters at all", ""),
+    ];
+    // Operations carrying `registryId`, and what else their request needs.
+    let carriers: Vec<(&str, Value)> = vec![
+        // The recorded instance's operation.
+        ("DescribeRepositories", json!({})),
+        ("CreateRepository", json!({"repositoryName": "well-formed"})),
+        ("ListImages", json!({"repositoryName": "well-formed"})),
+        ("DescribeImages", json!({"repositoryName": "well-formed"})),
+        ("DeleteRepository", json!({"repositoryName": "well-formed"})),
+    ];
+
+    let router = emulator();
+    let bare = format!("must satisfy regular expression {REGISTRY_ID_EXPRESSION}");
+    for (shape, registry_id) in &malformed {
+        for (operation, extra) in &carriers {
+            let case = format!("{shape} on {operation}");
+            let mut request = extra.clone();
+            request["registryId"] = json!(registry_id);
+            assert_clause(&router, &case, operation, &request, "registryId", &bare).await;
+        }
+    }
+
+    // The other half of the rule: the classes whose expression ECR DOES delimit, so the
+    // bare form above is the account-id class's and not every parameter's.
+    let delimited: Vec<(&str, &str, Value, &str, String)> = vec![
+        (
+            "a repository name",
+            "CreateRepository",
+            json!({"repositoryName": "Invalid_Name"}),
+            "repositoryName",
+            format!("must satisfy regular expression '{REPOSITORY_NAME_EXPRESSION}'"),
+        ),
+        (
+            "a pull through cache rule prefix",
+            "DeletePullThroughCacheRule",
+            json!({"ecrRepositoryPrefix": "Not A Prefix"}),
+            "ecrRepositoryPrefix",
+            format!("must satisfy regular expression '{PREFIX_EXPRESSION}'"),
+        ),
+    ];
+    for (case, operation, request, parameter, constraint) in delimited {
+        assert_clause(&router, case, operation, &request, parameter, &constraint).await;
+    }
+}
+
+/// A value of a LIST this registry acts on no value of is refused at the LIST member, with
+/// what each element must satisfy nested in the collection form — while a list ECR
+/// resolves the values of is refused one value at a time, under the singular of its name.
+///
+/// `registryIds` is the list in question: `smithy_query(query="operation",
+/// operation="GetAuthorizationToken")` shows the member `@deprecated` ("This field is
+/// deprecated. The returned authorization token can be used to access any Amazon ECR
+/// registry that the IAM principal has access to, specifying a registry ID doesn't change
+/// the permissions scope of the authorization token."), so ECR reads no value out of it.
+///
+/// The rows differ along what the rule generalises over: how the element is malformed, how
+/// many elements the list carries and WHICH of them offends (the first, the second, the
+/// last of the ten the `@length(1..10)` admits), and whether the constraint the request
+/// broke is an element's or the COLLECTION's own — crossed against the list whose values
+/// ECR does resolve. The recorded instance is a single malformed element.
+#[tokio::test]
+async fn a_list_this_registry_reads_no_value_of_is_refused_at_the_list_member() {
+    /// One well-formed account id, so a row can place the offending element anywhere.
+    const WELL_FORMED: &str = "000000000000";
+
+    let nested = format!(
+        "Member must satisfy constraint: [Member must satisfy regular expression pattern: \
+         {REGISTRY_ID_EXPRESSION}]"
+    );
+    let ten_with_last_malformed: Vec<String> = (0..9)
+        .map(|_| WELL_FORMED.to_string())
+        .chain(std::iter::once("00000000000".to_string()))
+        .collect();
+
+    // (case, the registryIds sent, the parameter the clause names, the constraint)
+    let rows: Vec<(&str, Value, &str, String)> = vec![
+        (
+            // The recorded instance.
+            "one element of too few digits",
+            json!(["00000000000"]),
+            "registryIds",
+            nested.clone(),
+        ),
+        (
+            "one element carrying a letter",
+            json!(["01234567890a"]),
+            "registryIds",
+            nested.clone(),
+        ),
+        (
+            "the SECOND element, so no position is in the clause",
+            json!([WELL_FORMED, "0000000000000"]),
+            "registryIds",
+            nested.clone(),
+        ),
+        (
+            "the last of the ten the list admits",
+            json!(ten_with_last_malformed),
+            "registryIds",
+            nested.clone(),
+        ),
+        (
+            // The COLLECTION's own constraint, which no element broke: stated as the
+            // collection's own requirement, with nothing nested.
+            "the empty list, below the list's own minimum",
+            json!([]),
+            "registryIds",
+            "Member must have length greater than or equal to 1".to_string(),
+        ),
+        (
+            "eleven elements, past the list's own maximum",
+            json!((0..11).map(|_| WELL_FORMED).collect::<Vec<&str>>()),
+            "registryIds",
+            "Member must have length less than or equal to 10".to_string(),
+        ),
+    ];
+
+    let router = emulator();
+    for (case, registry_ids, parameter, constraint) in rows {
+        let request = json!({"registryIds": registry_ids});
+        assert_clause(
+            &router,
+            case,
+            "GetAuthorizationToken",
+            &request,
+            parameter,
+            &constraint,
+        )
+        .await;
+    }
+
+    // The other half of the rule: a list whose values this registry RESOLVES is refused
+    // one value at a time, so its clause names that one value's parameter — the singular
+    // of the list's name — and nests nothing.
+    assert_clause(
+        &router,
+        "an element of a list the registry resolves",
+        "DescribeRepositories",
+        &json!({"repositoryNames": ["well-formed", "ALSO-Upper"]}),
+        "repositoryName",
+        &format!("must satisfy regular expression '{REPOSITORY_NAME_EXPRESSION}'"),
+    )
+    .await;
 }

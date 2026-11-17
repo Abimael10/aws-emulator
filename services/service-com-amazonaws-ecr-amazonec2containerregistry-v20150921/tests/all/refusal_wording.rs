@@ -12,7 +12,9 @@
 //! 1. a refusal about ONE UPLOAD states the upload id, the repository it was opened
 //!    against and the registry, then the verdict;
 //! 2. a resource HELD INSIDE a repository that the registry does not hold is reported
-//!    `within` that repository, whatever kind of resource it is;
+//!    `within` that repository, whatever kind of resource it is — and for an IMAGE the
+//!    `imageId` it states is the identifier the failed resolution leaves, not the entry
+//!    the request sent;
 //! 3. a continuation token this listing never minted is stated in the
 //!    parameter-and-constraint form, naming the parameter's API label, and does not echo
 //!    the token;
@@ -46,9 +48,21 @@ const INVALID_PARAMETER: &str = "InvalidParameterException";
 /// this registry never issued, so it passes the boundary and resolves to nothing.
 const UNISSUED_UPLOAD_ID: &str = "3b9f1c7a-6d42-4e18-8b05-7c2a9f4d6e13";
 
-/// A well-formed `LayerDigest` nothing was ever pushed under.
+/// A well-formed `LayerDigest` nothing was ever pushed under. Not the all-zero digest:
+/// that is the digest a refusal renders for an identifier carrying NONE
+/// ([`UNSET_IMAGE_DIGEST`]), so a row sending it would not show whose digest was echoed.
 const UNSTORED_DIGEST: &str =
+    "sha256:1c7f3e5a9b2d48061f3a7c5e9d2b4860af13c7e592b4d80617a3c5e9d2b48061";
+
+/// The digest a refusal renders for an identifier that carries NONE: `sha256:` followed
+/// by 64 zero hex digits, the width a `sha256` digest has.
+const UNSET_IMAGE_DIGEST: &str =
     "sha256:0000000000000000000000000000000000000000000000000000000000000000";
+
+/// A second well-formed digest nothing was pushed under, so the digest a refusal states
+/// cannot be one value this suite happens to use everywhere.
+const OTHER_UNSTORED_DIGEST: &str =
+    "sha256:9e4d2c6b8a0f13577e4d2c6b8a0f1357ce9b4d2a6f80135779e4d2c6b8a0f135";
 
 // ---------------------------------------------------------------------------
 // The sentences under test, written out literally — the point of these suites is that the
@@ -234,6 +248,9 @@ async fn an_upload_refusal_names_the_upload_the_repository_and_the_registry() {
 /// image) and so the operation asked, how it was addressed (a digest, a tag, both), and
 /// whether the resource exists elsewhere in the registry. The reported instance is the
 /// first row.
+///
+/// What an IMAGE refusal names the identifier as is the next suite's rule: the identifier
+/// the failed resolution leaves, not the request's entry.
 #[tokio::test]
 async fn a_resource_missing_inside_a_repository_is_reported_within_it() {
     let router = emulator();
@@ -275,7 +292,7 @@ async fn a_resource_missing_inside_a_repository_is_reported_within_it() {
             "DescribeImages",
             json!({"repositoryName": "within-mine", "imageIds": [{"imageTag": "absent"}]}),
             "ImageNotFoundException",
-            "image with imageId {imageDigest:'null', imageTag:'absent'}".to_string(),
+            format!("image with imageId {{imageDigest:'{UNSET_IMAGE_DIGEST}', imageTag:'null'}}"),
         ),
         (
             "an image addressed by both",
@@ -285,9 +302,7 @@ async fn a_resource_missing_inside_a_repository_is_reported_within_it() {
                 "imageIds": [{"imageDigest": UNSTORED_DIGEST, "imageTag": "absent"}],
             }),
             "ImageNotFoundException",
-            format!(
-                "image with imageId {{imageDigest:'{UNSTORED_DIGEST}', imageTag:'absent'}}"
-            ),
+            format!("image with imageId {{imageDigest:'{UNSTORED_DIGEST}', imageTag:'null'}}"),
         ),
     ];
 
@@ -297,10 +312,135 @@ async fn a_resource_missing_inside_a_repository_is_reported_within_it() {
     }
 }
 
+/// Every operation that refuses an identifier naming no stored image, with the request it
+/// takes for the identifier `id`.
+///
+/// The parameter is `imageId` everywhere but `DescribeImages`, whose parameter is the LIST
+/// `imageIds`, and `UpdateImageStorageClass` also carries the storage class it would move
+/// the image to (`smithy_query(query="operation",
+/// operation="DescribeImages,DescribeImageScanFindings,StartImageScan,DescribeImageReplicationStatus,DescribeImageSigningStatus,UpdateImageStorageClass")`).
+fn image_lookups(repository: &str, id: &Value) -> Vec<(&'static str, Value)> {
+    vec![
+        (
+            "DescribeImages",
+            json!({"repositoryName": repository, "imageIds": [id.clone()]}),
+        ),
+        (
+            "DescribeImageScanFindings",
+            json!({"repositoryName": repository, "imageId": id.clone()}),
+        ),
+        (
+            "DescribeImageReplicationStatus",
+            json!({"repositoryName": repository, "imageId": id.clone()}),
+        ),
+        (
+            "DescribeImageSigningStatus",
+            json!({"repositoryName": repository, "imageId": id.clone()}),
+        ),
+        (
+            "StartImageScan",
+            json!({"repositoryName": repository, "imageId": id.clone()}),
+        ),
+        (
+            "UpdateImageStorageClass",
+            json!({
+                "repositoryName": repository,
+                "imageId": id.clone(),
+                "targetStorageClass": "ARCHIVE",
+            }),
+        ),
+    ]
+}
+
+/// The `imageId` an image-not-found refusal states is the identifier the FAILED RESOLUTION
+/// leaves, not the entry the request sent: a tag that matched no image is cleared and
+/// reads `null`, and an identifier the request gave no digest reads the unset `sha256`
+/// digest.
+///
+/// The rows differ along what the rule generalises over: which members the identifier
+/// carries (a tag alone, a digest alone, both), the shape of the tag (the shortest and the
+/// longest `ImageTag`'s `@length(1..300)` admits, and one carrying separators), and the
+/// digest's own value — crossed with every operation that resolves an identifier, because
+/// the rule belongs to the resolution rather than to one operation. The reported instance
+/// is a tag-only lookup on `DescribeImages`.
+#[tokio::test]
+async fn an_image_refusal_states_the_identifier_the_resolution_leaves() {
+    // `ImageTag` is `@length(1..300)` (`smithy_query(query="shape", shape="ImageTag")`),
+    // so a tag of one character and one of 300 are both well formed and reach the lookup.
+    let longest_tag = "t".repeat(300);
+
+    // (case, the identifier sent, the digest the refusal must state, the tag it must state)
+    let rows: Vec<(&str, Value, &str, &str)> = vec![
+        // The reported instance: a tag-only lookup in a repository holding no image.
+        (
+            "a tag nothing carries",
+            json!({"imageTag": "latest"}),
+            UNSET_IMAGE_DIGEST,
+            "null",
+        ),
+        (
+            "the shortest tag the model admits",
+            json!({"imageTag": "a"}),
+            UNSET_IMAGE_DIGEST,
+            "null",
+        ),
+        (
+            "the longest tag the model admits",
+            json!({"imageTag": longest_tag.clone()}),
+            UNSET_IMAGE_DIGEST,
+            "null",
+        ),
+        (
+            "a tag carrying separators",
+            json!({"imageTag": "release-1.2_3"}),
+            UNSET_IMAGE_DIGEST,
+            "null",
+        ),
+        (
+            "a digest nothing was pushed under",
+            json!({"imageDigest": UNSTORED_DIGEST}),
+            UNSTORED_DIGEST,
+            "null",
+        ),
+        (
+            "another digest nothing was pushed under",
+            json!({"imageDigest": OTHER_UNSTORED_DIGEST}),
+            OTHER_UNSTORED_DIGEST,
+            "null",
+        ),
+        (
+            "a digest and a tag, neither of which resolves",
+            json!({"imageDigest": UNSTORED_DIGEST, "imageTag": "absent"}),
+            UNSTORED_DIGEST,
+            "null",
+        ),
+    ];
+
+    let router = emulator();
+    given_repository(&router, "the empty repository", "resolution-empty").await;
+    for (case, id, digest, tag) in rows {
+        for (operation, request) in image_lookups("resolution-empty", &id) {
+            let case = format!("{case} on {operation}");
+            let expected = not_within_sentence(
+                &format!("image with imageId {{imageDigest:'{digest}', imageTag:'{tag}'}}"),
+                "resolution-empty",
+            );
+            assert_refusal(
+                &router,
+                &case,
+                operation,
+                &request,
+                "ImageNotFoundException",
+                &expected,
+            )
+            .await;
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // 3. A continuation token no listing minted
 // ---------------------------------------------------------------------------
-
 /// The constraint a token this service never minted fails: one phrase for the class,
 /// stating no detail of how a token is read.
 const NEXT_TOKEN_CONSTRAINT: &str = "Invalid next token provided";

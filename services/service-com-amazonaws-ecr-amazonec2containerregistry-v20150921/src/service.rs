@@ -156,6 +156,10 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
 /// Only a `@pattern` is worded differently by the two: every other constraint is "Member
 /// must …" either way, so only the parameter label can differ for it.
 ///
+/// One parameter is named by neither: a LIST ECR reads no value out of
+/// ([`element_constraint`]) has no one value to refuse, so its clause names the list
+/// itself and nests what each element must satisfy.
+///
 /// A violation kind neither wording knows (the enum is `#[non_exhaustive]`) keeps the
 /// framework's own clause, which states the same two facts in its own words.
 fn clause(violation: &Violation) -> String {
@@ -167,6 +171,11 @@ fn clause(violation: &Violation) -> String {
         if let Some(prose) = arn_constraint(&member, pattern, violation.value.as_deref()) {
             return stated(&member, &prose);
         }
+    }
+    // A list ECR acts on no value of is refused as a WHOLE, so this is settled before the
+    // position of the member is looked at too; see [`element_constraint`].
+    if let Some((collection, requirement)) = element_constraint(violation) {
+        return stated(collection, &requirement);
     }
     let by_ecr = caught_by_ecr(violation);
     let Some(requirement) = requirement(&violation.kind, by_ecr) else {
@@ -224,24 +233,108 @@ fn requirement(kind: &ViolationKind, by_ecr: bool) -> Option<String> {
         // The one requirement NOT worded "Member must …": a parameter ECR validates
         // itself has its expression stated the way ECR publishes it. Deliberate — do not
         // "align" it with the arms around it.
-        ViolationKind::Pattern(pattern) if by_ecr => {
-            format!(
-                "must satisfy regular expression '{}'",
-                as_stated(policed(pattern))
-            )
-        }
-        ViolationKind::Pattern(pattern) => {
-            format!(
-                "Member must satisfy regular expression pattern: {}",
-                policed(pattern)
-            )
-        }
+        ViolationKind::Pattern(pattern) if by_ecr => stated_expression(pattern),
+        ViolationKind::Pattern(pattern) => pattern_requirement(policed(pattern)),
+        // The value set is stated in the order the admissible values' own HASH TABLE is
+        // walked rather than the order the model declares them in: the front door this
+        // service answers behind holds them keyed on each value's own text and enumerates
+        // that table. The order follows from the values themselves
+        // (`::service_common::validation_message::hashed_enum_order`, the tree's one
+        // derivation of it), so it belongs to the enumerated TYPE: every enum of this
+        // model is stated through it and none is written out anywhere.
         ViolationKind::EnumValue(allowed) => {
-            format!("Member must satisfy enum value set: [{}]", allowed.join(", "))
+            format!(
+                "Member must satisfy enum value set: [{}]",
+                ::service_common::validation_message::hashed_enum_order(allowed).join(", ")
+            )
         }
         ViolationKind::UniqueItems => "Member must have unique values".to_string(),
         _ => return None,
     })
+}
+
+/// The requirement a clause states for a `@pattern` in the `Member must …` wording, over
+/// `expression`: the one spelling of that sentence, so the clause the model-driven walk
+/// states and the one nested inside a collection's ([`element_constraint`]) cannot word it
+/// differently.
+fn pattern_requirement(expression: &str) -> String {
+    format!("Member must satisfy regular expression pattern: {expression}")
+}
+
+/// The expressions ECR states BARE — the expression alone inside the clause's own quotes,
+/// with no inner quoting.
+///
+/// ECR's own validation states the expression it polices for a value class
+/// ([`as_stated`]), and whether that statement DELIMITS the expression is a property of
+/// the value CLASS rather than of the member, the operation or the constraint: the
+/// recorded refusals show the repository-name classes' expression delimited in single
+/// quotes (`… 'must satisfy regular expression '[a-z0-9]+…''`) and the ACCOUNT-ID class's
+/// — the twelve digits a registry id is — stated with nothing around it. Keyed on the
+/// expression, exactly as [`policed`] is, so it holds for every member targeting that
+/// shape: `registryId` is a parameter most operations of this service carry, and the
+/// clause reads the same on each.
+///
+/// `smithy_query(query="shape", shape="RegistryId")` gives `^[0-9]{12}$`, which
+/// [`as_stated`] publishes as the expression listed here.
+const EXPRESSIONS_STATED_BARE: [&str; 1] = ["[0-9]{12}"];
+
+/// The requirement ECR'S OWN validation states for a `@pattern`: the expression as ECR
+/// publishes it ([`as_stated`]), delimited unless the value class is one ECR states bare
+/// ([`EXPRESSIONS_STATED_BARE`]).
+fn stated_expression(pattern: &str) -> String {
+    let expression = as_stated(policed(pattern));
+    if EXPRESSIONS_STATED_BARE.contains(&expression.as_str()) {
+        return format!("must satisfy regular expression {expression}");
+    }
+    format!("must satisfy regular expression '{expression}'")
+}
+
+/// The list members this model marks `@deprecated`, which is ECR saying it acts on no
+/// value of them.
+///
+/// `smithy_query(query="operation", operation="GetAuthorizationToken")` shows
+/// `registryIds` carrying `@deprecated` — "This field is deprecated. The returned
+/// authorization token can be used to access any Amazon ECR registry that the IAM
+/// principal has access to, specifying a registry ID doesn't change the permissions scope
+/// of the authorization token." — and it is the only such list this model declares.
+const LISTS_ECR_ACTS_ON_NO_VALUE_OF: [&str; 1] = ["registryIds"];
+
+/// The clause's two halves for a violation at an ELEMENT of a list ECR acts on no value of
+/// ([`LISTS_ECR_ACTS_ON_NO_VALUE_OF`]): the LIST member, under the plural name it is
+/// declared with, and the element's requirement nested in the collection form
+/// `Member must satisfy constraint: [ … ]`.
+///
+/// Which half of a clause names WHAT follows from what ECR does with the value. A value
+/// ECR resolves to a resource is refused one value at a time, so the clause names that one
+/// value's parameter ([`member_at_fault`], the singular of the collection's name). A list
+/// ECR reads no value out of has no one value to refuse: the LIST is what it checks the
+/// shape of, so the clause names the list and states what each element has to satisfy
+/// inside it.
+///
+/// The nesting is [`::service_common::validation_message::element_set_requirement`], the
+/// tree's one spelling of that wrapper, so this cannot word it differently from the
+/// services that hand the whole refusal to that module. Inside it the requirement is the
+/// element's, in the `Member must …` wording ([`pattern_requirement`]) over the expression
+/// ECR publishes for the value class ([`as_stated`]) — ECR's own validation is still what
+/// caught the value, so the expression is ECR's published one rather than the model's
+/// source text.
+///
+/// `None` for every other violation — one at an element of a list ECR DOES resolve, one on
+/// a collection ITSELF (its `@length`, its `@uniqueItems`), one on a scalar member — each
+/// of which keeps its own clause.
+fn element_constraint(violation: &Violation) -> Option<(&str, String)> {
+    let collection = ::service_common::validation::list_of_element(&violation.path)?;
+    if !LISTS_ECR_ACTS_ON_NO_VALUE_OF.contains(&collection) {
+        return None;
+    }
+    let requirement = match &violation.kind {
+        ViolationKind::Pattern(pattern) => pattern_requirement(&as_stated(policed(pattern))),
+        kind => requirement(kind, false)?,
+    };
+    Some((
+        collection,
+        ::service_common::validation_message::element_set_requirement(&[requirement]),
+    ))
 }
 
 /// Whether `path` names a parameter the request CARRIES, which is what ECR validates in

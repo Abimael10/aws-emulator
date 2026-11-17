@@ -557,11 +557,14 @@ async fn a_parameter_ecr_validates_itself_is_stated_as_aws_states_it() {
             format!("must satisfy regular expression '{PREFIX_EXPRESSION}'"),
         ),
         (
-            "an expression with no escape at all",
+            // The expression of the account-id class is stated BARE: whether ECR delimits
+            // the expression it publishes belongs to the value class, so this row and the
+            // repository-name rows above differ in exactly that.
+            "an expression the account-id class states bare",
             "CreateRepository",
             json!({"repositoryName": "well-formed", "registryId": "00000000000"}),
             "registryId",
-            "must satisfy regular expression '[0-9]{12}'".to_string(),
+            "must satisfy regular expression [0-9]{12}".to_string(),
         ),
         (
             "the signing profile of the only rule",

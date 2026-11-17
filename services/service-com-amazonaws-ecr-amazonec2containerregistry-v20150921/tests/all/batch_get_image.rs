@@ -43,6 +43,12 @@ const MANIFEST_UNTYPED: &str = r#"{"schemaVersion":1,"name":"untyped"}"#;
 /// A manifest nothing is ever pushed under, so its digest names no stored image.
 const MANIFEST_NEVER_PUSHED: &str = r#"{"schemaVersion":2,"never":"pushed"}"#;
 
+/// The digest a refusal renders for an identifier that carries NONE: `sha256:` followed
+/// by 64 zero hex digits, the width a `sha256` digest has. Spelled out literally rather
+/// than imported, so a change in how the service renders it fails this suite.
+const UNSET_IMAGE_DIGEST: &str =
+    "sha256:0000000000000000000000000000000000000000000000000000000000000000";
+
 /// One row of the batching table: the case name, the entries the call asks for, the
 /// manifests it must report in `images`, and the codes it must report in `failures`.
 type BatchCase<'a> = (&'a str, Vec<Value>, Vec<&'a str>, Vec<&'a str>);
@@ -512,8 +518,10 @@ async fn accepted_media_types_do_not_change_which_image_resolves() {
 
 /// The identifier resolution is one rule, shared with `DescribeImages`: the difference
 /// is only in how an unresolvable entry is reported. `DescribeImages` refuses the whole
-/// call, and its message names the requested identifier with both members spelled out —
-/// an absent one as `null` — so the rows differ along which members the entry carries.
+/// call, and its message names the identifier the FAILED RESOLUTION leaves — a tag that
+/// matched no image is cleared and reads `null`, a digest the request did not carry reads
+/// as the unset `sha256` digest — so the rows differ along which members the entry carries
+/// and along whether the tag resolved at all.
 #[tokio::test]
 async fn describe_images_refuses_the_same_identifiers_and_names_them() {
     let router = seeded("shared-resolution").await;
@@ -524,7 +532,7 @@ async fn describe_images_refuses_the_same_identifiers_and_names_them() {
         (
             "a tag nothing carries",
             json!({"imageTag": "ghost"}),
-            "imageId {imageDigest:'null', imageTag:'ghost'}".to_string(),
+            format!("imageId {{imageDigest:'{UNSET_IMAGE_DIGEST}', imageTag:'null'}}"),
         ),
         (
             "a digest nothing was pushed under",
@@ -532,6 +540,7 @@ async fn describe_images_refuses_the_same_identifiers_and_names_them() {
             format!("imageId {{imageDigest:'{absent_digest}', imageTag:'null'}}"),
         ),
         (
+            // The tag DID resolve, to another stored image, so nothing cleared it.
             "a stored digest with a tag on another image",
             json!({"imageDigest": docker_digest.clone(), "imageTag": "oci"}),
             format!("imageId {{imageDigest:'{docker_digest}', imageTag:'oci'}}"),

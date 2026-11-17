@@ -37,16 +37,20 @@ const INVALID_PARAMETER: &str = "InvalidParameterException";
 const REPOSITORY_NAME_CLAUSE: &str = r"must satisfy regular expression '[a-z0-9]+((\.|_|__|-+)[a-z0-9]+)*(/[a-z0-9]+((\.|_|__|-+)[a-z0-9]+)*)*'";
 
 /// The same clause for `RegistryId`, whose `@pattern` is `^[0-9]{12}$` (same
-/// `smithy_query` call, `shape="RegistryId"`).
-const REGISTRY_ID_CLAUSE: &str = "must satisfy regular expression '[0-9]{12}'";
+/// `smithy_query` call, `shape="RegistryId"`) — and whose expression ECR states BARE,
+/// with no quoting of its own inside the clause's quotes, where the repository-name
+/// classes' is quoted. Which it is belongs to the value class, not to the member or the
+/// operation.
+const REGISTRY_ID_CLAUSE: &str = "must satisfy regular expression [0-9]{12}";
 
 /// The clause a value outside an enumerated type states: the whole value set the type
-/// declares, in the order it declares them.
+/// declares, in the order the admissible values' own hash table is walked — which is what
+/// the front door enumerates, and is NOT the order the model declares them in.
 ///
 /// `smithy_query(query="shape", shape="ImageTagMutability", model_path="services/service-com-amazonaws-ecr-amazonec2containerregistry-v20150921/smithy-model/com-amazonaws-ecr-amazonec2containerregistry-v20150921.json")`
 /// gives `["MUTABLE", "IMMUTABLE", "IMMUTABLE_WITH_EXCLUSION", "MUTABLE_WITH_EXCLUSION"]`.
 const IMAGE_TAG_MUTABILITY_CLAUSE: &str = "Member must satisfy enum value set: \
-     [MUTABLE, IMMUTABLE, IMMUTABLE_WITH_EXCLUSION, MUTABLE_WITH_EXCLUSION]";
+     [IMMUTABLE, MUTABLE, MUTABLE_WITH_EXCLUSION, IMMUTABLE_WITH_EXCLUSION]";
 
 /// One refusal row: the case name, the operation called, the request, the dotted member
 /// path the answer must name, and the constraint clause it must state.
