@@ -12,12 +12,23 @@
 //! review. The resulting status is persisted, so every later read reports it, and a
 //! record in any other status cannot be submitted at all.
 //!
+//! Two rules about the ANSWER go with it:
+//!
+//! * the instant the answer reports is a timestamp in the form its target timestamp shape
+//!   declares — `DateTimestamp` carries `@timestampFormat("date-time")`, so it is an
+//!   RFC 3339 / ISO 8601 date-time STRING in UTC and never an epoch number;
+//! * a record whose stored status is not `DRAFT` is a precondition on the resource's
+//!   state, so the submission is the modelled `ValidationException` (HTTP 400) worded in
+//!   one sentence whose only variable part is that stored status.
+//!
 //! Every test asserts over a TABLE of inputs, so it holds for a class of requests rather
 //! than for one recorded shape.
 
 use std::sync::Arc;
 use std::time::Duration;
 
+use aws_smithy_types::date_time::Format;
+use aws_smithy_types::DateTime;
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -31,9 +42,13 @@ const AUTHORIZATION: &str = "AWS4-HMAC-SHA256 \
      Credential=AKIDTESTAGENTREGISTRY/20260101/us-west-2/agent-registry/aws4_request, \
      SignedHeaders=host;x-amz-date, Signature=0123456789abcdef";
 
-/// Longer than the service's own asynchronous-transition span, so a transition the clock
-/// owes (a registry becoming `READY`, a record becoming `DRAFT`) has certainly come due.
-const PAST_THE_TRANSITION: Duration = Duration::from_millis(900);
+/// How long a wait for a transition the clock owes (a registry becoming `READY`, a record
+/// becoming `DRAFT`) may take before a test gives up. Generous on purpose: the wait is on
+/// the CONDITION, so a loaded host only polls more times.
+const TRANSITION_DEADLINE: Duration = Duration::from_secs(30);
+
+/// How long a poll loop pauses between two looks at a resource.
+const POLL_INTERVAL: Duration = Duration::from_millis(20);
 
 /// One HTTP answer, reduced to what these tests assert on.
 struct Reply {
@@ -195,8 +210,9 @@ async fn submit_record(router: &MultiServiceRouter, registry_id: &str, record_id
     .await
 }
 
-/// Create a registry with `body` and wait out the creation the clock owes, so it is
-/// `READY`. Returns its registry id.
+/// Create a registry with `body` and wait for the creation the clock owes to come due, so
+/// it is `READY`. The wait is on the CONDITION, never on a fixed span. Returns its
+/// registry id.
 async fn ready_registry(router: &MultiServiceRouter, case: &str, body: Value) -> String {
     let created = create_registry(router, body).await;
     assert_eq!(
@@ -205,15 +221,46 @@ async fn ready_registry(router: &MultiServiceRouter, case: &str, body: Value) ->
         created.status, created.body
     );
     let registry_id = id_of(created.str_field("registryArn")).to_string();
-    tokio::time::sleep(PAST_THE_TRANSITION).await;
-    let got = get_registry(router, &registry_id).await;
-    assert_eq!(
-        got.str_field("status"),
-        "READY",
-        "case {case:?}: a created registry becomes READY, got {:?}",
-        got.body
-    );
-    registry_id
+    let started = std::time::Instant::now();
+    loop {
+        let got = get_registry(router, &registry_id).await;
+        if got.str_field("status") == "READY" {
+            return registry_id;
+        }
+        assert!(
+            started.elapsed() < TRANSITION_DEADLINE,
+            "case {case:?}: a created registry becomes READY, last answer {} {:?}",
+            got.status,
+            got.body
+        );
+        tokio::time::sleep(POLL_INTERVAL).await;
+    }
+}
+
+/// Look at a record until it reports `wanted`, or give up at the deadline. The wait is on
+/// the CONDITION — a transition the clock owes, or a status another call has written —
+/// never on a fixed span.
+async fn record_reaching(
+    router: &MultiServiceRouter,
+    case: &str,
+    registry_id: &str,
+    record_id: &str,
+    wanted: &str,
+) {
+    let started = std::time::Instant::now();
+    loop {
+        let got = get_record(router, registry_id, record_id).await;
+        if got.str_field("status") == wanted {
+            return;
+        }
+        assert!(
+            started.elapsed() < TRANSITION_DEADLINE,
+            "case {case:?}: the record never reached {wanted}, last answer {} {:?}",
+            got.status,
+            got.body
+        );
+        tokio::time::sleep(POLL_INTERVAL).await;
+    }
 }
 
 /// A `descriptors` value per `RecordType`, so each row of a record table carries a
@@ -235,8 +282,8 @@ fn descriptors_for(record_type: &str) -> Value {
     }
 }
 
-/// Create a record of `record_type` named `name` and wait out the creation the clock
-/// owes, so it is `DRAFT`. Returns its record id.
+/// Create a record of `record_type` named `name` and wait for the creation the clock owes
+/// to come due, so it is `DRAFT`. Returns its record id.
 async fn draft_record(
     router: &MultiServiceRouter,
     case: &str,
@@ -260,15 +307,29 @@ async fn draft_record(
         created.status, created.body
     );
     let record_id = id_of(created.str_field("recordArn")).to_string();
-    tokio::time::sleep(PAST_THE_TRANSITION).await;
-    let got = get_record(router, registry_id, &record_id).await;
-    assert_eq!(
-        got.str_field("status"),
-        "DRAFT",
-        "case {case:?}: a created record becomes DRAFT, got {:?}",
-        got.body
-    );
+    record_reaching(router, case, registry_id, &record_id, "DRAFT").await;
     record_id
+}
+
+/// Move a record to another status through the registry's curation workflow, so a test can
+/// address a record this service's own operations put in a status other than `DRAFT`.
+async fn update_status(
+    router: &MultiServiceRouter,
+    registry_id: &str,
+    record_id: &str,
+    body: Value,
+) -> Reply {
+    call(
+        router,
+        "PATCH",
+        &format!(
+            "/registries/{}/records/{}/status",
+            encode_label(registry_id),
+            encode_label(record_id)
+        ),
+        Some(body),
+    )
+    .await
 }
 
 /// The approval configurations a registry can carry, each with the status its registry
@@ -736,4 +797,227 @@ async fn a_record_held_by_a_registry_stays_submittable_because_that_registry_is_
         "case {case:?}: the message must name the record, got {:?}",
         refused.message()
     );
+}
+
+/// Whether `text` is the `date-time` form Smithy declares — an RFC 3339 instant in UTC,
+/// `YYYY-MM-DDTHH:MM:SS[.fraction]Z`. Written out rather than delegated so the SHAPE of
+/// the text is asserted and not merely that some parser accepted it.
+fn is_utc_date_time_text(text: &str) -> bool {
+    let Some(civil) = text.strip_suffix('Z') else {
+        return false;
+    };
+    let Some((date, time)) = civil.split_once('T') else {
+        return false;
+    };
+    let date_fields: Vec<&str> = date.split('-').collect();
+    if date_fields.len() != 3 {
+        return false;
+    }
+    for (field, width) in date_fields.iter().zip([4, 2, 2]) {
+        if field.len() != width || !field.bytes().all(|byte| byte.is_ascii_digit()) {
+            return false;
+        }
+    }
+    let (clock, fraction) = match time.split_once('.') {
+        Some((clock, fraction)) => (clock, Some(fraction)),
+        None => (time, None),
+    };
+    let clock_fields: Vec<&str> = clock.split(':').collect();
+    if clock_fields.len() != 3 {
+        return false;
+    }
+    for field in &clock_fields {
+        if field.len() != 2 || !field.bytes().all(|byte| byte.is_ascii_digit()) {
+            return false;
+        }
+    }
+    match fraction {
+        Some(digits) => !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit()),
+        None => true,
+    }
+}
+
+/// The instant a reported timestamp names, asserting the wire form on the way: the member
+/// is a STRING in the UTC date-time form, a client's own date-time parser reads it, and
+/// re-rendering what was read gives the same text back.
+fn date_time_instant(case: &str, path: &str, value: &Value) -> f64 {
+    let text = match value {
+        Value::String(text) => text.clone(),
+        other => {
+            panic!("case {case:?}: {path} must be an RFC 3339 date-time string, got {other:?}")
+        }
+    };
+    assert!(
+        is_utc_date_time_text(&text),
+        "case {case:?}: {path} must be YYYY-MM-DDTHH:MM:SS[.fraction]Z, got {text:?}"
+    );
+    let parsed = match DateTime::from_str(&text, Format::DateTime) {
+        Ok(parsed) => parsed,
+        Err(error) => {
+            panic!("case {case:?}: {path} must parse as a date-time, got {text:?} ({error})")
+        }
+    };
+    let rendered = parsed.fmt(Format::DateTime).ok();
+    assert_eq!(
+        rendered.as_deref(),
+        Some(text.as_str()),
+        "case {case:?}: {path} must survive a date-time round trip, got {rendered:?} from \
+         {text:?}"
+    );
+    parsed.as_secs_f64()
+}
+
+#[tokio::test]
+async fn the_answer_to_a_submission_reports_updated_at_as_a_date_time_string() {
+    let router = router();
+
+    // Rows differ along the registry's approval configuration (so the submitted record
+    // lands in each status a submission can produce) and along the record's own type (so
+    // each row carries a descriptor of a different shape): the WIRE FORM of the instant
+    // cannot depend on either.
+    let record_types = ["MCP", "AGENT", "SKILL", "GATEWAY"];
+    for (index, (case, registry_body, expected_status)) in
+        approval_configuration_table().into_iter().enumerate()
+    {
+        let mut registry_body = registry_body;
+        registry_body["name"] = json!(format!("submit-date-time-{index}"));
+        let record_type = record_types[index % record_types.len()];
+        let registry_id = ready_registry(&router, case, registry_body).await;
+        let record_id =
+            draft_record(&router, case, &registry_id, "date.time.probe", record_type).await;
+
+        let before = get_record(&router, &registry_id, &record_id).await;
+        let created = date_time_instant(case, "$.createdAt of the record", &before.body["createdAt"]);
+
+        let submitted = submit_record(&router, &registry_id, &record_id).await;
+        assert_eq!(
+            (submitted.status, submitted.str_field("status")),
+            (202, expected_status),
+            "case {case:?}: a submission answers 202 with the status the registry decides, \
+             got {} {:?}",
+            submitted.status,
+            submitted.body
+        );
+        let submitted_at =
+            date_time_instant(case, "$.updatedAt of the submission", &submitted.body["updatedAt"]);
+        assert!(
+            submitted_at >= created,
+            "case {case:?}: the submission's updatedAt is not before the record was created, \
+             got {submitted_at} against {created}"
+        );
+
+        // The instant the submission answered is the one every later read reports, in the
+        // same form.
+        let after = get_record(&router, &registry_id, &record_id).await;
+        assert_eq!(
+            after.body["updatedAt"], submitted.body["updatedAt"],
+            "case {case:?}: GetRegistryRecord reports the instant the submission answered, \
+             got {:?} against {:?}",
+            after.body["updatedAt"], submitted.body["updatedAt"]
+        );
+        date_time_instant(case, "$.updatedAt of the read-back record", &after.body["updatedAt"]);
+    }
+}
+
+/// A `READY` registry holding one record in `start_status`, reached through this service's
+/// own operations: a submission enters the workflow (auto-approved where the registry's
+/// configuration says so), and the curation steps the lifecycle allows carry the record the
+/// rest of the way. Returns (registryId, recordId).
+async fn record_in_status(
+    router: &MultiServiceRouter,
+    case: &str,
+    index: usize,
+    start_status: &str,
+) -> (String, String) {
+    // A submission is auto-approved where the start status is the one past review, so the
+    // record gets there without a curation step the lifecycle would refuse.
+    let mut registry_body = json!({ "name": format!("submit-refusal-{index}") });
+    if start_status == "APPROVED" {
+        registry_body["approvalConfiguration"] = json!({ "autoApprovalRules": ["APPROVE_ALL"] });
+    }
+    let registry_id = ready_registry(router, case, registry_body).await;
+    let record_id = draft_record(router, case, &registry_id, "refusal.probe", "CUSTOM").await;
+    if start_status == "DRAFT" {
+        return (registry_id, record_id);
+    }
+
+    // Retirement is reached from the record's own DRAFT status, so a retired record never
+    // entered the approval workflow at all; every other status is past a submission.
+    if start_status != "DEPRECATED" {
+        let submitted = submit_record(router, &registry_id, &record_id).await;
+        assert_eq!(
+            submitted.status, 202,
+            "case {case:?}: staging needs the submission to answer 202, got {} {:?}",
+            submitted.status, submitted.body
+        );
+    }
+    let entered = get_record(router, &registry_id, &record_id).await;
+    if entered.str_field("status") != start_status {
+        let moved = update_status(
+            router,
+            &registry_id,
+            &record_id,
+            json!({ "status": start_status, "statusReason": "staged by the suite" }),
+        )
+        .await;
+        assert_eq!(
+            moved.status, 202,
+            "case {case:?}: staging the record in {start_status} must answer 202, got {} {:?}",
+            moved.status, moved.body
+        );
+    }
+    record_reaching(router, case, &registry_id, &record_id, start_status).await;
+    (registry_id, record_id)
+}
+
+#[tokio::test]
+async fn a_record_in_any_status_other_than_draft_is_refused_with_this_operations_own_sentence() {
+    let router = router();
+
+    // Rows span the statuses other than DRAFT a stored record can be addressed in: the two
+    // a submission itself produces, the one a curator's rejection produces, and the
+    // lifecycle's terminal status. (`CREATING` — and with it the class of statuses this
+    // service reaches only while its own asynchronous work is in flight — is the first row
+    // of `a_record_that_is_not_draft_cannot_be_submitted` above.) The values come from
+    // `RegistryRecordStatus`' own catalogue (`smithy_query(query="shape",
+    // shape="RegistryRecordStatus")`: DRAFT, PENDING_APPROVAL, APPROVED, REJECTED,
+    // DEPRECATED, CREATING, UPDATING, CREATE_FAILED, UPDATE_FAILED).
+    let rows: [(&str, &str); 4] = [
+        ("a record waiting for a curator", "PENDING_APPROVAL"),
+        ("a record its registry approved on submission", "APPROVED"),
+        ("a record a curator turned down", "REJECTED"),
+        ("a retired record", "DEPRECATED"),
+    ];
+
+    for (index, (case, status)) in rows.into_iter().enumerate() {
+        let (registry_id, record_id) = record_in_status(&router, case, index, status).await;
+        let before = get_record(&router, &registry_id, &record_id).await;
+
+        let refused = submit_record(&router, &registry_id, &record_id).await;
+        assert_eq!(
+            (
+                refused.status,
+                refused.error_code.as_deref(),
+                refused.message()
+            ),
+            (
+                400,
+                Some("ValidationException"),
+                format!("Cannot submit the record for approval in current status: {status}")
+            ),
+            "case {case:?}: a record in {status} is refused with the modelled 400 and this \
+             operation's own sentence, whose only variable part is that status, got {} {:?}",
+            refused.status,
+            refused.body
+        );
+
+        // The refusal wrote nothing: the record is still where the workflow left it.
+        let after = get_record(&router, &registry_id, &record_id).await;
+        assert_eq!(
+            (after.str_field("status"), &after.body["updatedAt"]),
+            (status, &before.body["updatedAt"]),
+            "case {case:?}: a refused submission changes nothing, got {:?}",
+            after.body
+        );
+    }
 }

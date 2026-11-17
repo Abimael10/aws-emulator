@@ -304,8 +304,12 @@ pub fn invalid_status_transition_message(current: &str, target: &str) -> String 
 }
 
 /// How this service refuses any later change to a record in a terminal status: the
-/// record is retired, so a submission, an edit and a status change all state this. The one
+/// record is retired, so an edit and a status change both state this. The one
 /// variable part is the status the record is stored in.
+///
+/// A SUBMISSION does not: that operation states every status a record cannot be submitted
+/// from, the terminal one included, in its own one sentence
+/// ([`NOT_SUBMITTABLE_IN_STATUS`]).
 pub fn terminal_record_status_message(status: &str) -> String {
     format!("Cannot update registry record in {status} status (terminal state)")
 }
