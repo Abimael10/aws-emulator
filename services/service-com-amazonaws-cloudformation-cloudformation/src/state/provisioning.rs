@@ -204,6 +204,10 @@ use super::provisioner::{provisioner_for, Provisioner};
 use super::StoredResource;
 
 mod apigateway_rest_api;
+/// The two `AWS::Athena::*` types a stack declares — the workgroup its queries run in and the
+/// data catalog they are routed through: created in Amazon Athena itself
+/// ([`athena_resources`]).
+mod athena_resources;
 /// The two AppSync custom-domain types a stack declares — the domain itself and the mapping
 /// of an API onto it: visible to the rest of this service's state because the types' own
 /// NAMES live here, beside the arms that provision them (the naming rules read the property
@@ -1132,6 +1136,10 @@ pub(super) enum Owner {
     /// instance registered in a service. Which of them it is travels with the owner, as it
     /// does for the types above.
     ServiceDiscovery(service_discovery::Kind),
+    /// One of the two Amazon Athena types [`athena_resources`] creates: the workgroup a stack's
+    /// queries run in, and the data catalog they are routed through. Which of them it is travels
+    /// with the owner, as it does for the types above.
+    Athena(athena_resources::Kind),
 }
 
 /// The owner of a template resource type, or `None` for a type this emulator leaves
@@ -1226,6 +1234,9 @@ pub(super) fn owner_for(resource_type: &str) -> Option<Owner> {
     }
     if let Some(kind) = service_discovery::kind_of(resource_type) {
         return Some(Owner::ServiceDiscovery(kind));
+    }
+    if let Some(kind) = athena_resources::kind_of(resource_type) {
+        return Some(Owner::Athena(kind));
     }
     provisioner_for(resource_type).map(Owner::Builtin)
 }
