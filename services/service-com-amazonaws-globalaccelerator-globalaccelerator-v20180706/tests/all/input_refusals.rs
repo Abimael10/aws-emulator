@@ -178,6 +178,9 @@ async fn a_modelled_constraint_refusal_is_the_modelled_invalid_argument_error() 
 
     let cases: Vec<(&str, &str, Value, Expect)> = vec![
         // @range{0,100} on TrafficDialPercentage: both bounds, and one step past each.
+        // The clause names the member path this service reports for it
+        // (`trafficRetentionPercentage`) and renders the rejected float with its
+        // fractional part — see `src/service/constraint_report.rs`.
         (
             "dial-at-the-lower-bound",
             "CreateEndpointGroup",
@@ -195,7 +198,7 @@ async fn a_modelled_constraint_refusal_is_the_modelled_invalid_argument_error() 
             "CreateEndpointGroup",
             group(json!({ "TrafficDialPercentage": -1.0 })),
             Expect::Refused {
-                path: "trafficDialPercentage",
+                path: "trafficRetentionPercentage",
                 requirement: "Member must have value greater than or equal to 0",
             },
         ),
@@ -204,7 +207,7 @@ async fn a_modelled_constraint_refusal_is_the_modelled_invalid_argument_error() 
             "CreateEndpointGroup",
             group(json!({ "TrafficDialPercentage": 100.5 })),
             Expect::Refused {
-                path: "trafficDialPercentage",
+                path: "trafficRetentionPercentage",
                 requirement: "Member must have value less than or equal to 100",
             },
         ),
@@ -213,7 +216,7 @@ async fn a_modelled_constraint_refusal_is_the_modelled_invalid_argument_error() 
             "CreateEndpointGroup",
             group(json!({ "TrafficDialPercentage": 150.0 })),
             Expect::Refused {
-                path: "trafficDialPercentage",
+                path: "trafficRetentionPercentage",
                 requirement: "Member must have value less than or equal to 100",
             },
         ),
@@ -223,7 +226,7 @@ async fn a_modelled_constraint_refusal_is_the_modelled_invalid_argument_error() 
             "UpdateEndpointGroup",
             update_group(json!({ "TrafficDialPercentage": 150.0 })),
             Expect::Refused {
-                path: "trafficDialPercentage",
+                path: "trafficRetentionPercentage",
                 requirement: "Member must have value less than or equal to 100",
             },
         ),

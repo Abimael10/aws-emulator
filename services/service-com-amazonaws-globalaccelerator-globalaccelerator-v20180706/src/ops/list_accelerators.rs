@@ -159,7 +159,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .map_err(|_| -> ListAcceleratorsError {
                 ListAcceleratorsErrorModeled::InvalidNextTokenException(
                     InvalidNextTokenException {
-                        message: Some("NextToken is not a valid continuation token".to_string()),
+                        message: Some(crate::state::INVALID_NEXT_TOKEN_MESSAGE.to_string()),
                     },
                 )
                 .into()

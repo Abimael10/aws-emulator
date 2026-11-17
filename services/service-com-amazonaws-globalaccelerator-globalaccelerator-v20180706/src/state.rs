@@ -987,9 +987,11 @@ pub fn validate_health_check_interval(seconds: i32) -> Result<(), String> {
         .map(i32::to_string)
         .collect::<Vec<_>>()
         .join(" or ");
+    // The wording the service states this class with — recorded wire behaviour on
+    // `UpdateEndpointGroup` — whose variable parts are the rejected value from the
+    // request and the set of supported intervals.
     Err(format!(
-        "HealthCheckIntervalSeconds {seconds} is not supported: the time between each health \
-         check is {supported} seconds"
+        "Invalid HealthCheck Interval Seconds: {seconds} expected values are: {supported}"
     ))
 }
 
@@ -1234,6 +1236,33 @@ pub fn endpoint_group_not_found_message(endpoint_group_arn: &str) -> String {
     format!("EndpointGroup {endpoint_group_arn} does not exist.")
 }
 
+/// The message for a create that names a Region the listener's groups already cover.
+///
+/// "A listener can have only one endpoint group in a specific Region"
+/// (`CreateEndpointGroup$EndpointGroupRegion`), and the service states that conflict with
+/// one FIXED sentence — recorded wire behaviour on `CreateEndpointGroup` — naming neither
+/// the Region, nor the listener, nor the group that already covers it. Every duplicate
+/// therefore gets the same text, and no generated identifier leaks into it.
+pub const ENDPOINT_GROUP_ALREADY_EXISTS_MESSAGE: &str = "Endpoint group already exists.";
+
+/// The message for an endpoint whose `AttachmentArn` names a cross-account attachment the
+/// store does not hold.
+///
+/// An `AttachmentArn` names "the Amazon Resource Name (ARN) of the cross-account
+/// attachment that specifies the endpoints (resources) that can be added to accelerators
+/// and principals that have permission to add the endpoints"
+/// (`EndpointConfiguration$AttachmentArn`), and the attachment operations are not
+/// implemented in this emulator, so no stored attachment can grant that permission. The
+/// refusal names the attachment the request claimed and the endpoint it was claimed for,
+/// and is stated once for every leg that configures an endpoint — the create and the
+/// update — so the two cannot drift apart.
+pub fn attachment_grants_nothing_message(attachment_arn: &str, endpoint_id: &str) -> String {
+    format!(
+        "cross-account attachment {attachment_arn} does not exist, so it grants no permission \
+         to add endpoint {endpoint_id}"
+    )
+}
+
 /// The message for deleting an accelerator that is still enabled.
 ///
 /// "Before you can delete an accelerator, you must disable it" (`DeleteAccelerator`
@@ -1243,28 +1272,28 @@ pub fn accelerator_not_disabled_message(accelerator_arn: &str) -> String {
     format!("Please disable accelerator {accelerator_arn} before deleting it.")
 }
 
-/// The message for deleting an accelerator that still has a listener.
+/// The message for a delete refused because a dependent resource still exists.
 ///
-/// "You must remove all dependent resources from an accelerator before you can delete
-/// it" (`AssociatedListenerFoundException` doc) — stated over the request's own ARN,
-/// for the same reason as [`accelerator_not_disabled_message`].
-pub fn associated_listener_found_message(accelerator_arn: &str) -> String {
-    format!(
-        "Accelerator {accelerator_arn} has a listener associated with it; delete its \
-         listeners before deleting it."
-    )
+/// "You must remove all dependent resources from a resource before you can delete it"
+/// (`AssociatedListenerFoundException` / `AssociatedEndpointGroupFoundException` docs).
+/// The service states that whole class with ONE template — recorded wire behaviour on
+/// `DeleteListener` — whose only variable parts are the kind of resource the request
+/// asked to delete, the ARN it carried for it, and the kind of dependent that blocks it:
+/// `Cannot delete <resource> <arn> because an associated <dependent> was found.`
+fn associated_dependent_found_message(resource: &str, arn: &str, dependent: &str) -> String {
+    format!("Cannot delete {resource} {arn} because an associated {dependent} was found.")
 }
 
-/// The message for deleting a listener that still has an endpoint group.
-///
-/// "You must remove all dependent resources from a listener before you can delete it"
-/// (`AssociatedEndpointGroupFoundException` doc) — the same rule as
-/// [`associated_listener_found_message`], one level down.
+/// The message for deleting an accelerator that still has a listener — the class
+/// template of [`associated_dependent_found_message`] at the accelerator level.
+pub fn associated_listener_found_message(accelerator_arn: &str) -> String {
+    associated_dependent_found_message("accelerator", accelerator_arn, "listener")
+}
+
+/// The message for deleting a listener that still has an endpoint group — the same
+/// template one level down.
 pub fn associated_endpoint_group_found_message(listener_arn: &str) -> String {
-    format!(
-        "Listener {listener_arn} has an endpoint group associated with it; delete its \
-         endpoint groups before deleting it."
-    )
+    associated_dependent_found_message("listener", listener_arn, "endpoint group")
 }
 
 /// One page of keys, plus the token that resumes immediately after it.
@@ -1296,6 +1325,27 @@ pub fn decode_next_token(token: &str) -> Option<String> {
     String::from_utf8(hex::decode(token).ok()?).ok()
 }
 
+/// The id at the end of an ARN: its last path segment, which is the id this service
+/// minted for that resource (`.../accelerator/<id>/listener/<id>/endpoint-group/<id>`).
+///
+/// A continuation token names a position by this id rather than by the whole ARN, because
+/// `NextToken` is a `GenericString` (`@length` 0..255) and the hex encoding is twice its
+/// key's length: the ARN of a nested resource — an endpoint group's, which hangs off its
+/// listener's, which hangs off its accelerator's — already exceeds half that bound, so a
+/// token naming the whole ARN would be a token the caller cannot send back. Within one
+/// collection the ids are distinct, so the shorter key names the same position.
+fn arn_resource_id(arn: &str) -> &str {
+    arn.rsplit('/').next().unwrap_or(arn)
+}
+
+/// The message for a `NextToken` this service did not issue.
+///
+/// "There isn't another item to return" (`InvalidNextTokenException` doc): a token that
+/// does not decode, or that names a position the collection no longer holds, resumes
+/// nothing. Stated once, beside [`paginate`], because every paginated list refuses the
+/// same class and the three of them must not drift apart.
+pub const INVALID_NEXT_TOKEN_MESSAGE: &str = "NextToken is not a valid continuation token";
+
 /// Cut one page out of `all`.
 ///
 /// `max_results` truncates the page; the returned token names the first key of
@@ -1316,9 +1366,9 @@ pub fn paginate(
     let start = match next_token {
         None => 0,
         Some(token) => {
-            let key = decode_next_token(token).ok_or(InvalidPageToken)?;
+            let id = decode_next_token(token).ok_or(InvalidPageToken)?;
             all.iter()
-                .position(|candidate| *candidate == key)
+                .position(|candidate| arn_resource_id(candidate) == id)
                 .ok_or(InvalidPageToken)?
         }
     };
@@ -1329,7 +1379,7 @@ pub fn paginate(
     let end = start.saturating_add(limit).min(all.len());
     Ok(Page {
         keys: all[start..end].to_vec(),
-        next_token: (end < all.len()).then(|| encode_next_token(&all[end])),
+        next_token: (end < all.len()).then(|| encode_next_token(arn_resource_id(&all[end]))),
     })
 }
 

@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateEndpointGroup
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateEndpointGroup`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateEndpointGroup::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Updates one endpoint group in place and persists it in [`crate::state`], so the next
+//! `DescribeEndpointGroup` reports exactly what was stored. Each member the request
+//! carries replaces the stored one and a member it omits is not a change; a refused
+//! update leaves the stored group untouched.
 //!
 //! ## Shape of an operation
 //!
@@ -178,18 +173,131 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateEndpointGroup` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateEndpointGroupErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateEndpointGroup"))
+        // `ctx` carries request metadata only; this operation needs none of it.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(UpdateEndpointGroupErrorModeled::InternalServiceErrorException(
+                InternalServiceErrorException {
+                    message: Some("the Global Accelerator store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+
+        // Everything that depends only on the request is checked before the store is
+        // touched, so a refused update writes nothing — the same order the create path
+        // uses, through the same helpers, so both legs refuse the same inputs with the
+        // same words.
+        let invalid = |message: String| -> Self::Error {
+            UpdateEndpointGroupErrorModeled::InvalidArgumentException(InvalidArgumentException {
+                message: Some(message),
+            })
+            .into()
+        };
+
+        if let Some(seconds) = input.health_check_interval_seconds {
+            if let Err(message) = crate::state::validate_health_check_interval(seconds) {
+                return Err(invalid(message));
+            }
+        }
+
+        let port_overrides = match input.port_overrides.as_deref() {
+            Some(overrides) => match crate::state::port_overrides_to_pairs(overrides) {
+                Ok(pairs) => Some(pairs),
+                Err(message) => return Err(invalid(message)),
+            },
+            None => None,
+        };
+
+        let configurations = input.endpoint_configurations.as_deref();
+        let endpoints = match configurations {
+            Some(configurations) => {
+                match crate::state::endpoints_from_configurations(configurations) {
+                    Ok(endpoints) => Some(endpoints),
+                    Err(message) => return Err(invalid(message)),
+                }
+            }
+            None => None,
+        };
+
+        let mut store = state.lock();
+        let Some(record) = store.endpoint_groups.get_mut(&input.endpoint_group_arn) else {
+            return Err(
+                UpdateEndpointGroupErrorModeled::EndpointGroupNotFoundException(
+                    EndpointGroupNotFoundException {
+                        message: Some(crate::state::endpoint_group_not_found_message(
+                            &input.endpoint_group_arn,
+                        )),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // The same rule the create path states, in the same words: an `AttachmentArn`
+        // names the cross-account attachment that permits an endpoint, the store holds
+        // none (the attachment operations are not implemented), so the permission the
+        // caller claims cannot be established. Asked after the endpoint-group lookup —
+        // it needs nothing from the store, but a request that ALSO names a group the
+        // store does not hold is answered the not-found, as on the create leg — and
+        // before anything is written, so this refusal leaves the group untouched too.
+        if let Some(endpoint) = configurations
+            .unwrap_or_default()
+            .iter()
+            .find(|configuration| configuration.attachment_arn.is_some())
+        {
+            let attachment = endpoint.attachment_arn.clone().unwrap_or_default();
+            let endpoint_id = endpoint.endpoint_id.clone().unwrap_or_default();
+            return Err(UpdateEndpointGroupErrorModeled::AccessDeniedException(
+                AccessDeniedException {
+                    message: Some(crate::state::attachment_grants_nothing_message(
+                        &attachment,
+                        &endpoint_id,
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // Each member the request carries replaces the stored one; a member it omits is
+        // not a change, so the persisted value stays ("The updated list of endpoint
+        // objects", "The updated value for the time ... between each health check" —
+        // `UpdateEndpointGroup`'s own input docs). The group's ARN and its Region
+        // identify it rather than configure it: the model carries no Region member on
+        // this operation at all.
+        if let Some(endpoints) = endpoints {
+            record.endpoints = endpoints;
+        }
+        if let Some(pairs) = port_overrides {
+            record.port_overrides = pairs;
+        }
+        if let Some(percentage) = input.traffic_dial_percentage {
+            record.traffic_dial_percentage = percentage;
+        }
+        if let Some(port) = input.health_check_port {
+            record.health_check_port = Some(port);
+        }
+        if let Some(protocol) = input.health_check_protocol {
+            record.health_check_protocol = protocol;
+        }
+        if let Some(seconds) = input.health_check_interval_seconds {
+            record.health_check_interval_seconds = seconds;
+        }
+        if let Some(count) = input.threshold_count {
+            record.threshold_count = count;
+        }
+        // A path only belongs to an HTTP/S health check, so the resolution the create
+        // path applies runs over the protocol this group now has: a group switched to
+        // HTTP/S without a path of its own takes the documented default of "/".
+        record.health_check_path = crate::state::resolve_health_check_path(
+            input
+                .health_check_path
+                .or_else(|| record.health_check_path.clone()),
+            &record.health_check_protocol,
+        );
+
+        Ok(UpdateEndpointGroupOutput {
+            endpoint_group: Some(record.to_wire()),
+        })
     }
 }

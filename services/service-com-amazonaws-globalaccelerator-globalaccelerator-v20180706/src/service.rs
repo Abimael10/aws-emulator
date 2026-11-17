@@ -46,6 +46,7 @@
 //! service's model declares — see [`error_message_member`] for the rule and why the
 //! refusal seam below cannot state it.
 
+pub mod constraint_report;
 pub mod error_message_member;
 
 use smithy_server_runtime::{
@@ -169,9 +170,8 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // too, so only the code and the wording change), carrying the
         // `<N> validation error(s) detected: ` envelope over one clause per
         // violated member: the rejected value, the member's path and the bound it
-        // failed, all taken from the request. That envelope is exactly what the
-        // framework renders, so the message is borrowed rather than restated —
-        // only the code, which a client branches on, is this service's own.
+        // failed, all taken from the request. The envelope and the requirement are
+        // exactly what the framework renders, so neither is restated here.
         //
         // An authentication refusal keeps the framework's wording: it is not an
         // input-constraint failure, and the service models `AccessDeniedException`
@@ -182,6 +182,11 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         //
         // The ONE class it states in its own words is a tag (see [`INVALID_PARAMETER`]),
         // which this service validates itself and reports without naming a member.
+        //
+        // The clauses of the report itself are stated through
+        // [`constraint_report::report`]: the envelope, the requirement and the bound are
+        // the framework's, while the member path this service reports and the rendering
+        // of the rejected value are this service's own — see that module for the rule.
         match refusal {
             Refusal::Invalid(violations) if only_tag_parameters(violations) => Some(Refused {
                 code: INVALID_ARGUMENT_EXCEPTION.to_string(),
@@ -189,7 +194,7 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
             }),
             Refusal::Invalid(violations) => Some(Refused {
                 code: INVALID_ARGUMENT_EXCEPTION.to_string(),
-                message: ::aws_smithy_schema_server::envelope(violations)?,
+                message: constraint_report::report(violations)?,
             }),
             _ => None,
         }

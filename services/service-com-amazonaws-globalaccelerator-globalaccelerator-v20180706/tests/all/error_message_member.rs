@@ -191,7 +191,7 @@ async fn a_boundary_refusal_reports_its_text_in_the_modelled_message_member() {
             "UpdateEndpointGroup",
             json!({ "EndpointGroupArn": endpoint_group_arn, "TrafficDialPercentage": 150.0 }),
             Expect::Report {
-                path: "trafficDialPercentage",
+                path: "trafficRetentionPercentage",
                 requirement: "Member must have value less than or equal to 100",
             },
         ),
@@ -205,7 +205,7 @@ async fn a_boundary_refusal_reports_its_text_in_the_modelled_message_member() {
                 "TrafficDialPercentage": -1.0,
             }),
             Expect::Report {
-                path: "trafficDialPercentage",
+                path: "trafficRetentionPercentage",
                 requirement: "Member must have value greater than or equal to 0",
             },
         ),

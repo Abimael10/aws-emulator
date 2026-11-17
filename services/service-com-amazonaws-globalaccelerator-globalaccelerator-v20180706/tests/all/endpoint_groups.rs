@@ -70,11 +70,33 @@ async fn create_group(
     call(router, "CreateEndpointGroup", body).await
 }
 
+/// `UpdateEndpointGroup` with the members a row names, over the group `arn`.
+async fn update_group(router: &MultiServiceRouter, arn: &str, extra: Value) -> (u16, Value) {
+    let mut body = json!({ "EndpointGroupArn": arn });
+    if let (Some(target), Some(extra)) = (body.as_object_mut(), extra.as_object()) {
+        for (key, value) in extra {
+            target.insert(key.clone(), value.clone());
+        }
+    }
+    call(router, "UpdateEndpointGroup", body).await
+}
+
 fn group_arn(group: &Value) -> String {
     group["EndpointGroupArn"]
         .as_str()
         .unwrap_or_else(|| panic!("EndpointGroupArn missing from {group}"))
         .to_string()
+}
+
+/// The ARNs a `ListEndpointGroups` page reports, in the order it reported them.
+fn listed_arns(page: &Value) -> Vec<String> {
+    page["EndpointGroups"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .iter()
+        .map(group_arn)
+        .collect()
 }
 
 /// A created endpoint group, as `DescribeEndpointGroup` reports it.
@@ -325,6 +347,14 @@ async fn a_listener_holds_one_endpoint_group_per_region() {
             "EndpointGroupAlreadyExistsException",
             "case {region:?}: expected EndpointGroupAlreadyExistsException, got {dup}"
         );
+        // The sentence this service states the conflict with is FIXED: it names neither
+        // the Region, nor the listener, nor the group that already covers it, so every
+        // duplicate — whatever its Region — gets exactly this text.
+        assert_eq!(
+            error_message(&dup),
+            "Endpoint group already exists.",
+            "case {region:?}: expected the fixed already-exists sentence, got {dup}"
+        );
 
         // The SAME token is the same request: it replays the group it minted.
         let (replay_status, replay) =
@@ -396,10 +426,16 @@ async fn a_listener_with_an_endpoint_group_cannot_be_deleted() {
             "case {} group(s): expected AssociatedEndpointGroupFoundException, got {refusal}",
             arns.len()
         );
-        // A refusal about a named resource identifies it by the ARN the request carried.
-        assert!(
-            error_message(&refusal).contains(&listener_arn),
-            "case {} group(s): expected the refusal to name the listener {listener_arn}, got {refusal}",
+        // A refusal about a named resource identifies it by the ARN the request carried,
+        // which is the template's only variable part.
+        assert_eq!(
+            error_message(&refusal),
+            format!(
+                "Cannot delete listener {listener_arn} because an associated endpoint group \
+                 was found."
+            ),
+            "case {} group(s): expected the wording this service states a blocked delete \
+             with, got {refusal}",
             arns.len()
         );
     }
@@ -686,5 +722,690 @@ async fn a_create_past_the_endpoint_group_quota_is_refused_and_a_delete_frees_a_
         status, 200,
         "case freed-slot: a delete frees one slot for any listener of the accelerator, \
          got {status} with {body}"
+    );
+}
+
+/// RULE: an update replaces every member the request names and changes nothing else —
+/// the members it omits keep their stored values, and the group's own identity (its ARN
+/// and its Region) is not configuration at all — and what it answers is what the store
+/// now holds, so a `DescribeEndpointGroup` reports the same record.
+#[tokio::test]
+async fn an_update_replaces_the_members_it_names_and_leaves_the_others() {
+    let router = emulator();
+    let listener_arn = fixture(&router, "update").await;
+
+    // The group every row starts from names every member, each at a value that is NOT the
+    // documented default, so a member a row leaves out can be asserted to have kept it.
+    let base = json!({
+        "HealthCheckProtocol": "HTTP",
+        "HealthCheckPath": "/health",
+        "HealthCheckPort": 8080,
+        "HealthCheckIntervalSeconds": 30,
+        "ThresholdCount": 5,
+        "TrafficDialPercentage": 70.0,
+        "PortOverrides": [{ "ListenerPort": 80, "EndpointPort": 1080 }],
+        "EndpointConfigurations": [{ "EndpointId": "i-00000000000000001", "Weight": 9 }],
+    });
+
+    // Rows differ along WHICH members the update names — one, several, all, none — and in
+    // the kind of each: a float, an integer, an enumerated string, a list of structures.
+    let rows: Vec<(&str, Value, Value)> = vec![
+        (
+            "interval-only",
+            json!({ "HealthCheckIntervalSeconds": 10 }),
+            json!({
+                "HealthCheckIntervalSeconds": 10,
+                "TrafficDialPercentage": 70.0,
+                "ThresholdCount": 5,
+                "HealthCheckProtocol": "HTTP",
+                "HealthCheckPath": "/health",
+                "HealthCheckPort": 8080,
+                "PortOverrides": [{ "ListenerPort": 80, "EndpointPort": 1080 }],
+            }),
+        ),
+        (
+            "dial-only",
+            json!({ "TrafficDialPercentage": 0.0 }),
+            json!({
+                "TrafficDialPercentage": 0.0,
+                "HealthCheckIntervalSeconds": 30,
+                "ThresholdCount": 5,
+            }),
+        ),
+        (
+            "endpoints-replaced",
+            json!({ "EndpointConfigurations": [
+                { "EndpointId": "198.51.100.9" },
+                { "EndpointId": "i-00000000000000002", "Weight": 3 },
+            ] }),
+            json!({
+                "EndpointDescriptions": [
+                    { "EndpointId": "198.51.100.9", "Weight": 128, "HealthState": "INITIAL" },
+                    { "EndpointId": "i-00000000000000002", "Weight": 3,
+                      "HealthState": "INITIAL" },
+                ],
+                "HealthCheckIntervalSeconds": 30,
+                "TrafficDialPercentage": 70.0,
+            }),
+        ),
+        (
+            "port-overrides-replaced-by-an-empty-list",
+            json!({ "PortOverrides": [] }),
+            json!({ "PortOverrides": [], "HealthCheckPort": 8080 }),
+        ),
+        (
+            "every-member-named",
+            json!({
+                "HealthCheckProtocol": "TCP",
+                "HealthCheckPort": 443,
+                "HealthCheckIntervalSeconds": 10,
+                "ThresholdCount": 1,
+                "TrafficDialPercentage": 12.5,
+                "PortOverrides": [{ "ListenerPort": 443, "EndpointPort": 1443 }],
+                "EndpointConfigurations": [{ "EndpointId": "203.0.113.4" }],
+            }),
+            json!({
+                "HealthCheckProtocol": "TCP",
+                "HealthCheckPort": 443,
+                "HealthCheckIntervalSeconds": 10,
+                "ThresholdCount": 1,
+                "TrafficDialPercentage": 12.5,
+                "PortOverrides": [{ "ListenerPort": 443, "EndpointPort": 1443 }],
+                "EndpointDescriptions": [
+                    { "EndpointId": "203.0.113.4", "Weight": 128, "HealthState": "INITIAL" },
+                ],
+                // A path the caller set is the group's own, so it stays with it.
+                "HealthCheckPath": "/health",
+            }),
+        ),
+        (
+            "no-member-named",
+            json!({}),
+            base.clone(),
+        ),
+    ];
+
+    for (index, (case, update, expected)) in rows.into_iter().enumerate() {
+        // Each row gets its own group: one listener holds one group per Region.
+        let region = format!("us-east-{index}");
+        let (status, created) =
+            create_group(&router, &listener_arn, &region, case, base.clone()).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected the fixture group, got {status} with {created}"
+        );
+        let arn = group_arn(&created["EndpointGroup"]);
+
+        let (status, body) = update_group(&router, &arn, update).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected HTTP 200, got {status} with {body}"
+        );
+        let updated = body["EndpointGroup"].clone();
+        assert_eq!(
+            updated["EndpointGroupArn"],
+            json!(arn),
+            "case {case:?}: an update answers the group it updated, got {updated}"
+        );
+        assert_eq!(
+            updated["EndpointGroupRegion"],
+            json!(region),
+            "case {case:?}: the Region identifies the group and is not updated, got {updated}"
+        );
+        for (member, want) in expected.as_object().expect("an object of expectations") {
+            // `EndpointConfigurations` is the input member; the group reports its
+            // endpoints as `EndpointDescriptions`, which the rows name directly.
+            if member == "EndpointConfigurations" {
+                continue;
+            }
+            assert_eq!(
+                updated.get(member).unwrap_or(&Value::Null),
+                want,
+                "case {case:?}: expected {member} {want}, got {updated}"
+            );
+        }
+
+        // The update persisted: the read-back is that record, not a second computation.
+        let read = describe_group(&router, &arn).await;
+        assert_eq!(
+            read, updated,
+            "case {case:?}: expected DescribeEndpointGroup to report the updated group \
+             {updated}, got {read}"
+        );
+    }
+}
+
+/// RULE: a health-check path belongs to an HTTP/S check — "If the protocol is HTTP/S,
+/// then this specifies the path that is the destination for health check targets. The
+/// default value is slash (/)" — so the path a group ends up with follows the protocol it
+/// now has, whether that protocol arrived with the create or with an update.
+#[tokio::test]
+async fn a_health_check_path_follows_the_protocol_the_group_now_has() {
+    let router = emulator();
+    let listener_arn = fixture(&router, "paths").await;
+
+    // (case, what the create named, what the update named, the path afterwards)
+    let rows: Vec<(&str, Value, Value, Value)> = vec![
+        (
+            "tcp-group-switched-to-http",
+            json!({ "HealthCheckProtocol": "TCP" }),
+            json!({ "HealthCheckProtocol": "HTTP" }),
+            json!("/"),
+        ),
+        (
+            "tcp-group-switched-to-https-with-a-path",
+            json!({ "HealthCheckProtocol": "TCP" }),
+            json!({ "HealthCheckProtocol": "HTTPS", "HealthCheckPath": "/ping" }),
+            json!("/ping"),
+        ),
+        (
+            "tcp-group-left-on-tcp",
+            json!({ "HealthCheckProtocol": "TCP" }),
+            json!({ "HealthCheckIntervalSeconds": 10 }),
+            Value::Null,
+        ),
+        (
+            "http-group-given-another-path",
+            json!({ "HealthCheckProtocol": "HTTP", "HealthCheckPath": "/first" }),
+            json!({ "HealthCheckPath": "/second" }),
+            json!("/second"),
+        ),
+    ];
+
+    for (index, (case, create, update, expected)) in rows.into_iter().enumerate() {
+        let region = format!("me-south-{index}");
+        let (status, created) = create_group(&router, &listener_arn, &region, case, create).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected the fixture group, got {status} with {created}"
+        );
+        let arn = group_arn(&created["EndpointGroup"]);
+
+        let (status, body) = update_group(&router, &arn, update).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected HTTP 200, got {status} with {body}"
+        );
+        let read = describe_group(&router, &arn).await;
+        assert_eq!(
+            read.get("HealthCheckPath").unwrap_or(&Value::Null),
+            &expected,
+            "case {case:?}: expected HealthCheckPath {expected}, got {read}"
+        );
+    }
+}
+
+/// RULE: only the two intervals the member documents are accepted — "The time—10 seconds
+/// or 30 seconds—between each health check for an endpoint" — so every other value inside
+/// the modelled `@range` (10..30) is refused with the sentence this service states for
+/// that class, on the create leg and on the update leg alike, and a refused update leaves
+/// the stored group exactly as it was.
+#[tokio::test]
+async fn an_unsupported_health_check_interval_is_refused_in_the_services_words() {
+    let router = emulator();
+    let listener_arn = fixture(&router, "interval-words").await;
+
+    // Rows: every unsupported value strictly between the two published ones, so the rule
+    // is tested over the class rather than on the one value a run recorded.
+    for interval in [11, 15, 20, 29] {
+        let case = format!("interval-{interval}");
+        let region = format!("ap-northeast-{interval}");
+        let (status, created) = create_group(
+            &router,
+            &listener_arn,
+            &region,
+            &case,
+            json!({ "HealthCheckIntervalSeconds": 30, "TrafficDialPercentage": 90.0 }),
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected the fixture group, got {status} with {created}"
+        );
+        let arn = group_arn(&created["EndpointGroup"]);
+        let expected = format!(
+            "Invalid HealthCheck Interval Seconds: {interval} expected values are: 10 or 30"
+        );
+
+        // The update leg: refused, and the other member the same request carried is not
+        // applied either.
+        let (status, refusal) = update_group(
+            &router,
+            &arn,
+            json!({ "HealthCheckIntervalSeconds": interval, "TrafficDialPercentage": 50.0 }),
+        )
+        .await;
+        assert_eq!(
+            (status, error_code(&refusal).as_str()),
+            (400, "InvalidArgumentException"),
+            "case {case:?}: expected the modelled 400 InvalidArgumentException, got \
+             {status} with {refusal}"
+        );
+        assert_eq!(
+            error_message(&refusal),
+            expected,
+            "case {case:?}: expected the wording this service states the class with, \
+             got {refusal}"
+        );
+        let read = describe_group(&router, &arn).await;
+        assert_eq!(
+            (
+                read["HealthCheckIntervalSeconds"].clone(),
+                read["TrafficDialPercentage"].clone()
+            ),
+            (json!(30), json!(90.0)),
+            "case {case:?}: a refused update must change nothing, got {read}"
+        );
+
+        // The create leg states the same sentence for the same value.
+        let (status, refusal) = create_group(
+            &router,
+            &listener_arn,
+            &format!("{region}-fresh"),
+            &format!("{case}-create"),
+            json!({ "HealthCheckIntervalSeconds": interval }),
+        )
+        .await;
+        assert_eq!(
+            (status, error_code(&refusal).as_str()),
+            (400, "InvalidArgumentException"),
+            "case {case:?}: expected the create leg to refuse it too, got {status} with \
+             {refusal}"
+        );
+        assert_eq!(
+            error_message(&refusal),
+            expected,
+            "case {case:?}: expected both legs to state one sentence, got {refusal}"
+        );
+
+        // Each supported value is accepted on the update leg and round-trips.
+        for supported in [10, 30] {
+            let (status, body) =
+                update_group(&router, &arn, json!({ "HealthCheckIntervalSeconds": supported }))
+                    .await;
+            assert_eq!(
+                status, 200,
+                "case {case:?}/{supported}: a supported interval is accepted, got {status} \
+                 with {body}"
+            );
+            let read = describe_group(&router, &arn).await;
+            assert_eq!(
+                read["HealthCheckIntervalSeconds"],
+                json!(supported),
+                "case {case:?}/{supported}: expected the stored interval {supported}, got {read}"
+            );
+        }
+    }
+}
+
+/// RULE: a value outside a modelled bound is refused with the standard constraint report,
+/// whose clause names the member path this service reports for that member and renders
+/// the rejected value as the member's modelled type — a float with its fractional part.
+/// `TrafficDialPercentage` is `@range` 0..100 and type `float`
+/// (`smithy_query(query="shape", shape="TrafficDialPercentage")`), carried by both the
+/// create and the update leg; and neither refusal writes anything.
+#[tokio::test]
+async fn a_rejected_traffic_dial_percentage_is_reported_as_this_service_reports_it() {
+    let router = emulator();
+    let listener_arn = fixture(&router, "dial-clause").await;
+    let (status, created) = create_group(
+        &router,
+        &listener_arn,
+        "eu-south-1",
+        "dial-clause-base",
+        json!({ "TrafficDialPercentage": 50.0 }),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "case base: expected the fixture group, got {status} with {created}"
+    );
+    let arn = group_arn(&created["EndpointGroup"]);
+    // The Region every refused create below names, left free by each of them.
+    let refused_region = "eu-north-1";
+
+    // (case, the value sent, how the clause renders it, the requirement it broke)
+    let rows: Vec<(&str, Value, &str, &str)> = vec![
+        (
+            "far-past-the-maximum",
+            json!(150.0),
+            "150.0",
+            "Member must have value less than or equal to 100",
+        ),
+        (
+            "just-past-the-maximum",
+            json!(100.5),
+            "100.5",
+            "Member must have value less than or equal to 100",
+        ),
+        (
+            "a-whole-number-past-the-maximum",
+            json!(101),
+            "101.0",
+            "Member must have value less than or equal to 100",
+        ),
+        (
+            "below-the-minimum",
+            json!(-1.0),
+            "-1.0",
+            "Member must have value greater than or equal to 0",
+        ),
+        (
+            "just-below-the-minimum",
+            json!(-0.5),
+            "-0.5",
+            "Member must have value greater than or equal to 0",
+        ),
+    ];
+
+    for (case, value, rendered, requirement) in rows {
+        let expected = format!(
+            "1 validation error detected: Value '{rendered}' at 'trafficRetentionPercentage' \
+             failed to satisfy constraint: {requirement}"
+        );
+        let legs = [
+            (
+                "create",
+                create_group(
+                    &router,
+                    &listener_arn,
+                    refused_region,
+                    case,
+                    json!({ "TrafficDialPercentage": value }),
+                )
+                .await,
+            ),
+            (
+                "update",
+                update_group(&router, &arn, json!({ "TrafficDialPercentage": value })).await,
+            ),
+        ];
+        for (leg, (status, body)) in legs {
+            assert_eq!(
+                (status, error_code(&body).as_str()),
+                (400, "InvalidArgumentException"),
+                "case {case:?} on the {leg} leg: expected the modelled 400 \
+                 InvalidArgumentException, got {status} with {body}"
+            );
+            assert_eq!(
+                error_message(&body),
+                expected,
+                "case {case:?} on the {leg} leg: expected the constraint report this \
+                 service states, got {body}"
+            );
+        }
+
+        // Neither refusal wrote: the group still holds the percentage it was created
+        // with.
+        let read = describe_group(&router, &arn).await;
+        assert_eq!(
+            read["TrafficDialPercentage"],
+            json!(50.0),
+            "case {case:?}: a refused update must change nothing, got {read}"
+        );
+    }
+
+    // Nor did any refused create: the Region they all named is still free.
+    let (status, body) = create_group(
+        &router,
+        &listener_arn,
+        refused_region,
+        "after-the-refusals",
+        json!({}),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "case after-the-refusals: a refused create must write nothing, got {status} \
+         with {body}"
+    );
+}
+
+/// RULE: an update of an endpoint group the store does not hold is the operation's own
+/// modelled not-found error, naming the ARN the request carried, and nothing is created
+/// for it.
+#[tokio::test]
+async fn an_update_of_a_group_the_store_does_not_hold_is_the_modelled_not_found() {
+    let router = emulator();
+    let listener_arn = fixture(&router, "update-missing").await;
+
+    // Rows: an ARN of the right shape that was never minted, and one whose group was
+    // deleted — both name no endpoint group.
+    let (status, created) = create_group(
+        &router,
+        &listener_arn,
+        "af-south-1",
+        "update-missing-base",
+        json!({}),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "case base: expected the fixture group, got {status} with {created}"
+    );
+    let deleted = group_arn(&created["EndpointGroup"]);
+    ok(
+        &router,
+        "DeleteEndpointGroup",
+        json!({ "EndpointGroupArn": deleted }),
+    )
+    .await;
+
+    for (case, arn) in [
+        (
+            "never-minted",
+            format!("{listener_arn}/endpoint-group/00000000cafe"),
+        ),
+        ("deleted", deleted.clone()),
+    ] {
+        let (status, body) =
+            update_group(&router, &arn, json!({ "HealthCheckIntervalSeconds": 10 })).await;
+        assert_eq!(
+            (status, error_code(&body).as_str()),
+            (400, "EndpointGroupNotFoundException"),
+            "case {case:?}: expected the modelled not-found, got {status} with {body}"
+        );
+        assert_eq!(
+            error_message(&body),
+            format!("EndpointGroup {arn} does not exist."),
+            "case {case:?}: expected the refusal to name the endpoint group, got {body}"
+        );
+
+        // The refused update created nothing under that ARN.
+        let (status, read) = call(
+            &router,
+            "DescribeEndpointGroup",
+            json!({ "EndpointGroupArn": arn }),
+        )
+        .await;
+        assert_eq!(
+            (status, error_code(&read).as_str()),
+            (400, "EndpointGroupNotFoundException"),
+            "case {case:?}: a refused update must create nothing, got {status} with {read}"
+        );
+    }
+}
+
+/// RULE: a listener's endpoint groups are reported from the store — every group it holds,
+/// in the order they were created, one page at a time — so a group a refused create never
+/// made is not among them, a deleted one is gone, and another listener's groups are not
+/// listed with them.
+#[tokio::test]
+async fn a_listeners_endpoint_groups_are_listed_from_the_store() {
+    let router = emulator();
+    let accelerator = create_accelerator(&router, "eg-list", "acc-list").await;
+    let accelerator_arn = arn_of(&accelerator);
+    let first = listener(&router, &accelerator_arn, 80, 80, "list-1").await;
+    let second = listener(&router, &accelerator_arn, 443, 443, "list-2").await;
+
+    // Nothing created yet: no group, and no page after this one.
+    let page = ok(
+        &router,
+        "ListEndpointGroups",
+        json!({ "ListenerArn": first }),
+    )
+    .await;
+    assert_eq!(
+        page["EndpointGroups"],
+        json!([]),
+        "case empty: a listener with no endpoint group lists none, got {page}"
+    );
+    assert_eq!(
+        page["NextToken"],
+        Value::Null,
+        "case empty: a single page carries no continuation token, got {page}"
+    );
+
+    // A refused create made no group, so there is still nothing to list.
+    let (status, refusal) = create_group(
+        &router,
+        &first,
+        "us-west-2",
+        "list-refused",
+        json!({ "TrafficDialPercentage": 150.0 }),
+    )
+    .await;
+    assert_eq!(
+        status, 400,
+        "case refused: expected the refusal, got {status} with {refusal}"
+    );
+    let page = ok(
+        &router,
+        "ListEndpointGroups",
+        json!({ "ListenerArn": first }),
+    )
+    .await;
+    assert_eq!(
+        page["EndpointGroups"],
+        json!([]),
+        "case refused: a refused create is not a group, got {page}"
+    );
+
+    // Three groups on the first listener, one on the second: each listener lists its own,
+    // in creation order.
+    let mut arns: Vec<String> = Vec::new();
+    for region in ["us-west-2", "eu-west-1", "ap-south-1"] {
+        let (status, body) =
+            create_group(&router, &first, region, &format!("list-{region}"), json!({})).await;
+        assert_eq!(
+            status, 200,
+            "case {region:?}: expected HTTP 200, got {status} with {body}"
+        );
+        arns.push(group_arn(&body["EndpointGroup"]));
+    }
+    let (status, body) = create_group(&router, &second, "us-west-2", "list-sibling", json!({})).await;
+    assert_eq!(
+        status, 200,
+        "case sibling: expected HTTP 200, got {status} with {body}"
+    );
+    let sibling = group_arn(&body["EndpointGroup"]);
+
+    let page = ok(
+        &router,
+        "ListEndpointGroups",
+        json!({ "ListenerArn": first }),
+    )
+    .await;
+    assert_eq!(
+        listed_arns(&page),
+        arns,
+        "case three: expected the groups in creation order, got {page}"
+    );
+    let page = ok(
+        &router,
+        "ListEndpointGroups",
+        json!({ "ListenerArn": second }),
+    )
+    .await;
+    assert_eq!(
+        listed_arns(&page),
+        vec![sibling.clone()],
+        "case sibling: a listener lists only its own groups, got {page}"
+    );
+
+    // A page the caller bounded, resumed by the token it answered: the two pages together
+    // are the collection, in order, and the last page carries no token.
+    let page = ok(
+        &router,
+        "ListEndpointGroups",
+        json!({ "ListenerArn": first, "MaxResults": 2 }),
+    )
+    .await;
+    assert_eq!(
+        listed_arns(&page),
+        arns[..2].to_vec(),
+        "case page-1: expected the first two groups, got {page}"
+    );
+    let token = page["NextToken"]
+        .as_str()
+        .unwrap_or_else(|| panic!("case page-1: expected a continuation token, got {page}"))
+        .to_string();
+    let page = ok(
+        &router,
+        "ListEndpointGroups",
+        json!({ "ListenerArn": first, "MaxResults": 2, "NextToken": token }),
+    )
+    .await;
+    assert_eq!(
+        listed_arns(&page),
+        arns[2..].to_vec(),
+        "case page-2: expected the rest of the collection, got {page}"
+    );
+    assert_eq!(
+        page["NextToken"],
+        Value::Null,
+        "case page-2: the last page carries no continuation token, got {page}"
+    );
+
+    // A token this service never issued is the modelled refusal.
+    let (status, body) = call(
+        &router,
+        "ListEndpointGroups",
+        json!({ "ListenerArn": first, "NextToken": "not-a-token" }),
+    )
+    .await;
+    assert_eq!(
+        (status, error_code(&body).as_str()),
+        (400, "InvalidNextTokenException"),
+        "case bad-token: expected the modelled InvalidNextTokenException, got {status} \
+         with {body}"
+    );
+
+    // A delete removes the group from the list, and the list of a listener the store does
+    // not hold is the modelled not-found.
+    ok(
+        &router,
+        "DeleteEndpointGroup",
+        json!({ "EndpointGroupArn": arns[1] }),
+    )
+    .await;
+    let page = ok(
+        &router,
+        "ListEndpointGroups",
+        json!({ "ListenerArn": first }),
+    )
+    .await;
+    assert_eq!(
+        listed_arns(&page),
+        vec![arns[0].clone(), arns[2].clone()],
+        "case deleted: a deleted group is not listed, got {page}"
+    );
+
+    let missing = format!("{first}-not-a-listener");
+    let (status, body) = call(
+        &router,
+        "ListEndpointGroups",
+        json!({ "ListenerArn": missing }),
+    )
+    .await;
+    assert_eq!(
+        (status, error_code(&body).as_str()),
+        (400, "ListenerNotFoundException"),
+        "case missing-listener: expected the modelled not-found, got {status} with {body}"
+    );
+    assert_eq!(
+        error_message(&body),
+        format!("Listener {missing} not found."),
+        "case missing-listener: expected the refusal to name the listener, got {body}"
     );
 }

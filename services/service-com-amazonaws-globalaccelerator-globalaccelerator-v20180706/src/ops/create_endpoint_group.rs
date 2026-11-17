@@ -283,9 +283,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             let endpoint_id = endpoint.endpoint_id.clone().unwrap_or_default();
             return Err(CreateEndpointGroupErrorModeled::AccessDeniedException(
                 AccessDeniedException {
-                    message: Some(format!(
-                        "cross-account attachment {attachment} does not exist, so it grants no \
-                         permission to add endpoint {endpoint_id}"
+                    message: Some(crate::state::attachment_grants_nothing_message(
+                        &attachment,
+                        &endpoint_id,
                     )),
                 },
             )
@@ -307,20 +307,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // "A listener can have only one endpoint group in a specific Region"
-        // (`CreateEndpointGroup$EndpointGroupRegion`).
-        if let Some(existing) = group_arns.iter().find(|arn| {
+        // (`CreateEndpointGroup$EndpointGroupRegion`). The refusal is the fixed sentence
+        // the service states this conflict with
+        // ([`crate::state::ENDPOINT_GROUP_ALREADY_EXISTS_MESSAGE`]): it names neither the
+        // Region nor an ARN, so no generated identifier reaches it.
+        if group_arns.iter().any(|arn| {
             store
                 .endpoint_groups
-                .get(*arn)
+                .get(arn)
                 .is_some_and(|group| group.endpoint_group_region == input.endpoint_group_region)
         }) {
             return Err(
                 CreateEndpointGroupErrorModeled::EndpointGroupAlreadyExistsException(
                     EndpointGroupAlreadyExistsException {
-                        message: Some(format!(
-                            "endpoint group {existing} already covers Region {} for listener {}",
-                            input.endpoint_group_region, input.listener_arn
-                        )),
+                        message: Some(
+                            crate::state::ENDPOINT_GROUP_ALREADY_EXISTS_MESSAGE.to_string(),
+                        ),
                     },
                 )
                 .into(),
