@@ -85,6 +85,7 @@ pub mod acme_http;
 pub mod acme_jws;
 pub mod acme_role_trust;
 pub mod authorization;
+mod clause_values;
 mod enum_value_sets;
 
 use smithy_server_runtime::{
@@ -103,18 +104,17 @@ use ::aws_smithy_schema_server::constraints::{
 /// and a message without its matching code is worse than leaving both alone.
 const VALIDATION_EXCEPTION: &str = "ValidationException";
 
-/// How ACM names the subject of a constraint clause: the POSITION in the input that
-/// failed, and never the value submitted there.
+/// How ACM names the subject of a constraint clause at a position it states WITHOUT the
+/// value submitted there: the POSITION in the input that failed, and nothing else.
 ///
-/// The phrase is FIXED text — the member path is the only part of a clause that comes
-/// from the request — so a refusal reflects no request content back at a caller or into
-/// its logs. It is the subject of every recorded refusal of this class, at every
-/// position: a malformed resource identifier, a request token outside its pattern, a tag
-/// key or value outside its charset, a collection past its own bound, a list element
-/// outside its element constraint set, and a filter value outside its enum. The one
-/// position that reads differently is a member the request never sent
-/// ([`ABSENT_SUBJECT`]), where there is no submitted value to withhold in the first
-/// place.
+/// The phrase is FIXED text — the member path is the only part of such a clause that comes
+/// from the request. It is the subject of the positions this service does not reflect a
+/// caller's text back from — a resource identifier, a request token, a tag key or value, a
+/// value set — and of the positions the validating walk kept no submitted text for, a
+/// collection among them; [`clause_values`] owns that reading and states why each class
+/// withholds. Every OTHER position quotes the text the request carried there
+/// ([`quoted_subject`]), and a member the request never sent reads as absent
+/// ([`ABSENT_SUBJECT`]), there being no submitted text at it to state either way.
 const SUBJECT: &str = "Value of the input at";
 
 /// How the subject reads when the member was ABSENT, which is the cross-service
@@ -132,8 +132,8 @@ const ABSENT_SUBJECT: &str = "Value null at";
 /// declared, but it owns only which value a clause echoes, not these, so they are
 /// inlined here as they are in the other service crates that word their own
 /// refusals. The migration that moves them there owns this copy too. (Which value a
-/// clause echoes is not a question this service has: it echoes none — see
-/// [`SUBJECT`].)
+/// clause echoes is this service's own question, answered per POSITION — see
+/// [`clause_values`].)
 ///
 /// Returns `None` for a violation class this service has no wording for, which
 /// lets [`constraint_envelope`] decline the whole refusal and keep the
@@ -205,7 +205,7 @@ fn enum_value_set<S: AsRef<str>>(allowed: &[S]) -> String {
 pub(crate) fn enum_value_refusal(path: &str, allowed: &[&str]) -> String {
     one_error_envelope(&format!(
         "{} failed to satisfy constraint: {}",
-        clause_subject(path, true),
+        withheld_subject(path),
         enum_value_set(allowed)
     ))
 }
@@ -250,24 +250,47 @@ pub(crate) fn cross_account_arn_in_request_refusal() -> String {
     "Invalid ARN in request: Same account ARN expected but got cross-account ARN".to_string()
 }
 
-/// The subject a clause about `path` opens with: the position that failed
-/// ([`SUBJECT`]) when the request submitted a value there, and the absent-member form
-/// ([`ABSENT_SUBJECT`]) when it sent none.
+/// The subject a clause about `path` opens with, decided by what the request carried
+/// there.
 ///
-/// What the caller submitted is NOT part of the subject either way, so the walk's echo
-/// of it is read for its presence alone — which is the one thing the two subjects
-/// differ on.
-fn clause_subject(path: &str, submitted: bool) -> String {
-    if submitted {
-        format!("{SUBJECT} '{path}'")
-    } else {
-        format!("{ABSENT_SUBJECT} '{path}'")
+/// * nothing at all — the absent-member form ([`ABSENT_SUBJECT`]);
+/// * a value at a position this service states without it, or one the validating walk kept
+///   no submitted text for ([`clause_values`]) — the position alone ([`SUBJECT`]);
+/// * anything else — the text the request carried, quoted ([`quoted_subject`]), which is
+///   the only report a caller gets of which of its values was rejected.
+///
+/// A `@sensitive` member's value is withheld by the validating walk itself (it records the
+/// violation without it), so this never has one to quote: that redaction is the
+/// framework's and is not undone here.
+fn clause_subject(path: &str, violation: &Violation) -> String {
+    let Some(stored) = violation.value.as_deref() else {
+        return absent_subject(path);
+    };
+    if violation.sensitive || !clause_values::quotes_submitted_text(path, &violation.kind, stored) {
+        return withheld_subject(path);
     }
+    quoted_subject(path, stored)
+}
+
+/// The subject of a clause about a member the request never sent ([`ABSENT_SUBJECT`]).
+fn absent_subject(path: &str) -> String {
+    format!("{ABSENT_SUBJECT} '{path}'")
+}
+
+/// The subject of a clause that states the position alone ([`SUBJECT`]).
+fn withheld_subject(path: &str) -> String {
+    format!("{SUBJECT} '{path}'")
+}
+
+/// The subject of a clause that quotes what the request carried: the submitted text in
+/// single quotes, then the position it was carried at.
+fn quoted_subject(path: &str, submitted: &str) -> String {
+    format!("Value '{submitted}' at '{path}'")
 }
 
 /// Render one constraint violation the way this service states it: the input position
-/// that failed and the requirement it failed, and never the value submitted there
-/// ([`clause_subject`]).
+/// that failed, the text the request carried there where this service states it, and the
+/// requirement it failed ([`clause_subject`]).
 fn constraint_clause(violation: &Violation) -> Option<String> {
     let requirement = requirement(&violation.kind)?;
     // A failure of the collection's own ELEMENT is reported against the
@@ -278,18 +301,22 @@ fn constraint_clause(violation: &Violation) -> Option<String> {
     // value tripped over. An element set the model does not describe for that member
     // (a list nested inside a structure, an element with no constraints of its own)
     // keeps the single violated requirement, which is never wrong.
+    //
+    // Such a clause states the position alone: the position it names is the COLLECTION,
+    // which the request carried many values at rather than the one this violation was
+    // recorded for, so there is no submitted text of that position's own to quote.
     let (subject, requirement) = match collection_element(&violation.path) {
         Some(collection) => (
-            clause_subject(collection, violation.value.is_some()),
+            match violation.value {
+                Some(_) => withheld_subject(collection),
+                None => absent_subject(collection),
+            },
             format!(
                 "Member must satisfy constraint: [{}]",
                 element_constraint_set(collection).unwrap_or(requirement)
             ),
         ),
-        None => (
-            clause_subject(&violation.path, violation.value.is_some()),
-            requirement,
-        ),
+        None => (clause_subject(&violation.path, violation), requirement),
     };
     Some(format!(
         "{subject} failed to satisfy constraint: {requirement}"
@@ -616,9 +643,11 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // service reword it.
         //
         // ACM states a member-constraint failure against the INPUT POSITION that
-        // failed and the constraint it failed, and never against the value
-        // submitted there ([`SUBJECT`]) — a member the request did not send reads
-        // as absent instead ([`ABSENT_SUBJECT`]). A `@pattern`
+        // failed, the text the request carried there, and the constraint it failed
+        // — a member the request did not send reads as absent instead
+        // ([`ABSENT_SUBJECT`]), and the positions this service states without the
+        // submitted text keep the position-only subject ([`SUBJECT`],
+        // [`clause_values`]). A `@pattern`
         // requirement names the expression without the model's `^` / `$`
         // anchoring, and an enum's value set is listed in the order this service
         // states that enum's values in. The code stays the modeled

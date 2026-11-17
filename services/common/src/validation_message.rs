@@ -203,6 +203,26 @@ pub fn list_item_count(stored: &str) -> Option<usize> {
     collection_size(stored, " items")
 }
 
+/// How many bytes the framework's rendering of a BLOB member states, when `stored` is one.
+/// `None` for a collection's rendering and for a caller's own string.
+///
+/// The third rendering the walk writes in place of a value it has no text for, beside the two
+/// collection summaries above: a blob has no text rendering at all, so a clause about one
+/// states `<n> bytes` and nothing of its content. `pub` for the same reason [`list_item_count`]
+/// is — a service that reads a stored echo to tell one of the walk's own renderings from a
+/// caller's text has no other means to tell this one, and two services must not disagree about
+/// which is which.
+///
+/// Read as the walk's rendering only when the count it states EXCEEDS the text stating it,
+/// which is the discipline [`crate::validation::named_byte_count`] applies to the elision
+/// marker and for the same reason: `4096 bytes` summarises a blob, while `5 bytes` is seven
+/// characters a caller sent.
+#[must_use]
+pub fn blob_byte_count(stored: &str) -> Option<usize> {
+    let named = collection_size(stored, " bytes")?;
+    (named > stored.len()).then_some(named)
+}
+
 /// Which COLLECTION a `@length` violation is about, and how much of it the request
 /// carried.
 ///

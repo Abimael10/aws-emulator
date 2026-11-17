@@ -7,9 +7,9 @@
 //! collection, or anything reached through one: a pair's key, a pair's value, an entry of
 //! a key list — names that position and NOT the text submitted there
 //! (`Value of the input at '<member path>' failed to satisfy constraint: <requirement>`),
-//! which is the subject ACM states EVERY position with: a position off the tag surface
-//! reads the same way, so no caller-supplied text reaches a message wherever it came
-//! from.
+//! so no tag text a caller composed reaches a message wherever it came from. A position
+//! OFF the tag surface quotes what the request carried there, which is
+//! [`crate::refusal_message_templates`]'s rule and the contrast this one stands against.
 //!
 //! The tables below span what the rule generalises over rather than the one request a
 //! trace recorded:
@@ -27,9 +27,7 @@
 //!   `TagValue`'s `@length` maxima, and `TagList`'s own maximum;
 //! * the text classes the `@pattern` excludes, including one that is not renderable at
 //!   all (an emoji, Unicode category `So`) and a control character — the values whose
-//!   echo would land in a log;
-//! * the rows OFF the tag surface, which state the position alike — an integer member
-//!   and a string member of a nested structure.
+//!   echo would land in a log.
 //!
 //! The envelope itself (`N validation error(s) detected: `), the unanchored `@pattern`
 //! rendering and the absent-member subject have their own suite in
@@ -263,28 +261,6 @@ fn rows(endpoint: &str, certificate: &str) -> Vec<Row> {
             requirement: pattern_requirement(),
             submitted: "prod|1".to_string(),
         },
-        // The rows OFF the tag surface: they state the position the same way, so the
-        // rule above is the service's one subject rather than the tag surface's own.
-        Row {
-            what: "an integer member off the tag surface, below its range minimum".to_string(),
-            operation: "ListCertificates",
-            body: json!({ "MaxItems": 0 }),
-            path: "maxItems",
-            requirement: "Member must have value greater than or equal to 1".to_string(),
-            submitted: "0".to_string(),
-        },
-        Row {
-            what: "a string member off the tag surface, outside its pattern".to_string(),
-            operation: "CreateAcmeDomainValidation",
-            body: json!({
-                "AcmeEndpointArn": endpoint,
-                "DomainName": "withheld.example.com",
-                "PrevalidationOptions": { "DnsPrevalidation": { "HostedZoneId": "zone-1" } },
-            }),
-            path: "prevalidationOptions.dnsPrevalidation.hostedZoneId",
-            requirement: "Member must satisfy regular expression pattern: Z[A-Z0-9]+".to_string(),
-            submitted: "zone-1".to_string(),
-        },
     ];
 
     // Every excluded text class, on the value and on the key of a generic tag pair, and
@@ -330,7 +306,7 @@ fn rows(endpoint: &str, certificate: &str) -> Vec<Row> {
 }
 
 /// RULE: a clause about a position on ACM's tag surface names the position and withholds
-/// the text submitted there — as a clause about a position off that surface does too.
+/// the text submitted there.
 #[tokio::test]
 async fn a_tag_surface_clause_names_the_position_and_withholds_the_text() {
     let router = router();

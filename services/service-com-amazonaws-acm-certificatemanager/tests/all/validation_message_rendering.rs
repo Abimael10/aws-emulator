@@ -9,11 +9,12 @@
 //! 1. ACM states every member-constraint failure as
 //!    `<subject> failed to satisfy constraint: <modelled requirement>`, joined into
 //!    the AWS envelope (`N validation error(s) detected: `). The subject names the
-//!    input POSITION that failed and NOTHING the request submitted there
-//!    (`Value of the input at '<member path>'`): the member path is the only part of a
-//!    clause that comes from the request, so no caller-supplied text is reflected back
-//!    — at any position, of any constraint class, at any depth. A member the request
-//!    never sent has no value to withhold and reads `Value null at '<path>'` instead.
+//!    input POSITION that failed and the text the request carried there
+//!    (`Value '<the submitted text>' at '<member path>'`) — except at the positions this
+//!    service states without that text (`Value of the input at '<member path>'`): a
+//!    resource identifier, a request token, tag content, a value set, and a position the
+//!    validating walk kept no submitted text for, a collection among them. A member the
+//!    request never sent reads `Value null at '<path>'` instead.
 //!    A `@pattern` requirement
 //!    reports the expression without the model's `^` / `$` anchoring, an enum's value
 //!    set is listed in the order this service states that enum's values in, and a
@@ -23,8 +24,10 @@
 //!    two of them is still one clause and one error.
 //!    The table spans the constraint kinds (`@required`, `@length` on a string and
 //!    on a list, `@range`, `@pattern`, `@enum`), the member depth (a top-level
-//!    member, a collection element, and a member of a collection element), both
+//!    member, a collection element, and a member of a collection element), all three
 //!    subjects, several operations, and the one- and many-clause envelopes.
+//!    WHICH positions quote their text and which do not is
+//!    [`crate::refusal_message_templates`]'s own rule and is not restated here.
 //! 2. `ListCertificates` refuses a request that names exactly one of
 //!    `SortBy` / `SortOrder` with the sentence for that paired-parameter rule.
 //! 3. `RequestCertificate` refuses a `DomainValidationOptions` entry naming a domain
@@ -41,8 +44,8 @@ use serde_json::{json, Value};
 
 use crate::certificate_lifecycle::{call, describe, error_code, router, ACCOUNT, REGION};
 
-/// How ACM names the subject of a constraint clause: the input position, never the
-/// submitted value.
+/// How ACM names the subject of a clause at a position whose submitted text it does not
+/// state.
 const WITHHOLDING_SUBJECT: &str = "Value of the input at";
 
 /// How the subject reads for a member the request never sent, which has no submitted
@@ -50,14 +53,16 @@ const WITHHOLDING_SUBJECT: &str = "Value of the input at";
 /// rule).
 const ABSENT_SUBJECT: &str = "Value null at";
 
-/// Which of the two subjects a row's clauses open with.
+/// Which of the three subjects a row's clauses open with.
 #[derive(Clone, Copy)]
 enum Subject {
-    /// The position alone, which is what EVERY position a request submitted a value at
-    /// states.
+    /// The position alone, which is what the positions this service states without a
+    /// submitted text read as.
     Withheld,
     /// The absent-member form, for a member the request never sent.
     Absent,
+    /// The text the request carried at the position, quoted in front of it.
+    Quoted(&'static str),
 }
 
 impl Subject {
@@ -66,6 +71,7 @@ impl Subject {
         match self {
             Subject::Withheld => format!("{WITHHOLDING_SUBJECT} '{path}'"),
             Subject::Absent => format!("{ABSENT_SUBJECT} '{path}'"),
+            Subject::Quoted(submitted) => format!("Value '{submitted}' at '{path}'"),
         }
     }
 }
@@ -318,23 +324,23 @@ fn cases() -> Vec<Case<'static>> {
             what: "an integer member below its @range minimum",
             operation: "ListCertificates",
             body: json!({ "MaxItems": 0 }),
-            subject: Subject::Withheld,
+            subject: Subject::Quoted("0"),
             clauses: vec![(
                 "maxItems",
                 "Member must have value greater than or equal to 1".to_string(),
             )],
-            withheld: vec!["0"],
+            withheld: vec![],
         },
         Case {
             what: "an integer member above its @range maximum",
             operation: "ListCertificates",
             body: json!({ "MaxItems": 1001 }),
-            subject: Subject::Withheld,
+            subject: Subject::Quoted("1001"),
             clauses: vec![(
                 "maxItems",
                 "Member must have value less than or equal to 1000".to_string(),
             )],
-            withheld: vec!["1001"],
+            withheld: vec![],
         },
         // An ABSENT required member: the one subject that is not the withholding form,
         // since there is no submitted value to withhold.
@@ -527,9 +533,9 @@ async fn a_whole_envelope_is_pinned_as_a_literal() {
 
 /// RULE: ACM states every member-constraint failure against the input POSITION that
 /// failed and the requirement the model declares there — one clause per violation in the
-/// AWS envelope, with nothing the caller submitted echoed into it, an enum's value set
-/// in the order the service states it, and a `@pattern` reported without the model's
-/// anchors.
+/// AWS envelope, with the submitted text quoted where this service states it, an enum's
+/// value set in the order the service states it, and a `@pattern` reported without the
+/// model's anchors.
 #[tokio::test]
 async fn every_constraint_failure_is_stated_against_the_input_position() {
     let router = router();
