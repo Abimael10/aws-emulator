@@ -1,15 +1,54 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetFinding
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetFinding`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetFinding::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports ONE external-access finding of the analyzer the request names: the finding whose
+//! `id` the request carries, out of the same analysis `ListFindings` reports in full.
+//!
+//! A finding whose access is still granted is COMPUTED from the resource-based policies this
+//! emulator holds for the resources of the analyzer's own account
+//! ([`crate::state::monitored_resources`]) by the crate's ONE external-access analysis
+//! ([`crate::state::external_access_findings`]), and the one the request names is projected
+//! onto the single-finding shape by [`crate::state::finding_detail`] — so a finding a listing
+//! reports and the same finding read here cannot disagree about any member, and the id is
+//! DERIVED from what it identifies ([`crate::state::derived_uuid`]) rather than minted, which
+//! is what lets a listing's id be read back here.
+//!
+//! A finding whose access is no longer granted is the analyzer's own RECORD of it
+//! ([`crate::state::ReportedFinding`]), reported `RESOLVED`: the analyzer has been analyzing
+//! since it was created, so the comparison of its last analysis with the account's policies
+//! as they are now is owed whatever a caller does, and this read materialises it
+//! ([`crate::state::reconcile_reported_findings`]) rather than claiming the analyzer never
+//! reported the finding. Nothing else about a finding is stored, and reconciling twice over
+//! the same policies records nothing further, so two reads of one finding report the same
+//! finding.
+//!
+//! ## What is reported
+//!
+//! * `analyzerArn` must name a stored analyzer (404 otherwise), and that analyzer must be an
+//!   EXTERNAL access analyzer: "GetFinding is supported only for external access analyzers.
+//!   You must use GetFindingV2 for internal and unused access analyzers", so a request naming
+//!   an analyzer of the unused-access or internal-access family is refused with the service's
+//!   fixed `ValidationException` for an unsupported action rather than answered with a finding
+//!   it does not report.
+//! * `id` must identify a finding THAT analyzer reports: one of its current analysis, or one
+//!   it reported before whose access has since been resolved. An id it reports nothing under
+//!   — one that was never a finding of this analyzer, and one of another analyzer — is the
+//!   modelled `ResourceNotFoundException` (404), never an empty success: `finding` is an
+//!   optional member, and answering 200 without it would claim the analyzer reports a finding
+//!   with nothing in it.
+//!
+//! ## What bounds the work
+//!
+//! The findings are not stored, so every call re-derives the account's findings to find the
+//! one the request names. That analysis is bounded exactly as a findings listing is: at most
+//! [`crate::state::MAX_MONITORED_RESOURCES`] resources read, at most
+//! [`MAX_ANALYZER_FINDINGS`] findings, and at most [`MAX_ANALYSIS_UNITS`] units of work
+//! charged for every policy read, statement visited, principal considered and string copied
+//! into a finding. A call past either ceiling is refused with the modelled
+//! `ValidationException` naming the member to change rather than run. The analysis runs on
+//! the blocking pool with every store lock already released, exactly as `ListFindings` and
+//! `GetAnalyzedResource` run theirs.
 //!
 //! ## Shape of an operation
 //!
@@ -76,6 +115,10 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+
+// What bounds one call's analysis, shared with every other analysis in this crate so no
+// two of them answer the same question differently.
+use crate::state::Budget;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -149,18 +192,162 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetFinding` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetFindingErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetFinding"))
+        // The finding is a function of the account's stored resource policies, the analyzer's
+        // own record of what it has reported and the clock, so nothing of the request
+        // metadata is consulted: what this call writes is the analysis the analyzer owes
+        // (below), never anything about the caller.
+        let _ = ctx;
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            GetFindingErrorModeled::InternalServerException(crate::state::store_unavailable())
+        })?;
+        // The analyzer is read under this service's lock, which is RELEASED (the block ends
+        // here) before any other store is read or any analysis runs.
+        let (analyzer_arn, analyzer_created_at) = {
+            let state = state.lock();
+
+            // Fixed text, the ARN the caller named in the modelled `resourceId`: every
+            // resource-scoped refusal in this service goes through `crate::state`'s
+            // constructors.
+            let analyzer = state.analyzer_by_arn(&input.analyzer_arn).ok_or_else(|| {
+                GetFindingErrorModeled::ResourceNotFoundException(crate::state::analyzer_not_found(
+                    &input.analyzer_arn,
+                ))
+            })?;
+
+            // "GetFinding is supported only for external access analyzers. You must use
+            // GetFindingV2 for internal and unused access analyzers" — an analyzer of either
+            // configured family reports no external access, so the request is refused rather
+            // than answered with a 404 for an id that analyzer could never have reported.
+            // The refusal is about the analyzer the request names rather than about one
+            // malformed member, so it carries no `fieldList` and its message is the service's
+            // fixed text for an unsupported action, the same one `ListFindings` and
+            // `GetAnalyzedResource` refuse that family with.
+            if analyzer.configured_access().is_some() {
+                return Err(GetFindingErrorModeled::ValidationException(
+                    crate::state::unsupported_action_exception(),
+                )
+                .into());
+            }
+
+            (analyzer.arn.clone(), analyzer.created_at)
+        };
+
+        // The zone of trust of an account analyzer is the account it monitors and the Region
+        // it monitors it in, both of which its own ARN names; the resources of that account
+        // are read out of the services that own them, each under its own lock and none of
+        // them held past the read.
+        let resources = crate::state::monitored_resources(&*self.engine, &analyzer_arn);
+
+        // Deriving the account's findings reads documents, allocates findings and copies
+        // strings, so it is CPU-bound: it runs on the blocking pool, the way `ListFindings`
+        // sends its own analysis there, under ONE budget of [`MAX_ANALYSIS_UNITS`], with
+        // every store lock already released.
+        let analysis_arn = analyzer_arn.clone();
+        let derived = ::tokio::task::spawn_blocking(move || {
+            let mut budget = Budget::new(MAX_ANALYSIS_UNITS);
+            crate::state::external_access_findings(
+                &analysis_arn,
+                analyzer_created_at,
+                &resources,
+                MAX_ANALYZER_FINDINGS,
+                &mut budget,
+            )
+        })
+        .await;
+
+        let derived = match derived {
+            Ok(Ok(derived)) => derived,
+            // The account's policies are analyzable, but finding the one this call asks for
+            // would cost more than this emulator spends on one call: refused, naming the
+            // request member at fault, rather than allocating further.
+            Ok(Err(exhausted)) => {
+                ::tracing::info!(
+                    operation = Self::NAME,
+                    refusal = "budget",
+                    "refused a finding read past this emulator's analysis ceiling"
+                );
+                return Err(GetFindingErrorModeled::ValidationException(
+                    crate::state::field_validation_exception(exhausted.member, exhausted.detail),
+                )
+                .into());
+            }
+            // A panic or a cancellation on the pool says nothing about the account's
+            // policies, so it is reported as the server fault it is rather than as a finding
+            // the analyzer does not report.
+            Err(error) => {
+                ::tracing::error!(
+                    operation = Self::NAME,
+                    error = %error,
+                    "the external access analysis did not complete"
+                );
+                return Err(GetFindingErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: "the external access analysis did not complete".to_string(),
+                        retry_after_seconds: None,
+                    },
+                )
+                .into());
+            }
+        };
+
+        // The analyzer has been analyzing since it was created, so the comparison of its
+        // last analysis with the account's policies as they are now is owed whatever this
+        // call does: it is materialised here, which is what makes a finding whose access is
+        // no longer granted answer as the resolved finding it is rather than as an id this
+        // analyzer never reported. Reconciling twice over the same policies records nothing
+        // further, so this read reports what the read before it did.
+        let reported = {
+            let mut state = state.lock();
+            let analyzer = state.analyzer_by_arn_mut(&analyzer_arn).ok_or_else(|| {
+                GetFindingErrorModeled::ResourceNotFoundException(crate::state::analyzer_not_found(
+                    &input.analyzer_arn,
+                ))
+            })?;
+            crate::state::reconcile_reported_findings(
+                &mut analyzer.reported_findings,
+                derived,
+                ::std::time::SystemTime::now(),
+            )
+        };
+
+        // The id identifies ONE finding of this analyzer: the record's own finding, projected
+        // onto the single-finding shape rather than derived a second time. An id the analyzer
+        // reports nothing under is the modelled 404, naming the id in `resourceId`, rather
+        // than a success carrying no finding.
+        reported
+            .into_iter()
+            .find(|(_, finding)| finding.id == input.id)
+            .map(|(_, finding)| GetFindingOutput {
+                finding: Some(crate::state::finding_detail(finding)),
+            })
+            .ok_or_else(|| {
+                GetFindingErrorModeled::ResourceNotFoundException(crate::state::finding_not_found(
+                    &input.id,
+                ))
+                .into()
+            })
     }
 }
+
+// ---------------------------------------------------------------------------
+// What one call of this operation may spend
+// ---------------------------------------------------------------------------
+
+/// How many findings this emulator will derive while looking for the one this call names.
+///
+/// A finding whose access is still granted is not stored, so every call re-derives it; this
+/// is the emulator's OWN ceiling on that work, the same one a findings listing applies to the
+/// whole account — the policy parser bounds each factor (document bytes, statements, element
+/// values) but not their PRODUCT, and it is the product that decides how many findings exist.
+const MAX_ANALYZER_FINDINGS: usize = 1_000;
+
+/// How much work ONE call's analysis may spend: reading the account's policies and deriving
+/// their findings, under one ceiling.
+///
+/// A unit is one policy read, one statement visited, one principal considered or one string
+/// copied into a finding — so this bounds the allocation and the byte-level work of the
+/// analysis in the PRODUCT of its factors rather than in each factor alone, whatever the
+/// account's stored policies look like. The counterpart of the ceiling `ListFindings` and
+/// `GetAnalyzedResource` spend on theirs.
+const MAX_ANALYSIS_UNITS: u64 = 500_000;

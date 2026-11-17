@@ -12,10 +12,12 @@
 //! Nothing of the analysis is stored here. The policies are read from the service that
 //! OWNS each resource on every read ([`monitored_resources`]), so there is no second copy
 //! of a policy to drift from the one that service reports, and the findings are derived
-//! from them on every read ([`external_access_findings`]) — which is what makes a reporting
-//! operation write nothing at all and two reads of one analyzer report the same findings
-//! with the same ids: the id is DERIVED from what it identifies ([`super::derived_uuid`])
-//! rather than minted.
+//! from them on every read ([`external_access_findings`]) — which is what makes two reads of
+//! one analyzer report the same findings with the same ids: the id is DERIVED from what it
+//! identifies ([`super::derived_uuid`]) rather than minted. The one thing about a finding
+//! that no policy states, because a removed grant is no longer in one, is that the analyzer
+//! REPORTED it: that is the analyzer's own ledger ([`super::ReportedFinding`]), which is what
+//! lets a finding whose access is gone be reported resolved.
 //!
 //! ## What is analyzed
 //!
@@ -54,17 +56,17 @@ use std::time::SystemTime;
 
 use super::{derived_uuid, resource_owner_account};
 use crate::ops::check_no_new_access::policy;
-use crate::ops::types::{AnalyzedResource, FindingSource, FindingSummary};
+use crate::ops::types::{AnalyzedResource, Finding, FindingSource, FindingSummary};
 
-/// The `FindingStatus` a reported external-access finding carries: `ACTIVE`, the status of
-/// a finding whose access the resource's policy still grants and which no archive rule has
-/// archived. One of the model's [`crate::ops::types::FINDING_STATUS_VALUES`].
+/// The `FindingStatus` a reported external-access finding carries while the access it
+/// reports is still granted: `ACTIVE`, the status of a finding no archive rule has archived.
+/// One of the model's [`crate::ops::types::FINDING_STATUS_VALUES`].
 ///
 /// `ARCHIVED` is what an archive rule produces (`ApplyArchiveRule` is itself still
 /// scaffolded, with an issue of its own) and `RESOLVED` what a finding whose access was
-/// removed carries; the analysis holds no record of an access that is no longer granted, so
-/// a grant this emulator cannot read in a stored policy any more reports no finding rather
-/// than a resolved one.
+/// removed carries: the analysis derives a finding only from a grant it can still read in a
+/// stored policy, so a resolved finding is reported from the analyzer's own record of the
+/// finding it reported before ([`super::ReportedFinding`]) rather than from the policy.
 pub const FINDING_STATUS_ACTIVE: &str = "ACTIVE";
 
 /// The `ResourceType` of an IAM role's finding, from the model's
@@ -506,6 +508,33 @@ pub fn external_access_findings(
     }
     findings.sort_by(|left, right| left.0.cmp(&right.0));
     Ok(findings)
+}
+
+/// ONE finding of the analysis, as an operation that reports a single finding returns it.
+///
+/// `Finding` and `FindingSummary` are the same fifteen members (`smithy_query(query="shape",
+/// shape="Finding,FindingSummary")`) — the model's two names for one finding, one for a
+/// listing's entry and one for a single-finding read — so what a read of one finding reports
+/// is the analysis' own finding, PROJECTED rather than derived a second time: a finding a
+/// listing reports and the same finding read on its own cannot disagree about any member.
+pub fn finding_detail(finding: FindingSummary) -> Finding {
+    Finding {
+        id: finding.id,
+        principal: finding.principal,
+        action: finding.action,
+        resource: finding.resource,
+        is_public: finding.is_public,
+        resource_type: finding.resource_type,
+        condition: finding.condition,
+        created_at: finding.created_at,
+        analyzed_at: finding.analyzed_at,
+        updated_at: finding.updated_at,
+        status: finding.status,
+        resource_owner_account: finding.resource_owner_account,
+        error: finding.error,
+        sources: finding.sources,
+        resource_control_policy_restriction: finding.resource_control_policy_restriction,
+    }
 }
 
 /// What the analyzer reports ABOUT one resource it analyzed: the resource itself, and its

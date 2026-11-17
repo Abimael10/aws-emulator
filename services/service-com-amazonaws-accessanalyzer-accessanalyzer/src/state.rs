@@ -40,6 +40,11 @@ pub use external_access::*;
 mod analyzed_trails;
 pub use analyzed_trails::*;
 
+/// The findings an analyzer HAS REPORTED: the one thing about a finding that cannot be read
+/// back out of today's policies, which is what makes a resolved finding reportable.
+mod reported_findings;
+pub use reported_findings::*;
+
 use crate::ops::types::{
     AccessPreview, AccessPreviewStatusReason, AnalyzerConfiguration, AnalyzerSummary,
     ArchiveRuleSummary, CloudTrailProperties, Configuration, ConflictException, Criterion,
@@ -91,6 +96,10 @@ pub const ARCHIVE_RULE_RESOURCE_TYPE: &str = "archive-rule";
 
 /// The `resourceType` an access-preview-scoped `ResourceNotFoundException` reports.
 pub const ACCESS_PREVIEW_RESOURCE_TYPE: &str = "access-preview";
+
+/// The `resourceType` a finding-scoped `ResourceNotFoundException` reports: the kind of
+/// resource a `FindingId` identifies.
+pub const FINDING_RESOURCE_TYPE: &str = "finding";
 
 /// The only `Type` an access preview can be created against: the account
 /// external-access analyzer. `CreateAccessPreview$analyzerArn` documents it — "You can
@@ -262,6 +271,24 @@ pub fn archive_rule_quota_exceeded(rule_name: &str) -> ServiceQuotaExceededExcep
         message: ARCHIVE_RULE_QUOTA_EXCEEDED_MESSAGE.to_string(),
         resource_id: rule_name.to_string(),
         resource_type: ARCHIVE_RULE_RESOURCE_TYPE.to_string(),
+    }
+}
+
+/// The fixed `message` of a `ResourceNotFoundException` for a finding the named analyzer
+/// does not report — an id that identifies no finding of this analyzer's analysis, one that
+/// identifies a finding of a DIFFERENT analyzer, and one whose access the resource's policy
+/// no longer grants are the same refusal, so they carry the same text. Same provenance as
+/// [`ARCHIVE_RULE_NOT_FOUND_MESSAGE`]: what the model fixes is that the text is CONSTANT and
+/// that the identifier travels in `resourceId`.
+pub const FINDING_NOT_FOUND_MESSAGE: &str = "Finding not found";
+
+/// The 404 for a finding the analyzer does not report: fixed text, the `id` the caller named
+/// in the modelled `resourceId`/`resourceType` members.
+pub fn finding_not_found(finding_id: &str) -> ResourceNotFoundException {
+    ResourceNotFoundException {
+        message: FINDING_NOT_FOUND_MESSAGE.to_string(),
+        resource_id: finding_id.to_string(),
+        resource_type: FINDING_RESOURCE_TYPE.to_string(),
     }
 }
 
@@ -537,6 +564,18 @@ pub struct Analyzer {
     /// the SAME request answers with the first id instead of previewing twice.
     /// Bounded; see [`ClientTokens`].
     pub access_preview_tokens: ClientTokens<String>,
+    /// Every external-access finding this analyzer has reported, keyed by the position in
+    /// the analysis it is about (resource, then statement, then principal) — the same key
+    /// the finding's id is derived from.
+    ///
+    /// The findings themselves are NOT stored here: a finding whose access the account's
+    /// policies still grant is derived from those policies on every read
+    /// ([`external_access_findings`]). What this ledger holds is the finding's LIFECYCLE,
+    /// which no policy states — a finding the analyzer reported for an access that is no
+    /// longer granted is `RESOLVED` rather than gone — and it is reconciled against the
+    /// analysis by [`reconcile_reported_findings`]. Ordered by that key for the same paging
+    /// reason as `analyzers`.
+    pub reported_findings: BTreeMap<String, ReportedFinding>,
 }
 
 /// Which `AnalyzerConfiguration` union member an analyzer's `type` configures.

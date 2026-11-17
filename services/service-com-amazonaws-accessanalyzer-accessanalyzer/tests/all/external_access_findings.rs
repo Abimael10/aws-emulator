@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! End-to-end coverage of `ListFindings`, driven over the wire.
+//! End-to-end coverage of the external-access findings surface — `ListFindings` and
+//! `GetFinding` — driven over the wire.
 //!
 //! Every case here goes through the real router: an `http::Request` is dispatched to the
 //! mounted services, so the restJson1 routing, the boundary constraint validation, the
@@ -15,7 +16,9 @@
 //! OUTSIDE that account that an `Allow` statement of that policy grants access to — marked
 //! `isPublic` when the statement admits every principal with nothing in its `Condition`
 //! binding the caller — and none for a statement that grants nothing or grants only inside
-//! the account.
+//! the account. A finding has a LIFECYCLE: it is `ACTIVE` while the policy still grants the
+//! access, `RESOLVED` once it does not, and it is addressable by its own id either way, which
+//! reports the same finding the listing reports.
 //!
 //! The table spans the classes that rule generalises over: both resource types whose
 //! policy this emulator holds (an IAM role's trust policy, an S3 bucket's bucket policy),
@@ -33,7 +36,7 @@ use service_com_amazonaws_accessanalyzer_accessanalyzer::ops::types::{
 };
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::harness::is_timestamp;
+use crate::harness::{is_timestamp, label};
 
 /// The region every request is signed for; it is the region the analyzer's ARN carries.
 const REGION: &str = "us-east-1";
@@ -198,6 +201,21 @@ impl Emulator {
     /// `POST /finding` with the given request body.
     async fn list_findings(&self, body: Value) -> Reply {
         self.send("POST", "/finding", Some(body)).await
+    }
+
+    /// `GET /finding/{id}?analyzerArn=…`: the id is an `@httpLabel` and the analyzer ARN an
+    /// `@httpQuery` entry, both encoded the way an SDK encodes one.
+    async fn get_finding(&self, analyzer_arn: &str, id: &str) -> Reply {
+        self.send(
+            "GET",
+            &format!(
+                "/finding/{}?analyzerArn={}",
+                label(id),
+                label(analyzer_arn)
+            ),
+            None,
+        )
+        .await
     }
 
     /// One awsQuery call to IAM.
@@ -777,8 +795,11 @@ async fn a_findings_condition_reports_the_statements_condition_keys() {
 /// A read of the findings reports the same findings as the one before it: the analysis is a
 /// function of the stored policies, so nothing about reading it moves.
 ///
-/// And when the trust is NARROWED through IAM, the next read reports the access the policy
-/// now grants — which for a trust that no longer names anyone outside the account is none.
+/// And when the trust is NARROWED through IAM, the next read reports the finding the analyzer
+/// already reported for the access that is gone as `RESOLVED` — a finding has a lifecycle, so
+/// an access the policy no longer grants resolves the finding about it rather than erasing
+/// it. Widening the trust again grants the access anew, and the finding is `ACTIVE` once
+/// more.
 #[tokio::test]
 async fn findings_follow_the_stored_policy_and_are_stable_across_reads() {
     let own = own_account();
@@ -814,9 +835,15 @@ async fn findings_follow_the_stored_policy_and_are_stable_across_reads() {
         "case \"two reads\": expected one finding, got {:?}",
         first.findings()
     );
+    let reported = first.findings()[0].clone();
+    let reported_id = reported
+        .get("id")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
 
-    // Narrow the trust to this account alone: the external access is gone, so no finding
-    // reports it any more.
+    // Narrow the trust to this account alone: the external access is gone, so the finding
+    // that reported it is resolved — same id, same access reported, `RESOLVED`.
     emulator
         .update_trust(
             "narrowed",
@@ -827,12 +854,58 @@ async fn findings_follow_the_stored_policy_and_are_stable_across_reads() {
     let narrowed = emulator
         .list_findings(json!({"analyzerArn": analyzer}))
         .await;
+    let resolved = narrowed.findings();
     assert_eq!(
-        narrowed.findings(),
-        Vec::<Value>::new(),
-        "case \"narrowed\": a trust naming only this account grants no external access, \
-         got {:?}",
-        narrowed.findings()
+        resolved.len(),
+        1,
+        "case \"narrowed\": the finding the analyzer reported is resolved, not erased, got \
+         {resolved:?}"
+    );
+    assert_eq!(
+        (
+            resolved[0].get("id").and_then(Value::as_str),
+            resolved[0].get("status").and_then(Value::as_str),
+            resolved[0].get("principal"),
+            resolved[0].get("action"),
+        ),
+        (
+            Some(reported_id.as_str()),
+            Some("RESOLVED"),
+            reported.get("principal"),
+            reported.get("action"),
+        ),
+        "case \"narrowed\": a trust that no longer names anyone outside the account resolves \
+         the finding it granted, keeping its id and what it reported, got {resolved:?} after \
+         {reported:?}"
+    );
+
+    // Widen it again: the access is granted anew, so the finding is active again.
+    emulator
+        .update_trust(
+            "widened again",
+            "stable-role",
+            &trust(json!({"AWS": format!("arn:aws:iam::{EXTERNAL_ACCOUNT}:root")})),
+        )
+        .await;
+    let widened = emulator
+        .list_findings(json!({"analyzerArn": analyzer}))
+        .await;
+    let active = widened.findings();
+    assert_eq!(
+        (
+            active.len(),
+            active
+                .first()
+                .and_then(|finding| finding.get("status"))
+                .and_then(Value::as_str),
+            active
+                .first()
+                .and_then(|finding| finding.get("id"))
+                .and_then(Value::as_str),
+        ),
+        (1, Some("ACTIVE"), Some(reported_id.as_str())),
+        "case \"widened again\": the access is granted once more, so the finding about it is \
+         active again, got {active:?}"
     );
 }
 
@@ -1140,5 +1213,345 @@ async fn refusals_name_what_the_caller_has_to_change() {
         "Unsupported operation",
         "case \"an unused access analyzer\": expected the fixed unsupported-action text, \
          got {refused:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// `GetFinding`: ONE finding of the same analysis, addressed by its id
+// ---------------------------------------------------------------------------
+
+/// RULE: a finding the analyzer reports is addressable by its own id — a read of it reports
+/// the SAME finding the listing reports, member for member, whatever the finding is about.
+///
+/// The rows differ along what the rule generalises over: the resource type whose policy
+/// granted the access (an IAM role's trust policy, an S3 bucket's bucket policy), the
+/// principal form the grant names (an account root ARN, a bare account id, a role ARN, the
+/// `*` wildcard), the number of actions it allows, and whether the statement carries a
+/// `Condition` — one row per finding the analyzer reports, each read back by its id.
+#[tokio::test]
+async fn every_finding_the_analyzer_reports_is_read_back_by_its_id() {
+    let emulator = Emulator::new();
+    let analyzer = emulator
+        .analyzer("read back", "read-back-analyzer", "ACCOUNT")
+        .await;
+    // One resource per class the rule spans, so the listing reports several findings that
+    // differ in resource type, principal form, action count and condition.
+    emulator
+        .create_role(
+            "read back",
+            "read-back-root",
+            &trust(json!({"AWS": format!("arn:aws:iam::{EXTERNAL_ACCOUNT}:root")})),
+        )
+        .await;
+    emulator
+        .create_role("read back", "read-back-account", &trust(json!({"AWS": OTHER_ACCOUNT})))
+        .await;
+    emulator
+        .create_role(
+            "read back",
+            "read-back-role",
+            &trust(json!({"AWS": format!("arn:aws:iam::{EXTERNAL_ACCOUNT}:role/peer")})),
+        )
+        .await;
+    emulator
+        .create_role("read back", "read-back-public", &trust(json!("*")))
+        .await;
+    emulator
+        .create_bucket(
+            "read back",
+            "read-back-bucket",
+            &policy(
+                "Allow",
+                json!({"AWS": EXTERNAL_ACCOUNT}),
+                json!(["s3:GetObject", "s3:PutObject"]),
+                Some("arn:aws:s3:::read-back-bucket/*"),
+                Some(json!({"StringEquals": {"aws:PrincipalOrgID": "o-abc123"}})),
+            ),
+        )
+        .await;
+
+    let listed = emulator
+        .list_findings(json!({"analyzerArn": analyzer}))
+        .await;
+    let findings = listed.findings();
+    assert_eq!(
+        findings.len(),
+        5,
+        "the fixture grants five external accesses, so the listing reports five findings, \
+         got {findings:?}"
+    );
+
+    for finding in &findings {
+        let case = finding
+            .get("resource")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        let id = finding
+            .get("id")
+            .and_then(Value::as_str)
+            .unwrap_or_else(|| panic!("case {case:?}: expected an id in {finding:?}"));
+        let read = emulator.get_finding(&analyzer, id).await;
+        assert_eq!(
+            read.status, 200,
+            "case {case:?}: GetFinding must answer 200 for an id the listing reported, got \
+             {read:?}"
+        );
+        assert_eq!(
+            read.member("finding"),
+            Some(finding),
+            "case {case:?}: expected the finding the listing reports, got {read:?}"
+        );
+        // And reading it again reports the same finding: a read of a finding changes none of
+        // it.
+        let again = emulator.get_finding(&analyzer, id).await;
+        assert_eq!(
+            again.member("finding"),
+            Some(finding),
+            "case {case:?}: a second read must report the same finding, got {again:?}"
+        );
+    }
+}
+
+/// RULE: a finding has a lifecycle — while the access it reports is granted it is `ACTIVE`,
+/// once the policy no longer grants that access the finding the analyzer reported is
+/// `RESOLVED` (same id, same access reported), and if the access is granted again the finding
+/// is `ACTIVE` once more.
+///
+/// The rows are the steps of that lifecycle, each driven through the policy's OWN service:
+/// granted, removed, granted again.
+#[tokio::test]
+async fn a_finding_resolves_when_its_access_is_removed_and_activates_when_it_returns() {
+    let own = own_account();
+    let emulator = Emulator::new();
+    let analyzer = emulator
+        .analyzer("lifecycle", "lifecycle-analyzer", "ACCOUNT")
+        .await;
+    let external = trust(json!({"AWS": format!("arn:aws:iam::{EXTERNAL_ACCOUNT}:root")}));
+    emulator
+        .create_role("lifecycle", "lifecycle-role", &external)
+        .await;
+
+    let listed = emulator
+        .list_findings(json!({"analyzerArn": analyzer}))
+        .await;
+    let active = listed.findings();
+    assert_eq!(
+        active.len(),
+        1,
+        "case \"granted\": the trust grants one external account, got {active:?}"
+    );
+    let id = active[0]
+        .get("id")
+        .and_then(Value::as_str)
+        .unwrap_or_else(|| panic!("case \"granted\": expected an id in {:?}", active[0]))
+        .to_string();
+    let granted = emulator.get_finding(&analyzer, &id).await;
+    let granted_finding = granted
+        .member("finding")
+        .unwrap_or_else(|| panic!("case \"granted\": expected a finding, got {granted:?}"))
+        .clone();
+    assert_eq!(
+        granted_finding.get("status").and_then(Value::as_str),
+        Some("ACTIVE"),
+        "case \"granted\": an access the policy still grants is an active finding, got \
+         {granted_finding:?}"
+    );
+
+    // Remove the access through IAM: the finding the analyzer reported is resolved, not gone.
+    emulator
+        .update_trust(
+            "removed",
+            "lifecycle-role",
+            &trust(json!({"AWS": format!("arn:aws:iam::{own}:root")})),
+        )
+        .await;
+    let resolved = emulator.get_finding(&analyzer, &id).await;
+    assert_eq!(
+        resolved.status, 200,
+        "case \"removed\": GetFinding must still report the finding it reported, got \
+         {resolved:?}"
+    );
+    let resolved_finding = resolved
+        .member("finding")
+        .unwrap_or_else(|| panic!("case \"removed\": expected a finding, got {resolved:?}"))
+        .clone();
+    assert_eq!(
+        (
+            resolved_finding.get("id").and_then(Value::as_str),
+            resolved_finding.get("status").and_then(Value::as_str),
+            resolved_finding.get("principal"),
+            resolved_finding.get("action"),
+            resolved_finding.get("resource"),
+            resolved_finding.get("createdAt"),
+        ),
+        (
+            Some(id.as_str()),
+            Some("RESOLVED"),
+            granted_finding.get("principal"),
+            granted_finding.get("action"),
+            granted_finding.get("resource"),
+            granted_finding.get("createdAt"),
+        ),
+        "case \"removed\": the resolved finding keeps its id and what it reported, got \
+         {resolved_finding:?} after {granted_finding:?}"
+    );
+    assert!(
+        crate::harness::timestamp_at_least(
+            resolved_finding.get("updatedAt"),
+            resolved_finding.get("createdAt"),
+        ),
+        "case \"removed\": the finding was updated when it was resolved, so updatedAt is at \
+         or after createdAt, got {resolved_finding:?}"
+    );
+    // A resolved finding is a stored record, so reading it again reports it unchanged, and
+    // the listing reports the same record.
+    let again = emulator.get_finding(&analyzer, &id).await;
+    assert_eq!(
+        again.member("finding"),
+        Some(&resolved_finding),
+        "case \"removed\": a second read must report the same resolved finding, got {again:?}"
+    );
+    let relisted = emulator
+        .list_findings(json!({"analyzerArn": analyzer}))
+        .await;
+    assert_eq!(
+        relisted.findings(),
+        vec![resolved_finding.clone()],
+        "case \"removed\": the listing reports the same resolved finding, got {:?}",
+        relisted.findings()
+    );
+
+    // Grant it again: the access is back, so the finding about it is active again.
+    emulator
+        .update_trust("granted again", "lifecycle-role", &external)
+        .await;
+    let reactivated = emulator.get_finding(&analyzer, &id).await;
+    let reactivated_finding = reactivated
+        .member("finding")
+        .unwrap_or_else(|| panic!("case \"granted again\": expected a finding, got {reactivated:?}"))
+        .clone();
+    assert_eq!(
+        (
+            reactivated_finding.get("id").and_then(Value::as_str),
+            reactivated_finding.get("status").and_then(Value::as_str),
+            reactivated_finding.get("principal"),
+        ),
+        (
+            Some(id.as_str()),
+            Some("ACTIVE"),
+            granted_finding.get("principal"),
+        ),
+        "case \"granted again\": the access is granted once more, so the finding is active \
+         again, got {reactivated_finding:?}"
+    );
+}
+
+/// RULE: a request this operation cannot answer is refused with the modelled error for what
+/// is wrong with it, never with an empty success.
+///
+/// Rows differ along what is wrong: the analyzer, the analyzer's family, and what the `id`
+/// identifies (nothing at all, and a finding of ANOTHER analyzer — every analyzer derives its
+/// own ids, so one analyzer's id is not a finding of the next).
+#[tokio::test]
+async fn a_finding_read_names_what_the_caller_has_to_change() {
+    let own = own_account();
+    let emulator = Emulator::new();
+    let external = emulator
+        .analyzer("refusals", "finding-refusal-analyzer", "ACCOUNT")
+        .await;
+    let other = emulator
+        .analyzer("refusals", "finding-other-analyzer", "ACCOUNT")
+        .await;
+    let unused = emulator
+        .analyzer("refusals", "finding-refusal-unused", "ACCOUNT_UNUSED_ACCESS")
+        .await;
+    let missing = format!("arn:aws:access-analyzer:{REGION}:{own}:analyzer/never-created");
+    emulator
+        .create_role(
+            "refusals",
+            "refusal-role",
+            &trust(json!({"AWS": format!("arn:aws:iam::{EXTERNAL_ACCOUNT}:root")})),
+        )
+        .await;
+    // The id the OTHER analyzer reports for the same access: a finding of that analyzer, and
+    // of no other.
+    let other_listing = emulator.list_findings(json!({"analyzerArn": other})).await;
+    let other_id = other_listing.findings()[0]
+        .get("id")
+        .and_then(Value::as_str)
+        .unwrap_or_else(|| panic!("expected an id in {:?}", other_listing.findings()))
+        .to_string();
+
+    for (case, analyzer, id, status, code, message) in [
+        (
+            "an analyzer this account never created",
+            missing.as_str(),
+            other_id.as_str(),
+            404,
+            "ResourceNotFoundException",
+            "Analyzer not found",
+        ),
+        (
+            "an unused access analyzer",
+            unused.as_str(),
+            other_id.as_str(),
+            400,
+            "ValidationException",
+            "Unsupported operation",
+        ),
+        (
+            "an id that identifies no finding at all",
+            external.as_str(),
+            "00000000-0000-0000-0000-000000000000",
+            404,
+            "ResourceNotFoundException",
+            "Finding not found",
+        ),
+        (
+            "an id that is not an id this service mints",
+            external.as_str(),
+            "not-a-finding-id",
+            404,
+            "ResourceNotFoundException",
+            "Finding not found",
+        ),
+        (
+            "a finding of another analyzer",
+            external.as_str(),
+            other_id.as_str(),
+            404,
+            "ResourceNotFoundException",
+            "Finding not found",
+        ),
+    ] {
+        let reply = emulator.get_finding(analyzer, id).await;
+        assert_eq!(
+            (reply.status, reply.code(), reply.message().as_str()),
+            (status, code, message),
+            "case {case:?}: expected HTTP {status} {code} {message:?}, got {reply:?}"
+        );
+        assert!(
+            reply.member("finding").is_none(),
+            "case {case:?}: a refusal carries no finding, got {reply:?}"
+        );
+    }
+
+    // A finding refusal carries the identifier the caller named in the modelled structured
+    // members rather than in its message.
+    let unknown = emulator
+        .get_finding(&external, "00000000-0000-0000-0000-000000000000")
+        .await;
+    assert_eq!(
+        (
+            unknown.member("resourceId").and_then(Value::as_str),
+            unknown.member("resourceType").and_then(Value::as_str),
+        ),
+        (
+            Some("00000000-0000-0000-0000-000000000000"),
+            Some("finding")
+        ),
+        "case \"an id that identifies no finding at all\": expected the id and the resource \
+         kind in the modelled members, got {unknown:?}"
     );
 }

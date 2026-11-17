@@ -269,6 +269,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // A fresh analyzer previews nothing yet; `CreateAccessPreview` fills these.
             access_previews: ::std::collections::BTreeMap::new(),
             access_preview_tokens: crate::state::ClientTokens::default(),
+            // A fresh analyzer has reported nothing yet: its first analysis is what records
+            // the findings it reports, and it is the findings-reporting operations that
+            // materialise that analysis.
+            reported_findings: ::std::collections::BTreeMap::new(),
         };
         state
             .analyzers

@@ -7,12 +7,23 @@
 //! account: a finding is the access one `Allow` statement of such a policy grants to a
 //! principal outside that account.
 //!
-//! Nothing is stored for a finding. Every finding is derived on each read from the policies
-//! their owning services hold ([`crate::state::monitored_resources`]) by the crate's ONE
-//! external-access analysis ([`crate::state::external_access_findings`]), so this operation
-//! writes nothing and two reads of one analyzer report the same findings with the same ids
-//! — the id is DERIVED from what it identifies ([`crate::state::derived_uuid`]) rather than
-//! minted, which is what makes it stable without a stored table of ids.
+//! Nothing is stored for a finding whose access is still granted. Every such finding is
+//! derived on each read from the policies their owning services hold
+//! ([`crate::state::monitored_resources`]) by the crate's ONE external-access analysis
+//! ([`crate::state::external_access_findings`]), so two reads of one analyzer report the same
+//! findings with the same ids — the id is DERIVED from what it identifies
+//! ([`crate::state::derived_uuid`]) rather than minted, which is what makes it stable without
+//! a stored table of ids.
+//!
+//! What a policy cannot state is the finding of an access it NO LONGER grants. A finding the
+//! analyzer reported for an access that has since been removed is `RESOLVED`, not gone, so
+//! the analyzer keeps a record of every finding it has reported
+//! ([`crate::state::ReportedFinding`]) and this listing reports those records too. The
+//! analyzer has been analyzing since it was created, so the comparison of its last analysis
+//! with the account's current policies is owed whatever a caller does, and this operation
+//! materialises it ([`crate::state::reconcile_reported_findings`]); reconciling twice over
+//! the same policies records nothing further, so one listing reports what the listing before
+//! it did.
 //!
 //! ## What a finding is
 //!
@@ -21,7 +32,8 @@
 //! (for an account analyzer, the account that owns the resource) that an `Allow` statement
 //! grants access to, marked `isPublic` exactly when the statement admits every principal
 //! with nothing in its `Condition` binding the caller. Each finding carries the statement's
-//! own `Action` list and `Condition` keys, and `status` `ACTIVE`.
+//! own `Action` list and `Condition` keys, and `status` `ACTIVE` while the statement still
+//! grants the access, `RESOLVED` once it does not.
 //!
 //! ## What this operation adds to it
 //!
@@ -37,19 +49,20 @@
 //!
 //! ## What bounds the work
 //!
-//! The findings are not stored, so EVERY call re-derives them from the account's policies
-//! and then matches them against the request's `filter`. The policy parser bounds each
-//! factor of that work (document bytes, statements, element values) but not their product,
-//! and it is the product that decides how much there is to do — so the whole analysis is
-//! bounded: at most [`crate::state::MAX_MONITORED_RESOURCES`] resources read, at most
-//! [`MAX_DERIVED_FINDINGS`] findings, at most [`MAX_FILTER_CRITERIA`] criteria, and at most
-//! [`MAX_ANALYSIS_UNITS`] units of work charged for every policy read, statement visited,
-//! principal considered, string copied into a finding and [`FILTER_BYTES_PER_UNIT`] bytes
-//! compared by a criterion. A call past any of those ceilings is refused with the modelled
-//! `ValidationException` naming the member to change rather than run. Both stages run on
-//! the blocking pool with every store lock already released, exactly as `CheckNoNewAccess`
-//! runs its policy comparison, so a call at the top of its budget cannot starve the async
-//! worker or hold up another request.
+//! A finding whose access is still granted is not stored, so EVERY call re-derives it from
+//! the account's policies and then matches it against the request's `filter`. The policy
+//! parser bounds each factor of that work (document bytes, statements, element values) but
+//! not their product, and it is the product that decides how much there is to do — so the
+//! whole analysis is bounded: at most [`crate::state::MAX_MONITORED_RESOURCES`] resources
+//! read, at most [`MAX_DERIVED_FINDINGS`] findings, at most
+//! [`crate::state::MAX_RESOLVED_FINDINGS_PER_ANALYZER`] records of findings whose access is
+//! gone, at most [`MAX_FILTER_CRITERIA`] criteria, and at most [`MAX_ANALYSIS_UNITS`] units
+//! of work charged for every policy read, statement visited, principal considered, string
+//! copied into a finding and [`FILTER_BYTES_PER_UNIT`] bytes compared by a criterion. A call
+//! past any of those ceilings is refused with the modelled `ValidationException` naming the
+//! member to change rather than run. Both stages run on the blocking pool with every store
+//! lock already released, exactly as `CheckNoNewAccess` runs its policy comparison, so a call
+//! at the top of its budget cannot starve the async worker or hold up another request.
 //!
 //! ## Shape of an operation
 //!
@@ -200,9 +213,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // A read: the findings are a function of the account's stored resource policies,
-        // the analyzer and the clock, so nothing of the request metadata is consulted and
-        // nothing is written — not by this call and not by the stores it reads.
+        // The findings are a function of the account's stored resource policies, the
+        // analyzer's own record of what it has reported and the clock, so nothing of the
+        // request metadata is consulted: what this call writes is the analysis the analyzer
+        // owes (below), never anything about the caller.
         let _ = ctx;
 
         // The filter and the sort are refused before any store is read: a criterion naming
@@ -257,56 +271,68 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // them against the request's criteria and ordering them — reads documents,
         // allocates findings and compares strings, so it is CPU-bound: it runs on the
         // blocking pool, the way `CheckNoNewAccess` sends its policy comparison there,
-        // under ONE budget of [`MAX_ANALYSIS_UNITS`]. The budget bounds the work and the
-        // allocation of both stages together; the pool keeps them off the async worker that
-        // serves health checks and every other request. What is left on the worker is
-        // taking one page (at most [`crate::state::MAX_PAGE_SIZE`] items) out of the result.
-        let analysed = ::tokio::task::spawn_blocking(move || {
+        // under ONE budget of [`MAX_ANALYSIS_UNITS`], which is carried from the derivation
+        // into the match. The budget bounds the work and the allocation of both stages
+        // together; the pool keeps them off the async worker that serves health checks and
+        // every other request. What is left on the worker is reconciling the analyzer's own
+        // records with the derivation and taking one page (at most
+        // [`crate::state::MAX_PAGE_SIZE`] items) out of the result.
+        let analysis_arn = analyzer_arn.clone();
+        let derivation = ::tokio::task::spawn_blocking(move || {
             let mut budget = Budget::new(MAX_ANALYSIS_UNITS);
-            let findings = crate::state::external_access_findings(
-                &analyzer_arn,
+            crate::state::external_access_findings(
+                &analysis_arn,
                 analyzer_created_at,
                 &resources,
                 MAX_DERIVED_FINDINGS,
                 &mut budget,
-            )?;
-            let matching = matching_findings(findings, &criteria, &mut budget)?;
+            )
+            .map(|findings| (findings, budget))
+        })
+        .await;
+        let (derived, mut budget) = match derivation {
+            Ok(Ok(derived)) => derived,
+            Ok(Err(exhausted)) => return Err(budget_refusal(Self::NAME, exhausted)),
+            Err(error) => return Err(analysis_fault(Self::NAME, &error)),
+        };
+
+        // The analyzer has been analyzing since it was created, so the comparison of its
+        // last analysis with the account's policies as they are now is owed whatever this
+        // call does: it is materialised here, which is what makes a finding whose access is
+        // no longer granted reported as the resolved finding it is rather than dropped from
+        // the listing. Reconciling twice over the same policies records nothing further, so
+        // this listing reports what the listing before it did. Bounded work under the lock:
+        // the derivation holds at most [`MAX_DERIVED_FINDINGS`] findings and the analyzer at
+        // most [`crate::state::MAX_RESOLVED_FINDINGS_PER_ANALYZER`] resolved records.
+        let reported = {
+            let mut state = state.lock();
+            let analyzer = state.analyzer_by_arn_mut(&analyzer_arn).ok_or_else(|| {
+                ListFindingsErrorModeled::ResourceNotFoundException(
+                    crate::state::analyzer_not_found(&input.analyzer_arn),
+                )
+            })?;
+            crate::state::reconcile_reported_findings(
+                &mut analyzer.reported_findings,
+                derived,
+                ::std::time::SystemTime::now(),
+            )
+        };
+
+        let selected = ::tokio::task::spawn_blocking(move || {
+            let matching = matching_findings(reported, &criteria, &mut budget)?;
             Ok::<_, Exhausted>(ordered(matching, sort.as_ref()))
         })
         .await;
-        let matching = match analysed {
+        let matching = match selected {
             Ok(Ok(matching)) => matching,
             // The account's policies are analyzable, but reporting their findings would
             // cost more than this emulator spends on one call: refused, naming the request
             // member at fault, rather than allocating further.
-            Ok(Err(exhausted)) => {
-                ::tracing::info!(
-                    operation = Self::NAME,
-                    refusal = "budget",
-                    "refused a findings listing past this emulator's analysis ceiling"
-                );
-                return Err(ListFindingsErrorModeled::ValidationException(
-                    crate::state::field_validation_exception(exhausted.member, exhausted.detail),
-                )
-                .into());
-            }
+            Ok(Err(exhausted)) => return Err(budget_refusal(Self::NAME, exhausted)),
             // A panic or a cancellation on the pool says nothing about the account's
             // policies, so it is reported as the server fault it is rather than as an empty
             // result.
-            Err(error) => {
-                ::tracing::error!(
-                    operation = Self::NAME,
-                    error = %error,
-                    "the external access analysis did not complete"
-                );
-                return Err(ListFindingsErrorModeled::InternalServerException(
-                    InternalServerException {
-                        message: "the external access analysis did not complete".to_string(),
-                        retry_after_seconds: None,
-                    },
-                )
-                .into());
-            }
+            Err(error) => return Err(analysis_fault(Self::NAME, &error)),
         };
 
         let page = crate::state::page(matching, input.max_results, input.next_token.as_deref())
@@ -324,17 +350,56 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 }
 
 // ---------------------------------------------------------------------------
+// What a call that cannot be answered is refused with
+// ---------------------------------------------------------------------------
+
+/// The refusal for an analysis past one of this emulator's ceilings: the modelled
+/// `ValidationException`, naming the request member a client narrows to get under it.
+///
+/// One constructor for both stages of the analysis — the derivation and the match — so a
+/// refusal reads the same whichever of them ran out of budget.
+fn budget_refusal(operation: &'static str, exhausted: Exhausted) -> ListFindingsError {
+    ::tracing::info!(
+        operation,
+        refusal = "budget",
+        "refused a findings listing past this emulator's analysis ceiling"
+    );
+    ListFindingsErrorModeled::ValidationException(crate::state::field_validation_exception(
+        exhausted.member,
+        exhausted.detail,
+    ))
+    .into()
+}
+
+/// The refusal for an analysis that did not complete at all: a panic or a cancellation on
+/// the blocking pool says nothing about the account's policies, so it is the server fault it
+/// is rather than an empty result.
+fn analysis_fault(operation: &'static str, error: &::tokio::task::JoinError) -> ListFindingsError {
+    ::tracing::error!(
+        operation,
+        error = %error,
+        "the external access analysis did not complete"
+    );
+    ListFindingsErrorModeled::InternalServerException(InternalServerException {
+        message: "the external access analysis did not complete".to_string(),
+        retry_after_seconds: None,
+    })
+    .into()
+}
+
+// ---------------------------------------------------------------------------
 // What one call of this operation may spend
 // ---------------------------------------------------------------------------
 
-/// How many findings this emulator will report for ONE analyzer.
+/// How many findings this emulator will DERIVE for ONE analyzer.
 ///
-/// The findings are not stored, so every call re-derives them: this is the emulator's OWN
-/// ceiling on that work, generous beside the ten full pages
+/// A finding whose access is still granted is not stored, so every call re-derives it: this
+/// is the emulator's OWN ceiling on that work, generous beside the ten full pages
 /// ([`crate::state::MAX_PAGE_SIZE`]) a realistic listing walks, and far below what the
 /// account's stored policies could otherwise ask for — the policy parser bounds each factor
 /// (documents, statements, element values) but not their PRODUCT, and it is the product
-/// that decides how many findings exist.
+/// that decides how many findings exist. The records of findings whose access is GONE are
+/// bounded separately, by [`crate::state::MAX_RESOLVED_FINDINGS_PER_ANALYZER`].
 const MAX_DERIVED_FINDINGS: usize = 1_000;
 
 /// How much work ONE call's analysis may spend: deriving the findings AND matching them
