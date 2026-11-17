@@ -167,8 +167,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         use crate::state::document_listing::{
-            invalid_owner_message, is_document_filter_key, is_document_name, is_document_owner,
-            list_documents_page_size, DocumentListingFilter, DOCUMENT_KEY_VALUES_FILTER_KEYS,
+            document_page_size, invalid_owner_message, is_document_filter_key, is_document_name,
+            is_document_owner, DocumentListingFilter, DOCUMENT_KEY_VALUES_FILTER_KEYS,
             FILTER_KEY_OWNER, ONE_OWNER_PER_REQUEST, ONE_TAG_KEY_PER_REQUEST,
         };
         use crate::state::{invalid_filter_key_message, request_region, INVALID_NEXT_TOKEN};
@@ -257,7 +257,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         }
 
-        let page_size = list_documents_page_size(input.max_results)
+        let page_size = document_page_size(input.max_results)
             .map_err(crate::scaffolded::Scaffolded::validation)?;
 
         // The token is the name of the document the next page starts at, so a token that

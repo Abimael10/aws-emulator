@@ -1,15 +1,25 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListDocumentVersions
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListDocumentVersions`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Report every version one SSM document holds — the version half of this service's
+//! document slice. This is the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListDocumentVersions::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! "List all versions for a document": the document the request names is resolved through
+//! the one lookup every document read goes through
+//! ([`crate::state::ComAmazonawsSsmAmazonssmState::resolve_document_for_request`]), so a
+//! name the account holds no document for — through the endpoint the request was signed
+//! for — is `InvalidDocument` rather than an empty answer, and a document Systems Manager
+//! publishes resolves without any create. Each version is reported from the store in
+//! [`crate::state`] ([`crate::state::document_listing::document_version_info`]), oldest
+//! first, with the flag that says which of them is the document's DEFAULT version.
+//!
+//! A version's `Status` moves with the clock, so this report materialises the move that
+//! was already due whether or not anybody called, and writes nothing else: what it reports
+//! is what the store already holds.
+//!
+//! The page is bounded by `MaxResults` and resumed by `NextToken`, which is the VERSION
+//! the next page starts at — so a token that names no version of the document was not
+//! issued here and is refused as `InvalidNextToken`.
 //!
 //! ## Shape of an operation
 //!
@@ -146,18 +156,60 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListDocumentVersions` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListDocumentVersionsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListDocumentVersions"))
+        use crate::state::document_listing::document_page_size;
+        use crate::state::{document_not_found_message, request_region, INVALID_NEXT_TOKEN};
+
+        // `Name`'s pattern and `MaxResults`'s range are MODELLED constraints, so the
+        // centralized walk has already refused anything outside them.
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListDocumentVersionsErrorModeled::InternalServerError(InternalServerError {
+                message: Some("the document store is unavailable".to_string()),
+            })
+        })?;
+
+        let page_size = document_page_size(input.max_results)
+            .map_err(crate::scaffolded::Scaffolded::validation)?;
+
+        // The document the request names, resolved through the endpoint it was signed for
+        // by the one lookup every document read uses; it also materialises the status move
+        // the clock already owed each version. The account holds the documents a caller
+        // created here AND the ones Systems Manager publishes, so a name the catalogue
+        // carries resolves without any create; only a name neither holds is a miss.
+        let region = request_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
+        let Some(record) = state
+            .lock()
+            .resolve_document_for_request(&input.name, &region, now)
+        else {
+            return Err(ListDocumentVersionsErrorModeled::InvalidDocument(InvalidDocument {
+                message: Some(document_not_found_message(&input.name)),
+            })
+            .into());
+        };
+
+        // The token is the version the next page starts at, so a value that is not a
+        // version number at all — or one past the newest version this document has, which
+        // could have started no page of its history — was not issued here.
+        let resume_from = match input.next_token.as_deref() {
+            None | Some("") => None,
+            Some(token) => match token.parse::<u64>() {
+                Ok(version) if version > 0 && version <= record.latest_version() => Some(version),
+                _ => {
+                    return Err(ListDocumentVersionsErrorModeled::InvalidNextToken(
+                        InvalidNextToken {
+                            message: Some(INVALID_NEXT_TOKEN.to_string()),
+                        },
+                    )
+                    .into())
+                }
+            },
+        };
+
+        let page = record.list_versions(resume_from, page_size);
+
+        Ok(ListDocumentVersionsOutput {
+            document_versions: Some(page.versions),
+            next_token: page.next_token,
+        })
     }
 }

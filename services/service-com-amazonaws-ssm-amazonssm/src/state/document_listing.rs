@@ -25,10 +25,18 @@
 //! same doc lists ([`DOCUMENT_KEY_VALUES_FILTER_KEYS`]) and the `tag:tagName` form; a key
 //! outside them names no attribute of a document, which is what `InvalidFilterKey` ("The
 //! specified key isn't valid") reports.
+//!
+//! The other listing of this slice walks the versions of ONE document rather than the
+//! documents of a Region ([`DocumentRecord::list_versions`]). It walks them in ascending
+//! version order — the order the versions were minted in, which is the order the store
+//! holds them — so its resume cursor is total the same way: the cursor is the VERSION
+//! NUMBER the next page starts at, not an offset into a history an update may have grown
+//! between two pages. Each version is reported by [`document_version_info`], derived from
+//! the same record a describe of that version reports.
 
 use std::borrow::Cow;
 
-use crate::ops::types::DocumentIdentifier;
+use crate::ops::types::{DocumentIdentifier, DocumentVersionInfo};
 
 use super::{
     tagging, ComAmazonawsSsmAmazonssmState, DocumentRecord, DocumentVersionRecord,
@@ -117,13 +125,14 @@ pub const ONE_TAG_KEY_PER_REQUEST: &str =
     "This API operation only supports filtering documents by using a single tag key and one \
      or more tag values.";
 
-/// The lower bound the modelled `MaxResults` of a document listing carries
-/// (`ListDocumentsRequest$MaxResults`, range 1..50).
-pub const MIN_LIST_DOCUMENTS_PAGE_SIZE: i32 = 1;
+/// The lower bound the modelled `MaxResults` of a document listing carries — the same
+/// range 1..50 for both of this slice's listings (`ListDocumentsRequest$MaxResults` and
+/// `ListDocumentVersionsRequest$MaxResults`), so one bound pair serves both.
+pub const MIN_DOCUMENT_PAGE_SIZE: i32 = 1;
 
-/// The upper bound of the same member, and the page size a request naming no `MaxResults`
-/// is served up to (see [`super::page_size`]).
-pub const MAX_LIST_DOCUMENTS_PAGE_SIZE: i32 = 50;
+/// The upper bound of the same members, and the page size a request naming no
+/// `MaxResults` is served up to (see [`super::page_size`]).
+pub const MAX_DOCUMENT_PAGE_SIZE: i32 = 50;
 
 /// The shortest and the longest a document name may be, from the modelled `DocumentARN`
 /// pattern `^[a-zA-Z0-9_\-.:/]{3,128}$` — which is what a page's resume cursor is one of.
@@ -132,13 +141,11 @@ const MIN_DOCUMENT_NAME: usize = 3;
 /// See [`MIN_DOCUMENT_NAME`].
 const MAX_DOCUMENT_NAME: usize = 128;
 
-/// The page size a document listing serves (see [`super::page_size`]).
-pub fn list_documents_page_size(max_results: Option<i32>) -> Result<usize, String> {
-    super::page_size(
-        max_results,
-        MIN_LIST_DOCUMENTS_PAGE_SIZE,
-        MAX_LIST_DOCUMENTS_PAGE_SIZE,
-    )
+/// The page size a listing of this slice serves — the documents of a Region or the
+/// versions of one document, whose modelled `MaxResults` carry the same range (see
+/// [`super::page_size`]).
+pub fn document_page_size(max_results: Option<i32>) -> Result<usize, String> {
+    super::page_size(max_results, MIN_DOCUMENT_PAGE_SIZE, MAX_DOCUMENT_PAGE_SIZE)
 }
 
 /// Whether `value` is spelled the way a document name is — the modelled `DocumentARN`
@@ -365,6 +372,77 @@ impl ComAmazonawsSsmAmazonssmState {
         }
         DocumentPage {
             identifiers,
+            next_token,
+        }
+    }
+}
+
+/// The modelled `DocumentVersionInfo` of `version` of `record`: the version's own members
+/// beside the whole document's name and review status, and whether it is the DEFAULT
+/// version.
+///
+/// Derived from the same record [`DocumentRecord::description_of`] describes a version
+/// from, so a version's identity in a listing cannot disagree with its description.
+pub fn document_version_info(
+    record: &DocumentRecord,
+    version: &DocumentVersionRecord,
+) -> DocumentVersionInfo {
+    DocumentVersionInfo {
+        name: Some(record.name.clone()),
+        display_name: version.display_name.clone(),
+        document_version: Some(version.version.to_string()),
+        version_name: version.version_name.clone(),
+        created_date: Some(::aws_smithy_types::DateTime::from(version.created_date)),
+        // "An identifier for the default version of the document": the version a read that
+        // names no selector resolves to ([`DocumentRecord::select`]) is the one this flags.
+        is_default_version: version.version == record.default_version,
+        document_format: Some(version.document_format.clone()),
+        status: Some(version.status.clone()),
+        // "A message returned by Amazon Web Services Systems Manager that explains the
+        // `Status` value", which it words for a failure; nothing here failed.
+        status_information: None,
+        review_status: record.review_status(),
+    }
+}
+
+/// One page of a document's version listing: the versions it reports, and the version the
+/// next page resumes at when one was left over.
+#[derive(Debug, Clone, Default)]
+pub struct DocumentVersionPage {
+    pub versions: Vec<DocumentVersionInfo>,
+    /// "The token to use when requesting the next set of items. If there are no additional
+    /// items to return, the string is empty" — so `None` when this page is the last.
+    pub next_token: Option<String>,
+}
+
+impl DocumentRecord {
+    /// The page of this document's versions starting at the version `resume_from` numbers
+    /// and holding at most `page_size` of them, oldest first.
+    ///
+    /// The walk resumes at the oldest version still held at or after `resume_from`, so a
+    /// page keeps making forward progress across a version deletion that removed the one a
+    /// token named.
+    pub fn list_versions(
+        &self,
+        resume_from: Option<u64>,
+        page_size: usize,
+    ) -> DocumentVersionPage {
+        let mut versions = Vec::new();
+        let mut next_token = None;
+        for version in &self.versions {
+            if resume_from.is_some_and(|from| version.version < from) {
+                continue;
+            }
+            if versions.len() == page_size {
+                // The page is full and a version is still waiting: hand the caller the
+                // version it resumes at, so the next request continues where this stopped.
+                next_token = Some(version.version.to_string());
+                break;
+            }
+            versions.push(document_version_info(self, version));
+        }
+        DocumentVersionPage {
+            versions,
             next_token,
         }
     }

@@ -1,24 +1,27 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! `UpdateDocument` end to end: an update appends a version, a read resolves one.
+//! `UpdateDocument` end to end: an update appends a version, a read resolves one, and
+//! `ListDocumentVersions` reports every version the document holds.
 //!
 //! Every case goes through the front door a client uses — the shared harness in
-//! `all/parameter_store.rs` ([`router`], [`call`], [`error_code`]) dispatches `POST /`
-//! with `X-Amz-Target: AmazonSSM.<Operation>` through the multi-service router. Nothing
-//! reaches into the state struct, so what an update persisted is read back only through
-//! `DescribeDocument` and `GetDocument`.
+//! `all/parameter_store.rs` ([`router`], [`call`], [`call_in_region`], [`error_code`])
+//! dispatches `POST /` with `X-Amz-Target: AmazonSSM.<Operation>` through the
+//! multi-service router. Nothing reaches into the state struct, so what an update
+//! persisted is read back only through `DescribeDocument`, `GetDocument` and
+//! `ListDocumentVersions`.
 //!
 //! The suites are tables. Each row is one input along the axis the rule under test
 //! generalises over — document type, document format, how many updates follow one
-//! another, which version a selector names, which member the request supplies and which
-//! it omits — rather than the single document a recorded unit happened to update.
+//! another, which version a selector names, which version is the default, how large a
+//! page the caller asks for, which member the request supplies and which it omits —
+//! rather than the single document a recorded unit happened to update.
 
 use std::time::Duration;
 
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::parameter_store::{call, error_code, error_message, router};
+use crate::parameter_store::{call, call_in_region, error_code, error_message, router, REGION};
 
 /// The transient window a version spends in `Creating`/`Updating`
 /// (`crate::state::DOCUMENT_TRANSITION_DELAY`), which the service stores as a due instant
@@ -877,4 +880,477 @@ async fn content_an_update_cannot_persist_is_refused() {
             "case {case}: a refused update appends no version, got {described}"
         );
     }
+}
+
+/// The `DocumentStatus` values the model's enum declares
+/// (`ops::types::DOCUMENT_STATUS_VALUES`), one of which every listed version reports.
+const DOCUMENT_STATUS_VALUES: &[&str] =
+    service_com_amazonaws_ssm_amazonssm::ops::types::DOCUMENT_STATUS_VALUES;
+
+/// The documents Systems Manager publishes in every account and Region
+/// (`state::PUBLISHED_DOCUMENTS`), which resolve without anybody creating them.
+const CATALOGUE: &[service_com_amazonaws_ssm_amazonssm::state::PublishedDocument] =
+    service_com_amazonaws_ssm_amazonssm::state::PUBLISHED_DOCUMENTS;
+
+/// `ListDocumentVersions` with `body`, returning `(status, body)`.
+async fn list_versions(router: &MultiServiceRouter, body: &Value) -> (u16, Value) {
+    call(router, "ListDocumentVersions", body).await
+}
+
+/// `ListDocumentVersions`, asserting it succeeded, and returning the whole response.
+async fn list_versions_ok(router: &MultiServiceRouter, case: &str, body: &Value) -> Value {
+    let (status, response) = list_versions(router, body).await;
+    assert_eq!(
+        status, 200,
+        "case {case}: ListDocumentVersions {body} must succeed, got {status} {response}"
+    );
+    response
+}
+
+/// The `DocumentVersions` of one response as a slice, asserting the member is a list.
+fn reported<'a>(case: &str, response: &'a Value) -> &'a Vec<Value> {
+    response["DocumentVersions"]
+        .as_array()
+        .unwrap_or_else(|| panic!("case {case}: DocumentVersions must be a list, got {response}"))
+}
+
+/// One version-listing row: a document, the contents of the versions it holds, the
+/// `VersionName` each of them carries, and which version the default is moved to.
+struct VersionsListed<'a> {
+    case: &'a str,
+    name: &'a str,
+    /// `None` leaves `DocumentType` to the service's default.
+    document_type: Option<&'a str>,
+    /// `None` leaves `DocumentFormat` to the documented `JSON` default.
+    format: Option<&'a str>,
+    /// One content per version, oldest first; the first is the create's.
+    contents: Vec<String>,
+    /// The `VersionName` each version carries, `None` for a version created without one.
+    version_names: Vec<Option<&'a str>>,
+    /// The version number `UpdateDocumentDefaultVersion` makes the default, 1-based, or
+    /// `None` to leave the default where the create put it.
+    default_version: Option<usize>,
+}
+
+/// Create the row's document, append a version per further content, and move the default
+/// when the row names one.
+async fn seed_versions(router: &MultiServiceRouter, row: &VersionsListed<'_>) {
+    let mut body = json!({ "Name": row.name, "Content": row.contents[0] });
+    if let Some(document_type) = row.document_type {
+        body["DocumentType"] = json!(document_type);
+    }
+    if let Some(format) = row.format {
+        body["DocumentFormat"] = json!(format);
+    }
+    if let Some(version_name) = row.version_names[0] {
+        body["VersionName"] = json!(version_name);
+    }
+    create_ok(router, row.case, &body).await;
+
+    for (index, content) in row.contents.iter().enumerate().skip(1) {
+        let mut body = json!({ "Name": row.name, "Content": content });
+        if let Some(format) = row.format {
+            body["DocumentFormat"] = json!(format);
+        }
+        if let Some(version_name) = row.version_names[index] {
+            body["VersionName"] = json!(version_name);
+        }
+        update_ok(router, row.case, &body).await;
+    }
+
+    if let Some(default_version) = row.default_version {
+        let (status, response) = call(
+            router,
+            "UpdateDocumentDefaultVersion",
+            &json!({ "Name": row.name, "DocumentVersion": default_version.to_string() }),
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {}: UpdateDocumentDefaultVersion {default_version} must succeed, \
+             got {status} {response}",
+            row.case
+        );
+    }
+}
+
+/// "List all versions for a document": the listing reports EVERY version the document
+/// holds, oldest first, flagging the one that is the default — whatever the document's
+/// type and format, however many versions it holds, and whether the default is still the
+/// created version or was moved to another one.
+///
+/// Each version is reported with the members the same version's `DescribeDocument`
+/// reports, so a listing cannot disagree with a describe.
+#[tokio::test]
+async fn every_version_is_listed_oldest_first_with_the_default_flagged() {
+    let router = router();
+    let rows = vec![
+        VersionsListed {
+            case: "a JSON Command document with one version",
+            name: "ListOneVersionDocument",
+            document_type: None,
+            format: None,
+            contents: vec![command_json("only")],
+            version_names: vec![None],
+            default_version: None,
+        },
+        VersionsListed {
+            case: "a JSON Command document with four versions, default still the first",
+            name: "ListFourVersionsDocument",
+            document_type: Some("Command"),
+            format: Some("JSON"),
+            contents: vec![
+                command_json("first"),
+                command_json("second"),
+                command_json("third"),
+                command_json("fourth"),
+            ],
+            version_names: vec![Some("1.0"), None, Some("1.2"), None],
+            default_version: None,
+        },
+        VersionsListed {
+            case: "a YAML Automation document whose default moved to the middle version",
+            name: "ListAutomationVersionsDocument",
+            document_type: Some("Automation"),
+            format: Some("YAML"),
+            contents: vec![
+                automation_yaml("remediate one"),
+                automation_yaml("remediate two"),
+                automation_yaml("remediate three"),
+            ],
+            version_names: vec![None, Some("2.0"), None],
+            default_version: Some(2),
+        },
+        VersionsListed {
+            case: "TEXT content, whose default moved to the latest version",
+            name: "ListCalendarVersionsDocument",
+            document_type: Some("ChangeCalendar"),
+            format: Some("TEXT"),
+            contents: vec![calendar_text("one"), calendar_text("two")],
+            version_names: vec![None, None],
+            default_version: Some(2),
+        },
+    ];
+
+    for row in rows {
+        let case = row.case;
+        seed_versions(&router, &row).await;
+
+        let response = list_versions_ok(&router, case, &json!({ "Name": row.name })).await;
+        let listed = reported(case, &response);
+        assert_eq!(
+            listed.len(),
+            row.contents.len(),
+            "case {case}: every version the document holds is listed, got {response}"
+        );
+        assert_eq!(
+            response["NextToken"],
+            Value::Null,
+            "case {case}: a page holding every version resumes nothing, got {response}"
+        );
+
+        let default_version = row.default_version.unwrap_or(1);
+        for (index, entry) in listed.iter().enumerate() {
+            let version = (index + 1).to_string();
+            assert_eq!(
+                entry["DocumentVersion"],
+                json!(version),
+                "case {case}: the listing is oldest first, so entry {index} is version \
+                 {version}, got {entry}"
+            );
+            assert_eq!(
+                entry["IsDefaultVersion"],
+                json!(index + 1 == default_version),
+                "case {case}: version {version} is the default exactly when it is version \
+                 {default_version}, got {entry}"
+            );
+            assert_eq!(
+                entry["DocumentFormat"],
+                json!(row.format.unwrap_or("JSON")),
+                "case {case}: version {version} reports the format it was written in, \
+                 got {entry}"
+            );
+            assert!(
+                entry["Status"]
+                    .as_str()
+                    .is_some_and(|status| DOCUMENT_STATUS_VALUES.contains(&status)),
+                "case {case}: version {version} reports a modelled DocumentStatus, got {entry}"
+            );
+            // Everything else a listed version carries is what a describe of that same
+            // version reports, including the `VersionName` it was given and the members a
+            // version carrying none leaves unset.
+            let described = describe_ok(&router, case, row.name, Some(version.as_str())).await;
+            for member in [
+                "Name",
+                "DisplayName",
+                "VersionName",
+                "CreatedDate",
+                "ReviewStatus",
+            ] {
+                assert_eq!(
+                    entry[member], described[member],
+                    "case {case}: version {version} reports the {member} its describe \
+                     reports, got {entry} and {described}"
+                );
+            }
+            assert_eq!(
+                entry["VersionName"],
+                row.version_names[index].map_or(Value::Null, |name| json!(name)),
+                "case {case}: version {version} reports the VersionName it was given, \
+                 got {entry}"
+            );
+        }
+    }
+}
+
+/// A document Systems Manager publishes holds exactly the one version it publishes, which
+/// is its default — the catalogue resolves without anybody creating it, so its versions
+/// list without any create too.
+#[tokio::test]
+async fn a_published_document_lists_the_one_version_it_holds() {
+    let router = router();
+    for entry in CATALOGUE {
+        let case = entry.name;
+        let response = list_versions_ok(&router, case, &json!({ "Name": entry.name })).await;
+        let listed = reported(case, &response);
+        assert_eq!(
+            listed.len(),
+            1,
+            "case {case}: a published document holds one version, got {response}"
+        );
+        assert_eq!(
+            (
+                listed[0]["Name"].clone(),
+                listed[0]["DocumentVersion"].clone(),
+                listed[0]["IsDefaultVersion"].clone()
+            ),
+            (json!(entry.name), json!("1"), json!(true)),
+            "case {case}: the published version is version 1 and the default, got {response}"
+        );
+    }
+}
+
+/// A page is bounded by `MaxResults` and resumed by the `NextToken` it hands back: the
+/// pages of one listing partition the document's versions, in order, whatever page size
+/// the caller asks for — and a `MaxResults` outside the modelled range is refused.
+#[tokio::test]
+async fn a_page_is_bounded_by_max_results_and_resumed_by_its_token() {
+    let router = router();
+    let name = "PagedVersionsDocument";
+    let held = 5;
+    create_ok(
+        &router,
+        "the first version",
+        &json!({ "Name": name, "Content": command_json("version 1") }),
+    )
+    .await;
+    for version in 2..=held {
+        update_ok(
+            &router,
+            "a further version",
+            &json!({ "Name": name, "Content": command_json(&format!("version {version}")) }),
+        )
+        .await;
+    }
+    let every_version: Vec<String> = (1..=held).map(|version| version.to_string()).collect();
+
+    // The modelled `MaxResults` range is 1..50 (`ListDocumentVersionsRequest$MaxResults`),
+    // so both of its bounds are asked for beside the sizes in between.
+    for page_size in [1usize, 2, 3, 5, 50] {
+        let case = format!("pages of {page_size}");
+        let mut walked: Vec<String> = Vec::new();
+        let mut next_token: Option<String> = None;
+        // One request per page at most, plus one: a page that reports nothing or repeats a
+        // version would be caught by the collected sequence below rather than by looping.
+        for _ in 0..=held {
+            let mut body = json!({ "Name": name, "MaxResults": page_size });
+            if let Some(token) = &next_token {
+                body["NextToken"] = json!(token);
+            }
+            let response = list_versions_ok(&router, &case, &body).await;
+            let listed = reported(&case, &response);
+            assert!(
+                !listed.is_empty() && listed.len() <= page_size,
+                "case {case}: a page holds between one and {page_size} versions, got {response}"
+            );
+            walked.extend(
+                listed
+                    .iter()
+                    .map(|entry| entry["DocumentVersion"].as_str().unwrap_or_default().to_string()),
+            );
+            next_token = response["NextToken"].as_str().map(str::to_string);
+            let remaining = held - walked.len();
+            assert_eq!(
+                next_token.is_some(),
+                remaining > 0,
+                "case {case}: a token resumes the listing exactly while {remaining} versions \
+                 are left, got {response}"
+            );
+            if next_token.is_none() {
+                break;
+            }
+        }
+        assert_eq!(
+            walked, every_version,
+            "case {case}: the pages partition the versions oldest first, got {walked:?}"
+        );
+    }
+
+    // One past each published bound of the same member is refused by the modelled range.
+    for past in [0, 51] {
+        let (status, response) =
+            list_versions(&router, &json!({ "Name": name, "MaxResults": past })).await;
+        assert_eq!(
+            (status, error_code(&response).as_str()),
+            (400, "ValidationException"),
+            "case MaxResults {past}: a page size outside the modelled range is refused, \
+             got {status} {response}"
+        );
+    }
+}
+
+/// A `NextToken` this listing did not issue names no position in the document's history:
+/// it is refused as `InvalidNextToken` rather than restarting the walk, while the empty
+/// token is the first page.
+#[tokio::test]
+async fn a_token_this_listing_did_not_issue_is_refused() {
+    let router = router();
+    let name = "UnissuedTokenVersionsDocument";
+    create_ok(
+        &router,
+        "the first version",
+        &json!({ "Name": name, "Content": command_json("version 1") }),
+    )
+    .await;
+    update_ok(
+        &router,
+        "the second version",
+        &json!({ "Name": name, "Content": command_json("version 2") }),
+    )
+    .await;
+
+    for (case, token) in [
+        ("prose", "not-a-token"),
+        ("a version number no document counts", "0"),
+        ("a negative number", "-1"),
+        ("a version past the newest one held", "3"),
+        ("a number with a fraction", "1.5"),
+        ("a document name, which is another listing's cursor", name),
+    ] {
+        let (status, response) =
+            list_versions(&router, &json!({ "Name": name, "NextToken": token })).await;
+        assert_eq!(
+            (status, error_code(&response).as_str()),
+            (400, "InvalidNextToken"),
+            "case {case}: token {token:?} was not issued here, got {status} {response}"
+        );
+        assert_eq!(
+            error_message(&response),
+            "The NextToken value is not valid",
+            "case {case}: token {token:?} is refused in the service's words, got {response}"
+        );
+    }
+
+    // The empty token is no position at all, which is where a listing starts.
+    let response = list_versions_ok(
+        &router,
+        "the empty token",
+        &json!({ "Name": name, "NextToken": "" }),
+    )
+    .await;
+    assert_eq!(
+        reported("the empty token", &response).len(),
+        2,
+        "the empty token serves the first page, got {response}"
+    );
+
+    // The token the first page handed back resumes at the version it names.
+    let first = list_versions_ok(
+        &router,
+        "the first page",
+        &json!({ "Name": name, "MaxResults": 1 }),
+    )
+    .await;
+    let token = first["NextToken"]
+        .as_str()
+        .unwrap_or_else(|| panic!("the first page of two resumes, got {first}"));
+    let second = list_versions_ok(
+        &router,
+        "the resumed page",
+        &json!({ "Name": name, "NextToken": token }),
+    )
+    .await;
+    assert_eq!(
+        reported("the resumed page", &second)[0]["DocumentVersion"],
+        json!("2"),
+        "the issued token resumes at the version it names, got {second}"
+    );
+}
+
+/// A name the account holds no document for — through the endpoint the request was signed
+/// for — has no versions to list: the listing is refused with `InvalidDocument`, whichever
+/// way the name misses.
+#[tokio::test]
+async fn a_name_the_account_holds_no_document_for_is_refused() {
+    let router = router();
+    let held = "HeldVersionsDocument";
+    create_ok(
+        &router,
+        "the document this account holds",
+        &json!({ "Name": held, "Content": command_json("one") }),
+    )
+    .await;
+    let deleted = "DeletedVersionsDocument";
+    create_ok(
+        &router,
+        "the document this account deletes",
+        &json!({ "Name": deleted, "Content": command_json("one") }),
+    )
+    .await;
+    let (status, response) = call(&router, "DeleteDocument", &json!({ "Name": deleted })).await;
+    assert_eq!(
+        status, 200,
+        "DeleteDocument must succeed, got {status} {response}"
+    );
+
+    for (case, name) in [
+        ("a name nothing created", "NoSuchVersionsDocument"),
+        ("a document that was deleted", deleted),
+        (
+            "an ARN of another service, which could name no document",
+            "arn:aws:s3:::a-bucket/a-key",
+        ),
+    ] {
+        let (status, response) = list_versions(&router, &json!({ "Name": name })).await;
+        assert_eq!(
+            (status, error_code(&response).as_str()),
+            (400, "InvalidDocument"),
+            "case {case}: got {status} {response}"
+        );
+        assert_eq!(
+            error_message(&response),
+            format!("Document with name {name} does not exist."),
+            "case {case}: the miss is reported in the service's words, got {response}"
+        );
+    }
+
+    // A document is reached through the endpoint it was created against, so the same name
+    // names nothing at another Region's endpoint.
+    let other_region = if REGION == "us-east-1" {
+        "eu-west-1"
+    } else {
+        "us-east-1"
+    };
+    let (status, response) = call_in_region(
+        &router,
+        other_region,
+        "ListDocumentVersions",
+        &json!({ "Name": held }),
+    )
+    .await;
+    assert_eq!(
+        (status, error_code(&response).as_str()),
+        (400, "InvalidDocument"),
+        "case another Region's endpoint: got {status} {response}"
+    );
 }
