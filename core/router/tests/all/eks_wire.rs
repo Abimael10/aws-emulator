@@ -34,11 +34,16 @@ const AUTOSCALING_API_VERSION: &str = "2011-01-01";
 /// what an Amazon EKS refusal carries through.
 pub(crate) const EC2_NOT_FOUND_CODE: &str = "InvalidSubnetID.NotFound";
 
-/// A SigV4 `Authorization` header whose credential scope names `signing_name`.
-/// The signature is never checked: these suites run with authentication off.
-fn authorization(signing_name: &str) -> String {
+/// The access key id a request carries unless a suite names another one — a key no
+/// identity of the account holds, which is the ambient caller.
+pub(crate) const DEFAULT_ACCESS_KEY_ID: &str = "AKIDEXAMPLE";
+
+/// A SigV4 `Authorization` header whose credential scope names `signing_name` and
+/// `access_key_id`. The signature is never checked: these suites run with authentication
+/// off, and the access key id is what resolves the calling principal.
+fn authorization(access_key_id: &str, signing_name: &str) -> String {
     format!(
-        "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20260101/{REGION}/{signing_name}/aws4_request, \
+        "AWS4-HMAC-SHA256 Credential={access_key_id}/20260101/{REGION}/{signing_name}/aws4_request, \
          SignedHeaders=host;x-amz-date, Signature=deadbeef"
     )
 }
@@ -76,11 +81,37 @@ pub(crate) fn send(
     content_type: &str,
     body: String,
 ) -> Answer {
+    send_as(
+        router,
+        runtime,
+        DEFAULT_ACCESS_KEY_ID,
+        signing_name,
+        method,
+        uri,
+        content_type,
+        body,
+    )
+}
+
+/// [`send`], signed (in the routing sense) with `access_key_id` — the credential the
+/// service resolves the calling principal from, which for a key a session was minted
+/// under is that session.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn send_as(
+    router: &MultiServiceRouter,
+    runtime: &tokio::runtime::Runtime,
+    access_key_id: &str,
+    signing_name: &str,
+    method: &str,
+    uri: &str,
+    content_type: &str,
+    body: String,
+) -> Answer {
     let request = http::Request::builder()
         .method(method)
         .uri(format!("https://{signing_name}.{REGION}.amazonaws.com{uri}"))
         .header("host", format!("{signing_name}.{REGION}.amazonaws.com"))
-        .header("authorization", authorization(signing_name))
+        .header("authorization", authorization(access_key_id, signing_name))
         .header("content-type", content_type)
         .body(bytes::Bytes::from(body))
         .expect("a well-formed request");
@@ -161,9 +192,21 @@ pub(crate) fn iam(
     action: &str,
     params: &[(&str, &str)],
 ) -> Answer {
-    send(
+    iam_as(router, runtime, DEFAULT_ACCESS_KEY_ID, action, params)
+}
+
+/// Drive one awsQuery IAM action as the holder of `access_key_id`.
+pub(crate) fn iam_as(
+    router: &MultiServiceRouter,
+    runtime: &tokio::runtime::Runtime,
+    access_key_id: &str,
+    action: &str,
+    params: &[(&str, &str)],
+) -> Answer {
+    send_as(
         router,
         runtime,
+        access_key_id,
         "iam",
         "POST",
         "/",
