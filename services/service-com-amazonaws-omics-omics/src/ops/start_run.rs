@@ -488,11 +488,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
 
         // `workflowOwnerId` asks for a workflow shared from another account; this
-        // emulator holds only its own account's workflows (see `is_emulator_account`).
-        if let Some(owner) = input
+        // emulator holds only its own account's workflows (see `is_emulator_account`), so
+        // the workflow the request names is one it cannot resolve — the same condition,
+        // and the same sentence, as any other unresolved workflow.
+        if input
             .workflow_owner_id
             .as_deref()
-            .filter(|owner| !crate::state::is_emulator_account(owner))
+            .is_some_and(|owner| !crate::state::is_emulator_account(owner))
         {
             crate::state::audit(
                 Self::NAME,
@@ -502,7 +504,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
             return Err(StartRunErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: format!("no workflow shared from account {owner} exists here"),
+                    message: crate::state::workflow_not_found_message(&workflow_id),
                 },
             )
             .into());
@@ -511,7 +513,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The run is bound to the stored workflow, so an id no workflow of that type
         // carries is "not found" rather than a run that references nothing. Only the
         // workflow's EXISTENCE is required here: HealthOmics documents no status the
-        // workflow must be in for StartRun, so this emulator asserts none.
+        // workflow must be in for StartRun, so this emulator asserts none. The refusal
+        // carries the service's own wording for a workflow it cannot resolve, the same
+        // sentence every other operation that resolves a `workflowId` answers with.
         let workflow = store
             .workflow(&workflow_id)
             .filter(|workflow| workflow.r#type == workflow_type)
@@ -523,9 +527,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     Some(&workflow_id),
                 );
                 StartRunErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-                    message: format!(
-                        "no {workflow_type} workflow with id {workflow_id} exists in this region"
-                    ),
+                    message: crate::state::workflow_not_found_message(&workflow_id),
                 })
             })?;
         let workflow_uuid = Some(workflow.uuid.clone());
@@ -585,26 +587,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .or_else(|| source.map(|run| run.storage_type.clone()))
             .or_else(|| workflow.storage_type.clone())
             .unwrap_or_else(|| crate::state::DEFAULT_RUN_STORAGE_TYPE.to_string());
-        // From the same documentation: "The storage capacity is not required for runs
-        // with a DYNAMIC storage type" — so a run that resolves to STATIC must have one,
-        // from the request, the run it duplicates or the workflow's default.
-        if storage_type == crate::state::STORAGE_TYPE_STATIC && storage_capacity.is_none() {
-            crate::state::audit(
-                Self::NAME,
-                ctx,
-                crate::state::AuditOutcome::ValidationRefused,
-                Some(&workflow_id),
-            );
-            return Err(
-                StartRunErrorModeled::ValidationException(ValidationException {
-                    message: format!(
-                        "storageCapacity is required for a run with the {} storage type",
-                        crate::state::STORAGE_TYPE_STATIC
-                    ),
-                })
-                .into(),
-            );
-        }
+        // `storageCapacity`'s own documentation RESOLVES the member rather than demanding
+        // it: "The default run storage capacity is 1200 GiB. ... This field is not
+        // required if the storage type is DYNAMIC (the system ignores any value that you
+        // enter)." So a STATIC run that named no capacity anywhere gets the service
+        // default, and a DYNAMIC run carries none at all — the value a caller entered is
+        // ignored, so the stored run reports none either. The only refusable capacity is
+        // one outside the modelled `@range(0..100000)`, which the centralized constraint
+        // walk already refused before this body ran.
+        let storage_capacity = if storage_type == crate::state::STORAGE_TYPE_STATIC {
+            Some(storage_capacity.unwrap_or(crate::state::DEFAULT_RUN_STORAGE_CAPACITY))
+        } else {
+            None
+        };
 
         if store.runs.len() >= crate::state::MAX_RUNS {
             crate::state::audit(

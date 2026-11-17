@@ -267,7 +267,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     Some(&input.id),
                 );
                 GetWorkflowErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-                    message: format!("no workflow with id {} exists in this region", input.id),
+                    message: crate::state::workflow_not_found_message(&input.id),
                 })
             })?;
         crate::state::audit(

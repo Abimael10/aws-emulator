@@ -192,11 +192,13 @@ pub fn is_deletable_run_status(status: &str) -> bool {
     DELETABLE_RUN_STATUSES.contains(&status)
 }
 
-/// What an operation on a workflow's VERSIONS answers when the workflow itself is not
-/// one this emulator holds: there is no version collection to reach when its workflow
-/// is absent.
+/// What an operation answers when the workflow a request names is not one this emulator
+/// holds — including an operation on that workflow's VERSIONS, where there is no version
+/// collection to reach when its workflow is absent.
 ///
-/// The variable part is the workflow id the REQUEST carried.
+/// The variable part is the workflow id the REQUEST carried; the sentence states the kind
+/// of resource and nothing else of the request, so one wording serves every operation
+/// that resolves a `workflowId`.
 pub fn workflow_not_found_message(workflow_id: &str) -> String {
     format!("Workflow {workflow_id} not found")
 }
@@ -289,6 +291,15 @@ pub const STORAGE_TYPE_STATIC: &str = "STATIC";
 /// From that member's own documentation: "By default, the run uses `STATIC` storage
 /// type, which allocates a fixed amount of storage."
 pub const DEFAULT_RUN_STORAGE_TYPE: &str = STORAGE_TYPE_STATIC;
+
+/// The STATIC `storageCapacity` (in gibibytes) a run gets when nothing names one.
+///
+/// From the `storageCapacity` member's own documentation: "The default run storage
+/// capacity is 1200 GiB." The member is optional, so a run that resolves to the STATIC
+/// storage type and carries no capacity from the request, the run it duplicates or the
+/// workflow's default is given this one rather than refused. Inside the modelled
+/// `@range(0..100000)`, so a defaulted run is never out of range.
+pub const DEFAULT_RUN_STORAGE_CAPACITY: i32 = 1200;
 
 /// `WorkflowType` applied when `StartRun` omits `workflowType`.
 ///

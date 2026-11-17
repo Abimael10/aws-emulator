@@ -25,7 +25,9 @@ use std::time::Duration;
 
 use aws_smithy_types::base64;
 use serde_json::{json, Map, Value};
-use service_com_amazonaws_omics_omics::state::{FIRST_RESOURCE_ID, MAX_TAGS};
+use service_com_amazonaws_omics_omics::state::{
+    DEFAULT_RUN_STORAGE_CAPACITY, FIRST_RESOURCE_ID, MAX_TAGS,
+};
 use sha2::Digest;
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -821,8 +823,10 @@ async fn an_unknown_workflow_is_not_found() {
     let existing = created_id("only", status, &body);
 
     // The rule generalises over the id's width and value: anything the store does not
-    // hold is not found, however it is shaped.
+    // hold is not found, however it is shaped. Every operation that resolves a
+    // `workflowId` answers the same sentence, whose only variable part is that id.
     for id in ["0", "1", "999999", "999999999999999999", "1000001"] {
+        let workflow_missing = format!("Workflow {id} not found");
         assert_ne!(id, existing, "the fixture must not collide with the real id");
         let (status, body) = get_workflow(&router, id).await;
         assert_eq!(
@@ -834,11 +838,21 @@ async fn an_unknown_workflow_is_not_found() {
             "ResourceNotFoundException",
             "case {id:?}: expected ResourceNotFoundException, got {body:?}"
         );
+        assert_eq!(
+            body.get("message").and_then(Value::as_str),
+            Some(workflow_missing.as_str()),
+            "case {id:?}: expected GetWorkflow to answer {workflow_missing:?}, got {body:?}"
+        );
 
         let (status, body) = delete_workflow(&router, id).await;
         assert_eq!(
             status, 404,
             "case {id:?}: expected 404 from DeleteWorkflow, got {body:?}"
+        );
+        assert_eq!(
+            body.get("message").and_then(Value::as_str),
+            Some(workflow_missing.as_str()),
+            "case {id:?}: expected DeleteWorkflow to answer {workflow_missing:?}, got {body:?}"
         );
 
         let (status, body) = get_run(&router, id).await;
@@ -871,6 +885,12 @@ async fn an_unknown_workflow_is_not_found() {
     assert_eq!(
         status, 404,
         "a READY2RUN lookup of a PRIVATE workflow must be 404, got {body:?}"
+    );
+    let expected = format!("Workflow {existing} not found");
+    assert_eq!(
+        body.get("message").and_then(Value::as_str),
+        Some(expected.as_str()),
+        "a workflow sought under a type it does not carry must answer {expected:?}, got {body:?}"
     );
 }
 
@@ -1319,8 +1339,8 @@ fn run_cases() -> Vec<RunCase> {
                 "name": "priority-low",
                 "priority": CAPACITY_RANGE.0,
                 "parameters": {},
-                "storageCapacity": 0,
-                "storageType": "DYNAMIC",
+                "storageCapacity": CAPACITY_RANGE.0,
+                "storageType": "STATIC",
                 "logLevel": "OFF",
                 "retentionMode": "REMOVE",
                 "cacheBehavior": "CACHE_ON_FAILURE",
@@ -1330,8 +1350,8 @@ fn run_cases() -> Vec<RunCase> {
                 "name": "priority-low",
                 "priority": CAPACITY_RANGE.0,
                 "parameters": {},
-                "storageCapacity": 0,
-                "storageType": "DYNAMIC",
+                "storageCapacity": CAPACITY_RANGE.0,
+                "storageType": "STATIC",
                 "logLevel": "OFF",
                 "retentionMode": "REMOVE",
                 "cacheBehavior": "CACHE_ON_FAILURE",
@@ -1539,68 +1559,129 @@ async fn the_default_run_storage_type_applies_when_no_one_names_one() {
 }
 
 #[tokio::test]
-async fn a_static_run_needs_a_storage_capacity_from_somewhere() {
+async fn a_runs_storage_capacity_is_resolved_rather_than_demanded() {
     let router = emulator();
-    // From the `storageCapacity` documentation: "The storage capacity is not required
-    // for runs with a DYNAMIC storage type" — so a run whose storage type resolves to
-    // STATIC must have a capacity, from the request or from the workflow's default.
-    let (status, body) = create_workflow(
-        &router,
-        &json!({ "requestId": "bare", "name": "bare" }),
-    )
-    .await;
+    // From the `storageCapacity` member's own documentation: "The default run storage
+    // capacity is 1200 GiB. ... This field is not required if the storage type is
+    // DYNAMIC (the system ignores any value that you enter)." The member is OPTIONAL, so
+    // a run that names no capacity is accepted: a STATIC one is given the documented
+    // default, and a DYNAMIC one records none at all, whatever the request or the
+    // workflow lent it.
+    //
+    // The rule generalises over WHERE the capacity could come from (the request, the
+    // workflow's default, nowhere) and over the resolved storage type, so the table has a
+    // row per combination, including both published bounds of the modelled range.
+    let (status, body) =
+        create_workflow(&router, &json!({ "requestId": "bare", "name": "bare" })).await;
     let bare = created_id("bare", status, &body);
+    // `workflow_for_runs` creates a STATIC workflow whose own default capacity is 1200.
     let with_capacity = workflow_for_runs(&router, "with-capacity").await;
+    let workflow_default = 1200i64;
+    let documented_default = i64::from(DEFAULT_RUN_STORAGE_CAPACITY);
 
-    // (case, workflow, request members, expected status)
-    let rows: Vec<(&str, &String, Value, u16)> = vec![
-        ("STATIC with no capacity anywhere", &bare, json!({}), 400),
+    // (case, workflow, request members, the capacity the run must report)
+    let rows: Vec<(&str, &String, Value, Option<i64>)> = vec![
         (
-            "STATIC with a capacity on the request",
+            "no storageType and no capacity anywhere",
             &bare,
-            json!({ "storageCapacity": 1 }),
-            201,
-        ),
-        (
-            "STATIC with the capacity at the low published bound",
-            &bare,
-            json!({ "storageCapacity": CAPACITY_RANGE.0 }),
-            201,
-        ),
-        (
-            "STATIC with the capacity from the workflow",
-            &with_capacity,
             json!({}),
-            201,
-        ),
-        (
-            "DYNAMIC needs no capacity",
-            &bare,
-            json!({ "storageType": "DYNAMIC" }),
-            201,
+            Some(documented_default),
         ),
         (
             "explicit STATIC with no capacity anywhere",
             &bare,
             json!({ "storageType": "STATIC" }),
-            400,
+            Some(documented_default),
+        ),
+        (
+            "STATIC with a capacity on the request",
+            &bare,
+            json!({ "storageCapacity": 1 }),
+            Some(1),
+        ),
+        (
+            "STATIC with the capacity at the low published bound",
+            &bare,
+            json!({ "storageCapacity": CAPACITY_RANGE.0 }),
+            Some(CAPACITY_RANGE.0),
+        ),
+        (
+            "STATIC with the capacity at the high published bound",
+            &bare,
+            json!({ "storageCapacity": CAPACITY_RANGE.1 }),
+            Some(CAPACITY_RANGE.1),
+        ),
+        (
+            "STATIC with the capacity from the workflow",
+            &with_capacity,
+            json!({}),
+            Some(workflow_default),
+        ),
+        (
+            "STATIC with the request beating the workflow's capacity",
+            &with_capacity,
+            json!({ "storageCapacity": 7 }),
+            Some(7),
+        ),
+        (
+            "DYNAMIC with no capacity anywhere",
+            &bare,
+            json!({ "storageType": "DYNAMIC" }),
+            None,
+        ),
+        (
+            "DYNAMIC ignores the capacity the request entered",
+            &bare,
+            json!({ "storageType": "DYNAMIC", "storageCapacity": 9_999 }),
+            None,
+        ),
+        (
+            "DYNAMIC ignores the workflow's capacity",
+            &with_capacity,
+            json!({ "storageType": "DYNAMIC" }),
+            None,
         ),
     ];
 
     for (case, workflow, extra, expected) in &rows {
         let body = start_run_body(workflow, &format!("capacity-{case}"), extra);
         let (status, response) = start_run(&router, &body).await;
+        let id = created_id(case, status, &response);
+        let (_, run) = get_run(&router, &id).await;
+        let actual = run.get("storageCapacity").and_then(Value::as_i64);
         assert_eq!(
-            status, *expected,
-            "case {case:?}: expected {expected}, got {response:?}"
+            actual, *expected,
+            "case {case:?}: expected storageCapacity {expected:?}, got {actual:?} in {run:?}"
         );
-        if *expected == 400 {
-            assert_eq!(
-                error_code(&response),
-                "ValidationException",
-                "case {case:?}: expected ValidationException, got {response:?}"
-            );
-        }
+    }
+}
+
+#[tokio::test]
+async fn only_a_storage_capacity_outside_the_modelled_range_is_refused() {
+    let router = emulator();
+    // `storageCapacity` carries `@range(0..100000)`, so the only refusable capacity is
+    // one past a published bound. Each bound itself is accepted by the table above.
+    let workflow = workflow_for_runs(&router, "range").await;
+
+    for (case, capacity) in [
+        ("one below the low published bound", CAPACITY_RANGE.0 - 1),
+        ("one above the high published bound", CAPACITY_RANGE.1 + 1),
+    ] {
+        let body = start_run_body(
+            &workflow,
+            &format!("range-{case}"),
+            &json!({ "storageCapacity": capacity }),
+        );
+        let (status, response) = start_run(&router, &body).await;
+        assert_eq!(
+            status, 400,
+            "case {case:?}: expected 400 for capacity {capacity}, got {response:?}"
+        );
+        assert_eq!(
+            error_code(&response),
+            "ValidationException",
+            "case {case:?}: expected ValidationException, got {response:?}"
+        );
     }
 }
 
@@ -1616,7 +1697,9 @@ async fn a_duplicated_run_inherits_the_source_runs_defaults() {
             "priority": 42,
             "logLevel": "ERROR",
             "retentionMode": "REMOVE",
-            "storageType": "DYNAMIC",
+            // A STATIC source run, so the capacity it carries is one a duplicate can
+            // inherit; a DYNAMIC run records none at all.
+            "storageType": "STATIC",
             "storageCapacity": 321,
             "cacheBehavior": "CACHE_ALWAYS",
             "parameters": { "reads": ["s3://bucket/x.fastq"] },
@@ -1639,7 +1722,7 @@ async fn a_duplicated_run_inherits_the_source_runs_defaults() {
                 "priority": 42,
                 "logLevel": "ERROR",
                 "retentionMode": "REMOVE",
-                "storageType": "DYNAMIC",
+                "storageType": "STATIC",
                 "storageCapacity": 321,
                 "cacheBehavior": "CACHE_ALWAYS",
                 "parameters": { "reads": ["s3://bucket/x.fastq"] },
@@ -1670,7 +1753,7 @@ async fn a_duplicated_run_inherits_the_source_runs_defaults() {
                 "logLevel": "ALL",
                 "parameters": { "reads": ["s3://bucket/y.fastq"] },
                 "tags": { "origin": "duplicate" },
-                "storageType": "DYNAMIC",
+                "storageType": "STATIC",
                 "storageCapacity": 321,
             }),
         ),
@@ -1707,21 +1790,34 @@ async fn starting_a_run_on_an_unknown_workflow_is_not_found() {
     let workflow_id = workflow_for_runs(&router, "exists").await;
 
     // The rule generalises over what is missing: the workflow id, the type it is sought
-    // under, or the run a duplicate was asked to copy.
-    let rows: Vec<(&str, Value)> = vec![
-        ("unknown workflowId", json!({ "workflowId": "999999" })),
+    // under, the account it is sought in, or the run a duplicate was asked to copy. A
+    // missing workflow carries the service's own sentence for an unresolved workflow,
+    // whose only variable part is the id the request named.
+    let rows: Vec<(&str, Value, Option<String>)> = vec![
+        (
+            "unknown workflowId",
+            json!({ "workflowId": "999999" }),
+            Some("999999".to_string()),
+        ),
         (
             "unknown wide workflowId",
             json!({ "workflowId": "999999999999999999" }),
+            Some("999999999999999999".to_string()),
         ),
         (
             "real workflowId sought as READY2RUN",
             json!({ "workflowId": workflow_id.clone(), "workflowType": "READY2RUN" }),
+            Some(workflow_id.clone()),
         ),
-        ("unknown runId to duplicate", json!({ "runId": "888888" })),
+        (
+            "real workflowId sought in another account",
+            json!({ "workflowId": workflow_id.clone(), "workflowOwnerId": "210987654321" }),
+            Some(workflow_id.clone()),
+        ),
+        ("unknown runId to duplicate", json!({ "runId": "888888" }), None),
     ];
 
-    for (case, extra) in &rows {
+    for (case, extra, missing_workflow) in &rows {
         let mut body = Map::new();
         body.insert("roleArn".to_string(), json!(ROLE_ARN));
         body.insert("outputUri".to_string(), json!(OUTPUT_URI));
@@ -1739,6 +1835,15 @@ async fn starting_a_run_on_an_unknown_workflow_is_not_found() {
             "ResourceNotFoundException",
             "case {case:?}: expected ResourceNotFoundException, got {response:?}"
         );
+        if let Some(id) = missing_workflow {
+            let expected = format!("Workflow {id} not found");
+            let actual = response.get("message").and_then(Value::as_str);
+            assert_eq!(
+                actual,
+                Some(expected.as_str()),
+                "case {case:?}: expected message {expected:?}, got {actual:?}"
+            );
+        }
     }
 
     // A request that names neither a workflow nor a run to duplicate is a bad request,
