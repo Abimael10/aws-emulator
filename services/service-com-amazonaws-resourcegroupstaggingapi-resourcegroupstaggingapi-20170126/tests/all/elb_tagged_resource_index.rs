@@ -15,6 +15,13 @@
 //! balancer family the ARN carries, how many tags the create recorded, a tag with an empty
 //! value, and resources carrying no tag at all. The target group the issue cited is one
 //! row.
+//!
+//! Because there is ONE tag set per resource, the write path does not matter either: a tag
+//! written through that service's OWN `AddTags` is indexed exactly as one written here, so
+//! a `TagFilters` query selects the resource and its own `RemoveTags` withdraws it from
+//! that selection. The tables for that span the resource kind, the number of resources one
+//! tag call names, whether the filter names values, an empty value, AND-ed filters and a
+//! key written twice.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -684,4 +691,375 @@ async fn an_absent_elb_arn_fails_with_elastic_load_balancings_own_refusal() {
             "case {case}: expected the per-resource failure to carry {own_message:?}, got {failure}"
         );
     }
+}
+
+/// The form fields that name `arns` in an Elastic Load Balancing `ResourceArns` list.
+fn resource_arn_fields(arns: &[&str]) -> Vec<(String, String)> {
+    arns.iter()
+        .enumerate()
+        .map(|(index, arn)| p(&format!("ResourceArns.member.{}", index + 1), arn))
+        .collect()
+}
+
+/// One `AddTags` call of Elastic Load Balancing's OWN tag API: every pair onto every ARN.
+async fn elb_add_tags(router: &MultiServiceRouter, arns: &[&str], tags: &[(&str, &str)]) {
+    let mut form = action("AddTags");
+    form.extend(resource_arn_fields(arns));
+    form.extend(tag_fields(tags));
+    elb_ok(router, &form).await;
+}
+
+/// One `RemoveTags` call of Elastic Load Balancing's OWN tag API.
+async fn elb_remove_tags(router: &MultiServiceRouter, arns: &[&str], keys: &[&str]) {
+    let mut form = action("RemoveTags");
+    form.extend(resource_arn_fields(arns));
+    for (index, key) in keys.iter().enumerate() {
+        form.push(p(&format!("TagKeys.member.{}", index + 1), key));
+    }
+    elb_ok(router, &form).await;
+}
+
+/// The ARNs the index selects for `filters`, sorted so a case compares sets.
+async fn arns_for_tag_filters(router: &MultiServiceRouter, filters: &Value) -> Vec<String> {
+    let (status, body) = tagging(router, "GetResources", json!({ "TagFilters": filters })).await;
+    assert_eq!(status, 200, "TagFilters={filters}: GetResources body {body}");
+    let mut arns = page_arns(&body);
+    arns.sort();
+    arns
+}
+
+/// `arns` as the sorted expectation [`arns_for_tag_filters`] is compared against.
+fn sorted(arns: &[&str]) -> Vec<String> {
+    let mut sorted: Vec<String> = arns.iter().map(|arn| (*arn).to_string()).collect();
+    sorted.sort();
+    sorted
+}
+
+/// One `AddTags` call of a case below: the ARNs it names and the key/value pairs it
+/// writes onto each of them.
+type TagWrite<'a> = (Vec<&'a str>, Vec<(&'a str, &'a str)>);
+
+/// One case of the table below: the tag calls Elastic Load Balancing's own API makes, and
+/// what the index then selects for each filter list.
+struct NativeWriteCase<'a> {
+    case: &'static str,
+    /// The `AddTags` calls, applied in order, so a case can write the same key twice.
+    writes: Vec<TagWrite<'a>>,
+    /// `(what the filter list asks, the list, the ARNs it must select)`.
+    checks: Vec<(&'static str, Value, Vec<String>)>,
+}
+
+/// A tag written through the OWNING service's own tag write is that resource's one tag
+/// set, so the account-wide index selects the resource under a `TagFilters` entry naming
+/// that key — and, where the entry names values, only while the resource carries one of
+/// them. Filters are AND-ed across entries and the values within one entry are OR-ed.
+///
+/// The rows span the resource kind (both load balancer families, a target group, a
+/// listener and a listener rule), the number of resources one tag call names (two in one
+/// call, and one per call), whether the filter names values, a tag whose value is empty,
+/// two filters AND-ed, and a key written twice. The pair of load balancer and target group
+/// the issue cited is the first row.
+#[tokio::test]
+async fn natively_written_elb_tags_are_selected_by_tag_filters() {
+    let router = emulator();
+    let (rows, _) = estate(&router).await;
+    assert_eq!(
+        rows.len(),
+        5,
+        "the estate holds one row per taggable kind the suite creates, got {}",
+        rows.len()
+    );
+    // The estate in creation order, named by the kind each row is.
+    let (alb, nlb, target_group, listener, rule) = (
+        rows[0].arn.as_str(),
+        rows[1].arn.as_str(),
+        rows[2].arn.as_str(),
+        rows[3].arn.as_str(),
+        rows[4].arn.as_str(),
+    );
+
+    // Each case writes under ITS OWN keys, so one case's filters select only what that
+    // case wrote; none of the keys below is one the creates recorded.
+    let cases: Vec<NativeWriteCase<'_>> = vec![
+        NativeWriteCase {
+            case: "a load balancer and a target group tagged in one call",
+            writes: vec![(
+                vec![alb, target_group],
+                vec![("inventory", "fleet-a")],
+            )],
+            checks: vec![
+                (
+                    "the key and the value both resources carry",
+                    json!([{ "Key": "inventory", "Values": ["fleet-a"] }]),
+                    sorted(&[alb, target_group]),
+                ),
+                (
+                    "a value nothing carries",
+                    json!([{ "Key": "inventory", "Values": ["fleet-b"] }]),
+                    Vec::new(),
+                ),
+            ],
+        },
+        NativeWriteCase {
+            case: "one key written one resource per call, onto a listener and a rule",
+            writes: vec![
+                (vec![listener], vec![("rollout", "wave-1")]),
+                (vec![rule], vec![("rollout", "wave-1")]),
+            ],
+            checks: vec![(
+                "the key both calls wrote",
+                json!([{ "Key": "rollout", "Values": ["wave-1"] }]),
+                sorted(&[listener, rule]),
+            )],
+        },
+        NativeWriteCase {
+            case: "one key carrying two different values",
+            writes: vec![
+                (vec![alb], vec![("stage", "blue")]),
+                (vec![nlb], vec![("stage", "green")]),
+            ],
+            checks: vec![
+                (
+                    "a filter naming no value, which matches the key with any value",
+                    json!([{ "Key": "stage" }]),
+                    sorted(&[alb, nlb]),
+                ),
+                (
+                    "one of the two values",
+                    json!([{ "Key": "stage", "Values": ["green"] }]),
+                    sorted(&[nlb]),
+                ),
+                (
+                    "both values in one filter, which are OR-ed",
+                    json!([{ "Key": "stage", "Values": ["blue", "green"] }]),
+                    sorted(&[alb, nlb]),
+                ),
+            ],
+        },
+        NativeWriteCase {
+            case: "a tag whose value is empty",
+            writes: vec![(vec![target_group], vec![("retired", "")])],
+            checks: vec![
+                (
+                    "the empty value itself",
+                    json!([{ "Key": "retired", "Values": [""] }]),
+                    sorted(&[target_group]),
+                ),
+                (
+                    "the key alone",
+                    json!([{ "Key": "retired" }]),
+                    sorted(&[target_group]),
+                ),
+            ],
+        },
+        NativeWriteCase {
+            case: "two keys, one of them on a second resource",
+            writes: vec![
+                (vec![alb], vec![("squad", "platform"), ("slo", "gold")]),
+                (vec![nlb], vec![("squad", "platform")]),
+            ],
+            checks: vec![
+                (
+                    "two filters, which are AND-ed",
+                    json!([
+                        { "Key": "squad", "Values": ["platform"] },
+                        { "Key": "slo", "Values": ["gold"] },
+                    ]),
+                    sorted(&[alb]),
+                ),
+                (
+                    "the filter both resources satisfy",
+                    json!([{ "Key": "squad", "Values": ["platform"] }]),
+                    sorted(&[alb, nlb]),
+                ),
+            ],
+        },
+        NativeWriteCase {
+            case: "a key written twice, whose second write replaces the value",
+            writes: vec![
+                (vec![rule], vec![("wave", "first")]),
+                (vec![rule], vec![("wave", "second")]),
+            ],
+            checks: vec![
+                (
+                    "the value that was replaced",
+                    json!([{ "Key": "wave", "Values": ["first"] }]),
+                    Vec::new(),
+                ),
+                (
+                    "the value the second write stored",
+                    json!([{ "Key": "wave", "Values": ["second"] }]),
+                    sorted(&[rule]),
+                ),
+            ],
+        },
+    ];
+
+    for case in &cases {
+        for (arns, tags) in &case.writes {
+            elb_add_tags(&router, arns, tags).await;
+            // ONE tag set per resource: the owning service's own tag read reports every
+            // pair the write stored, which is what the index below is reporting.
+            for arn in arns {
+                let got = elb_tags(&router, arn).await;
+                for (key, value) in tags {
+                    assert_eq!(
+                        got.get(*key).map(String::as_str),
+                        Some(*value),
+                        "case {}: expected DescribeTags to report {key}={value:?} on {arn}, \
+                         got {got:?}",
+                        case.case
+                    );
+                }
+            }
+        }
+        for (asks, filters, want) in &case.checks {
+            let got = arns_for_tag_filters(&router, filters).await;
+            assert_eq!(
+                &got, want,
+                "case {} / {asks}: expected TagFilters={filters} to select {want:?}, got {got:?}",
+                case.case
+            );
+        }
+    }
+}
+
+/// The owning service's own `RemoveTags` withdraws the key from the same tag set the index
+/// reads, so the resource leaves a selection on that key while every other resource of the
+/// batch stays in it, the tags the create recorded are left alone, and withdrawing the key
+/// from the last resource converges the selection to nothing.
+///
+/// The rows are every taggable kind of the estate, withdrawn one at a time, so the
+/// withdrawal is shown to be per resource and not per service. The last row repeats the
+/// withdrawal of a key the resource no longer carries, which asks for a state that already
+/// holds and is therefore not an error.
+#[tokio::test]
+async fn remove_tags_withdraws_a_natively_written_key_from_the_index() {
+    let router = emulator();
+    let (rows, _) = estate(&router).await;
+    const KEY: &str = "lifecycle";
+    const VALUE: &str = "retain";
+
+    let arns: Vec<&str> = rows.iter().map(|row| row.arn.as_str()).collect();
+    elb_add_tags(&router, &arns, &[(KEY, VALUE)]).await;
+
+    let filters = json!([{ "Key": KEY, "Values": [VALUE] }]);
+    let mut remaining = sorted(&arns);
+    let got = arns_for_tag_filters(&router, &filters).await;
+    assert_eq!(
+        got, remaining,
+        "expected the one call to put {KEY}={VALUE} on every kind, got {got:?}"
+    );
+
+    for row in &rows {
+        elb_remove_tags(&router, &[row.arn.as_str()], &[KEY]).await;
+        remaining.retain(|arn| arn != &row.arn);
+
+        let got = arns_for_tag_filters(&router, &filters).await;
+        assert_eq!(
+            got, remaining,
+            "case {}: expected the withdrawal from {} to leave {remaining:?} selected, \
+             got {got:?}",
+            row.case, row.arn
+        );
+
+        // Only the named key was withdrawn: the pairs the create recorded are still the
+        // resource's tags, in its own tag read and in the index.
+        let want = expected(row.tags);
+        let got = elb_tags(&router, &row.arn).await;
+        assert_eq!(
+            got, want,
+            "case {}: expected the withdrawal to leave {want:?} on {}, got {got:?}",
+            row.case, row.arn
+        );
+        let page = resources_for(&router, &row.arn).await;
+        let got = page_tags(&page, &row.arn);
+        assert_eq!(
+            got, want,
+            "case {}: expected GetResources to report {want:?} for {}, got {got:?}",
+            row.case, row.arn
+        );
+    }
+
+    assert!(
+        remaining.is_empty(),
+        "every row was withdrawn, so nothing is left to select: {remaining:?}"
+    );
+    let got = arns_for_tag_filters(&router, &filters).await;
+    assert!(
+        got.is_empty(),
+        "expected the selection on {KEY}={VALUE} to converge to nothing, got {got:?}"
+    );
+
+    // A key the resource no longer carries is nothing to withdraw, not a failure.
+    elb_remove_tags(&router, &[rows[0].arn.as_str()], &[KEY]).await;
+    let got = arns_for_tag_filters(&router, &filters).await;
+    assert!(
+        got.is_empty(),
+        "expected a repeated withdrawal to leave the selection empty, got {got:?}"
+    );
+}
+
+/// There is ONE tag home per resource whichever API wrote the tag: a key written through
+/// Elastic Load Balancing's own `AddTags` and the same key written through this API's
+/// `TagResources` land in the same place, so a single `TagFilters` query selects both
+/// resources and each write is visible through the other API's reader.
+#[tokio::test]
+async fn one_tag_home_serves_both_write_paths_under_one_filter() {
+    let router = emulator();
+    let (rows, _) = estate(&router).await;
+    let load_balancer = rows
+        .iter()
+        .find(|row| row.resource_type == "elasticloadbalancing:loadbalancer")
+        .expect("the estate holds a load balancer")
+        .arn
+        .clone();
+    let target_group = rows
+        .iter()
+        .find(|row| row.resource_type == "elasticloadbalancing:targetgroup")
+        .expect("the estate holds a target group")
+        .arn
+        .clone();
+    const KEY: &str = "owner";
+    const VALUE: &str = "payments";
+
+    // The owning service's own write for one resource...
+    elb_add_tags(&router, &[load_balancer.as_str()], &[(KEY, VALUE)]).await;
+    // ...and this API's write for the other.
+    let (status, body) = tagging(
+        &router,
+        "TagResources",
+        json!({ "ResourceARNList": [&target_group], "Tags": { KEY: VALUE } }),
+    )
+    .await;
+    assert_eq!(status, 200, "TagResources body {body}");
+    assert_eq!(
+        body["FailedResourcesMap"],
+        json!({}),
+        "expected no failed resource, got {}",
+        body["FailedResourcesMap"]
+    );
+
+    let filters = json!([{ "Key": KEY, "Values": [VALUE] }]);
+    let want = sorted(&[load_balancer.as_str(), target_group.as_str()]);
+    let got = arns_for_tag_filters(&router, &filters).await;
+    assert_eq!(
+        got, want,
+        "expected one filter to select both write paths' resources {want:?}, got {got:?}"
+    );
+
+    // Each write is visible through the OTHER API's reader.
+    let got = elb_tags(&router, &target_group).await;
+    assert_eq!(
+        got.get(KEY).map(String::as_str),
+        Some(VALUE),
+        "expected DescribeTags to report the tag this API wrote on {target_group}, got {got:?}"
+    );
+    let page = resources_for(&router, &load_balancer).await;
+    let got = page_tags(&page, &load_balancer);
+    assert_eq!(
+        got.get(KEY).map(String::as_str),
+        Some(VALUE),
+        "expected GetResources to report the tag AddTags wrote on {load_balancer}, got {got:?}"
+    );
 }
