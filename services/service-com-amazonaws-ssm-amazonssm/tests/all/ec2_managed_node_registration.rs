@@ -825,12 +825,13 @@ async fn an_association_runs_on_the_nodes_its_targets_select() {
     // The association that reached no node settles too: its execution is over as soon as
     // the targets have been evaluated, and it reports the result of a run over no node —
     // `Success`, with no count of targets by status, because there were no targets.
-    let reached_nothing = describe_association(&router, &other_id).await;
-    assert_eq!(
-        reached_nothing["Overview"]["Status"], json!("Success"),
-        "case \"an unregistered node\": expected an association that reached no node to settle \
-         Success, got {reached_nothing}"
-    );
+    //
+    // Its settle is a span of ITS OWN, so this looks again for it — the helper returns only
+    // once the association reports `Success`, and fails naming the body otherwise — instead
+    // of resting on however long the run above happened to take: on a loaded host the two
+    // spans need not have elapsed in the same order they fell due.
+    let reached_nothing =
+        association_when_successful(&router, "an unregistered node", &other_id).await;
     assert_eq!(
         reached_nothing["Overview"]["DetailedStatus"], json!("Success"),
         "case \"an unregistered node\": expected the detail of a finished run, got \

@@ -306,7 +306,7 @@ impl History {
 }
 
 /// The command ids of a `ListCommands` body, in the order it reported them.
-fn listed_ids(case: &str, body: &Value) -> Vec<String> {
+pub(crate) fn listed_ids(case: &str, body: &Value) -> Vec<String> {
     body["Commands"]
         .as_array()
         .unwrap_or_else(|| panic!("case {case:?}: expected a Commands list, got {body:?}"))

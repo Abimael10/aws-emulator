@@ -1444,7 +1444,7 @@ const COMMAND_INSTANTS: &[&str] = &["ExpiresAfter", "RequestedDateTime"];
 /// What a command whose send configured nothing reports for each configurable member: an
 /// unset scalar as the empty string, an unset list as empty, and an unset configuration
 /// structure as the object with its own members at their defaults.
-fn unconfigured_members(region: &str) -> Vec<(&'static str, Value)> {
+pub(crate) fn unconfigured_members(region: &str) -> Vec<(&'static str, Value)> {
     vec![
         ("Comment", json!("")),
         ("OutputS3Region", json!(region)),
@@ -1475,7 +1475,7 @@ fn unconfigured_members(region: &str) -> Vec<(&'static str, Value)> {
 
 /// Assert `command` reports every member of the projection, and reports each instant at
 /// the millisecond resolution this protocol's `timestamp` carries.
-fn assert_complete_projection(case: &str, command: &Value) {
+pub(crate) fn assert_complete_projection(case: &str, command: &Value) {
     for member in COMMAND_MEMBERS {
         assert!(
             !command[*member].is_null(),
