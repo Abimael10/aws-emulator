@@ -799,10 +799,16 @@ async fn a_token_authorizer_decides_the_method_and_a_refusal_never_reaches_the_b
 /// request the authorizer never decided publishes none, which an unresolved reference renders
 /// as the placeholder AWS writes an access-log field it has no value for as.
 fn expected_principal(row: &Row) -> String {
-    match row.message {
+    published_principal(row.message, row.token.unwrap_or_default())
+}
+
+/// The principal a request that earned `message` and presented `token` published, as the
+/// record's own format reports it — the ONE reading of it both tables of this suite assert by.
+fn published_principal(message: Option<&str>, token: &str) -> String {
+    match message {
         // A refused call published nothing, whichever refusal it earned.
         Some(_) => service_common::api_gateway_access_logs::UNRESOLVED_VALUE.to_string(),
-        None => format!("principal-{}", row.token.unwrap_or_default()),
+        None => format!("principal-{token}"),
     }
 }
 
@@ -1184,5 +1190,332 @@ async fn an_authorizer_naming_a_role_is_invoked_under_it_rather_than_by_the_func
                 answered.text()
             );
         }
+    }
+}
+
+// ---------------------------------------------------------------------------------------
+// How a client that resolves the api's own invoke host NOWHERE addresses the same stage.
+//
+// THE RULE, one level above the addressing the suite above uses: a client on the machine
+// this emulator runs on resolves `{api-id}.execute-api.{region}.amazonaws.com` nowhere, so
+// it reaches the emulator's own endpoint and carries in the PATH what it cannot carry in the
+// host — the reserved `/_aws` namespace segment, then the ENDPOINT it was handed, written
+// either as that endpoint's `execute-api` label followed by the api id or as the endpoint
+// HOST itself (the two ways a rewriter can carry an endpoint across), then the invoke path
+// whole. Such an address is read on whatever host it arrives at, and the stage answers it
+// with the same decision, the same integration result and the same access-log record its own
+// endpoint answers with — so a `CUSTOM`-authorized method is as decidable for that client as
+// for one that reaches AWS. An address naming an endpoint whose api id this emulator holds no
+// api for is served by no api of it.
+//
+// The rows differ along what the rule generalises over: the SPELLING of the endpoint behind
+// the marker (the label and the api id; the endpoint host itself, in its plain, `-fips` and
+// China-partition forms), the HOST the request arrives at (the emulator's own loopback
+// endpoint with a port, that endpoint written by name, and the api's own `execute-api` host),
+// and what the request presents at the authorizer's identity source, which is what decides
+// whether the method's integration runs at all.
+// ---------------------------------------------------------------------------------------
+
+/// An address of the emulator's own endpoint, which names no service at all: what a client
+/// that cannot resolve the api's own host sends to.
+const LOCAL_ENDPOINT: &str = "127.0.0.1:9297";
+
+/// That same endpoint written by name, the other way a client on this machine addresses it.
+const LOCAL_NAME: &str = "localhost";
+
+/// An api id this emulator holds no api for, so no endpoint of it is served by any api.
+const UNHELD_API_ID: &str = "zzz9999999";
+
+/// How a row names the endpoint it addresses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Addressing {
+    /// `/_aws/execute-api/{api-id}/…` — the endpoint LABEL, then the api id.
+    EndpointLabel,
+    /// `/_aws/{api-id}.execute-api.{region}.amazonaws.com/…` — the endpoint HOST itself.
+    EndpointHost,
+    /// That host in the `-fips` variant spelling of the same endpoint.
+    FipsEndpointHost,
+    /// That host in the China partition's domain, which carries one label more.
+    ChinaEndpointHost,
+    /// The api's own endpoint host with no marker in the path at all: the addressing
+    /// `RestApi$disableExecuteApiEndpoint` documents, which is the control here.
+    OwnEndpointHost,
+}
+
+impl Addressing {
+    /// The path a request of this addressing carries for `api`, asking for `marker`.
+    fn path(self, api: &str, marker: &str) -> String {
+        let invoke = format!("/{STAGE}/{RESOURCE_PATH}?marker={marker}");
+        match self {
+            Self::EndpointLabel => format!("/_aws/execute-api/{api}{invoke}"),
+            Self::EndpointHost => {
+                format!("/_aws/{api}.execute-api.{REGION}.amazonaws.com{invoke}")
+            }
+            Self::FipsEndpointHost => {
+                format!("/_aws/{api}.execute-api-fips.{REGION}.amazonaws.com{invoke}")
+            }
+            Self::ChinaEndpointHost => {
+                format!("/_aws/{api}.execute-api.cn-north-1.amazonaws.com.cn{invoke}")
+            }
+            Self::OwnEndpointHost => invoke,
+        }
+    }
+}
+
+/// One row: how the request names the endpoint, and which host it arrives at.
+struct AddressRow {
+    case: &'static str,
+    addressing: Addressing,
+    /// The host the request carries, or `None` for the api's own endpoint host.
+    host: Option<&'static str>,
+}
+
+/// The table the addressing rule is asserted over.
+const ADDRESS_ROWS: &[AddressRow] = &[
+    AddressRow {
+        case: "the endpoint label and the api id, on the emulator's own loopback endpoint",
+        addressing: Addressing::EndpointLabel,
+        host: Some(LOCAL_ENDPOINT),
+    },
+    AddressRow {
+        case: "the endpoint host carried across, on the emulator's own loopback endpoint",
+        addressing: Addressing::EndpointHost,
+        host: Some(LOCAL_ENDPOINT),
+    },
+    AddressRow {
+        case: "the endpoint host carried across, on that endpoint written by name",
+        addressing: Addressing::EndpointHost,
+        host: Some(LOCAL_NAME),
+    },
+    AddressRow {
+        case: "the endpoint host in its -fips variant spelling",
+        addressing: Addressing::FipsEndpointHost,
+        host: Some(LOCAL_ENDPOINT),
+    },
+    AddressRow {
+        case: "the endpoint host in the China partition's domain",
+        addressing: Addressing::ChinaEndpointHost,
+        host: Some(LOCAL_ENDPOINT),
+    },
+    AddressRow {
+        case: "the marker read on the api's OWN endpoint host, as it is on any host",
+        addressing: Addressing::EndpointLabel,
+        host: None,
+    },
+    AddressRow {
+        case: "the api's own endpoint host with no marker at all",
+        addressing: Addressing::OwnEndpointHost,
+        host: None,
+    },
+];
+
+/// What the authorizer's policy says about a presented token, and what the stage therefore
+/// owes the request: the two outcomes every addressing above is asserted over.
+struct Decision {
+    case: &'static str,
+    token: &'static str,
+    status: u16,
+    /// The sentence a refused answer carries, or `None` for the row the integration serves.
+    message: Option<&'static str>,
+    /// Whether the method's integration — the backend function — runs at all.
+    backend_runs: bool,
+}
+
+const DECISIONS: &[Decision] = &[
+    Decision {
+        case: "a token whose policy explicitly denies the invoked method",
+        token: "deny-me",
+        status: 403,
+        message: Some(EXPLICIT_DENY),
+        backend_runs: false,
+    },
+    Decision {
+        case: "a token whose policy allows the invoked method",
+        token: "allow-me",
+        status: 200,
+        message: None,
+        backend_runs: true,
+    },
+];
+
+/// One request to the stage, addressed as `row` says and carrying `token` at the authorizer's
+/// identity source — and no credential, as a client of a `CUSTOM`-authorized method sends
+/// none.
+async fn invoke_addressed(
+    router: &MultiServiceRouter,
+    api: &str,
+    row: &AddressRow,
+    token: &str,
+    marker: &str,
+) -> Answered {
+    let host = row
+        .host
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("{api}.execute-api.{REGION}.amazonaws.com"));
+    dispatch(
+        router,
+        "GET",
+        &host,
+        &row.addressing.path(api, marker),
+        &[(IDENTITY_HEADER, token)],
+        Bytes::new(),
+    )
+    .await
+}
+
+#[tokio::test]
+async fn a_rewritten_endpoint_reaches_the_same_stage_and_earns_the_same_decision() {
+    let router = emulator();
+    let api = deployed(&router).await;
+    let backend_group = format!("/aws/lambda/{BACKEND_FUNCTION}");
+
+    for (index, row) in ADDRESS_ROWS.iter().enumerate() {
+        for (choice, decision) in DECISIONS.iter().enumerate() {
+            let case = format!("{} / {}", row.case, decision.case);
+            let marker = format!("addressed-{index}-{choice}");
+            let answered = invoke_addressed(&router, &api, row, decision.token, &marker).await;
+
+            assert_eq!(
+                answered.status,
+                decision.status,
+                "case {case:?}: expected HTTP {} from the stage, got {} with {:?}",
+                decision.status,
+                answered.status,
+                answered.text()
+            );
+            match decision.message {
+                Some(sentence) => assert_eq!(
+                    answered.message(),
+                    sentence,
+                    "case {case:?}: expected the refusal {sentence:?}, got {:?}",
+                    answered.text()
+                ),
+                None => assert_eq!(
+                    answered.json(),
+                    json!({ "ran": marker }),
+                    "case {case:?}: expected the integration's own answer for {marker:?}, got {:?}",
+                    answered.text()
+                ),
+            }
+
+            // The stage logged the request it just answered, under the STAGE-QUALIFIED path
+            // the client addressed — the api's own path space, whatever the client had to
+            // carry in front of it to reach this emulator.
+            let request_id = answered
+                .request_id
+                .clone()
+                .unwrap_or_else(|| panic!("case {case:?}: the answer reported no request id"));
+            let awaited = awaited_message(&router, ACCESS_GROUP, |message| {
+                message.contains(&request_id)
+            })
+            .await;
+            let held = delivered(&router, ACCESS_GROUP).await;
+            let record = awaited.unwrap_or_else(|| {
+                panic!(
+                    "case {case:?}: expected an access-log record for {request_id:?} in \
+                     {ACCESS_GROUP:?}, got {held:?}"
+                )
+            });
+            let logged: Value = serde_json::from_str(&record).unwrap_or(Value::Null);
+            assert_eq!(
+                logged,
+                json!({
+                    "requestId": request_id,
+                    "path": format!("/{STAGE}/{RESOURCE_PATH}"),
+                    "status": decision.status.to_string(),
+                    "principal": published_principal(decision.message, decision.token),
+                }),
+                "case {case:?}: expected the stage's own record of this request, got {record:?}"
+            );
+            // ONE record per answered request, which is what the stage owes: a second
+            // delivery of the same request fails here.
+            let for_this_request = delivered(&router, ACCESS_GROUP)
+                .await
+                .unwrap_or_default()
+                .iter()
+                .filter(|message| message.contains(&request_id))
+                .count();
+            assert_eq!(
+                for_this_request, 1,
+                "case {case:?}: expected exactly one access-log record for {request_id:?}, got \
+                 {for_this_request}"
+            );
+
+            // And what the BACKEND ran: the marker this request carried, present only where
+            // the authorizer admitted the call. The absence is read once the record above
+            // arrived, so the gateway has finished answering the request by then.
+            let ran =
+                awaited_backend_line(&router, &backend_group, &marker, decision.backend_runs).await;
+            let backend_held = delivered(&router, &backend_group).await;
+            assert_eq!(
+                ran, decision.backend_runs,
+                "case {case:?}: expected the backend to have run={}, got the group \
+                 {backend_group:?} holding {backend_held:?}",
+                decision.backend_runs
+            );
+
+            // The AUTHORIZER's own function ran for every row, whichever way it decided, so
+            // its own log group holds that run — the evidence that tells a refusal the
+            // authorizer MADE from a request that never reached it.
+            let authorizer_group = format!("/aws/lambda/{AUTHORIZER_FUNCTION}");
+            let framed = awaited_message(&router, &authorizer_group, |message| {
+                message.starts_with("START RequestId: ")
+            })
+            .await;
+            assert!(
+                framed.is_some(),
+                "case {case:?}: expected the authorizer's own run in {authorizer_group:?}, got \
+                 {:?}",
+                delivered(&router, &authorizer_group).await
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_rewritten_endpoint_naming_an_api_this_emulator_holds_none_for_is_served_by_no_api() {
+    let router = emulator();
+    let api = deployed(&router).await;
+    let backend_group = format!("/aws/lambda/{BACKEND_FUNCTION}");
+
+    // Both spellings of the marker, each naming an endpoint of an api id this emulator holds
+    // no api for: the api deployed above answers neither, however reachable its own stage is.
+    let cases: &[(&str, String)] = &[
+        (
+            "the endpoint label and an api id no api of this emulator has",
+            format!("/_aws/execute-api/{UNHELD_API_ID}/{STAGE}/{RESOURCE_PATH}?marker=unheld"),
+        ),
+        (
+            "the endpoint host of an api id no api of this emulator has",
+            format!(
+                "/_aws/{UNHELD_API_ID}.execute-api.{REGION}.amazonaws.com/{STAGE}/\
+                 {RESOURCE_PATH}?marker=unheld"
+            ),
+        ),
+    ];
+    for (case, path) in cases {
+        let answered = dispatch(
+            &router,
+            "GET",
+            LOCAL_ENDPOINT,
+            path,
+            &[(IDENTITY_HEADER, "allow-me")],
+            Bytes::new(),
+        )
+        .await;
+        assert_ne!(
+            answered.status, 200,
+            "case {case:?}: expected the stage of {api} not to serve {path:?}, got HTTP {} \
+             with {:?}",
+            answered.status,
+            answered.text()
+        );
+        let ran = awaited_backend_line(&router, &backend_group, "unheld", false).await;
+        assert!(
+            !ran,
+            "case {case:?}: expected the backend never to run for {path:?}, got the group \
+             {backend_group:?} holding {:?}",
+            delivered(&router, &backend_group).await
+        );
     }
 }

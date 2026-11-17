@@ -1083,9 +1083,13 @@ struct Resolved<'s, 'r> {
 ///   through one ([`Addressed::delivered_through`]) — which is what the api's resource policy
 ///   can then be conditioned on ([`super::resource_policy::SOURCE_VPCE_KEY`]);
 /// * PREFIXED PATH-STYLE, the addressing a client reaching an EMULATOR uses: the data
-///   plane is named by the reserved namespace segment [`EMULATOR_PATH_NAMESPACE`] and the
-///   [`EXECUTE_API_LABEL`], then the api id, then the invoke path —
-///   `/_aws/execute-api/{api_id}/{stage}/{resource-path}`. One
+///   plane is named by the reserved namespace segment [`EMULATOR_PATH_NAMESPACE`], then the
+///   ENDPOINT the client was handed — its [`EXECUTE_API_LABEL`] label and the api id
+///   (`/_aws/execute-api/{api_id}/{stage}/{resource-path}`), or that endpoint's own HOST
+///   (`/_aws/{api_id}.execute-api.{region}.amazonaws.com/{stage}/{resource-path}`) — then
+///   the invoke path. It is read AHEAD of the host's own api id — a path under the reserved
+///   namespace is in no api's resource-path space, so the endpoint it names is the one the
+///   client was handed, whichever host that client could reach. One
 ///   endpoint serves this emulator's whole surface, control plane and data plane alike, so
 ///   a client that cannot reach `{api_id}.execute-api.{region}.amazonaws.com` names the
 ///   data plane in the path before naming the api, which is what keeps an invoke path off
@@ -1093,7 +1097,8 @@ struct Resolved<'s, 'r> {
 ///   whatever host it arrives at, EXCEPT an address this emulator published for another
 ///   service's resource: that address is a resource of its own, whose whole path space is
 ///   that resource's ([`answered_by_another_service`], applied to every addressing here
-///   before any of them is read);
+///   before any of them is read), and an interface VPC endpoint's own DNS name, whose
+///   addressing above names the endpoint the request arrived through;
 /// * PATH-STYLE: the api id is the FIRST PATH SEGMENT and the invoke path is what follows
 ///   it. A client on the machine this emulator runs on resolves
 ///   `{api_id}.execute-api.{region}.amazonaws.com` nowhere, so it reaches the emulator's own
@@ -1148,23 +1153,24 @@ fn resolve<'s, 'r>(
                 source_vpce: addressed.delivered_through.or(Some(endpoint)),
             });
     }
-    if let Some(api_id) = addressed.host.and_then(api_id_of_host) {
-        return store.rest_apis.get(api_id).map(|api| Resolved {
-            api,
-            invoke_path: addressed.path,
-            source_vpce: addressed.delivered_through,
-        });
-    }
-    // PREFIXED PATH-STYLE: the path names this data plane before it names the api, so it is
-    // read on whatever host it arrives at — the prefix is in no service's modelled path
-    // space, and an api id this service does not hold is served by nothing here. (An ADDRESS
-    // another service published for one of its resources is not such a host: the claim this
-    // resolving is reached through declines it ahead of every addressing below,
+    // PREFIXED PATH-STYLE before the host's own api id: the path names this data plane and
+    // the endpoint it addresses before it names anything else, so it is read on whatever
+    // host it arrives at — the prefix is in no service's modelled path space, and an api id
+    // this service does not hold is served by nothing here. (An ADDRESS another service
+    // published for one of its resources is not such a host: the claim this resolving is
+    // reached through declines it ahead of every addressing here,
     // [`answered_by_another_service`].)
     if let Some((api_id, invoke_path)) = split_execute_api_prefix(addressed.path) {
         return store.rest_apis.get(api_id).map(|api| Resolved {
             api,
             invoke_path,
+            source_vpce: addressed.delivered_through,
+        });
+    }
+    if let Some(api_id) = addressed.host.and_then(api_id_of_host) {
+        return store.rest_apis.get(api_id).map(|api| Resolved {
+            api,
+            invoke_path: addressed.path,
             source_vpce: addressed.delivered_through,
         });
     }
@@ -1216,21 +1222,30 @@ fn resolve<'s, 'r>(
 /// The api id and the invoke path of a PREFIXED PATH-STYLE address, or `None` when `path`
 /// does not carry that prefix.
 ///
-/// The prefix is [`EMULATOR_PATH_NAMESPACE`] then [`EXECUTE_API_LABEL`], by exact segment
-/// equality, and what follows is the api id and then the invoke path the host-style
-/// addressing carries whole — `/_aws/execute-api/{api-id}/{stage}/{resource-path}`. The
-/// invoke path is a SLICE of the request's own path, so nothing is copied, and a prefix
-/// with no api id after it resolves nothing.
+/// The prefix is [`EMULATOR_PATH_NAMESPACE`], by exact segment equality, and what follows
+/// names the ENDPOINT the client was handed, then the invoke path the host-style addressing
+/// carries whole. BOTH spellings of that endpoint resolve — the endpoint's
+/// [`EXECUTE_API_LABEL`] label followed by the api id
+/// (`/_aws/execute-api/{api-id}/{stage}/{resource-path}`), and the endpoint HOST itself
+/// (`/_aws/{api-id}.execute-api.{region}.amazonaws.com/{stage}/{resource-path}`, read by
+/// [`api_id_of_host`]) — because what a client that resolves that host nowhere has to carry
+/// across is the HOST it was given, and those are the two ways to write it. The invoke path
+/// is a SLICE of the request's own path, so nothing is copied, and a prefix naming no
+/// endpoint, or an endpoint with no api id after it, resolves nothing.
 fn split_execute_api_prefix(path: &str) -> Option<(&str, &str)> {
     let (prefix, after_prefix) = split_first_segment(path)?;
     if prefix != EMULATOR_PATH_NAMESPACE {
         return None;
     }
-    let (label, after_label) = split_first_segment(after_prefix)?;
-    if label != EXECUTE_API_LABEL {
+    let (endpoint, after_endpoint) = split_first_segment(after_prefix)?;
+    // The endpoint HOST spelling: the api is the first label of the host carried across.
+    if let Some(api_id) = api_id_of_host(endpoint) {
+        return Some((api_id, after_endpoint));
+    }
+    if endpoint != EXECUTE_API_LABEL {
         return None;
     }
-    split_first_segment(after_label)
+    split_first_segment(after_endpoint)
 }
 
 /// The first non-empty segment of `path` and the path that follows it, or `None` for a

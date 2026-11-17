@@ -88,9 +88,11 @@ fn a_vpc_endpoints_own_dns_name_names_the_endpoint_and_not_an_api() {
 #[test]
 fn the_data_plane_path_prefix_names_the_api_before_the_stage() {
     // Rows differ along what follows the prefix (an api id with an invoke path, with a
-    // stage alone, with nothing), along the spelling of the prefix itself (extra
-    // slashes, a label that merely starts with it, one segment of it alone) and along
-    // paths that carry no prefix at all, which the other addressings read.
+    // stage alone, with nothing), along the SPELLING of the endpoint behind it (the
+    // endpoint label and the api id, or the endpoint host itself, in each variant and
+    // partition a host of it is written in), along the spelling of the prefix itself
+    // (extra slashes, a label that merely starts with it, one segment of it alone) and
+    // along paths that carry no prefix at all, which the other addressings read.
     let cases: &[(&str, Option<(&str, &str)>)] = &[
         (
             "/_aws/execute-api/abc1230000/prod/pets",
@@ -101,6 +103,28 @@ fn the_data_plane_path_prefix_names_the_api_before_the_stage() {
             Some(("abc1230000", "prod")),
         ),
         ("/_aws/execute-api/abc1230000", Some(("abc1230000", ""))),
+        // The endpoint HOST spelling, which is what a client that rewrote the endpoint it
+        // was handed carries across: the api is the host's own first label.
+        (
+            "/_aws/abc1230000.execute-api.us-east-1.amazonaws.com/prod/pets",
+            Some(("abc1230000", "prod/pets")),
+        ),
+        (
+            "/_aws/abc1230000.execute-api.us-east-1.amazonaws.com/prod",
+            Some(("abc1230000", "prod")),
+        ),
+        (
+            "/_aws/abc1230000.execute-api.us-east-1.amazonaws.com",
+            Some(("abc1230000", "")),
+        ),
+        (
+            "/_aws/0123456789.execute-api-fips.us-gov-west-1.amazonaws.com/live/pets",
+            Some(("0123456789", "live/pets")),
+        ),
+        (
+            "/_aws/abc1230000.execute-api.cn-north-1.amazonaws.com.cn/prod/pets",
+            Some(("abc1230000", "prod/pets")),
+        ),
         // Empty segments are not segments, so the same address spelled with extra
         // slashes names the same api, and the invoke path it leaves is read by
         // [`split_stage`], which drops them too.
@@ -112,6 +136,12 @@ fn the_data_plane_path_prefix_names_the_api_before_the_stage() {
         // with it is a different path.
         ("/_awsx/execute-api/abc1230000/prod", None),
         ("/_aws/execute-apifoo/abc1230000/prod", None),
+        // A segment that is no `execute-api` endpoint host carries no api id either.
+        (
+            "/_aws/abc1230000.execute-apifoo.us-east-1.amazonaws.com/prod",
+            None,
+        ),
+        ("/_aws/127.0.0.1:9297/prod/pets", None),
         // The prefix with nothing after it names no api.
         ("/_aws/execute-api", None),
         ("/_aws", None),
