@@ -22,7 +22,11 @@
 //! assertion quotes the emulator's own log, which is where a delivery that could not be made
 //! says so. ONE deployment is driven here, since starting the binary costs what starting the
 //! emulator costs; what the pipeline generalises over is spanned in process by the sibling
-//! suite `cfn_deployed_s3_notification_to_lambda_pipeline`.
+//! suite `cfn_deployed_s3_notification_to_lambda_pipeline`. For the same reason the one START
+//! this suite pays for is SHARED: the leg in
+//! [`crate::s3_notification_converts_on_a_started_emulator`] — the same chain wired by hand from
+//! the function onwards, and filtered by a key-name `Filter` whose rules this suite's template
+//! does not carry — runs on this emulator rather than starting a second one.
 
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -80,7 +84,12 @@ def handler(event, context):
 "#;
 
 /// A running emulator, killed and its home folder removed once dropped, however a test ends.
-struct Started {
+///
+/// `pub(crate)` because starting the built binary is the one harness no suite can write a second
+/// time without drifting from this one: the sibling suite
+/// [`crate::s3_notification_converts_on_a_started_emulator`] drives the same started emulator
+/// through its own calls.
+pub(crate) struct Started {
     child: Child,
     home: PathBuf,
     folder: PathBuf,
@@ -101,7 +110,7 @@ impl Drop for Started {
 impl Started {
     /// Start the built binary on a free port in a home folder of its own, and wait until it has
     /// published the files a client reads its port, its certificate and its credentials from.
-    fn start() -> Self {
+    pub(crate) fn start() -> Self {
         let home = new_home();
         let log = std::fs::File::create(home.join("emulator.log")).expect("create the log file");
         let mut command = Command::new(emulator_binary());
@@ -161,12 +170,12 @@ impl Started {
 
     /// Everything the emulator has written to its own log, which is where a delivery that could
     /// not be made, a throttled run or a refused call says so.
-    fn log(&self) -> String {
+    pub(crate) fn log(&self) -> String {
         std::fs::read_to_string(self.home.join("emulator.log")).unwrap_or_default()
     }
 
     /// One signed call, answered with its status and body text.
-    fn call(
+    pub(crate) fn call(
         &self,
         signing_name: &str,
         method: &str,
@@ -247,7 +256,7 @@ impl Started {
     }
 
     /// One CloudFormation call over its awsQuery wire.
-    fn cloudformation(&self, action: &str, members: &[(&str, &str)]) -> (u16, String) {
+    pub(crate) fn cloudformation(&self, action: &str, members: &[(&str, &str)]) -> (u16, String) {
         let mut body = format!("Action={action}&Version=2010-05-15");
         for (key, value) in members {
             body.push('&');
@@ -265,7 +274,7 @@ impl Started {
     }
 
     /// One call against S3's REST surface, path-style.
-    fn s3(&self, method: &str, path: &str, body: &str) -> (u16, String) {
+    pub(crate) fn s3(&self, method: &str, path: &str, body: &str) -> (u16, String) {
         self.call(
             "s3",
             method,
@@ -276,7 +285,7 @@ impl Started {
     }
 
     /// Everything the function logged, as `FilterLogEvents` reports it.
-    fn logged(&self, function: &str) -> String {
+    pub(crate) fn logged(&self, function: &str) -> String {
         let group = format!("/aws/lambda/{function}");
         let (status, body) = self.call(
             "logs",
@@ -436,7 +445,7 @@ fn pipeline(bucket: &str) -> Value {
 
 /// Create `stack` from `template`, wait for a terminal status and answer its outputs. A stack
 /// that did not complete is quoted with the emulator's own log.
-fn deployed(
+pub(crate) fn deployed(
     emulator: &Started,
     case: &str,
     stack: &str,
@@ -484,7 +493,7 @@ fn deployed(
 }
 
 /// The value `name` the stack published, or a failure naming what it did publish.
-fn output(
+pub(crate) fn output(
     outputs: &std::collections::BTreeMap<String, String>,
     case: &str,
     name: &str,
@@ -495,7 +504,10 @@ fn output(
 }
 
 /// The whole pipeline on the started emulator: the stack completes, the write the configuration
-/// admits runs the function, and the marker the handler wrote reads back.
+/// admits runs the function, and the marker the handler wrote reads back. Then, on the SAME
+/// started emulator, the key-name filter leg of
+/// [`crate::s3_notification_converts_on_a_started_emulator`], which needs a running emulator and
+/// not a second one.
 #[test]
 fn a_deployed_pipeline_runs_on_the_emulator_a_client_starts() {
     let case = "the pipeline deployed on a started emulator";
@@ -557,4 +569,9 @@ fn a_deployed_pipeline_runs_on_the_emulator_a_client_starts() {
         Some(written),
         "case {case:?}: the marker must carry the bytes the handler read back, got {body}"
     );
+
+    // The second leg, on this same started emulator: a pipeline wired by hand from the function
+    // onwards, whose notification configuration carries a key-name `Filter`.
+    crate::s3_notification_converts_on_a_started_emulator::
+        an_armed_notification_converts_only_what_its_literal_filter_admits(&emulator);
 }

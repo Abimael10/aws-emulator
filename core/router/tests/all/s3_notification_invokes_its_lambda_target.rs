@@ -79,9 +79,10 @@ const BOOT_STACK_SIZE: usize = 64 * 1024 * 1024;
 /// runtime this suite's deliveries are made on: a notification delivery is a task of its own,
 /// so it runs on this same thread and needs the same depth.
 ///
-/// One copy for both cases of this suite, so neither can drift onto a thread the chain it
-/// drives does not fit on.
-fn driven<Body>(name: &'static str, body: Body)
+/// One copy for both cases of this suite — and for the sibling
+/// [`crate::s3_notification_key_filter_is_literal`], which drives the same chain and so needs
+/// the same thread — so none of them can drift onto a thread the chain does not fit on.
+pub(crate) fn driven<Body>(name: &'static str, body: Body)
 where
     Body: FnOnce() -> ::std::pin::Pin<Box<dyn ::std::future::Future<Output = ()>>>
         + Send
