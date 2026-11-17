@@ -35,18 +35,29 @@
 //!    The rows span the cluster-identifier forms, whether the cluster exists at all, and
 //!    the length bounds `bootstrapId` admits.
 //!
+//!
+//! Rules 2 and 3 are also checked where they MEET: one resource that is not there,
+//! addressed BOTH by the identifier members its own operation takes and by the ARN the
+//! tagging operations take, is refused in the two different wordings, and a resource a
+//! request names in its BODY rather than in an identifier member is refused by the same
+//! identifier-kind vocabulary as one named by an identifier member.
+//!
 //! Every refusal of a client carries one status, the service's [`CLIENT_ERROR_STATUS`],
 //! and names its class in the body.
 //!
 //! Each test builds its own engine, so the state one test writes is invisible to the
 //! others.
 
+use std::time::{Duration, Instant};
+
 use serde_json::{json, Value};
 use service_com_amazonaws_pcs_awsparallelcomputingservice::service::wire::CLIENT_ERROR_STATUS;
-use service_com_amazonaws_pcs_awsparallelcomputingservice::state::MAX_STORED_LIST_ENTRIES;
+use service_com_amazonaws_pcs_awsparallelcomputingservice::state::{
+    MAX_STORED_LIST_ENTRIES, STATUS_ACTIVE,
+};
 use smithy_server_runtime::MultiServiceRouter;
 
-use super::cluster_lifecycle::{call, emulator, wait_past_the_owed_transition};
+use super::cluster_lifecycle::{call, emulator};
 
 /// The constraint clause PCS states for a resource name outside its member's `@pattern`.
 ///
@@ -66,6 +77,14 @@ const REGION: &str = "us-east-1";
 /// lookup the tagging operations take, as against the identifier-addressed lookups, whose
 /// sentence names the kind of resource.
 const ARN_ADDRESSED_NOT_FOUND: &str = "Resource cannot be found.";
+
+/// How long a test waits for a lifecycle transition the clock owes before it calls the
+/// emulator broken. Generous on purpose: the tests below wait for the CONDITION a later
+/// caller reads, so the speed of the host running them never decides the outcome.
+const OWED_TRANSITION_DEADLINE: Duration = Duration::from_secs(60);
+
+/// How often the poll below looks again while it waits for that condition.
+const POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 /// The awsJson1_0 error code, without the namespace the envelope may prefix.
 fn error_code(payload: &Value) -> String {
@@ -106,6 +125,11 @@ fn create_compute_node_group(cluster: &str, name: &str) -> Value {
 
 /// Create a cluster under `name`, wait until the clock has made it ACTIVE, and answer the
 /// id PCS minted for it.
+///
+/// The wait polls the cluster's own reader for the CONDITION a later caller sees, rather
+/// than sleeping for the span the service stores, and bounds itself by
+/// [`OWED_TRANSITION_DEADLINE`] — far longer than that span, so the speed of the host
+/// running these tests never decides the outcome.
 async fn active_cluster(router: &MultiServiceRouter, name: &str) -> String {
     let (status, created) = call(router, "CreateCluster", &create_cluster(name)).await;
     assert_eq!(status, 200, "case create {name}: got {created}");
@@ -113,8 +137,20 @@ async fn active_cluster(router: &MultiServiceRouter, name: &str) -> String {
         .as_str()
         .unwrap_or_default()
         .to_string();
-    wait_past_the_owed_transition().await;
-    id
+    let deadline = Instant::now() + OWED_TRANSITION_DEADLINE;
+    loop {
+        let (status, read) = call(router, "GetCluster", &json!({"clusterIdentifier": &id})).await;
+        assert_eq!(status, 200, "case polling {name}: got {read}");
+        if read["cluster"]["status"].as_str() == Some(STATUS_ACTIVE) {
+            return id;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "case polling {name}: expected the cluster to reach {STATUS_ACTIVE}, last read \
+             {read}"
+        );
+        tokio::time::sleep(POLL_INTERVAL).await;
+    }
 }
 
 /// The clusters `ListClusters` reports, by name.
@@ -394,6 +430,283 @@ async fn a_not_found_names_the_identifier_it_could_not_resolve_and_its_kind() {
              {refused}"
         );
     }
+}
+
+/// One resource that is NOT there, addressed the two ways PCS lets a request address it:
+/// by the identifier members its own operation takes, and by the ARN the tagging
+/// operations take.
+struct MissingResource {
+    case: &'static str,
+    /// The operation that addresses it by identifier, and the request that does so.
+    operation: &'static str,
+    request: Value,
+    /// The identifier that resolves to nothing, as the request supplies it.
+    identifier: &'static str,
+    /// How the service names the KIND of that identifier, which the identifier-addressed
+    /// refusal reports in `resourceType`.
+    identifier_label: &'static str,
+    /// How the service's own sentence names that kind of resource.
+    noun: &'static str,
+    /// The ARN the tagging operations address the same missing resource by.
+    arn: String,
+}
+
+#[tokio::test]
+async fn the_identifier_and_arn_paths_word_the_same_missing_resource_differently() {
+    let router = emulator();
+    // A cluster that EXISTS, so the child rows below address a resource whose parent is
+    // real and only the child itself is missing — on both paths.
+    let (status, created) = call(&router, "CreateCluster", &create_cluster("two-paths")).await;
+    assert_eq!(status, 200, "setup CreateCluster: got {created}");
+    let cluster = created["cluster"]["id"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    let account = engine::EMULATOR_ACCOUNT_ID;
+
+    // The rows span the three kinds of resource PCS holds, each addressed by a generated
+    // id of the form only this service mints.
+    let rows = vec![
+        MissingResource {
+            case: "a cluster",
+            operation: "GetCluster",
+            request: json!({"clusterIdentifier": "pcs_00000000000000000000"}),
+            identifier: "pcs_00000000000000000000",
+            identifier_label: "Cluster ID",
+            noun: "cluster",
+            arn: format!("arn:aws:pcs:{REGION}:{account}:cluster/pcs_00000000000000000000"),
+        },
+        MissingResource {
+            case: "a queue of a cluster that exists",
+            operation: "GetQueue",
+            request: json!({
+                "clusterIdentifier": cluster.clone(),
+                "queueIdentifier": "pcs_11111111111111111111",
+            }),
+            identifier: "pcs_11111111111111111111",
+            identifier_label: "Queue ID",
+            noun: "queue",
+            arn: format!(
+                "arn:aws:pcs:{REGION}:{account}:cluster/{cluster}/queue/pcs_11111111111111111111"
+            ),
+        },
+        MissingResource {
+            case: "a compute node group of a cluster that exists",
+            operation: "GetComputeNodeGroup",
+            request: json!({
+                "clusterIdentifier": cluster.clone(),
+                "computeNodeGroupIdentifier": "pcs_22222222222222222222",
+            }),
+            identifier: "pcs_22222222222222222222",
+            identifier_label: "Compute Node Group ID",
+            noun: "compute node group",
+            arn: format!(
+                "arn:aws:pcs:{REGION}:{account}:cluster/{cluster}/computenodegroup/\
+                 pcs_22222222222222222222"
+            ),
+        },
+    ];
+
+    for row in &rows {
+        let MissingResource {
+            case,
+            operation,
+            request,
+            identifier,
+            identifier_label,
+            noun,
+            arn,
+        } = row;
+
+        // Addressed by IDENTIFIER: the sentence names the kind of resource, and the
+        // modelled members carry the identifier as supplied and the kind of identifier
+        // that did not resolve.
+        let (status, refused) = call(&router, operation, request).await;
+        assert_eq!(
+            (status, error_code(&refused).as_str()),
+            (CLIENT_ERROR_STATUS, "ResourceNotFoundException"),
+            "case {case:?} by identifier: expected the client-error status with \
+             ResourceNotFoundException, got {status} with {refused}"
+        );
+        assert_eq!(
+            (
+                refused["message"].as_str(),
+                refused["resourceId"].as_str(),
+                refused["resourceType"].as_str(),
+            ),
+            (
+                Some(format!("AWS PCS couldn't find the {noun} you specified.").as_str()),
+                Some(*identifier),
+                Some(*identifier_label),
+            ),
+            "case {case:?} by identifier: got {refused}"
+        );
+
+        // Addressed by ARN: one fixed sentence for the whole tagging surface, naming
+        // neither the kind of resource nor any identifier.
+        for (operation, request) in [
+            (
+                "TagResource",
+                json!({"resourceArn": arn, "tags": {"env": "prod"}}),
+            ),
+            ("ListTagsForResource", json!({"resourceArn": arn})),
+            (
+                "UntagResource",
+                json!({"resourceArn": arn, "tagKeys": ["env"]}),
+            ),
+        ] {
+            let (status, refused) = call(&router, operation, &request).await;
+            assert_eq!(
+                (status, error_code(&refused).as_str()),
+                (CLIENT_ERROR_STATUS, "ResourceNotFoundException"),
+                "case {case:?} by ARN through {operation}: expected the client-error status \
+                 with ResourceNotFoundException, got {status} with {refused}"
+            );
+            assert_eq!(
+                refused["message"].as_str(),
+                Some(ARN_ADDRESSED_NOT_FOUND),
+                "case {case:?} by ARN through {operation}: expected \
+                 {ARN_ADDRESSED_NOT_FOUND:?}, got {refused}"
+            );
+            // The two wordings are not collapsed: what the identifier-addressed refusal
+            // states about the resource is exactly what this one does not. What the
+            // ARN-addressed refusal reports INSTEAD is
+            // `an_arn_addressed_not_found_reports_the_arn_the_request_carried`.
+            let sentence = refused["message"].as_str().unwrap_or_default();
+            assert!(
+                !sentence.contains(noun) && !sentence.contains(identifier),
+                "case {case:?} by ARN through {operation}: the sentence must name neither \
+                 the kind nor the identifier, got {refused}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_resource_a_request_names_in_its_body_is_refused_by_the_same_vocabulary() {
+    let router = emulator();
+    let cluster = active_cluster(&router, "body-reference").await;
+
+    // A compute node group this cluster DOES hold, so a row naming it proves the refusals
+    // below are about the identifier that did not resolve and not about the member being
+    // present at all.
+    let (status, group) = call(
+        &router,
+        "CreateComputeNodeGroup",
+        &create_compute_node_group(&cluster, "held-nodes"),
+    )
+    .await;
+    assert_eq!(status, 200, "setup CreateComputeNodeGroup: got {group}");
+    let held = group["computeNodeGroup"]["id"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+
+    // Each row: the compute node groups the queue would be assigned to, and the one of
+    // them that resolves to nothing. `computeNodeGroupId` targets a plain `String` with no
+    // pattern (`smithy_query(query="shape", shape="ComputeNodeGroupConfiguration")`), so
+    // the rows span the forms a caller can put there — a generated group id, a group name,
+    // an arbitrary token — as well as how many groups the queue names and where in the
+    // list the unresolvable one sits.
+    let rows: Vec<(&str, Vec<String>, &str)> = vec![
+        (
+            "a generated group id nothing holds",
+            vec!["pcs_00000000000000000000".to_string()],
+            "pcs_00000000000000000000",
+        ),
+        (
+            "a group name nothing holds",
+            vec!["no-such-group".to_string()],
+            "no-such-group",
+        ),
+        (
+            "an arbitrary token in the member",
+            vec!["not an identifier at all".to_string()],
+            "not an identifier at all",
+        ),
+        (
+            "the second of two, the first of which resolves",
+            vec![held.clone(), "pcs_11111111111111111111".to_string()],
+            "pcs_11111111111111111111",
+        ),
+        (
+            "the first of two, the second of which resolves",
+            vec!["absent-nodes".to_string(), held.clone()],
+            "absent-nodes",
+        ),
+    ];
+
+    for (index, (case, groups, unresolved)) in rows.iter().enumerate() {
+        let request = json!({
+            "clusterIdentifier": &cluster,
+            "queueName": format!("body-queue-{index}"),
+            "computeNodeGroupConfigurations": groups
+                .iter()
+                .map(|id| json!({"computeNodeGroupId": id}))
+                .collect::<Vec<Value>>(),
+        });
+        let (status, refused) = call(&router, "CreateQueue", &request).await;
+        assert_eq!(
+            (status, error_code(&refused).as_str()),
+            (CLIENT_ERROR_STATUS, "ResourceNotFoundException"),
+            "case {case:?}: expected the client-error status with ResourceNotFoundException, \
+             got {status} with {refused}"
+        );
+        // The same vocabulary as an identifier-addressed lookup: the kind of resource in
+        // the sentence, the identifier that did not resolve and the kind of identifier it
+        // was in the modelled members.
+        assert_eq!(
+            (
+                refused["message"].as_str(),
+                refused["resourceId"].as_str(),
+                refused["resourceType"].as_str(),
+            ),
+            (
+                Some("AWS PCS couldn't find the compute node group you specified."),
+                Some(*unresolved),
+                Some("Compute Node Group ID"),
+            ),
+            "case {case:?}: got {refused}"
+        );
+    }
+
+    // The control: the same create naming only the group the cluster DOES hold is served.
+    let (status, created) = call(
+        &router,
+        "CreateQueue",
+        &json!({
+            "clusterIdentifier": &cluster,
+            "queueName": "served-queue",
+            "computeNodeGroupConfigurations": [{"computeNodeGroupId": &held}],
+        }),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "case a queue naming only the group the cluster holds: got {created}"
+    );
+
+    // And not one of the refused creates left a queue behind.
+    let (status, listed) = call(
+        &router,
+        "ListQueues",
+        &json!({"clusterIdentifier": &cluster, "maxResults": 100}),
+    )
+    .await;
+    assert_eq!(status, 200, "case ListQueues: got {listed}");
+    let names: Vec<String> = listed["queues"]
+        .as_array()
+        .map(|rows| {
+            rows.iter()
+                .map(|row| row["name"].as_str().unwrap_or_default().to_string())
+                .collect()
+        })
+        .unwrap_or_default();
+    assert_eq!(
+        names,
+        vec!["served-queue".to_string()],
+        "expected only the queue the served create made, got {names:?}"
+    );
 }
 
 #[tokio::test]
