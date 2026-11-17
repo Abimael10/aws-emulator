@@ -66,6 +66,14 @@ const FUNCTION_NOT_FOUND: &str = "ResourceNotFoundException";
 /// handed to Lambda fails with ([`refuse_unpassable_role`]).
 const INVALID_PARAMETER_VALUE: &str = "InvalidParameterValueException";
 
+/// The HTTP status Lambda answers that refusal with, which is the status the SDK diagnostic
+/// of the refused call states ([`refuse_unpassable_role`]).
+///
+/// Source: that error's own `httpError` in Lambda's model
+/// (`smithy_query(query="operation",operation="CreateFunction")`:
+/// `InvalidParameterValueException`, errorKind client, httpError 400).
+const INVALID_PARAMETER_VALUE_STATUS: u16 = 400;
+
 /// The property that names the role the function RUNS AS.
 const ROLE_PROPERTY: &str = "Role";
 
@@ -898,6 +906,14 @@ fn reported_text(answered: &Value, member: &str) -> Option<String> {
 /// The code and the sentence are the ones AWS Lambda refuses such a create with, because
 /// that is the refusal this condition is: `InvalidParameterValueException` with that
 /// service's own message, which the resource's failure reason then quotes.
+///
+/// And the message is reported as the EXCEPTION a Lambda SDK raises for that refusal
+/// ([`super::sdk_message`]) — that service's sentence followed by the SDK's diagnostic of the
+/// refused call — exactly as it is for a refusal this provider learnt by MAKING the call
+/// ([`super::in_process_calls::refusal_of_call`]). The provider does not word its own
+/// diagnosis of a refusal: what it reports is what its own SDK raised, so the reason a client
+/// reads for the failed resource carries the service attribution and the status whether the
+/// call was made and refused or refused ahead of being made.
 async fn refuse_unpassable_role(
     ctx: &smithy_server_runtime::OperationContext<'_>,
     region: &str,
@@ -916,9 +932,12 @@ async fn refuse_unpassable_role(
     {
         return Err(Refusal {
             code: INVALID_PARAMETER_VALUE.to_string(),
-            message:
-                ::service_com_amazonaws_lambda_awsgirapiservice::state::ROLE_NOT_ASSUMABLE_MESSAGE
-                    .to_string(),
+            message: super::sdk_message(
+                LAMBDA_SIGNING_NAME,
+                INVALID_PARAMETER_VALUE_STATUS,
+                INVALID_PARAMETER_VALUE,
+                ::service_com_amazonaws_lambda_awsgirapiservice::state::ROLE_NOT_ASSUMABLE_MESSAGE,
+            ),
         });
     }
     Ok(())
