@@ -634,6 +634,25 @@ async fn an_account_that_created_no_afi_sees_the_published_catalog() {
             fpga_image.members
         );
         assert_eq!(
+            fpga_image.member("ownerAlias"),
+            PUBLISHED_OWNER_ALIAS,
+            "case {case:?}: expected Amazon's owner alias, got {:?}",
+            fpga_image.members
+        );
+        assert_eq!(
+            fpga_image.member("dataRetentionSupport"),
+            "false",
+            "case {case:?}: expected data retention to be unsupported, got {:?}",
+            fpga_image.members
+        );
+        // `FpgaImage$InstanceTypes` is a restriction the AFI's owner records on it, not a fact
+        // of the FPGA-accelerated catalog, so a published AFI carries no such list at all.
+        assert!(
+            !fpga_image.members.contains_key("instanceTypes"),
+            "case {case:?}: expected no supported-instance-type list, got {:?}",
+            fpga_image.members
+        );
+        assert_eq!(
             fpga_image.state_code.as_deref(),
             Some(FPGA_IMAGE_STATE_AVAILABLE),
             "case {case:?}: expected it to be available, got {:?}",

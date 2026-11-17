@@ -738,6 +738,11 @@ const SHORT_TCP_ESTABLISHED_TIMEOUT: i32 = 350;
 /// extra bandwidth can be given to.
 const CONFIGURABLE_BANDWIDTH_WEIGHTINGS: &[&str] = &["default", "ebs-1", "vpc-1"];
 
+/// The Elastic Fabric Adapters (`EfaInfo$MaximumEfaInterfaces`) the newest hardware
+/// generation's whole-host sizes are offered: its adapter carries many more of them than the
+/// single one an earlier generation's largest size publishes.
+const NEWEST_GENERATION_EFA_INTERFACES: i32 = 16;
+
 /// The published hardware facts of the instance types recorded so far, one row per type.
 ///
 /// Read through [`published_instance_type_facts`]. The rows are grouped by family, and each
@@ -1889,6 +1894,219 @@ static PUBLISHED_INSTANCE_TYPE_FACTS: &[PublishedInstanceTypeFacts] = &[
         .host_features(true, false)
         .secondary_network(false)
         .ipv4_per_secondary_interface(0),
+    // C7gd — the C7g host with local NVMe SSD. It is the SAME Graviton3 hardware as the family
+    // above, so it publishes that family's rows of "Amazon EBS optimized instance types" and
+    // its network figures unchanged — a baseline the sizes below the `8xlarge` burst above, up
+    // to 10,000 Mbps and 40,000 IOPS, dedicated bandwidth from that size up, and up to 12.5
+    // Gigabit of network at the three smallest sizes, up to 15 at the two above them, then the
+    // 15, 22.5 and 30 Gigabit of the dedicated sizes. What the `d` adds is the local store, and
+    // its device SIZE is what the family's specification publishes per size while the device
+    // COUNT only grows at the two largest sizes: the figures below are that published column,
+    // not a multiple of the size in the type's name. The devices come out of the attachment
+    // pool the type shares with its interfaces and its EBS volumes, so the EBS limit each size
+    // reports is what that pool leaves — except on the bare metal size, which publishes the 31
+    // volumes a bare metal instance takes. The rest of the family's capabilities are the C7g
+    // ones: the smallest size takes two interfaces of four private addresses each, an enclave is
+    // offered from the `large` size up on this architecture, the Elastic Fabric Adapter only on
+    // the two sizes that hold the whole host, ENA Express on the two sizes above the one that
+    // carries the family's whole dedicated share and on the bare metal size, and the hardware
+    // generation takes no configurable ENA queue count and no interface attachment from a
+    // secondary network, with no local PTP hardware clock while reboot migration IS offered.
+    PublishedInstanceTypeFacts::of("c7gd.medium")
+        .ebs(315, 2_500, 10_000, 40_000)
+        .instance_store(1, 59)
+        .network("Up to 12.5 Gigabit")
+        .interfaces(2)
+        .ipv4_per_interface(4)
+        .efa(0)
+        .ena_srd(false)
+        .flexible_ena_queues(false)
+        .processor("AWS", 2.6)
+        .host_features(true, false)
+        .secondary_network(false)
+        .ipv4_per_secondary_interface(0),
+    PublishedInstanceTypeFacts::of("c7gd.large")
+        .ebs(630, 3_600, 10_000, 40_000)
+        .instance_store(1, 118)
+        .network("Up to 12.5 Gigabit")
+        .efa(0)
+        .ena_srd(false)
+        .flexible_ena_queues(false)
+        .nitro_enclaves(true)
+        .processor("AWS", 2.6)
+        .host_features(true, false)
+        .secondary_network(false)
+        .ipv4_per_secondary_interface(0),
+    PublishedInstanceTypeFacts::of("c7gd.xlarge")
+        .ebs(1_250, 6_000, 10_000, 40_000)
+        .instance_store(1, 237)
+        .network("Up to 12.5 Gigabit")
+        .efa(0)
+        .ena_srd(false)
+        .flexible_ena_queues(false)
+        .processor("AWS", 2.6)
+        .host_features(true, false)
+        .secondary_network(false)
+        .ipv4_per_secondary_interface(0),
+    PublishedInstanceTypeFacts::of("c7gd.2xlarge")
+        .ebs(2_500, 12_000, 10_000, 40_000)
+        .instance_store(1, 475)
+        .network("Up to 15 Gigabit")
+        .efa(0)
+        .ena_srd(false)
+        .flexible_ena_queues(false)
+        .processor("AWS", 2.6)
+        .host_features(true, false)
+        .secondary_network(false)
+        .ipv4_per_secondary_interface(0),
+    PublishedInstanceTypeFacts::of("c7gd.4xlarge")
+        .ebs(5_000, 20_000, 10_000, 40_000)
+        .instance_store(1, 950)
+        .network("Up to 15 Gigabit")
+        .efa(0)
+        .ena_srd(false)
+        .flexible_ena_queues(false)
+        .processor("AWS", 2.6)
+        .host_features(true, false)
+        .secondary_network(false)
+        .ipv4_per_secondary_interface(0),
+    PublishedInstanceTypeFacts::of("c7gd.8xlarge")
+        .ebs(10_000, 40_000, 10_000, 40_000)
+        .instance_store(1, 1_900)
+        .network("15 Gigabit")
+        .efa(0)
+        .ena_srd(false)
+        .flexible_ena_queues(false)
+        .processor("AWS", 2.6)
+        .host_features(true, false)
+        .secondary_network(false)
+        .ipv4_per_secondary_interface(0),
+    PublishedInstanceTypeFacts::of("c7gd.12xlarge")
+        .ebs(15_000, 60_000, 15_000, 60_000)
+        .instance_store(2, 1_425)
+        .network("22.5 Gigabit")
+        .efa(0)
+        .flexible_ena_queues(false)
+        .processor("AWS", 2.6)
+        .host_features(true, false)
+        .secondary_network(false)
+        .ipv4_per_secondary_interface(0),
+    PublishedInstanceTypeFacts::of("c7gd.16xlarge")
+        .ebs(20_000, 80_000, 20_000, 80_000)
+        .instance_store(2, 1_900)
+        .network("30 Gigabit")
+        .efa(1)
+        .flexible_ena_queues(false)
+        .processor("AWS", 2.6)
+        .host_features(true, false)
+        .secondary_network(false)
+        .ipv4_per_secondary_interface(0),
+    PublishedInstanceTypeFacts::of("c7gd.metal")
+        .ebs(20_000, 80_000, 20_000, 80_000)
+        .ebs_attachments(31)
+        .instance_store(2, 1_900)
+        .network("30 Gigabit")
+        .efa(1)
+        .ena_srd(true)
+        .processor("AWS", 2.6)
+        .auto_recovery(true)
+        .host_features(true, false)
+        .secondary_network(false)
+        .ipv4_per_secondary_interface(0),
+    // R9g — memory optimized on the newest AWS Graviton hardware, with no local instance store.
+    // The family's network and EBS bandwidth is CONFIGURABLE, so it publishes the bandwidth
+    // weightings a launch may ask for, which the families whose split is fixed publish none of;
+    // its EBS volumes are attached to EBS hardware of the type's own rather than out of the pool
+    // shared with its interfaces, so every size reports a limit of the `dedicated` kind, and the
+    // figure that limit carries is the 32 volumes published from the smallest size up to the
+    // `12xlarge` — above that the family's published figure is not recorded here yet, so those
+    // rows carry the KIND of the limit without a figure; and its connection tracking applies the
+    // generation's
+    // own, much shorter established-TCP idle timeout. It takes no interface attachment from a
+    // secondary network — so no address at all is available on one — and its guest's packets
+    // cannot be copied under a mirroring session. The Elastic Fabric Adapter is offered on
+    // the two sizes that hold the whole host, each publishing the 16 adapters of this
+    // generation. The remaining figures of the family are not recorded here yet, so each row
+    // carries only what IS published for it and the derivation answers the rest.
+    PublishedInstanceTypeFacts::of("r9g.medium")
+        .dedicated_ebs_attachments(32)
+        .bandwidth_weightings(CONFIGURABLE_BANDWIDTH_WEIGHTINGS)
+        .tcp_established_timeout(SHORT_TCP_ESTABLISHED_TIMEOUT)
+        .traffic_mirroring(false)
+        .secondary_network(false)
+        .ipv4_per_secondary_interface(0),
+    PublishedInstanceTypeFacts::of("r9g.large")
+        .dedicated_ebs_attachments(32)
+        .bandwidth_weightings(CONFIGURABLE_BANDWIDTH_WEIGHTINGS)
+        .tcp_established_timeout(SHORT_TCP_ESTABLISHED_TIMEOUT)
+        .traffic_mirroring(false)
+        .secondary_network(false)
+        .ipv4_per_secondary_interface(0),
+    PublishedInstanceTypeFacts::of("r9g.xlarge")
+        .dedicated_ebs_attachments(32)
+        .bandwidth_weightings(CONFIGURABLE_BANDWIDTH_WEIGHTINGS)
+        .tcp_established_timeout(SHORT_TCP_ESTABLISHED_TIMEOUT)
+        .traffic_mirroring(false)
+        .secondary_network(false)
+        .ipv4_per_secondary_interface(0),
+    PublishedInstanceTypeFacts::of("r9g.2xlarge")
+        .dedicated_ebs_attachments(32)
+        .bandwidth_weightings(CONFIGURABLE_BANDWIDTH_WEIGHTINGS)
+        .tcp_established_timeout(SHORT_TCP_ESTABLISHED_TIMEOUT)
+        .traffic_mirroring(false)
+        .secondary_network(false)
+        .ipv4_per_secondary_interface(0),
+    PublishedInstanceTypeFacts::of("r9g.4xlarge")
+        .dedicated_ebs_attachments(32)
+        .bandwidth_weightings(CONFIGURABLE_BANDWIDTH_WEIGHTINGS)
+        .tcp_established_timeout(SHORT_TCP_ESTABLISHED_TIMEOUT)
+        .traffic_mirroring(false)
+        .secondary_network(false)
+        .ipv4_per_secondary_interface(0),
+    PublishedInstanceTypeFacts::of("r9g.8xlarge")
+        .dedicated_ebs_attachments(32)
+        .bandwidth_weightings(CONFIGURABLE_BANDWIDTH_WEIGHTINGS)
+        .tcp_established_timeout(SHORT_TCP_ESTABLISHED_TIMEOUT)
+        .traffic_mirroring(false)
+        .secondary_network(false)
+        .ipv4_per_secondary_interface(0),
+    PublishedInstanceTypeFacts::of("r9g.12xlarge")
+        .dedicated_ebs_attachments(32)
+        .bandwidth_weightings(CONFIGURABLE_BANDWIDTH_WEIGHTINGS)
+        .tcp_established_timeout(SHORT_TCP_ESTABLISHED_TIMEOUT)
+        .traffic_mirroring(false)
+        .secondary_network(false)
+        .ipv4_per_secondary_interface(0),
+    PublishedInstanceTypeFacts::of("r9g.16xlarge")
+        .dedicated_attachment_limit()
+        .bandwidth_weightings(CONFIGURABLE_BANDWIDTH_WEIGHTINGS)
+        .tcp_established_timeout(SHORT_TCP_ESTABLISHED_TIMEOUT)
+        .traffic_mirroring(false)
+        .secondary_network(false)
+        .ipv4_per_secondary_interface(0),
+    PublishedInstanceTypeFacts::of("r9g.24xlarge")
+        .dedicated_attachment_limit()
+        .bandwidth_weightings(CONFIGURABLE_BANDWIDTH_WEIGHTINGS)
+        .tcp_established_timeout(SHORT_TCP_ESTABLISHED_TIMEOUT)
+        .traffic_mirroring(false)
+        .secondary_network(false)
+        .ipv4_per_secondary_interface(0),
+    PublishedInstanceTypeFacts::of("r9g.48xlarge")
+        .dedicated_attachment_limit()
+        .bandwidth_weightings(CONFIGURABLE_BANDWIDTH_WEIGHTINGS)
+        .tcp_established_timeout(SHORT_TCP_ESTABLISHED_TIMEOUT)
+        .traffic_mirroring(false)
+        .secondary_network(false)
+        .ipv4_per_secondary_interface(0)
+        .efa(NEWEST_GENERATION_EFA_INTERFACES),
+    PublishedInstanceTypeFacts::of("r9g.metal-48xl")
+        .dedicated_attachment_limit()
+        .bandwidth_weightings(CONFIGURABLE_BANDWIDTH_WEIGHTINGS)
+        .tcp_established_timeout(SHORT_TCP_ESTABLISHED_TIMEOUT)
+        .traffic_mirroring(false)
+        .secondary_network(false)
+        .ipv4_per_secondary_interface(0)
+        .efa(NEWEST_GENERATION_EFA_INTERFACES),
     // C9gd — compute optimized with local NVMe on the newest AWS Graviton hardware. The
     // family's network and EBS bandwidth is CONFIGURABLE: it publishes the bandwidth
     // weightings a launch may ask for, which the families whose split is fixed publish none

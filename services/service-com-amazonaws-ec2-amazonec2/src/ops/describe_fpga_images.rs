@@ -509,13 +509,6 @@ const FPGA_IMAGE_STATE_AVAILABLE: &str = "available";
 /// `amazon`, the first of [`FPGA_IMAGE_OWNER_ALIASES`].
 const FPGA_IMAGE_OWNER_ALIAS_AMAZON: &str = FPGA_IMAGE_OWNER_ALIASES[0];
 
-/// The instance types a published AFI of this catalog supports (`FpgaImage$InstanceTypes`):
-/// the FPGA-accelerated family an AFI is deployed on — "you can securely deploy an AFI on
-/// multiple FPGA-accelerated instances" (`CreateFpgaImage`) — whose members are the `f1.`
-/// entries of the model's own `InstanceType` catalog
-/// (`smithy_query(query="shape",shape="InstanceType")`).
-const FPGA_ACCELERATED_INSTANCE_TYPES: [&str; 3] = ["f1.2xlarge", "f1.4xlarge", "f1.16xlarge"];
-
 /// The PCI vendor id an Amazon FPGA device reports on the PCI bus (`PciId$VendorId`): the
 /// vendor id allocated to Amazon, which every AFI of this catalog is attached to the bus
 /// under. The device and subsystem ids beside it are the ones the AWS FPGA Hardware
@@ -644,12 +637,12 @@ fn published_fpga_images() -> Vec<FpgaImage> {
             tags: Some(Vec::new()),
             public: Some(true),
             data_retention_support: Some(false),
-            instance_types: Some(
-                FPGA_ACCELERATED_INSTANCE_TYPES
-                    .iter()
-                    .map(|instance_type| (*instance_type).to_string())
-                    .collect(),
-            ),
+            // `FpgaImage$InstanceTypes` is "the instance types supported by the AFI" — a
+            // restriction the AFI's owner records on it, not a fact of the FPGA-accelerated
+            // catalog. A published AFI carries none: it is loadable on whatever accelerated
+            // type the account launches, so this reports no list rather than naming the
+            // families the catalog happens to offer today.
+            instance_types: None,
         })
         .collect()
 }
