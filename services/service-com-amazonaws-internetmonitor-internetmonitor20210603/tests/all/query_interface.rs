@@ -5,14 +5,13 @@
 //!
 //! The rules under test:
 //!
-//! * A monitor is built from the application resources added to it, and every query type
-//!   reports measurements of the traffic to those resources, so a start against a monitor
-//!   whose `Resources` is empty has no data any query type could return: it is refused as
-//!   an input-validation failure (400 `BadRequestException`), records no query and starts
-//!   no lifecycle.
-//! * A start against a monitor with resources mints a `QueryId` and records the query in
-//!   the non-terminal `QUEUED` state; the clock then carries it to `RUNNING` and
-//!   `SUCCEEDED`, which is what `GetQueryStatus` reports and what `StopQuery` cancels.
+//! * A start against a monitor this account holds mints a `QueryId` and records the query
+//!   in the non-terminal `QUEUED` state, whatever that monitor holds: how many resources
+//!   it has decides what the query RETURNS, never whether it may be started. The clock
+//!   then carries the query to `RUNNING` and `SUCCEEDED`, which is what `GetQueryStatus`
+//!   reports and what `StopQuery` cancels.
+//! * A `MonitorName` this account does not hold, and a time period that ends before it
+//!   starts, are refused (400) and record no query.
 //! * A `QueryId` no query of the named monitor carries is refused by both readers with the
 //!   modelled `ValidationException` (400) — `StopQuery` never succeeds as a no-op for one.
 //!
@@ -30,9 +29,8 @@ use service_com_amazonaws_internetmonitor_internetmonitor20210603::ops::types::{
 };
 use service_com_amazonaws_internetmonitor_internetmonitor20210603::state::{
     invalid_resource_id_message, monitor_resource_path, service_state, QueryRecord,
-    INVALID_QUERY_ID_MESSAGE, INVALID_REQUEST_BODY_MESSAGE, MONITOR_ACTIVATION_DELAY,
-    MONITOR_STATE_ACTIVE, QUERY_STATUS_CANCELED, QUERY_STATUS_QUEUED, QUERY_STATUS_RUNNING,
-    QUERY_STATUS_SUCCEEDED, QUERY_STEP_DELAY,
+    INVALID_QUERY_ID_MESSAGE, INVALID_REQUEST_BODY_MESSAGE, QUERY_STATUS_CANCELED,
+    QUERY_STATUS_QUEUED, QUERY_STATUS_RUNNING, QUERY_STATUS_SUCCEEDED, QUERY_STEP_DELAY,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -182,68 +180,59 @@ struct StartCase {
 }
 
 // ---------------------------------------------------------------------------------------
-// A monitor with no resources has nothing any query type can return
+// What a monitor holds decides what a query RETURNS, never whether it may be started
 // ---------------------------------------------------------------------------------------
 
 #[tokio::test]
-async fn start_query_refuses_a_monitor_with_no_resources_whatever_it_asks_for() {
-    let router = emulator();
+async fn start_query_accepts_a_monitor_whatever_it_holds() {
+    let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
+    let router = emulator_on(Arc::clone(&engine));
     create_monitor(&router, json!({ "MonitorName": "resourceless-monitor" })).await;
+    monitor_with_resources(&router, "resourceful-monitor").await;
 
-    // Every `QueryType` the model declares, so the rule is checked over the whole catalog
-    // rather than the one type a recording happened to use
+    // Rows differ along how much the monitor holds — nothing at all, and one resource —
+    // because that is what the dropped admission rule keyed on; and every `QueryType` the
+    // model declares, so the rule is checked over the whole catalog rather than the one
+    // type a recording happened to use
     // (`smithy_query(query="shape",shape="QueryType")`, re-exported as
     // `QUERY_TYPE_VALUES`).
     let now = SystemTime::now();
-    for query_type in QUERY_TYPE_VALUES {
-        let (status, refused) =
-            start_query(&router, "resourceless-monitor", start_body(query_type, now)).await;
-        assert_eq!(
-            status, 400,
-            "case {query_type:?}: expected 400, got {status} with {refused}"
-        );
-        assert_eq!(
-            error_code(&refused),
-            "BadRequestException",
-            "case {query_type:?}: expected BadRequestException, got {refused}"
-        );
-        assert_eq!(
-            error_message(&refused),
-            INVALID_REQUEST_BODY_MESSAGE,
-            "case {query_type:?}: unexpected message in {refused}"
-        );
+    let mut minted: Vec<(String, String)> = Vec::new();
+    for monitor in ["resourceless-monitor", "resourceful-monitor"] {
+        for query_type in QUERY_TYPE_VALUES {
+            let case = format!("{monitor} asked for {query_type}");
+            let (status, started) =
+                start_query(&router, monitor, start_body(query_type, now)).await;
+            assert_eq!(
+                status, 200,
+                "case {case:?}: expected 200, got {status} with {started}"
+            );
+            let query_id = started["QueryId"]
+                .as_str()
+                .unwrap_or_else(|| panic!("case {case:?}: no QueryId in {started}"))
+                .to_string();
+            assert!(
+                !query_id.is_empty(),
+                "case {case:?}: the minted QueryId must not be empty, got {started}"
+            );
+
+            // The id is not just handed back: the query is recorded against the monitor it
+            // names, in the non-terminal state its lifecycle starts in.
+            assert_eq!(
+                reported_status(&router, &case, monitor, &query_id).await,
+                QUERY_STATUS_QUEUED,
+                "case {case:?}: a started query must first report QUEUED"
+            );
+            minted.push((case, query_id));
+        }
     }
 
-    // The monitor is untouched by the refusals: once the clock has carried it past its
-    // activation span it still reports its own state.
-    tokio::time::sleep(MONITOR_ACTIVATION_DELAY + Duration::from_millis(250)).await;
-    let (status, got) = call(
-        &router,
-        "GET",
-        "/v20210603/Monitors/resourceless-monitor",
-        None,
-    )
-    .await;
+    // Every start minted its own id, so no row was served another row's query.
+    let distinct: BTreeSet<&String> = minted.iter().map(|(_, id)| id).collect();
     assert_eq!(
-        status, 200,
-        "the monitor after the refusals: expected 200, got {status} with {got}"
-    );
-    assert_eq!(
-        got["Status"],
-        json!(MONITOR_STATE_ACTIVE),
-        "a refused start must leave the monitor's own state alone, got {got}"
-    );
-
-    // And nothing was recorded, so the monitor has no query to report.
-    let (status, polled) = query_status(
-        &router,
-        "resourceless-monitor",
-        "00000000-0000-4000-8000-000000000000",
-    )
-    .await;
-    assert_eq!(
-        status, 400,
-        "polling after a refused start: expected 400, got {status} with {polled}"
+        distinct.len(),
+        minted.len(),
+        "each start must mint its own QueryId, got {minted:?}"
     );
 }
 

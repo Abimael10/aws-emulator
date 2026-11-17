@@ -8,8 +8,9 @@
 //! the clock to carry it to `RUNNING` and then `SUCCEEDED`. `GetQueryStatus` reports it
 //! and `StopQuery` cancels it.
 //!
-//! A monitor whose `Resources` is empty has no application traffic to query, so a start
-//! against one is refused with `BadRequestException` (400) and nothing is recorded.
+//! A `MonitorName` this account does not hold is refused with `ValidationException` (400)
+//! and nothing is recorded; the monitor's own contents condition nothing, since what a
+//! monitor holds decides what a query RETURNS rather than whether it may be started.
 //!
 //! ## Shape of an operation
 //!
@@ -120,8 +121,8 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-internetmonitor-interne
 //
 // `BadRequestException` is widened in through `extra_errors`: this SERVICE models it
 // (`TagResource` lists it, "A bad request was received", HTTP 400) and it is the shape
-// this service answers an input-validation failure of a request with — here, a request
-// that asks for data a monitor cannot have, or a time period that ends before it starts.
+// this service answers an input-validation failure of a request with — here, a time
+// period that ends before it starts.
 #[smithy_macros::operation_error(
     "com.amazonaws.internetmonitor#StartQuery",
     extra_errors = ["BadRequestException"]
@@ -217,14 +218,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // queryable resource at all. The wording extends the form this service uses for a
         // resource id it cannot resolve (recorded for a health event) to the monitor's own
         // resource path; it is that form applied here, not a separately recorded message.
-        let Some(monitor) = store.monitors.get(&input.monitor_name) else {
+        //
+        // The monitor's own contents condition nothing: how many resources it holds, and
+        // so how much data a query can return, decides what the RESULTS are, never whether
+        // the query may be started.
+        if !store.monitors.contains_key(&input.monitor_name) {
             return Err(StartQueryErrorModeled::ValidationException(ValidationException {
                 message: Some(crate::state::invalid_resource_id_message(
                     &crate::state::monitor_resource_path(&input.monitor_name),
                 )),
             })
             .into());
-        };
+        }
 
         // "Specify a time period for the data that you want returned by using StartTime
         // and EndTime": a period that ends before it starts is no period, so the request
@@ -233,18 +238,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let start_time = input.start_time.as_secs_f64();
         let end_time = input.end_time.as_secs_f64();
         if end_time < start_time {
-            return Err(StartQueryErrorModeled::BadRequestException(BadRequestException {
-                message: Some(crate::state::INVALID_REQUEST_BODY_MESSAGE.to_string()),
-            })
-            .into());
-        }
-
-        // A monitor is "built based on information from the application resources that you
-        // add", and every query type reports measurements of the traffic to those
-        // resources: a monitor with none has no data any query type could return, so the
-        // request is refused whatever it asked for, and no query is recorded and no
-        // lifecycle started.
-        if monitor.resources.is_empty() {
             return Err(StartQueryErrorModeled::BadRequestException(BadRequestException {
                 message: Some(crate::state::INVALID_REQUEST_BODY_MESSAGE.to_string()),
             })

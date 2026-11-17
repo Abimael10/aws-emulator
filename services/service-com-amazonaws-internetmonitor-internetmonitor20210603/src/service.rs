@@ -46,6 +46,10 @@
 //! reason named in [`error_code`]: `code` belongs to the error ENVELOPE rather than to any
 //! modelled error shape, so no schema-driven error serializer can write it. Routing,
 //! status, `__type` and `message` all stay with the framework.
+//!
+//! A sixth seam, `override_protocol`, is taken too: every timestamp member of this model
+//! declares `@timestampFormat("date-time")`, so each one is an RFC 3339 STRING on the wire
+//! rather than the epoch-seconds number `restJson1` defaults to. See the method below.
 
 pub mod error_code;
 
@@ -64,6 +68,10 @@ pub struct EmulatedService<Eng: Send + Sync + 'static> {
     /// The envelope wrapper every routable request is served through. Held in a field,
     /// built once, because `override_operation` hands back a reference to it.
     envelope: error_code::ErrorCodeOperation,
+    /// The codec every modelled body of this service is read with and written with, built
+    /// ONCE here because [`Service::override_protocol`] hands back a borrow of it and must
+    /// never build a protocol per request.
+    protocol: ::service_common::date_time_json::DateTimeRestJson,
 }
 
 impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
@@ -74,6 +82,7 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
         Self {
             entry: crate::ServiceDefinition::new(engine),
             envelope: error_code::ErrorCodeOperation,
+            protocol: ::service_common::date_time_json::DateTimeRestJson::new(),
         }
     }
 }
@@ -160,5 +169,17 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // consume it on `None`.
         let _ = error;
         None
+    }
+
+    fn override_protocol(&self) -> Option<&dyn smithy_server_runtime::ServerHttpProtocol> {
+        // Every timestamp member of this model declares `@timestampFormat("date-time")`
+        // — `GetMonitor`'s `CreatedAt` and `ModifiedAt`, a health event's and an internet
+        // event's instants, `StartQuery`'s `StartTime` and `EndTime` and every listing's
+        // window (`smithy_query(query="operation",…)` reports the trait on each of them,
+        // and the model declares no `epoch-seconds` or `http-date` member at all). So each
+        // one is an RFC 3339 date-time STRING in both directions, not the epoch-seconds
+        // number `restJson1` defaults to. The generated member schemas drop that format
+        // and the shared codec supplies it, never overriding a member that declares one.
+        Some(&self.protocol)
     }
 }

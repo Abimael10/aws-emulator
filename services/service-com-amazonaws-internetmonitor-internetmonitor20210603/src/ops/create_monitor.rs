@@ -298,25 +298,34 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        let status = crate::state::MONITOR_STATE_PENDING.to_string();
-        let record = crate::state::MonitorRecord {
+        let mut record = crate::state::MonitorRecord {
             name: input.monitor_name.clone(),
             arn: crate::state::monitor_arn(&region, &input.monitor_name),
             resources,
-            processing_status: Some(crate::state::MonitorRecord::processing_status_for(&status)),
-            processing_status_info: None,
-            status,
+            // The health of the data processing, which is not the configuration state:
+            // a monitor's pipeline starts gathering measurements, and the text that goes
+            // with that processing state is fixed.
+            processing_status: Some(crate::state::PROCESSING_STATUS_COLLECTING_DATA.to_string()),
+            processing_status_info: Some(
+                crate::state::PROCESSING_STATUS_INFO_COLLECTING_DATA.to_string(),
+            ),
+            status: crate::state::MONITOR_STATE_PENDING.to_string(),
             created_at: now,
             modified_at: now,
-            // A created monitor is returned non-terminal (`PENDING`), so the clock owes it
-            // `ACTIVE` once the activation span has passed.
-            active_at: Some(now + crate::state::MONITOR_ACTIVATION_DELAY),
+            owed_status: None,
             tags,
             max_city_networks_to_monitor: input.max_city_networks_to_monitor,
             traffic_percentage_to_monitor: input.traffic_percentage_to_monitor,
-            internet_measurements_log_delivery: input.internet_measurements_log_delivery,
+            // A monitor always has a log-delivery configuration; a create that names none
+            // leaves it empty rather than absent.
+            internet_measurements_log_delivery: input
+                .internet_measurements_log_delivery
+                .unwrap_or_default(),
             health_events_config: input.health_events_config,
         };
+        // A created monitor is returned non-terminal (`PENDING`), so the clock owes it
+        // `ACTIVE` once the activation span has passed.
+        record.request_config_state(crate::state::MONITOR_STATE_ACTIVE, now);
 
         let output = CreateMonitorOutput {
             arn: record.arn.clone(),

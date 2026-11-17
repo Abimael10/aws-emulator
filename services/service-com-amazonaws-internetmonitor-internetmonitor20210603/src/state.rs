@@ -48,11 +48,20 @@ pub const MONITOR_STATE_ACTIVE: &str = "ACTIVE";
 /// See [`MONITOR_STATE_PENDING`].
 pub const MONITOR_STATE_INACTIVE: &str = "INACTIVE";
 
-/// `MonitorProcessingStatusCode` members used by this slice (see
+/// The `MonitorProcessingStatusCode` every monitor this emulator holds reports (see
 /// `crate::ops::types::MONITOR_PROCESSING_STATUS_CODE_VALUES`).
+///
+/// `ProcessingStatus` is "the health of the data processing for the monitor" — a property
+/// of the measurement pipeline, not of the monitor's configuration state. This emulator
+/// runs exactly one pipeline state: a monitor's measurements are being gathered and no
+/// insight has yet been produced from them, which is what `COLLECTING_DATA` reports.
 pub const PROCESSING_STATUS_COLLECTING_DATA: &str = "COLLECTING_DATA";
-/// See [`PROCESSING_STATUS_COLLECTING_DATA`].
-pub const PROCESSING_STATUS_INACTIVE: &str = "INACTIVE";
+
+/// The `ProcessingStatusInfo` that goes with [`PROCESSING_STATUS_COLLECTING_DATA`]: the
+/// sentence AWS words this processing state with. It is fixed text — the member carries no
+/// part of the request and no value from this service's state.
+pub const PROCESSING_STATUS_INFO_COLLECTING_DATA: &str =
+    "The monitor is OK and is collecting data-points to produce insights";
 
 /// `HealthEventStatus` members, as the model spells them (see
 /// `crate::ops::types::HEALTH_EVENT_STATUS_VALUES`).
@@ -66,13 +75,15 @@ pub const DEFAULT_REGION: &str = "us-east-1";
 /// The ARN namespace of this service, as `OPERATIONS.md` records it.
 pub const ARN_NAMESPACE: &str = "internetmonitor";
 
-/// How long a freshly created monitor reports `PENDING` before the clock owes it
-/// `ACTIVE`.
+/// How long a monitor reports `PENDING` before the clock owes it the configuration state
+/// a call asked it into.
 ///
-/// `CreateMonitor` returns a monitor in the non-terminal `PENDING` state, so the
-/// transition to `ACTIVE` is owed by the clock rather than by any later call. The span is
-/// chosen (AWS documents no duration for it) and is deliberately non-zero, so a caller
-/// polling immediately after the create still observes `PENDING`.
+/// Every call that asks a monitor into a configuration state answers with the non-terminal
+/// `PENDING` state — `CreateMonitor`, which asks for `ACTIVE`, and `UpdateMonitor`, which
+/// asks for the state its request carried — so that transition is owed by the clock rather
+/// than by any later call. The span is chosen (AWS documents no duration for it) and is
+/// deliberately non-zero, so a caller polling immediately after the call still observes
+/// `PENDING`.
 pub const MONITOR_ACTIVATION_DELAY: Duration = Duration::from_millis(400);
 
 /// The most monitors this emulator holds for its one account.
@@ -174,8 +185,23 @@ pub struct ClientTokenRecord {
     pub recorded_at: SystemTime,
 }
 
-/// One stored monitor: every member `GetMonitor` reports, plus the instant at which the
-/// clock owes this monitor its `PENDING` -> `ACTIVE` transition.
+/// The configuration state the clock owes a monitor, and the instant from which it is
+/// due.
+///
+/// A call that asks a monitor into a configuration state does not apply it: the monitor
+/// reports [`MONITOR_STATE_PENDING`] and reaches the asked-for state once
+/// [`MONITOR_ACTIVATION_DELAY`] has passed, which [`MonitorRecord::settle`] materialises.
+/// The pair lives in one value so the state and its due instant cannot drift apart.
+#[derive(Debug, Clone)]
+pub struct OwedConfigState {
+    /// The `MonitorConfigState` the monitor reaches when the clock owes it.
+    pub status: String,
+    /// The instant from which [`Self::status`] is due.
+    pub due: SystemTime,
+}
+
+/// One stored monitor: every member `GetMonitor` reports, plus the configuration state the
+/// clock still owes it.
 #[derive(Debug, Clone)]
 pub struct MonitorRecord {
     /// `MonitorName` — the store's key, kept on the record so a value-only scan can
@@ -189,18 +215,20 @@ pub struct MonitorRecord {
     /// `Status`, one of [`MONITOR_STATE_PENDING`] / [`MONITOR_STATE_ACTIVE`] /
     /// [`MONITOR_STATE_INACTIVE`].
     pub status: String,
-    /// `ProcessingStatus`.
+    /// `ProcessingStatus` — the health of this monitor's data processing, which is a
+    /// property of the measurement pipeline and not of [`Self::status`] (see
+    /// [`PROCESSING_STATUS_COLLECTING_DATA`]).
     pub processing_status: Option<String>,
-    /// `ProcessingStatusInfo`.
+    /// `ProcessingStatusInfo`, the text that goes with [`Self::processing_status`].
     pub processing_status_info: Option<String>,
     /// `CreatedAt`.
     pub created_at: SystemTime,
     /// `ModifiedAt`, bumped by every call that mutates the record.
     pub modified_at: SystemTime,
-    /// When set, the instant from which this monitor's `PENDING` -> `ACTIVE` transition
-    /// is due; [`MonitorRecord::settle`] materialises it. `None` once the monitor has
-    /// reached a state the clock owes nothing from.
-    pub active_at: Option<SystemTime>,
+    /// When set, the configuration state the clock still owes this monitor;
+    /// [`MonitorRecord::settle`] materialises it. `None` once the monitor has reached a
+    /// state the clock owes nothing from.
+    pub owed_status: Option<OwedConfigState>,
     /// `Tags`, shared by `GetMonitor`, `TagResource`, `UntagResource` and
     /// `ListTagsForResource`.
     pub tags: BTreeMap<String, String>,
@@ -208,8 +236,11 @@ pub struct MonitorRecord {
     pub max_city_networks_to_monitor: Option<i32>,
     /// `TrafficPercentageToMonitor`.
     pub traffic_percentage_to_monitor: Option<i32>,
-    /// `InternetMeasurementsLogDelivery`.
-    pub internet_measurements_log_delivery: Option<InternetMeasurementsLogDelivery>,
+    /// `InternetMeasurementsLogDelivery`. Not optional on the record: a monitor always
+    /// HAS a log-delivery configuration, and one nothing has been published to is the
+    /// empty configuration rather than no configuration at all, so `GetMonitor` reports
+    /// the structure whether or not a call has filled it in.
+    pub internet_measurements_log_delivery: InternetMeasurementsLogDelivery,
     /// `HealthEventsConfig`.
     pub health_events_config: Option<HealthEventsConfig>,
 }
@@ -217,28 +248,45 @@ pub struct MonitorRecord {
 impl MonitorRecord {
     /// Materialise the transition the clock already owed at `now`.
     ///
-    /// A reporting operation calls this before it reads: the monitor would have been
-    /// `ACTIVE` at this instant whether or not anybody called, so making it so is not a
-    /// mutation driven by the read. It never moves a monitor an explicit call has put
-    /// into another state, because such a call clears [`MonitorRecord::active_at`].
+    /// A reporting operation calls this before it reads: the monitor would have reached
+    /// the owed state at this instant whether or not anybody called, so making it so is
+    /// not a mutation driven by the read. A monitor the clock owes nothing is left where
+    /// it is.
     pub fn settle(&mut self, now: SystemTime) {
-        if let Some(due) = self.active_at {
-            if now >= due {
-                self.status = MONITOR_STATE_ACTIVE.to_string();
-                self.active_at = None;
+        if let Some(owed) = self.owed_status.as_ref() {
+            if now >= owed.due {
+                self.status = owed.status.clone();
+                self.owed_status = None;
             }
         }
     }
 
-    /// The `ProcessingStatus` a monitor in `status` reports: a monitor that is not
-    /// configured to run is not processing data, so it reports `INACTIVE`; otherwise it
-    /// is still gathering its first measurements (`COLLECTING_DATA`).
-    pub fn processing_status_for(status: &str) -> String {
-        if status == MONITOR_STATE_INACTIVE {
-            PROCESSING_STATUS_INACTIVE.to_string()
-        } else {
-            PROCESSING_STATUS_COLLECTING_DATA.to_string()
-        }
+    /// The configuration state this monitor settles into: the state the clock owes it when
+    /// one is owed, and its current state otherwise.
+    ///
+    /// What a call that changes a configuration but asks for no state leaves the monitor
+    /// headed for.
+    pub fn settled_status(&self) -> &str {
+        self.owed_status
+            .as_ref()
+            .map_or(self.status.as_str(), |owed| owed.status.as_str())
+    }
+
+    /// Record that a call asked this monitor into `status`: the configuration change is
+    /// applied asynchronously, so the monitor reports [`MONITOR_STATE_PENDING`] from now
+    /// and the clock owes it `status` once [`MONITOR_ACTIVATION_DELAY`] has passed.
+    ///
+    /// One rule for every call that changes a monitor's configuration — `CreateMonitor`
+    /// (which asks for [`MONITOR_STATE_ACTIVE`]) and `UpdateMonitor` (which asks for the
+    /// state its request carried, or for [`Self::settled_status`] when it carried none) —
+    /// so a client polling for the documented `PENDING` -> settled transition observes it
+    /// whichever call started it.
+    pub fn request_config_state(&mut self, status: impl Into<String>, now: SystemTime) {
+        self.status = MONITOR_STATE_PENDING.to_string();
+        self.owed_status = Some(OwedConfigState {
+            status: status.into(),
+            due: now + MONITOR_ACTIVATION_DELAY,
+        });
     }
 }
 

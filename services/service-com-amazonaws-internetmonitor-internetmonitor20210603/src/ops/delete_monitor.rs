@@ -5,9 +5,11 @@
 //! Removes one monitor — with its tags — from [`crate::state`], so a later `GetMonitor`
 //! fails and `ListMonitors` no longer reports it.
 //!
-//! The operation is `@idempotent` and the model declares no not-found error for it (see
-//! `smithy_query(query="operation",operation="DeleteMonitor")`), so deleting a monitor
-//! that is already gone succeeds with the same empty body.
+//! A `MonitorName` this account does not hold addresses no monitor to delete, so the call
+//! is refused with the service's not-found shape (`ResourceNotFoundException`, HTTP 404,
+//! widened in through `extra_errors` as `GetMonitor` does) rather than reporting a delete
+//! of something that was never there: a caller has to be able to tell "I deleted it" from
+//! "it was never there".
 //!
 //! ## Shape of an operation
 //!
@@ -59,6 +61,8 @@
 //! * `AccessDeniedException` (HTTP 403) — You don't have sufficient permission to perform
 //!   this action.
 //! * `InternalServerException` (HTTP 500) — An internal error occurred.
+//! * `ResourceNotFoundException` (HTTP 404) — widened in through `extra_errors` (see
+//!   below): the shape this service answers for a monitor the account does not hold.
 //! * `ThrottlingException` (HTTP 429) — The request was denied due to request throttling.
 //! * `ValidationException` (HTTP 400) — Invalid request.
 
@@ -76,11 +80,21 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-internetmonitor-interne
 // here — hence the `DeleteMonitorError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.internetmonitor#DeleteMonitor")]
+//
+// `ResourceNotFoundException` is widened in through `extra_errors`: this SERVICE models
+// it (`UpdateMonitor` lists it, "The request specifies a resource that doesn't exist",
+// HTTP 404) and it is the shape a call addressing a monitor the account does not hold is
+// refused with — the same shape, and the same wording, `GetMonitor` and `UpdateMonitor`
+// answer such a call with.
+#[smithy_macros::operation_error(
+    "com.amazonaws.internetmonitor#DeleteMonitor",
+    extra_errors = ["ResourceNotFoundException"]
+)]
 #[derive(Debug)]
 pub enum DeleteMonitorErrorModeled {
     AccessDeniedException(AccessDeniedException),
     InternalServerException(InternalServerException),
+    ResourceNotFoundException(ResourceNotFoundException),
     ThrottlingException(ThrottlingException),
     ValidationException(ValidationException),
 }
@@ -145,8 +159,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
 
         let mut store = state.lock();
-        // The record owns its tags, so removing it removes them with it.
-        store.monitors.remove(&input.monitor_name);
+        // The record owns its tags, so removing it removes them with it. A name no monitor
+        // carries addresses nothing to remove: the message is built from the request and
+        // the caller's account by the one helper every operation whose addressed resource
+        // IS the monitor the request names uses, so the three cannot drift.
+        if store.monitors.remove(&input.monitor_name).is_none() {
+            return Err(DeleteMonitorErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(crate::state::monitor_not_found_message(
+                        &input.monitor_name,
+                    )),
+                },
+            )
+            .into());
+        }
         // An idempotency record that named this monitor can no longer report it, so it is
         // dropped with the monitor rather than left pointing at a gap.
         store.forget_tokens_for(&input.monitor_name);

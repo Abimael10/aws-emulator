@@ -7,6 +7,12 @@
 //! overwrites what is stored, and `ModifiedAt` is bumped. A `MonitorName` no monitor
 //! carries is `ResourceNotFoundException` (404).
 //!
+//! A `Status` the request carries, like every other configuration change, is APPLIED
+//! ASYNCHRONOUSLY: the answer reports the in-flight `PENDING` state and the clock owes the
+//! monitor the state it settles into — the requested one, or the one it was already headed
+//! for when the request asked for none — exactly as `CreateMonitor` owes a created monitor
+//! its `ACTIVE`. See [`crate::state::MonitorRecord::request_config_state`].
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -283,14 +289,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
         monitor.resources = resources;
-        if let Some(status) = input.status {
-            monitor.processing_status =
-                Some(crate::state::MonitorRecord::processing_status_for(&status));
-            monitor.status = status;
-            // An explicitly set state is the one the monitor is in: the clock no longer
-            // owes it the activation transition a create started.
-            monitor.active_at = None;
-        }
         if let Some(max_city_networks) = input.max_city_networks_to_monitor {
             monitor.max_city_networks_to_monitor = Some(max_city_networks);
         }
@@ -298,12 +296,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             monitor.traffic_percentage_to_monitor = Some(traffic_percentage);
         }
         if let Some(log_delivery) = input.internet_measurements_log_delivery {
-            monitor.internet_measurements_log_delivery = Some(log_delivery);
+            monitor.internet_measurements_log_delivery = log_delivery;
         }
         if let Some(health_events_config) = input.health_events_config {
             monitor.health_events_config = Some(health_events_config);
         }
         monitor.modified_at = now;
+        // An accepted update is applied asynchronously, so the monitor reports the
+        // in-flight `PENDING` state and the clock owes it the state it settles into — the
+        // state this request asked for, or the one it was already headed for when the
+        // request asked for none. The same rule `CreateMonitor` takes for the monitor it
+        // creates. `ProcessingStatus` is the health of the data processing, so no
+        // configuration state recomputes it.
+        let settles_into = input
+            .status
+            .unwrap_or_else(|| monitor.settled_status().to_string());
+        monitor.request_config_state(settles_into, now);
 
         let output = UpdateMonitorOutput {
             monitor_arn: monitor.arn.clone(),

@@ -23,6 +23,9 @@ serde_json = { workspace = true }
 tracing = { workspace = true }
 # Hex codec for ListMonitors' opaque NextToken (and its round-trip back to a name).
 hex = { workspace = true }
+# The shared restJson1 date-time timestamp codec (`date_time_json`), which this model's
+# `@timestampFormat("date-time")` members are read with and written with.
+service-common = { path = "../common" }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

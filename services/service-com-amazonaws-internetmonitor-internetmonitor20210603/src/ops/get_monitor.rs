@@ -252,7 +252,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     .collect(),
             ),
             max_city_networks_to_monitor: monitor.max_city_networks_to_monitor,
-            internet_measurements_log_delivery: monitor.internet_measurements_log_delivery.clone(),
+            // A monitor always has a log-delivery configuration, so the structure is
+            // always reported; an empty one is an empty structure, not an absent member.
+            internet_measurements_log_delivery: Some(
+                monitor.internet_measurements_log_delivery.clone(),
+            ),
             traffic_percentage_to_monitor: monitor.traffic_percentage_to_monitor,
             health_events_config: monitor.health_events_config.clone(),
         })

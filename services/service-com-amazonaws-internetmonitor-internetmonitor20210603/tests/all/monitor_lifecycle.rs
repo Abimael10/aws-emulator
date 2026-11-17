@@ -16,9 +16,10 @@ use std::time::Duration;
 use bytes::Bytes;
 use serde_json::{json, Value};
 use service_com_amazonaws_internetmonitor_internetmonitor20210603::state::{
-    service_state, CLIENT_TOKEN_RETENTION, MAX_CLIENT_TOKENS, MAX_MONITORS,
-    MAX_RESOURCES_PER_MONITOR, MAX_TAGS_PER_MONITOR, MONITOR_ACTIVATION_DELAY,
+    monitor_not_found_message, service_state, CLIENT_TOKEN_RETENTION, MAX_CLIENT_TOKENS,
+    MAX_MONITORS, MAX_RESOURCES_PER_MONITOR, MAX_TAGS_PER_MONITOR, MONITOR_ACTIVATION_DELAY,
     MONITOR_STATE_ACTIVE, MONITOR_STATE_INACTIVE, MONITOR_STATE_PENDING,
+    PROCESSING_STATUS_COLLECTING_DATA, PROCESSING_STATUS_INFO_COLLECTING_DATA,
 };
 use service_com_amazonaws_internetmonitor_internetmonitor20210603::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
@@ -36,6 +37,39 @@ const ACCOUNT: &str = "000000000000";
 /// Long enough to be past [`MONITOR_ACTIVATION_DELAY`] without being a visible pause.
 fn past_activation() -> Duration {
     MONITOR_ACTIVATION_DELAY + Duration::from_millis(250)
+}
+
+/// `GetMonitor` for `name`, polled until its `Status` is `expected`, and the whole
+/// response as it then reads.
+///
+/// A configuration state the clock owes is materialised by the first call made at or after
+/// its due instant, so the condition is waited FOR rather than slept past. The deadline is
+/// generous beside [`MONITOR_ACTIVATION_DELAY`], so a loaded or a fast host reaches the
+/// same verdict; what the case asserts is the state the monitor settles into, never how
+/// long it took.
+pub(crate) async fn settled_monitor(
+    router: &MultiServiceRouter,
+    case: &str,
+    name: &str,
+    expected: &str,
+) -> Value {
+    let deadline = std::time::Instant::now() + MONITOR_ACTIVATION_DELAY + Duration::from_secs(30);
+    let path = format!("/v20210603/Monitors/{}", label(name));
+    loop {
+        let (status, got) = call(router, "GET", &path, None).await;
+        assert_eq!(
+            status, 200,
+            "case {case}: GetMonitor expected 200, got {status} with {got}"
+        );
+        if got["Status"] == json!(expected) {
+            return got;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "case {case}: expected the monitor to settle into {expected}, got {got}"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
 }
 
 /// One emulator: the shared engine behind the one service under test, mounted in the
@@ -180,10 +214,11 @@ fn resource_set(value: &Value, field: &str) -> BTreeSet<String> {
 
 /// A wire timestamp as epoch seconds, for ordering two of them.
 ///
-/// The vendored codegen does not carry `@timestampFormat` into a shape's schema, so every
-/// timestamp this emulator writes takes the protocol default — epoch seconds for
-/// `restJson1`. Both forms are accepted here so this helper keeps working if that
-/// framework-level gap is closed.
+/// This service writes every timestamp in the `date-time` form its model declares (see
+/// `Service::override_protocol`), which is what
+/// [`every_date_time_timestamp_is_reported_as_an_rfc3339_string`] pins strictly. Ordering
+/// is all this helper is for, so it accepts either form rather than restating that rule:
+/// a case about the FORM asserts it with `date_time_text`.
 pub(crate) fn timestamp_secs(value: &Value, field: &str) -> f64 {
     let found = value
         .get(field)
@@ -230,11 +265,12 @@ struct CreateCase {
 
 /// The optional members whose stored value `GetMonitor` must report verbatim. Each is
 /// optional on both sides, so "absent in the request" must read back as "absent".
-const VERBATIM_MEMBERS: &[&str] = &[
-    "MaxCityNetworksToMonitor",
-    "TrafficPercentageToMonitor",
-    "InternetMeasurementsLogDelivery",
-];
+///
+/// `InternetMeasurementsLogDelivery` is NOT one of them: a monitor always has a
+/// log-delivery configuration, so the structure is always reported and an empty one reads
+/// back as an empty structure — see
+/// [`get_monitor_always_reports_the_log_delivery_structure`].
+const VERBATIM_MEMBERS: &[&str] = &["MaxCityNetworksToMonitor", "TrafficPercentageToMonitor"];
 
 fn create_cases() -> Vec<CreateCase> {
     let long_name = "l".repeat(255);
@@ -379,8 +415,24 @@ async fn get_monitor_reports_exactly_what_create_monitor_stored() {
             case.case
         );
         assert_eq!(
-            got["ProcessingStatus"], json!("COLLECTING_DATA"),
+            got["ProcessingStatus"], json!(PROCESSING_STATUS_COLLECTING_DATA),
             "case {}: unexpected ProcessingStatus in {got}",
+            case.case
+        );
+        assert_eq!(
+            got["ProcessingStatusInfo"], json!(PROCESSING_STATUS_INFO_COLLECTING_DATA),
+            "case {}: unexpected ProcessingStatusInfo in {got}",
+            case.case
+        );
+        // The log-delivery configuration is always reported, as the structure the request
+        // carried or as the empty one when it carried none.
+        let expected_log_delivery = member(&case.body, "InternetMeasurementsLogDelivery")
+            .cloned()
+            .unwrap_or_else(|| json!({}));
+        assert_eq!(
+            member(&got, "InternetMeasurementsLogDelivery").cloned(),
+            Some(expected_log_delivery),
+            "case {}: unexpected InternetMeasurementsLogDelivery in {got}",
             case.case
         );
 
@@ -1023,28 +1075,140 @@ async fn update_monitor_accepts_only_the_statuses_its_model_documents() {
             "case {status_value}: expected {expected}, got {status} with {response}"
         );
         if expected == 200 {
+            // The requested state is applied asynchronously, so the answer reports the
+            // in-flight PENDING state whichever accepted state was asked for.
             assert_eq!(
-                response["Status"], json!(status_value),
-                "case {status_value}: the update must report the status it set, got {response}"
+                response["Status"], json!(MONITOR_STATE_PENDING),
+                "case {status_value}: an accepted update must report PENDING, got {response}"
             );
-            let (_, got) = call(&router, "GET", "/v20210603/Monitors/status-monitor", None).await;
+            // And the clock, not a later call, carries the monitor into it.
+            let got = settled_monitor(&router, status_value, "status-monitor", status_value).await;
             assert_eq!(
                 got["Status"], json!(status_value),
-                "case {status_value}: GetMonitor must observe the new status, got {got}"
+                "case {status_value}: the monitor must settle into the requested state, got {got}"
             );
         }
     }
 
-    // An INACTIVE monitor is not processing data.
-    let (_, got) = call(&router, "GET", "/v20210603/Monitors/status-monitor", None).await;
+    // `ProcessingStatus` is the health of the data processing, not a restatement of the
+    // configuration state: an INACTIVE monitor's pipeline is still the one this emulator
+    // runs, so it reports the same processing state and the same info text.
+    let got = settled_monitor(
+        &router,
+        "the last accepted status",
+        "status-monitor",
+        MONITOR_STATE_INACTIVE,
+    )
+    .await;
     assert_eq!(
-        got["Status"], json!(MONITOR_STATE_INACTIVE),
-        "the last accepted status must still be in force, got {got}"
+        got["ProcessingStatus"], json!(PROCESSING_STATUS_COLLECTING_DATA),
+        "the configuration state must not decide ProcessingStatus, got {got}"
     );
     assert_eq!(
-        got["ProcessingStatus"], json!("INACTIVE"),
-        "an INACTIVE monitor must report ProcessingStatus INACTIVE, got {got}"
+        got["ProcessingStatusInfo"], json!(PROCESSING_STATUS_INFO_COLLECTING_DATA),
+        "the configuration state must not decide ProcessingStatusInfo, got {got}"
     );
+}
+
+/// One accepted update: the state the monitor is in before it, the request, and the state
+/// the clock must then carry the monitor into.
+struct SettleCase {
+    /// Names the row in every assertion message.
+    case: &'static str,
+    /// Whether the row takes the monitor out of service before the update under test.
+    start_inactive: bool,
+    /// The `UpdateMonitor` body under test.
+    update: Value,
+    /// The configuration state the monitor must settle into after it.
+    expected: &'static str,
+}
+
+#[tokio::test]
+async fn an_accepted_update_reports_pending_and_settles_into_the_state_it_is_headed_for() {
+    let router = emulator();
+
+    // Rows differ along what the request asks for — a state, another state, a
+    // configuration member, a resource set, and nothing at all — and along the state the
+    // monitor was in when it arrived, because neither decides the ANSWER: an accepted
+    // update is applied asynchronously, so it reports PENDING and the clock settles it.
+    let cases: Vec<SettleCase> = vec![
+        SettleCase {
+            case: "a configuration member on an active monitor",
+            start_inactive: false,
+            update: json!({ "MaxCityNetworksToMonitor": 7 }),
+            expected: MONITOR_STATE_ACTIVE,
+        },
+        SettleCase {
+            case: "a resource set on a monitor that is out of service",
+            start_inactive: true,
+            update: json!({ "ResourcesToAdd": [VPC_A] }),
+            expected: MONITOR_STATE_INACTIVE,
+        },
+        SettleCase {
+            case: "asking an out-of-service monitor back into service",
+            start_inactive: true,
+            update: json!({ "Status": MONITOR_STATE_ACTIVE }),
+            expected: MONITOR_STATE_ACTIVE,
+        },
+        SettleCase {
+            case: "asking an active monitor out of service",
+            start_inactive: false,
+            update: json!({ "Status": MONITOR_STATE_INACTIVE }),
+            expected: MONITOR_STATE_INACTIVE,
+        },
+        SettleCase {
+            case: "an update that asks for nothing at all",
+            start_inactive: false,
+            update: json!({}),
+            expected: MONITOR_STATE_ACTIVE,
+        },
+    ];
+
+    for (index, case) in cases.into_iter().enumerate() {
+        let name = format!("settle-case-{index}");
+        let path = format!("/v20210603/Monitors/{name}");
+        create_monitor(&router, json!({ "MonitorName": name })).await;
+        // The create's own owed transition is let through first, so what the row observes
+        // is the update's.
+        settled_monitor(&router, case.case, &name, MONITOR_STATE_ACTIVE).await;
+
+        if case.start_inactive {
+            let (status, out) = call(
+                &router,
+                "PATCH",
+                &path,
+                Some(json!({ "Status": MONITOR_STATE_INACTIVE })),
+            )
+            .await;
+            assert_eq!(
+                status, 200,
+                "case {}: taking the monitor out of service expected 200, got {status} with {out}",
+                case.case
+            );
+            settled_monitor(&router, case.case, &name, MONITOR_STATE_INACTIVE).await;
+        }
+
+        let (status, updated) = call(&router, "PATCH", &path, Some(case.update.clone())).await;
+        assert_eq!(
+            status, 200,
+            "case {}: expected 200, got {status} with {updated}",
+            case.case
+        );
+        assert_eq!(
+            updated["Status"], json!(MONITOR_STATE_PENDING),
+            "case {}: an accepted update must report PENDING, got {updated}",
+            case.case
+        );
+        // The in-flight state is observable, not just reported: a reader sees PENDING or
+        // the settled state, never a third thing.
+        let got = settled_monitor(&router, case.case, &name, case.expected).await;
+        assert_eq!(
+            got["Status"], json!(case.expected),
+            "case {}: expected the monitor to settle into {}, got {got}",
+            case.case,
+            case.expected
+        );
+    }
 }
 
 #[tokio::test]
@@ -1170,12 +1334,23 @@ async fn deleting_a_monitor_makes_it_unobservable_and_frees_its_name() {
         "ListTagsForResource for a deleted monitor must be 404, got {status} with {tags}"
     );
 
-    // DeleteMonitor is @idempotent and models no not-found error, so deleting again
-    // succeeds.
+    // A name no monitor carries addresses nothing to delete, so a repeated delete is
+    // refused with the service's not-found shape rather than reporting a success: a caller
+    // has to be able to tell "I deleted it" from "it was never there".
     let (status, again) = call(&router, "DELETE", "/v20210603/Monitors/doomed-monitor", None).await;
     assert_eq!(
-        status, 200,
-        "a repeated delete must succeed, got {status} with {again}"
+        status, 404,
+        "a repeated delete must be refused as not found, got {status} with {again}"
+    );
+    assert_eq!(
+        error_code(&again),
+        "ResourceNotFoundException",
+        "a repeated delete must name the not-found shape, got {again}"
+    );
+    assert_eq!(
+        error_message(&again),
+        monitor_not_found_message("doomed-monitor"),
+        "a repeated delete must carry the service's not-found message, got {again}"
     );
 
     // And the name is free again.
@@ -1656,5 +1831,253 @@ async fn a_monitors_tag_map_is_bounded() {
         after["Tags"].as_object().map(serde_json::Map::len),
         Some(MAX_TAGS_PER_MONITOR),
         "an overwrite must keep the map at its size, got {after}"
+    );
+}
+
+// ---------------------------------------------------------------------------------------
+// The wire form of a `date-time` timestamp, and of the always-present log-delivery
+// structure
+// ---------------------------------------------------------------------------------------
+
+/// The date-time text a timestamp member must carry, or a panic naming what it carried.
+///
+/// A `@timestampFormat("date-time")` member is an RFC 3339 STRING, so a JSON number is a
+/// value no client of the modelled API can read: the number form is rejected here rather
+/// than parsed.
+fn date_time_text(case: &str, value: &Value, field: &str) -> String {
+    let found = value
+        .get(field)
+        .unwrap_or_else(|| panic!("case {case}: {field} must be present, got {value}"));
+    let text = found.as_str().unwrap_or_else(|| {
+        panic!("case {case}: {field} must be a date-time string, got {found} in {value}")
+    });
+    ::aws_smithy_types::DateTime::from_str(text, ::aws_smithy_types::date_time::Format::DateTime)
+        .unwrap_or_else(|error| {
+            panic!("case {case}: {field} {text:?} is not an RFC 3339 date-time: {error}")
+        });
+    text.to_string()
+}
+
+#[tokio::test]
+async fn every_date_time_timestamp_is_reported_as_an_rfc3339_string() {
+    let router = emulator();
+    create_monitor(
+        &router,
+        json!({ "MonitorName": "timestamped-monitor", "MaxCityNetworksToMonitor": 2 }),
+    )
+    .await;
+
+    // The members the model declares with `@timestampFormat("date-time")` on this
+    // response: `smithy_query(query="operation",operation="GetMonitor")` reports the trait
+    // on `CreatedAt` and `ModifiedAt`, and the model declares no `epoch-seconds` or
+    // `http-date` member at all.
+    const MONITOR_INSTANTS: [&str; 2] = ["CreatedAt", "ModifiedAt"];
+
+    let (status, fresh) = call(
+        &router,
+        "GET",
+        "/v20210603/Monitors/timestamped-monitor",
+        None,
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "a fresh monitor: expected 200, got {status} with {fresh}"
+    );
+    for field in MONITOR_INSTANTS {
+        date_time_text("a fresh monitor", &fresh, field);
+    }
+
+    // An update bumps one of them, so the rule is checked on a written instant as well as
+    // on a created one.
+    let (status, updated) = call(
+        &router,
+        "PATCH",
+        "/v20210603/Monitors/timestamped-monitor",
+        Some(json!({ "MaxCityNetworksToMonitor": 3 })),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "an update: expected 200, got {status} with {updated}"
+    );
+    let (_, after) = call(
+        &router,
+        "GET",
+        "/v20210603/Monitors/timestamped-monitor",
+        None,
+    )
+    .await;
+    for field in MONITOR_INSTANTS {
+        date_time_text("an updated monitor", &after, field);
+    }
+    assert_eq!(
+        date_time_text("an updated monitor", &after, "CreatedAt"),
+        date_time_text("a fresh monitor", &fresh, "CreatedAt"),
+        "an update must not move CreatedAt: {fresh} then {after}"
+    );
+    assert!(
+        timestamp_secs(&after, "ModifiedAt") > timestamp_secs(&fresh, "ModifiedAt"),
+        "an update must bump ModifiedAt: {fresh} then {after}"
+    );
+
+    // The rule is the model's, not this operation's: the service's own internet-event feed
+    // declares its instants the same way, so its listing reports them the same way.
+    let (status, events) = call(&router, "GET", "/v20210603/InternetEvents", None).await;
+    assert_eq!(
+        status, 200,
+        "ListInternetEvents: expected 200, got {status} with {events}"
+    );
+    let summaries = events["InternetEvents"]
+        .as_array()
+        .unwrap_or_else(|| panic!("no InternetEvents in {events}"));
+    assert!(
+        !summaries.is_empty(),
+        "the service's feed must report events, got {events}"
+    );
+    for summary in summaries {
+        let case = format!(
+            "internet event {}",
+            summary["EventId"].as_str().unwrap_or_default()
+        );
+        date_time_text(&case, summary, "StartedAt");
+        // `EndedAt` is set exactly for an event that has ended, so it is checked only
+        // where it is reported.
+        if member(summary, "EndedAt").is_some() {
+            date_time_text(&case, summary, "EndedAt");
+        }
+    }
+}
+
+#[tokio::test]
+async fn get_monitor_always_reports_the_log_delivery_structure() {
+    let router = emulator();
+
+    // Rows differ along the forms a log-delivery configuration arrives in: absent from the
+    // request, an empty structure, a structure whose `S3Config` names only what it must,
+    // and a full one. The members are `InternetMeasurementsLogDelivery$S3Config` and
+    // `S3Config$BucketName,BucketPrefix,LogDeliveryStatus`
+    // (`smithy_query(query="shape",shape="InternetMeasurementsLogDelivery,S3Config")`).
+    let cases: Vec<(&str, Value, Value)> = vec![
+        (
+            "no log delivery in the request",
+            json!({ "MonitorName": "log-absent" }),
+            json!({}),
+        ),
+        (
+            "an empty log-delivery structure",
+            json!({ "MonitorName": "log-empty", "InternetMeasurementsLogDelivery": {} }),
+            json!({}),
+        ),
+        (
+            "an S3Config naming only its bucket",
+            json!({
+                "MonitorName": "log-bucket",
+                "InternetMeasurementsLogDelivery": { "S3Config": { "BucketName": "abc" } },
+            }),
+            json!({ "S3Config": { "BucketName": "abc" } }),
+        ),
+        (
+            "a full S3Config",
+            json!({
+                "MonitorName": "log-full",
+                "InternetMeasurementsLogDelivery": {
+                    "S3Config": {
+                        "BucketName": "measurements",
+                        "BucketPrefix": "im/",
+                        "LogDeliveryStatus": "DISABLED",
+                    }
+                },
+            }),
+            json!({
+                "S3Config": {
+                    "BucketName": "measurements",
+                    "BucketPrefix": "im/",
+                    "LogDeliveryStatus": "DISABLED",
+                }
+            }),
+        ),
+    ];
+
+    for (case, body, expected) in cases {
+        let name = body["MonitorName"].as_str().expect("a name").to_string();
+        create_monitor(&router, body).await;
+        let (status, got) = call(
+            &router,
+            "GET",
+            &format!("/v20210603/Monitors/{}", label(&name)),
+            None,
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {case}: GetMonitor expected 200, got {status} with {got}"
+        );
+        assert_eq!(
+            member(&got, "InternetMeasurementsLogDelivery").cloned(),
+            Some(expected.clone()),
+            "case {case}: expected InternetMeasurementsLogDelivery {expected}, got {got}"
+        );
+        assert_eq!(
+            got["ProcessingStatusInfo"], json!(PROCESSING_STATUS_INFO_COLLECTING_DATA),
+            "case {case}: expected the processing-status info text, got {got}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn delete_monitor_refuses_a_name_no_monitor_carries() {
+    let router = emulator();
+    create_monitor(&router, json!({ "MonitorName": "kept-monitor" })).await;
+
+    // Rows differ along how the name misses: never created, created under another name,
+    // and at each published bound of `ResourceName` (len 1..255, pattern
+    // ^[a-zA-Z0-9_.-]+$, from
+    // `smithy_query(query="operation",operation="DeleteMonitor")`), so the refusal is not
+    // keyed to the shape of one recorded name.
+    let long_name = "z".repeat(255);
+    let cases: Vec<(&str, String)> = vec![
+        ("never created", "no-such-monitor".to_string()),
+        ("a near miss of a held name", "kept-monitor.2".to_string()),
+        ("a name at the published minimum", "q".to_string()),
+        ("a name at the published maximum", long_name),
+        ("every allowed character class", "A_b.c-9".to_string()),
+    ];
+
+    for (case, name) in cases {
+        let (status, refused) = call(
+            &router,
+            "DELETE",
+            &format!("/v20210603/Monitors/{}", label(&name)),
+            None,
+        )
+        .await;
+        assert_eq!(
+            status, 404,
+            "case {case}: expected 404, got {status} with {refused}"
+        );
+        assert_eq!(
+            error_code(&refused),
+            "ResourceNotFoundException",
+            "case {case}: expected ResourceNotFoundException, got {refused}"
+        );
+        assert_eq!(
+            error_message(&refused),
+            monitor_not_found_message(&name),
+            "case {case}: unexpected message in {refused}"
+        );
+    }
+
+    // The monitor this account does hold is untouched by the refusals, and deleting it
+    // succeeds exactly once.
+    let (status, deleted) = call(&router, "DELETE", "/v20210603/Monitors/kept-monitor", None).await;
+    assert_eq!(
+        status, 200,
+        "deleting a held monitor: expected 200, got {status} with {deleted}"
+    );
+    let (status, again) = call(&router, "DELETE", "/v20210603/Monitors/kept-monitor", None).await;
+    assert_eq!(
+        status, 404,
+        "deleting it twice: expected 404, got {status} with {again}"
     );
 }
