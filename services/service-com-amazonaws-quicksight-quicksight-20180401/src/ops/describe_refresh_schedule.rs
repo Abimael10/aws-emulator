@@ -194,9 +194,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(
                 DescribeRefreshScheduleErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {
-                        message: Some(format!(
-                            "Refresh schedule with ID {} not found.",
-                            input.schedule_id
+                        message: Some(crate::state::refresh_schedule_not_found_message(
+                            &input.schedule_id,
                         )),
                         // `ExceptionResourceType` has no member naming a refresh
                         // schedule, so the resource this error is about cannot be

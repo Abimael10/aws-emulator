@@ -123,6 +123,16 @@ pub fn refresh_schedule_limit_message(
     )
 }
 
+/// The miss a refresh-schedule operation reports for a `ScheduleId` the data set holds
+/// no schedule under — the same text whether the call reads the schedule or deletes it.
+///
+/// A refresh schedule is a child addressed through the data set it refreshes and
+/// `ExceptionResourceType` has no member naming one, so the refusal names it by the id the
+/// call carried rather than by a resource kind and an ARN.
+pub fn refresh_schedule_not_found_message(schedule_id: &str) -> String {
+    format!("Refresh schedule with ID {schedule_id} not found.")
+}
+
 /// The labelled fields QuickSight's identity path closes a refusal with: the account
 /// the call addressed, then one field per part of the address naming what inside that
 /// account the refusal is about, ending in a period and a space.

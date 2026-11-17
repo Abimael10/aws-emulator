@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteRefreshSchedule
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteRefreshSchedule`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteRefreshSchedule::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -155,18 +146,74 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteRefreshSchedule` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteRefreshScheduleErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteRefreshSchedule"))
+        // `ctx` carries the region a refusal's ARN is scoped to; the deleted schedule's
+        // own ARN is the one minted when it was created.
+        let region = crate::state::request_region(ctx.parts());
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(DeleteRefreshScheduleErrorModeled::InternalFailureException(
+                InternalFailureException {
+                    message: Some("the QuickSight store is unavailable".to_string()),
+                    request_id: Some(crate::state::next_request_id()),
+                },
+            )
+            .into());
+        };
+
+        let request_id = crate::state::next_request_id();
+        let mut store = state.lock();
+
+        // A refresh schedule is addressed through the data set it refreshes, so a data
+        // set this account does not hold cannot hold the schedule either.
+        if !store
+            .data_sets
+            .contains_key(&(input.aws_account_id.clone(), input.data_set_id.clone()))
+        {
+            return Err(DeleteRefreshScheduleErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(crate::state::data_set_not_found_message(
+                        &region,
+                        &input.aws_account_id,
+                        &input.data_set_id,
+                    )),
+                    resource_type: Some("DATA_SET".to_string()),
+                    request_id: Some(request_id),
+                },
+            )
+            .into());
+        }
+
+        // The delete removes exactly the record its path identifies, so the schedule goes
+        // out of the store under the whole `(account, data set, schedule)` key: the data
+        // set's other schedules, and every other data set's, stay where they are. The
+        // place it held in the data set's documented allowance is freed with it.
+        let key = (
+            input.aws_account_id.clone(),
+            input.data_set_id.clone(),
+            input.schedule_id.clone(),
+        );
+        let Some(removed) = store.refresh_schedules.remove(&key) else {
+            return Err(DeleteRefreshScheduleErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(crate::state::refresh_schedule_not_found_message(
+                        &input.schedule_id,
+                    )),
+                    // `ExceptionResourceType` has no member naming a refresh schedule,
+                    // so the resource this error is about cannot be named here.
+                    resource_type: None,
+                    request_id: Some(request_id),
+                },
+            )
+            .into());
+        };
+
+        // The ARN and the id are the deleted record's own, not a template rendered from
+        // the request: what the delete reports is what the schedule reported while it
+        // existed.
+        Ok(DeleteRefreshScheduleOutput {
+            arn: Some(removed.arn),
+            schedule_id: Some(removed.schedule_id),
+            request_id: Some(request_id),
+            status: 200,
+        })
     }
 }

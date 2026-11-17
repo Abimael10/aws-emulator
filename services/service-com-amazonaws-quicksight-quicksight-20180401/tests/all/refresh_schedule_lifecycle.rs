@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! Data set refresh schedules: the create and the read that reports it, over HTTP.
+//! Data set refresh schedules: the create, the read that reports it and the delete that
+//! removes it, over HTTP.
 //!
 //! Every case drives the real wire path — `MultiServiceRouter::dispatch` with a signed
 //! restJson1 request — so what is asserted is what a QuickSight SDK client would see:
@@ -16,6 +17,15 @@
 //! single data set (at most five schedules, one schedule per sub-daily interval, the
 //! sub-15/30-minute intervals only for incremental refreshes, a day named for the weekly
 //! and monthly intervals) are asserted on both sides of each bound.
+//!
+//! `DeleteRefreshSchedule` is the other side of that identity: addressed at the same
+//! `(AwsAccountId, DataSetId, ScheduleId)` path it removes exactly that record — reporting
+//! the ARN and the id the record itself carries — leaves every other schedule of that data
+//! set and of every other data set and account in place, frees the one place it held in
+//! the data set's allowance, and refuses with `ResourceNotFoundException` when the data
+//! set or the schedule the path names is not held. The rows about it vary the region, the
+//! account, the form of the ids, the deleted schedule's interval and its position among
+//! the data set's schedules.
 
 use serde_json::{json, Value};
 
@@ -64,10 +74,10 @@ const REFRESH_ON_DAY_REQUIRED_INTERVALS: &[&str] = &["WEEKLY", "MONTHLY"];
 /// same allowance rather than restating it.
 pub(crate) const MAX_SCHEDULES_PER_DATA_SET: usize = 5;
 
+/// A refresh schedule's ARN in [`REGION`], the region most rows sign for; the template
+/// itself lives in [`refresh_schedule_arn_in`].
 fn refresh_schedule_arn(account: &str, data_set_id: &str, schedule_id: &str) -> String {
-    format!(
-        "arn:aws:quicksight:{REGION}:{account}:dataset/{data_set_id}/refresh-schedule/{schedule_id}"
-    )
+    refresh_schedule_arn_in(REGION, account, data_set_id, schedule_id)
 }
 
 /// A one-entry `PhysicalTableMap` holding a relational table on `data_source_arn`, so a
@@ -177,15 +187,7 @@ async fn describe_schedule(
     data_set_id: &str,
     schedule_id: &str,
 ) -> (u16, Value) {
-    harness
-        .call(
-            "GET",
-            &format!(
-                "/accounts/{account}/data-sets/{data_set_id}/refresh-schedules/{schedule_id}"
-            ),
-            None,
-        )
-        .await
+    describe_schedule_in(harness, REGION, account, data_set_id, schedule_id).await
 }
 
 /// The day a schedule on `interval` must name, or `None` for an interval that needs none:
@@ -808,6 +810,570 @@ async fn a_schedule_on_a_weekly_or_monthly_interval_must_name_the_day() {
         assert_eq!(
             status, expected,
             "case {interval} with RefreshOnDay: expected {expected}, got {status} with body {body}"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------------------
+// `DeleteRefreshSchedule`: removing one schedule from the data set it refreshes.
+// ---------------------------------------------------------------------------------------
+
+/// A refresh schedule's ARN in `region`:
+/// `arn:aws:quicksight:<region>:<account>:dataset/<data-set-id>/refresh-schedule/<schedule-id>`.
+/// Source: `smithy_query(query="operation", operation="CreateRefreshSchedule")` — the `Arn`
+/// a create reports for the schedule it minted.
+fn refresh_schedule_arn_in(
+    region: &str,
+    account: &str,
+    data_set_id: &str,
+    schedule_id: &str,
+) -> String {
+    format!(
+        "arn:aws:quicksight:{region}:{account}:dataset/{data_set_id}/refresh-schedule/{schedule_id}"
+    )
+}
+
+/// `DeleteRefreshSchedule`:
+/// `DELETE /accounts/{AwsAccountId}/data-sets/{DataSetId}/refresh-schedules/{ScheduleId}`.
+/// Source: `smithy_query(query="operation", operation="DeleteRefreshSchedule")`.
+async fn delete_schedule_in(
+    harness: &Harness,
+    region: &str,
+    account: &str,
+    data_set_id: &str,
+    schedule_id: &str,
+) -> (u16, Value) {
+    harness
+        .call_in_region(
+            region,
+            "DELETE",
+            &format!("/accounts/{account}/data-sets/{data_set_id}/refresh-schedules/{schedule_id}"),
+            None,
+        )
+        .await
+}
+
+/// [`describe_schedule`], signed for `region`: a row that drives one emulator from two
+/// regions reads its schedules in the region it created them in. The route is
+/// `GET /accounts/{AwsAccountId}/data-sets/{DataSetId}/refresh-schedules/{ScheduleId}`.
+/// Source: `smithy_query(query="operation", operation="DescribeRefreshSchedule")`.
+async fn describe_schedule_in(
+    harness: &Harness,
+    region: &str,
+    account: &str,
+    data_set_id: &str,
+    schedule_id: &str,
+) -> (u16, Value) {
+    harness
+        .call_in_region(
+            region,
+            "GET",
+            &format!("/accounts/{account}/data-sets/{data_set_id}/refresh-schedules/{schedule_id}"),
+            None,
+        )
+        .await
+}
+
+/// The `ScheduleId`s `ListRefreshSchedules` reports for one data set, sorted, so a row can
+/// compare them without depending on creation order. Route source:
+/// `smithy_query(query="operation", operation="ListRefreshSchedules")`.
+async fn list_schedule_ids(
+    harness: &Harness,
+    region: &str,
+    account: &str,
+    data_set_id: &str,
+    case: &str,
+) -> Vec<String> {
+    let (status, body) = harness
+        .call_in_region(
+            region,
+            "GET",
+            &format!("/accounts/{account}/data-sets/{data_set_id}/refresh-schedules"),
+            None,
+        )
+        .await;
+    assert_eq!(
+        status, 200,
+        "case {case}: list expected 200, got {status} with body {body}"
+    );
+    let mut ids: Vec<String> = body["RefreshSchedules"]
+        .as_array()
+        .unwrap_or_else(|| panic!("case {case}: expected a RefreshSchedules list, got {body}"))
+        .iter()
+        .map(|entry| entry["ScheduleId"].as_str().unwrap_or_default().to_string())
+        .collect();
+    ids.sort();
+    ids
+}
+
+/// One data set driven to a known set of schedules, and the one of them a row deletes.
+struct DeleteCase {
+    /// Case name, reported by every assertion below.
+    name: &'static str,
+    /// The region the row signs for — the region in every ARN the row expects.
+    region: &'static str,
+    /// The 12-digit account the row addresses.
+    region_account: &'static str,
+    /// The data set the row hangs its schedules on.
+    data_set_id: &'static str,
+    /// The schedules the row creates, as `(ScheduleId, Interval)`. No sub-daily interval
+    /// appears twice and no row exceeds the allowance, so nothing but the delete removes
+    /// a schedule.
+    held: &'static [(&'static str, &'static str)],
+    /// Which entry of `held` the row deletes.
+    delete: &'static str,
+}
+
+/// Rows varying the region, the account, the ids' form, the deleted schedule's interval
+/// and its position among the data set's schedules (only child, first, middle, last). The
+/// `RefreshInterval` members each row names come from [`REFRESH_INTERVALS`].
+const DELETE_CASES: &[DeleteCase] = &[
+    DeleteCase {
+        name: "the data set's only schedule",
+        region: "us-west-2",
+        region_account: "000000000000",
+        data_set_id: "orders",
+        held: &[("nightly", "DAILY")],
+        delete: "nightly",
+    },
+    DeleteCase {
+        name: "the first of three, in another region",
+        region: "eu-central-1",
+        region_account: "000000000000",
+        data_set_id: "sales.q3_2026-rollup",
+        held: &[
+            ("a-daily", "DAILY"),
+            ("m-weekly", "WEEKLY"),
+            ("z-monthly", "MONTHLY"),
+        ],
+        delete: "a-daily",
+    },
+    DeleteCase {
+        name: "a sub-daily schedule in the middle, another account",
+        region: "ap-southeast-2",
+        region_account: OTHER_ACCOUNT,
+        data_set_id: "i",
+        held: &[
+            ("a-daily", "DAILY"),
+            ("m_hourly.v2", "HOURLY"),
+            ("z-weekly", "WEEKLY"),
+        ],
+        delete: "m_hourly.v2",
+    },
+    DeleteCase {
+        name: "the last of a full allowance",
+        region: "us-east-1",
+        region_account: "123456789012",
+        data_set_id: "DATA-set_9",
+        held: &[
+            ("a", "DAILY"),
+            ("b", "DAILY"),
+            ("c", "WEEKLY"),
+            ("d", "MONTHLY"),
+            ("e", "HOURLY"),
+        ],
+        delete: "e",
+    },
+];
+
+/// Create every schedule `case` holds, asserting each create succeeded.
+async fn fill_held(harness: &Harness, case: &DeleteCase) {
+    let name = case.name;
+    for (schedule_id, interval) in case.held {
+        let (status, body) = create_schedule_in(
+            harness,
+            case.region,
+            case.region_account,
+            case.data_set_id,
+            daily_schedule(schedule_id, interval),
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {name} / {schedule_id}: create expected 200, got {status} with body {body}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_delete_removes_exactly_the_schedule_its_path_names() {
+    for case in DELETE_CASES {
+        let name = case.name;
+        let harness = Harness::new();
+        data_set_fixture_in(&harness, case.region, case.region_account, case.data_set_id).await;
+        fill_held(&harness, case).await;
+
+        // What the schedules that must survive reported before the delete.
+        let survivors: Vec<&str> = case
+            .held
+            .iter()
+            .map(|(schedule_id, _)| *schedule_id)
+            .filter(|schedule_id| *schedule_id != case.delete)
+            .collect();
+        let mut before: Vec<Value> = Vec::new();
+        for schedule_id in &survivors {
+            let (status, body) = describe_schedule_in(
+                &harness,
+                case.region,
+                case.region_account,
+                case.data_set_id,
+                schedule_id,
+            )
+            .await;
+            assert_eq!(
+                status, 200,
+                "case {name} / {schedule_id}: describe before the delete expected 200, got {status} with body {body}"
+            );
+            before.push(body["RefreshSchedule"].clone());
+        }
+
+        let (status, body) = delete_schedule_in(
+            &harness,
+            case.region,
+            case.region_account,
+            case.data_set_id,
+            case.delete,
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {name}: delete expected 200, got {status} with body {body}"
+        );
+        let expected_arn = refresh_schedule_arn_in(
+            case.region,
+            case.region_account,
+            case.data_set_id,
+            case.delete,
+        );
+        assert_eq!(
+            body["Arn"],
+            json!(expected_arn),
+            "case {name}: delete expected the deleted schedule's ARN {expected_arn:?}, got {body}"
+        );
+        assert_eq!(
+            body["ScheduleId"],
+            json!(case.delete),
+            "case {name}: delete reported the wrong ScheduleId: {body}"
+        );
+        // `Status` is `@httpResponseCode`-bound, so it IS the HTTP status asserted above
+        // rather than a body member.
+        assert_eq!(
+            body["Status"],
+            Value::Null,
+            "case {name}: Status is bound to the HTTP status, so it is not a body member: {body}"
+        );
+        assert!(
+            body["RequestId"].as_str().is_some_and(|id| !id.is_empty()),
+            "case {name}: delete expected a RequestId, got {body}"
+        );
+
+        // The deleted schedule is gone, by both reads.
+        let (status, body) = describe_schedule_in(
+            &harness,
+            case.region,
+            case.region_account,
+            case.data_set_id,
+            case.delete,
+        )
+        .await;
+        assert_eq!(
+            status, 404,
+            "case {name}: describing the deleted schedule expected 404, got {status} with body {body}"
+        );
+        let listed = list_schedule_ids(
+            &harness,
+            case.region,
+            case.region_account,
+            case.data_set_id,
+            name,
+        )
+        .await;
+        let mut expected_ids: Vec<String> = survivors.iter().map(|id| (*id).to_string()).collect();
+        expected_ids.sort();
+        assert_eq!(
+            listed, expected_ids,
+            "case {name}: after the delete the list expected {expected_ids:?}, got {listed:?}"
+        );
+
+        // Every schedule the delete did not name reads back exactly as it did before.
+        for (schedule_id, stored) in survivors.iter().zip(before.iter()) {
+            let (status, body) = describe_schedule_in(
+                &harness,
+                case.region,
+                case.region_account,
+                case.data_set_id,
+                schedule_id,
+            )
+            .await;
+            assert_eq!(
+                status, 200,
+                "case {name} / {schedule_id}: describe after the delete expected 200, got {status} with body {body}"
+            );
+            assert_eq!(
+                &body["RefreshSchedule"], stored,
+                "case {name} / {schedule_id}: the delete changed a surviving schedule: expected {stored}, got {}",
+                body["RefreshSchedule"]
+            );
+        }
+
+        let state = qs_state::service_state(&*harness.engine).expect("the QuickSight store");
+        let held = state
+            .lock()
+            .refresh_schedules_in(case.region_account, case.data_set_id)
+            .len();
+        assert_eq!(
+            held,
+            survivors.len(),
+            "case {name}: expected {} stored schedule(s) after the delete, got {held}",
+            survivors.len()
+        );
+    }
+}
+
+#[tokio::test]
+async fn deleting_a_schedule_the_path_does_not_name_is_refused() {
+    for case in DELETE_CASES {
+        let name = case.name;
+        let harness = Harness::new();
+        data_set_fixture_in(&harness, case.region, case.region_account, case.data_set_id).await;
+        fill_held(&harness, case).await;
+
+        let (status, body) = delete_schedule_in(
+            &harness,
+            case.region,
+            case.region_account,
+            case.data_set_id,
+            case.delete,
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {name}: the first delete expected 200, got {status} with body {body}"
+        );
+
+        // The id of the schedule this delete already removed, and an id the data set never
+        // held: both name nothing now, so both are refused the same way.
+        for schedule_id in [case.delete, "no-such-schedule"] {
+            let (status, body) = delete_schedule_in(
+                &harness,
+                case.region,
+                case.region_account,
+                case.data_set_id,
+                schedule_id,
+            )
+            .await;
+            assert_eq!(
+                status, 404,
+                "case {name} / {schedule_id}: deleting an absent schedule expected 404, got {status} with body {body}"
+            );
+            assert_eq!(
+                body["__type"],
+                json!("ResourceNotFoundException"),
+                "case {name} / {schedule_id}: expected ResourceNotFoundException, got {body}"
+            );
+            // The sentence a refresh-schedule miss carries, naming the id the call
+            // asked about — the same wording the single-schedule read answers, so what
+            // the refusal says does not depend on which call asked.
+            let expected_message = format!("Refresh schedule with ID {schedule_id} not found.");
+            assert_eq!(
+                body["Message"],
+                json!(expected_message),
+                "case {name} / {schedule_id}: expected the message {expected_message:?}, got {}",
+                body["Message"]
+            );
+            let (read_status, read_body) = describe_schedule_in(
+                &harness,
+                case.region,
+                case.region_account,
+                case.data_set_id,
+                schedule_id,
+            )
+            .await;
+            assert_eq!(
+                read_status, 404,
+                "case {name} / {schedule_id}: describing an absent schedule expected 404, got {read_status} with body {read_body}"
+            );
+            assert_eq!(
+                body["Message"], read_body["Message"],
+                "case {name} / {schedule_id}: the delete's refusal {:?} differs from the read's {:?}",
+                body["Message"], read_body["Message"]
+            );
+        }
+
+        // A data set the account does not hold cannot hold the schedule either, so the
+        // refusal is about the data set and names it by its ARN.
+        let absent_data_set = format!("{}-absent", case.data_set_id);
+        let (status, body) = delete_schedule_in(
+            &harness,
+            case.region,
+            case.region_account,
+            &absent_data_set,
+            case.delete,
+        )
+        .await;
+        assert_eq!(
+            status, 404,
+            "case {name}: deleting through an absent data set expected 404, got {status} with body {body}"
+        );
+        assert_eq!(
+            body["ResourceType"],
+            json!("DATA_SET"),
+            "case {name}: the refusal must be about the data set, got {body}"
+        );
+        let expected_message = format!(
+            "DataSet arn:aws:quicksight:{}:{}:dataset/{absent_data_set} is not found",
+            case.region, case.region_account
+        );
+        assert_eq!(
+            body["Message"],
+            json!(expected_message),
+            "case {name}: expected the message {expected_message:?}, got {}",
+            body["Message"]
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_delete_touches_no_other_data_set_or_account() {
+    // The same schedule id on three data sets: the one addressed, a sibling of the same
+    // account, and the same data set id under another account. Only the addressed one goes.
+    const SCHEDULE_ID: &str = "nightly";
+
+    let harness = Harness::new();
+    for (account, data_set_id) in [
+        (ACCOUNT, "orders"),
+        (ACCOUNT, "orders-sibling"),
+        (OTHER_ACCOUNT, "orders"),
+    ] {
+        data_set_fixture(&harness, account, data_set_id).await;
+        let (status, body) = create_schedule(
+            &harness,
+            account,
+            data_set_id,
+            daily_schedule(SCHEDULE_ID, "DAILY"),
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "fixture {account}/{data_set_id}: create expected 200, got {status} with body {body}"
+        );
+    }
+
+    let (status, body) = delete_schedule_in(&harness, REGION, ACCOUNT, "orders", SCHEDULE_ID).await;
+    assert_eq!(
+        status, 200,
+        "keying: delete expected 200, got {status} with body {body}"
+    );
+
+    for (account, data_set_id) in [(ACCOUNT, "orders-sibling"), (OTHER_ACCOUNT, "orders")] {
+        let (status, body) = describe_schedule(&harness, account, data_set_id, SCHEDULE_ID).await;
+        assert_eq!(
+            status, 200,
+            "keying {account}/{data_set_id}: the schedule must survive the delete, got {status} with body {body}"
+        );
+        assert_eq!(
+            body["Arn"],
+            json!(refresh_schedule_arn(account, data_set_id, SCHEDULE_ID)),
+            "keying {account}/{data_set_id}: expected the surviving schedule's own ARN, got {body}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_delete_frees_one_place_in_the_data_sets_allowance() {
+    for case in DELETE_CASES {
+        let name = case.name;
+        let harness = Harness::new();
+        data_set_fixture_in(&harness, case.region, case.region_account, case.data_set_id).await;
+
+        // Fill the allowance with full-refresh DAILY schedules: DAILY carries no
+        // one-per-data-set bound of its own, so the only bound a row reaches is the
+        // per-data-set one.
+        for index in 0..MAX_SCHEDULES_PER_DATA_SET {
+            let schedule_id = format!("fill-{index}");
+            let (status, body) = create_schedule_in(
+                &harness,
+                case.region,
+                case.region_account,
+                case.data_set_id,
+                daily_schedule(&schedule_id, "DAILY"),
+            )
+            .await;
+            assert_eq!(
+                status, 200,
+                "case {name} / {schedule_id}: create expected 200, got {status} with body {body}"
+            );
+        }
+
+        let (status, body) = create_schedule_in(
+            &harness,
+            case.region,
+            case.region_account,
+            case.data_set_id,
+            daily_schedule("one-too-many", "DAILY"),
+        )
+        .await;
+        assert_eq!(
+            status, 409,
+            "case {name}: one past the allowance expected 409, got {status} with body {body}"
+        );
+
+        let (status, body) = delete_schedule_in(
+            &harness,
+            case.region,
+            case.region_account,
+            case.data_set_id,
+            "fill-0",
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {name}: delete expected 200, got {status} with body {body}"
+        );
+
+        // The place the delete freed is usable.
+        let (status, body) = create_schedule_in(
+            &harness,
+            case.region,
+            case.region_account,
+            case.data_set_id,
+            daily_schedule("one-too-many", "DAILY"),
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {name}: a create into the freed place expected 200, got {status} with body {body}"
+        );
+
+        // And the allowance is full again: the delete freed exactly one place.
+        let (status, body) = create_schedule_in(
+            &harness,
+            case.region,
+            case.region_account,
+            case.data_set_id,
+            daily_schedule("one-more", "DAILY"),
+        )
+        .await;
+        assert_eq!(
+            status, 409,
+            "case {name}: a second create into the freed place expected 409, got {status} with body {body}"
+        );
+
+        let listed = list_schedule_ids(
+            &harness,
+            case.region,
+            case.region_account,
+            case.data_set_id,
+            name,
+        )
+        .await;
+        let expected_ids: Vec<String> = ["fill-1", "fill-2", "fill-3", "fill-4", "one-too-many"]
+            .iter()
+            .map(|id| (*id).to_string())
+            .collect();
+        assert_eq!(
+            listed, expected_ids,
+            "case {name}: after the delete and the create the list expected {expected_ids:?}, got {listed:?}"
         );
     }
 }
