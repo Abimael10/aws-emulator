@@ -778,3 +778,249 @@ async fn the_same_shapes_with_operands_their_operator_takes_are_evaluated() {
         "case well-formed substitution keys: expected the seeded item, got {answered}"
     );
 }
+
+/// WHICH SENTENCE each class of expression defect states, and which error CODE it is
+/// stated under, across the surfaces that read an expression.
+///
+/// RULE: a defect of a request's expression PARAMETERS — a member carrying no expression,
+/// a member past the documented 4 KB ceiling, a call given a value where its signature
+/// declares a document path, a call given the wrong number of operands, a key condition
+/// whose operand type its operator cannot take or that constrains one key twice, an
+/// operand a comparison cannot order, a malformed literal — is a defect of the REQUEST:
+/// 400 `ValidationException` naming the rule that was broken, never the parser's token
+/// dump, never `ConditionalCheckFailedException`, and never a cancelled transaction. A
+/// substitution table sent with NO expression at all breaks a different rule from one
+/// sent with a token no expression references, and the two state different sentences.
+///
+/// The rows differ along the expression MEMBER the text arrived in, the operation carrying
+/// it, the operator or function at fault, and the literal's type; the last blocks drive
+/// the same classes through a transaction, where the refusal is the call's own rather
+/// than a cancellation.
+#[tokio::test]
+async fn each_expression_parameter_defect_states_its_own_rule() {
+    let router = seeded().await;
+
+    // One expression past the documented 4 KB ceiling, whichever member carries it.
+    let oversized = format!("attribute_exists({})", "a".repeat(4100));
+
+    for (case, operation, request, expected) in [
+        (
+            "an empty filter",
+            "Scan",
+            json!({"TableName": TABLE, "FilterExpression": ""}),
+            clause("FilterExpression", "The expression can not be empty;"),
+        ),
+        (
+            "an empty condition on a write",
+            "PutItem",
+            json!({"TableName": TABLE, "Item": key(), "ConditionExpression": ""}),
+            enveloped(&clause(
+                "ConditionExpression",
+                "The expression can not be empty;",
+            )),
+        ),
+        (
+            "an empty update",
+            "UpdateItem",
+            json!({"TableName": TABLE, "Key": key(), "UpdateExpression": ""}),
+            enveloped(&clause(
+                "UpdateExpression",
+                "The expression can not be empty;",
+            )),
+        ),
+        (
+            "a filter past the size ceiling",
+            "Scan",
+            json!({"TableName": TABLE, "FilterExpression": oversized}),
+            clause(
+                "FilterExpression",
+                "Expression size has exceeded the maximum allowed size;",
+            ),
+        ),
+        (
+            "a condition past the size ceiling",
+            "PutItem",
+            json!({"TableName": TABLE, "Item": key(), "ConditionExpression": oversized}),
+            enveloped(&clause(
+                "ConditionExpression",
+                "Expression size has exceeded the maximum allowed size;",
+            )),
+        ),
+        (
+            "a value placeholder where a path belongs",
+            "Scan",
+            json!({"TableName": TABLE, "FilterExpression": "attribute_exists(:v)",
+                   "ExpressionAttributeValues": {":v": {"S": "beta"}}}),
+            clause("FilterExpression", &needs_a_path("attribute_exists")),
+        ),
+        (
+            "a one-operand function given two",
+            "Scan",
+            json!({"TableName": TABLE, "FilterExpression": "attribute_exists(#a, #a)",
+                   "ExpressionAttributeNames": {"#a": "n"}}),
+            clause("FilterExpression", &operand_count("attribute_exists", 2)),
+        ),
+        (
+            "a prefix test given a number against a string sort key",
+            "Query",
+            json!({"TableName": TABLE,
+                   "KeyConditionExpression": "pk = :p AND begins_with(sk, :n)",
+                   "ExpressionAttributeValues": {":p": {"S": "item-1"}, ":n": {"N": "1"}}}),
+            clause("KeyConditionExpression", &operand_type("begins_with", "N")),
+        ),
+        (
+            "a sort key constrained twice",
+            "Query",
+            json!({"TableName": TABLE,
+                   "KeyConditionExpression": "pk = :p AND sk = :a AND sk = :b",
+                   "ExpressionAttributeValues": {":p": {"S": "item-1"}, ":a": {"S": "a"},
+                                                 ":b": {"S": "b"}}}),
+            clause(
+                "KeyConditionExpression",
+                "KeyConditionExpressions must only contain one condition per key",
+            ),
+        ),
+        (
+            "a value table offered to a request that states no expression",
+            "PutItem",
+            json!({"TableName": TABLE, "Item": key(),
+                   "ExpressionAttributeValues": {":v": {"S": "beta"}}}),
+            enveloped("ExpressionAttributeValues can only be specified when using expressions"),
+        ),
+        (
+            "a name table offered to a request that states no expression",
+            "PutItem",
+            json!({"TableName": TABLE, "Item": key(),
+                   "ExpressionAttributeNames": {"#a": "n"}}),
+            enveloped("ExpressionAttributeNames can only be specified when using expressions"),
+        ),
+    ] {
+        let (status, body) = call(&router, operation, request.clone()).await;
+        assert_eq!(
+            (status, error_code(&body).as_str()),
+            (400, "ValidationException"),
+            "case {case:?} ({operation}): expected 400 ValidationException, got {status} {body}"
+        );
+        let said = message(&body);
+        assert_eq!(
+            said, expected,
+            "case {case:?} ({operation}): expected {expected:?}, got {said:?}"
+        );
+    }
+
+    // A document path in a key position is reported against the KEY CONDITION, the member
+    // that carried it, rather than as a key schema the query failed to cover.
+    let (status, body) = call(
+        &router,
+        "Query",
+        json!({"TableName": TABLE, "KeyConditionExpression": "pk.foo = :v",
+               "ExpressionAttributeValues": {":v": {"S": "item-1"}}}),
+    )
+    .await;
+    assert_eq!(
+        (status, error_code(&body).as_str()),
+        (400, "ValidationException"),
+        "case a document path in a key position: expected 400 ValidationException, got \
+         {status} {body}"
+    );
+    let said = message(&body);
+    assert!(
+        said.starts_with("Invalid KeyConditionExpression: "),
+        "case a document path in a key position: expected the KeyConditionExpression clause, \
+         got {said:?}"
+    );
+
+    // The shapes a condition cannot have are refused as the REQUEST defects they are, so
+    // none of them is answered as an unmet condition.
+    for (case, request) in [
+        (
+            "an ordering comparison against a boolean literal",
+            json!({"TableName": TABLE, "Item": key(), "ConditionExpression": "n < :v",
+                   "ExpressionAttributeValues": {":v": {"BOOL": true}}}),
+        ),
+        (
+            "a substring search with one path on both sides",
+            json!({"TableName": TABLE, "Item": key(),
+                   "ConditionExpression": "contains(s, s)"}),
+        ),
+        (
+            "a range whose bounds are the wrong way round",
+            json!({"TableName": TABLE, "Item": key(),
+                   "ConditionExpression": "n BETWEEN :hi AND :lo",
+                   "ExpressionAttributeValues": {":hi": {"N": "9"}, ":lo": {"N": "1"}}}),
+        ),
+        (
+            "a type test naming no attribute type",
+            json!({"TableName": TABLE, "Item": key(),
+                   "ConditionExpression": "attribute_type(s, :t)",
+                   "ExpressionAttributeValues": {":t": {"S": "Q"}}}),
+        ),
+        (
+            "a literal whose text denotes no number",
+            json!({"TableName": TABLE, "Item": key(), "ConditionExpression": "n = :v",
+                   "ExpressionAttributeValues": {":v": {"N": "abc"}}}),
+        ),
+    ] {
+        let (status, body) = call(&router, "PutItem", request.clone()).await;
+        assert_eq!(
+            (status, error_code(&body).as_str()),
+            (400, "ValidationException"),
+            "case {case:?}: a condition SHAPE defect is a request defect, got {status} {body}"
+        );
+    }
+
+    // The same shapes inside a transaction are the CALL's own refusal, not a cancellation
+    // reported per element.
+    for (case, condition, values) in [
+        (
+            "an ordering comparison against a boolean literal",
+            "n < :v",
+            json!({":v": {"BOOL": true}}),
+        ),
+        (
+            "a type test naming no attribute type",
+            "attribute_type(s, :t)",
+            json!({":t": {"S": "Q"}}),
+        ),
+    ] {
+        let (status, body) = call(
+            &router,
+            "TransactWriteItems",
+            json!({"TransactItems": [{"Put": {
+                "TableName": TABLE, "Item": key(),
+                "ConditionExpression": condition,
+                "ExpressionAttributeValues": values,
+            }}]}),
+        )
+        .await;
+        assert_eq!(
+            (status, error_code(&body).as_str()),
+            (400, "ValidationException"),
+            "case {case:?} in a transaction: expected the call's own refusal, got {status} {body}"
+        );
+    }
+
+    // A placeholder an expression never references breaks the OTHER rule, and an element
+    // of a transaction states that sentence on its own.
+    let (status, body) = call(
+        &router,
+        "TransactWriteItems",
+        json!({"TransactItems": [{"Put": {
+            "TableName": TABLE, "Item": key(),
+            "ConditionExpression": "attribute_exists(pk)",
+            "ExpressionAttributeValues": {":unused": {"S": "beta"}},
+        }}]}),
+    )
+    .await;
+    assert_eq!(
+        (status, error_code(&body).as_str()),
+        (400, "ValidationException"),
+        "case an unused placeholder on a transaction element: got {status} {body}"
+    );
+    let said = message(&body);
+    assert_eq!(
+        said, "Value provided in ExpressionAttributeValues unused in expressions: keys: {:unused}",
+        "case an unused placeholder on a transaction element: expected the bare sentence, got \
+         {said:?}"
+    );
+}

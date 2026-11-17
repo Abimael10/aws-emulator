@@ -95,6 +95,24 @@ impl Position {
     fn stated(&self) -> String {
         format!("{}:{}:{}", self.line, self.column, self.width)
     }
+
+    /// The position of the RUN that opens here and ends with the token at `closes`.
+    ///
+    /// A refusal about a run of SEVERAL tokens — a source path and its qualifiers, say —
+    /// reports the one run: where it opens and how many characters it takes, both read off
+    /// the two tokens' own positions. A run the statement spells across a line break has no
+    /// single width, so it is reported as the run its first line holds.
+    fn through(self, closes: Self) -> Self {
+        Self {
+            line: self.line,
+            column: self.column,
+            width: if closes.line == self.line {
+                (closes.column + closes.width).saturating_sub(self.column)
+            } else {
+                self.width
+            },
+        }
+    }
 }
 
 /// Which defect a statement that does not parse carries, as the phrase the parser
@@ -247,15 +265,16 @@ fn incorrect_operand_count(operator_or_function: &str, operands: usize) -> Reque
     RequestError::Validation(operand_count_clause(operator_or_function, operands))
 }
 
-/// How an `INSERT` whose `INTO` clause carries an index qualifier is refused: the
-/// positioned sentence about that clause.
+/// How a data-manipulation statement whose source carries an index qualifier is refused:
+/// the positioned sentence about the clause that names the source.
 ///
 /// An index projects a table's items and is written through no statement ("attributes
 /// that are copied (projected) from the table into the global secondary index",
-/// `GlobalSecondaryIndex$Projection`), so the clause naming a statement's source names
-/// one table and nothing else. The position reported is where the statement spells that
-/// TABLE, so every part of the message is a fact of the request. An `UPDATE` and a
-/// `DELETE` are refused with [`unsupported_on_an_index`] instead.
+/// `GlobalSecondaryIndex$Projection`), so the clause naming the source of an `INSERT`, an
+/// `UPDATE` or a `DELETE` names one table and nothing else. The position reported is the
+/// run the statement spells that SOURCE PATH at — its qualifier included, because the
+/// whole path is what holds more than the single table name the sentence is about — so
+/// every part of the message is a fact of the request.
 fn single_table_in_data_manipulation(at: Position) -> RequestError {
     RequestError::Validation(format!(
         "FROM clause may only contain a single table name in data manipulation statements at {}",
@@ -263,14 +282,15 @@ fn single_table_in_data_manipulation(at: Position) -> RequestError {
     ))
 }
 
-/// How an `UPDATE` or a `DELETE` whose source carries an index qualifier is refused:
-/// the fixed sentence DynamoDB states for an operation asked of an index, which is the
-/// same one the classic surface states for one.
+/// How an `UPDATE` whose target carries a qualifier is refused: the fixed sentence
+/// DynamoDB states for an operation asked of an index, which is the same one the classic
+/// surface states for one.
 ///
-/// Both verbs CHANGE an item of the table, and an index holds a projection of one
-/// rather than items of its own, so a qualified source asks for a write through an
-/// index — which is what the refusal says. An `INSERT` names its target inside a clause
-/// and earns that clause's own sentence
+/// An `UPDATE` names the item it changes through the statement's own TARGET, with no
+/// clause around it, so a qualifier there does not make a clause name two things — it
+/// asks for the update through an index, and an index holds a projection of a table's
+/// items rather than items of its own. The verbs that name their source inside a clause
+/// (`INSERT INTO`, `DELETE FROM`) earn that clause's own sentence
 /// ([`single_table_in_data_manipulation`]) instead.
 fn unsupported_on_an_index() -> RequestError {
     RequestError::Validation("This operation is not supported on an index".to_string())
@@ -1003,11 +1023,13 @@ impl ReturnedValues {
 }
 
 /// The source a statement's `FROM` clause names: the table and the index of it a read
-/// is served through.
+/// is served through, with the run of statement text the whole path sits in — what a
+/// refusal about that path reports its position as.
 #[derive(Debug, Clone)]
 struct StatementSource {
     table: String,
     index: Option<String>,
+    at: Position,
 }
 
 /// A `SELECT`: which stored items to report, and in which order.
@@ -1614,7 +1636,8 @@ impl StatementParser<'_> {
     /// `INSERT INTO source VALUE tuple`.
     fn insert(&mut self) -> Result<InsertStatement, RequestError> {
         self.expect_clause_word("into")?;
-        let table = self.write_target(&["value", "values"], single_table_in_data_manipulation)?;
+        let (components, at) = self.write_target(&["value", "values"])?;
+        let table = Self::one_table_in_clause(&components, at)?;
         if !self.accept_word("value") && !self.accept_word("values") {
             // What follows an `INSERT`'s target is the VALUE it inserts, so the position
             // admits a TERM: text that states none — the statement stopping there, or a
@@ -1641,7 +1664,13 @@ impl StatementParser<'_> {
     /// therefore a token the grammar has no place for, and the statement is refused as
     /// one token past its expression rather than read as a list.
     fn update(&mut self) -> Result<UpdateStatement, RequestError> {
-        let table = self.write_target(&["set", "remove"], |_| unsupported_on_an_index())?;
+        let (components, _at) = self.write_target(&["set", "remove"])?;
+        let [table] = components.as_slice() else {
+            // The target an `UPDATE` names carries no clause around it, so a qualifier on
+            // it asks for the update through an index.
+            return Err(unsupported_on_an_index());
+        };
+        let table = table.clone();
         let mut clauses = Vec::new();
         loop {
             if self.accept_word("set") {
@@ -1679,10 +1708,11 @@ impl StatementParser<'_> {
         let table = source.table;
         if source.index.is_some() {
             // A `DELETE` removes an item of the TABLE, and an index holds a projection
-            // of one rather than items of its own, so a qualified source asks for a
-            // delete through an index: the fixed index sentence, the same one the
-            // classic surface states for an operation asked of an index.
-            return Err(unsupported_on_an_index());
+            // of one rather than items of its own, so a qualified source names more than
+            // the single table a data-manipulation statement's clause may: the positioned
+            // sentence over the run that path sits in, the same refusal the other two
+            // verbs' targets earn ([`single_table_in_data_manipulation`]).
+            return Err(single_table_in_data_manipulation(source.at));
         }
         let filter = self.required_where_clause()?;
         let returning = self.returning()?;
@@ -1708,8 +1738,11 @@ impl StatementParser<'_> {
     /// The source a `FROM` clause names — a `SELECT`'s and a `DELETE`'s: `table` or
     /// `table.index`, either part quoted or bare.
     fn read_source(&mut self, continues: &[&str]) -> Result<StatementSource, RequestError> {
+        let opens_at = self.position();
+        let mut closes_at = opens_at;
         let table = self.path_component()?;
         let index = if self.accept(&Token::Dot) {
+            closes_at = self.position();
             Some(self.path_component()?)
         } else {
             None
@@ -1721,7 +1754,11 @@ impl StatementParser<'_> {
                 FROM_PATH_ARITY_MESSAGE.to_string(),
             ));
         }
-        let source = StatementSource { table, index };
+        let source = StatementSource {
+            table,
+            index,
+            at: opens_at.through(closes_at),
+        };
         self.read_table_alias(continues);
         Ok(source)
     }
@@ -1737,34 +1774,46 @@ impl StatementParser<'_> {
     }
 
     /// The target a write names DIRECTLY — an `INSERT`'s `INTO` and an `UPDATE`'s own
-    /// source: one table, since a data-manipulation statement addresses the table rather
-    /// than an index of it.
+    /// source: the components of the path, and the run of statement text that whole path
+    /// sits in.
     ///
-    /// `qualified` is how a qualifier on that target is refused, which depends on how the
-    /// verb spells the target: inside a CLAUSE (an `INSERT`'s `INTO`) the refusal is
-    /// about the clause and reports where the path sits
-    /// ([`single_table_in_data_manipulation`]); with no clause around it (an `UPDATE`)
-    /// it is the fixed index sentence ([`unsupported_on_an_index`]).
+    /// The path is READ whole, qualifier included, so a statement whose target carries one
+    /// is refused for the target rather than for the token after it. WHICH refusal that is
+    /// belongs to the verb, because it depends on whether the verb names its source inside
+    /// a clause ([`StatementParser::insert`], [`StatementParser::update`]).
     fn write_target(
         &mut self,
         continues: &[&str],
-        qualified: impl FnOnce(Position) -> RequestError,
-    ) -> Result<String, RequestError> {
+    ) -> Result<(Vec<String>, Position), RequestError> {
         let opens_at = self.position();
-        let table = self.path_component()?;
-        if self.peek() == Some(&Token::Dot) {
-            // The whole path is read, qualifier included, so a statement whose target
-            // carries one is refused for the target rather than for the token after it;
-            // the position reported is where the statement spells the TABLE.
-            self.at += 1;
-            let _qualifier = self.path_component()?;
-            while self.accept(&Token::Dot) {
-                let _further = self.path_component()?;
-            }
-            return Err(qualified(opens_at));
+        let mut closes_at = opens_at;
+        let mut components = vec![self.path_component()?];
+        while self.accept(&Token::Dot) {
+            closes_at = self.position();
+            components.push(self.path_component()?);
         }
-        self.read_table_alias(continues);
-        Ok(table)
+        if components.len() == 1 {
+            self.read_table_alias(continues);
+        }
+        Ok((components, opens_at.through(closes_at)))
+    }
+
+    /// The ONE table a source path names, for a verb that spells that path inside a clause
+    /// — an `INSERT`'s `INTO` and a `DELETE`'s `FROM`.
+    ///
+    /// Such a clause names one table and nothing else, so a path of two components is
+    /// refused with the positioned single-table sentence
+    /// ([`single_table_in_data_manipulation`]) and a longer one is past what any source
+    /// path may spell at all, which is the arity sentence a read's source earns too
+    /// ([`FROM_PATH_ARITY_MESSAGE`]).
+    fn one_table_in_clause(components: &[String], at: Position) -> Result<String, RequestError> {
+        match components {
+            [table] => Ok(table.clone()),
+            [_, _] => Err(single_table_in_data_manipulation(at)),
+            _ => Err(RequestError::Validation(
+                FROM_PATH_ARITY_MESSAGE.to_string(),
+            )),
+        }
     }
 
     /// Read the ALIAS a statement binds to the table it has just named, when it states
