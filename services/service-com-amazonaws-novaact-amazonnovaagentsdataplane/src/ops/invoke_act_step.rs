@@ -1,15 +1,27 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op InvokeActStep
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `InvokeActStep`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Takes the next step of one STORED act: it records the results of the tool calls the
+//! caller executed, hands back the next call the act wants executed, and answers 200 with
+//! that call list and the identifier minted for this step.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`InvokeActStep::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! An act is driven by its CLIENT, so what a step hands back comes from what the act
+//! DECLARED: `CreateAct` stores the tool specifications the act may invoke, and a step asks
+//! for the first of them no earlier step has asked for, carrying an input built from that
+//! tool's own declared input schema ([`crate::state::act_step`] holds both rules, and the
+//! record of every call handed out that a later step resolves its results against). An act
+//! whose declared tools have all been asked for has nothing further for its caller to
+//! execute: its step hands back no calls and the act has finished, so it moves to the status
+//! that says so, with the instant it ended at. While calls are outstanding the next move is
+//! the caller's, which is the status an act is created in.
+//!
+//! All four identifiers in the path are resolved first: an unknown definition name, run id,
+//! session id or act id answers `ResourceNotFoundException` (404). An identifier the request
+//! carries for something the SERVICE minted — a `callId` a result answers, the
+//! `previousStepId` a step follows — must name one this act actually produced, else the
+//! request is refused `ValidationException` (400). A run that is not running, or an act that
+//! has already finished, has no execution left for a further step to describe and conflicts
+//! (409).
 //!
 //! ## Shape of an operation
 //!
@@ -172,18 +184,153 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `InvokeActStep` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(InvokeActStepErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("InvokeActStep"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            InvokeActStepErrorModeled::InternalServerException(InternalServerException {
+                message: "the com-amazonaws-novaact-amazonnovaagentsdataplane store is unavailable"
+                    .to_string(),
+                retry_after_seconds: None,
+                reason: None,
+            })
+        })?;
+        // The region is read for the identifier a refusal reports: the missing resource's
+        // ARN in the requesting credential scope's region.
+        let region = crate::state::request_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
+        let not_found = |missing: crate::state::MissingResource| -> Self::Error {
+            InvokeActStepErrorModeled::ResourceNotFoundException(missing.not_found(&region)).into()
+        };
+
+        let mut state = state.lock();
+        // A deletion the clock has already made due is completed first, as every handler of
+        // this service does: an act under a definition whose removal was owed at this instant
+        // is gone, so this step cannot resurrect one.
+        state.complete_due_deletions(now);
+
+        // One walk down the chain for the run's status — only a running run has execution
+        // left for a step to take — with the session resolved in the same pass, so the first
+        // link the store does not hold is what the refusal reports.
+        let run_status = {
+            let run = state
+                .definition(&input.workflow_definition_name)
+                .and_then(|definition| definition.run(&input.workflow_run_id))
+                .map_err(not_found)?;
+            run.session(&input.session_id).map_err(not_found)?;
+            run.status
+        };
+
+        // What this step needs off the stored act: the state a step can be taken from, and
+        // the execution record both the request's identifiers and the next call resolve
+        // against.
+        let (act_status, unmatched, unknown_previous_step, planned) = {
+            let act = state
+                .act(
+                    &input.workflow_definition_name,
+                    &input.workflow_run_id,
+                    &input.session_id,
+                    &input.act_id,
+                )
+                .map_err(not_found)?;
+            (
+                act.status,
+                crate::state::act_step::unmatched_result(&input.call_results, &act.execution),
+                input
+                    .previous_step_id
+                    .as_deref()
+                    .is_some_and(|step_id| !act.execution.holds_step(step_id)),
+                crate::state::act_step::next_tool(&act.tool_specs, &act.execution).cloned(),
+            )
+        };
+
+        // An identifier the request carries for something the SERVICE minted has to name one
+        // this act produced — a `callId` matches a result back to the call it answers, and
+        // `previousStepId` names the step this one follows. A request naming one the act
+        // never produced is not a request this service can act on, whatever state the act is
+        // in, so it is refused before the state checks below.
+        if let Some(member) = unmatched {
+            return Err(InvokeActStepErrorModeled::ValidationException(
+                crate::state::act_step::unresolved_identifier(
+                    &member,
+                    "a tool call this act requested",
+                ),
+            )
+            .into());
+        }
+        if unknown_previous_step {
+            return Err(InvokeActStepErrorModeled::ValidationException(
+                crate::state::act_step::unresolved_identifier(
+                    "previousStepId",
+                    "a step taken on this act",
+                ),
+            )
+            .into());
+        }
+
+        if !run_status.is_running() {
+            return Err(InvokeActStepErrorModeled::ConflictException(ConflictException {
+                message: format!(
+                    "workflow run {} is {} and cannot execute a step",
+                    input.workflow_run_id,
+                    run_status.as_wire()
+                ),
+                resource_id: input.workflow_run_id.clone(),
+                resource_type: "workflow-run".to_string(),
+            })
+            .into());
+        }
+        if act_status.is_terminal() {
+            return Err(InvokeActStepErrorModeled::ConflictException(ConflictException {
+                message: format!(
+                    "act {} is {} and cannot execute a step",
+                    input.act_id,
+                    act_status.as_wire()
+                ),
+                resource_id: input.act_id.clone(),
+                resource_type: "act".to_string(),
+            })
+            .into());
+        }
+
+        let step_id = state.mint_uuid();
+        // The call this step asks for, under an identifier the service mints for it: that
+        // identifier is what the result of this call will be matched back by. One call per
+        // step, so the record this act accumulates is bounded by the tools it declared.
+        let calls = match planned {
+            Some(spec) => {
+                let call_id = state.mint_uuid();
+                vec![crate::state::act_step::call_for(&spec, call_id)]
+            }
+            None => Vec::new(),
+        };
+        // An act waiting on calls it asked for has handed the next move to its caller; one
+        // that asked for nothing has nothing further for the caller to execute and has run
+        // to the end, which is what `move_to` records the end instant for.
+        let next_status = if calls.is_empty() {
+            crate::state::ActStatus::Succeeded
+        } else {
+            crate::state::ActStatus::PendingClientAction
+        };
+
+        let act = state
+            .act_mut(
+                &input.workflow_definition_name,
+                &input.workflow_run_id,
+                &input.session_id,
+                &input.act_id,
+            )
+            .map_err(not_found)?;
+        act.execution.record(crate::state::act_step::ActStep {
+            step_id: step_id.clone(),
+            previous_step_id: input.previous_step_id.clone(),
+            taken_at: now,
+            calls: calls.clone(),
+            answered_calls: input
+                .call_results
+                .iter()
+                .map(|result| result.call_id.clone())
+                .collect(),
+        });
+        act.move_to(next_status, now);
+
+        Ok(InvokeActStepOutput { calls, step_id })
     }
 }

@@ -48,6 +48,10 @@ pub mod export_config;
 /// of this service states the same way.
 pub mod status_transition;
 
+/// Taking the next step of an act: the calls one step hands its caller, the results it
+/// accepts back, and the record of both that every later step resolves against.
+pub mod act_step;
+
 /// The region an ARN carries when the request's SigV4 credential scope does not name a
 /// usable one (an unsigned in-process call, say). The `@pattern` on every ARN shape in
 /// this model requires a non-empty `[a-z0-9-]+` region segment, so there is no "no
@@ -544,6 +548,10 @@ pub struct Act {
     /// Where this act's trace is stored, as `ActSummary`'s `traceLocation` reports it.
     /// `None` until something records a trace for the act.
     pub trace_location: Option<TraceLocation>,
+    /// The steps taken on this act: the calls each one handed the caller and the calls whose
+    /// results it carried back ([`act_step`]). Empty until the first step is taken, and
+    /// bounded by the tools the act declared ([`act_step::ActExecution`]).
+    pub execution: act_step::ActExecution,
     pub insertion_seq: u64,
 }
 
@@ -805,6 +813,25 @@ impl ComAmazonawsNovaactAmazonnovaagentsdataplaneState {
             self.stored_acts += 1;
         }
         Ok(())
+    }
+
+    /// The act those four identifiers name: every parent in the chain is resolved first, so
+    /// an act reached through here is never one under a parent this store does not hold, and
+    /// whichever link is missing is what the refusal reports.
+    pub fn act(
+        &self,
+        definition_name: &str,
+        run_id: &str,
+        session_id: &str,
+        act_id: &str,
+    ) -> Result<&Act, MissingResource> {
+        let path = act_path(definition_name, run_id, session_id, act_id);
+        self.definition(definition_name)?
+            .run(run_id)?
+            .session(session_id)?
+            .acts
+            .get(act_id)
+            .ok_or_else(|| MissingResource::new("act", path))
     }
 
     /// The act those four identifiers name, mutably: every parent in the chain is resolved

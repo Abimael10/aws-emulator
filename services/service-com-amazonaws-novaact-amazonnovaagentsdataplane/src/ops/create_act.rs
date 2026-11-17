@@ -291,6 +291,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // starts in, and has no trace recorded for it yet.
             ended_at: None,
             trace_location: None,
+            // No step has been taken on an act that has only just been created, so its
+            // execution record is empty until `InvokeActStep` takes the first one.
+            execution: crate::state::act_step::ActExecution::default(),
             insertion_seq,
         };
         let status = act.status.as_wire().to_string();

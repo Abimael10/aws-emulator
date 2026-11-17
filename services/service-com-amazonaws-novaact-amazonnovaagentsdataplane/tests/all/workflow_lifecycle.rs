@@ -141,7 +141,10 @@ impl Emulator {
 
 /// `UuidString` in the model is `^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`;
 /// this is that pattern, checked without pulling in a regex engine.
-fn is_lowercase_uuid(value: &str) -> bool {
+///
+/// `pub(crate)` so a sibling suite asserting the form of an id this service MINTS checks it
+/// against this one reading of the pattern rather than a copy of it.
+pub(crate) fn is_lowercase_uuid(value: &str) -> bool {
     const GROUPS: [usize; 5] = [8, 4, 4, 4, 12];
     let parts: Vec<&str> = value.split('-').collect();
     parts.len() == GROUPS.len()
