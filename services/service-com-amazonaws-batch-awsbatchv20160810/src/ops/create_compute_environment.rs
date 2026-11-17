@@ -296,6 +296,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 status: batch::STATUS_CREATING.to_string(),
                 status_reason: None,
                 status_due_at: Some(now + batch::JOB_PHASE_MILLIS),
+                // No capacity has been provisioned for this environment yet: it is scaled out
+                // when a job of one of its queues needs it (`state::ec2_capacity`).
+                capacity_ready_at: None,
                 uuid: uuid.clone(),
                 // The cluster this environment is backed by, for an environment Batch
                 // orchestrates with Amazon ECS: it is named here and CREATED where that

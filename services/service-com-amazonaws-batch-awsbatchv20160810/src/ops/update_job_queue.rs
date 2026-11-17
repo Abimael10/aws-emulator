@@ -290,9 +290,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     })?,
             ),
         };
-        // The stored order is walked every time a service job of this queue is placed, so
-        // how many entries it keeps is bounded
-        // (`state::limits::MAX_SERVICE_ENVIRONMENT_ORDER_ENTRIES`).
+        // The stored orders are walked every time a job of this queue is placed — the
+        // compute one every time the capacity behind the queue is scaled too — so how many
+        // entries each keeps is bounded
+        // (`state::limits::MAX_COMPUTE_ENVIRONMENT_ORDER_ENTRIES`,
+        // `state::limits::MAX_SERVICE_ENVIRONMENT_ORDER_ENTRIES`).
+        if let Some(entries) = compute_environment_order.as_deref() {
+            batch::validate_stored_list_length(
+                "computeEnvironmentOrder",
+                entries.len(),
+                batch::limits::MAX_COMPUTE_ENVIRONMENT_ORDER_ENTRIES,
+            )
+            .map_err(|detail| {
+                UpdateJobQueueError::from(UpdateJobQueueErrorModeled::ClientException(
+                    batch::client_exception(detail),
+                ))
+            })?;
+        }
         if let Some(entries) = service_environment_order.as_deref() {
             batch::validate_stored_list_length(
                 "serviceEnvironmentOrder",

@@ -80,6 +80,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 mod array_jobs;
 mod described_collections;
+mod ec2_capacity;
 mod ecs_cluster;
 mod fargate;
 mod image_pull;
@@ -92,6 +93,7 @@ mod service_job_dispatch;
 
 pub use array_jobs::*;
 pub use described_collections::*;
+pub use ec2_capacity::*;
 pub use ecs_cluster::*;
 pub use fargate::*;
 pub use image_pull::*;
@@ -212,6 +214,15 @@ pub mod limits {
     /// service job is weighed against the environment, so a request past this answers the
     /// modelled `ClientException`.
     pub const MAX_SERVICE_ENVIRONMENT_CAPACITY_LIMITS: usize = 20;
+
+    /// How many `computeEnvironmentOrder` entries ONE job queue carries. An EMULATOR bound
+    /// (the model declares no length for the list): the list is caller-filled and is walked
+    /// whenever a job of the queue is placed or the capacity behind the queue is scaled
+    /// ([`super::ec2_capacity`]), so one request cannot decide how much work a later one
+    /// costs. Sized at the compute environments this store holds at once
+    /// ([`MAX_COMPUTE_ENVIRONMENTS`]) — an entry has to name an environment that exists
+    /// before a queue can be attached to it, so no queue can usefully order more.
+    pub const MAX_COMPUTE_ENVIRONMENT_ORDER_ENTRIES: usize = MAX_COMPUTE_ENVIRONMENTS;
 
     /// How many `serviceEnvironmentOrder` entries ONE job queue carries, bounded for the
     /// same reason as the capacity limits above: the list is caller-filled and is walked
@@ -1496,6 +1507,14 @@ pub struct ComputeEnvironment {
     /// Set while the `CREATING` -> `VALID` or `UPDATING` -> `VALID` move is still
     /// owed by the clock.
     pub status_due_at: Option<i64>,
+    /// When the capacity this environment SCALED OUT for the jobs waiting on its queues can
+    /// hold one of them, and `None` while it has launched none ([`ec2_capacity`]).
+    ///
+    /// Internal bookkeeping, not a modelled member: what the environment scaled out TO is
+    /// `computeResources.desiredvCpus`, which every reader reports; this is when the
+    /// instances behind that figure have joined the environment's cluster, which is what a
+    /// job waiting for capacity waits for.
+    pub capacity_ready_at: Option<i64>,
     /// The environment's unique identifier, minted once at creation.
     pub uuid: String,
     /// The Amazon ECS cluster BACKING this environment, as that service keys one, or `None`
@@ -3065,6 +3084,10 @@ impl ComAmazonawsBatchAwsbatchv20160810State {
                 // nested under one nothing resolves any more.
                 self.quota_shares
                     .retain(|_, share| share.job_queue_arn != removed.arn);
+                // Nothing of this queue's is outstanding any more, so the compute
+                // environments it ordered are scaled to the demand that is left
+                // ([`ec2_capacity`]) — the queue's own order, which went with it.
+                self.rescale_ordered_capacity(&removed.compute_environment_order, now);
             }
         }
         // A service environment is stored already `VALID` (AWS returns it ready), so the
@@ -3947,6 +3970,15 @@ impl ComAmazonawsBatchAwsbatchv20160810State {
             end_open_attempt(job, reason, ended_at);
         }
         self.record_job_state_change(id, ended_at);
+        // The job no longer needs capacity, so the compute environments behind its queue are
+        // scaled to the demand that is left ([`ec2_capacity`]) — back to the vCPUs they
+        // maintain once nothing of theirs is outstanding any more.
+        let queue_arn = self
+            .jobs
+            .get(id)
+            .map(|job| job.job_queue_arn.clone())
+            .unwrap_or_default();
+        self.rescale_queue_capacity(&queue_arn, ended_at);
         let waiting = self.dependents.get(id).cloned().unwrap_or_default();
         for dependent in waiting {
             let still_waiting = self.jobs.get(&dependent).is_some_and(|job| {

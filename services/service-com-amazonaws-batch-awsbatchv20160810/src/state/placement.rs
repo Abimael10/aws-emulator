@@ -376,16 +376,18 @@ impl ComAmazonawsBatchAwsbatchv20160810State {
         self.set_job_due(id, Some(at + JOB_PHASE_MILLIS));
     }
 
-    /// Owe `id` its placement one span after `at`, or nothing at all when its queue has no
-    /// capacity to place it on — in which case the job RESTS in `RUNNABLE`.
+    /// Owe `id` its placement, or nothing at all when its queue has no capacity to place it
+    /// on — in which case the job RESTS in `RUNNABLE`.
+    ///
+    /// WHEN that placement falls due is the capacity's to decide: one span for capacity that
+    /// is already running, later for a compute environment that has to provision instances
+    /// for the job first ([`Self::placement_due_at`]).
     ///
     /// Called from the ONE place a job enters `RUNNABLE`, so the decision is taken once
     /// per entry and from the instant the job entered, never from the instant a reader
     /// looked.
     pub(super) fn arm_placement(&mut self, id: &str, at: i64) {
-        let due = self
-            .job_is_placeable(id)
-            .then_some(at + JOB_PHASE_MILLIS);
+        let due = self.placement_due_at(id, at);
         self.set_job_due(id, due);
     }
 
@@ -396,8 +398,8 @@ impl ComAmazonawsBatchAwsbatchv20160810State {
     /// so what makes its next move due is the change that publishes some: a compute
     /// environment reaching the end of its creation, one a caller re-enabled
     /// (`UpdateComputeEnvironment`), or a queue given a different `computeEnvironmentOrder`
-    /// (`UpdateJobQueue`). The placement then falls due one span after `at`, like every
-    /// other transition this service owes — and `at` is the instant the capacity was
+    /// (`UpdateJobQueue`). The placement then falls due as the capacity behind the queue
+    /// decides ([`Self::placement_due_at`]) — counted from `at`, the instant the capacity was
     /// published, so what a later caller sees does not depend on when it called. The twin
     /// of [`Self::rearm_resting_service_jobs`] for container jobs.
     pub fn rearm_resting_jobs(&mut self, at: i64) {
@@ -409,7 +411,8 @@ impl ComAmazonawsBatchAwsbatchv20160810State {
             .filter(|id| self.job_is_placeable(id))
             .collect();
         for id in resting {
-            self.set_job_due(&id, Some(at + JOB_PHASE_MILLIS));
+            let due = self.placement_due_at(&id, at);
+            self.set_job_due(&id, due);
         }
     }
 }

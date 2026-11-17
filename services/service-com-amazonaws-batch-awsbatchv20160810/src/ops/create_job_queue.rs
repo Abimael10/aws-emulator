@@ -227,9 +227,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let requested_order = input.compute_environment_order.unwrap_or_default();
         let requested_services = input.service_environment_order.unwrap_or_default();
-        // `serviceEnvironmentOrder` is stored and walked every time a service job of this
-        // queue is placed, so how many entries are kept is bounded
-        // (`state::limits::MAX_SERVICE_ENVIRONMENT_ORDER_ENTRIES`).
+        // Both orders are stored and walked every time a job of this queue is placed — and
+        // the compute one every time the capacity behind the queue is scaled — so how many
+        // entries are kept is bounded
+        // (`state::limits::MAX_COMPUTE_ENVIRONMENT_ORDER_ENTRIES`,
+        // `state::limits::MAX_SERVICE_ENVIRONMENT_ORDER_ENTRIES`).
+        batch::validate_stored_list_length(
+            "computeEnvironmentOrder",
+            requested_order.len(),
+            batch::limits::MAX_COMPUTE_ENVIRONMENT_ORDER_ENTRIES,
+        )
+        .map_err(|detail| {
+            CreateJobQueueError::from(CreateJobQueueErrorModeled::ClientException(
+                batch::client_exception(detail),
+            ))
+        })?;
         batch::validate_stored_list_length(
             "serviceEnvironmentOrder",
             requested_services.len(),
