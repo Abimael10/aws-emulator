@@ -18058,6 +18058,7 @@ dependencies = [
  "service-com-amazonaws-paymentcryptography-paymentcryptographycontrolplane",
  "service-com-amazonaws-sts-awssecuritytokenservicev20110615",
  "service-common",
+ "sha1 0.10.7",
  "sha2 0.10.9",
  "tokio",
  "tracing",

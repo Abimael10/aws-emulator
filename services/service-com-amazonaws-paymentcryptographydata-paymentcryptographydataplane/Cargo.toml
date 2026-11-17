@@ -49,6 +49,10 @@ cmac = "0.7"
 # `digest` version has to serve all of them.
 hmac = "0.12"
 sha2 = { workspace = true }
+# SHA-1, which the EMV Option B issuer master key derivation hashes a card's account
+# number with. 0.10 for the same reason `hmac` is pinned there: it is the release built
+# on `digest` 0.10, the generation the other primitives above share.
+sha1 = "0.10"
 # Renders a ciphertext, a plaintext and a MAC as the hex the model's patterns admit.
 hex = { workspace = true }
 

@@ -1,15 +1,20 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op VerifyAuthRequestCryptogram
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `VerifyAuthRequestCryptogram`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`VerifyAuthRequestCryptogram::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Recomputes the Authorization Request Cryptogram (ARQC) of `TransactionData` under
+//! the session key the issuer master key `KeyIdentifier` names derives for the card and
+//! the transaction `SessionKeyDerivationAttributes` describe (see
+//! [`crate::state::crypto::emv`]), and compares it with the one presented: equal is the
+//! verification, unequal is the modelled `VerificationFailedException`. Nothing is
+//! stored — the cryptogram is a function of the key's material and the request alone,
+//! which is what makes recomputing it the verification.
+//!
+//! `AuthResponseAttributes` asks for an Authorization Response Cryptogram (ARPC) once
+//! the verification succeeds: method 1 answers the response code mixed into the request
+//! cryptogram and encrypted under the session key, method 2 the leading bytes of the
+//! EMV MAC over the request cryptogram and the card status update. A request naming
+//! neither is the boolean verification alone, and answers no `AuthResponseValue`.
 //!
 //! ## Shape of an operation
 //!
@@ -194,18 +199,155 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `VerifyAuthRequestCryptogram` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(VerifyAuthRequestCryptogramErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("VerifyAuthRequestCryptogram"))
+        // IAM decides ahead of the service, so this is asked before anything about the
+        // request is read: a caller whose policies do not allow this action learns nothing
+        // about the key it addressed.
+        crate::service::authorization::authorize(
+            &*self.engine,
+            ctx,
+            Self::NAME,
+            &input.key_identifier,
+        )
+        .map_err(denied)?;
+
+        let key =
+            crate::state::resolve_key(&*self.engine, &input.key_identifier).map_err(refused)?;
+        // The same key the generating half of the pair takes: the issuer master key for
+        // application cryptograms, whose modes of use have to include the derivation
+        // this call performs under it. Judged ahead of the modes-of-use gate for the
+        // reason the sibling `GenerateAuthRequestCryptogram` states.
+        if key.key_usage != crate::state::KEY_USAGE_EMV_APP_CRYPTOGRAMS {
+            return Err(invalid(format!(
+                "KeyUsage {} is not valid for this operation.",
+                key.key_usage
+            )));
+        }
+        if !key.modes.derive_key() {
+            return Err(invalid(format!(
+                "The KeyModesOfUse of key {} do not include DeriveKey.",
+                key.key_arn
+            )));
+        }
+
+        let Ok(transaction_data) = hex::decode(&input.transaction_data) else {
+            return Err(invalid(
+                "TransactionData must be an even number of hexadecimal characters.".to_string(),
+            ));
+        };
+        let session_key = crate::state::crypto::emv::session_key(
+            &input.major_key_derivation_mode,
+            &key.key_algorithm,
+            key.material(),
+            &input.session_key_derivation_attributes,
+        )
+        .map_err(cryptogram_refusal)?;
+        let computed =
+            crate::state::crypto::emv::auth_request_cryptogram(&session_key, &transaction_data)
+                .map_err(cryptogram_refusal)?;
+
+        // The presented cryptogram is hex, so it is compared as hex without regard to
+        // the case the caller wrote it in.
+        if !input
+            .auth_request_cryptogram
+            .eq_ignore_ascii_case(&hex::encode(&computed))
+        {
+            return Err(
+                VerifyAuthRequestCryptogramErrorModeled::VerificationFailedException(
+                    VerificationFailedException {
+                        reason: crate::state::VERIFICATION_FAILED_INVALID_AUTH_REQUEST_CRYPTOGRAM
+                            .to_string(),
+                        message: VERIFICATION_FAILED_MESSAGE.to_string(),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // "provide an APRC (Authorization Response Cryptogram) response using Method 1
+        // or Method 2" (this operation's own documentation): the response cryptogram is
+        // answered only to a request that asked for one, and only once the request
+        // cryptogram has verified.
+        let auth_response_value = match &input.auth_response_attributes {
+            None => None,
+            Some(response) => Some(hex::encode_upper(
+                crate::state::crypto::emv::auth_response_cryptogram(
+                    &session_key,
+                    &computed,
+                    response,
+                )
+                .map_err(cryptogram_refusal)?,
+            )),
+        };
+
+        Ok(VerifyAuthRequestCryptogramOutput {
+            key_arn: key.key_arn,
+            key_check_value: key.key_check_value,
+            auth_response_value,
+        })
+    }
+}
+
+/// The message a failed auth request cryptogram verification carries, beside the
+/// modelled `Reason`. Fixed text: it states which verification failed and nothing about
+/// the key or the value presented.
+const VERIFICATION_FAILED_MESSAGE: &str = "Auth request cryptogram verification failed.";
+
+/// A request the calling principal's IAM policies do not allow: the modelled
+/// `AccessDeniedException` (HTTP 403), worded by [`crate::service::authorization`].
+fn denied(exception: AccessDeniedException) -> VerifyAuthRequestCryptogramError {
+    VerifyAuthRequestCryptogramErrorModeled::AccessDeniedException(exception).into()
+}
+
+/// A request this operation cannot serve as asked: the modelled `ValidationException`.
+fn invalid(message: String) -> VerifyAuthRequestCryptogramError {
+    VerifyAuthRequestCryptogramErrorModeled::ValidationException(ValidationException {
+        message,
+        field_list: None,
+    })
+    .into()
+}
+
+/// The refusal the cryptogram computation answered, in this operation's own error
+/// channel: an inadmissible request is the modelled `ValidationException`, and key
+/// material that cannot key a derivation its algorithm admits is this emulator's own
+/// invariant — the modelled `InternalServerException` rather than a refusal of the
+/// request.
+fn cryptogram_refusal(
+    refusal: crate::state::crypto::emv::CryptogramRefusal,
+) -> VerifyAuthRequestCryptogramError {
+    match refusal {
+        crate::state::crypto::emv::CryptogramRefusal::Invalid(message) => invalid(message),
+        crate::state::crypto::emv::CryptogramRefusal::Unusable(message) => {
+            VerifyAuthRequestCryptogramErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some(message),
+                },
+            )
+            .into()
+        }
+    }
+}
+
+/// The refusal [`crate::state::resolve_key`] answered, in this operation's own error
+/// channel.
+fn refused(refusal: crate::state::KeyRefusal) -> VerifyAuthRequestCryptogramError {
+    match refusal {
+        crate::state::KeyRefusal::NotFound(identifier) => {
+            VerifyAuthRequestCryptogramErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    resource_id: Some(identifier),
+                },
+            )
+            .into()
+        }
+        crate::state::KeyRefusal::NotUsable(message) => invalid(message),
+        crate::state::KeyRefusal::Unavailable(message) => {
+            VerifyAuthRequestCryptogramErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some(message),
+                },
+            )
+            .into()
+        }
     }
 }

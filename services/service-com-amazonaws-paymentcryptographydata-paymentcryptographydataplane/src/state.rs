@@ -93,6 +93,7 @@ pub struct KeyModes {
     decrypt: bool,
     generate: bool,
     verify: bool,
+    derive_key: bool,
     no_restrictions: bool,
 }
 
@@ -119,6 +120,14 @@ impl KeyModes {
     #[must_use]
     pub fn verify(&self) -> bool {
         self.verify || self.no_restrictions
+    }
+
+    /// Whether the key may be used to derive another key — the mode an EMV issuer
+    /// master key is used under, since what the cryptogram operations do with it is
+    /// derive the card's key and then the transaction's.
+    #[must_use]
+    pub fn derive_key(&self) -> bool {
+        self.derive_key || self.no_restrictions
     }
 }
 
@@ -246,6 +255,7 @@ fn key_facts<Eng: Send + Sync + 'static>(
             decrypt: modes.decrypt,
             generate: modes.generate,
             verify: modes.verify,
+            derive_key: modes.derive_key,
             no_restrictions: modes.no_restrictions,
         },
     })
@@ -255,6 +265,11 @@ fn key_facts<Eng: Send + Sync + 'static>(
 /// `KeyUsage`: the TR-31 card verification key, which is the CVK the card data
 /// operations' own documentation requires.
 pub const KEY_USAGE_CARD_VERIFICATION: &str = "TR31_C0_CARD_VERIFICATION_KEY";
+
+/// The `KeyUsage` an EMV issuer master key for application cryptograms carries, from
+/// the same modelled `KeyUsage`: the IMK-AC the auth request cryptogram operations'
+/// own documentation requires.
+pub const KEY_USAGE_EMV_APP_CRYPTOGRAMS: &str = "TR31_E0_EMV_MKEY_APP_CRYPTOGRAMS";
 
 /// The `ValidationData` length applied when the request names none: "The length of
 /// the CVV or CSC to be generated. The default value is 3"
@@ -267,6 +282,11 @@ pub const VERIFICATION_FAILED_INVALID_MAC: &str = "INVALID_MAC";
 
 /// The `Reason` a failed card data verification carries, from the same shape.
 pub const VERIFICATION_FAILED_INVALID_VALIDATION_DATA: &str = "INVALID_VALIDATION_DATA";
+
+/// The `Reason` a failed auth request cryptogram verification carries, from the same
+/// shape.
+pub const VERIFICATION_FAILED_INVALID_AUTH_REQUEST_CRYPTOGRAM: &str =
+    "INVALID_AUTH_REQUEST_CRYPTOGRAM";
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.
 ///

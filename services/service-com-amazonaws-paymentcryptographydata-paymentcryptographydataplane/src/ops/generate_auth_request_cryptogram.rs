@@ -1,15 +1,19 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GenerateAuthRequestCryptogram
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GenerateAuthRequestCryptogram`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GenerateAuthRequestCryptogram::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Computes the Authorization Request Cryptogram (ARQC) of `TransactionData` under the
+//! session key the issuer master key `KeyIdentifier` names derives for the card and the
+//! transaction `SessionKeyDerivationAttributes` describe (see
+//! [`crate::state::crypto::emv`]). The cryptogram is a function of (issuer master key
+//! material, major key derivation mode, session key derivation attributes, transaction
+//! data) and of nothing else, so `VerifyAuthRequestCryptogram` recomputing it from the
+//! same four is what verifies it — no cryptogram is stored anywhere.
+//!
+//! This slice serves every modelled `SessionKeyDerivation` scheme and both modelled
+//! `MajorKeyDerivationMode` options, under an issuer master key of either Triple DES
+//! algorithm; a key whose algorithm names no Triple DES cipher derives no EMV key, so
+//! it is refused rather than run under a derivation it has no definition for.
 //!
 //! ## Shape of an operation
 //!
@@ -183,18 +187,121 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GenerateAuthRequestCryptogram` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GenerateAuthRequestCryptogramErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GenerateAuthRequestCryptogram"))
+        // IAM decides ahead of the service, so this is asked before anything about the
+        // request is read: a caller whose policies do not allow this action learns nothing
+        // about the key it addressed.
+        crate::service::authorization::authorize(
+            &*self.engine,
+            ctx,
+            Self::NAME,
+            &input.key_identifier,
+        )
+        .map_err(denied)?;
+
+        let key =
+            crate::state::resolve_key(&*self.engine, &input.key_identifier).map_err(refused)?;
+        // "ARQC generation uses an Issuer Master Key (IMK) for application cryptograms
+        // (TR31_E0_EMV_MKEY_APP_CRYPTOGRAMS) to derive a session key" (this operation's
+        // own documentation): a key of another usage is the wrong KEY, so that is what
+        // the refusal says, ahead of the modes-of-use gate a caller could widen and
+        // still be handed back a key that derives no EMV session key.
+        if key.key_usage != crate::state::KEY_USAGE_EMV_APP_CRYPTOGRAMS {
+            return Err(invalid(format!(
+                "KeyUsage {} is not valid for this operation.",
+                key.key_usage
+            )));
+        }
+        // "The KeyModesOfUse should be set to DeriveKey for the IMK-AC encryption key"
+        // (this operation's own documentation), which is what this call does with that
+        // key: derive the card's master key, and from it the transaction's session key.
+        if !key.modes.derive_key() {
+            return Err(invalid(format!(
+                "The KeyModesOfUse of key {} do not include DeriveKey.",
+                key.key_arn
+            )));
+        }
+
+        let Ok(transaction_data) = hex::decode(&input.transaction_data) else {
+            return Err(invalid(
+                "TransactionData must be an even number of hexadecimal characters.".to_string(),
+            ));
+        };
+        let session_key = crate::state::crypto::emv::session_key(
+            &input.major_key_derivation_mode,
+            &key.key_algorithm,
+            key.material(),
+            &input.session_key_derivation_attributes,
+        )
+        .map_err(cryptogram_refusal)?;
+        let auth_request_cryptogram = hex::encode_upper(
+            crate::state::crypto::emv::auth_request_cryptogram(&session_key, &transaction_data)
+                .map_err(cryptogram_refusal)?,
+        );
+
+        Ok(GenerateAuthRequestCryptogramOutput {
+            key_arn: key.key_arn,
+            key_check_value: key.key_check_value,
+            auth_request_cryptogram,
+        })
+    }
+}
+
+/// A request the calling principal's IAM policies do not allow: the modelled
+/// `AccessDeniedException` (HTTP 403), worded by [`crate::service::authorization`].
+fn denied(exception: AccessDeniedException) -> GenerateAuthRequestCryptogramError {
+    GenerateAuthRequestCryptogramErrorModeled::AccessDeniedException(exception).into()
+}
+
+/// A request this operation cannot serve as asked: the modelled `ValidationException`.
+fn invalid(message: String) -> GenerateAuthRequestCryptogramError {
+    GenerateAuthRequestCryptogramErrorModeled::ValidationException(ValidationException {
+        message,
+        field_list: None,
+    })
+    .into()
+}
+
+/// The refusal the cryptogram computation answered, in this operation's own error
+/// channel: an inadmissible request is the modelled `ValidationException`, and key
+/// material that cannot key a derivation its algorithm admits is this emulator's own
+/// invariant — the modelled `InternalServerException` rather than a refusal of the
+/// request.
+fn cryptogram_refusal(
+    refusal: crate::state::crypto::emv::CryptogramRefusal,
+) -> GenerateAuthRequestCryptogramError {
+    match refusal {
+        crate::state::crypto::emv::CryptogramRefusal::Invalid(message) => invalid(message),
+        crate::state::crypto::emv::CryptogramRefusal::Unusable(message) => {
+            GenerateAuthRequestCryptogramErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some(message),
+                },
+            )
+            .into()
+        }
+    }
+}
+
+/// The refusal [`crate::state::resolve_key`] answered, in this operation's own error
+/// channel.
+fn refused(refusal: crate::state::KeyRefusal) -> GenerateAuthRequestCryptogramError {
+    match refusal {
+        crate::state::KeyRefusal::NotFound(identifier) => {
+            GenerateAuthRequestCryptogramErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    resource_id: Some(identifier),
+                },
+            )
+            .into()
+        }
+        crate::state::KeyRefusal::NotUsable(message) => invalid(message),
+        crate::state::KeyRefusal::Unavailable(message) => {
+            GenerateAuthRequestCryptogramErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some(message),
+                },
+            )
+            .into()
+        }
     }
 }

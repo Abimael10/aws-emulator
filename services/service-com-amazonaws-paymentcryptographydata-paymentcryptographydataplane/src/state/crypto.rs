@@ -20,6 +20,9 @@
 //!   computes.
 //! * the CVV/CVC computation and its decimalisation, which is a payment-industry
 //!   algorithm no general crate implements.
+//! * the EMV key derivations and application cryptograms, in [`emv`], which are the
+//!   payment-industry chain the EMV specifications publish and which no general crate
+//!   implements either.
 //!
 //! None of these is a stand-in: each mode is pinned against the worked examples NIST
 //! publishes for it (see the tests at the foot of this file), a ciphertext is the
@@ -37,6 +40,8 @@ use cmac::{Cmac, Mac};
 use des::{Des, TdesEde2, TdesEde3};
 use hmac::Hmac;
 use sha2::{Sha224, Sha256, Sha384, Sha512};
+
+pub mod emv;
 
 /// How many characters of a hex-coded wire value one byte of data occupies.
 ///

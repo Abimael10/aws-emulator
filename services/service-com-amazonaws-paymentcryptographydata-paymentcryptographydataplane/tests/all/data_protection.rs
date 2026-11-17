@@ -2,7 +2,8 @@
 
 //! The symmetric data-protection loop of the Payment Cryptography data plane, end to
 //! end over the wire: `EncryptData`, `DecryptData`, `GenerateMac`, `VerifyMac`,
-//! `GenerateCardValidationData`, `VerifyCardValidationData`.
+//! `GenerateCardValidationData`, `VerifyCardValidationData`,
+//! `GenerateAuthRequestCryptogram`, `VerifyAuthRequestCryptogram`.
 //!
 //! Every call goes through the real `MultiServiceRouter`, and the keys these cases use
 //! are minted by the CONTROL plane's own `CreateKey` / `CreateAlias` on the SAME
@@ -17,8 +18,9 @@
 //! decrypt inverts an encrypt and a verify recomputes a generate. Each case is one
 //! row of a table spanning the class the rule generalises over — every modelled
 //! `EncryptionMode`, every symmetric `KeyAlgorithm`, every `MacAlgorithm` with a
-//! computation, both published bounds of `PrimaryAccountNumber` and every
-//! `ValidationDataLength` — rather than the single row the issue named.
+//! computation, both published bounds of `PrimaryAccountNumber`, every
+//! `ValidationDataLength`, every modelled `SessionKeyDerivation` scheme and both
+//! `MajorKeyDerivationMode` options — rather than the single row the issue named.
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -28,7 +30,8 @@ use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
 use service_com_amazonaws_paymentcryptographydata_paymentcryptographydataplane::ops::types::{
-    ENCRYPTION_MODE_VALUES, MAC_ALGORITHM_VALUES, VERIFICATION_FAILED_REASON_VALUES,
+    ENCRYPTION_MODE_VALUES, MAC_ALGORITHM_VALUES, MAJOR_KEY_DERIVATION_MODE_VALUES,
+    VERIFICATION_FAILED_REASON_VALUES,
 };
 use service_com_amazonaws_paymentcryptographydata_paymentcryptographydataplane::EmulatedService as DataPlane;
 use service_com_amazonaws_paymentcryptography_paymentcryptographycontrolplane::EmulatedService as ControlPlane;
@@ -1424,5 +1427,706 @@ async fn an_attribute_set_with_no_computation_here_still_says_so() {
         (status, error_code(&parsed).as_str()),
         (501, "NotImplemented"),
         "a DUKPT derivation must say so, got {status} {parsed}"
+    );
+}
+
+/// The `KeyUsage` an EMV issuer master key for application cryptograms carries, from
+/// the control plane's modelled `KeyUsage`: the IMK-AC the auth request cryptogram
+/// operations' own documentation requires.
+const USAGE_EMV_APP_CRYPTOGRAMS: &str = "TR31_E0_EMV_MKEY_APP_CRYPTOGRAMS";
+
+/// Modes of use for a key whose job is deriving other keys, which is what the cryptogram
+/// operations do with an issuer master key.
+fn derive_key() -> Value {
+    json!({"DeriveKey": true})
+}
+
+/// `POST /cryptogram/generate`, the URI the model binds `GenerateAuthRequestCryptogram`
+/// to.
+const GENERATE_CRYPTOGRAM_URI: &str = "/cryptogram/generate";
+
+/// `POST /cryptogram/verify`, the URI the model binds `VerifyAuthRequestCryptogram` to.
+const VERIFY_CRYPTOGRAM_URI: &str = "/cryptogram/verify";
+
+/// The `KeyAlgorithm` values an EMV issuer master key can carry: the Triple DES
+/// algorithms, since the derivation produces a double-length Triple DES key. Source:
+/// the control plane's `SymmetricKeyAlgorithm`, less the AES and HMAC algorithms, which
+/// name no Triple DES cipher.
+const ISSUER_MASTER_KEY_ALGORITHMS: &[&str] = &["TDES_2KEY", "TDES_3KEY"];
+
+/// Every modelled `SessionKeyDerivation` member, with the attributes that member
+/// carries for `pan`. Source:
+/// `smithy_query(query="shape",shape="SessionKeyDerivation")` and the members of each
+/// target shape — the EMV common, Mastercard, EMV2000 and UnionPay members carry a
+/// transaction counter, Mastercard's an unpredictable number as well, and the American
+/// Express and Visa members the card alone.
+fn session_key_schemes(pan: &str) -> Vec<(&'static str, Value)> {
+    vec![
+        (
+            "EmvCommon",
+            json!({"EmvCommon": {
+                "PrimaryAccountNumber": pan,
+                "PanSequenceNumber": "01",
+                "ApplicationTransactionCounter": "006D",
+            }}),
+        ),
+        (
+            "Mastercard",
+            json!({"Mastercard": {
+                "PrimaryAccountNumber": pan,
+                "PanSequenceNumber": "01",
+                "ApplicationTransactionCounter": "006D",
+                "UnpredictableNumber": "1A2B3C4D",
+            }}),
+        ),
+        (
+            "Emv2000",
+            json!({"Emv2000": {
+                "PrimaryAccountNumber": pan,
+                "PanSequenceNumber": "01",
+                "ApplicationTransactionCounter": "006D",
+            }}),
+        ),
+        (
+            "Amex",
+            json!({"Amex": {"PrimaryAccountNumber": pan, "PanSequenceNumber": "01"}}),
+        ),
+        (
+            "Visa",
+            json!({"Visa": {"PrimaryAccountNumber": pan, "PanSequenceNumber": "01"}}),
+        ),
+        (
+            "UnionPay",
+            json!({"UnionPay": {
+                "PrimaryAccountNumber": pan,
+                "PanSequenceNumber": "01",
+                "ApplicationTransactionCounter": "006D",
+            }}),
+        ),
+    ]
+}
+
+/// The `GenerateAuthRequestCryptogram` request body.
+fn generate_cryptogram_body(
+    key_identifier: &str,
+    mode: &str,
+    attributes: &Value,
+    transaction_data: &str,
+) -> Value {
+    json!({
+        "KeyIdentifier": key_identifier,
+        "MajorKeyDerivationMode": mode,
+        "SessionKeyDerivationAttributes": attributes.clone(),
+        "TransactionData": transaction_data,
+    })
+}
+
+/// The `VerifyAuthRequestCryptogram` request body, with the response attributes a
+/// request asking for an ARPC carries.
+fn verify_cryptogram_body(
+    key_identifier: &str,
+    mode: &str,
+    attributes: &Value,
+    transaction_data: &str,
+    cryptogram: &str,
+    response: Option<&Value>,
+) -> Value {
+    let mut body = generate_cryptogram_body(key_identifier, mode, attributes, transaction_data);
+    if let Value::Object(target) = &mut body {
+        target.insert(
+            "AuthRequestCryptogram".to_string(),
+            json!(cryptogram.to_string()),
+        );
+        if let Some(response) = response {
+            target.insert("AuthResponseAttributes".to_string(), response.clone());
+        }
+    }
+    body
+}
+
+#[tokio::test]
+async fn every_session_key_scheme_generates_a_cryptogram_its_verify_accepts() {
+    let router = emulator();
+    // The table spans both modelled `MajorKeyDerivationMode` options: one the model
+    // gains later fails this assertion rather than going untested.
+    let modes: Vec<&str> = MAJOR_KEY_DERIVATION_MODE_VALUES.to_vec();
+    assert_eq!(
+        modes.iter().copied().collect::<BTreeSet<_>>(),
+        ["EMV_OPTION_A", "EMV_OPTION_B"]
+            .into_iter()
+            .collect::<BTreeSet<_>>(),
+        "the mode table must span the modelled MajorKeyDerivationMode catalog, which is \
+         {modes:?}"
+    );
+    // The published bounds of `PrimaryAccountNumber` (length 12..19), so the
+    // diversification value is exercised both shorter and longer than the sixteen digits
+    // it carries.
+    for pan in ["411111111111", "4111111111111111", "4111111111111111999"] {
+        for key_algorithm in ISSUER_MASTER_KEY_ALGORITHMS {
+            let key = create_key(
+                &router,
+                key_algorithm,
+                USAGE_EMV_APP_CRYPTOGRAMS,
+                derive_key(),
+            )
+            .await;
+            for mode in &modes {
+                // The transaction data's own length is free (`TransactionDataType`,
+                // length 2..1024), so a short, a block-sized and a multi-block value
+                // each have to compute.
+                for bytes in [1usize, 8, 24] {
+                    let transaction_data = hex_data(bytes);
+                    for (scheme, attributes) in session_key_schemes(pan) {
+                        let case =
+                            format!("{pan}/{key_algorithm}/{mode}/{scheme}/{bytes} bytes");
+                        let generated = ok_data(
+                            &router,
+                            GENERATE_CRYPTOGRAM_URI,
+                            &generate_cryptogram_body(
+                                &key.arn,
+                                mode,
+                                &attributes,
+                                &transaction_data,
+                            ),
+                        )
+                        .await;
+                        let cryptogram =
+                            string(&generated, "AuthRequestCryptogram").to_string();
+                        // `AuthRequestCryptogramType` is exactly sixteen hexadecimal
+                        // characters: the eight-byte EMV MAC.
+                        assert!(
+                            cryptogram.len() == 16
+                                && cryptogram.chars().all(|c| c.is_ascii_hexdigit()),
+                            "case {case}: AuthRequestCryptogram {cryptogram} must be 16 \
+                             hexadecimal characters"
+                        );
+                        assert_eq!(
+                            string(&generated, "KeyArn"),
+                            key.arn,
+                            "case {case}: the answer must carry the canonical key ARN"
+                        );
+                        assert_eq!(
+                            string(&generated, "KeyCheckValue"),
+                            key.key_check_value,
+                            "case {case}: the answer must carry the key's own check value"
+                        );
+
+                        // The cryptogram is a function of the key and the request, so
+                        // the same call answers the same value.
+                        let again = ok_data(
+                            &router,
+                            GENERATE_CRYPTOGRAM_URI,
+                            &generate_cryptogram_body(
+                                &key.arn,
+                                mode,
+                                &attributes,
+                                &transaction_data,
+                            ),
+                        )
+                        .await;
+                        assert_eq!(
+                            string(&again, "AuthRequestCryptogram"),
+                            cryptogram,
+                            "case {case}: the same request must reproduce the cryptogram"
+                        );
+
+                        let verified = ok_data(
+                            &router,
+                            VERIFY_CRYPTOGRAM_URI,
+                            &verify_cryptogram_body(
+                                &key.arn,
+                                mode,
+                                &attributes,
+                                &transaction_data,
+                                &cryptogram,
+                                None,
+                            ),
+                        )
+                        .await;
+                        assert_eq!(
+                            string(&verified, "KeyArn"),
+                            key.arn,
+                            "case {case}: verify must carry the canonical key ARN"
+                        );
+                        assert_eq!(
+                            string(&verified, "KeyCheckValue"),
+                            key.key_check_value,
+                            "case {case}: verify must carry the key's own check value"
+                        );
+                        assert!(
+                            verified.get("AuthResponseValue").is_none(),
+                            "case {case}: a request asking for no ARPC must be answered \
+                             none, got {verified}"
+                        );
+                        // The cryptogram the caller presents is hexadecimal, so the case
+                        // it is written in cannot change the verdict.
+                        ok_data(
+                            &router,
+                            VERIFY_CRYPTOGRAM_URI,
+                            &verify_cryptogram_body(
+                                &key.arn,
+                                mode,
+                                &attributes,
+                                &transaction_data,
+                                &cryptogram.to_lowercase(),
+                                None,
+                            ),
+                        )
+                        .await;
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn each_derivation_is_its_own_computation() {
+    let router = emulator();
+    // What the cryptogram is computed from is the key, the derivation mode and the
+    // transaction's own data: change any one of them and the cryptogram changes. The
+    // schemes compared here are the four with distinct derivations — the two that carry
+    // no transaction counter compute under the card's master key itself, and the two
+    // that carry a counter alone diversify by the same value.
+    let pan = "4111111111111111";
+    let transaction_data = hex_data(8);
+    let keys = [
+        create_key(
+            &router,
+            "TDES_2KEY",
+            USAGE_EMV_APP_CRYPTOGRAMS,
+            derive_key(),
+        )
+        .await,
+        create_key(
+            &router,
+            "TDES_2KEY",
+            USAGE_EMV_APP_CRYPTOGRAMS,
+            derive_key(),
+        )
+        .await,
+    ];
+    let mut answered: Vec<(String, String)> = Vec::new();
+    for (index, key) in keys.iter().enumerate() {
+        for mode in ["EMV_OPTION_A", "EMV_OPTION_B"] {
+            for (scheme, attributes) in session_key_schemes(pan) {
+                if !["EmvCommon", "Mastercard", "Emv2000", "Amex"].contains(&scheme) {
+                    continue;
+                }
+                let generated = ok_data(
+                    &router,
+                    GENERATE_CRYPTOGRAM_URI,
+                    &generate_cryptogram_body(&key.arn, mode, &attributes, &transaction_data),
+                )
+                .await;
+                answered.push((
+                    format!("key {index}/{mode}/{scheme}"),
+                    string(&generated, "AuthRequestCryptogram").to_string(),
+                ));
+            }
+        }
+    }
+    let distinct: BTreeSet<&String> = answered.iter().map(|(_, value)| value).collect();
+    assert_eq!(
+        distinct.len(),
+        answered.len(),
+        "each key, derivation mode and scheme must compute its own cryptogram, got \
+         {answered:?}"
+    );
+
+    // And the transaction data itself: one changed character changes the cryptogram.
+    let key = &keys[0];
+    let (_, attributes) = session_key_schemes(pan)
+        .into_iter()
+        .find(|(scheme, _)| *scheme == "EmvCommon")
+        .expect("the EMV common scheme is in the table");
+    let first = ok_data(
+        &router,
+        GENERATE_CRYPTOGRAM_URI,
+        &generate_cryptogram_body(&key.arn, "EMV_OPTION_A", &attributes, &transaction_data),
+    )
+    .await;
+    let longer = ok_data(
+        &router,
+        GENERATE_CRYPTOGRAM_URI,
+        &generate_cryptogram_body(
+            &key.arn,
+            "EMV_OPTION_A",
+            &attributes,
+            &format!("{transaction_data}FF"),
+        ),
+    )
+    .await;
+    assert_ne!(
+        string(&first, "AuthRequestCryptogram"),
+        string(&longer, "AuthRequestCryptogram"),
+        "the transaction data must change the cryptogram"
+    );
+}
+
+#[tokio::test]
+async fn a_cryptogram_that_the_transaction_did_not_produce_is_refused() {
+    let router = emulator();
+    // A verification compares what the transaction computes with what the caller
+    // presented: a cryptogram that was tampered with, or one computed over any other
+    // transaction, key or derivation, fails verification rather than being accepted.
+    let pan = "4111111111111111";
+    let other_pan = "5500000000000004";
+    let transaction_data = hex_data(8);
+    let key = create_key(
+        &router,
+        "TDES_2KEY",
+        USAGE_EMV_APP_CRYPTOGRAMS,
+        derive_key(),
+    )
+    .await;
+    let other_key = create_key(
+        &router,
+        "TDES_2KEY",
+        USAGE_EMV_APP_CRYPTOGRAMS,
+        derive_key(),
+    )
+    .await;
+    let schemes = session_key_schemes(pan);
+    let (_, attributes) = schemes
+        .iter()
+        .find(|(scheme, _)| *scheme == "EmvCommon")
+        .expect("the EMV common scheme is in the table");
+    let generated = ok_data(
+        &router,
+        GENERATE_CRYPTOGRAM_URI,
+        &generate_cryptogram_body(&key.arn, "EMV_OPTION_A", attributes, &transaction_data),
+    )
+    .await;
+    let cryptogram = string(&generated, "AuthRequestCryptogram").to_string();
+
+    let tampered = format!(
+        "{}{}",
+        &cryptogram[..15],
+        if cryptogram.ends_with('0') { '1' } else { '0' }
+    );
+    let other_counter = json!({"EmvCommon": {
+        "PrimaryAccountNumber": pan,
+        "PanSequenceNumber": "01",
+        "ApplicationTransactionCounter": "006E",
+    }});
+    let other_card = json!({"EmvCommon": {
+        "PrimaryAccountNumber": other_pan,
+        "PanSequenceNumber": "01",
+        "ApplicationTransactionCounter": "006D",
+    }});
+    let other_sequence = json!({"EmvCommon": {
+        "PrimaryAccountNumber": pan,
+        "PanSequenceNumber": "02",
+        "ApplicationTransactionCounter": "006D",
+    }});
+    let (_, mastercard) = schemes
+        .iter()
+        .find(|(scheme, _)| *scheme == "Mastercard")
+        .expect("the Mastercard scheme is in the table");
+    // (case, the key, the mode, the attributes, the transaction data, the cryptogram)
+    let rows: Vec<(&str, &str, &str, &Value, String, String)> = vec![
+        (
+            "a tampered cryptogram",
+            &key.arn,
+            "EMV_OPTION_A",
+            attributes,
+            transaction_data.clone(),
+            tampered,
+        ),
+        (
+            "another transaction's data",
+            &key.arn,
+            "EMV_OPTION_A",
+            attributes,
+            hex_data(9),
+            cryptogram.clone(),
+        ),
+        (
+            "another transaction counter",
+            &key.arn,
+            "EMV_OPTION_A",
+            &other_counter,
+            transaction_data.clone(),
+            cryptogram.clone(),
+        ),
+        (
+            "another card",
+            &key.arn,
+            "EMV_OPTION_A",
+            &other_card,
+            transaction_data.clone(),
+            cryptogram.clone(),
+        ),
+        (
+            "another card sequence number",
+            &key.arn,
+            "EMV_OPTION_A",
+            &other_sequence,
+            transaction_data.clone(),
+            cryptogram.clone(),
+        ),
+        (
+            "the other major key derivation mode",
+            &key.arn,
+            "EMV_OPTION_B",
+            attributes,
+            transaction_data.clone(),
+            cryptogram.clone(),
+        ),
+        (
+            "another session key derivation scheme",
+            &key.arn,
+            "EMV_OPTION_A",
+            mastercard,
+            transaction_data.clone(),
+            cryptogram.clone(),
+        ),
+        (
+            "another issuer master key",
+            &other_key.arn,
+            "EMV_OPTION_A",
+            attributes,
+            transaction_data.clone(),
+            cryptogram.clone(),
+        ),
+    ];
+    for (case, key_arn, mode, attributes, transaction, presented) in rows {
+        let (status, parsed) = data(
+            &router,
+            VERIFY_CRYPTOGRAM_URI,
+            &verify_cryptogram_body(key_arn, mode, attributes, &transaction, &presented, None),
+        )
+        .await;
+        assert_eq!(
+            (status, error_code(&parsed).as_str()),
+            (400, "VerificationFailedException"),
+            "case {case}: expected a 400 VerificationFailedException, got {status} {parsed}"
+        );
+        assert_eq!(
+            parsed.get("Reason").and_then(Value::as_str),
+            Some("INVALID_AUTH_REQUEST_CRYPTOGRAM"),
+            "case {case}: the refusal must name the modelled reason, got {parsed}"
+        );
+        assert!(
+            VERIFICATION_FAILED_REASON_VALUES.contains(&"INVALID_AUTH_REQUEST_CRYPTOGRAM"),
+            "the reason must be one the model's VerificationFailedReason carries"
+        );
+    }
+}
+
+#[tokio::test]
+async fn the_response_cryptogram_is_the_one_its_method_computes() {
+    let router = emulator();
+    // "provide an APRC (Authorization Response Cryptogram) response using Method 1 or
+    // Method 2" (`VerifyAuthRequestCryptogram`): each method is its own computation over
+    // the verified request cryptogram, and what it is computed from changes it.
+    let pan = "4111111111111111";
+    let transaction_data = hex_data(8);
+    let key = create_key(
+        &router,
+        "TDES_2KEY",
+        USAGE_EMV_APP_CRYPTOGRAMS,
+        derive_key(),
+    )
+    .await;
+    let (_, attributes) = session_key_schemes(pan)
+        .into_iter()
+        .find(|(scheme, _)| *scheme == "Mastercard")
+        .expect("the Mastercard scheme is in the table");
+    let generated = ok_data(
+        &router,
+        GENERATE_CRYPTOGRAM_URI,
+        &generate_cryptogram_body(&key.arn, "EMV_OPTION_A", &attributes, &transaction_data),
+    )
+    .await;
+    let cryptogram = string(&generated, "AuthRequestCryptogram").to_string();
+
+    // (case, the response attributes, the hexadecimal characters the ARPC carries)
+    let rows: Vec<(&str, Value, usize)> = vec![
+        (
+            "method 1, an approval code",
+            json!({"ArpcMethod1": {"AuthResponseCode": "3030"}}),
+            16,
+        ),
+        (
+            "method 1, a decline code",
+            json!({"ArpcMethod1": {"AuthResponseCode": "3035"}}),
+            16,
+        ),
+        (
+            "method 2, a card status update",
+            json!({"ArpcMethod2": {"CardStatusUpdate": "00112233"}}),
+            8,
+        ),
+        (
+            "method 2, with proprietary authentication data",
+            json!({"ArpcMethod2": {
+                "CardStatusUpdate": "00112233",
+                "ProprietaryAuthenticationData": "AABBCCDD",
+            }}),
+            8,
+        ),
+    ];
+    let mut answered: Vec<(String, String)> = Vec::new();
+    for (case, response, characters) in rows {
+        let verified = ok_data(
+            &router,
+            VERIFY_CRYPTOGRAM_URI,
+            &verify_cryptogram_body(
+                &key.arn,
+                "EMV_OPTION_A",
+                &attributes,
+                &transaction_data,
+                &cryptogram,
+                Some(&response),
+            ),
+        )
+        .await;
+        let value = string(&verified, "AuthResponseValue").to_string();
+        assert!(
+            value.len() == characters && value.chars().all(|c| c.is_ascii_hexdigit()),
+            "case {case}: AuthResponseValue {value} must be {characters} hexadecimal \
+             characters"
+        );
+        // `AuthResponseValueType` carries 1..16 characters, which both methods fit.
+        assert!(
+            (1..=16).contains(&value.len()),
+            "case {case}: AuthResponseValue {value} must fit the modelled length bound"
+        );
+        answered.push((case.to_string(), value));
+    }
+    let distinct: BTreeSet<&String> = answered.iter().map(|(_, value)| value).collect();
+    assert_eq!(
+        distinct.len(),
+        answered.len(),
+        "each method and each response datum must compute its own ARPC, got {answered:?}"
+    );
+}
+
+#[tokio::test]
+async fn the_cryptogram_operations_need_an_issuer_master_key_that_derives() {
+    let router = emulator();
+    // "ARQC generation uses an Issuer Master Key (IMK) for application cryptograms
+    // (TR31_E0_EMV_MKEY_APP_CRYPTOGRAMS) to derive a session key ... The KeyModesOfUse
+    // should be set to DeriveKey" (`GenerateAuthRequestCryptogram`): a key of another
+    // usage, a key whose algorithm names no Triple DES cipher and a key that may not
+    // derive are each refused rather than run under the wrong key.
+    let pan = "4111111111111111";
+    let transaction_data = hex_data(8);
+    let (_, attributes) = session_key_schemes(pan)
+        .into_iter()
+        .find(|(scheme, _)| *scheme == "EmvCommon")
+        .expect("the EMV common scheme is in the table");
+    // (case, key algorithm, key usage, modes of use, whether the call is served)
+    let rows: Vec<(&str, &str, &str, Value, bool)> = vec![
+        (
+            "an issuer master key that derives",
+            "TDES_2KEY",
+            USAGE_EMV_APP_CRYPTOGRAMS,
+            derive_key(),
+            true,
+        ),
+        (
+            "a key with no restriction on its use",
+            "TDES_2KEY",
+            USAGE_EMV_APP_CRYPTOGRAMS,
+            json!({"NoRestrictions": true}),
+            true,
+        ),
+        (
+            "another key usage",
+            "TDES_2KEY",
+            USAGE_DATA_ENCRYPTION,
+            json!({"DeriveKey": true, "Encrypt": true, "Decrypt": true}),
+            false,
+        ),
+        (
+            "an AES issuer master key",
+            "AES_128",
+            USAGE_EMV_APP_CRYPTOGRAMS,
+            derive_key(),
+            false,
+        ),
+        (
+            "modes of use without DeriveKey",
+            "TDES_2KEY",
+            USAGE_EMV_APP_CRYPTOGRAMS,
+            generate_verify(),
+            false,
+        ),
+    ];
+    for (case, key_algorithm, key_usage, modes, served) in rows {
+        let key = create_key(&router, key_algorithm, key_usage, modes).await;
+        let (status, parsed) = data(
+            &router,
+            GENERATE_CRYPTOGRAM_URI,
+            &generate_cryptogram_body(&key.arn, "EMV_OPTION_A", &attributes, &transaction_data),
+        )
+        .await;
+        if !served {
+            assert_eq!(
+                (status, error_code(&parsed).as_str()),
+                (400, "ValidationException"),
+                "case {case}: expected a 400 ValidationException, got {status} {parsed}"
+            );
+            // The verifying half of the pair judges the same key the same way.
+            let (status, parsed) = data(
+                &router,
+                VERIFY_CRYPTOGRAM_URI,
+                &verify_cryptogram_body(
+                    &key.arn,
+                    "EMV_OPTION_A",
+                    &attributes,
+                    &transaction_data,
+                    "00112233445566FF",
+                    None,
+                ),
+            )
+            .await;
+            assert_eq!(
+                (status, error_code(&parsed).as_str()),
+                (400, "ValidationException"),
+                "case {case}: verify must refuse the same key, got {status} {parsed}"
+            );
+            continue;
+        }
+        assert_eq!(
+            status, 200,
+            "case {case}: expected 200, got {status} {parsed}"
+        );
+        let cryptogram = string(&parsed, "AuthRequestCryptogram").to_string();
+        ok_data(
+            &router,
+            VERIFY_CRYPTOGRAM_URI,
+            &verify_cryptogram_body(
+                &key.arn,
+                "EMV_OPTION_A",
+                &attributes,
+                &transaction_data,
+                &cryptogram,
+                None,
+            ),
+        )
+        .await;
+    }
+
+    // An identifier naming no key is the modelled `ResourceNotFoundException`, as it is
+    // for every other operation here.
+    let (status, parsed) = data(
+        &router,
+        GENERATE_CRYPTOGRAM_URI,
+        &generate_cryptogram_body(
+            "alias/no-such-issuer-master-key",
+            "EMV_OPTION_A",
+            &attributes,
+            &transaction_data,
+        ),
+    )
+    .await;
+    assert_eq!(
+        (status, error_code(&parsed).as_str()),
+        (404, "ResourceNotFoundException"),
+        "an identifier naming no key must be a 404, got {status} {parsed}"
     );
 }
