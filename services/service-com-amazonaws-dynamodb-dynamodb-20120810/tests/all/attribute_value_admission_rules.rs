@@ -240,6 +240,186 @@ async fn a_null_attribute_value_must_state_true() {
     );
 }
 
+/// The documented depth a value may nest to: "DynamoDB supports nested attributes up to 32
+/// levels deep" ("Service, Account, and Table Quotas").
+const MAX_ATTRIBUTE_DEPTH: usize =
+    service_com_amazonaws_dynamodb_dynamodb_20120810::state::MAX_ATTRIBUTE_DEPTH;
+
+/// The clause a value nesting past that depth earns.
+const NESTING_CLAUSE: &str = "Nesting Levels have exceeded supported limits: Attributes in the \
+                              item have nested levels beyond supported limit";
+
+/// A value nesting `levels` deep, counting the value itself: `levels - 1` containers of
+/// `container` (`L` or `M`) around one scalar.
+fn nested(levels: usize, container: &str) -> Value {
+    let mut value = json!({"S": "deep"});
+    for _ in 1..levels {
+        value = if container == "L" {
+            json!({"L": [value]})
+        } else {
+            json!({"M": {"inner": value}})
+        };
+    }
+    value
+}
+
+/// A depth past every bound a value is read under — past the documented one, past what any
+/// reader of a value descends to, and past the nesting the request codec itself admits — so
+/// a row at this depth shows a refusal is ANSWERED however deep the caller nested.
+const PAST_EVERY_BOUND: usize = MAX_ATTRIBUTE_DEPTH * 4;
+
+/// A depth far past the documented one that every reader of a value still descends to, so
+/// the rows that assert the quota's CLAUSE are answered by the surface that states that
+/// quota rather than by a bound the request met on the way in.
+const DEEP_LEVELS: usize = MAX_ATTRIBUTE_DEPTH + 20;
+
+#[tokio::test]
+async fn a_value_nesting_past_the_supported_levels_is_refused_however_deep_it_goes() {
+    let router = seeded().await;
+
+    // A value AT the documented depth is served, through either nesting datatype, and is
+    // read back as itself: the rows below are about the levels past that depth, not about
+    // nesting.
+    for container in ["L", "M"] {
+        let key = format!("at-the-limit-{container}");
+        let value = nested(MAX_ATTRIBUTE_DEPTH, container);
+        ok(
+            &router,
+            "PutItem",
+            json!({"TableName": TABLE,
+                   "Item": {"pk": {"S": key.clone()}, "tree": value.clone()}}),
+        )
+        .await;
+        let read = ok(
+            &router,
+            "GetItem",
+            json!({"TableName": TABLE, "Key": {"pk": {"S": key}}}),
+        )
+        .await;
+        assert_eq!(
+            read["Item"]["tree"], value,
+            "case a {container} nested to the documented depth: expected it stored and read \
+             back as itself, got {read}"
+        );
+    }
+
+    // Rows differ in how far past the documented depth the value goes — one level and far
+    // past it — in the nesting datatype that carries it, and in the surface it arrives
+    // through. Every one is refused with the quota's clause and HTTP 400.
+    let rows: Vec<(&str, &str, Value)> = vec![
+        (
+            "a list one level past the documented depth",
+            "PutItem",
+            json!({"TableName": TABLE,
+                   "Item": {"pk": {"S": "d1"}, "tree": nested(MAX_ATTRIBUTE_DEPTH + 1, "L")}}),
+        ),
+        (
+            "a map one level past the documented depth",
+            "PutItem",
+            json!({"TableName": TABLE,
+                   "Item": {"pk": {"S": "d2"}, "tree": nested(MAX_ATTRIBUTE_DEPTH + 1, "M")}}),
+        ),
+        (
+            "a list far past the documented depth",
+            "PutItem",
+            json!({"TableName": TABLE,
+                   "Item": {"pk": {"S": "d3"}, "tree": nested(DEEP_LEVELS, "L")}}),
+        ),
+        (
+            "a map far past the documented depth",
+            "PutItem",
+            json!({"TableName": TABLE,
+                   "Item": {"pk": {"S": "d4"}, "tree": nested(DEEP_LEVELS, "M")}}),
+        ),
+        (
+            "a value an update binds, far past the documented depth",
+            "UpdateItem",
+            json!({"TableName": TABLE,
+                   "Key": {"pk": {"S": "seed"}},
+                   "UpdateExpression": "SET tree = :v",
+                   "ExpressionAttributeValues": {":v": nested(DEEP_LEVELS, "L")}}),
+        ),
+    ];
+
+    for (case, operation, request) in rows {
+        let (status, answered) = call(&router, operation, request).await;
+        let stated = message(&answered);
+        assert_eq!(
+            (status, error_code(&answered).as_str()),
+            (400, "ValidationException"),
+            "case {case:?}: expected 400 ValidationException, got {status} with {answered}"
+        );
+        assert!(
+            stated.contains(NESTING_CLAUSE),
+            "case {case:?}: expected the clause {NESTING_CLAUSE:?}, got {stated:?}"
+        );
+    }
+
+    // And a value nested deeper than anything that walks it will descend is still ANSWERED
+    // — with a refusal, by whichever bound the request meets first, rather than by taking
+    // the serving process down with it. Both nesting datatypes, since each has its own
+    // reader, and one of them through an expression value as well as through an item.
+    let unbounded: Vec<(&str, &str, Value)> = vec![
+        (
+            "a list nested past every bound a value is read under",
+            "PutItem",
+            json!({"TableName": TABLE,
+                   "Item": {"pk": {"S": "d6"}, "tree": nested(PAST_EVERY_BOUND, "L")}}),
+        ),
+        (
+            "a map nested past every bound a value is read under",
+            "PutItem",
+            json!({"TableName": TABLE,
+                   "Item": {"pk": {"S": "d7"}, "tree": nested(PAST_EVERY_BOUND, "M")}}),
+        ),
+        (
+            "an expression value nested past every bound a value is read under",
+            "UpdateItem",
+            json!({"TableName": TABLE,
+                   "Key": {"pk": {"S": "seed"}},
+                   "UpdateExpression": "SET tree = :v",
+                   "ExpressionAttributeValues": {
+                       ":v": nested(PAST_EVERY_BOUND, "M"),
+                   }}),
+        ),
+    ];
+
+    for (case, operation, request) in unbounded {
+        let (status, answered) = call(&router, operation, request).await;
+        assert_eq!(
+            (status, error_code(&answered).as_str()),
+            (400, "ValidationException"),
+            "case {case:?}: expected 400 ValidationException, got {status} with {answered}"
+        );
+    }
+
+    // Nothing a refused write carried was stored, and the seeded item is untouched.
+    for key in ["d1", "d2", "d3", "d4", "d6", "d7"] {
+        let read = ok(
+            &router,
+            "GetItem",
+            json!({"TableName": TABLE, "Key": {"pk": {"S": key}}}),
+        )
+        .await;
+        assert_eq!(
+            read.get("Item"),
+            None,
+            "case a refused nesting at {key:?}: a refused write stores nothing, got {read}"
+        );
+    }
+    let read = ok(
+        &router,
+        "GetItem",
+        json!({"TableName": TABLE, "Key": {"pk": {"S": "seed"}}}),
+    )
+    .await;
+    assert_eq!(
+        read["Item"].get("tree"),
+        None,
+        "case a refused update: the attribute is not written, got {read}"
+    );
+}
+
 #[tokio::test]
 async fn an_exponent_is_read_as_a_64_bit_integer_and_then_range_checked() {
     let router = seeded().await;

@@ -16,10 +16,15 @@
 //!
 //! > each member of an `OnDemandThroughput` is one ceiling of the on-demand capacity
 //! > model, set by a value of 1 or more and REMOVED by -1 through that same member, while
-//! > a member the request leaves out leaves its ceiling exactly as it was; a dimension
-//! > with no maximum is reported as the same -1 that clears it, and a value that is
-//! > neither — zero, or a negative number that is not the removal value — is refused with
-//! > HTTP 400 `ValidationException`.
+//! > a member the request leaves out leaves its ceiling exactly as it was; and a value
+//! > that is neither — zero, or a negative number that is not the removal value — is
+//! > refused with HTTP 400 `ValidationException`.
+//!
+//! > a description reports an optional SETTING block only for a resource that carries that
+//! > setting: a table on which no on-demand maximum has been set carries no
+//! > `OnDemandThroughput` at all, rather than one built out of the -1 that REMOVES a
+//! > maximum; once either dimension is capped the block is reported, and the dimension
+//! > without a maximum reads as that same -1.
 //!
 //! The rows of each table below differ along what the rule generalises over: the FORM the
 //! key identifier takes, the operation that carries the specification, which ceiling the
@@ -31,7 +36,9 @@
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::emulator::{call_in, emulator_with_kms, error_code, ok_in, ok_kms, ok_kms_in, REGION};
+use crate::emulator::{
+    call_in, describe_when_active, emulator_with_kms, error_code, ok_in, ok_kms, ok_kms_in, REGION,
+};
 
 /// Wait out one transient span, so whatever the clock owes a table is due.
 async fn settle() {
@@ -71,11 +78,20 @@ async fn described_encryption(router: &MultiServiceRouter, name: &str) -> Value 
         .clone()
 }
 
-/// The `OnDemandThroughput` `DescribeTable` reports for `name`.
+/// The `OnDemandThroughput` `DescribeTable` reports for `name`, or `Null` where the
+/// description carries no such block — an optional block the response omits and one it
+/// could carry as a JSON `null` are the same value here, and this service's serializer
+/// writes no member at all for a setting that is absent.
 async fn described_ceilings(router: &MultiServiceRouter, name: &str) -> Value {
     ok_in(router, REGION, "DescribeTable", json!({"TableName": name})).await["Table"]
         ["OnDemandThroughput"]
         .clone()
+}
+
+/// The whole `Table` block `DescribeTable` reports for `name`, for a row that asserts a
+/// member is ABSENT from it rather than what its value is.
+async fn described_table(router: &MultiServiceRouter, name: &str) -> Value {
+    ok_in(router, REGION, "DescribeTable", json!({"TableName": name})).await["Table"].clone()
 }
 
 #[tokio::test]
@@ -457,11 +473,11 @@ const REPLICA_REGION: &str = "us-west-2";
 async fn each_on_demand_ceiling_is_set_and_cleared_through_its_own_member() {
     let router = emulator_with_kms();
     create_table(&router, "Ceilings", "PAY_PER_REQUEST", json!({})).await;
-    settle().await;
+    describe_when_active(&router, "the table every row updates", "Ceilings").await;
     assert_eq!(
         described_ceilings(&router, "Ceilings").await,
-        json!({"MaxReadRequestUnits": -1, "MaxWriteRequestUnits": -1}),
-        "case a table with no maximum: both dimensions report the no-maximum value"
+        Value::Null,
+        "case a table with no maximum: no maximum is set, so no block is reported"
     );
 
     // Rows differ in which member the request names and in what it asks of it: setting one
@@ -498,7 +514,7 @@ async fn each_on_demand_ceiling_is_set_and_cleared_through_its_own_member() {
         (
             "clearing both ceilings",
             json!({"MaxReadRequestUnits": -1, "MaxWriteRequestUnits": -1}),
-            json!({"MaxReadRequestUnits": -1, "MaxWriteRequestUnits": -1}),
+            Value::Null,
         ),
         (
             "a ceiling re-set after both were cleared",
@@ -529,6 +545,101 @@ async fn each_on_demand_ceiling_is_set_and_cleared_through_its_own_member() {
             "case {case}: a later read reports the same pair"
         );
     }
+}
+
+#[tokio::test]
+async fn an_on_demand_maximum_is_reported_only_for_a_table_that_carries_one() {
+    let router = emulator_with_kms();
+
+    // Rows differ in the capacity mode the table is in and in which maximum, if any, its
+    // create named — which is the whole of what the rule generalises over: the block is
+    // reported for exactly the tables that carry a maximum, and the dimension a request
+    // left out reads as the no-maximum value only because the OTHER one is capped.
+    let cases: [(&str, &str, Value, Value); 5] = [
+        (
+            "an on-demand table whose create named no maximum",
+            "PAY_PER_REQUEST",
+            json!({}),
+            Value::Null,
+        ),
+        (
+            "a provisioned table, whose capacity is its ProvisionedThroughput",
+            "PROVISIONED",
+            json!({}),
+            Value::Null,
+        ),
+        (
+            "the read maximum alone",
+            "PAY_PER_REQUEST",
+            json!({"OnDemandThroughput": {"MaxReadRequestUnits": 100}}),
+            json!({"MaxReadRequestUnits": 100, "MaxWriteRequestUnits": -1}),
+        ),
+        (
+            "the write maximum alone",
+            "PAY_PER_REQUEST",
+            json!({"OnDemandThroughput": {"MaxWriteRequestUnits": 7}}),
+            json!({"MaxReadRequestUnits": -1, "MaxWriteRequestUnits": 7}),
+        ),
+        (
+            "both maxima at once, at the documented minimum and above it",
+            "PAY_PER_REQUEST",
+            json!({"OnDemandThroughput": {"MaxReadRequestUnits": 1, "MaxWriteRequestUnits": 4}}),
+            json!({"MaxReadRequestUnits": 1, "MaxWriteRequestUnits": 4}),
+        ),
+    ];
+
+    for (row, (case, billing_mode, extra, expected)) in cases.into_iter().enumerate() {
+        let name = format!("Maximum{row}");
+        let created = create_table(&router, &name, billing_mode, extra.clone()).await;
+        let answered = created["TableDescription"]["OnDemandThroughput"].clone();
+        assert_eq!(
+            answered, expected,
+            "case {case}: the create reports {expected}, got {answered} in {created}"
+        );
+        // And the same through the reader, which is what a client round-trips into its next
+        // request: a block that is absent is absent from the object, not a null member.
+        let described = describe_when_active(&router, case, &name).await;
+        let reported = described
+            .get("OnDemandThroughput")
+            .cloned()
+            .unwrap_or(Value::Null);
+        assert_eq!(
+            reported, expected,
+            "case {case}: a later read reports {expected}, got {reported} in {described}"
+        );
+        if expected.is_null() {
+            assert!(
+                described.get("OnDemandThroughput").is_none(),
+                "case {case}: a table with no maximum carries no OnDemandThroughput member at \
+                 all, got {described}"
+            );
+        }
+    }
+
+    // A maximum that is REMOVED leaves the table in the state of one that never had it: the
+    // -1 the request sends to clear it is no configuration to report back.
+    let cleared = ok_in(
+        &router,
+        REGION,
+        "UpdateTable",
+        json!({
+            "TableName": "Maximum4",
+            "OnDemandThroughput": {"MaxReadRequestUnits": -1, "MaxWriteRequestUnits": -1},
+        }),
+    )
+    .await;
+    let answered = cleared["TableDescription"]["OnDemandThroughput"].clone();
+    assert_eq!(
+        answered,
+        Value::Null,
+        "case both maxima removed: the update reports no block, got {answered} in {cleared}"
+    );
+    let described = described_table(&router, "Maximum4").await;
+    assert!(
+        described.get("OnDemandThroughput").is_none(),
+        "case both maxima removed: a later read carries no OnDemandThroughput member, got \
+         {described}"
+    );
 }
 
 #[tokio::test]

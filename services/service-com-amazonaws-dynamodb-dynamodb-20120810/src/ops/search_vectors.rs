@@ -615,6 +615,7 @@ fn consumed_vector_capacity(requested: Option<&str>, read_bytes: i64) -> Option<
             // for, so the figure reported is the figure counted.
             vector_search_request_bytes: Some(read_bytes.max(0) as f64),
             vector_write_request_bytes: None,
+            vector_write_request_units: None,
         }),
         _ => None,
     }

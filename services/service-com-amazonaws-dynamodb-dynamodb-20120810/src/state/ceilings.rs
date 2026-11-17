@@ -14,7 +14,8 @@
 //! So the pair is TWO INDEPENDENT settings, each of which a request may set, clear or
 //! leave alone — which is what this module holds, and what [`OnDemandCeilings::apply`]
 //! moves. A ceiling that is not set has no maximum, which the description reports as the
-//! same -1 that clears it.
+//! same -1 that clears it — and a table with NEITHER ceiling set carries no such setting
+//! at all, so it reports no `OnDemandThroughput` ([`OnDemandCeilings::describe`]).
 
 use crate::ops::types::OnDemandThroughput;
 
@@ -63,18 +64,31 @@ impl OnDemandCeilings {
         }
     }
 
-    /// The pair as `TableDescription$OnDemandThroughput` reports it: the ceiling in force
-    /// for each dimension, and [`NO_ON_DEMAND_CEILING`] for a dimension with no maximum —
-    /// the value that same member takes to clear it.
-    pub fn describe(self) -> OnDemandThroughput {
-        OnDemandThroughput {
-            max_read_request_units: Some(
-                self.max_read_request_units.unwrap_or(NO_ON_DEMAND_CEILING),
-            ),
-            max_write_request_units: Some(
-                self.max_write_request_units.unwrap_or(NO_ON_DEMAND_CEILING),
-            ),
-        }
+    /// The pair as `TableDescription$OnDemandThroughput` reports it, or `None` for a
+    /// resource with NO maximum at all.
+    ///
+    /// `OnDemandThroughput` is the maximum-request-units SETTING — "to specify a maximum
+    /// `OnDemandThroughput` on your table, set the value of `MaxReadRequestUnits` as
+    /// greater than or equal to 1" — and [`NO_ON_DEMAND_CEILING`] is the value a REQUEST
+    /// sends to remove one (`OnDemandThroughput$MaxReadRequestUnits`). A resource nobody
+    /// has set a maximum on therefore has no such setting to report, and the description
+    /// omits the block rather than materialising it out of the removal value: a client that
+    /// reads a description back into a request would otherwise resend that value as a
+    /// configuration.
+    ///
+    /// Once either dimension IS capped the block is reported, and the dimension without a
+    /// maximum reads as the -1 that means "no maximum" for it.
+    pub fn describe(self) -> Option<OnDemandThroughput> {
+        (self.max_read_request_units.is_some() || self.max_write_request_units.is_some()).then(
+            || OnDemandThroughput {
+                max_read_request_units: Some(
+                    self.max_read_request_units.unwrap_or(NO_ON_DEMAND_CEILING),
+                ),
+                max_write_request_units: Some(
+                    self.max_write_request_units.unwrap_or(NO_ON_DEMAND_CEILING),
+                ),
+            },
+        )
     }
 }
 

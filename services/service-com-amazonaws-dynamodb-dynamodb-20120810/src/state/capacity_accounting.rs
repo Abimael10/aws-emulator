@@ -46,11 +46,11 @@ pub struct WriteCapacity {
     pub local_secondary_indexes: BTreeMap<String, f64>,
     /// The units consumed on each global secondary index the write affected.
     pub global_secondary_indexes: BTreeMap<String, f64>,
-    /// The `VectorWriteRequestBytes` metered on each VECTOR index the write affected: a
-    /// vector index is metered in BYTES rather than in capacity units, so its figure sits
-    /// beside the breakdown above and is no part of [`Self::total`] — what writing the
-    /// vector costs in capacity is charged on the item itself
-    /// ([`Table::metered_item_size`]).
+    /// What each VECTOR index the write affected metered: a vector index is metered in
+    /// BYTES rather than in capacity units, so its figure sits beside the breakdown above
+    /// and is no part of [`Self::total`] — what writing the vector costs in capacity is
+    /// charged on the item itself ([`Table::metered_item_size`]). One figure per index,
+    /// reported under both names an entry carries ([`vector_breakdown`]).
     pub vector_indexes: BTreeMap<String, f64>,
 }
 
@@ -157,6 +157,12 @@ pub fn consumed_write_capacity(
 /// The `VectorIndexes` map a write reports, or `None` when it reached no vector index —
 /// an index a write did not touch metered nothing on it, so it is left out rather than
 /// reported as zero.
+///
+/// Each entry reports the metered figure under BOTH names a recorded entry carries: the
+/// byte figure the model declares (`VectorCapacity$VectorWriteRequestBytes`) and the
+/// write-request-units figure AWS reports beside it
+/// ([`VectorCapacity::vector_write_request_units`]) — one meter, so the two can never
+/// disagree about what the write cost.
 fn vector_breakdown(
     bytes: &BTreeMap<String, f64>,
 ) -> Option<HashMap<String, VectorCapacity>> {
@@ -168,6 +174,7 @@ fn vector_breakdown(
                     name.clone(),
                     VectorCapacity {
                         vector_write_request_bytes: Some(*bytes),
+                        vector_write_request_units: Some(*bytes),
                         // Nothing was searched, so the read figure is left out.
                         vector_search_request_bytes: None,
                     },

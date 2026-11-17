@@ -2043,12 +2043,13 @@ impl Table {
                 .map(|encryption| encryption.describe(now)),
             // "Sets the maximum number of read and write units for the specified
             // on-demand table" (the `OnDemandThroughput` doc): the pair belongs to the
-            // on-demand capacity model, so it is reported for a table in that mode — each
-            // dimension either capped or reported as the -1 that means "no maximum"
-            // ([`OnDemandCeilings::describe`]) — and not for a provisioned one, whose
-            // capacity is its `ProvisionedThroughput`.
+            // on-demand capacity model, so it is reported for a table in that mode that
+            // HAS a maximum — and for no other: a table nobody capped carries no such
+            // setting, and a provisioned table's capacity is its `ProvisionedThroughput`
+            // ([`OnDemandCeilings::describe`]).
             on_demand_throughput: (self.billing_mode == "PAY_PER_REQUEST")
-                .then(|| self.on_demand_throughput.describe()),
+                .then(|| self.on_demand_throughput.describe())
+                .flatten(),
             ..TableDescription::default()
         }
     }

@@ -830,11 +830,7 @@ pub fn return_values_must_be_old_or_none() -> RequestError {
 /// `TransactItems` entry is a member of that entry ([`unenveloped`] is where each of
 /// those readers states it).
 pub fn nesting_levels_exceeded() -> RequestError {
-    refused(
-        "Nesting Levels have exceeded supported limits: Attributes in the item have nested \
-         levels beyond supported limit"
-            .to_string(),
-    )
+    refused(crate::ops::types::NESTING_LEVELS_EXCEEDED_MESSAGE.to_string())
 }
 
 /// How a write path states a refusal about a value a change would leave in the STORED

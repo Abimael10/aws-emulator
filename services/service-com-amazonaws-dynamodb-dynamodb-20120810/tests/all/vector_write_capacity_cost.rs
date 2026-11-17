@@ -4,10 +4,11 @@
 //!
 //! The rule pinned here: a vector is held as 32-bit floats, four bytes per dimension, so a
 //! write of an item carrying one is METERED on that stored form rather than on the decimal
-//! text the request spelled each coordinate with — both in the bytes each index reports
+//! text the request spelled each coordinate with — both in the figure each index reports
 //! ("VectorWriteRequestBytes", `ConsumedCapacity$VectorIndexes`, held to a one-kilobyte
-//! per-write floor) and in the capacity the item's own write consumes
-//! (`ConsumedCapacity$CapacityUnits` and `ConsumedCapacity$Table`, one unit per kilobyte).
+//! per-write floor, and reported under `VectorWriteRequestUnits` as well) and in the
+//! capacity the item's own write consumes (`ConsumedCapacity$CapacityUnits` and
+//! `ConsumedCapacity$Table`, one unit per kilobyte).
 //! The per-dimension cost is therefore part of what the write costs, and what it costs
 //! does not depend on how many digits a coordinate was written with.
 //!
@@ -17,10 +18,12 @@
 //! coordinate carries (which moves the item's stored text by kilobytes while leaving the
 //! metered figures where they are).
 //!
-//! `ConsumedCapacity$VectorIndexes` is a map of `VectorCapacity`, whose members are
-//! `VectorSearchRequestBytes` and `VectorWriteRequestBytes`
-//! (`smithy_query(query="shape", shape="com.amazonaws.dynamodb#VectorCapacity")`), so a
-//! write reports the byte figure and no search figure.
+//! `ConsumedCapacity$VectorIndexes` is a map of `VectorCapacity`, whose modelled members
+//! are `VectorSearchRequestBytes` and `VectorWriteRequestBytes`
+//! (`smithy_query(query="shape", shape="com.amazonaws.dynamodb#VectorCapacity")`), and
+//! whose recorded entries carry the write figure under `VectorWriteRequestUnits` beside the
+//! byte member as well: ONE meter, so a write reports the same figure under both names and
+//! no search figure at all.
 //!
 //! Every test drives the operations over the wire (`POST /` with
 //! `X-Amz-Target: DynamoDB_20120810.<OperationName>`) through the same
@@ -210,23 +213,26 @@ async fn a_write_is_charged_for_the_vector_it_stores() {
         .await;
         let consumed = &answered["ConsumedCapacity"];
 
-        // Each index the write reached reports the bytes it metered, which is the stored
-        // vector and nothing of the text it was written as; an index the item does not
-        // reach reports nothing at all.
+        // Each index the write reached reports the figure it metered, which is the stored
+        // vector and nothing of the text it was written as — under both the byte member and
+        // the request-units member, since the two report one meter; an index the item does
+        // not reach reports nothing at all.
         for (index, attribute, dimensions) in [
             ("idx-small", "emb_small", SMALL_DIMENSIONS),
             ("idx-large", "emb_large", LARGE_DIMENSIONS),
         ] {
-            let reported = figure(consumed, &["VectorIndexes", index, "VectorWriteRequestBytes"]);
             let expected = vectors
                 .iter()
                 .any(|(written, _)| *written == attribute)
                 .then(|| expected_index_bytes(attribute, dimensions));
-            assert_eq!(
-                reported, expected,
-                "case {case:?}: expected {index} to meter {expected:?} write-request \
-                 byte(s), got {reported:?} in {consumed}"
-            );
+            for member in ["VectorWriteRequestBytes", "VectorWriteRequestUnits"] {
+                let reported = figure(consumed, &["VectorIndexes", index, member]);
+                assert_eq!(
+                    reported, expected,
+                    "case {case:?}: expected {index} to meter {expected:?} under {member}, got \
+                     {reported:?} in {consumed}"
+                );
+            }
             assert_eq!(
                 figure(consumed, &["VectorIndexes", index, "VectorSearchRequestBytes"]),
                 None,
@@ -247,5 +253,63 @@ async fn a_write_is_charged_for_the_vector_it_stores() {
                  vector, got {reported:?} in {consumed}"
             );
         }
+    }
+}
+
+#[tokio::test]
+async fn every_write_that_reaches_a_vector_index_meters_it_the_same_way() {
+    let router = emulator();
+    vector_table(&router).await;
+
+    // Rows differ in the OPERATION that reaches the index: what is metered is the index
+    // ENTRY a write puts there, changes or removes, so each of the three write operations
+    // reports the same figure for the same index and item.
+    let vector = json!({"L": vector(SMALL_DIMENSIONS, 1)});
+    let expected = expected_index_bytes("emb_small", SMALL_DIMENSIONS);
+    let cases: [(&str, &str, Value); 3] = [
+        (
+            "a put that stores the entry",
+            "PutItem",
+            json!({"TableName": TABLE, "ReturnConsumedCapacity": "INDEXES",
+                   "Item": {"pk": {"S": "w1"}, "emb_small": vector.clone()}}),
+        ),
+        (
+            "an update that sets the vector attribute",
+            "UpdateItem",
+            json!({"TableName": TABLE, "ReturnConsumedCapacity": "INDEXES",
+                   "Key": {"pk": {"S": "w2"}},
+                   "UpdateExpression": "SET emb_small = :v",
+                   "ExpressionAttributeValues": {":v": vector.clone()}}),
+        ),
+        (
+            "a delete that removes the entry the put stored",
+            "DeleteItem",
+            json!({"TableName": TABLE, "ReturnConsumedCapacity": "INDEXES",
+                   "Key": {"pk": {"S": "w1"}}}),
+        ),
+    ];
+
+    for (case, operation, request) in cases {
+        let answered = ok(&router, operation, request).await;
+        let consumed = &answered["ConsumedCapacity"];
+        for member in ["VectorWriteRequestBytes", "VectorWriteRequestUnits"] {
+            let reported = figure(consumed, &["VectorIndexes", "idx-small", member]);
+            assert_eq!(
+                reported,
+                Some(expected),
+                "case {case:?}: expected {operation} to meter {expected} under {member}, got \
+                 {reported:?} in {consumed}"
+            );
+        }
+        // The index the item never reached is metered by nobody, whichever write it was.
+        let untouched = figure(
+            consumed,
+            &["VectorIndexes", "idx-large", "VectorWriteRequestBytes"],
+        );
+        assert_eq!(
+            untouched, None,
+            "case {case:?}: {operation} reached no entry of idx-large, so it reports none, got \
+             {consumed}"
+        );
     }
 }

@@ -59,6 +59,37 @@ pub const EMPTY_ATTRIBUTE_VALUE_MESSAGE: &str =
 pub const AMBIGUOUS_ATTRIBUTE_VALUE_MESSAGE: &str = "Supplied AttributeValue has more than one \
      datatypes set, must contain exactly one of the supported datatypes";
 
+/// Why a value nesting past the levels DynamoDB supports is refused: AWS's fixed clause
+/// for that quota, which every surface that holds a value to it states
+/// ([`crate::state::nesting_levels_exceeded`] wraps this same sentence in the envelope a
+/// member's clause is reported in).
+pub const NESTING_LEVELS_EXCEEDED_MESSAGE: &str =
+    "Nesting Levels have exceeded supported limits: Attributes in the item have nested \
+     levels beyond supported limit";
+
+/// How deep a value READ FROM THE WIRE may nest before this reader refuses it.
+///
+/// `M` and `L` nest, so the reader below descends once per level and the levels are the
+/// CALLER's: without a bound the frames one request takes would be a function of the
+/// request, and a Rust stack overflow aborts the whole process rather than failing that
+/// one call. The bound is this reader's OWN — stated here so this function's stack use
+/// follows from this constant alone, whatever the codec underneath admits (it counts
+/// nested SHAPES, two per level of this union, so in practice it refuses a document
+/// shallower than this).
+///
+/// It sits ABOVE the documented item ceiling (32 levels — "DynamoDB supports nested
+/// attributes up to 32 levels deep", "Service, Account, and Table Quotas", held as
+/// [`crate::state::MAX_ATTRIBUTE_DEPTH`]) rather than at it, so every value a surface
+/// could accept is still READ and the surfaces that hold a value to that quota are the
+/// ones that state it, in the envelope each member's clause carries. What is refused here
+/// is only a document no surface would have admitted anyway, and it is refused with that
+/// same quota's sentence ([`NESTING_LEVELS_EXCEEDED_MESSAGE`]).
+///
+/// The WRITE path recurses over the same two datatypes and needs no bound of its own: a
+/// value it writes was either read through this reader or held to the documented ceiling
+/// before it was stored, so its depth is bounded before it is ever serialized.
+const MAX_ATTRIBUTE_VALUE_READ_DEPTH: usize = 64;
+
 #[allow(non_upper_case_globals)]
 impl AttributeValue {
     const M_S: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_member(
@@ -246,6 +277,27 @@ impl ::aws_smithy_schema_server::DeserializableStruct for AttributeValue {
     fn deserialize(
         deserializer: &mut dyn ::aws_smithy_schema::serde::ShapeDeserializer,
     ) -> ::std::result::Result<Self, ::aws_smithy_schema::serde::SerdeError> {
+        // The value a request carries is the first level of nesting.
+        Self::read_at_depth(deserializer, 1)
+    }
+}
+
+impl AttributeValue {
+    /// Read one value that sits `depth` levels deep, refusing past
+    /// [`MAX_ATTRIBUTE_VALUE_READ_DEPTH`] so the frames this reader takes are bounded by
+    /// that constant rather than by how deep the request nested.
+    ///
+    /// Every arm but `M` and `L` reads a scalar or a set of scalars and cannot descend; the
+    /// two that do pass `depth + 1` to the values inside them.
+    fn read_at_depth(
+        deserializer: &mut dyn ::aws_smithy_schema::serde::ShapeDeserializer,
+        depth: usize,
+    ) -> ::std::result::Result<Self, ::aws_smithy_schema::serde::SerdeError> {
+        if depth > MAX_ATTRIBUTE_VALUE_READ_DEPTH {
+            return ::std::result::Result::Err(::aws_smithy_schema::serde::SerdeError::custom(
+                NESTING_LEVELS_EXCEEDED_MESSAGE,
+            ));
+        }
         let mut out: ::std::option::Option<Self> = ::std::option::Option::None;
         deserializer.read_struct(&Self::SCHEMA, &mut |member, deserializer| {
             match member.member_index() {
@@ -296,8 +348,7 @@ impl ::aws_smithy_schema_server::DeserializableStruct for AttributeValue {
                     let mut entries: std::collections::HashMap<String, AttributeValue> =
                         ::std::default::Default::default();
                     deserializer.read_map(&Self::M_M, &mut |name, entry| {
-                        let value = <Self as ::aws_smithy_schema_server::DeserializableStruct>
-                            ::deserialize(entry)
+                        let value = Self::read_at_depth(entry, depth + 1)
                             .map_err(|error| {
                                 ::aws_smithy_schema_server::within_map_entry(error, &name)
                             })?;
@@ -312,10 +363,7 @@ impl ::aws_smithy_schema_server::DeserializableStruct for AttributeValue {
                     deserializer
                         .read_list(&Self::M_L, &mut |element| {
                             position += 1;
-                            members.push(
-                                <Self as ::aws_smithy_schema_server::DeserializableStruct>
-                                    ::deserialize(element)?,
-                            );
+                            members.push(Self::read_at_depth(element, depth + 1)?);
                             Ok(())
                         })
                         .map_err(|error| {
@@ -360,11 +408,136 @@ pub struct Capacity {
     pub capacity_units: Option<f64>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.dynamodb#VectorCapacity")]
+/// `VectorCapacity` — hand-written rather than expanded from the model, because a
+/// recorded `ConsumedCapacity$VectorIndexes` entry carries one member more than this
+/// snapshot of the model declares.
+///
+/// The model declares the two BYTE figures (`VectorSearchRequestBytes` and
+/// `VectorWriteRequestBytes`, `smithy_query(query="shape",
+/// shape="com.amazonaws.dynamodb#VectorCapacity")`); every recorded entry of a write to a
+/// table carrying vector indexes reports `VectorWriteRequestUnits` beside the byte member,
+/// carrying the same metered figure — the write-request figure a capacity-aware client
+/// budgets and throttles from, which it reads as absent while only the byte member is
+/// written. The `#[smithy_macros::smithy(shape = …)]` expansion derives every member from
+/// the model and cannot be told about one the model does not declare, and the model itself
+/// is codegen input this emulator leaves exactly as shipped.
+///
+/// Everything below is what that expansion emits for a structure of scalar members — the
+/// member statics, the `SCHEMA` an enclosing member writes it with, `SerializableStruct`
+/// and `DeserializableStruct` — plus the one member the model does not declare.
 #[derive(Debug, Clone, Default)]
 pub struct VectorCapacity {
     pub vector_search_request_bytes: Option<f64>,
     pub vector_write_request_bytes: Option<f64>,
+    /// NOT a modelled member: the write-request figure every recorded entry carries beside
+    /// [`Self::vector_write_request_bytes`], which is the same meter
+    /// ([`crate::state::VectorIndex::write_request_bytes`]).
+    pub vector_write_request_units: Option<f64>,
+}
+
+static VECTOR_CAPACITY_M_SEARCH_REQUEST_BYTES: ::aws_smithy_schema::Schema =
+    ::aws_smithy_schema::Schema::new_member(
+        ::aws_smithy_schema::ShapeId::from_static(
+            "com.amazonaws.dynamodb#VectorCapacity$VectorSearchRequestBytes",
+            "com.amazonaws.dynamodb",
+            "VectorSearchRequestBytes",
+        ),
+        ::aws_smithy_schema::ShapeType::Double,
+        "VectorSearchRequestBytes",
+        0,
+    );
+
+static VECTOR_CAPACITY_M_WRITE_REQUEST_BYTES: ::aws_smithy_schema::Schema =
+    ::aws_smithy_schema::Schema::new_member(
+        ::aws_smithy_schema::ShapeId::from_static(
+            "com.amazonaws.dynamodb#VectorCapacity$VectorWriteRequestBytes",
+            "com.amazonaws.dynamodb",
+            "VectorWriteRequestBytes",
+        ),
+        ::aws_smithy_schema::ShapeType::Double,
+        "VectorWriteRequestBytes",
+        1,
+    );
+
+/// The schema of the member the model does not declare, spelled the way the expansion
+/// spells a modelled one: the member NAME is the wire key the awsJson codec writes.
+static VECTOR_CAPACITY_M_WRITE_REQUEST_UNITS: ::aws_smithy_schema::Schema =
+    ::aws_smithy_schema::Schema::new_member(
+        ::aws_smithy_schema::ShapeId::from_static(
+            "com.amazonaws.dynamodb#VectorCapacity$VectorWriteRequestUnits",
+            "com.amazonaws.dynamodb",
+            "VectorWriteRequestUnits",
+        ),
+        ::aws_smithy_schema::ShapeType::Double,
+        "VectorWriteRequestUnits",
+        2,
+    );
+
+/// The members of [`VectorCapacity`], as the one `'static` slice its `SCHEMA` borrows (an
+/// associated `const` cannot borrow a temporary one).
+static VECTOR_CAPACITY_MEMBERS: &[&::aws_smithy_schema::Schema] = &[
+    &VECTOR_CAPACITY_M_SEARCH_REQUEST_BYTES,
+    &VECTOR_CAPACITY_M_WRITE_REQUEST_BYTES,
+    &VECTOR_CAPACITY_M_WRITE_REQUEST_UNITS,
+];
+
+impl VectorCapacity {
+    /// The schema an enclosing member writes this structure with.
+    pub const SCHEMA: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_struct(
+        ::aws_smithy_schema::ShapeId::from_static(
+            "com.amazonaws.dynamodb#VectorCapacity",
+            "com.amazonaws.dynamodb",
+            "VectorCapacity",
+        ),
+        ::aws_smithy_schema::ShapeType::Structure,
+        VECTOR_CAPACITY_MEMBERS,
+    );
+}
+
+impl ::aws_smithy_schema_server::DeserializableStruct for VectorCapacity {
+    fn deserialize(
+        deserializer: &mut dyn ::aws_smithy_schema::serde::ShapeDeserializer,
+    ) -> ::std::result::Result<Self, ::aws_smithy_schema::serde::SerdeError> {
+        let mut out = Self::default();
+        deserializer.read_struct(&Self::SCHEMA, &mut |member, deserializer| {
+            match member.member_index() {
+                ::std::option::Option::Some(0) => {
+                    out.vector_search_request_bytes = Some(
+                        deserializer.read_double(&VECTOR_CAPACITY_M_SEARCH_REQUEST_BYTES)?,
+                    );
+                }
+                ::std::option::Option::Some(1) => {
+                    out.vector_write_request_bytes =
+                        Some(deserializer.read_double(&VECTOR_CAPACITY_M_WRITE_REQUEST_BYTES)?);
+                }
+                ::std::option::Option::Some(2) => {
+                    out.vector_write_request_units =
+                        Some(deserializer.read_double(&VECTOR_CAPACITY_M_WRITE_REQUEST_UNITS)?);
+                }
+                _ => {}
+            }
+            Ok(())
+        })?;
+        Ok(out)
+    }
+}
+
+impl ::aws_smithy_schema::serde::SerializableStruct for VectorCapacity {
+    fn serialize_members(
+        &self,
+        serializer: &mut dyn ::aws_smithy_schema::serde::ShapeSerializer,
+    ) -> ::std::result::Result<(), ::aws_smithy_schema::serde::SerdeError> {
+        if let Some(bytes) = self.vector_search_request_bytes {
+            serializer.write_double(&VECTOR_CAPACITY_M_SEARCH_REQUEST_BYTES, bytes)?;
+        }
+        if let Some(bytes) = self.vector_write_request_bytes {
+            serializer.write_double(&VECTOR_CAPACITY_M_WRITE_REQUEST_BYTES, bytes)?;
+        }
+        if let Some(units) = self.vector_write_request_units {
+            serializer.write_double(&VECTOR_CAPACITY_M_WRITE_REQUEST_UNITS, units)?;
+        }
+        Ok(())
+    }
 }
 
 #[smithy_macros::smithy(shape = "com.amazonaws.dynamodb#InternalServerError")]
