@@ -3754,6 +3754,21 @@ pub fn integration_name_exists_message(integration_name: &str, account_id: &str)
     )
 }
 
+/// What `CreateIntegration` answers when an integration of this account already
+/// replicates from the `SourceArn` the request carries into its `TargetArn`.
+///
+/// A zero-ETL integration IS the flow between one source and one data warehouse,
+/// so a second integration between the same two would replicate the same data
+/// twice: the pair is what a create is refused on second, after the name, and the
+/// sentence names the two resources the request asked to replicate between and
+/// states the bound. Fixed text bar those two ARNs, both taken from the request.
+pub fn integration_pair_exists_message(source_arn: &str, target_arn: &str) -> String {
+    format!(
+        "An integration from source {source_arn} to target {target_arn} already exists. \
+         Only one integration is allowed."
+    )
+}
+
 /// What a zero-ETL request is refused with when the data warehouse its `TargetArn`
 /// names cannot be reached: it is not a data warehouse of this account at all, or
 /// it is one whose own resource policy grants the caller nothing

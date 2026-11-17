@@ -1,19 +1,18 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! What `ExecuteCommand` makes of the task's `enableExecuteCommand` flag, driven end to
-//! end over the shared wire harness in [`crate::ecs_wire`].
+//! What `ExecuteCommand` answers once the resources it names resolve, driven end to end
+//! over the shared wire harness in [`crate::ecs_wire`].
 //!
 //! # The rule under test
 //!
-//! > A session is gated on the TASK first: `Task$enableExecuteCommand` is set by the
-//! > placement that ran the task and cannot be turned on afterwards, so a task run without
-//! > it is refused with `InvalidParameterException` and the not-enabled sentence, BEFORE
-//! > anything about the target is read. A task run WITH it reaches the target the session
-//! > is opened against — the Systems Manager Session Manager target the container's
-//! > `ExecuteCommandAgent` registers — and a task whose container is no such target is
-//! > refused in the other class the operation models, `TargetNotConnectedException`. The
-//! > outcome therefore DEPENDS on the flag: exec is disabled by default and enabled by
-//! > request, and a client can tell the two refusals apart.
+//! > A session is opened on the `ExecuteCommandAgent` managed agent running inside the
+//! > container, so a task with no such agent gets no session: Amazon ECS refuses the call
+//! > with `InvalidParameterException` and ONE fixed sentence that states both conditions
+//! > that leave a task without one — the task was not run with `enableExecuteCommand`, or
+//! > its agent is not running — without saying which of them held. A task of this emulator
+//! > is a record of a placement with no container process behind it, so no task has a
+//! > running agent and every task whose cluster, task and container the request resolves
+//! > earns that one refusal, whatever `enableExecuteCommand` the placement recorded.
 //!
 //! # What the rows span
 //!
@@ -21,9 +20,8 @@
 //! task-definition family, both advanced to `RUNNING`. The table then varies what the
 //! `ExecuteCommand` request carries — the task by id and by full ARN, no container named
 //! and each of the revision's two containers named, and both values of `interactive` — so
-//! the outcome is asserted to be a property of the TASK's flag and of nothing else about
-//! the request. The recorded divergence (the same refusal with the flag on as with it off)
-//! is the pair of rows naming no container.
+//! the refusal is asserted to be a property of the session's missing agent and of nothing
+//! else about the request or the task.
 
 use std::time::{Duration, Instant};
 
@@ -44,16 +42,13 @@ const FAMILY: &str = "execflagfamily";
 const FIRST_CONTAINER: &str = "app";
 const SECOND_CONTAINER: &str = "sidecar";
 
-/// `InvalidParameterException$message` for a task that was not run with execute command
-/// turned on: fixed text, with no part taken from the request.
-const NOT_ENABLED: &str =
+/// `InvalidParameterException$message` for a task no session can be opened on: fixed text,
+/// with no part taken from the request, stating both conditions that leave a task without
+/// a running execute-command agent.
+const NOT_AVAILABLE: &str =
     "The execute command failed because execute command was not enabled when the task was \
      run or the execute command agent isn't running. Wait and try again or run a new task \
      with execute command enabled and try again.";
-
-/// `TargetNotConnectedException$message` for an exec-ENABLED task whose container is no
-/// Session Manager target.
-const NOT_CONNECTED: &str = "The execute command failed due to an internal error. Try again later.";
 
 /// How often the fixture re-reads a task it is waiting on, and how long it keeps trying:
 /// the start is clock-owed, so the condition is polled for rather than slept on, with
@@ -143,7 +138,7 @@ fn task_id(arn: &str) -> &str {
 }
 
 #[tokio::test]
-async fn execute_command_depends_on_the_flag_the_task_was_run_with() {
+async fn execute_command_is_refused_for_a_task_with_no_running_agent() {
     let router = fixture().await;
     let disabled = running_task(&router, false, "a task run without execute command").await;
     let enabled = running_task(&router, true, "a task run with execute command").await;
@@ -181,14 +176,9 @@ async fn execute_command_depends_on_the_flag_the_task_was_run_with() {
     ];
 
     for (row, by_arn, requested, interactive) in rows {
-        for (flag, task_arn, expected) in [
-            (false, &disabled, ("InvalidParameterException", NOT_ENABLED)),
-            (
-                true,
-                &enabled,
-                ("TargetNotConnectedException", NOT_CONNECTED),
-            ),
-        ] {
+        // The refusal a task earns is the same for both tasks, so it is stated once.
+        let expected = ("InvalidParameterException", NOT_AVAILABLE);
+        for (flag, task_arn) in [(false, &disabled), (true, &enabled)] {
             let case = format!("{row}, enableExecuteCommand {flag}");
             let reference = if by_arn {
                 task_arn.clone()
@@ -213,8 +203,9 @@ async fn execute_command_depends_on_the_flag_the_task_was_run_with() {
         }
     }
 
-    // The two outcomes are DIFFERENT, which is the whole of the rule: a client can
-    // attribute the refusal to the flag rather than to some other property of the task.
+    // The two refusals are the SAME, which is the whole of the rule: the flag the placement
+    // recorded is not what a caller's refusal turns on, because no task here has a running
+    // agent either way.
     let common = json!({
         "cluster": CLUSTER,
         "command": "/bin/sh",
@@ -224,23 +215,24 @@ async fn execute_command_depends_on_the_flag_the_task_was_run_with() {
     without["task"] = json!(disabled);
     let mut with = common;
     with["task"] = json!(enabled);
-    let (code_without, _) = refusal(&router, "ExecuteCommand", without, "the flag off").await;
-    let (code_with, _) = refusal(&router, "ExecuteCommand", with, "the flag on").await;
-    assert_ne!(
-        code_without, code_with,
-        "expected enabling execute command to change the outcome, got {code_without:?} both \
-         times"
+    let refused_without = refusal(&router, "ExecuteCommand", without, "the flag off").await;
+    let refused_with = refusal(&router, "ExecuteCommand", with, "the flag on").await;
+    assert_eq!(
+        refused_without, refused_with,
+        "expected the same refusal whatever the flag, got {refused_without:?} and \
+         {refused_with:?}"
     );
 }
 
 #[tokio::test]
-async fn the_flag_is_read_after_the_cluster_task_and_container() {
+async fn the_session_is_attempted_after_the_cluster_task_and_container() {
     let router = fixture().await;
     let enabled = running_task(&router, true, "a task run with execute command").await;
 
-    // The resources the request names are resolved BEFORE the flag, so a request that is
-    // wrong about one of them is reported on that resource whatever the task's flag says.
-    // The rows walk the three resources in the order they are resolved.
+    // The resources the request names are resolved BEFORE the session is attempted, so a
+    // request that is wrong about one of them is reported on that resource rather than on
+    // the agent that is not running. The rows walk the three resources in the order they
+    // are resolved.
     let rows: [(&str, serde_json::Value, &str, &str); 3] = [
         (
             "a cluster the account does not hold",

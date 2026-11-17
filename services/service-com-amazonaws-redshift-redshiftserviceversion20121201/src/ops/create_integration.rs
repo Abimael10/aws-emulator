@@ -31,7 +31,8 @@
 //! owner that cannot be asked at all leaves the question undecided and the ARN is
 //! stored exactly as the request carried it. A second create under one
 //! `IntegrationName` of the account is refused with
-//! `IntegrationAlreadyExistsFault`.
+//! `IntegrationAlreadyExistsFault`, and so is one naming a (`SourceArn`,
+//! `TargetArn`) pair an integration of the account already replicates between.
 //! The integration becomes `active` a `crate::state::PROVISIONING_SPAN` after
 //! this call.
 //!
@@ -424,6 +425,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         message: Some(st::integration_name_exists_message(
                             &input.integration_name,
                             ::engine::emulator_account_id(),
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+        // The other half of that identity is what the integration REPLICATES
+        // BETWEEN: an integration is the flow from one source into one data
+        // warehouse, so only one may hold a given (`SourceArn`, `TargetArn`) pair
+        // and a create naming a pair already taken is the same already-exists
+        // fault under a free name — otherwise two integrations would replicate
+        // the same data into the same warehouse.
+        if store
+            .integration_from_source_to_target(&input.source_arn, &input.target_arn)
+            .is_some()
+        {
+            return Err(
+                CreateIntegrationErrorModeled::IntegrationAlreadyExistsFault(
+                    IntegrationAlreadyExistsFault {
+                        message: Some(st::integration_pair_exists_message(
+                            &input.source_arn,
+                            &input.target_arn,
                         )),
                     },
                 )

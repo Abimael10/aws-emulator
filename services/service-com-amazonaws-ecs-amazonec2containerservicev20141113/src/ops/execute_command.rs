@@ -256,38 +256,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        // The FIRST precondition of a session is the task's own:
-        // `Task$enableExecuteCommand` — "whether the execute command functionality is
-        // turned on for this task" — is set by the placement that ran it
-        // (`RunTask`/`StartTask$enableExecuteCommand`, or the service's) and cannot be
-        // turned on afterwards, so a task run without it is refused here, before anything
-        // about the target is read. That is what makes exec disabled-by-default and
-        // enabled-by-request observable: the outcome a caller gets changes with the flag
-        // the task was run with.
-        if !task.enable_execute_command {
-            return Err(ExecuteCommandErrorModeled::InvalidParameterException(
-                InvalidParameterException {
-                    message: Some(
-                        crate::state::EXECUTE_COMMAND_NOT_ENABLED_MESSAGE.to_string(),
-                    ),
-                },
-            )
-            .into());
-        }
-
-        // An exec-ENABLED task gets as far as the target: the session is opened against
-        // the one the container's `ExecuteCommandAgent` managed agent registers with
-        // Systems Manager Session Manager ("when the execute command feature is turned on,
-        // the managed agent name is ExecuteCommandAgent"). This emulator runs no container,
-        // so no managed agent of one runs and no container of the task is a Session Manager
-        // target — the condition this modelled error states ("the SSM agent is not
-        // installed or is not running", and an account with no Session Manager endpoint),
-        // and an outcome of its own, distinct from the refusal a task run without the flag
-        // earns.
-        Err(ExecuteCommandErrorModeled::TargetNotConnectedException(
-            TargetNotConnectedException {
+        // The LAST precondition of a session is the one this emulator can never meet: the
+        // session is opened on the `ExecuteCommandAgent` managed agent running inside the
+        // container ("when the execute command feature is turned on, the managed agent name
+        // is ExecuteCommandAgent"), and a task here is a record of a placement with no
+        // container process behind it, so no such agent is running for any task. Amazon ECS
+        // states that in ONE sentence that also covers the task that was never run with
+        // `enableExecuteCommand` — "execute command was not enabled when the task was run OR
+        // the execute command agent isn't running" — so both conditions earn the same
+        // `InvalidParameterException`, whichever of them holds, and a caller is told what to
+        // change without being told which it was.
+        Err(ExecuteCommandErrorModeled::InvalidParameterException(
+            InvalidParameterException {
                 message: Some(
-                    crate::state::EXECUTE_COMMAND_TARGET_NOT_CONNECTED_MESSAGE.to_string(),
+                    crate::state::EXECUTE_COMMAND_NOT_AVAILABLE_MESSAGE.to_string(),
                 ),
             },
         )

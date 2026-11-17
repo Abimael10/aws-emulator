@@ -17,7 +17,8 @@
 //! class (400 `IntegrationConflictOperationFault`), and a namespace whose
 //! warehouse is active takes the integration (200, `Status` `creating`).** A
 //! refused create records nothing, and a second create under one
-//! `IntegrationName` of the account is refused with
+//! `IntegrationName` of the account, or under a (`SourceArn`, `TargetArn`) pair an
+//! integration of the account already replicates between, is refused with
 //! `IntegrationAlreadyExistsFault`.
 //!
 //! Every target a row expects to get past the authorization decision carries the
@@ -569,9 +570,11 @@ async fn an_integration_name_is_unique_within_the_account() {
         );
     }
 
-    // And a FREE name is accepted over the very pair the taken name was refused
-    // over, so the rule is about the name and nothing else.
-    let other_name = create_integration(
+    // A FREE name over the TAKEN pair is refused too, on the other half of an
+    // integration's identity: only one integration may replicate from one source
+    // into one data warehouse. The sentence is written out LITERALLY, with only
+    // the two ARNs the request carried interpolated.
+    let taken_pair = create_integration(
         &emulator,
         "zetlPairOtherName",
         SOURCE,
@@ -579,18 +582,153 @@ async fn an_integration_name_is_unique_within_the_account() {
     )
     .await;
     assert_eq!(
-        other_name.status, 200,
-        "case a free name over the same pair: expected 200, got {} with body {}",
-        other_name.status, other_name.body
+        (taken_pair.status, taken_pair.error_code().as_deref()),
+        (400, Some("IntegrationAlreadyExistsFault")),
+        "case a free name over the taken pair: expected 400 IntegrationAlreadyExistsFault, got \
+         {} / {:?} with body {}",
+        taken_pair.status,
+        taken_pair.error_code(),
+        taken_pair.body
+    );
+    let expected_pair_message = format!(
+        "An integration from source {SOURCE} to target {namespace_arn} already exists. Only one \
+         integration is allowed."
+    );
+    assert_eq!(
+        taken_pair.text("Message").as_deref(),
+        Some(expected_pair_message.as_str()),
+        "case a free name over the taken pair: expected the pair sentence naming the source and \
+         the target, got {:?}",
+        taken_pair.text("Message")
+    );
+
+    // And a free name over a FREE pair — the same source into the OTHER data
+    // warehouse — is accepted, so each half of the rule is about its own half.
+    let other_pair = create_integration(
+        &emulator,
+        "zetlPairOtherTarget",
+        SOURCE,
+        &other_namespace_arn,
+    )
+    .await;
+    assert_eq!(
+        other_pair.status, 200,
+        "case a free name over a free pair: expected 200, got {} with body {}",
+        other_pair.status, other_pair.body
     );
     let listed = emulator.call("DescribeIntegrations", &[]).await;
     assert_eq!(
         all_text(&listed.body, "IntegrationName"),
         vec![
             "zetlPairFirst".to_string(),
-            "zetlPairOtherName".to_string()
+            "zetlPairOtherTarget".to_string()
         ],
         "case read the name cases back: expected the two accepted integrations, got body {}",
+        listed.body
+    );
+}
+
+/// Only ONE integration of the account may replicate between a given (`SourceArn`,
+/// `TargetArn`) pair, whatever each is named: a second create over a taken pair is
+/// `IntegrationAlreadyExistsFault` with the sentence naming the two resources the
+/// request asked to replicate between, and a create that changes EITHER half of the
+/// pair is accepted.
+///
+/// The rows differ along what the rule generalises over: the kind of source the
+/// modelled `SourceArn` pattern admits (an Amazon S3 bucket and a DynamoDB table),
+/// which of two data warehouses the pair targets, and the name each create carries
+/// — which is what shows the refusal turns on the pair and not on the name.
+#[tokio::test]
+async fn one_integration_replicates_between_one_source_and_target_pair() {
+    let emulator = Emulator::with_serverless();
+    let (first_namespace, _id) = create_namespace(&emulator, "zetl-uniq-one").await;
+    create_workgroup(&emulator, "zetl-uniq-one-wg", "zetl-uniq-one").await;
+    await_workgroup(&emulator, "zetl-uniq-one-wg").await;
+    let (second_namespace, _other_id) = create_namespace(&emulator, "zetl-uniq-two").await;
+    create_workgroup(&emulator, "zetl-uniq-two-wg", "zetl-uniq-two").await;
+    await_workgroup(&emulator, "zetl-uniq-two-wg").await;
+    for target in [&first_namespace, &second_namespace] {
+        authorize_target(&emulator, "seed the target's resource policy", target).await;
+    }
+
+    /// The other kind of source the modelled `SourceArn` pattern admits
+    /// (`^arn:aws[a-z\-]*:(s3|dynamodb):.*:.*:[a-zA-Z0-9._\-\/]+$`, source
+    /// `smithy_query(query="operation", operation="CreateIntegration")`).
+    const TABLE_SOURCE: &str = "arn:aws:dynamodb:us-west-2:000000000000:table/zetlUniq";
+
+    // (case, the name the pair is first recorded under, the name the repeat
+    // carries, the source, the target)
+    let rows: [(&str, &str, &str, &str, &String); 3] = [
+        (
+            "an Amazon S3 source into the first warehouse",
+            "zetlUniqS3First",
+            "zetlUniqS3FirstAgain",
+            SOURCE,
+            &first_namespace,
+        ),
+        (
+            "a DynamoDB source into the first warehouse",
+            "zetlUniqDdbFirst",
+            "zetlUniqDdbFirstAgain",
+            TABLE_SOURCE,
+            &first_namespace,
+        ),
+        (
+            "the same Amazon S3 source into the second warehouse",
+            "zetlUniqS3Second",
+            "zetlUniqS3SecondAgain",
+            SOURCE,
+            &second_namespace,
+        ),
+    ];
+
+    let mut recorded: Vec<String> = Vec::new();
+    for (case, name, repeat, source, target) in rows {
+        // A pair no integration holds yet is accepted — including the two rows
+        // that differ from an accepted one in ONE half of the pair.
+        let created = create_integration(&emulator, name, source, target).await;
+        assert_eq!(
+            created.status, 200,
+            "case {case}: a free pair is accepted, expected 200, got {} with body {}",
+            created.status, created.body
+        );
+        recorded.push(name.to_string());
+
+        // The same pair under ANOTHER name is refused, with the sentence naming
+        // the source and the target the request carried — written out literally,
+        // with only those two ARNs interpolated.
+        let repeated = create_integration(&emulator, repeat, source, target).await;
+        let expected = format!(
+            "An integration from source {source} to target {target} already exists. Only one \
+             integration is allowed."
+        );
+        assert_eq!(
+            (
+                repeated.status,
+                repeated.error_code().as_deref(),
+                repeated.text("Message").as_deref()
+            ),
+            (
+                400,
+                Some("IntegrationAlreadyExistsFault"),
+                Some(expected.as_str())
+            ),
+            "case {case}: a taken pair is refused with the pair sentence, got {} / {:?} / {:?} \
+             with body {}",
+            repeated.status,
+            repeated.error_code(),
+            repeated.text("Message"),
+            repeated.body
+        );
+    }
+
+    // ROUND TRIP: only the three accepted pairs were recorded; no refused repeat
+    // left anything behind.
+    let listed = emulator.call("DescribeIntegrations", &[]).await;
+    assert_eq!(
+        all_text(&listed.body, "IntegrationName"),
+        recorded,
+        "case read the pair cases back: expected only the accepted integrations, got body {}",
         listed.body
     );
 }

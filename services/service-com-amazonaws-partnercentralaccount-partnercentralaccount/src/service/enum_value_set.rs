@@ -13,12 +13,13 @@
 //! operation targeting one enum is listed alike, at whatever depth and in whatever binding
 //! the value arrived, and a type the model gains needs nothing added here.
 //!
-//! The VALUE half of the clause is not this service's to choose: an enum clause quotes the
-//! value the request carried for the member it refuses — `Value '<value>' at '<member
-//! path>' failed to satisfy constraint: Member must satisfy enum value set: [ … ]` — just
-//! as a `@length`, a `@range` and a `@pattern` clause of this service do, and the one value
-//! a clause states nothing of is the one the framework's own walk withholds (a `@sensitive`
-//! member's).
+//! The VALUE half of the clause belongs to the same CLASS: a refusal of a value outside an
+//! enumerated type states no value at all — `Value at '<member path>' failed to satisfy
+//! constraint: Member must satisfy enum value set: [ … ]` — where a `@length`, a `@range`
+//! and a `@pattern` clause of the same message still echo the value they refused. That
+//! choice is taken where the clauses are worded (`super::constraint_envelope`), by the
+//! violation's class, so this module only re-orders the set and leaves every half of the
+//! clause to the one layer that writes them.
 //!
 //! Nothing about the SENTENCE is this module's: the counted envelope, the clause, the
 //! member path and the requirement each constraint class states live in the shared home for

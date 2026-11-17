@@ -793,21 +793,17 @@ pub const EXECUTE_COMMAND_TASK_NOT_FOUND_MESSAGE: &str =
 pub const EXECUTE_COMMAND_CONTAINER_NOT_FOUND_MESSAGE: &str =
     "The specified container was not found. Specify a valid container name and try again.";
 
-/// `InvalidParameterException$message` for an `ExecuteCommand` on a task that was NOT run
-/// with `enableExecuteCommand` — the first precondition of a session, which Amazon ECS
-/// states in one fixed sentence carrying nothing of the request.
-pub const EXECUTE_COMMAND_NOT_ENABLED_MESSAGE: &str =
+/// `InvalidParameterException$message` for an `ExecuteCommand` a session cannot be opened
+/// for because no execute-command agent of the task is there to open it on.
+///
+/// ONE fixed sentence states BOTH conditions that leave a task without such an agent —
+/// the task was not run with `enableExecuteCommand`, or its agent is not running — so a
+/// caller is told what to change without being told which of the two held, and the
+/// sentence carries nothing of the request.
+pub const EXECUTE_COMMAND_NOT_AVAILABLE_MESSAGE: &str =
     "The execute command failed because execute command was not enabled when the task was \
      run or the execute command agent isn't running. Wait and try again or run a new task \
      with execute command enabled and try again.";
-
-/// `TargetNotConnectedException$message` for an `ExecuteCommand` on an exec-ENABLED task
-/// whose container is no Systems Manager Session Manager target — the error class whose
-/// documented causes are "the SSM agent is not installed or is not running" and a missing
-/// Session Manager endpoint. The sentence Amazon ECS sends for the class, fixed text
-/// naming nothing of the request.
-pub const EXECUTE_COMMAND_TARGET_NOT_CONNECTED_MESSAGE: &str =
-    "The execute command failed due to an internal error. Try again later.";
 
 /// `Cluster$attachmentsStatus` while the cluster's capacity-provider association is
 /// being applied — the member's doc: "UPDATE_IN_PROGRESS: The available capacity

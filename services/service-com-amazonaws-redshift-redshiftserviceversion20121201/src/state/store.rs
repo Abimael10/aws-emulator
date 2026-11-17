@@ -795,6 +795,20 @@ impl ComAmazonawsRedshiftRedshiftserviceversion20121201State {
         })
     }
 
+    /// The stored integration replicating from `source_arn` into `target_arn`, if
+    /// any — the PAIR an integration replicates between, which only one
+    /// integration of the account may hold, whatever it is named.
+    pub fn integration_from_source_to_target(
+        &self,
+        source_arn: &str,
+        target_arn: &str,
+    ) -> Option<&StoredIntegration> {
+        self.integrations.iter().find(|stored| {
+            stored.integration.source_arn.as_deref() == Some(source_arn)
+                && stored.integration.target_arn.as_deref() == Some(target_arn)
+        })
+    }
+
     /// The cluster whose namespace this ARN names, if this account holds one —
     /// how a zero-ETL integration's `TargetArn` resolves to a target that
     /// exists.

@@ -48,8 +48,18 @@ const CLUSTER: &str = "zetl-auth-target";
 const SOURCE: &str = "arn:aws:s3:::zetl-auth-landing";
 
 /// Another source of the same kind, for the row whose policy admits only the
-/// first one.
+/// first one — and for the state-machine row that needs a (source, target) pair of
+/// its own, since only one integration may replicate between one pair.
 const OTHER_SOURCE: &str = "arn:aws:s3:::zetl-auth-other";
+
+/// The source the row naming the account ROOT as the create principal replicates
+/// from: one integration per (source, target) pair, so each row that gets as far as
+/// recording one brings its own source.
+const ROOT_PRINCIPAL_SOURCE: &str = "arn:aws:s3:::zetl-auth-root";
+
+/// The source the row whose inbound grant is narrowed to this ACCOUNT's sources
+/// replicates from; see [`ROOT_PRINCIPAL_SOURCE`].
+const ACCOUNT_CONDITION_SOURCE: &str = "arn:aws:s3:::zetl-auth-account";
 
 /// The ONE sentence a data warehouse the caller cannot reach is refused with,
 /// read from the sibling suite that already pins it so the wording lives in one
@@ -140,9 +150,11 @@ async fn put_policy(emulator: &Emulator, case: &str, target: &str, policy: &str)
     );
 }
 
-/// Attach the resource policy that AUTHORIZES an integration from [`SOURCE`] into
-/// `target`: the documented pair of grants, for a case whose subject is the state
-/// machine rather than the grant.
+/// Attach the resource policy that AUTHORIZES an integration from [`SOURCE`] or
+/// [`OTHER_SOURCE`] into `target`: the documented pair of grants, for a case whose
+/// subject is the state machine rather than the grant. Both sources are authorized
+/// because only one integration may replicate between one (source, target) pair, so
+/// a case needing two integrations into one target needs two sources.
 async fn authorize(emulator: &Emulator, target: &str) {
     let document = policy(vec![
         statement(
@@ -151,6 +163,7 @@ async fn authorize(emulator: &Emulator, target: &str) {
             "redshift:CreateInboundIntegration",
         ),
         authorize_statement(SOURCE),
+        authorize_statement(OTHER_SOURCE),
     ]);
     put_policy(emulator, "authorize the target", target, &document).await;
 }
@@ -200,11 +213,14 @@ fn policy(statements: Vec<serde_json::Value>) -> String {
     serde_json::json!({ "Version": "2012-10-17", "Statement": statements }).to_string()
 }
 
-/// One row of the authorization table: the policy attached to the target, and
-/// whether the create from [`SOURCE`] is then authorized.
+/// One row of the authorization table: the policy attached to the target, the
+/// source the create replicates from — each row that is authorized brings its own,
+/// since only one integration may replicate between one (source, target) pair — and
+/// whether the create is then authorized.
 struct PolicyRow {
     case: &'static str,
     name: &'static str,
+    source: &'static str,
     policy: String,
     authorized: bool,
 }
@@ -244,12 +260,14 @@ async fn a_target_data_warehouse_authorizes_an_integration_through_its_resource_
         PolicyRow {
             case: "the documented pair, naming the caller and this source",
             name: "zetlAuthBoth",
+            source: SOURCE,
             policy: policy(vec![caller_grant.clone(), authorize_statement(SOURCE)]),
             authorized: true,
         },
         PolicyRow {
-            case: "the same pair with the account root as the create principal",
+            case: "the documented pair with the account root as the create principal",
             name: "zetlAuthAccountRoot",
+            source: ROOT_PRINCIPAL_SOURCE,
             policy: policy(vec![
                 statement(
                     "Allow",
@@ -258,13 +276,14 @@ async fn a_target_data_warehouse_authorizes_an_integration_through_its_resource_
                     }),
                     "redshift:CreateInboundIntegration",
                 ),
-                authorize_statement(SOURCE),
+                authorize_statement(ROOT_PRINCIPAL_SOURCE),
             ]),
             authorized: true,
         },
         PolicyRow {
             case: "the inbound authorization narrowed to this account's sources",
             name: "zetlAuthByAccount",
+            source: ACCOUNT_CONDITION_SOURCE,
             policy: policy(vec![
                 caller_grant.clone(),
                 authorize_statement_for_account(engine::emulator_account_id()),
@@ -274,6 +293,7 @@ async fn a_target_data_warehouse_authorizes_an_integration_through_its_resource_
         PolicyRow {
             case: "the inbound authorization narrowed to another account's sources",
             name: "zetlAuthOtherAccount",
+            source: SOURCE,
             policy: policy(vec![
                 caller_grant.clone(),
                 authorize_statement_for_account("210987654321"),
@@ -283,6 +303,7 @@ async fn a_target_data_warehouse_authorizes_an_integration_through_its_resource_
         PolicyRow {
             case: "the create grant naming another principal",
             name: "zetlAuthOtherPrincipal",
+            source: SOURCE,
             policy: policy(vec![
                 statement(
                     "Allow",
@@ -296,24 +317,28 @@ async fn a_target_data_warehouse_authorizes_an_integration_through_its_resource_
         PolicyRow {
             case: "the inbound authorization conditioned on another source",
             name: "zetlAuthOtherSource",
+            source: SOURCE,
             policy: policy(vec![caller_grant.clone(), authorize_statement(OTHER_SOURCE)]),
             authorized: false,
         },
         PolicyRow {
             case: "the caller's create grant with no inbound authorization at all",
             name: "zetlAuthCreateOnly",
+            source: SOURCE,
             policy: policy(vec![caller_grant.clone()]),
             authorized: false,
         },
         PolicyRow {
             case: "the inbound authorization with no create grant at all",
             name: "zetlAuthAuthorizeOnly",
+            source: SOURCE,
             policy: policy(vec![authorize_statement(SOURCE)]),
             authorized: false,
         },
         PolicyRow {
             case: "the documented pair beside an explicit deny of the create",
             name: "zetlAuthDenied",
+            source: SOURCE,
             policy: policy(vec![
                 caller_grant.clone(),
                 authorize_statement(SOURCE),
@@ -328,6 +353,7 @@ async fn a_target_data_warehouse_authorizes_an_integration_through_its_resource_
         PolicyRow {
             case: "a policy that grants an unrelated action only",
             name: "zetlAuthUnrelated",
+            source: SOURCE,
             policy: policy(vec![statement(
                 "Allow",
                 serde_json::json!({ "AWS": caller() }),
@@ -339,7 +365,7 @@ async fn a_target_data_warehouse_authorizes_an_integration_through_its_resource_
 
     for row in &rows {
         put_policy(&emulator, row.case, &namespace, &row.policy).await;
-        let answer = create_integration(&emulator, row.name, SOURCE, &namespace).await;
+        let answer = create_integration(&emulator, row.name, row.source, &namespace).await;
         if row.authorized {
             assert_eq!(
                 (answer.status, answer.text("Status").as_deref()),
@@ -394,6 +420,9 @@ async fn a_target_data_warehouse_authorizes_an_integration_through_its_resource_
 struct InFlightRow {
     case: &'static str,
     name: &'static str,
+    /// The source this row's integration replicates from: one integration per
+    /// (source, target) pair, so each row brings its own.
+    source: &'static str,
     /// The action that puts the integration in its transient status, if any
     /// beyond the create itself.
     then: Option<&'static str>,
@@ -413,6 +442,7 @@ async fn only_an_integration_still_being_created_takes_no_delete() {
         InFlightRow {
             case: "the create itself has not settled",
             name: "zetlFlightCreating",
+            source: SOURCE,
             then: None,
             status: state::INTEGRATION_STATUS_CREATING,
             blocks: true,
@@ -420,6 +450,7 @@ async fn only_an_integration_still_being_created_takes_no_delete() {
         InFlightRow {
             case: "a modify has not settled",
             name: "zetlFlightModifying",
+            source: OTHER_SOURCE,
             then: Some("ModifyIntegration"),
             status: state::INTEGRATION_STATUS_MODIFYING,
             blocks: false,
@@ -427,7 +458,7 @@ async fn only_an_integration_still_being_created_takes_no_delete() {
     ];
 
     for row in &rows {
-        let created = create_integration(&emulator, row.name, SOURCE, &namespace).await;
+        let created = create_integration(&emulator, row.name, row.source, &namespace).await;
         assert_eq!(
             created.status, 200,
             "case {}: seeding the integration expected 200, got {} with body {}",
