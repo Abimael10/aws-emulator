@@ -43,9 +43,24 @@ const CLIENT_EXCEPTION: &str = "ClientException";
 const IDENTITY_NOT_VALID: &str =
     "The identity document and identity document signature were not valid.";
 
-/// What ECS says when a value WAS presented as the identity document but is not one: the
-/// document is refused as a whole, with no field of its body named back.
+/// What ECS says when a value WAS presented as the identity document but is not one at
+/// all: the document is refused as a whole, with no field of its body named back, because
+/// nothing inside it could be read.
 const IDENTITY_DOCUMENT_NOT_VALID: &str = "An identity document was provided, but not valid.";
+
+/// The member of the identity document that carries the account id, as the document the
+/// instance metadata publishes spells it.
+const ACCOUNT_ID_MEMBER: &str = "accountId";
+
+/// The member of the same document that carries the EC2 instance id.
+const INSTANCE_ID_MEMBER: &str = "instanceId";
+
+/// What ECS says when the document IS the published JSON but leaves `member` blank: the
+/// member of the document is what the caller fixes, so the member is what the sentence
+/// names.
+fn blank_member(member: &str) -> String {
+    format!("{member} cannot be blank.")
+}
 
 /// A minimal, valid container definition, so every refusal below is reached by the member
 /// under test rather than by an unrunnable container.
@@ -161,19 +176,48 @@ async fn a_registration_whose_identity_is_not_vouched_for_is_refused() {
         );
     }
 
-    // A value that is not a DOCUMENT is refused as that instead — the pair cannot be
-    // judged before there is a document to judge it against — and the sentence names
-    // nothing inside the body, whether or not a signature came with it.
-    for (case, document, signature) in [
+    // A value that is not a DOCUMENT at all is refused as that instead — the pair cannot
+    // be judged before there is a document to judge it against — while a document that IS
+    // the published JSON but leaves a member it has to name blank is refused by NAMING that
+    // member, whether or not a signature came with it. One row per member a document can
+    // leave blank, in the order they are read, beside the values that are no document at
+    // all.
+    for (case, document, signature, expected) in [
+        (
+            "a value that is not json, with a signature",
+            "not-a-document".to_string(),
+            Some(signature.clone()),
+            IDENTITY_DOCUMENT_NOT_VALID.to_string(),
+        ),
+        (
+            "a value that is json but not an object",
+            json!([ACCOUNT]).to_string(),
+            Some(signature.clone()),
+            IDENTITY_DOCUMENT_NOT_VALID.to_string(),
+        ),
         (
             "a document with no accountId and no signature",
             json!({ "instanceId": "i-0123456789abcdef0" }).to_string(),
             None,
+            blank_member(ACCOUNT_ID_MEMBER),
         ),
         (
-            "a document that is not json, with a signature",
-            "not-a-document".to_string(),
+            "a document whose accountId is blank",
+            json!({ "accountId": "   ", "instanceId": "i-0123456789abcdef0" }).to_string(),
             Some(signature.clone()),
+            blank_member(ACCOUNT_ID_MEMBER),
+        ),
+        (
+            "a document with an accountId and no instanceId",
+            json!({ "accountId": ACCOUNT, "region": SIGNED_REGION }).to_string(),
+            Some(signature.clone()),
+            blank_member(INSTANCE_ID_MEMBER),
+        ),
+        (
+            "a document leaving both blank, which names the first of them",
+            json!({ "accountId": "", "instanceId": "" }).to_string(),
+            Some(signature.clone()),
+            blank_member(ACCOUNT_ID_MEMBER),
         ),
     ] {
         let mut request = json!({
@@ -186,8 +230,8 @@ async fn a_registration_whose_identity_is_not_vouched_for_is_refused() {
         let (code, message) = refusal(&router, "RegisterContainerInstance", request, case).await;
         assert_eq!(
             (code.as_str(), message.as_str()),
-            (INVALID_PARAMETER, IDENTITY_DOCUMENT_NOT_VALID),
-            "case {case:?}: expected the document refused as a whole, got {code:?} with \
+            (INVALID_PARAMETER, expected.as_str()),
+            "case {case:?}: expected {INVALID_PARAMETER} {expected:?}, got {code:?} with \
              {message:?}"
         );
     }

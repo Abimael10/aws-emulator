@@ -15,6 +15,11 @@
 //! unset and one that already carries a pool, so a refused row is pinned to the REQUEST
 //! rather than to the state it was sent against. Every accepted row is read back through
 //! `DescribeLoadBalancers`, which is where a later caller sees the pool.
+//!
+//! The load balancer itself is resolved FIRST: an ARN this store holds no load balancer for
+//! is answered with the one error the model declares, `LoadBalancerNotFound` (400), whatever
+//! else the request names — so the at-least-one rule above is a rule about a request sent to
+//! a load balancer that exists.
 
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -26,6 +31,10 @@ use crate::wire::router;
 
 /// The code this API answers an input it cannot accept with.
 const VALIDATION_ERROR: &str = "ValidationError";
+
+/// The code `LoadBalancerNotFoundException` carries on the wire — the one error
+/// `ModifyIpPools` declares (`smithy_query(query="operation",operation="ModifyIpPools")`).
+const LOAD_BALANCER_NOT_FOUND: &str = "LoadBalancerNotFound";
 
 /// The one value `RemoveIpamPoolEnum` carries
 /// (`smithy_query(query="shape",shape="RemoveIpamPoolEnum")`): the address family whose
@@ -127,6 +136,56 @@ async fn a_request_naming_neither_pool_member_is_refused_and_changes_nothing() {
             carried.clone(),
             "case {case:?}: a refused call must leave the pool the load balancer carried"
         );
+    }
+}
+
+#[tokio::test]
+async fn an_unknown_load_balancer_is_reported_whatever_else_the_request_names() {
+    let router = router();
+    // The load balancer this operation modifies is resolved BEFORE the rest of the request
+    // is weighed, so a well-formed ARN this store holds no load balancer for is answered
+    // with the one error the model declares — whether the request names a pool, a removal,
+    // both, or neither (the case the at-least-one rule above refuses on an existing load
+    // balancer). One row per combination, against an ARN that never existed and against one
+    // whose load balancer was deleted.
+    let absent = crate::load_balancer_network_capacity_and_policy::absent_load_balancer_arn(
+        crate::provisioning_loop::REGION,
+        "app",
+        "never-made",
+        "0123456789abcdef",
+    );
+    let deleted = create_load_balancer(&router, "pools-deleted").await;
+    let mut form = action("DeleteLoadBalancer");
+    form.push(p("LoadBalancerArn", &deleted));
+    let removed = call(&router, &form).await;
+    assert_eq!(
+        removed.status, 200,
+        "DeleteLoadBalancer must answer 200, got {} {}",
+        removed.status, removed.body
+    );
+
+    let members: [(&str, Option<String>, Option<&str>); 4] = [
+        ("naming neither member", None, None),
+        ("naming a pool alone", Some(pool(5)), None),
+        ("naming a removal alone", None, Some(IPV4)),
+        ("naming both", Some(pool(6)), Some(IPV4)),
+    ];
+    for (target_case, lb_arn) in [
+        ("an ARN that never named a load balancer", absent.as_str()),
+        ("the ARN of a deleted load balancer", deleted.as_str()),
+    ] {
+        for (member_case, set, remove) in &members {
+            let case = format!("{target_case}, {member_case}");
+            let reply = modify(&router, lb_arn, set.as_deref(), *remove).await;
+            let stated = unescaped(&reply.text("Message").unwrap_or_default());
+            let expected = format!("Load balancer '{lb_arn}' not found");
+            assert_eq!(
+                (reply.status, reply.error_code(), stated.as_str()),
+                (400, LOAD_BALANCER_NOT_FOUND.to_string(), expected.as_str()),
+                "case {case:?}: expected 400 {LOAD_BALANCER_NOT_FOUND} {expected:?}, got {}",
+                reply.body
+            );
+        }
     }
 }
 

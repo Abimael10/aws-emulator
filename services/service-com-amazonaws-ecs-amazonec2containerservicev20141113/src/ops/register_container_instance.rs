@@ -114,8 +114,9 @@ const IDENTITY_DOCUMENT_INSTANCE_ID: &str = "instanceId";
 const IDENTITY_DOCUMENT_REGION: &str = "region";
 
 /// The members that make a value an instance identity DOCUMENT at all: the machine it
-/// describes is named by its account and its instance id, so a value leaving either out
-/// describes no machine and is not a document Amazon ECS can read.
+/// describes is named by its account and its instance id, so a value leaving either blank
+/// describes no machine. Read in THIS order, so a document leaving both blank is always
+/// refused for the same one.
 const IDENTITY_DOCUMENT_MEMBERS: [&str; 2] =
     [IDENTITY_DOCUMENT_ACCOUNT_ID, IDENTITY_DOCUMENT_INSTANCE_ID];
 
@@ -123,17 +124,23 @@ const IDENTITY_DOCUMENT_MEMBERS: [&str; 2] =
 /// signature presented with it are not the pair that vouches for one EC2 instance: one of
 /// the two is missing, or no signature of that document accompanies it.
 ///
-/// The PAIR is what is reported, never a member of the document's JSON body: that body is
-/// not a member of the request, so naming one of its fields would point the caller at
-/// input it never sent.
+/// The PAIR is what is reported here: neither of the two values alone is what failed, so
+/// there is no one member to name.
 const IDENTITY_NOT_VALID: &str =
     "The identity document and identity document signature were not valid.";
 
 /// What Amazon ECS says when a value WAS presented as the identity document but is not an
-/// instance identity document — not the JSON the instance metadata publishes, or JSON that
-/// describes no machine ([`IDENTITY_DOCUMENT_MEMBERS`]). The document is refused as a
-/// whole, with the same fixed text whatever is wrong inside it.
+/// instance identity document at all — not the JSON the instance metadata publishes. The
+/// document is refused as a whole, because nothing inside it could be read.
 const IDENTITY_DOCUMENT_NOT_VALID: &str = "An identity document was provided, but not valid.";
+
+/// What Amazon ECS says when the identity document IS the JSON the instance metadata
+/// publishes but leaves a member it has to name blank: the MEMBER of the document is named,
+/// because that is the one thing in it the caller can fix, and `member` is the member's name
+/// as the document spells it.
+fn member_cannot_be_blank(member: &str) -> String {
+    format!("{member} cannot be blank.")
+}
 
 /// The characters the instance identity document SIGNATURE is spelled with. The member's
 /// doc reads it from `http://169.254.169.254/latest/dynamic/instance-identity/signature/`,
@@ -196,16 +203,21 @@ fn identity_document_member(document: &::serde_json::Value, member: &str) -> Opt
 /// "The instance identity document for the EC2 instance to register", and "the instance
 /// identity document signature for the EC2 instance to register": the two together are
 /// what identifies the machine a registration is about, so a registration presents BOTH
-/// and they are judged as a UNIT. Nothing of the document's JSON body is named back: that
-/// body is not a member of the request, so a refusal reports the DOCUMENT or the PAIR and
-/// never a field inside it.
+/// and they are judged as a UNIT.
 ///
-/// Two conditions, each with its own fixed sentence: a value presented as the document
-/// that is not an instance identity document at all is
-/// [`IDENTITY_DOCUMENT_NOT_VALID`], and a document and signature that do not vouch
-/// together for a machine of this caller's account and Region — either of the two absent,
-/// a signature that is not one, or a document describing another account or Region — is
-/// [`IDENTITY_NOT_VALID`].
+/// Two conditions on the document itself, each with its own fixed sentence: a value
+/// presented as the document that is not the JSON the instance metadata publishes at all is
+/// refused as the document it was presented as ([`IDENTITY_DOCUMENT_NOT_VALID`]), while one
+/// that IS that JSON but leaves a member it has to name blank is refused by NAMING that
+/// member ([`member_cannot_be_blank`]) — a document that parsed is a document whose members
+/// can be reported, and the member is what the caller fixes. The members are read in a FIXED
+/// order ([`IDENTITY_DOCUMENT_MEMBERS`]), so a document leaving two of them blank is always
+/// refused for the same one.
+///
+/// Beyond the document, the PAIR: a document and signature that do not vouch together for a
+/// machine of this caller's account and Region — either of the two absent, a signature that
+/// is not one, or a document describing another account or Region — is
+/// [`IDENTITY_NOT_VALID`], which reports the pair rather than a member.
 ///
 /// The verdict is reached WITHOUT the store: the caller-supplied document is parsed here,
 /// outside the critical section the registration itself takes, and the refusal it earns is
@@ -219,13 +231,18 @@ fn documented_instance_id(input: &RegisterContainerInstanceInput, region: &str) 
         .ok_or_else(|| IDENTITY_NOT_VALID.to_string())?;
     let parsed = ::serde_json::from_str::<::serde_json::Value>(document)
         .unwrap_or(::serde_json::Value::Null);
-    // Is it a DOCUMENT at all? A value that is not the published JSON, or that names no
-    // machine, is refused as the document it was presented as.
-    if IDENTITY_DOCUMENT_MEMBERS
-        .iter()
-        .any(|member| identity_document_member(&parsed, member).is_none())
-    {
+    // Is it the published JSON at all? A value that is not a JSON object describes no
+    // machine and has no members to report, so it is refused as the document it was
+    // presented as.
+    if !parsed.is_object() {
         return Err(IDENTITY_DOCUMENT_NOT_VALID.to_string());
+    }
+    // It parsed, so what is wrong INSIDE it can be named: the first member it leaves blank,
+    // in the fixed order the members are read in.
+    for member in IDENTITY_DOCUMENT_MEMBERS {
+        if identity_document_member(&parsed, member).is_none() {
+            return Err(member_cannot_be_blank(member));
+        }
     }
     // Does the PAIR vouch for a machine this caller could be registering? What the
     // signature is OF cannot be checked here — verifying it needs the key that signed the
@@ -240,7 +257,7 @@ fn documented_instance_id(input: &RegisterContainerInstanceInput, region: &str) 
     // reads the value it checked. Answered rather than asserted, so no request can make
     // this operation panic.
     identity_document_member(&parsed, IDENTITY_DOCUMENT_INSTANCE_ID)
-        .ok_or_else(|| IDENTITY_DOCUMENT_NOT_VALID.to_string())
+        .ok_or_else(|| member_cannot_be_blank(IDENTITY_DOCUMENT_INSTANCE_ID))
 }
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative

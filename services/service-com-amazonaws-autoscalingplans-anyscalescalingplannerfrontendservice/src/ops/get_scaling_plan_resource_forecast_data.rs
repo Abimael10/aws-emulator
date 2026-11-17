@@ -7,10 +7,9 @@
 //! The forecast for ONE scalable resource over ONE time window, in two steps:
 //!
 //! 1. the request's own members are refused first — the forecast window (its two
-//!    endpoints in order, the documented seven-day maximum width and the documented
-//!    56-day limit on how far before the current date and time the start may sit, both
-//!    measured in whole hourly forecast periods, the granularity forecast data exists
-//!    at), and the resource coordinates — refused only where the
+//!    endpoints in order and the documented seven-day maximum width, measured in whole
+//!    hourly forecast periods, the granularity forecast data exists at), and the resource
+//!    coordinates — refused only where the
 //!    `(ServiceNamespace, ResourceId, ScalableDimension)` triple describes no one scalable
 //!    resource ([`crate::state::validate_resource_triple`]), the same question the write
 //!    paths ask of a scaling instruction's triple — and the `ForecastDataType` enum — so a
@@ -220,7 +219,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             FORECAST_DATA_TYPE_VALUES,
         )
         .map_err(validation)?;
-        validate_forecast_window(input.start_time, input.end_time, now).map_err(validation)?;
+        validate_forecast_window(input.start_time, input.end_time).map_err(validation)?;
         // A triple that describes one scalable resource is a request this service answers,
         // whichever resource it describes: WHICH resources it holds a forecast for is
         // decided below, by the stored plan, and a resource nothing instructs has no
@@ -292,14 +291,15 @@ pub const FORECAST_SCALABLE_DIMENSION: &str = "autoscaling:autoScalingGroup:Desi
 /// between the start and end time is seven days."
 pub const MAX_FORECAST_WINDOW_DAYS: i64 = 7;
 
-/// How far before the current date and time a forecast window may START, in days.
+/// How far back forecast DATA is available, in days.
 ///
-/// `GetScalingPlanResourceForecastDataRequest$StartTime`: "The inclusive start time of
-/// the time range for the forecast data to get. The date and time can be at most 56 days
-/// before the current date and time." That sentence bounds the REQUEST member, so a start
-/// further back than this is refused rather than served; this operation's own
-/// documentation states the same figure from the data's side ("Data points are available
-/// for up to 56 days").
+/// This operation's own documentation states the figure from the data's side: "Data points
+/// are available for up to 56 days." `GetScalingPlanResourceForecastDataRequest$StartTime`
+/// repeats it as prose about the member ("The date and time can be at most 56 days before
+/// the current date and time"), and the recorded responses show what AWS does with a window
+/// that reaches further back than it: it is SERVED, with the data points that exist inside
+/// the span — none, for a window entirely outside it — rather than refused. So the figure
+/// bounds the DATA ([`forecast_instants`]) and not the request.
 pub const MAX_FORECAST_HISTORY_DAYS: i64 = 56;
 
 /// Seconds in a day, for turning the documented day count into a span.
@@ -329,33 +329,35 @@ fn days_in_nanos(days: i64) -> i128 {
 /// The forecast window a caller asked for, refused where it is not one AWS issues
 /// forecast data over.
 ///
-/// THREE relations hold, each a documented bound on a request member, checked in the
-/// order below:
+/// TWO relations hold, each a documented bound on a request member, checked in the order
+/// below:
 ///
 /// 1. `StartTime` is "the inclusive start time" and `EndTime` "the exclusive end time" of
 ///    a time range, so an end at or before the start spans no time at all;
 /// 2. the documented maximum width — "The maximum time duration between the start and end
-///    time is seven days";
-/// 3. `StartTime` "can be at most [`MAX_FORECAST_HISTORY_DAYS`] days before the current
-///    date and time", so a start further back than that span before `now` is refused.
+///    time is seven days".
 ///
-/// Both DAY bounds are spans of forecast data, and forecast data exists at one data point
-/// per [`FORECAST_INTERVAL_SECONDS`] — so each is measured in whole forecast periods
-/// ([`period_nanos`]), the granularity the quantity they bound is reported at, and not at
-/// the nanosecond the wire can carry: a window reaching less than one period past a bound
+/// Both are relations between the two members alone, so the same window is judged the same
+/// way whenever it is asked for.
+///
+/// The width bound is a span of forecast data, and forecast data exists at one data point
+/// per [`FORECAST_INTERVAL_SECONDS`] — so it is measured in whole forecast periods
+/// ([`period_nanos`]), the granularity the quantity it bounds is reported at, and not at
+/// the nanosecond the wire can carry: a window reaching less than one period past the bound
 /// asks for no forecast period beyond it and is served, while one reaching a whole period
-/// past it is refused. Measuring either bound finer than the data it bounds refuses
-/// windows the service has every period of.
+/// past it is refused. Measuring it finer than the data it bounds refuses windows the
+/// service has every period of.
 ///
-/// Nothing bounds how far into the FUTURE the window may reach: `EndTime` "can accept a
-/// date and time that is more than two days in the future", and a window AWS issues no
-/// forecast for is the empty `Datapoints` list this operation answers with.
+/// Nothing bounds WHERE the window sits: `EndTime` "can accept a date and time that is more
+/// than two days in the future", and the 56 days `StartTime`'s prose names is a span of
+/// available DATA ([`MAX_FORECAST_HISTORY_DAYS`]) — a window outside either horizon is
+/// served with the data points that exist in it, which is the empty `Datapoints` list this
+/// operation answers with, as the recorded responses show.
 ///
 /// `Err` carries the refusal message naming the constraint the window broke.
 fn validate_forecast_window(
     start_time: ::aws_smithy_types::DateTime,
     end_time: ::aws_smithy_types::DateTime,
-    now: ::std::time::SystemTime,
 ) -> Result<(), String> {
     let start = epoch_nanos(start_time);
     let end = epoch_nanos(end_time);
@@ -365,12 +367,6 @@ fn validate_forecast_window(
     if whole_periods(end - start) > days_in_periods(MAX_FORECAST_WINDOW_DAYS) {
         return Err(format!(
             "The maximum allowed time range is {MAX_FORECAST_WINDOW_DAYS} days"
-        ));
-    }
-    if whole_periods(clock_nanos(now) - start) > days_in_periods(MAX_FORECAST_HISTORY_DAYS) {
-        return Err(format!(
-            "Start time must be at most {MAX_FORECAST_HISTORY_DAYS} days before the \
-             current date and time"
         ));
     }
     Ok(())

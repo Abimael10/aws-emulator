@@ -260,91 +260,80 @@ async fn a_read_that_matches_nothing_changes_nothing_a_later_caller_sees() {
 }
 
 #[tokio::test]
-async fn the_documented_window_bounds_are_measured_in_whole_forecast_periods() {
+async fn the_documented_window_width_is_measured_in_whole_forecast_periods() {
     let week = MAX_FORECAST_WINDOW_DAYS * DAY;
     let history = MAX_FORECAST_HISTORY_DAYS * DAY;
 
-    // Rows differ along the bound they probe (the maximum WIDTH of the window and how far
-    // back its START may sit), along how far past that bound they reach — nothing, a
-    // second, a minute, the last second inside one forecast period, a whole period, two
-    // periods — and along which side of now they lie. `accepted` is what the rule answers;
-    // `names_width` says which bound a refusal is about.
+    // Rows differ along how far past the maximum WIDTH they reach — nothing, a second, a
+    // minute, the last second inside one forecast period, a whole period, two periods —
+    // and, for the rows that probe no width at all, along how far back the window sits:
+    // the documented 56 days is the span forecast DATA is available over, so a window
+    // outside it is served rather than refused. `accepted` is what the rule answers.
     //
-    // `(label, window, accepted, names_width)`; a window is `(start, end)` in epoch
-    // seconds, with the start placed on a forecast period boundary where the WIDTH is what
-    // the row probes.
+    // `(label, window, accepted)`; a window is `(start, end)` in epoch seconds, with the
+    // start placed on a forecast period boundary where the WIDTH is what the row probes.
     let hour_start = now_secs().div_euclid(HOUR) * HOUR;
-    let cases: [(&str, (i64, i64), bool, bool); 10] = [
+    let cases: [(&str, (i64, i64), bool); 10] = [
         (
             "a window exactly at the documented maximum width",
             (hour_start, hour_start + week),
-            true,
             true,
         ),
         (
             "a window one second past the maximum width",
             (hour_start, hour_start + week + 1),
             true,
-            true,
         ),
         (
             "a window a minute past the maximum width",
             (hour_start, hour_start + week + 60),
-            true,
             true,
         ),
         (
             "a window the last second inside the period past the maximum width",
             (hour_start, hour_start + week + HOUR - 1),
             true,
-            true,
         ),
         (
             "a window a whole forecast period past the maximum width",
             (hour_start, hour_start + week + HOUR),
             false,
-            true,
         ),
         (
             "a window two forecast periods past the maximum width",
             (hour_start, hour_start + week + 2 * HOUR),
             false,
-            true,
         ),
         (
-            "a start exactly at the documented history bound",
+            "a start exactly at the documented data span",
             (now_secs() - history, now_secs() - history + HOUR),
             true,
-            false,
         ),
         (
-            "a start a minute past the history bound",
+            "a start a minute past the data span",
             (now_secs() - history - 60, now_secs() - history - 60 + HOUR),
             true,
-            false,
         ),
         (
-            "a start a whole forecast period past the history bound",
+            "a start a whole forecast period past the data span",
             (
                 now_secs() - history - HOUR,
                 now_secs() - history - HOUR + HOUR,
             ),
-            false,
-            false,
+            true,
         ),
         (
-            "a start two forecast periods past the history bound",
+            "a start two forecast periods past the data span",
             (
                 now_secs() - history - 2 * HOUR,
                 now_secs() - history - 2 * HOUR + HOUR,
             ),
-            false,
-            false,
+            true,
         ),
     ];
 
     let emulator = with_one_stored_plan().await;
-    for (label, window, accepted, names_width) in cases {
+    for (label, window, accepted) in cases {
         let (status, body) = emulator
             .call("GetScalingPlanResourceForecastData", &forecast_over(window))
             .await;
@@ -366,18 +355,13 @@ async fn the_documented_window_bounds_are_measured_in_whole_forecast_periods() {
             "case {label:?} ({window:?}): expected a 400 ValidationException, got {status} \
              with {body}"
         );
-        // The sentence is read only to tell WHICH bound refused the row, not because a
-        // message text is the rule.
+        // The sentence is read only to tell that the WIDTH bound refused the row, not
+        // because a message text is the rule.
         let message = error_message(&body);
-        let expected_days = if names_width {
-            MAX_FORECAST_WINDOW_DAYS
-        } else {
-            MAX_FORECAST_HISTORY_DAYS
-        };
         assert!(
-            message.contains(&format!("{expected_days} days")),
-            "case {label:?} ({window:?}): the refusal must be about the {expected_days}-day \
-             bound, got {message:?}"
+            message.contains(&format!("{MAX_FORECAST_WINDOW_DAYS} days")),
+            "case {label:?} ({window:?}): the refusal must be about the \
+             {MAX_FORECAST_WINDOW_DAYS}-day width bound, got {message:?}"
         );
     }
 }

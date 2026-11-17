@@ -203,19 +203,21 @@ pub fn network_acl_entry_limit_exceeded<E>(message: impl Into<String>) -> Scaffo
     Scaffolded::service_error(NETWORK_ACL_ENTRY_LIMIT_EXCEEDED, 400, message)
 }
 
-/// `entry` as a reader reports it.
+/// `entry` as a reader reports an entry a CALLER wrote.
 ///
-/// A reported entry carries exactly the members the RULE has: "the ICMP type and code"
+/// Such an entry carries exactly the members the RULE has: "the ICMP type and code"
 /// (`NetworkAclEntry$IcmpTypeCode`) only for a rule written with one — the protocols that need
 /// it — and "the range of ports the rule applies to" (`$PortRange`) only for a rule written
 /// with one, which is "required if specifying protocol 6 (TCP) or 17 (UDP)"
-/// (`CreateNetworkAclEntryRequest$PortRange`). A rule over every protocol has neither ports
-/// nor ICMP numbers, so it reports neither member rather than an empty one: an empty port
-/// range on an all-traffic rule would read as a port restriction the rule does not carry.
+/// (`CreateNetworkAclEntryRequest$PortRange`). A caller's rule over every protocol has neither
+/// ports nor ICMP numbers, so it reports neither member rather than an empty one.
 ///
-/// The ONE place that is applied, so every writer of a stored entry
-/// ([`created_network_acl_entries`], [`super::default_network_acl_entries`],
-/// [`ComAmazonawsEc2Amazonec2State::insert_network_acl_entry`]) stores the same shape and no
+/// The IMPLICIT entries the service itself writes onto an ACL it creates report both
+/// containers present and empty instead ([`implicit_network_acl_entry`]), which is what the
+/// recorded responses that report one carry.
+///
+/// The ONE place this is applied, so every writer of a caller's entry
+/// ([`ComAmazonawsEc2Amazonec2State::insert_network_acl_entry`]) stores the same shape and no
 /// two readers report one entry differently.
 pub fn reported_network_acl_entry(mut entry: NetworkAclEntry) -> NetworkAclEntry {
     entry.icmp_type_code = entry
@@ -225,6 +227,39 @@ pub fn reported_network_acl_entry(mut entry: NetworkAclEntry) -> NetworkAclEntry
         .port_range
         .filter(|range| range.from.is_some() || range.to.is_some());
     entry
+}
+
+/// One IMPLICIT entry — an entry the service itself writes onto an ACL it creates, rather
+/// than one a caller wrote — over every protocol and every IPv4 address, in the direction
+/// and at the rule number and action given.
+///
+/// An implicit entry reports the `icmpTypeCode` and `portRange` containers PRESENT and
+/// empty: it matches every protocol, so it carries no ICMP type and code and no port range,
+/// and the recorded responses of the operations that report one serialize each of those two
+/// members as an empty element rather than leaving it out. That is what separates it from an
+/// entry a caller wrote, which reports only the members the request named
+/// ([`reported_network_acl_entry`]).
+///
+/// The ONE definition of such an entry, so the implicit entries of a VPC's default ACL
+/// ([`super::default_network_acl_entries`]) and of an ACL a caller created
+/// ([`created_network_acl_entries`]) cannot be written two ways.
+pub fn implicit_network_acl_entry(
+    egress: bool,
+    rule_number: i32,
+    rule_action: &str,
+) -> NetworkAclEntry {
+    NetworkAclEntry {
+        cidr_block: Some(ALL_IPV4_ADDRESSES.to_string()),
+        egress: Some(egress),
+        // Present and empty: this entry's protocol is every protocol, so it carries
+        // neither an ICMP type and code nor a port range filled in.
+        icmp_type_code: Some(IcmpTypeCode::default()),
+        ipv6_cidr_block: None,
+        port_range: Some(PortRange::default()),
+        protocol: Some(ALL_IP_PROTOCOLS.to_string()),
+        rule_action: Some(rule_action.to_string()),
+        rule_number: Some(rule_number),
+    }
 }
 
 /// The entries a network ACL a CALLER created comes with: the catch-all deny in each
@@ -243,19 +278,11 @@ pub fn created_network_acl_entries() -> Vec<NetworkAclEntry> {
     let mut entries: Vec<NetworkAclEntry> = [false, true]
         .into_iter()
         .map(|egress| {
-            reported_network_acl_entry(NetworkAclEntry {
-                cidr_block: Some(ALL_IPV4_ADDRESSES.to_string()),
-                egress: Some(egress),
-                // ICMP type and code describe an entry whose protocol is ICMP, and a port
-                // range one whose protocol is TCP or UDP; this entry's protocol is every
-                // protocol, so it carries neither of them filled in.
-                icmp_type_code: None,
-                ipv6_cidr_block: None,
-                port_range: None,
-                protocol: Some(ALL_IP_PROTOCOLS.to_string()),
-                rule_action: Some(RULE_ACTION_DENY.to_string()),
-                rule_number: Some(DEFAULT_NETWORK_ACL_DENY_RULE_NUMBER),
-            })
+            implicit_network_acl_entry(
+                egress,
+                DEFAULT_NETWORK_ACL_DENY_RULE_NUMBER,
+                RULE_ACTION_DENY,
+            )
         })
         .collect();
     // Stored in the order an ACL's entries are reported in, through the one definition of

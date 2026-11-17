@@ -8,11 +8,13 @@
 //!
 //! The rule under test: a network ACL's reported `entrySet` is that ACL's whole stored rule
 //! table, projected ONE way — the egress rules first, then the ingress rules, each by
-//! ascending rule number — and every reported entry carries exactly the members its RULE has:
-//! "the ICMP type and code" (`NetworkAclEntry$IcmpTypeCode`) for a rule written with one and
-//! "the range of ports the rule applies to" (`$PortRange`) for a rule written with one, and
-//! NEITHER for a rule whose protocol has no ports and no ICMP numbers, beside the rule
-//! number, protocol, action, direction and range the rule was written with.
+//! ascending rule number — and every reported entry carries the members its RULE has beside
+//! the rule number, protocol, action, direction and range it was written with: "the ICMP type
+//! and code" (`NetworkAclEntry$IcmpTypeCode`) for a rule written with one and "the range of
+//! ports the rule applies to" (`$PortRange`) for a rule written with one, NEITHER for a
+//! CALLER's rule whose protocol has no ports and no ICMP numbers, and BOTH present-but-empty
+//! for an IMPLICIT entry — one the service itself wrote onto an ACL it created, which is over
+//! every protocol and whose two containers the recorded responses carry as empty elements.
 //!
 //! So the list `CreateNetworkAcl` answers, the list `DescribeNetworkAcls` answers for that
 //! same ACL — named by id, selected by a filter, or listed with the whole store — and the
@@ -234,8 +236,8 @@ impl Rule {
 }
 
 /// One rule-32767 entry every network ACL ends with, in the direction `egress` names: the
-/// catch-all deny over every protocol and every IPv4 address, which has no ports and no ICMP
-/// numbers and so reports neither member.
+/// catch-all deny over every protocol and every IPv4 address, an IMPLICIT entry whose port
+/// range and ICMP type and code are reported present and empty.
 fn catch_all(egress: bool) -> ReportedEntry {
     every_protocol_entry(DEFAULT_NETWORK_ACL_DENY_RULE_NUMBER, egress, RULE_ACTION_DENY)
 }
@@ -250,8 +252,9 @@ fn allow_everything(egress: bool) -> ReportedEntry {
     )
 }
 
-/// An entry over every protocol and every IPv4 address — the shape both entries a network
-/// ACL is created with take.
+/// An IMPLICIT entry over every protocol and every IPv4 address — the shape both entries a
+/// network ACL is created with take. Each of the two members such an entry carries no value
+/// for is reported as a present-but-empty element, which is `Some((None, None))` here.
 fn every_protocol_entry(rule_number: i32, egress: bool, rule_action: &str) -> ReportedEntry {
     ReportedEntry {
         rule_number: rule_number.to_string(),
@@ -260,8 +263,8 @@ fn every_protocol_entry(rule_number: i32, egress: bool, rule_action: &str) -> Re
         cidr_block: Some(ALL_IPV4_ADDRESSES.to_string()),
         ipv6_cidr_block: None,
         egress: egress.to_string(),
-        port_range: None,
-        icmp_type_code: None,
+        port_range: Some((None, None)),
+        icmp_type_code: Some((None, None)),
     }
 }
 
@@ -402,7 +405,7 @@ async fn assert_every_reader(
 /// Every reader projects the entries a network ACL is CREATED with the same way: the two
 /// rules of a VPC's own default ACL in each direction, and the catch-all deny in each
 /// direction for an ACL a caller created — egress first, each by ascending rule number, each
-/// over every protocol and so carrying neither a port range nor an ICMP type and code.
+/// over every protocol and so reporting an empty port range and an empty ICMP type and code.
 #[tokio::test]
 async fn every_reader_projects_the_entries_an_acl_is_created_with_the_same_way() {
     let (router, _engine) = super::ec2_query::emulator();

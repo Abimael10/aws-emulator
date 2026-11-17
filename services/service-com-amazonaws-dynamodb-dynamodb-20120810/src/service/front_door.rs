@@ -207,10 +207,9 @@ pub fn announced(req: &RtRequest, mut resp: RtResponse) -> RtResponse {
 /// [`::service_common::data_plane_addressing::reached_endpoint_host`]: that one answers the
 /// other question (a URL a caller must be able to reach back) and so prefers the host the
 /// request arrived at, which would make this report name the loopback address a client
-/// reaches this emulator at rather than the endpoint it addressed. It is the same name
-/// `DescribeEndpoints` labels its own advertised address after
-/// ([`crate::state::regional_endpoint_host`]), which is why both read it from one place;
-/// that one, being an address a client DIALS, names it in the zone this emulator answers in.
+/// reaches this emulator at rather than the endpoint it addressed. `DescribeEndpoints`
+/// answers the other question and so publishes the other value: an address a client DIALS,
+/// which is the endpoint this emulator is served at.
 fn health_response(parts: &::http::request::Parts) -> RtResponse {
     let endpoint = addressed_endpoint(parts);
     let mut resp = RtResponse::new(

@@ -157,12 +157,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         )
         .map_err(crate::scaffolded::Scaffolded::validation_error)?;
 
+        let mut guard = state.lock();
+        // The load balancer the request names is resolved BEFORE the rest of the request is
+        // weighed: this operation "modif[ies] the IP pool associated to a load balancer", so
+        // an ARN this store holds no load balancer for is reported as the one error the model
+        // declares whatever else the request says — a caller is told the load balancer is
+        // gone rather than being sent to fix a request about a load balancer that does not
+        // exist.
+        let Some(load_balancer) = guard.load_balancers.get_mut(&input.load_balancer_arn) else {
+            return Err(ModifyIpPoolsErrorModeled::LoadBalancerNotFoundException(
+                LoadBalancerNotFoundException {
+                    message: Some(crate::state::load_balancer_not_found_message(
+                        &input.load_balancer_arn,
+                    )),
+                },
+            )
+            .into());
+        };
+
         // A request naming NEITHER member asks for no change at all, and this operation
         // "modify[ies] the IP pool associated to a load balancer": there is nothing to
-        // modify, so it is the request that has to be fixed rather than a load balancer to
-        // write nothing to. The model declares no error shape for it, so the refusal is
-        // this service's own `ValidationError` ([`AT_LEAST_ONE_POOL_MEMBER_MESSAGE`]), and
-        // it is answered BEFORE the store is read: the rule reads the request alone.
+        // modify, so it is the request that has to be fixed. The model declares no error
+        // shape for it, so the refusal is this service's own `ValidationError`
+        // ([`AT_LEAST_ONE_POOL_MEMBER_MESSAGE`]).
         //
         // An EMPTY `RemoveIpamPools`, or one whose entries name no address family, names
         // nothing to remove — and the wire form this API is called over cannot tell an
@@ -175,18 +192,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 AT_LEAST_ONE_POOL_MEMBER_MESSAGE,
             ));
         }
-
-        let mut guard = state.lock();
-        let Some(load_balancer) = guard.load_balancers.get_mut(&input.load_balancer_arn) else {
-            return Err(ModifyIpPoolsErrorModeled::LoadBalancerNotFoundException(
-                LoadBalancerNotFoundException {
-                    message: Some(crate::state::load_balancer_not_found_message(
-                        &input.load_balancer_arn,
-                    )),
-                },
-            )
-            .into());
-        };
 
         // A request that names no pool for a family leaves that family's pool as it is:
         // this operation modifies the pools it names, it does not restate them all.

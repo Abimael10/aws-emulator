@@ -19,8 +19,9 @@
 
 use ec2::ops::types::{IcmpTypeCode, NetworkAclEntry, PortRange, Tag};
 use ec2::state::{
-    ComAmazonawsEc2Amazonec2State as Ec2State, NETWORK_ACL_ASSOCIATION_ID_PREFIX, NetworkAclSpec,
-    SubnetSpec, availability_zones_in_region,
+    ComAmazonawsEc2Amazonec2State as Ec2State, DEFAULT_NETWORK_ACL_DENY_RULE_NUMBER,
+    NETWORK_ACL_ASSOCIATION_ID_PREFIX, NetworkAclSpec, RULE_ACTION_DENY, SubnetSpec,
+    availability_zones_in_region, implicit_network_acl_entry,
 };
 use service_com_amazonaws_ec2_amazonec2 as ec2;
 use smithy_server_runtime::MultiServiceRouter;
@@ -246,10 +247,12 @@ fn default_entries() -> Vec<ReportedEntry> {
                 cidr_block: Some("0.0.0.0/0".to_string()),
                 ipv6_cidr_block: None,
                 egress: egress.to_string(),
-                // A reported entry carries only the members its RULE has; an entry over every
-                // protocol has no ICMP numbers and no ports, so it carries neither.
-                port_range: None,
-                icmp_type_code: None,
+                // An IMPLICIT entry — one the service itself wrote onto the ACL its VPC came
+                // with — reports both containers present and EMPTY: it is over every
+                // protocol, so it has no ICMP numbers and no ports, and each member is
+                // written as an empty element rather than left out.
+                port_range: Some((String::new(), String::new())),
+                icmp_type_code: Some((String::new(), String::new())),
             })
         })
         .collect()
@@ -1490,11 +1493,18 @@ async fn acl_of_subnet(router: &MultiServiceRouter, case: &str, subnet_id: &str)
 /// direction and nothing else, since a custom ACL "denies all inbound and outbound traffic
 /// until you add rules" (Amazon VPC User Guide, "Control subnet traffic with network access
 /// control lists").
+///
+/// Built through the service's own one definition of an IMPLICIT entry
+/// ([`implicit_network_acl_entry`]) rather than spelled out here, so this expectation cannot
+/// drift from the entries a create actually writes — including the `portRange` and
+/// `icmpTypeCode` containers such an entry reports present and empty.
 fn created_entries() -> Vec<NetworkAclEntry> {
-    vec![
-        with_cidr(rule(32767, false, "deny", "-1"), "0.0.0.0/0"),
-        with_cidr(rule(32767, true, "deny", "-1"), "0.0.0.0/0"),
-    ]
+    [false, true]
+        .into_iter()
+        .map(|egress| {
+            implicit_network_acl_entry(egress, DEFAULT_NETWORK_ACL_DENY_RULE_NUMBER, RULE_ACTION_DENY)
+        })
+        .collect()
 }
 
 /// What a created ACL's `entrySet` reports once `authored` has been added to it: the pair it
@@ -1512,12 +1522,13 @@ fn expected_entries(authored: &NetworkAclEntry) -> Vec<ReportedEntry> {
     entries.iter().map(reported_entry).collect()
 }
 
-/// `entry` as `DescribeNetworkAcls` reports it: each member as its wire text, and nothing at
-/// all for the members the rule leaves out.
+/// `entry` as `DescribeNetworkAcls` reports it: each member as its wire text, nothing at all
+/// for a container the rule leaves out, and the empty text an empty element parses as for a
+/// container that is present but carries no value.
 fn reported_entry(entry: &NetworkAclEntry) -> ReportedEntry {
-    let number = |value: Option<i32>| value.unwrap_or_default().to_string();
+    let text = |value: Option<i32>| value.map(|value| value.to_string()).unwrap_or_default();
     ReportedEntry {
-        rule_number: number(entry.rule_number),
+        rule_number: text(entry.rule_number),
         rule_action: entry.rule_action.clone().unwrap_or_default(),
         protocol: entry.protocol.clone().unwrap_or_default(),
         cidr_block: entry.cidr_block.clone(),
@@ -1526,11 +1537,11 @@ fn reported_entry(entry: &NetworkAclEntry) -> ReportedEntry {
         port_range: entry
             .port_range
             .as_ref()
-            .map(|range| (number(range.from), number(range.to))),
+            .map(|range| (text(range.from), text(range.to))),
         icmp_type_code: entry
             .icmp_type_code
             .as_ref()
-            .map(|icmp| (number(icmp.r#type), number(icmp.code))),
+            .map(|icmp| (text(icmp.r#type), text(icmp.code))),
     }
 }
 

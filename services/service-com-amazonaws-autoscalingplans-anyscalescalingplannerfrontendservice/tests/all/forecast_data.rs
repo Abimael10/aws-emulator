@@ -7,12 +7,12 @@
 //!
 //! * the forecast WINDOW is checked against its documented limits before any plan is
 //!   looked up, so the same window earns the same answer whether or not the named plan
-//!   exists — `EndTime` has to be later than `StartTime`, the window may span at most
-//!   `MAX_FORECAST_WINDOW_DAYS` days and `StartTime` may be at most
-//!   `MAX_FORECAST_HISTORY_DAYS` days before the current date and time, both bounds
-//!   measured in the whole hourly forecast periods the data exists at — whatever
-//!   sub-second precision the window's endpoints carry. Nothing bounds how far AHEAD a
-//!   window reaches;
+//!   exists — `EndTime` has to be later than `StartTime` and the window may span at most
+//!   `MAX_FORECAST_WINDOW_DAYS` days, the width measured in the whole hourly forecast
+//!   periods the data exists at, whatever sub-second precision the window's endpoints
+//!   carry. Nothing bounds WHERE the window sits: `MAX_FORECAST_HISTORY_DAYS` is how far
+//!   back forecast DATA is available, so a window outside it — like one reaching into the
+//!   future — is served with the data points it holds rather than refused;
 //! * a request that passes those checks is looked up by (`ScalingPlanName`,
 //!   `ScalingPlanVersion`), and a lookup that finds no stored plan has no forecast to
 //!   report: HTTP 200 with an empty `Datapoints` list, because this operation models no
@@ -178,9 +178,6 @@ enum Verdict {
     /// HTTP 400 `ValidationException`, because the window spans more than the documented
     /// maximum duration.
     RefusedAsTooWide,
-    /// HTTP 400 `ValidationException`, because the start is further than the documented
-    /// span before the current date and time.
-    RefusedAsTooOld,
     /// HTTP 400 `ValidationException`, because the end is not after the start.
     RefusedAsOutOfOrder,
 }
@@ -242,16 +239,12 @@ async fn assert_verdict(
     );
     let message = error_message(&parsed);
 
-    // The sentence is read only to tell WHICH relation refused the row — the width, the
-    // history span or the endpoint order — not because a message text is the rule.
-    let named = (
-        message.contains(&format!("{MAX_FORECAST_WINDOW_DAYS} days")),
-        message.contains(&format!("{MAX_FORECAST_HISTORY_DAYS} days")),
-    );
+    // The sentence is read only to tell WHICH relation refused the row — the width or the
+    // endpoint order — not because a message text is the rule.
+    let named = message.contains(&format!("{MAX_FORECAST_WINDOW_DAYS} days"));
     let expected = match verdict {
-        Verdict::RefusedAsTooWide => (true, false),
-        Verdict::RefusedAsTooOld => (false, true),
-        Verdict::Accepted | Verdict::RefusedAsOutOfOrder => (false, false),
+        Verdict::RefusedAsTooWide => true,
+        Verdict::Accepted | Verdict::RefusedAsOutOfOrder => false,
     };
     assert_eq!(
         named, expected,
@@ -387,13 +380,15 @@ async fn the_forecast_window_width_is_measured_in_whole_forecast_periods() {
 }
 
 #[tokio::test]
-async fn a_start_further_back_than_the_documented_span_is_refused() {
+async fn a_window_further_back_than_the_documented_data_span_is_served() {
     // One width — a day, well inside the documented maximum — at every position the
-    // request can put it: ahead of now, around now, just inside the documented span
-    // before now, just past it, and far past it on both sides. `StartTime` "can be at
-    // most MAX_FORECAST_HISTORY_DAYS days before the current date and time", while
-    // `EndTime` "can accept a date and time that is more than two days in the future",
-    // so only the backward direction is bounded.
+    // request can put it: ahead of now, around now, just inside the span forecast data is
+    // available over, just past it, and far past it on both sides. Every one of them is
+    // SERVED: the 56 days `StartTime`'s prose names is how far back forecast DATA exists
+    // ("Data points are available for up to 56 days"), so a window outside it carries the
+    // data points that exist in it — none — rather than being refused, and `EndTime` "can
+    // accept a date and time that is more than two days in the future", so neither
+    // direction is bounded.
     //
     // `(label, offset of the start from now in seconds, verdict)`.
     let history = MAX_FORECAST_HISTORY_DAYS * DAY;
@@ -427,22 +422,22 @@ async fn a_start_further_back_than_the_documented_span_is_refused() {
         (
             "a window a whole forecast period past the documented span",
             -history - HOUR,
-            Verdict::RefusedAsTooOld,
+            Verdict::Accepted,
         ),
         (
             "a window a hundred days in the past",
             -100 * DAY,
-            Verdict::RefusedAsTooOld,
+            Verdict::Accepted,
         ),
         (
             "a window two hundred days in the past",
             -200 * DAY,
-            Verdict::RefusedAsTooOld,
+            Verdict::Accepted,
         ),
         (
             "a window a year in the past",
             -365 * DAY,
-            Verdict::RefusedAsTooOld,
+            Verdict::Accepted,
         ),
     ];
 
@@ -585,15 +580,14 @@ async fn the_sub_second_part_of_a_window_adds_no_forecast_period_to_its_width() 
 }
 
 #[tokio::test]
-async fn the_sub_second_part_of_a_start_adds_no_forecast_period_to_its_history_span() {
+async fn a_start_outside_the_documented_data_span_is_served_whatever_its_sub_second_part() {
     let history = MAX_FORECAST_HISTORY_DAYS * DAY * MILLIS_PER_SECOND;
     let period = HOUR * MILLIS_PER_SECOND;
-    // The other documented day bound, at the same precision: how far before the current
-    // date and time the start may sit is measured in the same whole forecast periods, so a
-    // start part of a period past the span is served and one a whole period past it is
-    // refused. Rows differ along how far past the span the start sits and along its
-    // sub-second part. Each row's width is a day, well inside the maximum width, so the
-    // width rule cannot be what answers it.
+    // The span forecast data is available over bounds the DATA, not the request, so a
+    // start outside it is served at every precision a caller can ask with. Rows differ
+    // along how far past the span the start sits and along its sub-second part. Each row's
+    // width is a day, well inside the maximum width, so the width rule cannot be what
+    // answers it.
     //
     // `(label, offset of the start from now in millis, verdict)`.
     let cases: [(&str, i64, Verdict); 5] = [
@@ -615,12 +609,12 @@ async fn the_sub_second_part_of_a_start_adds_no_forecast_period_to_its_history_s
         (
             "a start a whole forecast period and a minute past the documented span",
             -history - period - CLOCK_MARGIN_SECONDS * MILLIS_PER_SECOND,
-            Verdict::RefusedAsTooOld,
+            Verdict::Accepted,
         ),
         (
             "a start a day and half a second past the documented span",
             -history - DAY * MILLIS_PER_SECOND - 500,
-            Verdict::RefusedAsTooOld,
+            Verdict::Accepted,
         ),
     ];
 

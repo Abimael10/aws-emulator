@@ -54,19 +54,7 @@ pub fn default_network_acl_entries() -> Vec<NetworkAclEntry> {
                 (DEFAULT_NETWORK_ACL_DENY_RULE_NUMBER, RULE_ACTION_DENY),
             ]
             .map(|(rule_number, rule_action)| {
-                reported_network_acl_entry(NetworkAclEntry {
-                    cidr_block: Some(ALL_IPV4_ADDRESSES.to_string()),
-                    egress: Some(egress),
-                    // ICMP type and code describe an entry whose protocol is ICMP, and a
-                    // port range one whose protocol is TCP or UDP; this entry's protocol is
-                    // every protocol, so it carries neither of them filled in.
-                    icmp_type_code: None,
-                    ipv6_cidr_block: None,
-                    port_range: None,
-                    protocol: Some(ALL_IP_PROTOCOLS.to_string()),
-                    rule_action: Some(rule_action.to_string()),
-                    rule_number: Some(rule_number),
-                })
+                implicit_network_acl_entry(egress, rule_number, rule_action)
             })
         })
         .collect();

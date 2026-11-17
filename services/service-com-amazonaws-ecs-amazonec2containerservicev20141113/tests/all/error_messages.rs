@@ -528,52 +528,73 @@ async fn a_fargate_registration_names_the_single_member_it_is_missing() {
 }
 
 #[tokio::test]
-async fn a_registration_refuses_an_unreadable_identity_document_as_a_whole() {
+async fn a_registration_names_what_is_wrong_with_the_identity_document_it_was_given() {
     let router = service();
     create_cluster(&router, CLUSTER, "identity").await;
 
-    // A value PRESENTED as the identity document that is not one — not the JSON the
-    // instance metadata publishes, or JSON describing no machine — is refused as the
-    // document it was presented as, in one fixed sentence that names nothing inside it.
-    // The rows span what can be wrong with it: the JSON type it came as, which of the
-    // members that name a machine is absent, blank or not a string, and whether a
-    // signature came with it (the document is read first either way).
+    // A value PRESENTED as the identity document that is not the JSON the instance
+    // metadata publishes at all is refused as the document it was presented as, in one
+    // fixed sentence that names nothing inside it; a document that IS that JSON but leaves
+    // a member it has to name blank is refused by NAMING that member. The rows span what
+    // can be wrong with it: the JSON type it came as, which of the members that name a
+    // machine is absent, blank or not a string, and whether a signature came with it (the
+    // document is read first either way).
     const DOCUMENT_NOT_VALID: &str = "An identity document was provided, but not valid.";
-    let rows: [(&str, Value, bool); 12] = [
-        ("an empty document", json!("{}"), false),
-        ("not json at all", json!("not-a-document"), false),
-        ("a json array", json!("[]"), false),
-        ("a json number", json!("17"), false),
-        ("a truncated document", json!("{\"accountId\":"), false),
+    /// The sentence a document that parsed but leaves `member` blank is refused with.
+    fn blank(member: &str) -> String {
+        format!("{member} cannot be blank.")
+    }
+    let rows: [(&str, Value, bool, String); 12] = [
+        ("an empty document", json!("{}"), false, blank("accountId")),
+        (
+            "not json at all",
+            json!("not-a-document"),
+            false,
+            DOCUMENT_NOT_VALID.to_string(),
+        ),
+        ("a json array", json!("[]"), false, DOCUMENT_NOT_VALID.to_string()),
+        ("a json number", json!("17"), false, DOCUMENT_NOT_VALID.to_string()),
+        (
+            "a truncated document",
+            json!("{\"accountId\":"),
+            false,
+            DOCUMENT_NOT_VALID.to_string(),
+        ),
         (
             "no accountId",
             json!(json!({ "instanceId": "i-0123456789abcdef0" }).to_string()),
             false,
+            blank("accountId"),
         ),
         (
             "a blank accountId",
             json!(json!({ "accountId": "   ", "instanceId": "i-0123456789abcdef0" }).to_string()),
             false,
+            blank("accountId"),
         ),
         (
             "an accountId that is not a string",
             json!(json!({ "accountId": 1234, "instanceId": "i-0123456789abcdef0" }).to_string()),
             false,
+            blank("accountId"),
         ),
         (
             "no instanceId",
             json!(json!({ "accountId": ACCOUNT, "region": SIGNED_REGION }).to_string()),
             false,
+            blank("instanceId"),
         ),
         (
             "a blank instanceId",
             json!(json!({ "accountId": ACCOUNT, "instanceId": " " }).to_string()),
             false,
+            blank("instanceId"),
         ),
         (
             "an instanceId that is not a string",
             json!(json!({ "accountId": ACCOUNT, "instanceId": 7 }).to_string()),
             false,
+            blank("instanceId"),
         ),
         (
             // The document is read BEFORE the signature, so the sentence is the
@@ -581,10 +602,11 @@ async fn a_registration_refuses_an_unreadable_identity_document_as_a_whole() {
             "an unreadable document with a valid signature",
             json!("not-a-document"),
             true,
+            DOCUMENT_NOT_VALID.to_string(),
         ),
     ];
 
-    for (case, document, signed) in rows {
+    for (case, document, signed, expected) in rows {
         let mut request = json!({ "cluster": CLUSTER, "instanceIdentityDocument": document });
         if signed {
             request["instanceIdentityDocumentSignature"] = json!(identity_document_signature());
@@ -592,9 +614,9 @@ async fn a_registration_refuses_an_unreadable_identity_document_as_a_whole() {
         let (code, message) = refusal(&router, "RegisterContainerInstance", request, case).await;
         assert_eq!(
             (code.as_str(), message.as_str()),
-            ("InvalidParameterException", DOCUMENT_NOT_VALID),
-            "case {case:?}: expected the document refused as a whole, got {code:?} with \
-             {message:?}"
+            ("InvalidParameterException", expected.as_str()),
+            "case {case:?}: expected InvalidParameterException {expected:?}, got {code:?} \
+             with {message:?}"
         );
     }
 

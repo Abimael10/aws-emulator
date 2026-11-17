@@ -3,26 +3,24 @@
 //! @op DescribeEndpoints
 //!
 //! IMPLEMENTED: endpoint discovery, answered with "the regional endpoint information" (the
-//! doc below) for the region the request ADDRESSED — this service's endpoint in that region,
-//! named in the zone THIS EMULATOR answers in and carrying the port this process is served
-//! on, with no scheme and no path, which is the form the modelled `Address` carries.
+//! doc below) as the one address this emulator is SERVED at — its own front door's
+//! `host[:port]`, with no scheme and no path, which is the form the modelled `Address`
+//! carries.
 //!
-//! Both halves are what a discovery client needs of an `Address`: it caches the value and
-//! re-targets its next call at it, so the address has to NAME the endpoint it stands for —
-//! a bare socket address names neither this service nor a region, so a multi-region client
-//! cannot tell two regions' discovered endpoints apart and no caller can check the one it
-//! was handed is the region it asked for — and it has to lead back HERE, which is why the
-//! name is minted in the zone this emulator is reached in rather than in the zone AWS
-//! publishes its own endpoints in: a client that honours the announced address keeps talking
-//! to this server, instead of being sent — with the developer's credentials — to the real
-//! regional endpoint. A request that arrives on the announced address is routed to this
-//! service by the endpoint prefix its first label carries, over the store of the region its
-//! second names.
+//! That is what a discovery client needs of an `Address`: it caches the value and re-targets
+//! its next call at it, so the address has to be one a client on this machine RESOLVES and
+//! reaches this emulator at. The emulator's front door is that address — it is where every
+//! service of this emulator is served, and a request arriving there is routed to this
+//! service by the credential scope it is signed with — so the announced value is the
+//! endpoint this process answers on and never a name in a zone AWS publishes its own
+//! endpoints in, which resolves off this machine (or to genuine AWS infrastructure) and
+//! would send a client that honours it out of the emulated environment carrying the
+//! credentials it is holding.
 //!
-//! The REGION addressed is therefore the only thing about a request that moves the answer:
-//! the serving address is a property of the PROCESS, so neither the socket a request arrived
-//! on nor the endpoint VARIANT it arrived through (a FIPS or dual-stack host) is carried into
-//! the answer — this process serves one endpoint and it is neither of those.
+//! Nothing about a request moves the answer: the serving address is a property of the
+//! PROCESS, so neither the socket a request arrived on, nor the endpoint VARIANT it arrived
+//! through (a FIPS or dual-stack host), nor the region it addresses is carried into the
+//! answer — this process serves one endpoint and it is none of those.
 //!
 //! ## Shape of an operation
 //!
@@ -80,47 +78,17 @@ use super::types::*;
 /// without ever handing out an address that goes stale.
 const ENDPOINT_CACHE_PERIOD_MINUTES: i64 = 24 * 60;
 
-/// The address discovery advertises for `region`, in the form the modelled `Address` carries
-/// (a host and a port, no scheme and no path): this service's endpoint in that region, named
-/// in the zone this emulator answers in and carrying the port this process is served on.
+/// The address discovery advertises, in the form the modelled `Address` carries (a host and
+/// a port, no scheme and no path): the one endpoint this emulator is SERVED at, which is the
+/// address a client that caches it can reach this service at.
 ///
-/// Both halves come from the one address this process is published at
-/// ([`::service_common::data_plane_addressing::served_endpoint_authority`], "the `host[:port]`
-/// this emulator is SERVED at"), so the advertised endpoint is this emulator's and no
-/// request moves it: the zone is the zone that address names
-/// ([`::service_common::data_plane_addressing::announced_zone_of_authority`] — the loopback
-/// zone for an address, which is where the core binds its listeners, and never a zone AWS
-/// publishes its own endpoints in), and the port is that address's own. An emulator served
-/// on no port at all — an in-process call with no socket behind it — has no address to
-/// publish, so the endpoint is named in the loopback zone on no port.
-///
-/// What the two labels in front of the zone are for: a discovery client CACHES this value
-/// and re-targets its next call at it, so the address has to name the endpoint it stands for
-/// — a bare socket address names neither this service nor a region, so a multi-region client
-/// cannot tell two regions' discovered endpoints apart and no caller can check the endpoint
-/// it was handed is the region it asked for. Named this way the address does both: its first
-/// label is this service's endpoint prefix, which is what routes a request that arrives on
-/// it to this service, and the second is the region, which selects that region's store.
-fn advertised_address(ctx: &smithy_server_runtime::OperationContext<'_>, region: &str) -> String {
-    let served =
-        ::service_common::data_plane_addressing::served_endpoint_authority(ctx.endpoint().as_str());
-    let zone = served.as_deref().map_or_else(
-        || ::service_common::data_plane_addressing::LOOPBACK_ZONE.to_string(),
-        ::service_common::data_plane_addressing::announced_zone_of_authority,
-    );
-    let endpoint = format!("{}.{region}.{zone}", crate::state::ENDPOINT_PREFIX);
-    match served.as_deref().and_then(served_port) {
-        Some(port) => {
-            ::service_common::data_plane_addressing::host_port_authority(&endpoint, port)
-        }
-        None => endpoint,
-    }
-}
-
-/// The port the address this emulator is served at names, when it names one.
-fn served_port(served: &str) -> Option<u16> {
-    ::service_common::data_plane_addressing::addressed_port(Some(served))
-        .and_then(|port| u16::try_from(port).ok())
+/// Read through the tree's one statement of that address
+/// ([`::service_common::data_plane_addressing::emulator_endpoint_authority`], "the
+/// `host[:port]` of the ONE endpoint this emulator serves its whole surface at — what a
+/// DISCOVERY operation publishes for a plane the client then DIALS"), so the value announced
+/// is the front door's own published base and no request moves it.
+fn advertised_address(ctx: &smithy_server_runtime::OperationContext<'_>) -> String {
+    ::service_common::data_plane_addressing::emulator_endpoint_authority(ctx)
 }
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
@@ -190,20 +158,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // `DescribeEndpointsRequest` has no members, and the answer is the endpoint of the
-        // region the request addressed, served on this process's port — not a property of
-        // the store — so no state is read or written here.
+        // `DescribeEndpointsRequest` has no members, and the answer is the address this
+        // process is served at — not a property of the store — so no state is read or
+        // written here.
         let _ = (&input, &self.engine);
-        // The region this request addresses, read exactly as every other request of this
-        // service reads it ([`crate::state::request_region`]), so the endpoint a caller is
-        // told about is the endpoint of the store its next call would reach.
-        let region = crate::state::request_region(ctx.parts());
-        // One regional endpoint serves one region, so exactly one is reported: a client
-        // discovers the endpoint of the region it is talking to, not a list of every
-        // region's.
+        // One endpoint serves the region a request addresses, so exactly one is reported: a
+        // client discovers the endpoint it is to talk to, not a list of every region's.
         Ok(DescribeEndpointsOutput {
             endpoints: vec![Endpoint {
-                address: advertised_address(ctx, &region),
+                address: advertised_address(ctx),
                 cache_period_in_minutes: ENDPOINT_CACHE_PERIOD_MINUTES,
             }],
         })
