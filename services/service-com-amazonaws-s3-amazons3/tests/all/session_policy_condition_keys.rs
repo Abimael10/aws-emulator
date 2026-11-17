@@ -491,6 +491,39 @@ pub(crate) fn assert_refused(
     resource: &str,
     reason: &str,
 ) {
+    assert_refusal(
+        case,
+        answer,
+        &denial_message(principal, action, resource, reason),
+    );
+}
+
+/// Assert `answer` is that same refusal for an action published with NO resource types, where
+/// there is nothing for the `on resource:` clause to carry: the account's own listing is such an
+/// action, and the sentence is the one the suite that drives that listing states
+/// ([`super::account_wide_listing_authorization::account_wide_denial_message`]).
+///
+/// `pub(crate)` beside [`assert_refused`], so the resource-bearing and the resourceless form of
+/// one sentence are read in one place.
+pub(crate) fn assert_refused_without_resource(
+    case: &str,
+    answer: &Answer,
+    principal: &str,
+    action: &str,
+    reason: &str,
+) {
+    assert_refusal(
+        case,
+        answer,
+        &super::account_wide_listing_authorization::account_wide_denial_message(
+            principal, action, reason,
+        ),
+    );
+}
+
+/// What the two readings above share: the status and the code S3 answers every authorization
+/// refusal with, and the `expected` sentence each of them worded.
+fn assert_refusal(case: &str, answer: &Answer, expected: &str) {
     let body = text(answer);
     assert_eq!(
         answer.status, 403,
@@ -501,9 +534,8 @@ pub(crate) fn assert_refused(
         body.contains(ACCESS_DENIED),
         "case {case:?}: expected the {ACCESS_DENIED} code, got {body}"
     );
-    let expected = denial_message(principal, action, resource, reason);
     assert!(
-        body.contains(&expected),
+        body.contains(expected),
         "case {case:?}: expected the message {expected:?}, got {body}"
     );
 }

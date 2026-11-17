@@ -31,6 +31,17 @@
 //!    the element is the wire document's: the fixed parts are the element name and `Code` =
 //!    `NoSuchBucket`, and the value is the bucket named in the request URI, which is what an
 //!    SDK surfaces as `BucketName` and hands back as absent when it is missing.
+//! 4. **Every decision this authorization gate takes answers `aws:RequestedRegion` from the
+//!    endpoint the request addressed, and the refusal names the DOCUMENT that decided it.**
+//!    The key is a property of the request rather than of the resource, so it is answered
+//!    whichever action is judged and whichever resource that action addresses — an object, the
+//!    bucket itself, or no resource at all for an action published with no resource types. And
+//!    the reason clause of the 403 says which decision refused the call: IAM words ` with an
+//!    explicit deny in an identity-based policy` where a `Deny` statement of the principal's
+//!    own documents matched, and `because no identity-based policy allows the <action> action`
+//!    only where nothing granted the action (IAM User Guide, *Policy evaluation logic*) — the
+//!    whole remediation signal, since the first says a statement has to be satisfied and the
+//!    second that a grant is missing.
 //!
 //! Every assertion drives real HTTP requests through a router holding S3 beside the two
 //! services such a decision reads from — IAM (the role, the same-named user and their
@@ -48,10 +59,19 @@
 //! principal value and which credential presents itself against it; and for rule 3 the
 //! operation, the shape of the bucket name (the published 3-character minimum and
 //! 63-character maximum, a dotted name, a digit-bearing one) and whether the name never held
-//! a bucket or held one that was deleted.
+//! a bucket or held one that was deleted; and for rule 4 the OPERATION and with it the shape
+//! of the resource the decision is taken over (an object, the bucket, none), which Region the
+//! call addresses, and which of the two refusals the Region clause produces — the grant
+//! withheld by the clause, and a `Deny` the clause turned on over a grant that is present.
 
 use serde_json::{json, Value};
 
+// What a dispatched request answered, read through the one `Answer` this test binary already
+// states — its status and the `<Code>` / `<Message>` of an error document.
+use super::bucket_lifecycle::Answer;
+// The ARN form a BUCKET itself is named by, stated once by the suite that names a bucket as an
+// analytics destination.
+use super::bucket_analytics_configuration::bucket_arn;
 // The element a bucket-scoped error document names the bucket by, stated once by the suite
 // that pins the BUCKET-configuration half of the same rule.
 use super::bucket_error_envelope::BUCKET_NAME_ELEMENT;
@@ -65,9 +85,13 @@ use super::role_session_object_authorization::{
     identity_document, no_grant, object_arn, IDENTITY_DENY,
 };
 // The three-service harness — S3 beside IAM and STS over one engine, with the Region of each
-// request in its credential scope — and the two assertions every authorization row of this
-// test binary is judged by.
-use super::session_policy_condition_keys::{assert_refused, assert_served, Emulator, ACCOUNT_KEY};
+// request in its credential scope — the credential a row calls with, and the assertions every
+// authorization row of this test binary is judged by: a served call, a refusal naming the
+// resource it addressed, and one naming none.
+use super::session_policy_condition_keys::{
+    assert_refused, assert_refused_without_resource, assert_served, Credential, Emulator,
+    ACCOUNT_KEY,
+};
 
 /// The Region a rule-1 clause names first, and the one rules 2 and 3 place their fixtures in.
 /// Deliberately NOT `us-east-1`: that Region is what a request carrying no parseable
@@ -142,12 +166,24 @@ enum RegionPolicy {
 }
 
 impl RegionPolicy {
-    /// The identity-based document this form builds, granting `action` on `resource`.
-    fn document(self, action: &str, resource: &str) -> String {
+    /// The identity-based document this form builds, granting `actions` on `resource`.
+    ///
+    /// ONE statement of how each form writes the clause, for the rule-1 rows (one action on one
+    /// object) and for the rule-4 table (every action the gate judges, on IAM's wildcard) alike,
+    /// so the two sections cannot drift apart in what the document says.
+    ///
+    /// The `Action` element is written in the spelling IAM's grammar gives for what it names: a
+    /// statement over ONE action states it as the bare string, and one over several as the list
+    /// of them — so both spellings are exercised rather than only the list.
+    fn document(self, actions: &[&str], resource: &str) -> String {
+        let named = match actions {
+            [one] => json!(one),
+            many => json!(many),
+        };
         let allow = |condition: Option<Value>| {
             let mut statement = json!({
                 "Effect": "Allow",
-                "Action": action,
+                "Action": named,
                 "Resource": resource,
             });
             if let Some(condition) = condition {
@@ -175,7 +211,7 @@ impl RegionPolicy {
                 allow(None),
                 json!({
                     "Effect": "Deny",
-                    "Action": action,
+                    "Action": named,
                     "Resource": resource,
                     "Condition": {"StringEquals": {"aws:RequestedRegion": OTHER_REGION}},
                 }),
@@ -340,7 +376,7 @@ async fn an_aws_requested_region_clause_in_the_roles_own_policy_gates_the_sessio
         let (role_arn, _) = emulator
             .create_role(
                 &format!("region-gated-role-{index}"),
-                &policy.document(action, &resource),
+                &policy.document(&[action], &resource),
             )
             .await;
         // No session policy: the clause under test lives in the role's OWN document, which is
@@ -816,5 +852,267 @@ async fn an_object_plane_refusal_names_the_bucket_the_request_addressed() {
             "case {case:?}: expected the <{BUCKET_NAME_ELEMENT}> to name {bucket:?}, got {:?}",
             answer.element(BUCKET_NAME_ELEMENT)
         );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// RULE 4: every decision this gate takes answers `aws:RequestedRegion` from the endpoint the
+// request addressed, and the refusal's reason clause names the document that decided it.
+// ---------------------------------------------------------------------------
+
+/// The IAM action a delete that names no version is authorized under: "`s3:DeleteObject` — to
+/// delete an object (or add a delete marker)" (`DeleteObject`'s own documentation of the
+/// permissions a delete needs).
+const DELETE_OBJECT: &str = "s3:DeleteObject";
+
+/// The IAM action a listing of one bucket's objects is authorized under: "you must have READ
+/// access to the bucket" — `s3:ListBucket` (`ListObjectsV2`'s own documentation of its general
+/// purpose bucket permissions). The decision is taken over the BUCKET's own ARN.
+const LIST_BUCKET: &str = "s3:ListBucket";
+
+/// The IAM action the ACCOUNT's own bucket listing is authorized under: "to grant IAM
+/// permission to use this operation, you must add the `s3:ListAllMyBuckets` policy action"
+/// (`ListBuckets`'s own documentation). The action supports no resource types, so the decision
+/// is taken over IAM's wildcard and the refusal names no resource.
+const LIST_ALL_MY_BUCKETS: &str = "s3:ListAllMyBuckets";
+
+/// Every call the rule-4 table drives, one per shape of resource the gate decides over.
+const GATED_CALLS: &[GatedCall] = &[
+    GatedCall::Write,
+    GatedCall::Read,
+    GatedCall::Delete,
+    GatedCall::ListObjects,
+    GatedCall::ListBuckets,
+];
+
+/// The only `Resource` element that can grant an action published with no resource types, and
+/// the one the rule-4 documents are written against so that a single statement covers the
+/// object, the bucket and the account-wide action alike.
+const ACCOUNT_WIDE_RESOURCE: &str = "*";
+
+/// Every action the calls of [`GATED_CALLS`] are judged under, read off the table itself, which
+/// is what the one statement of each role's document has to cover: derived rather than listed,
+/// so a call added to the table is granted by construction.
+fn gated_actions() -> Vec<&'static str> {
+    GATED_CALLS.iter().map(|call| call.action()).collect()
+}
+
+/// Which call a rule-4 row makes. One per SHAPE of resource the gate decides over — an object,
+/// the bucket itself, and no resource at all — because the Region the request addressed is a
+/// property of the request rather than of the resource, so the same clause has to decide each
+/// of them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GatedCall {
+    /// `PutObject`, judged over the object's ARN.
+    Write,
+    /// `GetObject`, over the same ARN under the read action.
+    Read,
+    /// `DeleteObject`, which answers `204 No Content` when it is served.
+    Delete,
+    /// `ListObjectsV2`, judged over the BUCKET's ARN rather than an object's.
+    ListObjects,
+    /// `ListBuckets`, the account's own listing, which addresses no resource at all.
+    ListBuckets,
+}
+
+impl GatedCall {
+    /// What to call this call in a failure, and the tag its row's object key carries.
+    fn label(self) -> &'static str {
+        match self {
+            Self::Write => "PutObject",
+            Self::Read => "GetObject",
+            Self::Delete => "DeleteObject",
+            Self::ListObjects => "ListObjectsV2",
+            Self::ListBuckets => "ListBuckets",
+        }
+    }
+
+    /// The IAM action this call is authorized under.
+    fn action(self) -> &'static str {
+        match self {
+            Self::Write => PUT_OBJECT,
+            Self::Read => GET_OBJECT,
+            Self::Delete => DELETE_OBJECT,
+            Self::ListObjects => LIST_BUCKET,
+            Self::ListBuckets => LIST_ALL_MY_BUCKETS,
+        }
+    }
+
+    /// The HTTP method the operation is bound to.
+    fn method(self) -> &'static str {
+        match self {
+            Self::Write => "PUT",
+            Self::Delete => "DELETE",
+            _ => "GET",
+        }
+    }
+
+    /// The path and query the operation is addressed by.
+    fn uri(self, bucket: &str, key: &str) -> String {
+        match self {
+            Self::Write | Self::Read | Self::Delete => format!("/{bucket}/{key}"),
+            Self::ListObjects => format!("/{bucket}?list-type=2"),
+            Self::ListBuckets => "/?x-id=ListBuckets".to_string(),
+        }
+    }
+
+    /// The bytes the request carries: the payload of a write, and nothing for every other.
+    fn body(self) -> &'static [u8] {
+        match self {
+            Self::Write => BODY,
+            _ => b"",
+        }
+    }
+
+    /// The status the operation answers when the policies in force leave the call alone: a
+    /// delete reports "204 No Content", every other call here 200.
+    fn served_status(self) -> u16 {
+        match self {
+            Self::Delete => 204,
+            _ => 200,
+        }
+    }
+
+    /// Whether the call addresses an object that has to be there first.
+    fn needs_fixture(self) -> bool {
+        matches!(self, Self::Read | Self::Delete)
+    }
+
+    /// The resource the decision about this call is taken over, and which a refusal names:
+    /// the object's ARN, the bucket's, or NONE for the account's own listing.
+    fn resource(self, bucket: &str, key: &str) -> Option<String> {
+        match self {
+            Self::Write | Self::Read | Self::Delete => Some(object_arn(bucket, key)),
+            Self::ListObjects => Some(bucket_arn(bucket)),
+            Self::ListBuckets => None,
+        }
+    }
+}
+
+/// Assert `answer` is S3's `AccessDenied` refusal worded for `principal`, `action` and the
+/// clause `reason`, through the readings the harness already states: naming `resource` for an
+/// action that addresses one ([`assert_refused`]), and naming NO resource for an action
+/// published with none ([`assert_refused_without_resource`]).
+fn assert_gate_refused(
+    case: &str,
+    answer: &Answer,
+    principal: &str,
+    action: &str,
+    resource: Option<&str>,
+    reason: &str,
+) {
+    match resource {
+        Some(resource) => assert_refused(case, answer, principal, action, resource, reason),
+        None => assert_refused_without_resource(case, answer, principal, action, reason),
+    }
+}
+
+/// RULE 4: the Region the request addressed is answered for EVERY decision this gate takes, so
+/// one Region-conditioned statement in the role's own permissions policy gates every action the
+/// gate judges — over an object, over the bucket, and over the account-wide action that
+/// addresses no resource — and the refusal's reason clause names the document that decided it:
+/// the explicit-deny clause where a `Deny` the clause turned on matched, and the no-grant clause
+/// only where the conditioned grant withheld itself.
+#[tokio::test]
+async fn the_requested_region_clause_decides_every_action_this_gate_judges() {
+    let emulator = Emulator::new();
+    // One bucket per Region, so every call addresses a bucket that really lives in the Region
+    // it was sent to and nothing but the clause can decide the difference between the two legs.
+    for region in [PERMITTED_REGION, OTHER_REGION] {
+        emulator.create_bucket(&region_bucket(region), region).await;
+    }
+    // Two roles, each carrying one of the two rule-1 forms over every action of the table and
+    // IAM's wildcard resource, assumed once: the form whose clause decides the GRANT, and the
+    // one whose clause turns on a DENY beside a grant that is present. No session policy is
+    // passed: the clause under test lives in the role's OWN document.
+    let actions = gated_actions();
+    let (granting_role, _) = emulator
+        .create_role(
+            "region-gated-every-action",
+            &RegionPolicy::EqualsPermitted.document(&actions, ACCOUNT_WIDE_RESOURCE),
+        )
+        .await;
+    let granted = emulator
+        .assume(
+            "the conditioned grant",
+            &granting_role,
+            "granted-session",
+            None,
+        )
+        .await;
+    let (denying_role, _) = emulator
+        .create_role(
+            "region-denied-every-action",
+            &RegionPolicy::DeniedInOther.document(&actions, ACCOUNT_WIDE_RESOURCE),
+        )
+        .await;
+    let denied = emulator
+        .assume("the conditioned deny", &denying_role, "denied-session", None)
+        .await;
+
+    for call in GATED_CALLS.iter().copied() {
+        for region in [PERMITTED_REGION, OTHER_REGION] {
+            let bucket = region_bucket(region);
+            // The two documents, each with the clause the refusal in the away Region must be
+            // worded by: a conditioned grant withholds itself, so nothing granted the action; a
+            // conditioned deny matched, so a statement refused it.
+            let subjects: [(&str, &Credential, &str, String); 2] = [
+                (
+                    "the role's grant is conditioned on the permitted Region",
+                    &granted,
+                    "granted",
+                    no_grant(call.action()),
+                ),
+                (
+                    "the role grants broadly and denies in the other Region",
+                    &denied,
+                    "denied",
+                    IDENTITY_DENY.to_string(),
+                ),
+            ];
+            for (document, session, tag, reason) in subjects {
+                let case = format!("{} / {document} / addressed to {region}", call.label());
+                let key = format!("residency/{tag}-{}-{region}.bin", call.label());
+                // A read and a delete address an object, written as the ACCOUNT under a key of
+                // this row's own — so no row's outcome depends on another's, and the fixture is
+                // never what the row's document decided.
+                if call.needs_fixture() {
+                    emulator.write_fixture(&bucket, region, &key).await;
+                }
+                let answer = emulator
+                    .s3(
+                        &session.access_key_id,
+                        region,
+                        call.method(),
+                        &call.uri(&bucket, &key),
+                        call.body(),
+                    )
+                    .await;
+                if region == PERMITTED_REGION {
+                    // The Region both documents leave the call alone in, which is what makes
+                    // every refusal below the clause's rather than the bucket's or the Region's.
+                    match call.served_status() {
+                        200 => assert_served(&case, &answer),
+                        expected => assert_eq!(
+                            answer.status,
+                            expected,
+                            "case {case:?}: expected the call to be authorized with HTTP \
+                             {expected}, got {} with {:?}",
+                            answer.status,
+                            String::from_utf8_lossy(&answer.body)
+                        ),
+                    }
+                } else {
+                    assert_gate_refused(
+                        &case,
+                        &answer,
+                        &session.principal_arn,
+                        call.action(),
+                        call.resource(&bucket, &key).as_deref(),
+                        &reason,
+                    );
+                }
+            }
+        }
     }
 }

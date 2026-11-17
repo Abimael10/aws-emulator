@@ -72,21 +72,33 @@ async fn list_directory_buckets(
 }
 
 /// The sentence S3 refuses an action that addresses NO resource with: the principal that
-/// signed it, the action it asked for and IAM's clause for an absent grant. Written out here
-/// rather than built from the service's own helper, so the wording has something to be wrong
-/// about.
+/// signed it, the action it asked for and the `reason` clause naming the document that decided
+/// it. Written out here rather than built from the service's own helper, so the wording has
+/// something to be wrong about — and it carries no `on resource:` clause, there being no
+/// resource such an action addresses.
+///
+/// `pub(crate)`: the harness that asserts the refusals of a Region-conditioned document
+/// ([`super::session_policy_condition_keys`]) words this same sentence through this one
+/// statement of it rather than a second copy.
+pub(crate) fn account_wide_denial_message(principal: &str, action: &str, reason: &str) -> String {
+    format!("User: {principal} is not authorized to perform: {action} {reason}")
+}
+
+/// That sentence with IAM's clause for an absent grant.
 fn no_grant_message(principal: &str, action: &str) -> String {
-    format!(
-        "User: {principal} is not authorized to perform: {action} because no identity-based \
-         policy allows the {action} action"
+    account_wide_denial_message(
+        principal,
+        action,
+        &format!("because no identity-based policy allows the {action} action"),
     )
 }
 
 /// The sentence it refuses one an identity-based document explicitly DENIES with.
 fn explicit_deny_message(principal: &str, action: &str) -> String {
-    format!(
-        "User: {principal} is not authorized to perform: {action} with an explicit deny in an \
-         identity-based policy"
+    account_wide_denial_message(
+        principal,
+        action,
+        "with an explicit deny in an identity-based policy",
     )
 }
 
