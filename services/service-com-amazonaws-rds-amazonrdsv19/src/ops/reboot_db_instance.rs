@@ -232,6 +232,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // now and the clock owes it `available` once the outage is over.
         record.status = "rebooting".to_string();
         record.pending_status = Some(crate::state::PendingStatus::in_a_moment("available"));
+        // `ForceFailover`: "Specifies whether the reboot is conducted through a Multi-AZ
+        // failover" — the service PROMOTES the standby, so the instance comes back up in the
+        // zone its standby was in and its standby is in the zone it was in before. The
+        // promotion lands with the status the clock owes, because the failover is over when
+        // the instance is available again and not while it is still out
+        // ([`crate::state::DbInstanceRecord::promote_standby`]).
+        record.pending_failover = input.force_failover.unwrap_or(false);
         // "Some parameter changes can cause an outage and are applied on the next call to
         // RebootDBInstance": a modification staged for the maintenance window
         // (`ApplyImmediately` disabled) is applied by the restart this call performs, so

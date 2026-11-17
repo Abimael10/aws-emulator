@@ -788,6 +788,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // Filled in below, once the core has assigned the engine listener its port.
             served_endpoint: None,
             multi_az: input.multi_az.unwrap_or(false),
+            // The standby of a Multi-AZ deployment, placed below once the record carries the
+            // zone its primary is in; a reboot is what asks for a failover, so a newly
+            // created instance owes none.
+            secondary_availability_zone: None,
+            pending_failover: false,
             // `StorageThroughput` "applies only to the gp3 storage type", whose
             // baseline the instance is provisioned with when the request names none.
             storage_throughput: input
@@ -910,6 +915,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             "DB instance {} created with engine {}; status {}",
             record.identifier, record.engine, record.status
         ));
+        // `MultiAZ`: "Specifies whether the DB instance is a Multi-AZ deployment" — a
+        // deployment with a STANDBY, which sits in another Availability Zone of the
+        // instance's Region and is what `SecondaryAvailabilityZone` names. An instance
+        // created Single-AZ has none.
+        record.place_multi_az_standby();
         record
         };
 

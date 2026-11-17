@@ -27,16 +27,28 @@
 //! of the instance lifecycle and of the shard-group lifecycle, the statuses a start can
 //! arrive in, each engine family the command does not apply to, a cluster member, and
 //! shard groups created with different capacities and standby redundancy.
+//!
+//! The Multi-AZ suite at the end of this file polls the other lifecycle a client drives
+//! with a poll loop: the STANDBY of a Multi-AZ DB instance. A Multi-AZ deployment keeps a
+//! standby in another Availability Zone of its Region and reports that zone, and a reboot
+//! conducted through a Multi-AZ failover promotes the standby, so the instance that comes
+//! back `available` runs in the zone the standby was in and its standby is in the zone the
+//! primary was in. Its rows span Regions, engine families and both deployment options, and
+//! the standby is driven on and off through `ModifyDBInstance` as well — applied at once and
+//! staged for the window the next reboot applies.
 
 use std::time::{Duration, Instant};
 
-use service_com_amazonaws_rds_amazonrdsv19::state::start_db_instance_state_message;
+use service_com_amazonaws_rds_amazonrdsv19::state::{
+    region_availability_zones, start_db_instance_state_message,
+    FORCE_FAILOVER_REQUIRES_MULTI_AZ_MESSAGE,
+};
 use smithy_server_runtime::MultiServiceRouter;
 use tokio::time::sleep;
 
 use crate::db_engine_versions::all_versions_of;
 use crate::db_instances::{
-    call, emulator, expect_error, expect_ok, optional_text, subtrees, text, REGION,
+    call, call_in, emulator, expect_error, expect_ok, optional_text, subtrees, text, REGION,
 };
 
 /// How long a poll loop is given before this suite calls a transition unobservable.
@@ -949,5 +961,439 @@ async fn a_cluster_member_cannot_be_started_on_its_own() {
     assert!(
         message.contains("emu-life-member") && message.contains("emu-life-member-cluster"),
         "the refusal must name the instance and its cluster, got {message:?}"
+    );
+}
+
+/// One row of the Multi-AZ standby table.
+struct StandbyCase {
+    case: &'static str,
+    identifier: &'static str,
+    engine: &'static str,
+    class: &'static str,
+    /// The `AllocatedStorage` the create asks for.
+    storage: i32,
+    /// The Region the instance is created in, which its zones are named after.
+    region: &'static str,
+    /// Whether the create asks for a Multi-AZ deployment, which is the deployment that has
+    /// a standby.
+    multi_az: bool,
+}
+
+/// `DescribeDBInstances` in `region`, polled until the instance reports `available`, as the
+/// one `<DBInstance>` it settled on.
+async fn poll_available_in(
+    router: &MultiServiceRouter,
+    region: &str,
+    case: &str,
+    identifier: &str,
+) -> String {
+    let params = params!["DBInstanceIdentifier" => identifier];
+    let (body, _polls) = poll_until(
+        case,
+        &format!("{identifier} reaching available in {region}"),
+        || call_in(router, region, "DescribeDBInstances", &params),
+        |http_status, body| {
+            http_status == 200
+                && optional_text(&the_instance(case, body), "DBInstanceStatus").as_deref()
+                    == Some("available")
+        },
+    )
+    .await;
+    the_instance(case, &body)
+}
+
+/// The deployment an instance reports: whether it is Multi-AZ, the zone its primary runs in
+/// and the zone its standby runs in, the last of which a Single-AZ deployment reports not at
+/// all.
+fn deployment(instance: &str) -> (String, String, Option<String>) {
+    (
+        text(instance, "MultiAZ"),
+        text(instance, "AvailabilityZone"),
+        optional_text(instance, "SecondaryAvailabilityZone"),
+    )
+}
+
+/// `RebootDBInstance`, optionally through a Multi-AZ failover, as the one `<DBInstance>` the
+/// accepted call answered with.
+async fn reboot(
+    router: &MultiServiceRouter,
+    region: &str,
+    case: &str,
+    identifier: &str,
+    force_failover: Option<bool>,
+) -> String {
+    let mut params: Vec<(&str, String)> =
+        params!["DBInstanceIdentifier" => identifier].to_vec();
+    if let Some(forced) = force_failover {
+        params.push(("ForceFailover", forced.to_string()));
+    }
+    let body = expect_ok(
+        case,
+        call_in(router, region, "RebootDBInstance", &params).await,
+    );
+    the_instance(case, &body)
+}
+
+#[tokio::test]
+async fn a_multi_az_db_instance_keeps_a_standby_zone_a_forced_failover_promotes() {
+    // The rows differ along what the rule generalises over: the Region the zones are named
+    // after, the engine family and instance class, the storage size, and both deployment
+    // options — the one with a standby and the one without.
+    let table: &[StandbyCase] = &[
+        StandbyCase {
+            case: "mysql Multi-AZ in the suite's own Region",
+            identifier: "emu-standby-mysql",
+            engine: "mysql",
+            class: "db.t3.micro",
+            storage: 20,
+            region: REGION,
+            multi_az: true,
+        },
+        StandbyCase {
+            case: "postgres Multi-AZ in another Region",
+            identifier: "emu-standby-postgres",
+            engine: "postgres",
+            class: "db.m5.large",
+            storage: 100,
+            region: "eu-west-1",
+            multi_az: true,
+        },
+        StandbyCase {
+            case: "oracle-se2 Multi-AZ, a licensed engine in a third Region",
+            identifier: "emu-standby-oracle",
+            engine: "oracle-se2",
+            class: "db.m5.xlarge",
+            storage: 40,
+            region: "ap-southeast-2",
+            multi_az: true,
+        },
+        StandbyCase {
+            case: "mariadb Single-AZ, which has no standby at all",
+            identifier: "emu-standby-mariadb",
+            engine: "mariadb",
+            class: "db.t3.small",
+            storage: 20,
+            region: REGION,
+            multi_az: false,
+        },
+    ];
+
+    for row in table {
+        // Each row gets its own emulator, so one row's transitions cannot settle for
+        // another.
+        let router = emulator();
+        let case = row.case;
+        // The zones of the row's Region, as this service's own catalogue publishes them —
+        // the standby is placed in one of them, never in a zone of another Region.
+        let zones = region_availability_zones(row.region);
+
+        let mut params: Vec<(&str, String)> = params![
+            "DBInstanceIdentifier" => row.identifier,
+            "Engine" => row.engine,
+            "DBInstanceClass" => row.class,
+            "AllocatedStorage" => row.storage,
+            "MasterUsername" => "emuadmin",
+        ]
+        .to_vec();
+        if row.multi_az {
+            params.push(("MultiAZ", "true".to_string()));
+        }
+        expect_ok(
+            case,
+            call_in(&router, row.region, "CreateDBInstance", &params).await,
+        );
+        let available = poll_available_in(&router, row.region, case, row.identifier).await;
+        let (multi_az, primary, standby) = deployment(&available);
+        assert_eq!(
+            multi_az,
+            row.multi_az.to_string(),
+            "case {case:?}: the settled instance must report the deployment the create asked \
+             for, got {multi_az:?}"
+        );
+        assert!(
+            zones.contains(&primary),
+            "case {case:?}: the primary must run in a zone of {}, got {primary:?}",
+            row.region
+        );
+
+        if !row.multi_az {
+            // A Single-AZ deployment has no standby, so it names none — and a failover
+            // through a reboot is the modelled refusal rather than a promotion of a standby
+            // that does not exist.
+            assert_eq!(
+                standby, None,
+                "case {case:?}: a Single-AZ instance must report no secondary zone, got \
+                 {standby:?}"
+            );
+            let refused = expect_error(
+                case,
+                call_in(
+                    &router,
+                    row.region,
+                    "RebootDBInstance",
+                    &params![
+                        "DBInstanceIdentifier" => row.identifier,
+                        "ForceFailover" => "true",
+                    ],
+                )
+                .await,
+                400,
+                "InvalidParameterValue",
+            );
+            assert_eq!(
+                text(&refused, "Message"),
+                FORCE_FAILOVER_REQUIRES_MULTI_AZ_MESSAGE,
+                "case {case:?}: the refusal must carry the service's own sentence, got {refused}"
+            );
+            // A plain reboot still restarts it, and restarting a Single-AZ instance places
+            // no standby.
+            reboot(&router, row.region, case, row.identifier, None).await;
+            let rebooted = poll_available_in(&router, row.region, case, row.identifier).await;
+            assert_eq!(
+                deployment(&rebooted),
+                (multi_az, primary, None),
+                "case {case:?}: a plain reboot must leave a Single-AZ instance's placement \
+                 alone, got {rebooted}"
+            );
+            continue;
+        }
+
+        let standby = standby.unwrap_or_else(|| {
+            panic!("case {case:?}: a Multi-AZ instance must report a secondary zone: {available}")
+        });
+        assert_ne!(
+            standby, primary,
+            "case {case:?}: the standby must be in another zone than the primary, got \
+             {standby:?} for both"
+        );
+        assert!(
+            zones.contains(&standby),
+            "case {case:?}: the standby must run in a zone of {}, got {standby:?}",
+            row.region
+        );
+
+        // A reboot conducted through a Multi-AZ failover is accepted, and the instance it
+        // answers with is still out and still in the zone pair it had: the promotion is part
+        // of coming back up.
+        let answered = reboot(&router, row.region, case, row.identifier, Some(true)).await;
+        assert_eq!(
+            text(&answered, "DBInstanceStatus"),
+            "rebooting",
+            "case {case:?}: an accepted reboot must answer `rebooting`, got {answered}"
+        );
+        assert_eq!(
+            deployment(&answered),
+            ("true".to_string(), primary.clone(), Some(standby.clone())),
+            "case {case:?}: the failover is not complete while the instance is out, so the \
+             accepted call must still report the pair it had, got {answered}"
+        );
+
+        // Once it is available again the standby has been PROMOTED: the instance runs where
+        // the standby ran, and its standby is where the primary ran.
+        let failed_over = poll_available_in(&router, row.region, case, row.identifier).await;
+        assert_eq!(
+            deployment(&failed_over),
+            ("true".to_string(), standby.clone(), Some(primary.clone())),
+            "case {case:?}: after the forced failover the primary must be the former standby \
+             zone {standby:?} and the standby the former primary zone {primary:?}, got \
+             {failed_over}"
+        );
+
+        // The promotion is the whole of the change, so a second forced failover brings the
+        // pair back: it is the two zones trading places, not a zone being invented.
+        reboot(&router, row.region, case, row.identifier, Some(true)).await;
+        let failed_back = poll_available_in(&router, row.region, case, row.identifier).await;
+        assert_eq!(
+            deployment(&failed_back),
+            ("true".to_string(), primary.clone(), Some(standby.clone())),
+            "case {case:?}: a second forced failover must trade the zones back, got \
+             {failed_back}"
+        );
+
+        // A reboot that does NOT ask for a failover promotes nothing: the standby stays
+        // where it is.
+        reboot(&router, row.region, case, row.identifier, Some(false)).await;
+        let restarted = poll_available_in(&router, row.region, case, row.identifier).await;
+        assert_eq!(
+            deployment(&restarted),
+            ("true".to_string(), primary.clone(), Some(standby.clone())),
+            "case {case:?}: a reboot without a failover must leave the placement alone, got \
+             {restarted}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn modifying_multi_az_places_and_removes_the_standby() {
+    let router = emulator();
+    let case = "mysql modified in and out of a Multi-AZ deployment";
+    let identifier = "emu-standby-modified";
+    let zones = region_availability_zones(REGION);
+
+    expect_ok(
+        case,
+        call(
+            &router,
+            "CreateDBInstance",
+            &params![
+                "DBInstanceIdentifier" => identifier,
+                "Engine" => "mysql",
+                "DBInstanceClass" => "db.t3.micro",
+                "AllocatedStorage" => 20,
+                "MasterUsername" => "emuadmin",
+            ],
+        )
+        .await,
+    );
+    let single = poll_available_in(&router, REGION, case, identifier).await;
+    let (_, primary, standby) = deployment(&single);
+    assert_eq!(
+        standby, None,
+        "case {case:?}: an instance created Single-AZ must report no secondary zone, got \
+         {standby:?}"
+    );
+
+    // Turning Multi-AZ on gives the instance a standby, in another zone of its Region.
+    let modified = expect_ok(
+        case,
+        call(
+            &router,
+            "ModifyDBInstance",
+            &params![
+                "DBInstanceIdentifier" => identifier,
+                "MultiAZ" => "true",
+                "ApplyImmediately" => "true",
+            ],
+        )
+        .await,
+    );
+    let turned_on = poll_available_in(&router, REGION, case, identifier).await;
+    for (what, instance) in [("the answer", &modified), ("the settled read", &turned_on)] {
+        let instance = the_instance(case, instance);
+        let (multi_az, now_primary, now_standby) = deployment(&instance);
+        assert_eq!(
+            (multi_az.as_str(), now_primary.as_str()),
+            ("true", primary.as_str()),
+            "case {case:?}: {what} must report the Multi-AZ deployment on the zone the \
+             instance already ran in, got {instance}"
+        );
+        let placed = now_standby.unwrap_or_else(|| {
+            panic!("case {case:?}: {what} must report a secondary zone: {instance}")
+        });
+        assert!(
+            placed != primary && zones.contains(&placed),
+            "case {case:?}: {what} must place the standby in another zone of {REGION}, got \
+             {placed:?}"
+        );
+    }
+
+    // And a failover is now something the instance can be rebooted through.
+    reboot(&router, REGION, case, identifier, Some(true)).await;
+    let failed_over = poll_available_in(&router, REGION, case, identifier).await;
+    let (_, promoted_primary, promoted_standby) = deployment(&failed_over);
+    assert_eq!(
+        promoted_standby.as_deref(),
+        Some(primary.as_str()),
+        "case {case:?}: the forced failover must leave the former primary {primary:?} as the \
+         standby, got {failed_over}"
+    );
+    assert_ne!(
+        promoted_primary, primary,
+        "case {case:?}: the forced failover must promote the standby, got {failed_over}"
+    );
+
+    // Turning Multi-AZ off takes the standby away: there is no second zone to report.
+    let turned_off = expect_ok(
+        case,
+        call(
+            &router,
+            "ModifyDBInstance",
+            &params![
+                "DBInstanceIdentifier" => identifier,
+                "MultiAZ" => "false",
+                "ApplyImmediately" => "true",
+            ],
+        )
+        .await,
+    );
+    assert_eq!(
+        deployment(&the_instance(case, &turned_off)),
+        ("false".to_string(), promoted_primary.clone(), None),
+        "case {case:?}: turning Multi-AZ off must leave the instance with no standby, got \
+         {turned_off}"
+    );
+    let single_again = poll_available_in(&router, REGION, case, identifier).await;
+    assert_eq!(
+        deployment(&single_again),
+        ("false".to_string(), promoted_primary.clone(), None),
+        "case {case:?}: the settled Single-AZ instance must report no standby, got \
+         {single_again}"
+    );
+    expect_error(
+        case,
+        call(
+            &router,
+            "RebootDBInstance",
+            &params![
+                "DBInstanceIdentifier" => identifier,
+                "ForceFailover" => "true",
+            ],
+        )
+        .await,
+        400,
+        "InvalidParameterValue",
+    );
+
+    // A modification the caller did not ask to apply immediately is STAGED: the instance
+    // still has no standby, and the reboot that applies the staged settings is what places
+    // one.
+    let staged = expect_ok(
+        case,
+        call(
+            &router,
+            "ModifyDBInstance",
+            &params![
+                "DBInstanceIdentifier" => identifier,
+                "MultiAZ" => "true",
+            ],
+        )
+        .await,
+    );
+    let staged_instance = the_instance(case, &staged);
+    assert_eq!(
+        deployment(&staged_instance),
+        ("false".to_string(), promoted_primary.clone(), None),
+        "case {case:?}: a staged modification must leave the running deployment alone, got \
+         {staged}"
+    );
+    let pending = subtrees(&staged_instance, "PendingModifiedValues");
+    assert_eq!(
+        pending.len(),
+        1,
+        "case {case:?}: the staged modification must be reported as pending, got {staged}"
+    );
+    assert_eq!(
+        text(&pending[0], "MultiAZ"),
+        "true",
+        "case {case:?}: the pending values must name the staged deployment, got {staged}"
+    );
+    // The staged modification left the instance `modifying`; the reboot that applies the
+    // staged settings is one the instance has to be available for.
+    poll_available_in(&router, REGION, case, identifier).await;
+    reboot(&router, REGION, case, identifier, None).await;
+    let applied = poll_available_in(&router, REGION, case, identifier).await;
+    let (multi_az, applied_primary, applied_standby) = deployment(&applied);
+    assert_eq!(
+        (multi_az.as_str(), applied_primary.as_str()),
+        ("true", promoted_primary.as_str()),
+        "case {case:?}: the reboot must apply the staged deployment, got {applied}"
+    );
+    let placed = applied_standby.unwrap_or_else(|| {
+        panic!("case {case:?}: the applied deployment must report a secondary zone: {applied}")
+    });
+    assert!(
+        placed != applied_primary && zones.contains(&placed),
+        "case {case:?}: the applied deployment must place the standby in another zone of \
+         {REGION}, got {placed:?}"
     );
 }

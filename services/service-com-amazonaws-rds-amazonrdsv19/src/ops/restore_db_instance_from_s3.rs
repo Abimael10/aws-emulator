@@ -709,6 +709,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 served_endpoint: None,
                 // "By default, the new DB instance is created as a Single-AZ deployment."
                 multi_az: input.multi_az.unwrap_or(false),
+                // The standby of a Multi-AZ deployment, placed below from the zone the
+                // restored instance's primary is in; a restore owes no failover.
+                secondary_availability_zone: None,
+                pending_failover: false,
                 storage_throughput: input
                     .storage_throughput
                     .unwrap_or_else(|| crate::state::default_storage_throughput(&storage_type)),
@@ -834,6 +838,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 "DB instance {} restored from the Amazon S3 bucket {}; status {}",
                 record.identifier, input.s3_bucket_name, record.status
             ));
+            // `MultiAZ`: an instance restored as a Multi-AZ deployment has a STANDBY in
+            // another Availability Zone of its Region, which is what
+            // `SecondaryAvailabilityZone` names; a Single-AZ one has none.
+            record.place_multi_az_standby();
             record
         };
 

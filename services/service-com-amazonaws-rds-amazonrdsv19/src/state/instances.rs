@@ -7,6 +7,25 @@ use super::*;
 /// the credential itself is never published and the value stands in for it.
 pub const MASKED_PENDING_MASTER_USER_PASSWORD: &str = "****";
 
+/// The Availability Zone the standby of a Multi-AZ DB instance in `region` is placed in,
+/// given the zone its primary runs in; `None` for an instance that is not a Multi-AZ
+/// deployment, which has no standby at all.
+///
+/// Source: `DBInstance$SecondaryAvailabilityZone` — "the name of the secondary Availability
+/// Zone for a DB instance with multi-AZ support" — reported for a Multi-AZ deployment,
+/// whose standby is in a DIFFERENT zone of the same Region from its primary. WHICH of the
+/// Region's other zones holds it is the service's own choice; this emulator takes the first
+/// zone of the Region that is not the primary's ([`region_availability_zones`]), as it takes
+/// the Region's first zone for a primary the request placed nowhere.
+pub fn standby_availability_zone(region: &str, primary: &str, multi_az: bool) -> Option<String> {
+    if !multi_az {
+        return None;
+    }
+    region_availability_zones(region)
+        .into_iter()
+        .find(|zone| zone != primary)
+}
+
 /// A stored DB instance: everything the service persists about it.
 ///
 /// The ARN, the endpoint DNS name and the hosted zone id are NOT stored as text:
@@ -59,12 +78,28 @@ pub struct DbInstanceRecord {
     /// the DNS-form endpoint and the configured port.
     pub served_endpoint: Option<ServedEndpoint>,
     pub multi_az: bool,
+    /// Whether the instance owes a Multi-AZ FAILOVER: a reboot was conducted "through a
+    /// Multi-AZ failover" (`RebootDBInstanceMessage$ForceFailover`), so the standby is
+    /// promoted as the instance comes back up and the two zones trade places
+    /// ([`Self::promote_standby`]). `false` for an instance with no failover owed, which is
+    /// every instance between reboots.
+    pub pending_failover: bool,
     pub storage_type: String,
     pub storage_encrypted: bool,
     pub kms_key_id: Option<String>,
     pub iops: Option<i32>,
     pub license_model: Option<String>,
     pub availability_zone: String,
+    /// `SecondaryAvailabilityZone` — "If present, specifies the name of the secondary
+    /// Availability Zone for a DB instance with multi-AZ support": the zone this instance's
+    /// STANDBY sits in.
+    ///
+    /// It is another zone of [`Self::region`] than [`Self::availability_zone`] — a Multi-AZ
+    /// deployment keeps its standby in a different zone from its primary, which is what
+    /// makes it one — and `None` exactly when [`Self::multi_az`] is false, since a Single-AZ
+    /// deployment has no standby to name. [`Self::place_multi_az_standby`] is what keeps the
+    /// two in step.
+    pub secondary_availability_zone: Option<String>,
     pub backup_retention_period: i32,
     pub preferred_backup_window: Option<String>,
     pub preferred_maintenance_window: Option<String>,
@@ -180,6 +215,14 @@ impl DbInstanceRecord {
                 self.engine_log
                     .record(format!("DB instance status is now {status}"));
                 self.status = status;
+                // A reboot "conducted through a Multi-AZ failover" promotes the standby, and
+                // the promotion is part of coming back up: the zones have traded places by
+                // the time the instance reports itself available again, never while it is
+                // still out.
+                if self.pending_failover {
+                    self.pending_failover = false;
+                    self.promote_standby();
+                }
             }
             Some(PendingChange::Removal) => return true,
             // Unreachable: the change was there a line ago, under this one `&mut self`.
@@ -229,6 +272,53 @@ impl DbInstanceRecord {
             }
             None => false,
         }
+    }
+
+    /// Place this instance's Multi-AZ standby, or take it away: a Multi-AZ deployment has a
+    /// standby in another Availability Zone of its own Region and names that zone, and a
+    /// Single-AZ deployment has no standby and names none.
+    ///
+    /// Call it wherever `MultiAZ` is set — a create, a restore, a replica, a modification —
+    /// so the setting and the zone pair cannot drift apart. A standby already placed in a
+    /// zone of this Region other than the primary's STAYS where it is, so a failover that
+    /// moved the pair is not undone by the next request that sets `MultiAZ` again.
+    pub fn place_multi_az_standby(&mut self) {
+        let already_placed = self
+            .secondary_availability_zone
+            .as_deref()
+            .is_some_and(|zone| {
+                zone != self.availability_zone
+                    && region_availability_zones(&self.region)
+                        .iter()
+                        .any(|known| known == zone)
+            });
+        if self.multi_az && already_placed {
+            return;
+        }
+        self.secondary_availability_zone =
+            standby_availability_zone(&self.region, &self.availability_zone, self.multi_az);
+    }
+
+    /// Turn Multi-AZ on or off, placing or removing the standby with it: the deployment a
+    /// `MultiAZ` setting asks for is the one with a standby, so the two are set together.
+    pub fn set_multi_az(&mut self, multi_az: bool) {
+        self.multi_az = multi_az;
+        self.place_multi_az_standby();
+    }
+
+    /// Promote the standby to primary, which is what a Multi-AZ failover DOES: the instance
+    /// runs in the zone its standby was in, and its standby is in the zone the former
+    /// primary was in.
+    ///
+    /// Returns whether anything was promoted — `false` for an instance with no standby,
+    /// whose placement is left alone.
+    pub fn promote_standby(&mut self) -> bool {
+        let Some(standby) = self.secondary_availability_zone.take() else {
+            return false;
+        };
+        self.secondary_availability_zone =
+            Some(::std::mem::replace(&mut self.availability_zone, standby));
+        true
     }
 
     /// Whether a delete has already been accepted for this instance, so it is on its
@@ -551,6 +641,11 @@ impl DbInstanceRecord {
                     .collect(),
             ),
             availability_zone: Some(self.availability_zone.clone()),
+            // `SecondaryAvailabilityZone`: "If present, specifies the name of the secondary
+            // Availability Zone for a DB instance with multi-AZ support" — the zone the
+            // instance's standby sits in, reported from the stored placement, and reported
+            // not at all for a Single-AZ deployment, which has no standby to name.
+            secondary_availability_zone: self.secondary_availability_zone.clone(),
             // The DB subnet group the instance was created in, as the GROUP's own record
             // reports it: its description, its VPC, its status and its `Subnets` — each
             // subnet with the Availability Zone the service that owns subnets answered

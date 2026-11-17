@@ -658,6 +658,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     .clone()
                     .unwrap_or_else(|| format!("{region}a")),
                 multi_az: input.multi_az.unwrap_or(false),
+                // The standby of a Multi-AZ replica, placed below from the replica's own
+                // zone — never inherited from the source, whose standby is the source's —
+                // and no failover is owed for an instance that has just been created.
+                secondary_availability_zone: None,
+                pending_failover: false,
                 storage_throughput: input
                     .storage_throughput
                     .unwrap_or(source.storage_throughput),
@@ -770,6 +775,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 replicates.describe(),
                 record.status
             ));
+            // `MultiAZ`: a replica created as a Multi-AZ deployment has a STANDBY of its
+            // own, in another Availability Zone of the Region it was created in, which is
+            // what `SecondaryAvailabilityZone` names; a Single-AZ replica has none.
+            record.place_multi_az_standby();
             (record, replicates)
         };
 
@@ -1287,6 +1296,10 @@ fn resolve_source_cluster(
         // "By default, the read replica is created as a Single-AZ deployment"; `MultiAZ` is
         // what asks for the other one.
         multi_az: false,
+        // A Single-AZ replica has no standby, and a replica created from these settings owes
+        // no failover.
+        secondary_availability_zone: None,
+        pending_failover: false,
         storage_throughput: crate::state::default_storage_throughput(&storage_type),
         storage_type,
         storage_encrypted: cluster.storage_encrypted,

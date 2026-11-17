@@ -164,7 +164,10 @@ impl DeferredModification {
             record.backup_retention_period = value;
         }
         if let Some(value) = self.multi_az {
-            record.multi_az = value;
+            // The standby goes with the setting: turning Multi-AZ on gives the instance one
+            // in another zone of its Region, and turning it off leaves it with none
+            // ([`DbInstanceRecord::set_multi_az`]).
+            record.set_multi_az(value);
         }
         if let Some(value) = self.storage_type {
             record.storage_type = value;

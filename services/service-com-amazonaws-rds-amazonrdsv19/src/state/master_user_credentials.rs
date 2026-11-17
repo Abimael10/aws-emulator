@@ -115,6 +115,8 @@ mod tests {
             endpoint_port: 3306,
             served_endpoint: None,
             multi_az: false,
+            secondary_availability_zone: None,
+            pending_failover: false,
             storage_type: "gp3".to_string(),
             storage_encrypted: false,
             kms_key_id: None,
