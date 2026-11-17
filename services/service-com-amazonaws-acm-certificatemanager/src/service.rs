@@ -48,17 +48,17 @@
 //! `acm.<region>.amazonaws.com`, whose first label names the service, and that is what
 //! the framework's route key resolves. Beside it, every managed ACME endpoint is given
 //! a URL on the Region's ACME ENROLLMENT host,
-//! `acm-acme-enroll.<region>.amazonaws.com` ([`crate::state::acme_endpoint_url`]),
+//! `acm-acme-enroll.<region>.<zone>` ([`crate::state::acme_endpoint_url`]),
 //! which is the URL `AcmeEndpoint$EndpointUrl` hands an ACME client and the address
 //! that client is configured with. A request to it has to reach THIS service rather
 //! than the control-plane resolver, which cannot name a service from the enrollment
 //! label and answers `404 UnknownService` — for a URL this service handed out.
 //!
-//! A caller that reached this emulator at its OWN endpoint resolves neither of those
-//! hostnames, so the same ACME surface is published to it on the endpoint it is already
-//! talking to, with the plane, the Region and the endpoint's id in the PATH
-//! ([`crate::state::acme_local_endpoint_base_url`]) — the addressing an ACME client that
-//! dials the advertised URL verbatim reaches.
+//! A caller that reached this emulator resolves no hostname of AWS's, so the enrollment
+//! name it is announced sits in the zone THIS emulator may announce a name of its own in
+//! and on the port the surface is served on
+//! ([`crate::state::announced_acme_enrollment_authority`]) — the same host FORM, which is
+//! what an ACME client that dials the advertised URL verbatim reaches.
 //!
 //! Three seams carry it, and nothing else changes:
 //!

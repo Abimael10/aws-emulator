@@ -32,7 +32,9 @@ use smithy_server_runtime::MultiServiceRouter;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::acme_account_registration::{external_account_binding, jws, AccountKey, Identification};
-use crate::acme_directory_endpoint::{activate_endpoints_now, create_endpoint, split_url};
+use crate::acme_directory_endpoint::{
+    activate_endpoints_now, create_endpoint, split_url, ENROLLMENT_LABEL,
+};
 use crate::acme_external_account_binding_lifecycle::create_binding;
 use crate::certificate_lifecycle::{call, router_with_engine, ACCOUNT, REGION};
 
@@ -223,16 +225,26 @@ async fn dialled(
 }
 
 /// The `host:port` and the path of a published `https://` URL, with the authority asserted
-/// to be an address on this machine — the only address a client here can reach. Loopback is
-/// read through the core's own predicate, so the assertion holds under any loopback bind.
+/// to be the Region's enrollment host in a zone that leads to THIS machine — the only
+/// address a client here can reach. The zone is read through the core's own loopback
+/// predicate, so the assertion holds under any loopback spelling.
 fn address(case: &str, url: &str) -> (String, String) {
     let (authority, path) = split_url(case, url);
     let (host, port) = authority
         .rsplit_once(':')
         .unwrap_or_else(|| panic!("case {case:?}: the published authority names no port: {authority}"));
+    let zone = host
+        .strip_prefix(&format!("{ENROLLMENT_LABEL}.{REGION}."))
+        .unwrap_or_else(|| {
+            panic!(
+                "case {case:?}: expected the published ACME host on \
+                 {ENROLLMENT_LABEL}.{REGION}.<zone>, got {host:?}"
+            )
+        });
     assert!(
-        emulator_server::is_loopback_host(host),
-        "case {case:?}: the published ACME address must be this machine's own, got {authority:?}"
+        emulator_server::is_loopback_host(zone),
+        "case {case:?}: the published ACME host must sit in a zone that leads to this \
+         machine, got {authority:?}"
     );
     assert!(
         port.parse::<u16>().is_ok_and(|port| port > 0),
@@ -292,16 +304,29 @@ async fn the_published_address_refuses_what_it_is_not_the_address_of() {
             404,
         ),
         (
-            "a traversal out of this plane's prefix",
+            "a traversal out of the path an ACME resource is published at",
             format!(
-                "GET /_aws/acm-acme-enroll/../../etc HTTP/1.1\r\nHost: {authority}\r\n\
-                 Connection: close\r\n\r\n"
+                "GET /{}/../../etc HTTP/1.1\r\nHost: {authority}\r\n\
+                 Connection: close\r\n\r\n",
+                path.trim_start_matches('/')
+                    .split('/')
+                    .next()
+                    .unwrap_or_default()
             ),
             400,
         ),
         (
             "a host this address does not serve",
             format!("GET {path} HTTP/1.1\r\nHost: attacker.example.com\r\nConnection: close\r\n\r\n"),
+            421,
+        ),
+        (
+            "the enrollment name in a zone this emulator announces nothing in, which only \
+             somebody else's resolver could point here",
+            format!(
+                "GET {path} HTTP/1.1\r\nHost: {ENROLLMENT_LABEL}.{REGION}.attacker.example.com\r\n\
+                 Connection: close\r\n\r\n"
+            ),
             421,
         ),
         (

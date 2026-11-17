@@ -25,8 +25,10 @@
 //! `hyper` server its sibling planes are served by, with the encoder's title-case option
 //! set, so every field name is written in the canonical spelling its specification states
 //! (`Replay-Nonce`, `Cache-Control`, `Location`, `Link`, `Content-Type`). The published
-//! `EndpointUrl` of every endpoint names that address, so a client that is handed it reads
-//! the fields RFC 8555 names under the names RFC 8555 gives them.
+//! `EndpointUrl` of every endpoint names that socket's PORT, under the Region's enrollment
+//! name in the zone this emulator may announce in
+//! ([`crate::state::announced_acme_enrollment_authority`]), so a client that is handed it
+//! reads the fields RFC 8555 names under the names RFC 8555 gives them.
 //!
 //! The encryption is negotiated IN BAND ([`::service_common::in_band_tls`]), so the one
 //! address serves both the `https://` an ACME client dials and a request made in the clear,
@@ -347,7 +349,14 @@ fn refused_before_dispatch(
     let Some(host) = sent("host").or_else(|| parts.uri.host()) else {
         return Some(plain(421, HOST_REQUIRED));
     };
-    if !::service_common::data_plane_addressing::host_names_the_bound_interface(host) {
+    // The addresses of the interface this emulator's listeners are bound on, and the
+    // enrollment name this service ANNOUNCES on this machine, which RFC 6761 reserves to
+    // that same interface ([`crate::state::addresses_announced_acme_host`]) — the name the
+    // published `EndpointUrl` carries. Any other host is one somebody else's resolver
+    // decides, which is what the rebinding guard refuses.
+    if !::service_common::data_plane_addressing::host_names_the_bound_interface(host)
+        && !crate::state::addresses_announced_acme_host(host)
+    {
         return Some(plain(421, HOST_NOT_ALLOWED));
     }
     if ::emulator_server::is_websocket_upgrade(sent("connection"), sent("upgrade"), sent(":protocol"))
@@ -364,15 +373,17 @@ fn refused_before_dispatch(
     ) {
         return Some(plain(403, reason));
     }
-    // A target that resolves out of the prefix naming the plane names another path
-    // entirely, and that prefix is the only thing that says whose surface must answer.
+    // A target that resolves out of the path an ACME resource is published at names another
+    // path entirely, and that path is the only thing that says whose surface must answer.
     let path = parts.uri.path();
     if ::service_common::data_plane_addressing::carries_a_dot_segment(path) {
         return Some(plain(400, NOT_A_REQUEST));
     }
-    // This socket is the address of ONE plane. A request addressing anything else is not
-    // forwarded at all: the control plane is reached at the emulator's own endpoint.
-    if !crate::state::addresses_acme_local_plane(path) {
+    // This socket is the address of ONE plane: the ACME resources of an endpoint, whose
+    // path is the endpoint's own id and the resource beneath it. A request addressing
+    // anything else is not forwarded at all — the control plane is reached at the
+    // emulator's own endpoint.
+    if crate::state::parse_acme_request_path(path).is_none() {
         return Some(plain(404, NO_SUCH_RESOURCE));
     }
     None

@@ -249,7 +249,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             None => {}
         }
 
-        store.account_configuration_requests.insert(
+        store.record_account_configuration_request(
             input.idempotency_token.clone(),
             crate::state::AccountConfigurationRequest {
                 expiry_events: requested.clone(),

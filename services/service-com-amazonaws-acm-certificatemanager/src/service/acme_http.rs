@@ -37,8 +37,9 @@
 //!
 //! * `GET <base>/directory` — the ACME directory resource (RFC 8555 §7.1.1): the
 //!   resource map a client starts from, every URL in it minted by
-//!   [`crate::state::acme_resource_url_at`] at the address the client reached this
-//!   surface on — the Region's enrollment host, or the emulator's own endpoint.
+//!   [`crate::state::acme_resource_url_on`] on the enrollment authority the client
+//!   addressed this surface at — AWS's own enrollment host for the Region, or the one this
+//!   emulator announces for it.
 //! * `HEAD <base>/new-nonce` -> `200`, `GET <base>/new-nonce` -> `204` — a fresh
 //!   anti-replay nonce in the `Replay-Nonce` header (RFC 8555 §7.2), recorded on the
 //!   endpoint so the POST that spends it can be checked.
@@ -366,17 +367,12 @@ impl<Eng: Send + Sync + 'static> AcmeHttpSurface<Eng> {
     /// method names the interaction — which is how an ACME server is addressed; there
     /// is no operation name on this wire.
     pub fn serve(&self, req: &RtRequest) -> RtResponse {
-        // Which endpoint's resource this request addresses, and the address it reached
-        // this surface on — the Region's published enrollment host, or the emulator's own
-        // endpoint. Every URL the answer carries is minted on that same address.
+        // Which endpoint's resource this request addresses, and the authority it addressed
+        // this surface at.
         let Some(addressed) = addressed_acme_resource(req) else {
             return problem(404, MALFORMED, NO_SUCH_RESOURCE);
         };
-        let (region, route, local) = (
-            addressed.region.as_str(),
-            &addressed.route,
-            addressed.local_endpoint.as_deref(),
-        );
+        let (region, route) = (addressed.region.as_str(), &addressed.route);
         let Some(resource) = resource_of(&route.resource) else {
             return problem(404, MALFORMED, NO_SUCH_RESOURCE);
         };
@@ -399,11 +395,22 @@ impl<Eng: Send + Sync + 'static> AcmeHttpSurface<Eng> {
             return problem(404, MALFORMED, NO_ACTIVE_ENDPOINT);
         }
 
-        let directory_url = state::acme_endpoint_url_at(local, region, &route.endpoint_id);
+        // The authority every URL this answer carries is minted on: one this service
+        // COMPOSED — the name it announces for the address it serves this surface at, or
+        // the authority it publishes that the request addressed — never the `Host` the
+        // request wrote ([`crate::state::minting_acme_authority`]).
+        let authority = state::minting_acme_authority(
+            region,
+            store.served_acme_address().as_deref(),
+            &addressed.authority,
+        );
+        let authority = authority.as_str();
+
+        let directory_url = state::acme_endpoint_url_on(authority, &route.endpoint_id);
         match (req.method(), resource) {
             // The directory is the one resource an ACME client fetches with a plain
             // `GET` (RFC 8555 §7.1.1); everything else on this wire is a JWS `POST`.
-            ("GET", AcmeResource::Directory) => directory(local, region, &route.endpoint_id),
+            ("GET", AcmeResource::Directory) => directory(authority, &route.endpoint_id),
             // `newNonce`: "the server MUST respond with a 200 (OK) to HEAD requests and
             // 204 (No Content) to GET requests" (RFC 8555 §7.2).
             ("HEAD", AcmeResource::NewNonce) => {
@@ -413,7 +420,7 @@ impl<Eng: Send + Sync + 'static> AcmeHttpSurface<Eng> {
                 nonce(204, &mut store, region, &route.endpoint_id, &directory_url)
             }
             ("POST", AcmeResource::Jws) => {
-                let mut answer = jws_interaction(&mut store, &addressed, req, now);
+                let mut answer = jws_interaction(&mut store, &addressed, authority, req, now);
                 // "The server MUST include a Replay-Nonce header field in every
                 // successful response to a POST request and SHOULD provide it in error
                 // responses as well" (RFC 8555 §6.5) — and MUST in a `badNonce` one,
@@ -446,17 +453,14 @@ enum Interaction {
 fn jws_interaction(
     store: &mut state::ComAmazonawsAcmCertificatemanagerState,
     addressed: &AddressedAcmeResource,
+    authority: &str,
     req: &RtRequest,
     now: SystemTime,
 ) -> RtResponse {
-    let (local, region, route) = (
-        addressed.local_endpoint.as_deref(),
-        addressed.region.as_str(),
-        &addressed.route,
-    );
+    let (region, route) = (addressed.region.as_str(), &addressed.route);
     let endpoint_arn = state::acme_endpoint_arn(region, &route.endpoint_id);
     let addressed_url =
-        state::acme_resource_url_at(local, region, &route.endpoint_id, &route.resource);
+        state::acme_resource_url_on(authority, &route.endpoint_id, &route.resource);
     // Which interaction this is. A resource this emulator performs no interaction for is
     // refused BEFORE the request is read, so each stays the one gap it is rather than
     // becoming a verdict on the client's JWS.
@@ -559,9 +563,15 @@ fn jws_interaction(
     }
 
     match interaction {
-        Interaction::NewAccount => {
-            new_account(store, addressed, &endpoint_arn, &addressed_url, &jws, now)
-        }
+        Interaction::NewAccount => new_account(
+            store,
+            addressed,
+            authority,
+            &endpoint_arn,
+            &addressed_url,
+            &jws,
+            now,
+        ),
         Interaction::Account(account_url) => {
             account_interaction(store, &endpoint_arn, &account_url, &jws)
         }
@@ -572,16 +582,13 @@ fn jws_interaction(
 fn new_account(
     store: &mut state::ComAmazonawsAcmCertificatemanagerState,
     addressed: &AddressedAcmeResource,
+    authority: &str,
     endpoint_arn: &str,
     addressed_url: &str,
     jws: &Jws,
     now: SystemTime,
 ) -> RtResponse {
-    let (local, region, route) = (
-        addressed.local_endpoint.as_deref(),
-        addressed.region.as_str(),
-        &addressed.route,
-    );
+    let (region, route) = (addressed.region.as_str(), &addressed.route);
     let SigningKey::Embedded(account_key) = &jws.key else {
         // Unreachable: the caller established that a registration embeds its key.
         return problem(400, MALFORMED, KEY_IDENTIFICATION);
@@ -654,10 +661,11 @@ fn new_account(
     let account = state::AcmeAccountRecord {
         acme_endpoint_arn: endpoint_arn.to_string(),
         // Server-assigned, under the same endpoint base URL the directory the client
-        // fetched is on, and carrying nothing the client sent.
-        account_url: state::acme_account_url_at(
-            local,
-            region,
+        // fetched is on, and carrying nothing the client sent: the authority is one this
+        // service composed ([`crate::state::minting_acme_authority`]) and the rest of the
+        // URL is the endpoint's own id and an id minted here.
+        account_url: state::acme_account_url_on(
+            authority,
             &route.endpoint_id,
             &::uuid::Uuid::new_v4().to_string(),
         ),
@@ -1048,19 +1056,18 @@ impl AcmeResource {
 /// The ACME directory resource of one endpoint: the map of the resources a client
 /// starts from (RFC 8555 §7.1.1).
 ///
-/// Every URL in it is built by [`crate::state::acme_resource_url_at`] from the endpoint's
-/// own id and Region at the address the client fetched this document from — the same
-/// function that minted the `EndpointUrl` it was handed — so the map a client follows
-/// stays on the address this service answered it on, and nothing in it comes from the
-/// request.
+/// Every URL in it is built by [`crate::state::acme_resource_url_on`] from the endpoint's
+/// own id on the authority the client fetched this document from — the same authority the
+/// `EndpointUrl` it was handed names — so the map a client follows stays on the address
+/// this service answered it on, and nothing in it comes from the request.
 ///
 /// The five members RFC 8555 §7.1.1 requires are present. The optional ones are not
 /// advertised: `newAuthz` belongs to pre-authorization, which no modelled operation
 /// configures, and `meta` (terms of service, website, CAA identities, whether an
 /// external account binding is required) would be claims about this CA that neither
 /// ACM's model nor its documentation states.
-fn directory(local: Option<&str>, region: &str, endpoint_id: &str) -> RtResponse {
-    let resource = |name: &str| state::acme_resource_url_at(local, region, endpoint_id, name);
+fn directory(authority: &str, endpoint_id: &str) -> RtResponse {
+    let resource = |name: &str| state::acme_resource_url_on(authority, endpoint_id, name);
     let document = ::serde_json::json!({
         "newNonce": resource(state::ACME_NEW_NONCE_RESOURCE),
         "newAccount": resource(state::ACME_NEW_ACCOUNT_RESOURCE),
@@ -1206,64 +1213,50 @@ fn bounded(value: &str) -> String {
         .collect()
 }
 
-/// Whether `req` addresses this service's ACME surface: the hostnames this service
-/// PUBLISHES in `AcmeEndpoint$EndpointUrl` for a client that resolves AWS's own hosts, or
-/// the reserved path the same surface is published at on the emulator's OWN endpoint.
+/// Whether `req` addresses this service's ACME surface: an ACME ENROLLMENT host, which is
+/// the only host form `AcmeEndpoint$EndpointUrl` is published on — AWS's own for the
+/// Region, or the one this emulator announces for it.
 pub fn addresses_acme_surface(req: &RtRequest) -> bool {
-    addresses_acme_surface_at(req.uri(), addressed_host_of_request(req))
+    addresses_acme_surface_at(addressed_host_of_request(req))
 }
 
 /// [`addresses_acme_surface`] for the buffered request parts `Service::can_handle` is
 /// handed, read by the same rule, so the claim and the answer cannot disagree about which
 /// requests this surface serves.
 pub fn addresses_acme_surface_of_parts(parts: &http::request::Parts) -> bool {
-    addresses_acme_surface_at(&parts.uri.to_string(), addressed_host_of_parts(parts))
+    addresses_acme_surface_at(addressed_host_of_parts(parts))
 }
 
-/// The one reading of that claim: the ACME plane's reserved path, whatever the host
-/// (which is how the surface is addressed on the emulator's own endpoint), else an
-/// enrollment host, whatever the path — a request to either is this service's to answer,
-/// including one whose path names no resource it publishes, which is answered with an
-/// ACME problem document rather than the front door's "unknown service".
-fn addresses_acme_surface_at(uri: &str, host: Option<&str>) -> bool {
-    state::addresses_acme_local_plane(request_path(uri))
-        || host.and_then(state::acme_enrollment_region).is_some()
+/// The one reading of that claim: an enrollment host, whatever the path — a request to one
+/// is this service's to answer, including one whose path names no resource it publishes,
+/// which is answered with an ACME problem document rather than the front door's "unknown
+/// service".
+fn addresses_acme_surface_at(host: Option<&str>) -> bool {
+    host.and_then(state::acme_enrollment_region).is_some()
 }
 
 /// What an ACME request addresses: the endpoint and resource it names, the Region that
-/// endpoint lives in, and the emulator's own endpoint it reached this surface on — `None`
-/// for a request addressed to the Region's published enrollment host, which is the
-/// address a client that resolves AWS's own hostnames holds.
+/// endpoint lives in, and the authority it addressed this surface at — which SELECTS the
+/// authority the answer's URLs are minted on ([`crate::state::minting_acme_authority`]) and
+/// is never itself published.
 #[derive(Debug)]
 struct AddressedAcmeResource {
     region: String,
     route: state::AcmeRequestPath,
-    local_endpoint: Option<String>,
+    authority: String,
 }
 
 /// Which endpoint's ACME resource `req` addresses, or `None` when it addresses none.
 ///
-/// The two addressings are the ones this surface publishes
-/// ([`crate::state::acme_resource_url_at`]): the reserved path on the emulator's own
-/// endpoint, read first because it names this plane explicitly whatever the host is, and
-/// the Region's enrollment host with the endpoint's id as the first path segment.
+/// The addressing is the one this surface publishes
+/// ([`crate::state::acme_resource_url_at`]): the Region's enrollment authority as the host,
+/// with the endpoint's id as the first path segment and the resource beneath it.
 fn addressed_acme_resource(req: &RtRequest) -> Option<AddressedAcmeResource> {
-    let host = addressed_host_of_request(req);
-    let path = request_path(req.uri());
-    if let Some((region, route)) = state::parse_acme_local_path(path) {
-        return Some(AddressedAcmeResource {
-            region,
-            route,
-            local_endpoint: ::service_common::data_plane_addressing::reached_emulator_endpoint(
-                req.uri(),
-                host,
-            ),
-        });
-    }
+    let host = addressed_host_of_request(req)?;
     Some(AddressedAcmeResource {
-        region: host.and_then(state::acme_enrollment_region)?.to_string(),
-        route: state::parse_acme_request_path(path)?,
-        local_endpoint: None,
+        region: state::acme_enrollment_region(host)?.to_string(),
+        route: state::parse_acme_request_path(request_path(req.uri()))?,
+        authority: host.to_string(),
     })
 }
 
