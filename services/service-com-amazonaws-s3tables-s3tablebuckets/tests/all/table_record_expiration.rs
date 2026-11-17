@@ -24,6 +24,16 @@
 //! carries, the `days` it retains records for (the modeled `@range(1,
 //! 2147483647)` bounds, and values between them), a configuration with no
 //! settings at all, the region, and which of the three operations is called.
+//!
+//! One more rule on that retention: the two ends of its modeled range are not
+//! answered alike. A day count below the minimum is a refusal of the request's
+//! shape, while a count above the maximum asks for the longest retention there
+//! is and so refuses nothing — it is read AS that maximum, and the operation's
+//! own gate is what decides the call. The recorded behaviour is the refusal half
+//! (the gate answers whatever the number), and reading the number as the maximum
+//! is what keeps the member at the `integer` the model gives it: no wider value
+//! can be stored or reported, so the rows below assert the capped retention a
+//! read reports as part of the same rule.
 
 use serde_json::{json, Map, Value};
 use service_com_amazonaws_s3tables_s3tablebuckets as s3tables;
@@ -42,6 +52,11 @@ const NOT_ALLOWED: &str = "Table record expiration configuration API calls to th
 
 /// The fixed sentence this service states a table the store does not hold with.
 const NO_TABLE: &str = "The specified table does not exist.";
+
+/// The longest retention the model declares for a table's records
+/// (`TableRecordExpirationSettings.days` targets `PositiveInteger`, `@range(1,
+/// 2147483647)`) — the retention a longer day count asks for.
+const LONGEST_RETENTION: i64 = 2_147_483_647;
 
 /// One row: the configuration a put carries, and what the reads must report for
 /// it once the table takes one.
@@ -463,7 +478,7 @@ async fn a_put_on_a_table_that_takes_one_is_reported_by_both_reads() {
 }
 
 #[tokio::test]
-async fn a_retention_outside_the_modeled_range_is_refused_and_persists_nothing() {
+async fn a_retention_below_the_modeled_minimum_is_refused_and_persists_nothing() {
     let emulator = Emulator::new();
     let table_arn = create_table(
         &emulator,
@@ -476,7 +491,9 @@ async fn a_retention_outside_the_modeled_range_is_refused_and_persists_nothing()
 
     // `PositiveInteger` is `@range(1, 2147483647)`: a day count below the
     // minimum is refused as client input before the handler runs, and nothing
-    // is persisted for the table.
+    // is persisted for the table. A day count ABOVE the maximum is the other
+    // end and refuses nothing — see
+    // [`a_retention_above_the_modeled_maximum_is_capped_and_the_table_gate_decides`].
     for days in [0, -1] {
         let refused = emulator
             .put_table_record_expiration_configuration(
@@ -522,6 +539,68 @@ async fn a_retention_outside_the_modeled_range_is_refused_and_persists_nothing()
             ),
             (Some("enabled".to_string()), Some(i64::from(days))),
             "case \"days={days}\": the read must report the stored retention"
+        );
+    }
+}
+
+/// The day counts above [`LONGEST_RETENTION`] a retention is read as that
+/// maximum from: one past it, a count no `i32` holds at all, a far larger one,
+/// and the largest number the wire carries.
+const LONGER_THAN_THE_LONGEST: [i64; 4] = [
+    LONGEST_RETENTION + 1,
+    4_294_967_296,
+    1_000_000_000_000,
+    i64::MAX,
+];
+
+#[tokio::test]
+async fn a_retention_above_the_modeled_maximum_is_capped_and_the_table_gate_decides() {
+    let emulator = Emulator::new();
+    let region = "us-east-1";
+    // One customer-created table (which takes no record-expiration
+    // configuration) and one Amazon Web Services manages (which does), so the
+    // same request is seen on both sides of the operation's own gate.
+    let customer = create_table(&emulator, region, "expiration-capped-own", "capped_own").await;
+    let managed = create_table(&emulator, region, "expiration-capped-aws", "capped_aws").await;
+    mark_managed(&emulator, &managed);
+
+    for days in LONGER_THAN_THE_LONGEST {
+        let case = format!("days={days}");
+        let value = json!({ "status": "enabled", "settings": { "days": days } });
+
+        // A day count longer than the longest retention there is refuses
+        // nothing: on a table that takes no configuration the eligibility gate
+        // decides the call, exactly as it does for a retention inside the
+        // range, and the refused put persists nothing.
+        let refused = emulator
+            .put_table_record_expiration_configuration(region, &customer, &value)
+            .await;
+        assert_not_allowed(&refused, &case, "PutTableRecordExpirationConfiguration");
+        assert_eq!(
+            stored_expiration(&emulator, &customer),
+            None,
+            "case {case:?}: the refused put must persist nothing, got {stored:?}",
+            stored = stored_expiration(&emulator, &customer)
+        );
+
+        // On a table that does take one the put is served, and the read reports
+        // the retention capped at the longest one the model declares.
+        let served = emulator
+            .put_table_record_expiration_configuration(region, &managed, &value)
+            .await;
+        assert_eq!(
+            served.status, 204,
+            "case {case:?}: the put must answer the modeled 204, got {status} {body}",
+            status = served.status,
+            body = served.body
+        );
+        let read = emulator
+            .get_table_record_expiration_configuration(region, &managed)
+            .await;
+        assert_eq!(
+            reported_configuration(&read, &case),
+            (Some("enabled".to_string()), Some(LONGEST_RETENTION)),
+            "case {case:?}: the read must report the retention capped at the modeled maximum"
         );
     }
 }

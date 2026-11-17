@@ -43,7 +43,7 @@
 //! shape="TableSummary,TableBucketSummary,NamespaceSummary,GetTableResponse")` reports it on
 //! each), so this service serves the model's `restJson1` codec with every timestamp in that
 //! form — `service_common::date_time_json`, which is where the whole workspace's rendering
-//! of such a member lives.
+//! of such a member lives — and with the one read [`record_expiration_retention`] replaces.
 //!
 //! The model-derived half of this service — its identity, wire protocol, routing
 //! table, and the default error renderers — lives in the generated `ServiceDefinition`
@@ -90,6 +90,11 @@ mod name_lookups;
 /// and the one choice this service makes about how that validator's envelope is
 /// stated.
 mod parameter_validation;
+
+/// The one modelled bound this service refuses no request for: the retention a
+/// record-expiration configuration names, read capped at the model's own maximum
+/// so the operation — not a request-validation refusal — decides such a call.
+mod record_expiration_retention;
 
 /// The one client-input error this service models: `BadRequestException`,
 /// `errorKind` client, `httpError` 400, one `message` member
@@ -162,24 +167,30 @@ const NAMESPACE_PARTS_MAX: i64 = 1;
 /// carried it.
 const STATUS_VALUES: [&str; 2] = ["enabled", "disabled"];
 
-/// The members a configuration of this service COUNTS in: every member the
-/// model targets at `PositiveInteger` (`@range(1, 2147483647)`)
-/// (`smithy_query(query="shape", shape="IcebergSnapshotManagementSettings,
-/// IcebergUnreferencedFileRemovalSettings,TableRecordExpirationSettings")`
-/// reports the target on each), and so the members the positive-integer sentence
-/// is stated for.
+/// The members a MAINTENANCE configuration of this service COUNTS in: the
+/// members the model targets at `PositiveInteger` (`@range(1, 2147483647)`)
+/// inside a maintenance task's settings (`smithy_query(query="shape",
+/// shape="IcebergSnapshotManagementSettings,
+/// IcebergUnreferencedFileRemovalSettings")` reports the target on each), and so
+/// the members the positive-integer sentence is stated for.
 ///
-/// `targetFileSizeMB` is the one other member of that shape, and it is
+/// `targetFileSizeMB` is the one other member of those shapes, and it is
 /// deliberately absent: S3 Tables compacts towards a narrower window of its own,
 /// and the sentence for a size outside it states that window, so the clause
 /// above this list is what states it. A bounded member of any OTHER shape (a
 /// page size, which the model bounds at a thousand) is not one of these either.
-const POSITIVE_INTEGER_MEMBERS: [&str; 5] = [
+///
+/// The retention a RECORD EXPIRATION configuration names
+/// (`TableRecordExpirationSettings.days`, bounded at the same range) is absent
+/// too, and for a different reason: S3 Tables states no sentence of its own for
+/// it. A retention below the minimum is the parameter validator's refusal, in
+/// that validator's envelope ([`parameter_validation`]), and a retention above
+/// the maximum is no refusal at all ([`record_expiration_retention`]).
+const POSITIVE_INTEGER_MEMBERS: [&str; 4] = [
     "minSnapshotsToKeep",
     "maxSnapshotAgeHours",
     "unreferencedDays",
     "nonCurrentDays",
-    "days",
 ];
 
 /// The input member a violation path names: its FIRST segment, so a value
@@ -340,9 +351,12 @@ fn stated_sentence(violation: &Violation) -> Option<String> {
         ("targetFileSizeMB", ViolationKind::MinValue(_) | ViolationKind::MaxValue(_)) => {
             Some(crate::state::invalid_compaction_file_size_message())
         }
-        // Every other member a configuration counts in: the model bounds each at
-        // the positive-integer range, and this service states a value outside
-        // that range by naming the member it was carried in.
+        // Every other member a MAINTENANCE configuration counts in: the model
+        // bounds each at the positive-integer range, and this service states a
+        // value outside that range by naming the member it was carried in. The
+        // retention a record-expiration configuration names is not one of them
+        // (see [`POSITIVE_INTEGER_MEMBERS`]), so it falls through to the
+        // validator's envelope below.
         (member, ViolationKind::MinValue(_) | ViolationKind::MaxValue(_))
             if POSITIVE_INTEGER_MEMBERS.contains(&member) =>
         {
@@ -361,7 +375,8 @@ fn stated_sentence(violation: &Violation) -> Option<String> {
 /// * a class this service validates itself — the names a create gives a
 ///   resource, the ARNs an operation is addressed by, the encryption, format and
 ///   metadata members it will not act on, and the members of a configuration's
-///   value (its status, its compaction strategy, the numbers it counts in) — is
+///   value (its status, its compaction strategy, the numbers a maintenance task
+///   counts in) — is
 ///   the service's own refusal: its modelled `BadRequestException`, worded with
 ///   the one sentence it states that class with;
 /// * every other class is refused by the parameter validator in front of the
@@ -416,7 +431,7 @@ pub struct EmulatedService<Eng: Send + Sync + 'static> {
     gated: smithy_server_runtime::OperationRoutingTable,
     /// This service's wire protocol, built ONCE here because
     /// [`Service::override_protocol`] hands back a borrow of it.
-    protocol: service_common::date_time_json::DateTimeRestJson,
+    protocol: record_expiration_retention::CappedRetentionRestJson,
     /// Answers a request whose body this service cannot read into the
     /// operation's modelled input (see [`request_layer`]). Held on the service
     /// because [`Service::override_operation`] hands back a borrow of one of its
@@ -506,7 +521,7 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
         Self {
             entry: crate::ServiceDefinition::new(Arc::clone(&engine)),
             gated,
-            protocol: service_common::date_time_json::DateTimeRestJson::new(),
+            protocol: record_expiration_retention::CappedRetentionRestJson::new(),
             unreadable_body: request_layer::UnreadableBody::new(),
             iceberg_catalog: iceberg_rest::IcebergCatalog::new(Arc::clone(&engine)),
             name_lookups: name_lookups::NameLookups::new(engine),
@@ -656,8 +671,11 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // `createdAt`/`modifiedAt`, a namespace's `createdAt`, a maintenance or
         // expiration job's `lastRunTimestamp`, a replicated update's `timestamp` — so
         // every instant this service reports is an RFC 3339 string rather than the
-        // protocol's default epoch-seconds number. The codec that applies it is
-        // otherwise the model's own `restJson1`.
+        // protocol's default epoch-seconds number. The one other difference from
+        // the model's own `restJson1` is on the way IN: the retention a
+        // record-expiration configuration names is read capped at the model's
+        // maximum rather than refused above it (see
+        // [`record_expiration_retention`]).
         Some(&self.protocol)
     }
 }

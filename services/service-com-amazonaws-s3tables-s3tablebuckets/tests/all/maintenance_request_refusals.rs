@@ -36,15 +36,19 @@
 //!   that task's settings, and the addressed resource's settings union has no
 //!   member for them;
 //!
-//! * RULE 3 — a member a configuration COUNTS in, given a value outside the
-//!   positive-integer range the model bounds it at (`PositiveInteger`,
+//! * RULE 3 — a member a MAINTENANCE configuration COUNTS in, given a value
+//!   outside the positive-integer range the model bounds it at
+//!   (`PositiveInteger`,
 //!   `@range(1, 2147483647)`), is refused with a sentence naming that member:
 //!   `The specified <member> is invalid. Value must be a positive integer.` The
-//!   members are the ones the model targets at that shape
+//!   members are the ones the model targets at that shape inside a maintenance
+//!   task's settings
 //!   (`smithy_query(query="shape", shape="IcebergSnapshotManagementSettings,
-//!   IcebergUnreferencedFileRemovalSettings,TableRecordExpirationSettings")`:
+//!   IcebergUnreferencedFileRemovalSettings")`:
 //!   `minSnapshotsToKeep`, `maxSnapshotAgeHours`, `unreferencedDays`,
-//!   `nonCurrentDays`, `days`), and the value AT the range's minimum is acted on;
+//!   `nonCurrentDays`), and the value AT the range's minimum is acted on. The
+//!   retention a RECORD EXPIRATION configuration names is bounded at the same
+//!   range and is not one of them — see [`COUNTED`];
 //!
 //! * RULE 4 — the compaction FILE SIZE is the one such member S3 Tables bounds
 //!   more narrowly than the model does: a size outside the window it compacts
@@ -530,9 +534,16 @@ impl CountedCase {
     }
 }
 
-/// Every member of this model a configuration counts in, with the put that
-/// carries it: the snapshot-management pair on a table, the unreferenced-file
-/// removal pair on a table bucket, and the retention of a table's records.
+/// Every member of this model a MAINTENANCE configuration counts in, with the
+/// put that carries it: the snapshot-management pair on a table and the
+/// unreferenced-file removal pair on a table bucket.
+///
+/// The retention a record-expiration configuration names
+/// (`TableRecordExpirationSettings.days`) is bounded at the same range and is
+/// deliberately NOT here: S3 Tables states no sentence of its own for it, so a
+/// retention below the minimum is the parameter validator's refusal
+/// (`parameter_validation_refusals.rs` pins that one) and a retention above the
+/// maximum refuses nothing at all (`table_record_expiration.rs`).
 const COUNTED: &[CountedCase] = &[
     CountedCase {
         target: Configured::TableMaintenance,
@@ -557,12 +568,6 @@ const COUNTED: &[CountedCase] = &[
         task: "icebergUnreferencedFileRemoval",
         member: "nonCurrentDays",
         settings_of_task: Some("icebergUnreferencedFileRemoval"),
-    },
-    CountedCase {
-        target: Configured::RecordExpiration,
-        task: "",
-        member: "days",
-        settings_of_task: None,
     },
 ];
 
