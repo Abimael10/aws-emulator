@@ -549,14 +549,6 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
         let subnet = configuration
             .and_then(|configuration| configuration.awsvpc_configuration.as_ref())
             .and_then(|awsvpc| awsvpc.subnets.first().cloned());
-        // The range the interface takes its own address out of is the subnet's own
-        // ([`allocated_interface_private_ipv4_address`]), as Amazon VPC holds it; a subnet
-        // this store was never told the CIDR block of contributes none.
-        let subnet_cidr_block = subnet.as_deref().and_then(|subnet| {
-            self.subnet_placements
-                .get(subnet)
-                .and_then(|placement| placement.cidr_block.clone())
-        });
         let details = subnet
             .map(|subnet| {
                 vec![KeyValuePair {
@@ -571,8 +563,12 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
             attachment_type: ATTACHMENT_TYPE_ELASTIC_NETWORK_INTERFACE.to_string(),
             status: ATTACHMENT_STATUS_PRECREATED.to_string(),
             details,
-            subnet_cidr_block,
             next_status_due_at: Some(now + INTERFACE_STEP_SPAN),
+            // The interface itself is created in Amazon VPC by the pass that runs with no
+            // guard of this store held ([`super::awsvpc_interfaces`]), which is also where
+            // its identity comes from.
+            allocated: None,
+            interface_released: false,
         }]
     }
 
@@ -2025,10 +2021,81 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
         self.tally_wanted(|task| task.container_instance_arn.as_deref() == Some(instance_arn))
     }
 
-    /// The latest `ACTIVE` revision registered for `family`, if any.
-    pub fn latest_active_revision(&self, family: &str) -> Option<&TaskDefinitionRecord> {
+    /// The revision a task-definition ARN names, read as the WHOLE identifier an ARN is:
+    /// the Region it belongs to, its family and its revision number.
+    ///
+    /// What every reader that holds a STORED reference resolves it through — a task's
+    /// `taskDefinitionArn`, a service's, a task set's — so a reference stored in one Region
+    /// resolves in that Region and in no other. `None` for text that is no task-definition
+    /// ARN, for one naming no revision, and for a revision this store no longer holds.
+    pub fn revision_of_arn(&self, arn: &str) -> Option<&TaskDefinitionRecord> {
+        let region = ::service_common::arn::parse(arn)?.region.to_string();
+        let (family, revision) = parse_task_definition_reference(arn)?;
+        self.revision(&region, &family, revision?)
+    }
+
+    /// The revision `(family, revision)` names in `region`, whatever its status — the one
+    /// lookup of a stored revision, so no caller assembles the key itself and none of them
+    /// can read across Regions.
+    ///
+    /// A task definition is registered against ONE Region's endpoint, so a reference is
+    /// resolved in the Region the call was made in and names nothing in any other.
+    pub fn revision(
+        &self,
+        region: &str,
+        family: &str,
+        revision: i32,
+    ) -> Option<&TaskDefinitionRecord> {
         self.task_definitions
-            .values()
+            .get(&(region.to_string(), family.to_string(), revision))
+    }
+
+    /// The same, for a write.
+    pub fn revision_mut(
+        &mut self,
+        region: &str,
+        family: &str,
+        revision: i32,
+    ) -> Option<&mut TaskDefinitionRecord> {
+        self.task_definitions
+            .get_mut(&(region.to_string(), family.to_string(), revision))
+    }
+
+    /// The revision a `family[:revision]` reference names in `region` for a READ: the
+    /// revision it names, or — for a reference that names none — "the latest ACTIVE
+    /// revision in that family" ([`Self::latest_active_revision`]).
+    pub fn referenced_revision(
+        &self,
+        region: &str,
+        family: &str,
+        revision: Option<i32>,
+    ) -> Option<&TaskDefinitionRecord> {
+        match revision {
+            Some(revision) => self.revision(region, family, revision),
+            None => self.latest_active_revision(region, family),
+        }
+    }
+
+    /// Every revision of `region`, whatever its family or status — what a listing of that
+    /// Region's endpoint reports, and nothing of any other Region's.
+    pub fn revisions_of_region(
+        &self,
+        region: &str,
+    ) -> impl Iterator<Item = &TaskDefinitionRecord> {
+        let region = region.to_string();
+        self.task_definitions
+            .iter()
+            .filter(move |((held, _, _), _)| *held == region)
+            .map(|(_, record)| record)
+    }
+
+    /// The latest `ACTIVE` revision registered for `family` in `region`, if any.
+    pub fn latest_active_revision(
+        &self,
+        region: &str,
+        family: &str,
+    ) -> Option<&TaskDefinitionRecord> {
+        self.revisions_of_region(region)
             .filter(|record| record.family == family && record.status == TASK_DEFINITION_ACTIVE)
             .max_by_key(|record| record.revision)
     }
@@ -2068,14 +2135,15 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
     /// this answers only a reference the REQUEST carries.
     pub fn usable_revision(
         &self,
+        region: &str,
         family: &str,
         revision: Option<i32>,
     ) -> Result<&TaskDefinitionRecord, TaskDefinitionRefusal> {
         match revision {
             None => self
-                .latest_active_revision(family)
+                .latest_active_revision(region, family)
                 .ok_or(TaskDefinitionRefusal::NotFound),
-            Some(revision) => match self.task_definitions.get(&(family.to_string(), revision)) {
+            Some(revision) => match self.revision(region, family, revision) {
                 None => Err(TaskDefinitionRefusal::NotFound),
                 Some(record) if record.status != TASK_DEFINITION_ACTIVE => {
                     Err(TaskDefinitionRefusal::Inactive)

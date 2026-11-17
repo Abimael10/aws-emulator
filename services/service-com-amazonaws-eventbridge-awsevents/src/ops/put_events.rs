@@ -3500,7 +3500,7 @@ fn delivery_condition(code: &str) -> &'static str {
 /// `smithy_query(query="operation", operation="SendMessage"|"Invoke"|"Publish"|
 /// "StartExecution"|"PutRecord"|"StartPipelineExecution"|"PutLogEvents")` names
 /// the shapes, and `query="shape"` carries the `awsQueryError` code of each.
-const TARGET_RESOURCE_ABSENT_CODES: [&str; 8] = [
+const TARGET_RESOURCE_ABSENT_CODES: [&str; 9] = [
     // Amazon SQS: `QueueDoesNotExist`, whose query code is the prefixed one.
     "AWS.SimpleQueueService.NonExistentQueue",
     "QueueDoesNotExist",
@@ -3516,6 +3516,10 @@ const TARGET_RESOURCE_ABSENT_CODES: [&str; 8] = [
     "PipelineNotFoundException",
     // Amazon SNS's `NotFoundException` under its shape name.
     "NotFoundException",
+    // Amazon ECS, whose `RunTask` answers this for a cluster the account holds
+    // none of (`smithy_query(query="operation", operation="RunTask")` of that
+    // service names `ClusterNotFoundException`).
+    "ClusterNotFoundException",
 ];
 
 /// Every error code a target's service answers when it refuses the IDENTITY the

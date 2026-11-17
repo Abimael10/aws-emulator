@@ -617,10 +617,14 @@ async fn a_schedule_is_accepted_only_on_the_default_event_bus() {
 ///
 /// The rows differ along the SERVICE the target belongs to, spanning the classes
 /// that documentation enumerates (a state machine, an event bus, a data stream,
-/// an EC2 instance, an API Gateway API) against the targets it does not name (a
-/// queue, a topic, a function, a log group) and against another resource of a
-/// service that is in the list (an activity of Step Functions, an api destination
-/// of this service), which is not one of them.
+/// an EC2 instance, an API Gateway API) and the class whose delivery IS such a
+/// call (an Amazon ECS cluster, which EventBridge runs a task in with
+/// `ecs:RunTask`) against the targets it does not name (a queue, a topic, a
+/// function, a log group) and against another resource of a service that is in
+/// the list (an activity of Step Functions, an api destination of this service),
+/// which is not one of them. An ECS ARN that names something OTHER than a cluster
+/// is refused as an ARN that names nothing a rule could invoke, whatever role it
+/// carries, which is `target_configuration_refusals`' own table.
 #[tokio::test]
 async fn put_targets_requires_a_role_for_the_targets_it_assumes_one_for() {
     let router = emulator();
@@ -630,6 +634,14 @@ async fn put_targets_requires_a_role_for_the_targets_it_assumes_one_for() {
         (
             "a Step Functions state machine",
             format!("arn:aws:states:{REGION}:{account}:stateMachine:flow"),
+            true,
+        ),
+        (
+            // The one class whose delivery is an API call EventBridge makes on a
+            // resource of the account: it runs the task the target's own
+            // `EcsParameters` describe in that cluster.
+            "an Amazon ECS cluster",
+            format!("arn:aws:ecs:{REGION}:{account}:cluster/orders"),
             true,
         ),
         (
@@ -705,11 +717,18 @@ async fn put_targets_requires_a_role_for_the_targets_it_assumes_one_for() {
         assert_eq!(status, 200, "case {case:?}: PutTargets answered {status} {body}");
 
         // Without a RoleArn: refused for the kinds EventBridge must assume one
-        // for, accepted for the kinds invoked under their own policy.
+        // for, accepted for the kinds invoked under their own policy. A target
+        // whose class is only deliverable THROUGH a parameter block carries it in
+        // both calls, so what each row is refused for is the role alone
+        // ([`class_parameters`]).
+        let mut target = json!({ "Id": "t1", "Arn": arn });
+        if let Some((member, block)) = class_parameters(arn) {
+            target[member] = block;
+        }
         let (status, body) = call(
             &router,
             "PutTargets",
-            &json!({ "Rule": rule, "Targets": [{ "Id": "t1", "Arn": arn }] }),
+            &json!({ "Rule": rule, "Targets": [target.clone()] }),
         )
         .await;
         if *role_required {
@@ -754,13 +773,11 @@ async fn put_targets_requires_a_role_for_the_targets_it_assumes_one_for() {
 
         // With a RoleArn: every kind is accepted, so the rows above are refused
         // for the member they omitted and nothing else.
+        target["RoleArn"] = json!(role);
         let (status, body) = call(
             &router,
             "PutTargets",
-            &json!({
-                "Rule": rule,
-                "Targets": [{ "Id": "t1", "Arn": arn, "RoleArn": role }],
-            }),
+            &json!({ "Rule": rule, "Targets": [target] }),
         )
         .await;
         assert_eq!(
@@ -768,6 +785,28 @@ async fn put_targets_requires_a_role_for_the_targets_it_assumes_one_for() {
             "case {case:?}: expected a target naming a role to be stored, got {status} {body}"
         );
     }
+}
+
+/// The parameter block a target of `arn`'s own class can only be delivered to with, as the
+/// `Target` member carrying it — `None` for a class that needs none.
+///
+/// An Amazon ECS cluster target is invoked THROUGH its block ("contains the Amazon ECS task
+/// definition and task count to be used, if the event target is an Amazon ECS task",
+/// `Target$EcsParameters`, whose `TaskDefinitionArn` is `@required`), so a row about the
+/// ROLE such a target needs carries the block as well: the request then differs from an
+/// accepted one in the role alone.
+fn class_parameters(arn: &str) -> Option<(&'static str, Value)> {
+    let cluster = ::service_common::arn::parse(arn)
+        .filter(|parsed| parsed.vendor == "ecs" && parsed.resource_type() == "cluster")?;
+    Some((
+        "EcsParameters",
+        json!({
+            "TaskDefinitionArn": format!(
+                "arn:aws:ecs:{}:{}:task-definition/orders:1",
+                cluster.region, cluster.account
+            ),
+        }),
+    ))
 }
 
 /// A tag key is the caller's own: a key in the namespace reserved for Amazon Web

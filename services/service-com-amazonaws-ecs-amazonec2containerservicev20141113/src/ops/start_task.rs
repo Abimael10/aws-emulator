@@ -357,7 +357,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // "If a revision isn't specified, the latest ACTIVE revision is used", and a
         // revision this call NAMES has to be one it may use: "You can't use an INACTIVE
         // task definition to run new tasks."
-        let definition = match guard.usable_revision(&family, requested_revision) {
+        let definition = match guard.usable_revision(&region, &family, requested_revision) {
             Ok(definition) => definition.clone(),
             Err(refusal) => {
                 let message = Some(refusal.message().to_string());

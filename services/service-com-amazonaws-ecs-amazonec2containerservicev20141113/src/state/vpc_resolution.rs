@@ -172,8 +172,8 @@ pub struct SubnetPlacement {
     /// task placed into it.
     pub availability_zone: String,
     /// `Subnet$cidrBlock`: "The IPv4 CIDR block assigned to the subnet", and `None` for a
-    /// subnet Amazon VPC holds none for — the range the interface created in it takes its
-    /// own address out of ([`allocated_interface_private_ipv4_address`]).
+    /// subnet Amazon VPC holds none for — the range an address inside the subnet is read
+    /// against.
     pub cidr_block: Option<String>,
 }
 

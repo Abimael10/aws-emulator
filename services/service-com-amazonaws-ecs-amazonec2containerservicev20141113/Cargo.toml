@@ -135,10 +135,6 @@ brush-parser = { version = "0.4", default-features = false }
 # of it (`state::ec2_capacity`), so the stored text is decoded with the one base64 codec this
 # workspace already locks.
 base64 = "0.22"
-# `ipnet`: the CIDR block of the subnet an `awsvpc` task's elastic network interface is
-# created in, parsed to take the address that interface is given out of that subnet's own
-# range (`state::task_interfaces`). Already in this workspace's lock file.
-ipnet = "2"
 # `hex`: the HEXADECIMAL spelling the authenticated bytes of a paginated read's `nextToken`
 # travel as, so the token is one word of URL- and log-safe text (`state::page_tokens`).
 hex = { workspace = true }

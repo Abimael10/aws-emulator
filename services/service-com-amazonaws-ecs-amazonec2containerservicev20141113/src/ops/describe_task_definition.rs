@@ -162,7 +162,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 message: Some("the ECS store is unavailable".to_string()),
             })
         })?;
-        let _ = ctx;
+        let region = crate::state::request_region(ctx);
 
         let Some((family, requested_revision)) =
             crate::state::parse_task_definition_reference(&input.task_definition)
@@ -185,11 +185,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let guard = state.lock();
         // "To determine the latest ACTIVE revision in a family, you can specify the
-        // family name."
-        let record = match requested_revision {
-            Some(revision) => guard.task_definitions.get(&(family, revision)),
-            None => guard.latest_active_revision(&family),
-        };
+        // family name." The reference is resolved in the REGION the call was made in: a
+        // task definition is a regional resource, so a revision registered against another
+        // Region's endpoint is one this call names nothing of.
+        let record = guard.referenced_revision(&region, &family, requested_revision);
         let Some(record) = record else {
             return Err(DescribeTaskDefinitionErrorModeled::ClientException(
                 ClientException {

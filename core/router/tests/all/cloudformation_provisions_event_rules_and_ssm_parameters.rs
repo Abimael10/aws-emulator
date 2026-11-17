@@ -404,6 +404,10 @@ const ROWS: &[Row] = &[
                                 {
                                     "Id": "First",
                                     "Arn": target_cluster_arn("us-east-1"),
+                                    // An ECS task target is invoked AS the role it names
+                                    // (EventBridge runs the task with `ecs:RunTask`), so a
+                                    // declaration of one names a role.
+                                    "RoleArn": TARGET_ROLE_ARN,
                                     "InputPath": "$.detail",
                                     "EcsParameters": {
                                         "TaskDefinitionArn": task_definition_arn("us-east-1")
@@ -412,6 +416,7 @@ const ROWS: &[Row] = &[
                                 {
                                     "Id": "Second",
                                     "Arn": target_cluster_arn("us-east-1"),
+                                    "RoleArn": TARGET_ROLE_ARN,
                                     "RetryPolicy": { "MaximumRetryAttempts": 2 },
                                     "EcsParameters": {
                                         "TaskDefinitionArn": task_definition_arn("us-east-1")
@@ -1001,7 +1006,9 @@ async fn an_update_applies_the_changed_declaration_in_place() {
                     "Id": id,
                     "Arn": target_cluster_arn(region),
                     // An Amazon ECS target names the cluster and carries the task it runs
-                    // in its parameter block, so a declaration of one names both.
+                    // in its parameter block, so a declaration of one names both — and the
+                    // role EventBridge runs that task as, which such a target requires.
+                    "RoleArn": TARGET_ROLE_ARN,
                     "EcsParameters": { "TaskDefinitionArn": task_definition_arn(region) }
                 })
             })

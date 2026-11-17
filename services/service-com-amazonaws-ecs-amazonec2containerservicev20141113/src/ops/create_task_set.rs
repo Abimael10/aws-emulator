@@ -456,7 +456,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
             .into());
         };
-        let definition = match guard.usable_revision(&family, revision) {
+        let definition = match guard.usable_revision(&region, &family, revision) {
             Ok(definition) => definition.clone(),
             Err(refusal) => {
                 let message = Some(refusal.message().to_string());
@@ -644,7 +644,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // `UpdateServicePrimaryTaskSet` is what promotes one to `PRIMARY`.
             status: crate::state::TASK_SET_ACTIVE.to_string(),
             task_definition_arn: definition.arn.clone(),
-            task_definition: (definition.family.clone(), definition.revision),
+            task_definition: (
+                region.clone(),
+                definition.family.clone(),
+                definition.revision,
+            ),
             launch_type,
             capacity_provider_strategy,
             platform_version: input.platform_version.clone(),

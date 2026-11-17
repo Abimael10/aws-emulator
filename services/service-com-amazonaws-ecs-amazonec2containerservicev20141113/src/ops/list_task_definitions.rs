@@ -178,6 +178,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 message: Some("the ECS store is unavailable".to_string()),
             })
         })?;
+        let region = crate::state::request_region(_ctx);
 
         // "This value can be between 1 and 100."
         if let Some(message) = input.max_results.and_then(|max_results| {
@@ -235,9 +236,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     .and_then(crate::state::parse_task_definition_reference)
                 {
                     Some((family, Some(revision)))
-                        if guard
-                            .task_definitions
-                            .contains_key(&(family.clone(), revision)) =>
+                        if guard.revision(&region, &family, revision).is_some() =>
                     {
                         Some((family, revision))
                     }
@@ -255,12 +254,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         };
         // "Returns a list of task definitions that are registered to your account" —
-        // every stored revision, narrowed by the filters the request sets. Each entry
-        // carries the sort key (family, revision) beside the ARN the listing reports, so
-        // the order and the token are computed from the same stored values.
+        // every revision stored IN THIS REGION, narrowed by the filters the request sets: a
+        // task definition is a regional resource, so one Region's endpoint lists the
+        // revisions registered against it and none of another's. Each entry carries the sort
+        // key (family, revision) beside the ARN the listing reports, so the order and the
+        // token are computed from the same stored values.
         let mut matching: Vec<(String, i32, String)> = guard
-            .task_definitions
-            .values()
+            .revisions_of_region(&region)
             .filter(|record| record.status == status)
             // "The FULL family name to filter the ListTaskDefinitions results with.
             // Specifying a familyPrefix limits the listed task definitions to task

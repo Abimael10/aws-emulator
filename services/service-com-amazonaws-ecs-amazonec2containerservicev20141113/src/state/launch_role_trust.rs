@@ -61,6 +61,10 @@ use super::*;
 /// A task this pass has run for is one the clock may then start
 /// ([`TaskRecord::launch_steps_taken`]).
 pub fn settle_task_launches<Eng: Send + Sync + 'static>(engine: &Eng) {
+    // The interface an `awsvpc` task runs on is created FIRST: Amazon ECS creates it while
+    // the task is provisioning, before it pulls an image or starts a container, and the
+    // interface is an Amazon VPC resource ([`super::settle_task_interfaces`]).
+    super::settle_task_interfaces(engine);
     evaluate_launch_role_assumptions(engine);
     evaluate_image_pulls(engine);
 }
@@ -251,8 +255,7 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
     /// under. The execution role needs no such lookup: it is kept on the task itself
     /// ([`TaskRecord::execution_role_arn`]), because the image pull is made as it.
     fn launched_task_role_arn(&self, task: &TaskRecord) -> Option<String> {
-        let (family, revision) = parse_task_definition_reference(&task.task_definition_arn)?;
-        let definition = self.task_definitions.get(&(family, revision?))?;
+        let definition = self.revision_of_arn(&task.task_definition_arn)?;
         resolved_task_role_arn(task.overrides.as_ref(), definition).map(ToString::to_string)
     }
 

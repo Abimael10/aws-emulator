@@ -157,7 +157,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 message: Some("the ECS store is unavailable".to_string()),
             })
         })?;
-        let _ = ctx;
+        let region = crate::state::request_region(ctx);
 
         // "Deregisters the specified task definition by family and revision. ... You must
         // specify a revision." The revision is what this call ACTS ON, so a
@@ -216,7 +216,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let mut guard = state.lock();
-        let Some(record) = guard.task_definitions.get_mut(&(family, revision)) else {
+        // Resolved in the REGION the call was made in: a revision registered against
+        // another Region's endpoint is one this call names nothing of, so it is the
+        // reference that resolves to nothing.
+        let Some(record) = guard.revision_mut(&region, &family, revision) else {
             return Err(DeregisterTaskDefinitionErrorModeled::ClientException(
                 ClientException {
                     message: Some(crate::state::TASK_DEFINITION_NOT_FOUND_MESSAGE.to_string()),

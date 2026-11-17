@@ -669,15 +669,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // "When you register a task definition for the first time, the revision is 1.
         // Each time that you register a new revision of a task definition in the same
-        // family, the revision value always increases by one."
-        let revision = guard
-            .next_revision
-            .get(&input.family)
-            .copied()
-            .unwrap_or(1);
-        guard
-            .next_revision
-            .insert(input.family.clone(), revision + 1);
+        // family, the revision value always increases by one." The counter is the family's
+        // IN THIS REGION: a task definition is a regional resource, so the first revision
+        // of a family registered against this endpoint is 1 however many revisions the same
+        // family name has in another Region.
+        let family_key = (region.clone(), input.family.clone());
+        let revision = guard.next_revision.get(&family_key).copied().unwrap_or(1);
+        guard.next_revision.insert(family_key, revision + 1);
 
         let record = crate::state::TaskDefinitionRecord {
             arn: crate::state::task_definition_arn(&region, &input.family, revision),
@@ -715,9 +713,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         let view = record.view();
         let tags = record.tags.clone();
-        guard
-            .task_definitions
-            .insert((input.family.clone(), revision), record);
+        guard.task_definitions.insert(
+            (region.clone(), input.family.clone(), revision),
+            record,
+        );
 
         Ok(RegisterTaskDefinitionOutput {
             task_definition: Some(view),

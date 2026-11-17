@@ -176,12 +176,7 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
     /// references nothing, so nothing is decided against it — the same reading the task role
     /// such a task runs under is resolved by.
     pub(super) fn launched_task_secrets(&self, task: &TaskRecord) -> Vec<ContainerSecret> {
-        let Some((family, revision)) = parse_task_definition_reference(&task.task_definition_arn)
-        else {
-            return Vec::new();
-        };
-        revision
-            .and_then(|revision| self.task_definitions.get(&(family, revision)))
+        self.revision_of_arn(&task.task_definition_arn)
             .map(definition_secrets)
             .unwrap_or_default()
     }

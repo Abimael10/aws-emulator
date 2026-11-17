@@ -129,67 +129,10 @@ pub const ATTACHMENT_DETAIL_MAC_ADDRESS: &str = "macAddress";
 /// `NetworkInterface$privateIpv4Address` on the container's own view.
 pub const ATTACHMENT_DETAIL_PRIVATE_IPV4_ADDRESS: &str = "privateIPv4Address";
 
-/// The id the `sequence`-th interface this store allocates carries: `eni-` and 17
-/// hexadecimal digits, the form an elastic network interface id takes. The counter starts
-/// at one, so the id is never the null id.
-pub fn allocated_interface_id(sequence: u64) -> String {
-    format!("eni-{sequence:017x}")
-}
-
-/// The MAC address the `sequence`-th interface carries: six octets whose first is `0a`,
-/// which makes the address locally administered and unicast, and whose remaining five spell
-/// the counter — so one interface's address is its own.
-pub fn allocated_interface_mac_address(sequence: u64) -> String {
-    let octet = |shift: u32| (sequence >> shift) & 0xff;
-    format!(
-        "0a:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
-        octet(32),
-        octet(24),
-        octet(16),
-        octet(8),
-        octet(0)
-    )
-}
-
-/// The private IPv4 address the `sequence`-th interface carries, out of the subnet it was
-/// created in.
-///
-/// An elastic network interface is created IN a subnet and is reachable at an address OF
-/// that subnet (`AwsVpcConfiguration$subnets`, and `Subnet$cidrBlock`: "the IPv4 CIDR block
-/// assigned to the subnet"), so the address comes out of that block — skipping the first
-/// four addresses, which AWS reserves in every subnet, and the broadcast address, so every
-/// address handed out is one a network interface may actually take (Amazon VPC User Guide,
-/// "Subnet CIDR blocks"). The counter is what makes one interface's address its own.
-///
-/// A subnet this emulator holds no CIDR block for falls back to `172.31.0.0/16`, the block
-/// AWS gives a default VPC (Amazon VPC User Guide, "Default VPCs"): the interface still has
-/// to report an address it could really hold.
-pub fn allocated_interface_private_ipv4_address(sequence: u64, cidr_block: Option<&str>) -> String {
-    /// The addresses AWS reserves at the start of every subnet's block.
-    const RESERVED_AT_START: u32 = 4;
-    /// The block a subnet with no CIDR block of its own is addressed out of, and its
-    /// prefix length.
-    const DEFAULT_VPC_NETWORK: ::std::net::Ipv4Addr = ::std::net::Ipv4Addr::new(172, 31, 0, 0);
-    const DEFAULT_VPC_PREFIX: u8 = 16;
-
-    let (network, prefix_len) = match cidr_block.and_then(|block| block.parse::<::ipnet::Ipv4Net>().ok())
-    {
-        Some(subnet) => (subnet.network(), subnet.prefix_len()),
-        None => (DEFAULT_VPC_NETWORK, DEFAULT_VPC_PREFIX),
-    };
-    // The addresses the block holds, less the four AWS reserves at its start and the
-    // broadcast address at its end: what is left is what an interface may be given. A block
-    // too small to hold one at all — which AWS allocates for no subnet — leaves the network
-    // address itself, so the address reported is always inside the block.
-    let held = 1u64 << (u32::BITS - u32::from(prefix_len));
-    let assignable = held.saturating_sub(u64::from(RESERVED_AT_START) + 1);
-    let offset = if assignable == 0 {
-        0
-    } else {
-        RESERVED_AT_START + (sequence % assignable) as u32
-    };
-    ::std::net::Ipv4Addr::from(u32::from(network).saturating_add(offset)).to_string()
-}
+// The interface's own id, MAC address and private IPv4 address are AMAZON VPC's to mint:
+// the interface is a resource of that service, created in the subnet the launch named
+// ([`super::awsvpc_interfaces`]), so what this attachment reports for it is read off that
+// record rather than derived here.
 
 impl AttachmentRecord {
     /// Report, on this attachment, the three details that belong to the interface ITSELF:
@@ -204,6 +147,15 @@ impl AttachmentRecord {
     /// supplied is reported from the start, because the launch supplied it
     /// ([`ATTACHMENT_DETAIL_SUBNET_ID`]).
     ///
+    /// The three values are the AMAZON VPC record's, read off the interface this task was
+    /// allocated ([`super::awsvpc_interfaces`]) rather than derived here: the id the
+    /// attachment names is an interface Amazon EC2's own `DescribeNetworkInterfaces`
+    /// returns, and the address it reports is the one that interface holds out of its
+    /// subnet. An attachment whose interface has not been created yet reports NONE of them
+    /// — the allocation pass reports them when it records the interface
+    /// ([`ComAmazonawsEcsAmazonec2containerservicev20141113State::record_allocated_interface`])
+    /// — because an id for an interface that does not exist is one no client could resolve.
+    ///
     /// Each is written once — a detail already reported is left as it is — and nothing but
     /// an elastic network interface gets any of them.
     ///
@@ -212,22 +164,19 @@ impl AttachmentRecord {
         if self.attachment_type != ATTACHMENT_TYPE_ELASTIC_NETWORK_INTERFACE {
             return false;
         }
+        let Some(allocated) = self.allocated.clone() else {
+            return false;
+        };
         let mut changed = false;
         for (name, value) in [
             (
                 ATTACHMENT_DETAIL_NETWORK_INTERFACE_ID,
-                allocated_interface_id(self.sequence),
+                allocated.network_interface_id,
             ),
-            (
-                ATTACHMENT_DETAIL_MAC_ADDRESS,
-                allocated_interface_mac_address(self.sequence),
-            ),
+            (ATTACHMENT_DETAIL_MAC_ADDRESS, allocated.mac_address),
             (
                 ATTACHMENT_DETAIL_PRIVATE_IPV4_ADDRESS,
-                allocated_interface_private_ipv4_address(
-                    self.sequence,
-                    self.subnet_cidr_block.as_deref(),
-                ),
+                allocated.private_ipv4_address,
             ),
         ] {
             if self

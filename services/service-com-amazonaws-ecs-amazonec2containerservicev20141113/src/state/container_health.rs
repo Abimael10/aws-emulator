@@ -457,10 +457,7 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
             if task.last_status != STATUS_RUNNING || task.desired_status != STATUS_RUNNING {
                 continue;
             }
-            let definition = parse_task_definition_reference(&task.task_definition_arn)
-                .and_then(|(family, revision)| {
-                    revision.and_then(|revision| self.task_definitions.get(&(family, revision)))
-                });
+            let definition = self.revision_of_arn(&task.task_definition_arn);
             for container in &task.containers {
                 if container.last_status != STATUS_RUNNING {
                     continue;

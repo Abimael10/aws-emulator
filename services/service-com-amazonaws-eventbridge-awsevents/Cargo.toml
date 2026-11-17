@@ -159,6 +159,12 @@ service-com-amazonaws-ssm-amazonssm = { workspace = true }
 # Lambda on one engine: the item a matched rule's invocation really wrote is asserted through
 # that service's own GetItem, which is where a client of the pipeline looks for it.
 service-com-amazonaws-dynamodb-dynamodb-20120810 = { workspace = true }
+# The cluster an ECS task target names, and the Amazon VPC subnets the task's own
+# network configuration names, mounted beside EventBridge on one engine: the task a
+# delivery ran is read back through that service's own ListTasks/DescribeTasks, and the
+# interface it was allocated through Amazon EC2's DescribeNetworkInterfaces.
+service-com-amazonaws-ecs-amazonec2containerservicev20141113 = { workspace = true }
+service-com-amazonaws-ec2-amazonec2 = { workspace = true }
 # The deployment package that suite uploads is a .zip archive it writes in memory.
 zip = { version = "9", default-features = false, features = ["deflate"] }
 

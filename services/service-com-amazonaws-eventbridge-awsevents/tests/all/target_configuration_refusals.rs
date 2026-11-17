@@ -122,6 +122,15 @@ fn cluster_arn() -> String {
     format!("arn:aws:ecs:{REGION}:{}:cluster/orders", account())
 }
 
+/// The role EventBridge is handed to invoke a target it makes an API call for. An ECS
+/// cluster target is one of them — the delivery is an `ecs:RunTask` on the cluster — so
+/// every ECS row below carries it: a target naming no role is refused for THAT before any
+/// of its parameters is read, which is the rule the `submitted_value_refusals` suite's own
+/// table over that class states.
+fn invoke_role() -> String {
+    format!("arn:aws:iam::{}:role/events-invoke", account())
+}
+
 /// The ARN of a task definition of this account and Region.
 fn task_definition_arn() -> String {
     format!("arn:aws:ecs:{REGION}:{}:task-definition/orders:1", account())
@@ -227,7 +236,11 @@ fn configuration_rows() -> Vec<Row> {
     vec![
         Row {
             case: "an ECS cluster target carrying no EcsParameters",
-            targets: json!([{ "Id": "Target0", "Arn": cluster_arn() }]),
+            targets: json!([{
+                "Id": "Target0",
+                "Arn": cluster_arn(),
+                "RoleArn": invoke_role(),
+            }]),
             refused: Some(must_be_specified("EcsParameters", "Target0")),
             stored: vec![],
         },
@@ -285,6 +298,7 @@ fn configuration_rows() -> Vec<Row> {
             targets: json!([{
                 "Id": "ecs-ok",
                 "Arn": cluster_arn(),
+                "RoleArn": invoke_role(),
                 "EcsParameters": ecs_parameters(),
             }]),
             refused: None,
@@ -317,6 +331,7 @@ fn configuration_rows() -> Vec<Row> {
             targets: json!([{
                 "Id": "ref",
                 "Arn": cluster_arn(),
+                "RoleArn": invoke_role(),
                 "EcsParameters": { "TaskDefinitionArn": "orders:1" },
             }]),
             refused: Some(not_valid_for_target("TaskDefinitionArn", "ref")),
@@ -327,6 +342,7 @@ fn configuration_rows() -> Vec<Row> {
             targets: json!([{
                 "Id": "ref2",
                 "Arn": cluster_arn(),
+                "RoleArn": invoke_role(),
                 "EcsParameters": {
                     "TaskDefinitionArn": format!("arn:aws:batch:{REGION}:{account}:job-definition/orders:1"),
                 },
@@ -339,6 +355,7 @@ fn configuration_rows() -> Vec<Row> {
             targets: json!([{
                 "Id": "ref3",
                 "Arn": cluster_arn(),
+                "RoleArn": invoke_role(),
                 "EcsParameters": { "TaskDefinitionArn": foreign_region_definition.clone() },
             }]),
             refused: Some(format!(
@@ -354,6 +371,7 @@ fn configuration_rows() -> Vec<Row> {
             targets: json!([{
                 "Id": "count-10",
                 "Arn": cluster_arn(),
+                "RoleArn": invoke_role(),
                 "EcsParameters": { "TaskDefinitionArn": task_definition_arn(), "TaskCount": 10 },
             }]),
             refused: None,
@@ -364,6 +382,7 @@ fn configuration_rows() -> Vec<Row> {
             targets: json!([{
                 "Id": "count-11",
                 "Arn": cluster_arn(),
+                "RoleArn": invoke_role(),
                 "EcsParameters": { "TaskDefinitionArn": task_definition_arn(), "TaskCount": 11 },
             }]),
             refused: Some(not_valid_for_target("TaskCount", "count-11")),
@@ -374,6 +393,7 @@ fn configuration_rows() -> Vec<Row> {
             targets: json!([{
                 "Id": "Target0",
                 "Arn": cluster_arn(),
+                "RoleArn": invoke_role(),
                 "EcsParameters": {
                     "TaskDefinitionArn": task_definition_arn(),
                     "LaunchType": "FARGATE",
@@ -391,6 +411,7 @@ fn configuration_rows() -> Vec<Row> {
             targets: json!([{
                 "Id": "fargate-ok",
                 "Arn": cluster_arn(),
+                "RoleArn": invoke_role(),
                 "EcsParameters": {
                     "TaskDefinitionArn": task_definition_arn(),
                     "LaunchType": "FARGATE",
@@ -406,6 +427,7 @@ fn configuration_rows() -> Vec<Row> {
             targets: json!([{
                 "Id": "ec2-platform",
                 "Arn": cluster_arn(),
+                "RoleArn": invoke_role(),
                 "EcsParameters": {
                     "TaskDefinitionArn": task_definition_arn(),
                     "LaunchType": "EC2",
@@ -424,6 +446,7 @@ fn configuration_rows() -> Vec<Row> {
             targets: json!([{
                 "Id": "external-ip",
                 "Arn": cluster_arn(),
+                "RoleArn": invoke_role(),
                 "EcsParameters": {
                     "TaskDefinitionArn": task_definition_arn(),
                     "LaunchType": "EXTERNAL",
@@ -449,6 +472,7 @@ fn configuration_rows() -> Vec<Row> {
             targets: json!([{
                 "Id": "ec2-noip",
                 "Arn": cluster_arn(),
+                "RoleArn": invoke_role(),
                 "EcsParameters": {
                     "TaskDefinitionArn": task_definition_arn(),
                     "LaunchType": "EC2",
@@ -468,6 +492,7 @@ fn configuration_rows() -> Vec<Row> {
             targets: json!([{
                 "Id": "subnets-16",
                 "Arn": cluster_arn(),
+                "RoleArn": invoke_role(),
                 "EcsParameters": {
                     "TaskDefinitionArn": task_definition_arn(),
                     "NetworkConfiguration": network_configuration(16, 5),
@@ -481,6 +506,7 @@ fn configuration_rows() -> Vec<Row> {
             targets: json!([{
                 "Id": "subnets-17",
                 "Arn": cluster_arn(),
+                "RoleArn": invoke_role(),
                 "EcsParameters": {
                     "TaskDefinitionArn": task_definition_arn(),
                     "NetworkConfiguration": network_configuration(17, 0),
@@ -494,6 +520,7 @@ fn configuration_rows() -> Vec<Row> {
             targets: json!([{
                 "Id": "subnets-0",
                 "Arn": cluster_arn(),
+                "RoleArn": invoke_role(),
                 "EcsParameters": {
                     "TaskDefinitionArn": task_definition_arn(),
                     "NetworkConfiguration": { "awsvpcConfiguration": { "Subnets": [] } },
@@ -507,6 +534,7 @@ fn configuration_rows() -> Vec<Row> {
             targets: json!([{
                 "Id": "sg-6",
                 "Arn": cluster_arn(),
+                "RoleArn": invoke_role(),
                 "EcsParameters": {
                     "TaskDefinitionArn": task_definition_arn(),
                     "NetworkConfiguration": network_configuration(1, 6),
@@ -521,7 +549,7 @@ fn configuration_rows() -> Vec<Row> {
             case: "a batch whose second entry names no parameter block",
             targets: json!([
                 { "Id": "Target1", "Arn": format!("arn:aws:sns:{REGION}:{account}:orders") },
-                { "Id": "Target2", "Arn": cluster_arn() },
+                { "Id": "Target2", "Arn": cluster_arn(), "RoleArn": invoke_role() },
             ]),
             refused: Some(must_be_specified("EcsParameters", "Target2")),
             stored: vec![],
@@ -530,7 +558,8 @@ fn configuration_rows() -> Vec<Row> {
             case: "a batch whose every entry is installable",
             targets: json!([
                 { "Id": "Target1", "Arn": format!("arn:aws:sns:{REGION}:{account}:orders") },
-                { "Id": "Target2", "Arn": cluster_arn(), "EcsParameters": ecs_parameters() },
+                { "Id": "Target2", "Arn": cluster_arn(),
+                  "RoleArn": invoke_role(), "EcsParameters": ecs_parameters() },
             ]),
             refused: None,
             stored: vec!["Target1", "Target2"],
@@ -611,6 +640,7 @@ fn account_rows() -> Vec<AccountRow> {
             target: json!({
                 "Id": "t1",
                 "Arn": format!("arn:aws:ecs:{REGION}:{FOREIGN_ACCOUNT}:cluster/orders"),
+                "RoleArn": invoke_role(),
                 "EcsParameters": {
                     "TaskDefinitionArn": format!(
                         "arn:aws:ecs:{REGION}:{FOREIGN_ACCOUNT}:task-definition/orders:1"

@@ -699,11 +699,13 @@ fn missing_parameter_block(target: &Target) -> Option<&'static str> {
 /// carrying no `RoleArn` names nothing for EventBridge to assume, so the
 /// delivery it asks for could never be made.
 ///
-/// The classes are the ones that documentation ENUMERATES, read off the service
-/// and the resource type of the target's ARN ([`ROLE_INVOKED_TARGETS`]) — a
-/// target of any other service is one this operation accepts without a role,
-/// whether it is invoked under a resource-based policy or under a role the
-/// delivery assumes when one is given
+/// The classes are the ones EventBridge delivers to BY MAKING that API call on a
+/// resource of the account — the ones the sentence above enumerates, plus the
+/// Amazon ECS task target, whose delivery is an `ecs:RunTask` on the cluster the
+/// target names — read off the service and the resource type of the target's ARN
+/// ([`ROLE_INVOKED_TARGETS`]). A target of any other service is one this
+/// operation accepts without a role, whether it is invoked under a
+/// resource-based policy or under a role the delivery assumes when one is given
 /// ([`crate::ops::put_events`]'s own reading of the same sentence).
 fn target_role_violation(target: &Target) -> Option<String> {
     if target.role_arn.is_some() || !invoked_under_a_named_role(&target.arn) {
@@ -712,15 +714,15 @@ fn target_role_violation(target: &Target) -> Option<String> {
     Some(format!("RoleArn is required for target {}.", target.arn))
 }
 
-/// The target classes `PutTargets` documents as invoked under the role the target
-/// names: the SERVICE of the ARN, and the resource TYPE within it that names a
-/// target of that class (`None` where the service names one kind of target only).
+/// The target classes EventBridge invokes under the role the target names: the
+/// SERVICE of the ARN, and the resource TYPE within it that names a target of
+/// that class (`None` where the service names one kind of target only).
 ///
 /// An ARN of the same service naming another kind of resource is NOT one of them:
 /// an `arn:aws:events:…:api-destination/…` is an HTTP endpoint this service
 /// invokes through a connection's own credentials, not the event bus of another
 /// account the documentation is about.
-const ROLE_INVOKED_TARGETS: [(&str, Option<&str>); 5] = [
+const ROLE_INVOKED_TARGETS: [(&str, Option<&str>); 6] = [
     // "Step Functions state machines"
     ("states", Some("stateMachine")),
     // "Kinesis Data Streams"
@@ -731,6 +733,13 @@ const ROLE_INVOKED_TARGETS: [(&str, Option<&str>); 5] = [
     ("execute-api", None),
     // The event bus of another account or Region
     (ARN_NAMESPACE, Some("event-bus")),
+    // An Amazon ECS task, which EventBridge starts by calling Amazon ECS
+    // `RunTask` on the CLUSTER the target names ("contains the Amazon ECS task
+    // definition and task count to be used, if the event target is an Amazon ECS
+    // task", `Target$EcsParameters`): the call is made against a resource of the
+    // account, so it is made AS a role the account hands EventBridge, and a
+    // target naming none names nothing for EventBridge to call ECS as.
+    (ECS_ARN_NAMESPACE, Some(ECS_CLUSTER_RESOURCE)),
 ];
 
 /// Whether the target `arn` names a resource of one of [`ROLE_INVOKED_TARGETS`].

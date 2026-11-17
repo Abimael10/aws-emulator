@@ -233,7 +233,12 @@ impl ComAmazonawsEc2Amazonec2State {
     /// association id: those belong to an Elastic IP the account allocated and associated.
     /// `DescribeNetworkInterfaces`, `DescribeNetworkInterfaceAttribute`'s
     /// `associatePublicIpAddress` and the instance's own report all read that one record.
-    pub(super) fn assign_amazon_public_ipv4(
+    ///
+    /// `pub` because the public address of an interface ANOTHER service created for a
+    /// resource of the account — the elastic network interface an Amazon ECS `awsvpc` task
+    /// runs on, whose launch may ask for one — is assigned through this same one place, so
+    /// there is exactly one way a public IPv4 address of this store is handed out.
+    pub fn assign_amazon_public_ipv4(
         &mut self,
         network_interface_id: &str,
         region: &str,

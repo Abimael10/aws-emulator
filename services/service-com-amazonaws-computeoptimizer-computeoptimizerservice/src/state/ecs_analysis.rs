@@ -179,9 +179,7 @@ pub fn ecs_service_config(
     let definition = record
         .task_definition
         .as_ref()
-        .and_then(|(family, revision)| {
-            inventory.task_definitions.get(&(family.clone(), *revision))
-        });
+        .and_then(|key| inventory.task_definitions.get(key));
     Some(EcsServiceConfig {
         launch_type: record.launch_type.clone(),
         capacity_providers: record

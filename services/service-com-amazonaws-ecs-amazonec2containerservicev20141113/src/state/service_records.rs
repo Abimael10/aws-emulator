@@ -42,9 +42,10 @@ pub struct ServiceRecord {
     /// takes the count on, so the catch-up happens once and on the clock.
     pub scheduler_due_at: Option<SystemTime>,
     pub task_definition_arn: Option<String>,
-    /// The family and revision the ARN above names, kept so the scheduler can read the
-    /// revision back when it places a task.
-    pub task_definition: Option<(String, i32)>,
+    /// The Region, family and revision the ARN above names, kept as the key the store holds
+    /// that revision under, so the scheduler can read the revision back when it places a
+    /// task.
+    pub task_definition: Option<(String, String, i32)>,
     pub launch_type: Option<String>,
     pub capacity_provider_strategy: Vec<CapacityProviderStrategyItem>,
     pub platform_version: Option<String>,
@@ -427,11 +428,12 @@ pub struct ServiceDeploymentRecord {
     /// The region this rollout was started in, so the redeployment a ROLLBACK performs
     /// mints its ARNs in the same region as the rollout it undoes.
     pub region: String,
-    /// The task-definition revision this rollout released, as the `(family, revision)` key
-    /// the store holds it under. `ServiceDeployment$targetServiceRevision` is "the workload
+    /// The task-definition revision this rollout released, as the
+    /// `(region, family, revision)` key the store holds it under.
+    /// `ServiceDeployment$targetServiceRevision` is "the workload
     /// configuration being deployed", and the revision is the part of it a ROLLBACK has to
     /// put back when a later rollout is rolled back to this one.
-    pub task_definition: Option<(String, i32)>,
+    pub task_definition: Option<(String, String, i32)>,
     /// The PAUSE lifecycle hooks this rollout has REACHED, oldest first — what
     /// `ServiceDeployment$lifecycleHookDetails` reports ("the details of the lifecycle
     /// hooks for the current service deployment").
@@ -851,9 +853,9 @@ pub struct TaskSetRecord {
     pub external_id: Option<String>,
     pub status: String,
     pub task_definition_arn: String,
-    /// The family and revision the ARN above names, kept so the scheduler can read the
-    /// revision back when it places a task — as [`ServiceRecord::task_definition`] is.
-    pub task_definition: (String, i32),
+    /// The Region, family and revision the ARN above names, kept so the scheduler can read
+    /// the revision back when it places a task — as [`ServiceRecord::task_definition`] is.
+    pub task_definition: (String, String, i32),
     pub launch_type: Option<String>,
     pub capacity_provider_strategy: Vec<CapacityProviderStrategyItem>,
     pub platform_version: Option<String>,
@@ -971,23 +973,28 @@ pub const ATTACHMENT_DETAIL_SUBNET_ID: &str = "subnetId";
 pub struct AttachmentRecord {
     pub id: String,
     /// Which attachment of this store's whole history this is, from the counter the id was
-    /// minted out of (`next_attachment_id`). Everything the interface itself carries is
-    /// derived from it, so one interface's id, MAC and address are its own and read the
-    /// same every time ([`AttachmentRecord::report_allocated_interface`]).
+    /// minted out of (`next_attachment_id`), which is what makes every attachment of every
+    /// task distinct.
     pub sequence: u64,
     pub attachment_type: String,
     pub status: String,
     pub details: Vec<KeyValuePair>,
-    /// `Subnet$cidrBlock` of the subnet the interface was created in, as Amazon VPC held it
-    /// when the placement was made ([`SubnetPlacement`]) — the range the interface's own
-    /// address is taken out of ([`allocated_interface_private_ipv4_address`]) — and `None`
-    /// for an attachment whose subnet this emulator holds no CIDR block for.
-    pub subnet_cidr_block: Option<String>,
     /// When the next step of this attachment's own progression falls due
     /// ([`INTERFACE_ATTACH_LIFECYCLE`]), and `None` once the clock owes it nothing more:
     /// the resource is in place, or an agent has reported a status that progression does
     /// not pass through.
     pub next_status_due_at: Option<SystemTime>,
+    /// The interface AMAZON VPC created for this attachment, as that store holds it
+    /// ([`super::awsvpc_interfaces`]) — the three details that belong to the interface
+    /// itself, which is why they are reported from here rather than derived
+    /// ([`AttachmentRecord::report_allocated_interface`]). `None` until the allocation pass
+    /// has created it, and for an attachment whose subnet Amazon VPC holds no record of.
+    pub allocated: Option<AllocatedInterface>,
+    /// Whether the interface above has been DELETED in Amazon VPC, which the stop of the
+    /// task that held it is what does: the record keeps the details it reported (they are
+    /// what a client reading a stopped task resolves the interface it held by), and this is
+    /// what keeps a later pass from asking for the same deletion twice.
+    pub interface_released: bool,
 }
 
 impl AttachmentRecord {

@@ -764,7 +764,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     })
                     .into());
                 };
-                let definition = match guard.usable_revision(&family, revision) {
+                let definition = match guard.usable_revision(&region, &family, revision) {
                     Ok(definition) => definition.clone(),
                     Err(refusal) => {
                         // "You can't use an INACTIVE task definition to ... create new
@@ -1087,7 +1087,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             task_definition_arn: definition.as_ref().map(|found| found.arn.clone()),
             task_definition: definition
                 .as_ref()
-                .map(|found| (found.family.clone(), found.revision)),
+                .map(|found| (region.clone(), found.family.clone(), found.revision)),
             launch_type,
             capacity_provider_strategy,
             platform_version: input.platform_version.clone(),

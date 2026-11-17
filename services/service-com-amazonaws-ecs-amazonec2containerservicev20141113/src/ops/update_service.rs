@@ -731,7 +731,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     })
                     .into());
                 };
-                let definition = match guard.usable_revision(&family, revision) {
+                let definition = match guard.usable_revision(&region, &family, revision) {
                     Ok(definition) => definition.clone(),
                     Err(refusal) => {
                         // "You can't update an existing service to reference an INACTIVE
@@ -1123,7 +1123,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
         if let Some(found) = definition.as_ref() {
             service.task_definition_arn = Some(found.arn.clone());
-            service.task_definition = Some((found.family.clone(), found.revision));
+            service.task_definition =
+                Some((region.clone(), found.family.clone(), found.revision));
         }
         // A service reports either a capacity-provider strategy or a launch type, so
         // moving it onto a strategy takes the launch type off it.

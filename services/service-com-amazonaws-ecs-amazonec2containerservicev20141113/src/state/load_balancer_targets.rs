@@ -223,9 +223,7 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
     /// ([`revision_container_ports`]); empty for a task whose revision this store no longer
     /// holds, which declares no ports for a check to be read against.
     fn task_container_ports(&self, task: &TaskRecord) -> ServedPorts {
-        parse_revision_reference(&task.task_definition_arn, TASK_DEFINITION_RESOURCE_TYPE)
-            .and_then(|(family, revision)| Some((family, revision?)))
-            .and_then(|key| self.task_definitions.get(&key))
+        self.revision_of_arn(&task.task_definition_arn)
             .map_or_else(|| ServedPorts::from(Vec::new()), revision_container_ports)
     }
 

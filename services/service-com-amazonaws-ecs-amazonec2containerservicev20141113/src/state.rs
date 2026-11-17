@@ -189,6 +189,12 @@ pub use validation::*;
 mod task_interfaces;
 pub use task_interfaces::*;
 
+/// That same interface as AMAZON VPC holds it: created in the subnet the launch named for
+/// the task that was placed, given a public address when the launch asked for one, and
+/// deleted with the task.
+mod awsvpc_interfaces;
+pub use awsvpc_interfaces::*;
+
 /// Whether a launched task can fetch the images its containers run from where it was
 /// placed — read off the Amazon VPC networking the launch named — and the stop a task that
 /// cannot earns.
@@ -4211,13 +4217,21 @@ pub struct ComAmazonawsEcsAmazonec2containerservicev20141113State {
     /// this key. Distinct from `ClusterRecord::capacity_providers`, which only records
     /// WHICH of these a cluster is associated with.
     pub capacity_providers: HashMap<String, CapacityProviderRecord>,
-    /// `(family, revision)` -> the registered revision.
-    pub task_definitions: HashMap<(String, i32), TaskDefinitionRecord>,
-    /// `family` -> the revision the next `RegisterTaskDefinition` for it will take.
-    /// Kept beside `task_definitions` so a revision number is never reused, even after
+    /// `(region, family, revision)` -> the registered revision.
+    ///
+    /// A task definition is a REGIONAL resource of Amazon ECS — it is registered against one
+    /// Region's endpoint and every ARN that endpoint reports carries that Region — so the
+    /// Region is part of the key: one family name is a family of each Region separately, a
+    /// revision registered in one Region resolves in that Region alone, and the revisions of
+    /// one Region are the only ones its listings report.
+    pub task_definitions: HashMap<(String, String, i32), TaskDefinitionRecord>,
+    /// `(region, family)` -> the revision the next `RegisterTaskDefinition` for it will
+    /// take. Kept beside `task_definitions` so a revision number is never reused, even after
     /// a revision is deregistered (`TaskDefinition$revision`: "the revision value
-    /// always increases by one. This is even if you deregistered previous revisions").
-    pub next_revision: HashMap<String, i32>,
+    /// always increases by one. This is even if you deregistered previous revisions") — and
+    /// keyed by Region for the reason that map is: the first revision of a family in one
+    /// Region is `1` however many revisions the same family name has in another.
+    pub next_revision: HashMap<(String, String), i32>,
     /// `(family, revision)` -> the registered DAEMON task-definition revision. Daemon
     /// task definitions are their own resource (see [`DaemonTaskDefinitionRecord`]), so
     /// they are held beside `task_definitions` rather than in it: the same family name

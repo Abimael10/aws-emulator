@@ -114,6 +114,19 @@ pub(crate) fn emulator() -> Emulator {
             &engine,
         )),
     );
+    // Amazon ECS: a rule target that is a cluster is delivered to by RUNNING the task the
+    // target's `EcsParameters` describe on it, and the task is read back through that
+    // service's own `ListTasks`/`DescribeTasks`. Amazon EC2 is mounted beside it because
+    // the subnets an `awsvpc` task's network configuration names are Amazon VPC's records,
+    // which the run resolves, and the interface the task is allocated is one of them.
+    router.register_service(
+        service_com_amazonaws_ecs_amazonec2containerservicev20141113::EmulatedService::new(
+            Arc::clone(&engine),
+        ),
+    );
+    router.register_service(
+        service_com_amazonaws_ec2_amazonec2::EmulatedService::new(Arc::clone(&engine)),
+    );
     Emulator { router, engine }
 }
 
@@ -352,6 +365,31 @@ pub(crate) async fn iam(
     params: &[(&str, &str)],
 ) -> (u16, String) {
     query(emulator, "iam", "2010-05-08", action, params).await
+}
+
+/// One Amazon EC2 call (`awsQuery`), answered with its status and XML body: the
+/// networking an `awsvpc` task target's run is resolved against lives there.
+pub(crate) async fn ec2(
+    emulator: &Emulator,
+    action: &str,
+    params: &[(&str, &str)],
+) -> (u16, String) {
+    query(emulator, "ec2", "2016-11-15", action, params).await
+}
+
+/// One Amazon ECS call (`AmazonEC2ContainerServiceV20141113`, awsJson1_1), answered with
+/// its status and body: the cluster an ECS task target names, and the tasks a delivery to
+/// it ran.
+pub(crate) async fn ecs(emulator: &Emulator, operation: &str, body: &Value) -> (u16, Value) {
+    rpc(
+        emulator,
+        "ecs",
+        "AmazonEC2ContainerServiceV20141113",
+        "1.1",
+        operation,
+        body,
+    )
+    .await
 }
 
 pub(crate) async fn sns(

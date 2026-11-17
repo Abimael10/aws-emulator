@@ -223,7 +223,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             if !seen.insert((family.clone(), revision)) {
                 continue;
             }
-            let Some(record) = guard.task_definitions.get_mut(&(family.clone(), revision)) else {
+            let Some(record) = guard.revision_mut(&region, &family, revision) else {
                 // An entry that resolves to no stored revision is a per-entry failure,
                 // not a refusal of the request: this operation reports "any failures
                 // associated with the call" beside the revisions it did delete, so one

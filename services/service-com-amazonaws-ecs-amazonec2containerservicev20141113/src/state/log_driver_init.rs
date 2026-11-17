@@ -135,12 +135,7 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
     /// so nothing is decided against it — the same reading the task role such a task runs
     /// under is resolved by ([`super::container_secrets`]).
     pub(super) fn launched_task_log_targets(&self, task: &TaskRecord) -> Vec<AwsLogsTarget> {
-        let Some((family, revision)) = parse_task_definition_reference(&task.task_definition_arn)
-        else {
-            return Vec::new();
-        };
-        let Some(definition) = revision.and_then(|revision| self.task_definitions.get(&(family, revision)))
-        else {
+        let Some(definition) = self.revision_of_arn(&task.task_definition_arn) else {
             return Vec::new();
         };
         // The Region the delivery is addressed in when the configuration names none: the one

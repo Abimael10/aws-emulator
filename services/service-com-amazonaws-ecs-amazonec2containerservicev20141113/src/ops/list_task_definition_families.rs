@@ -179,6 +179,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 message: Some("the ECS store is unavailable".to_string()),
             })
         })?;
+        let region = crate::state::request_region(_ctx);
 
         // "This value can be between 1 and 100."
         if let Some(message) = input.max_results.and_then(|max_results| {
@@ -225,9 +226,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 match crate::state::decode_page_token(&token_key, &page_scope, token).filter(
                     |cursor| {
                         guard
-                            .task_definitions
-                            .keys()
-                            .any(|(family, _)| family == cursor)
+                            .revisions_of_region(&region)
+                            .any(|record| record.family == *cursor)
                     },
                 ) {
                     Some(cursor) => Some(cursor),
@@ -249,12 +249,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // This list includes task definition families that no longer have any ACTIVE task
         // definition revisions" — a family is registered to the account exactly while a
         // revision of it is stored, whatever that revision's status, so both the family
-        // set and each family's ACTIVE-ness are derived from the stored revisions. The
+        // set and each family's ACTIVE-ness are derived from the stored revisions. Only the
+        // revisions of THIS REGION are read: a task definition is a regional resource, so a
+        // family registered against another Region's endpoint is no family of this one. The
         // map is keyed by the family name, so the listing is already in the lexicographic
         // order the token walks.
         let mut has_active: ::std::collections::BTreeMap<&str, bool> =
             ::std::collections::BTreeMap::new();
-        for record in guard.task_definitions.values() {
+        for record in guard.revisions_of_region(&region) {
             let active = record.status == crate::state::TASK_DEFINITION_ACTIVE;
             has_active
                 .entry(record.family.as_str())
