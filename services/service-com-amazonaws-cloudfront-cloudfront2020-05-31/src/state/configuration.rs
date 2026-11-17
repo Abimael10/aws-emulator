@@ -98,9 +98,12 @@ pub(super) fn resolve_logging(logging: Option<LoggingConfig>) -> LoggingConfig {
 /// A configuration that names no certificate of its own is served on CloudFront's own
 /// certificate: "If the distribution doesn't use `Aliases` ... set
 /// `CloudFrontDefaultCertificate` to `true` and leave all other fields empty." The method
-/// viewers connect over is then the recommended one
-/// ([`SSL_SUPPORT_METHOD_SNI_ONLY`]) — a configuration is never given the dedicated-IP
-/// method it did not ask for, which bills for dedicated addresses. The deprecated
+/// viewers connect over then follows HOW they reach the distribution, which is why
+/// `serves_own_domain` decides it: a distribution answering under a CloudFront domain name
+/// of its own is served at CloudFront's own addresses, where no viewer has to send the name
+/// it asked for ([`SSL_SUPPORT_METHOD_DEDICATED_IP`]), while a multi-tenant one is reached
+/// through a connection group that answers for the tenant whose name the viewer sent
+/// ([`SSL_SUPPORT_METHOD_SNI_ONLY`]). The deprecated
 /// `Certificate` and `CertificateSource` members report which certificate is in use and
 /// where it is kept, so they follow from the certificate the configuration chose.
 ///
@@ -129,10 +132,15 @@ pub(super) fn resolve_viewer_certificate(
             Some(resolved.cloud_front_default_certificate.unwrap_or(true));
     }
     if resolved.cloud_front_default_certificate == Some(true) {
+        let served_over = if serves_own_domain {
+            SSL_SUPPORT_METHOD_DEDICATED_IP
+        } else {
+            SSL_SUPPORT_METHOD_SNI_ONLY
+        };
         resolved.ssl_support_method = Some(
             resolved
                 .ssl_support_method
-                .unwrap_or_else(|| SSL_SUPPORT_METHOD_SNI_ONLY.to_string()),
+                .unwrap_or_else(|| served_over.to_string()),
         );
         if serves_own_domain || resolved.minimum_protocol_version.is_none() {
             resolved.minimum_protocol_version =

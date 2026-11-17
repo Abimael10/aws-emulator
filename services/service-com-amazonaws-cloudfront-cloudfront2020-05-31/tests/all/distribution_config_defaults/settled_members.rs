@@ -22,15 +22,6 @@
 
 use super::*;
 
-/// An ACM certificate ARN, in the one Region CloudFront supports ACM certificates from
-/// ("CloudFront only supports ACM certificates in the US East (N. Virginia) Region").
-const ACM_ARN: &str = "arn:aws:acm:us-east-1:000000000000:certificate/\
-     11111111-2222-3333-4444-555555555555";
-
-/// An IAM server certificate id, within the 32-character maximum
-/// `ViewerCertificate$IAMCertificateId` carries.
-const IAM_ID: &str = "ASCAEXAMPLE1234567890";
-
 /// One row: the certificate a configuration names and the settings the distribution it
 /// describes runs under.
 struct CustomCertificateRow {
@@ -38,8 +29,9 @@ struct CustomCertificateRow {
     /// The alternate domain name this row's distribution serves, which is what makes a
     /// certificate of the caller's the one that validates it.
     alias: &'static str,
-    /// The `ViewerCertificate` the configuration states.
-    certificate: &'static str,
+    /// The `ViewerCertificate` the configuration states, built by the parent suite's
+    /// `own_certificate` so the element has one construction.
+    certificate: String,
     /// The `SSLSupportMethod` the stored configuration reports: the declared one.
     ssl_support_method: &'static str,
     /// The `MinimumProtocolVersion` the stored configuration reports: the declared one.
@@ -57,12 +49,12 @@ fn custom_certificate_rows() -> Vec<CustomCertificateRow> {
         CustomCertificateRow {
             case: "an ACM certificate, SNI-only over TLSv1.2_2021",
             alias: "acm.example.com",
-            certificate: "<ViewerCertificate>\
-                          <ACMCertificateArn>arn:aws:acm:us-east-1:000000000000:certificate/\
-                          11111111-2222-3333-4444-555555555555</ACMCertificateArn>\
-                          <SSLSupportMethod>sni-only</SSLSupportMethod>\
-                          <MinimumProtocolVersion>TLSv1.2_2021</MinimumProtocolVersion>\
-                          </ViewerCertificate>",
+            certificate: own_certificate(
+                "ACMCertificateArn",
+                ACM_ARN,
+                "sni-only",
+                "TLSv1.2_2021",
+            ),
             ssl_support_method: "sni-only",
             minimum_protocol_version: "TLSv1.2_2021",
             certificate_source: CERTIFICATE_SOURCE_ACM,
@@ -71,12 +63,7 @@ fn custom_certificate_rows() -> Vec<CustomCertificateRow> {
         CustomCertificateRow {
             case: "an ACM certificate, dedicated-IP over TLSv1.3_2025",
             alias: "acm-vip.example.com",
-            certificate: "<ViewerCertificate>\
-                          <ACMCertificateArn>arn:aws:acm:us-east-1:000000000000:certificate/\
-                          11111111-2222-3333-4444-555555555555</ACMCertificateArn>\
-                          <SSLSupportMethod>vip</SSLSupportMethod>\
-                          <MinimumProtocolVersion>TLSv1.3_2025</MinimumProtocolVersion>\
-                          </ViewerCertificate>",
+            certificate: own_certificate("ACMCertificateArn", ACM_ARN, "vip", "TLSv1.3_2025"),
             ssl_support_method: "vip",
             minimum_protocol_version: "TLSv1.3_2025",
             certificate_source: CERTIFICATE_SOURCE_ACM,
@@ -85,11 +72,12 @@ fn custom_certificate_rows() -> Vec<CustomCertificateRow> {
         CustomCertificateRow {
             case: "an IAM server certificate, SNI-only over TLSv1.2_2018",
             alias: "iam.example.com",
-            certificate: "<ViewerCertificate>\
-                          <IAMCertificateId>ASCAEXAMPLE1234567890</IAMCertificateId>\
-                          <SSLSupportMethod>sni-only</SSLSupportMethod>\
-                          <MinimumProtocolVersion>TLSv1.2_2018</MinimumProtocolVersion>\
-                          </ViewerCertificate>",
+            certificate: own_certificate(
+                "IAMCertificateId",
+                IAM_ID,
+                "sni-only",
+                "TLSv1.2_2018",
+            ),
             ssl_support_method: "sni-only",
             minimum_protocol_version: "TLSv1.2_2018",
             certificate_source: CERTIFICATE_SOURCE_IAM,
@@ -111,9 +99,8 @@ async fn a_custom_certificate_keeps_the_settings_the_configuration_declared() {
         let document = config_xml(
             &format!("custom-certificate-{index}"),
             &format!(
-                "<Aliases><Quantity>1</Quantity><Items><CNAME>{}</CNAME></Items></Aliases>\
-                 {MINIMAL_CUSTOM_ORIGIN}{}<Comment>{case}</Comment><Enabled>true</Enabled>{}",
-                row.alias,
+                "{}{MINIMAL_CUSTOM_ORIGIN}{}<Comment>{case}</Comment><Enabled>true</Enabled>{}",
+                aliases(row.alias),
                 minimal_behavior(""),
                 row.certificate
             ),

@@ -13,10 +13,10 @@
 //!   request is the absent `@required` member and it is refused as that (400
 //!   `ValidationException`, the member named on its own), while the two definition imports
 //!   read the body themselves and state their own sentence for an empty definition;
-//! * a definition document that PARSED and declares neither version member is refused as a
-//!   version that could not be determined, which is a different refusal from a body no
-//!   reader could read as a document at all and from a VERSIONED document that cannot be
-//!   read as that format — those two share the other sentence;
+//! * a definition document that declares neither version member — or that stopped being
+//!   readable before it declared one — is refused as a version that could not be
+//!   determined, which is a different refusal from a document that DID declare its version
+//!   and is not a readable definition of that format;
 //! * a readable definition whose operations carry more than this emulator's resource guards
 //!   store is refused by the same guards that bound the operations which write those
 //!   records one at a time, and stores nothing.
@@ -220,13 +220,15 @@ fn definition_with_version(title: &str) -> String {
 /// — what the parsed document carries instead (nothing but an `info`, paths as well, a
 /// member whose name merely resembles the version field in Swagger 1.2's `swaggerVersion`,
 /// an `info.version`, which is the API's own version and not the format's) and the shape it
-/// parsed to (a mapping, a sequence, a scalar) — and along the spelling, JSON and the YAML
-/// the same document is written in. A body that never parsed at all earns the OTHER
-/// sentence, which the siblings
+/// parsed to (a mapping, a sequence, a scalar) — along whether the document read whole at
+/// all, since a body that stopped before any version member declares none either — and
+/// along the spelling, JSON and the YAML
+/// the same document is written in. A document that DECLARED a version and is then not a
+/// readable definition of that format earns the OTHER sentence, which the siblings
 /// [`a_document_that_did_not_read_keeps_the_invalid_input_sentence`] and
-/// [`a_body_no_reader_could_parse_is_refused_as_an_invalid_definition`] pin. The served rows
-/// are the same documents carrying each of the two members, which must NOT earn this
-/// sentence.
+/// [`a_body_the_reader_could_not_finish_is_refused_by_the_version_it_declared`] pin. The
+/// served rows are the same documents carrying each of the two members, which must NOT earn
+/// this sentence.
 #[tokio::test]
 async fn a_definition_whose_version_cannot_be_determined_is_refused_as_that() {
     let gateway = Gateway::new();
@@ -264,6 +266,16 @@ async fn a_definition_whose_version_cannot_be_determined_is_refused_as_that() {
         (
             "a YAML mapping carrying nothing but a title",
             "info:\n  title: no version\n".to_string(),
+        ),
+        // A body the reader could make no document of carries no version member either, so
+        // it declares none: the version is what could not be determined about it.
+        (
+            "text that is no document at all",
+            "}not a document{".to_string(),
+        ),
+        (
+            "a version-less document the reader could not finish",
+            "{\"info\": {\"title\": \"no version\"}, \"paths\": {".to_string(),
         ),
     ];
 
@@ -333,17 +345,17 @@ async fn a_definition_whose_version_cannot_be_determined_is_refused_as_that() {
     }
 }
 
-/// RULE: a body the reader could not read as a document AT ALL, and a document that read
-/// and declared its version but is not a valid definition of that format, are both the
-/// "this is not an API definition" refusal — the one beside the version sentence, so a
-/// caller can tell "this document does not say what it is" from "this is not a document /
-/// not a valid one of those".
+/// RULE: a document that declared the format it is written in and is not a readable
+/// definition of that format — whether the reading stopped partway or the document read
+/// whole — is the "this is not an API definition" refusal, the one beside the version
+/// sentence, so a caller can tell "nothing here says what this is" from "this is not a
+/// valid one of those".
 ///
 /// Rows span both halves of that class and differ along WHERE the reading stopped: a
-/// truncated document, an unterminated flow mapping, an unterminated quoted scalar, text
-/// that is no document, and a versioned document whose `paths` is not a mapping — in both
-/// version members and both spellings. The first four never reach version detection, which
-/// is why they are here and not in the sibling
+/// truncated document, an unterminated flow mapping, an unterminated quoted scalar, and a
+/// versioned document whose `paths` is not a mapping — in both version members and both
+/// spellings. Each of them declares its version first, which is why they are here and not
+/// in the sibling
 /// [`a_definition_whose_version_cannot_be_determined_is_refused_as_that`]. A refused
 /// request creates no API, which the count below checks.
 #[tokio::test]
@@ -352,8 +364,8 @@ async fn a_document_that_did_not_read_keeps_the_invalid_input_sentence() {
     let (api, _root) = create_api(&gateway, "unreadable-definitions").await;
     let before = api_count(&gateway, "before the unreadable bodies").await;
 
-    // Rows span the half of the class that never reaches version detection and the half
-    // that reaches it and then fails: both earn the one sentence.
+    // Rows span the half of the class whose reading stopped after the version member and
+    // the half that read whole and is no valid definition: both earn the one sentence.
     let refused: Vec<(&str, String)> = vec![
         (
             "a document truncated mid-object",
@@ -362,10 +374,6 @@ async fn a_document_that_did_not_read_keeps_the_invalid_input_sentence() {
         (
             "an unterminated flow mapping",
             "{\"openapi\": \"3.0.1\", \"paths\": {".to_string(),
-        ),
-        (
-            "text that is no document at all",
-            "}not a document{".to_string(),
         ),
         (
             "an unterminated quoted scalar",
@@ -413,55 +421,98 @@ async fn a_document_that_did_not_read_keeps_the_invalid_input_sentence() {
     );
 }
 
-/// RULE: a body no reader could PARSE at all — bytes that are not text, or text that is
-/// neither a JSON nor a YAML document — is refused as a body that is not an API definition,
-/// which is a DIFFERENT refusal from a document that parsed and declares neither version
-/// member: nothing a reader says about what a document declares applies to a body it never
-/// read, so the version-detection step is never reached for one.
+/// RULE: a body the reader could not finish reading is refused by WHETHER it declared the
+/// format it is written in before the reading stopped — a body carrying one of the two root
+/// version members is refused as a document that is not a valid definition of the format it
+/// says it is, and a body that stopped before any version member (text that is no document,
+/// bytes that are not text) declares no version at all and is refused as that, the same
+/// sentence a document that parsed whole and declares neither earns.
 ///
 /// Rows differ along WHERE the body stops being parseable (a flow mapping, a flow sequence
 /// or a quoted scalar that never closes, a document cut off mid-member, bytes that are no
 /// document at all), along the spelling the body starts out as (JSON and YAML), along
-/// which version member the truncated prefix happens to carry, and along whether the body
-/// is text in the first place. The control rows are the two neighbouring classes, which
-/// keep their own sentences: a document that PARSED and declares no version, and a
-/// well-formed document, which is served.
+/// which version member the truncated prefix happens to carry, along whether the body
+/// is text in the first place — and so along which of the two sentences each earns: the
+/// PAIRED rows are the same prefix with and without its version member, which is what
+/// isolates the one thing that decides the sentence. The control rows are the two
+/// neighbouring classes: a document that PARSED and declares no version, and a well-formed
+/// document, which is served.
 #[tokio::test]
-async fn a_body_no_reader_could_parse_is_refused_as_an_invalid_definition() {
+async fn a_body_the_reader_could_not_finish_is_refused_by_the_version_it_declared() {
     let gateway = Gateway::new();
     let (api, _root) = create_api(&gateway, "unparseable-definitions").await;
     let before = api_count(&gateway, "before the refusals").await;
 
-    // (case, body bytes)
-    let refused: Vec<(&str, Vec<u8>)> = vec![
+    // (case, body bytes, the sentence the body earns)
+    let refused: Vec<(&str, Vec<u8>, &str)> = vec![
         (
             "a JSON object cut off mid-member",
             b"{\"openapi\": \"3.0.1\", \"info\": {\"title\": \"cut off\" NOT A DOCUMENT !!!".to_vec(),
+            INVALID_DEFINITION,
+        ),
+        (
+            "the same object cut off with no version member",
+            b"{\"info\": {\"title\": \"cut off\" NOT A DOCUMENT !!!".to_vec(),
+            UNDETERMINED_VERSION,
         ),
         (
             "an unterminated flow mapping",
             b"{\"openapi\": \"3.0.1\", \"paths\": {".to_vec(),
+            INVALID_DEFINITION,
+        ),
+        (
+            "the same flow mapping with no version member",
+            b"{\"paths\": {".to_vec(),
+            UNDETERMINED_VERSION,
         ),
         (
             "an unterminated flow sequence",
             b"{\"swagger\": \"2.0\", \"schemes\": [\"https\"".to_vec(),
+            INVALID_DEFINITION,
         ),
-        ("text that is no document at all", b"}not a document{".to_vec()),
+        (
+            "the same flow sequence with no version member",
+            b"{\"schemes\": [\"https\"".to_vec(),
+            UNDETERMINED_VERSION,
+        ),
         (
             "an unterminated quoted scalar, written as YAML",
             b"openapi: \"3.0.1\ninfo:\n  title: x\n".to_vec(),
+            INVALID_DEFINITION,
+        ),
+        (
+            "an unterminated quoted scalar whose key is not a version member",
+            b"title: \"x\ninfo:\n  title: x\n".to_vec(),
+            UNDETERMINED_VERSION,
         ),
         (
             "a YAML document whose flow mapping never closes",
             b"swagger: '2.0'\npaths: {\"/pets\": {\n".to_vec(),
+            INVALID_DEFINITION,
+        ),
+        (
+            "the same YAML document with no version member",
+            b"paths: {\"/pets\": {\n".to_vec(),
+            UNDETERMINED_VERSION,
+        ),
+        (
+            "text that is no document at all",
+            b"}not a document{".to_vec(),
+            UNDETERMINED_VERSION,
+        ),
+        (
+            "a version-looking name inside a string value, with no member of that name",
+            b"{\"info\": {\"description\": \"see \\\"openapi\\\": 3\"}, \"paths\": {".to_vec(),
+            UNDETERMINED_VERSION,
         ),
         (
             "bytes that are not text",
             vec![0xff, 0xfe, 0x00, 0x9c, 0x01],
+            UNDETERMINED_VERSION,
         ),
     ];
 
-    for (case, body) in &refused {
+    for (case, body, expected) in &refused {
         let imported = gateway
             .call_bytes(
                 "POST",
@@ -472,7 +523,7 @@ async fn a_body_no_reader_could_parse_is_refused_as_an_invalid_definition() {
         assert_refusal(
             &imported,
             BAD_REQUEST,
-            INVALID_DEFINITION,
+            expected,
             &format!("ImportRestApi with {case}"),
         );
         let put = gateway
@@ -485,7 +536,7 @@ async fn a_body_no_reader_could_parse_is_refused_as_an_invalid_definition() {
         assert_refusal(
             &put,
             BAD_REQUEST,
-            INVALID_DEFINITION,
+            expected,
             &format!("PutRestApi with {case}"),
         );
     }

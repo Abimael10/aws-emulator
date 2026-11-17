@@ -1236,18 +1236,27 @@ pub const DEFAULT_MAX_TTL: i64 = 31_536_000;
 /// ("Customizing error responses").
 pub const DEFAULT_ERROR_CACHING_MIN_TTL: i64 = 300;
 
-/// `ViewerCertificate$SSLSupportMethod` the service supplies for a configuration that
-/// named none.
+/// `ViewerCertificate$SSLSupportMethod` the service supplies for a configuration served on
+/// CloudFront's own certificate from a CloudFront domain name of ITS own.
+///
+/// The member is not one such a configuration states — `SSLSupportMethod`: "If the
+/// distribution uses the CloudFront domain name such as `d111111abcdef8.cloudfront.net`,
+/// don't set a value for this field" — so what is reported for it is the method CloudFront
+/// serves that certificate over, and `vip` is what that is: "the distribution accepts HTTPS
+/// connections from all viewers including those that don't support SNI". A viewer reaches
+/// such a distribution at CloudFront's own addresses under CloudFront's own name, so
+/// nothing about the request selects which certificate is served and no viewer has to send
+/// the name it asked for.
+pub const SSL_SUPPORT_METHOD_DEDICATED_IP: &str = "vip";
+
+/// `ViewerCertificate$SSLSupportMethod` the service supplies for a MULTI-TENANT
+/// configuration served on CloudFront's own certificate.
 ///
 /// `sni-only` is "the distribution accepts HTTPS connections from only viewers that support
-/// server name indication (SNI). This is recommended. Most browsers and clients support
-/// SNI." The alternative the enum admits for a certificate CloudFront serves, `vip`, is the
-/// dedicated-IP method — "not recommended, and results in additional monthly charges from
-/// CloudFront" — and `static-ip` is "not [to be specified] unless your distribution has
-/// been enabled for this feature by the CloudFront team": a method that costs more, or that
-/// has to be enabled for the account, is never one a configuration is given without asking
-/// for it, so the recommended method is what the service supplies and a request naming
-/// another gets exactly the one it named.
+/// server name indication (SNI)", which is what a multi-tenant distribution is served over:
+/// it has no CloudFront domain name of its own, and its viewers reach it through a
+/// connection group that has to be told which name they asked for before it can answer for
+/// the tenant that name belongs to.
 pub const SSL_SUPPORT_METHOD_SNI_ONLY: &str = "sni-only";
 
 /// `ViewerCertificate$MinimumProtocolVersion` reported for a distribution served on

@@ -25,8 +25,10 @@
 //!
 //! The last two sections carry the same rule over the two members the SERVICE itself
 //! settles rather than echoes: the `ViewerCertificate` settings CloudFront's own
-//! certificate decides, and the `TenantConfig$ParameterDefinitions` a configuration
-//! declares. Each states the rule it asserts where it begins.
+//! certificate decides — including the `SSLSupportMethod` it serves that certificate
+//! over, which follows how viewers reach the distribution — and the
+//! `TenantConfig$ParameterDefinitions` a configuration declares. Each states the rule it
+//! asserts where it begins.
 //!
 //! The table spans what the rule generalises over: the kind of origin (custom, S3), how a
 //! behaviour states its cache key (the legacy `ForwardedValues` or a cache policy), how
@@ -51,7 +53,8 @@ use service_com_amazonaws_cloudfront_cloudfront2020_05_31::state::{
     DEFAULT_ERROR_CACHING_MIN_TTL, DEFAULT_HTTP_VERSION, DEFAULT_MAX_TTL, DEFAULT_MIN_TTL,
     DEFAULT_ORIGIN_KEEPALIVE_TIMEOUT, DEFAULT_ORIGIN_READ_TIMEOUT, DEFAULT_PRICE_CLASS,
     MAX_CACHE_BEHAVIORS, MAX_TRUSTED_KEY_GROUPS, MAX_TRUSTED_SIGNERS,
-    MINIMUM_PROTOCOL_VERSION_DEFAULT_CERTIFICATE, SERVICE_ENDPOINT, SSL_SUPPORT_METHOD_SNI_ONLY,
+    MINIMUM_PROTOCOL_VERSION_DEFAULT_CERTIFICATE, SERVICE_ENDPOINT,
+    SSL_SUPPORT_METHOD_DEDICATED_IP, SSL_SUPPORT_METHOD_SNI_ONLY,
 };
 /// The other half of the certificate rule the table below asserts: what a distribution on
 /// a CUSTOM certificate reports. A SUBMODULE so this file keeps one concern per section,
@@ -134,12 +137,12 @@ fn distribution_level_defaults() -> Vec<(String, String)> {
         at("Logging/Prefix", ""),
         at("PriceClass", DEFAULT_PRICE_CLASS),
         at("ViewerCertificate/CloudFrontDefaultCertificate", "true"),
-        // The method the service supplies is the recommended SNI-only one; the
-        // dedicated-IP method bills for dedicated addresses, so no configuration is given
-        // it without asking for it.
+        // The method the service supplies for a distribution served on CloudFront's own
+        // certificate under a CloudFront domain name of its own, where no viewer has to
+        // send the name it asked for.
         at(
             "ViewerCertificate/SSLSupportMethod",
-            SSL_SUPPORT_METHOD_SNI_ONLY,
+            SSL_SUPPORT_METHOD_DEDICATED_IP,
         ),
         at("ViewerCertificate/MinimumProtocolVersion", MINIMUM_PROTOCOL_VERSION_DEFAULT_CERTIFICATE),
         at("ViewerCertificate/CertificateSource", "cloudfront"),
@@ -857,19 +860,19 @@ fn tenancy_rows() -> Vec<TenancyRow> {
         standard(
             "no ViewerCertificate at all",
             String::new(),
-            SSL_SUPPORT_METHOD_SNI_ONLY,
+            SSL_SUPPORT_METHOD_DEDICATED_IP,
             MINIMUM_PROTOCOL_VERSION_DEFAULT_CERTIFICATE,
         ),
         standard(
             "CloudFront's own certificate, neither member named",
             default_certificate(None, None),
-            SSL_SUPPORT_METHOD_SNI_ONLY,
+            SSL_SUPPORT_METHOD_DEDICATED_IP,
             MINIMUM_PROTOCOL_VERSION_DEFAULT_CERTIFICATE,
         ),
         standard(
             "a standard distribution declaring a security policy, which is overridden",
             default_certificate(None, Some(DECLARED_POLICY)),
-            SSL_SUPPORT_METHOD_SNI_ONLY,
+            SSL_SUPPORT_METHOD_DEDICATED_IP,
             MINIMUM_PROTOCOL_VERSION_DEFAULT_CERTIFICATE,
         ),
     ];
@@ -882,8 +885,9 @@ fn tenancy_rows() -> Vec<TenancyRow> {
         ));
     }
     // The tenancy column: a multi-tenant configuration has no CloudFront domain name of its
-    // own, so a security policy it DECLARED is the one it keeps, while one it declared none
-    // of is served under the same automatic policy a standard distribution is. Its
+    // own, so it is served over the SNI-only method rather than the dedicated-address one,
+    // and a security policy it DECLARED is the one it keeps, while one it declared none of
+    // is served under the same automatic policy a standard distribution is. Its
     // `TenantConfig` is reported as the request stated it, and a `ParameterDefinitions`
     // carrying no entry declares no parameter, so no payload reports that element.
     rows.push(TenancyRow {
@@ -986,8 +990,10 @@ fn assert_tenancy(row: &TenancyRow, config: &Node, context: &str, raw: &str) {
 
 /// The certificate a configuration is served over and the tenant configuration it declares
 /// are the ones the REQUEST described: a configuration naming no `SSLSupportMethod` is
-/// served over the recommended SNI-only method — never the dedicated-IP one, which costs
-/// more — one naming a method gets exactly that method back, the security policy is the
+/// served over the method CloudFront serves its own certificate over for how that
+/// distribution is reached — the dedicated-address one under a CloudFront domain name of
+/// its own, the SNI-only one for a multi-tenant distribution reached through a connection
+/// group — one naming a method gets exactly that method back, the security policy is the
 /// automatic one for CloudFront's own certificate unless the distribution has no CloudFront
 /// domain name of its own to override it, and a `ParameterDefinitions` declaring no
 /// parameter is reported by no payload. Asserted on the create answer, on the read, and on
@@ -1231,6 +1237,238 @@ async fn the_location_is_rooted_at_the_endpoint_the_request_reached() {
         assert_eq!(
             location, expected,
             "case host={host}: expected Location {expected:?}, got {location:?}"
+        );
+    }
+}
+
+/// One row of the certificate-method table: the certificate and tenancy members a request
+/// carries, and the `SSLSupportMethod` every payload must then report.
+struct MethodRow {
+    case: &'static str,
+    /// The `ViewerCertificate` element the request carries; empty for a request carrying
+    /// none at all.
+    certificate: String,
+    /// The tenancy members the request carries; empty for a standard distribution.
+    tenancy: String,
+    /// Whether the configuration serves an alternate domain name of the caller's, which is
+    /// what makes a certificate of the caller's the one that validates it.
+    aliased: bool,
+    /// The `SSLSupportMethod` the resolved configuration must report.
+    expected: String,
+}
+
+/// An ACM certificate ARN, in the one Region CloudFront supports ACM certificates from
+/// ("CloudFront only supports ACM certificates in the US East (N. Virginia) Region"). Read
+/// by the [`settled_members`] submodule too, through its `use super::*`.
+const ACM_ARN: &str = "arn:aws:acm:us-east-1:000000000000:certificate/\
+     11111111-2222-3333-4444-555555555555";
+
+/// An IAM server certificate id, within the 32-character maximum
+/// `ViewerCertificate$IAMCertificateId` carries.
+const IAM_ID: &str = "ASCAEXAMPLE1234567890";
+
+/// A `ViewerCertificate` on a certificate of the caller's own, which states both members
+/// the caller decides there: a distribution using `Aliases` names one of
+/// `ACMCertificateArn` or `IAMCertificateId` together with the method viewers reach it
+/// over, and the security policy it is served under. Read by the [`settled_members`]
+/// submodule too, so the element is built in one place.
+pub(crate) fn own_certificate(member: &str, value: &str, method: &str, policy: &str) -> String {
+    format!(
+        "<ViewerCertificate><{member}>{value}</{member}>\
+         <SSLSupportMethod>{method}</SSLSupportMethod>\
+         <MinimumProtocolVersion>{policy}</MinimumProtocolVersion></ViewerCertificate>"
+    )
+}
+
+/// The `Aliases` element for one alternate domain name.
+pub(crate) fn aliases(name: &str) -> String {
+    format!("<Aliases><Quantity>1</Quantity><Items><CNAME>{name}</CNAME></Items></Aliases>")
+}
+
+/// The rows the certificate-method rule is asserted over.
+fn method_rows() -> Vec<MethodRow> {
+    let standard = |case: &'static str, certificate: String, expected: &str| MethodRow {
+        case,
+        certificate,
+        tenancy: String::new(),
+        aliased: false,
+        expected: expected.to_string(),
+    };
+    let tenant = |case: &'static str, certificate: String, expected: &str| MethodRow {
+        case,
+        certificate,
+        tenancy: TENANT_ONLY.to_string(),
+        aliased: false,
+        expected: expected.to_string(),
+    };
+    // A distribution on a certificate of the caller's own serves an alternate domain name,
+    // which is what such a certificate validates.
+    let own = |case: &'static str, certificate: String, expected: &str| MethodRow {
+        case,
+        certificate,
+        tenancy: String::new(),
+        aliased: true,
+        expected: expected.to_string(),
+    };
+    let mut rows = vec![
+        standard(
+            "a standard distribution carrying no ViewerCertificate at all",
+            String::new(),
+            SSL_SUPPORT_METHOD_DEDICATED_IP,
+        ),
+        standard(
+            "a standard distribution on CloudFront's own certificate",
+            default_certificate(None, None),
+            SSL_SUPPORT_METHOD_DEDICATED_IP,
+        ),
+        tenant(
+            "a multi-tenant distribution carrying no ViewerCertificate at all",
+            String::new(),
+            SSL_SUPPORT_METHOD_SNI_ONLY,
+        ),
+        tenant(
+            "a multi-tenant distribution on CloudFront's own certificate",
+            default_certificate(None, None),
+            SSL_SUPPORT_METHOD_SNI_ONLY,
+        ),
+        // A configuration whose tenancy is declared by its `TenantConfig` alone is
+        // multi-tenant too, so it is served over the same method as one naming the mode.
+        MethodRow {
+            case: "a distribution whose TenantConfig alone declares its tenancy",
+            certificate: default_certificate(None, None),
+            tenancy: format!("{TENANT_ONLY}{}", tenant_config(&["stage"])),
+            aliased: false,
+            expected: SSL_SUPPORT_METHOD_SNI_ONLY.to_string(),
+        },
+    ];
+    // Every method the model's own catalog admits
+    // (`ops::types::S_S_L_SUPPORT_METHOD_VALUES`, the values
+    // `smithy_query(query="shape",shape="SSLSupportMethod")` reports), named by the request
+    // on each kind of certificate: a named method is the one reported back, whichever
+    // certificate the configuration is served on and however viewers reach it.
+    for method in S_S_L_SUPPORT_METHOD_VALUES {
+        rows.push(standard(
+            "a standard distribution naming the method itself",
+            default_certificate(Some(method), None),
+            method,
+        ));
+        rows.push(tenant(
+            "a multi-tenant distribution naming the method itself",
+            default_certificate(Some(method), None),
+            method,
+        ));
+        rows.push(own(
+            "an ACM certificate of the caller's own",
+            own_certificate("ACMCertificateArn", ACM_ARN, method, DECLARED_POLICY),
+            method,
+        ));
+        rows.push(own(
+            "an IAM certificate of the caller's own",
+            own_certificate("IAMCertificateId", IAM_ID, method, DECLARED_POLICY),
+            method,
+        ));
+    }
+    rows
+}
+
+/// RULE: `SSLSupportMethod` is not a member a configuration on CloudFront's own certificate
+/// states — "If the distribution uses the CloudFront domain name such as
+/// `d111111abcdef8.cloudfront.net`, don't set a value for this field" — so what the service
+/// reports for such a configuration is the method it serves its own certificate over for HOW
+/// viewers reach that distribution: a distribution answering under a CloudFront domain name
+/// of its own is reached at CloudFront's own addresses, where no viewer has to send the name
+/// it asked for, while a multi-tenant distribution has none of its own and is reached
+/// through a connection group that answers for the tenant whose name the viewer sent. A
+/// configuration that NAMES a method keeps exactly the one it named, and one served on a
+/// certificate of the caller's own states the method itself.
+///
+/// The rows span what the rule generalises over: the tenancy (standard, multi-tenant by
+/// `ConnectionMode`, multi-tenant by `TenantConfig`), how the default certificate is
+/// declared (not at all, the member stated), every method the model's catalog admits when a
+/// request names one, and both places a certificate of the caller's own is kept. Each row is
+/// asserted on the create answer and on BOTH read paths, so no path invents a method of its
+/// own.
+#[tokio::test]
+async fn the_default_certificate_is_served_over_the_method_the_distribution_is_reached_by() {
+    let router = emulator();
+    for (index, row) in method_rows().into_iter().enumerate() {
+        let case = row.case;
+        let multi_tenant = !row.tenancy.is_empty();
+        // `PriceClass` "only supports standard distributions", so only a standard
+        // configuration states it. A row on a certificate of the caller's own serves an
+        // alternate domain name of its own, unique to the row so no two rows claim one
+        // domain.
+        let document = config_xml(
+            &format!("certificate-method-{index}"),
+            &format!(
+                "{}{MINIMAL_CUSTOM_ORIGIN}{}<Comment>certificate method</Comment>{}\
+                 <Enabled>true</Enabled>{}{}",
+                if row.aliased {
+                    aliases(&format!("method-{index}.example.com"))
+                } else {
+                    String::new()
+                },
+                minimal_behavior(""),
+                if multi_tenant {
+                    String::new()
+                } else {
+                    format!("<PriceClass>{DEFAULT_PRICE_CLASS}</PriceClass>")
+                },
+                row.certificate,
+                row.tenancy,
+            ),
+        );
+
+        let created = create_distribution(&router, &document).await;
+        assert_eq!(
+            created.status, 201,
+            "case {case}: expected the create to be accepted, got {} ({})",
+            created.status, created.raw
+        );
+        let id = created.root().text_at("Id").unwrap_or_default().to_string();
+        let actual = config_of(&created, case, "CreateDistribution")
+            .text_at("ViewerCertificate/SSLSupportMethod");
+        assert_eq!(
+            actual,
+            Some(row.expected.as_str()),
+            "case {case} (CreateDistribution): expected SSLSupportMethod {:?}, got {actual:?} \
+             in {}",
+            row.expected,
+            created.raw
+        );
+
+        // Both read paths answer from the stored record, so both report the method the
+        // create resolved.
+        let read = get_distribution(&router, &id).await;
+        assert_eq!(
+            read.status, 200,
+            "case {case}: expected the read to succeed, got {} ({})",
+            read.status, read.raw
+        );
+        let actual = config_of(&read, case, "GetDistribution")
+            .text_at("ViewerCertificate/SSLSupportMethod");
+        assert_eq!(
+            actual,
+            Some(row.expected.as_str()),
+            "case {case} (GetDistribution): expected SSLSupportMethod {:?}, got {actual:?} in {}",
+            row.expected,
+            read.raw
+        );
+
+        let stored = get_distribution_config(&router, &id).await;
+        assert_eq!(
+            stored.status, 200,
+            "case {case}: expected the configuration read to succeed, got {} ({})",
+            stored.status, stored.raw
+        );
+        let actual = stored.root().text_at("ViewerCertificate/SSLSupportMethod");
+        assert_eq!(
+            actual,
+            Some(row.expected.as_str()),
+            "case {case} (GetDistributionConfig): expected SSLSupportMethod {:?}, got \
+             {actual:?} in {}",
+            row.expected,
+            stored.raw
         );
     }
 }
