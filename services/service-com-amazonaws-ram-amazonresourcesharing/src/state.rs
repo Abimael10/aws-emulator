@@ -484,6 +484,45 @@ const fn resource_type_entry(
     }
 }
 
+/// The resource types of [`RESOURCE_TYPES`] whose resources are reachable from any
+/// Amazon Web Services Region.
+///
+/// `ResourceRegionScope` tells the two apart by where a resource can be reached from —
+/// `GLOBAL` "from any Amazon Web Services Region", `REGIONAL` "only by using requests
+/// that target the Amazon Web Services Region in which the resource exists" — and a
+/// resource reachable from anywhere names no Region in its own ARN, which is the same
+/// test [`resource_region_scope`] applies to a resource ARN. Source: the ARN format each
+/// owning service documents for the type. The entries below are the catalog's types
+/// whose ARN leaves the Region field empty — a global network and a core network
+/// (`arn:<partition>:networkmanager::<account>:core-network/<id>`), and an IP Address
+/// Manager, one of its pools and one of its resource discoveries
+/// (`arn:<partition>:ec2::<account>:ipam/<id>`); every other type in the catalog names
+/// its resources inside one Region.
+const GLOBAL_SCOPE_RESOURCE_TYPES: &[&str] = &[
+    "ec2:Ipam",
+    "ec2:IpamPool",
+    "ec2:IpamResourceDiscovery",
+    "networkmanager:CoreNetwork",
+    "networkmanager:GlobalNetwork",
+];
+
+/// The `ResourceRegionScope` of the resources of `resource_type`.
+///
+/// A property of the type rather than of any one resource of it, so it is read off the
+/// catalog ([`GLOBAL_SCOPE_RESOURCE_TYPES`]) the way `ListResourceTypes` reports it
+/// beside the type, and matched the way every other spelling of a resource type is
+/// ([`resource_type_matches`]).
+pub fn resource_type_region_scope(resource_type: &str) -> &'static str {
+    let global = GLOBAL_SCOPE_RESOURCE_TYPES
+        .iter()
+        .any(|global| resource_type_matches(global, resource_type));
+    if global {
+        RESOURCE_REGION_SCOPE_GLOBAL
+    } else {
+        RESOURCE_REGION_SCOPE_REGIONAL
+    }
+}
+
 /// Separates the fields of a composite page cursor or fingerprint input. A control
 /// character, so it cannot occur inside an ARN, a name or a principal id.
 const FIELD_SEPARATOR: char = '\u{1}';
@@ -2321,6 +2360,17 @@ pub fn resource_type_entry_of(value: &str) -> Option<&'static ResourceTypeEntry>
         .find(|entry| entry.resource_type.eq_ignore_ascii_case(value))
 }
 
+/// Where `value` sits in the published catalog, or `None` when the catalog carries no
+/// resource type of that name.
+///
+/// The position is what a page of the catalog resumes at, because [`RESOURCE_TYPES`] is
+/// published in its own order rather than in the order the display names sort in.
+pub fn resource_type_position(value: &str) -> Option<usize> {
+    RESOURCE_TYPES
+        .iter()
+        .position(|entry| entry.resource_type.eq_ignore_ascii_case(value))
+}
+
 /// What is wrong with a managed permission's `policyTemplate`, told apart by the
 /// modelled error RAM words that refusal with.
 #[derive(Debug, Clone)]
@@ -2540,6 +2590,29 @@ pub fn decode_invitation_cursor(token: &str) -> Option<String> {
 /// this service issued — the `InvalidNextTokenException` case.
 pub fn decode_permission_cursor(token: &str) -> Option<String> {
     decode_cursor(token).filter(|arn| is_permission_arn(arn))
+}
+
+/// A `nextToken` naming the resource type the next page of the catalog starts at.
+///
+/// The catalog is not a store of ARNs, so the page a token resumes is named by the
+/// display name of a resource type rather than by an ARN; the value is hex-encoded the
+/// way every other cursor of this service is, so `nextToken` stays opaque to a caller.
+pub fn encode_resource_type_cursor(resource_type: &str) -> String {
+    hex::encode(resource_type)
+}
+
+/// The resource type a `nextToken` names, or `None` when the token is not one this
+/// service issued — the `InvalidNextTokenException` case.
+///
+/// A token this service issued names a resource type, whether or not the catalog still
+/// carries that one, so the test is on the FORM of the value:
+/// `<service-code>:<resource-code>`.
+pub fn decode_resource_type_cursor(token: &str) -> Option<String> {
+    decode_cursor(token).filter(|value| {
+        value
+            .split_once(':')
+            .is_some_and(|(service, code)| !service.is_empty() && !code.is_empty())
+    })
 }
 
 fn decode_cursor(token: &str) -> Option<String> {

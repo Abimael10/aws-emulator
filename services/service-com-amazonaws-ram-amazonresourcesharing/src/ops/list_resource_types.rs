@@ -1,15 +1,19 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListResourceTypes
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListResourceTypes`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Reports the resource types this service can share, one `@paginated` page at a time,
+//! in resource-type order.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListResourceTypes::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The population is [`crate::state::RESOURCE_TYPES`] — the one catalog that also
+//! decides which resource ARNs a share may carry
+//! ([`crate::state::is_shareable_resource_arn`]) and which resource types a customer
+//! managed permission can be created for
+//! ([`crate::state::resource_type_rejection`]) — so a type this service shares is a
+//! type this read publishes, and the two can never disagree. Each entry is reported
+//! with the display name the catalog publishes, the service code half of it as the
+//! service the resources belong to, and the Region scope of that service's resources
+//! ([`crate::state::resource_type_region_scope`]); `resourceRegionScope` keeps one
+//! scope, or both under `ALL`, which is also what a request naming no filter gets.
 //!
 //! ## Shape of an operation
 //!
@@ -165,20 +169,67 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListResourceTypes` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListResourceTypesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListResourceTypes"))
+        // The catalog is this service's own, so the read needs no store — but a store
+        // that cannot be reached means this service is not mounted at all, which is the
+        // server-side failure rather than an empty page.
+        crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListResourceTypesErrorModeled::ServerInternalException(ServerInternalException {
+                message: "the resource share store is unavailable".to_string(),
+            })
+        })?;
+
+        let page_size = crate::state::page_size(input.max_results);
+        // A token this service issued names the catalog entry the next page starts at,
+        // and the catalog is fixed, so a value naming no entry of it is not a token this
+        // service issued.
+        let invalid_next_token = || {
+            ListResourceTypesErrorModeled::InvalidNextTokenException(InvalidNextTokenException {
+                message: "nextToken is not a pagination token issued by ListResourceTypes"
+                    .to_string(),
+            })
+        };
+        let start = match input.next_token.as_deref() {
+            None => 0,
+            Some(token) => {
+                let resource_type = crate::state::decode_resource_type_cursor(token)
+                    .ok_or_else(invalid_next_token)?;
+                crate::state::resource_type_position(&resource_type)
+                    .ok_or_else(invalid_next_token)?
+            }
+        };
+
+        let mut resource_types =
+            Vec::with_capacity(page_size.min(crate::state::RESOURCE_TYPES.len()));
+        let mut next_token = None;
+        // The catalog is published in its own order, so a token names where in that
+        // order the page resumes rather than a value to compare entries against.
+        for entry in &crate::state::RESOURCE_TYPES[start..] {
+            let scope = crate::state::resource_type_region_scope(entry.resource_type);
+            if !crate::state::resource_region_scope_matches(
+                input.resource_region_scope.as_deref(),
+                scope,
+            ) {
+                continue;
+            }
+            // The first type that does not fit becomes the next page's start, and only
+            // then is a `nextToken` emitted — the last page carries none.
+            if resource_types.len() == page_size {
+                next_token = Some(crate::state::encode_resource_type_cursor(entry.resource_type));
+                break;
+            }
+            resource_types.push(ServiceNameAndResourceType {
+                resource_type: Some(entry.resource_type.to_string()),
+                service_name: crate::state::resource_type_service(entry.resource_type)
+                    .map(str::to_string),
+                resource_region_scope: Some(scope.to_string()),
+            });
+        }
+
+        Ok(ListResourceTypesOutput {
+            resource_types: Some(resource_types),
+            next_token,
+        })
     }
 }
