@@ -559,6 +559,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> AdminInitiateAuth
                         code: None,
                         // Outstanding: this session has answered nothing yet.
                         spent: false,
+                        // The sign-in is what handed it out.
+                        issued_by: crate::state::SessionIssuer::SignIn,
                     },
                 );
                 let challenge_parameters =
@@ -602,6 +604,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> AdminInitiateAuth
                         // delivered as a message, and none for a factor the user
                         // reads its code off itself.
                         code,
+                        // The sign-in is what handed it out.
+                        issued_by: crate::state::SessionIssuer::SignIn,
                     },
                 );
                 // A pool that routes its email to a custom sender delivers an

@@ -616,6 +616,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> AdminRespondToAut
                         // Outstanding: this session has answered nothing yet.
                         spent: false,
                         code: started.code.clone(),
+                        // A response to one of the sign-in's challenges is what
+                        // handed it out.
+                        issued_by: crate::state::SessionIssuer::SignIn,
                     },
                 );
                 // The selection answered the challenge it was outstanding for,

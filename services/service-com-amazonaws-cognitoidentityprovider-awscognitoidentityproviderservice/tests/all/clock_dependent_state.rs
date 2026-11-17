@@ -420,6 +420,7 @@ async fn storing_a_session_sweeps_only_what_the_clock_expired() {
                 expires_at: *expires_at,
                 code: None,
                 spent: false,
+                issued_by: state::SessionIssuer::SignIn,
             },
         );
     }
@@ -434,6 +435,7 @@ async fn storing_a_session_sweeps_only_what_the_clock_expired() {
             expires_at: now + Duration::from_secs(180),
             code: None,
             spent: false,
+            issued_by: state::SessionIssuer::SignIn,
         },
     );
 

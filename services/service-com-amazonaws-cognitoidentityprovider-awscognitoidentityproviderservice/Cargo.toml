@@ -113,6 +113,9 @@ time = { version = "0.3.55", default-features = false, features = ["std"] }
 emulator-core-build-support = { workspace = true }
 
 [dev-dependencies]
+# Declares one module per `tests/all/<name>.rs`, so the crate's single integration-test
+# target picks a suite up from its file.
+automod = { workspace = true }
 hex = { workspace = true }
 # The signing-certificate suite decodes what `GetSigningCertificate` answers and reads
 # the X.509 certificate inside it the way the SAML identity provider an operator

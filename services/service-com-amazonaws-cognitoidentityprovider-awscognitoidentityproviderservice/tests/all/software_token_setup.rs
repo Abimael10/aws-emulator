@@ -938,6 +938,10 @@ fn planted_expired_session(
             expires_at: expired_at,
             code: None,
             spent: false,
+            // A session an association handed out, which is the one both
+            // software-token operations take, so each row's refusal is about the
+            // window that closed and nothing else.
+            issued_by: state::SessionIssuer::SoftwareTokenAssociation,
         },
     )
 }

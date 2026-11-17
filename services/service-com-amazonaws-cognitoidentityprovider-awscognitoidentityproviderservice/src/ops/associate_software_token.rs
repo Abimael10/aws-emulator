@@ -188,7 +188,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let guard = &mut *state.lock();
         let caller = guard
-            .software_token_caller(input.access_token.as_deref(), input.session.as_deref(), now)
+            .software_token_caller(
+                input.access_token.as_deref(),
+                input.session.as_deref(),
+                // `Session` here is "the session ID from a successful sign-in"
+                // (this operation's member in the model), which every session of
+                // that sign-in's exchange is.
+                crate::state::SESSIONS_OF_A_SIGN_IN,
+                now,
+            )
             .map_err(caller_rejected)?;
         // The key is minted only once the call is known to be for a stored user, by
         // the one component that generates secrets — as the sign-in operations of
@@ -206,7 +214,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A call the session flow authorized is handed the session that carries the
         // setup forward, and one an access token authorized carries no session at
         // all: the access token is what the verification of this key presents too.
-        let session = guard.continue_software_token_session(&caller, now);
+        let session = guard.continue_software_token_session(
+            &caller,
+            crate::state::SessionIssuer::SoftwareTokenAssociation,
+            now,
+        );
 
         Ok(AssociateSoftwareTokenOutput {
             secret_code: Some(secret_code),

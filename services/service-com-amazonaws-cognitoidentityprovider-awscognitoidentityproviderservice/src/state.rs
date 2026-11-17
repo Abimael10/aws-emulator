@@ -65,6 +65,9 @@ mod token_validity;
 /// The software token a user sets up as a TOTP authenticator: the private key an
 /// association mints for it and the one-time password a registration presents.
 mod software_tokens;
+/// Which call handed a challenge session out, and which sessions an operation
+/// that takes one resolves.
+mod sessions;
 /// Answering the `NEW_PASSWORD_REQUIRED` challenge: the password a user chooses
 /// for it and the attributes it asked for, checked and stored in one place for
 /// both of the operations that carry such a response.
@@ -85,6 +88,7 @@ pub use pool_preconditions::*;
 pub use pool_resources::*;
 pub use refresh_token_jwe::*;
 pub use saml_signing_certificate::*;
+pub use sessions::*;
 pub use software_tokens::*;
 pub use token_validity::*;
 pub use tokens::*;
@@ -2979,6 +2983,12 @@ pub struct AuthSession {
     /// ([`SESSION_ALREADY_USED_MESSAGE`] and
     /// [`SESSION_NOT_FOR_THIS_REQUEST_MESSAGE`]).
     pub spent: bool,
+    /// Which call of this service handed this session out ([`SessionIssuer`]).
+    ///
+    /// An operation's `Session` names the call the session it takes comes from,
+    /// so this is what tells a session of THIS request apart from a live
+    /// session of another exchange ([`SESSIONS_OF_AN_ASSOCIATION`]).
+    pub issued_by: SessionIssuer,
 }
 
 /// What resolving a `Session` token found

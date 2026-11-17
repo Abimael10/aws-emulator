@@ -748,6 +748,8 @@ async fn password_sign_in(
                     expires_at: now + session_validity,
                     // Outstanding: this session has answered nothing yet.
                     spent: false,
+                    // The sign-in is what handed it out.
+                    issued_by: crate::state::SessionIssuer::SignIn,
                     // This challenge is answered with a password the user chooses,
                     // not with a code anything delivered.
                     code: None,
@@ -790,6 +792,8 @@ async fn password_sign_in(
                     expires_at: now + session_validity,
                     // Outstanding: this session has answered nothing yet.
                     spent: false,
+                    // The sign-in is what handed it out.
+                    issued_by: crate::state::SessionIssuer::SignIn,
                     // The code the challenge delivered, for a factor that is
                     // delivered as a message, and none for a factor the user
                     // reads its code off itself.
@@ -1086,6 +1090,8 @@ fn email_otp_sign_in(
             code: Some(code),
             // Outstanding: this session has answered nothing yet.
             spent: false,
+            // The sign-in is what handed it out.
+            issued_by: crate::state::SessionIssuer::SignIn,
         },
     );
 

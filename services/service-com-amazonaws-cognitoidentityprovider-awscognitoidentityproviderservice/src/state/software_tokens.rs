@@ -236,7 +236,8 @@ pub enum SoftwareTokenRefusal {
     /// already answered ([`SESSION_ALREADY_USED_MESSAGE`]).
     SessionAlreadyUsed,
     /// The `Session` resolves no session of this request: a value this emulator
-    /// never handed out, or one started for a user its pool no longer holds
+    /// never handed out, one a call this operation's `Session` does not come
+    /// from handed out, or one started for a user its pool no longer holds
     /// ([`SESSION_NOT_FOR_THIS_REQUEST_MESSAGE`]).
     SessionNotForThisRequest,
 }
@@ -290,10 +291,17 @@ impl ComAmazonawsCognitoidentityproviderAwscognitoidentityproviderserviceState {
     /// identifies the user whose sign-in started it whatever challenge that
     /// sign-in is waiting on; which challenge it is decides what ANSWERS the
     /// challenge, not who the factor is being set up for.
+    ///
+    /// Only a session one of the calls in `accepted` handed out resolves a
+    /// caller: an operation's `Session` names the call the session it takes
+    /// comes from ([`SESSIONS_OF_A_SIGN_IN`] and
+    /// [`SESSIONS_OF_AN_ASSOCIATION`]), so a live session of a different
+    /// exchange is no session of this request whoever it names.
     pub fn software_token_caller(
         &mut self,
         access_token: Option<&str>,
         session: Option<&str>,
+        accepted: &[SessionIssuer],
         now: SystemTime,
     ) -> Result<SoftwareTokenCaller, SoftwareTokenRefusal> {
         match (access_token, session) {
@@ -320,6 +328,11 @@ impl ComAmazonawsCognitoidentityproviderAwscognitoidentityproviderserviceState {
                         return Err(SoftwareTokenRefusal::SessionNotForThisRequest);
                     }
                 };
+                // A session this operation's `Session` does not come from
+                // maintains the state of an exchange this call is not part of.
+                if !accepted.contains(&stored.issued_by) {
+                    return Err(SoftwareTokenRefusal::SessionNotForThisRequest);
+                }
                 // The user the session was started for may have been deleted
                 // since, in which case the session resolves no user of this
                 // request either.
@@ -429,6 +442,7 @@ impl ComAmazonawsCognitoidentityproviderAwscognitoidentityproviderserviceState {
     pub fn continue_software_token_session(
         &mut self,
         caller: &SoftwareTokenCaller,
+        issued_by: SessionIssuer,
         now: SystemTime,
     ) -> Option<String> {
         let session = caller.session.clone()?;
@@ -447,6 +461,9 @@ impl ComAmazonawsCognitoidentityproviderAwscognitoidentityproviderserviceState {
                 // The challenge it maintains the state of is answered by
                 // registering a factor, not with a code anything delivered.
                 code: None,
+                // The call handing it out is what the next call of the setup
+                // takes a session from.
+                issued_by,
                 ..session
             },
         ))

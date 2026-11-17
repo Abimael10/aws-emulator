@@ -207,7 +207,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let guard = &mut *state.lock();
         let caller = guard
-            .software_token_caller(input.access_token.as_deref(), input.session.as_deref(), now)
+            .software_token_caller(
+                input.access_token.as_deref(),
+                input.session.as_deref(),
+                // `Session` here is "the session ID from an
+                // `AssociateSoftwareToken` request" (this operation's member in
+                // the model): the session of the setup whose key this code is
+                // checked against, and no other session of the exchange.
+                crate::state::SESSIONS_OF_AN_ASSOCIATION,
+                now,
+            )
             .map_err(caller_rejected)?;
         match guard.register_software_token(&caller, &input.user_code, now) {
             crate::state::SoftwareTokenRegistration::Registered => {}
@@ -226,7 +235,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // an MFA_SETUP challenge" (this operation's `Session` in the model), which
         // the challenge response then supplies; one an access token authorized is
         // answering no challenge, so it carries no session at all.
-        let session = guard.continue_software_token_session(&caller, now);
+        let session = guard.continue_software_token_session(
+            &caller,
+            crate::state::SessionIssuer::SoftwareTokenVerification,
+            now,
+        );
         Ok(VerifySoftwareTokenOutput {
             // The authenticator is registered, which is the success this member
             // reports: one of the two modelled `VerifySoftwareTokenResponseType`
