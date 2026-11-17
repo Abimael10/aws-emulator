@@ -31,6 +31,10 @@ const WRONG_SECRET: &str = "not-the-github-token";
 /// `matchEquals`'s `{Branch}` placeholder resolves to.
 const BRANCH: &str = "main";
 
+/// How many pages a page-by-page enumeration here may be handed a token on before it is
+/// read as not terminating — far above the few any case in this suite stores.
+const PAGING_CEILING: usize = 64;
+
 /// The payload a provider sends for a push to that branch.
 fn push_payload(branch: &str) -> String {
     json!({"ref": format!("refs/heads/{branch}"), "repository": {"name": "demo"}}).to_string()
@@ -133,7 +137,14 @@ impl Emulator {
     }
 
     async fn ok(&self, operation: &str, body: &Value) -> Value {
-        let (status, response) = self.call_in("us-east-1", None, operation, body).await;
+        self.ok_in("us-east-1", operation, body).await
+    }
+
+    /// Call `operation` through a request signed for `region`, naming no endpoint, and
+    /// answer the body it succeeds with — the call a client makes in the Region the
+    /// resource it names lives in.
+    async fn ok_in(&self, region: &str, operation: &str, body: &Value) -> Value {
+        let (status, response) = self.call_in(region, None, operation, body).await;
         assert_eq!(
             status, 200,
             "{operation}: expected HTTP 200, got {status} with {response}"
@@ -180,7 +191,13 @@ impl Emulator {
     /// execution that reaches it waits for a job worker instead of being carried on by
     /// the clock) and configured for `BRANCH`.
     async fn create_pipeline(&self, name: &str) {
-        self.ok(
+        self.create_pipeline_in("us-east-1", name).await;
+    }
+
+    /// That same pipeline, created through a request signed for `region`.
+    async fn create_pipeline_in(&self, region: &str, name: &str) {
+        self.ok_in(
+            region,
             "CreatePipeline",
             &json!({"pipeline": {
                 "name": name,
@@ -248,11 +265,57 @@ impl Emulator {
             .unwrap_or_else(|| panic!("ListWebhooks reports the webhook {name}, got {listed}"))
     }
 
+    /// Every webhook `ListWebhooks` reports, read ONE page at a time through requests
+    /// signed for `region` and addressed to `host` — the enumeration a client that did
+    /// not keep the URL `PutWebhook` handed it makes to recover it.
+    async fn listed_page_by_page(&self, region: &str, host: Option<&str>) -> Vec<Value> {
+        let mut reported: Vec<Value> = Vec::new();
+        let mut token: Option<String> = None;
+        let mut pages = 0_usize;
+        loop {
+            let mut request = json!({"MaxResults": 1});
+            if let Some(token) = &token {
+                request["NextToken"] = json!(token);
+            }
+            let (status, page) = self.call_in(region, host, "ListWebhooks", &request).await;
+            assert_eq!(
+                status, 200,
+                "ListWebhooks: expected HTTP 200, got {status} with {page}"
+            );
+            reported.extend(page["webhooks"].as_array().into_iter().flatten().cloned());
+            token = page
+                .get("NextToken")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            if token.is_none() {
+                return reported;
+            }
+            // The PAGE count is what bounds the walk: a page carrying a token and no
+            // webhook at all would never grow the list it collects.
+            pages += 1;
+            assert!(
+                pages <= PAGING_CEILING,
+                "ListWebhooks issued a token on {pages} pages without reaching a last one, \
+                 having reported {} webhook(s)",
+                reported.len()
+            );
+        }
+    }
+
     /// How many executions of `pipeline` carry the `Webhook` trigger type — the runs a
     /// POST to a trigger URL started, and nothing else.
     async fn webhook_runs(&self, pipeline: &str) -> usize {
+        self.webhook_runs_in("us-east-1", pipeline).await
+    }
+
+    /// That same count, read through a request signed for `region`.
+    async fn webhook_runs_in(&self, region: &str, pipeline: &str) -> usize {
         let listed = self
-            .ok("ListPipelineExecutions", &json!({"pipelineName": pipeline}))
+            .ok_in(
+                region,
+                "ListPipelineExecutions",
+                &json!({"pipelineName": pipeline}),
+            )
             .await;
         listed["pipelineExecutionSummaries"]
             .as_array()
@@ -428,6 +491,227 @@ async fn the_published_trigger_url_is_an_address_this_emulator_serves() {
             runs, 1,
             "case {case:?}: expected the POST to start one Webhook-triggered execution, got {runs}"
         );
+    }
+}
+
+/// The `host[:port]` a URL minted by a call addressed to `host` is published on: that
+/// address when the caller named one, and the base this emulator publishes for itself when
+/// the caller named none and the emulator is served on no port.
+fn authority_of(host: Option<&str>) -> String {
+    host.unwrap_or("emulator.invalid").to_string()
+}
+
+/// The trigger URL `ListWebhooks` publishes for the webhook named `name`, out of the items
+/// an enumeration reported.
+fn discovered_url(reported: &[Value], name: &str) -> String {
+    let item = reported
+        .iter()
+        .find(|item| item["definition"]["name"] == json!(name))
+        .unwrap_or_else(|| panic!("ListWebhooks reports the webhook {name}, got {reported:?}"));
+    item["url"]
+        .as_str()
+        .unwrap_or_else(|| panic!("the listed webhook {name} carries a trigger URL, got {item}"))
+        .to_string()
+}
+
+/// `ListWebhooks` is the SECOND place this service publishes a webhook's trigger URL —
+/// `webhooks[].url` carries the same `@required` `WebhookUrl` as the `PutWebhook` result —
+/// so a client that recovers the URL from the listing rather than from the call that minted
+/// it is handed the same address this emulator serves, and a provider's POST to that
+/// recovered URL starts the webhook's target pipeline.
+///
+/// The rows span what that publication generalises over: which page of the enumeration the
+/// webhook lands on (the listing is read one webhook at a time, over a store that grows
+/// with each row), what the webhook has been through since it was defined (left alone,
+/// redefined in place, connected to the external tool, deleted and defined again under the
+/// same name), the Region it was defined in, the pipeline it targets, and the address the
+/// defining call reached this emulator at — never the address the enumerating call reaches
+/// it at, because a published URL is not re-derived from whoever reads it.
+#[tokio::test]
+async fn a_trigger_url_recovered_from_the_listing_is_served_too() {
+    /// What a webhook has been through by the time a client enumerates it.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum History {
+        /// Defined once and left alone.
+        Fresh,
+        /// Defined, then REDEFINED in place under the same name.
+        Redefined,
+        /// Defined, then connected to the external tool.
+        Registered,
+        /// Defined, deleted, and defined again under the same name.
+        Recreated,
+    }
+    struct Row {
+        case: &'static str,
+        name: &'static str,
+        region: &'static str,
+        /// The address the DEFINING call reached this emulator at.
+        minted_at: Option<&'static str>,
+        /// The address this row's second control-plane call reached it at.
+        second_at: Option<&'static str>,
+        history: History,
+    }
+    let rows = [
+        Row {
+            case: "a webhook defined and left alone",
+            name: "alpha",
+            region: "us-east-1",
+            minted_at: Some("127.0.0.1:37915"),
+            second_at: None,
+            history: History::Fresh,
+        },
+        Row {
+            case: "a webhook redefined in place from another address",
+            name: "bravo",
+            region: "eu-west-2",
+            minted_at: Some("localhost:9297"),
+            second_at: Some("127.0.0.1:41001"),
+            history: History::Redefined,
+        },
+        Row {
+            case: "a webhook connected to the external tool",
+            name: "charlie",
+            region: "ap-southeast-1",
+            minted_at: Some("[::1]:9297"),
+            second_at: None,
+            history: History::Registered,
+        },
+        Row {
+            case: "a webhook deleted and defined again under its name",
+            name: "delta",
+            region: "us-west-2",
+            minted_at: Some("127.0.0.1:37915"),
+            // The second definition names no address at all, so the URL it mints is
+            // published on the base an emulator served on no port has to name.
+            second_at: None,
+            history: History::Recreated,
+        },
+    ];
+
+    // Where every enumeration below is addressed: the reading request reaches this
+    // emulator at an address no published URL carries, because a stored URL is not
+    // re-derived from whoever reads it. Each row signs its own calls for its own Region,
+    // so a case never depends on what a request signed for another Region can see.
+    const READER_HOST: &str = "198.51.100.9:443";
+
+    let emulator = Emulator::new();
+    for row in rows {
+        let Row {
+            case,
+            name,
+            region,
+            minted_at,
+            second_at,
+            history,
+        } = row;
+        let pipeline = format!("pipe-{name}");
+        emulator.create_pipeline_in(region, &pipeline).await;
+
+        let mut webhook = github_definition(name, json!([{"jsonPath": "$.ref"}]));
+        webhook["targetPipeline"] = json!(pipeline);
+        let minted = emulator.put_webhook_in(region, minted_at, &webhook).await;
+
+        // What this row's history does to the webhook, and which URL it leaves published.
+        let (published, authority) = match history {
+            History::Fresh => (minted.clone(), authority_of(minted_at)),
+            History::Redefined => {
+                let mut revised = github_definition(
+                    name,
+                    json!([{"jsonPath": "$.repository.name", "matchEquals": "demo"}]),
+                );
+                revised["targetPipeline"] = json!(pipeline);
+                let again = emulator.put_webhook_in(region, second_at, &revised).await;
+                assert_eq!(
+                    again, minted,
+                    "case {case:?}: redefining a webhook keeps the URL its first \
+                     definition minted, got {again:?}"
+                );
+                (minted.clone(), authority_of(minted_at))
+            }
+            History::Registered => {
+                emulator
+                    .ok_in(
+                        region,
+                        "RegisterWebhookWithThirdParty",
+                        &json!({"webhookName": name}),
+                    )
+                    .await;
+                (minted.clone(), authority_of(minted_at))
+            }
+            History::Recreated => {
+                emulator
+                    .ok_in(region, "DeleteWebhook", &json!({"name": name}))
+                    .await;
+                let again = emulator.put_webhook_in(region, second_at, &webhook).await;
+                assert_ne!(
+                    again, minted,
+                    "case {case:?}: a webhook defined again under a deleted name gets \
+                     its own URL, got {again:?}"
+                );
+                (again, authority_of(second_at))
+            }
+        };
+
+        let reported = emulator
+            .listed_page_by_page(region, Some(READER_HOST))
+            .await;
+        let discovered = discovered_url(&reported, name);
+        assert_eq!(
+            discovered, published,
+            "case {case:?}: ListWebhooks publishes another URL than the one the \
+             control plane minted"
+        );
+        let expected_prefix =
+            format!("https://{authority}/_aws/codepipeline-webhooks/{region}/trigger?t=");
+        assert!(
+            discovered.starts_with(&expected_prefix) && discovered.ends_with("&v=1"),
+            "case {case:?}: expected a trigger URL under {expected_prefix:?}, \
+             got {discovered:?}"
+        );
+        // Neither a host of AWS's nor the address of whoever read the listing: the URL
+        // names the endpoint the minting request reached this emulator at.
+        for foreign in ["amazonaws.com", "webhooks.aws", READER_HOST] {
+            assert!(
+                !discovered.contains(foreign),
+                "case {case:?}: the listed URL names {foreign:?}, which is not the \
+                 address it was minted on: {discovered:?}"
+            );
+        }
+
+        // And that recovered address is SERVED: the POST a provider makes to it starts
+        // the webhook's own target pipeline.
+        let payload = push_payload(BRANCH);
+        let signed = signature("sha256", SECRET_TOKEN, &payload);
+        let (status, answer) = emulator
+            .trigger(&discovered, &[(signed.0, signed.1)], &payload)
+            .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: the URL recovered from the listing answered {status} \
+             ({answer:?}) to the POST it describes"
+        );
+        let runs = emulator.webhook_runs_in(region, &pipeline).await;
+        assert_eq!(
+            runs, 1,
+            "case {case:?}: expected the POST to start one Webhook-triggered execution \
+             of {pipeline}, got {runs}"
+        );
+
+        if history == History::Recreated {
+            // The URL the deleted webhook carried names nothing: the one the listing
+            // publishes is the one that is served.
+            let (status, answer) = emulator.trigger(&minted, &[], &payload).await;
+            assert_eq!(
+                status, 404,
+                "case {case:?}: the deleted webhook's URL answered {status} ({answer:?})"
+            );
+            let runs = emulator.webhook_runs_in(region, &pipeline).await;
+            assert_eq!(
+                runs, 1,
+                "case {case:?}: the deleted webhook's URL started another execution, \
+                 got {runs} in all"
+            );
+        }
     }
 }
 
