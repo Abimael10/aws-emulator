@@ -50,6 +50,11 @@ const SHARED_MEMBERS: [&str; 5] = [
 /// has to render.
 const TRIGGER_PRE_SIGN_UP: &str = "arn:aws:lambda:us-east-1:000000000000:function:pre-sign-up";
 
+/// The Amazon SNS caller a pool's SMS messages are sent through
+/// (`SmsConfigurationType.SnsCallerArn`), which a pool whose MFA mode is on
+/// carries (`CreateUserPool.MfaConfiguration`).
+const SNS_CALLER_ARN: &str = "arn:aws:iam::000000000000:role/sms-caller";
+
 /// One emulator with just this service mounted.
 fn router() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
@@ -272,8 +277,9 @@ fn pool_cases() -> Vec<PoolCase> {
             request: json!({
                 "PoolName": "configured-pool",
                 "MfaConfiguration": "OPTIONAL",
+                "SmsConfiguration": { "SnsCallerArn": SNS_CALLER_ARN },
                 "DeletionProtection": "ACTIVE",
-                "AutoVerifiedAttributes": ["email"],
+                "AutoVerifiedAttributes": ["email", "phone_number"],
                 "UserPoolTags": { "owner": "listing" },
             }),
         },

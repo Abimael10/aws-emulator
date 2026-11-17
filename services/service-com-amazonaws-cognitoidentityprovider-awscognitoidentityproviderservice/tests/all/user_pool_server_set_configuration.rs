@@ -53,6 +53,11 @@ const REGION: &str = "us-east-1";
 /// targets `ArnType`: length 20..2048).
 const TRIGGER_PRE_SIGN_UP: &str = "arn:aws:lambda:us-east-1:000000000000:function:pre-sign-up";
 
+/// The Amazon SNS caller a pool's SMS messages are sent through
+/// (`SmsConfigurationType.SnsCallerArn`), which a pool whose MFA mode is on
+/// carries (`CreateUserPool.MfaConfiguration`).
+const SNS_CALLER_ARN: &str = "arn:aws:iam::000000000000:role/sms-caller";
+
 /// A KMS key ARN a key configuration can name (`KeyConfigurationType.KmsKeyArn`:
 /// length 20..2048, the ARN pattern).
 const KMS_KEY_ARN: &str = "arn:aws:kms:us-east-1:000000000000:key/11111111-2222-3333-4444-555555555555";
@@ -892,6 +897,8 @@ async fn a_listing_entry_reports_the_trigger_configuration_and_the_pools_regions
             json!({
                 "PoolName": "listed-configured",
                 "MfaConfiguration": "OPTIONAL",
+                "SmsConfiguration": { "SnsCallerArn": SNS_CALLER_ARN },
+                "AutoVerifiedAttributes": ["phone_number"],
                 "UserPoolTags": { "owner": "listing" },
             }),
         ),

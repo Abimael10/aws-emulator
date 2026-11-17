@@ -47,6 +47,50 @@ pub fn sms_configuration_missing_for_auto_verification(
         && sms_configuration.is_none()
 }
 
+/// The message a user-pool write is refused with when it requires or offers MFA
+/// without the SMS delivery path and phone-number verification that factor rests
+/// on ([`mfa_without_sms_delivery`]).
+///
+/// Fixed text: it names the configuration the request is missing, which is the
+/// same pair for every such request, and neither the pool nor the mode asked for.
+pub const MFA_SMS_CONFIGURATION_REQUIRED_MESSAGE: &str =
+    "SMS configuration and Auto verification for phone_number are required when MFA is \
+     required/optional";
+
+/// Whether the configuration a write would leave the pool with turns MFA on
+/// without the configuration the factor it would challenge over needs.
+///
+/// "The `CreateUserPool` operation supports only SMS MFA configuration. If you set
+/// `MfaConfiguration` to either of these values, include an `SmsConfiguration` in
+/// the same request … If you omit `SmsConfiguration`, the operation returns an
+/// `InvalidParameterException`" (`CreateUserPoolRequest.MfaConfiguration` in this
+/// service's model) — a pool that writes its MFA mode through this surface can
+/// challenge over SMS alone, so it takes both halves of that delivery path: a
+/// caller to send the message through ([`names_an_sms_caller`]) and the phone
+/// number auto-verified, since a code is sent only to a number the pool verifies
+/// ([`PHONE_NUMBER_VERIFIED_ATTRIBUTE`]). A pool with MFA off challenges over
+/// nothing and is judged by neither.
+///
+/// Every argument is the EFFECTIVE value of the request — what the pool would
+/// hold once it is written — so the configuration is judged as the caller left
+/// it, whichever operation wrote it. The MFA factors `SetUserPoolMfaConfig`
+/// configures are that operation's own ([`crate::state::UserPool`] holds them
+/// beside this mode), so they are not part of this question.
+#[must_use]
+pub fn mfa_without_sms_delivery(
+    mfa_configuration: &str,
+    sms_configuration: Option<&SmsConfigurationType>,
+    auto_verified_attributes: &[String],
+) -> bool {
+    if mfa_configuration == MFA_OFF {
+        return false;
+    }
+    !names_an_sms_caller(sms_configuration)
+        || !auto_verified_attributes
+            .iter()
+            .any(|attribute| attribute == PHONE_NUMBER_VERIFIED_ATTRIBUTE)
+}
+
 /// The message a user-pool write is refused with when its
 /// `AccountRecoverySetting` repeats a priority or a mechanism
 /// ([`duplicate_recovery_mechanisms`]). Fixed text, naming neither the

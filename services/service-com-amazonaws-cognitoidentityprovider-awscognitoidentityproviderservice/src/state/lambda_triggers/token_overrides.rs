@@ -276,6 +276,25 @@ pub struct TokenOverrides {
     group_override: Option<GroupOverride>,
 }
 
+/// Whether `answered` carries override details this service cannot read as the contract
+/// member they are written for.
+///
+/// Each contract member is an OBJECT of the members that contract defines —
+/// `claimsOverrideDetails` with its claim maps, `claimsAndScopeOverrideDetails` with one
+/// object per token (this module's header) — so a member answered as anything else carries
+/// no overrides to read, however the function spelled it. A member the answer leaves out,
+/// and one it states as nothing at all, asks for no change and is not about this question.
+#[must_use]
+pub fn answer_is_unreadable(answered: &Value) -> bool {
+    let Some(response) = answered.get(RESPONSE) else {
+        return false;
+    };
+    [CLAIMS_AND_SCOPE_OVERRIDE_DETAILS, CLAIMS_OVERRIDE_DETAILS]
+        .iter()
+        .filter_map(|member| response.get(member))
+        .any(|details| !matches!(details, Value::Object(_) | Value::Null))
+}
+
 impl TokenOverrides {
     /// What a generation that invoked no function changes: nothing, so every claim, scope
     /// and group claim is the one the stored state computes.

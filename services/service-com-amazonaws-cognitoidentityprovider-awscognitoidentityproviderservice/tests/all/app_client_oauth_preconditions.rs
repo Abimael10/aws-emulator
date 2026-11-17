@@ -273,6 +273,10 @@ async fn an_oauth_app_client_carries_both_its_flows_and_its_scopes() {
                 "AllowedOAuthFlowsUserPoolClient": true,
                 "AllowedOAuthFlows": ["code", "implicit"],
                 "AllowedOAuthScopes": ["openid", "email"],
+                // A redirect-based grant is delivered to a registered callback
+                // URL, so a client that allows one carries at least one
+                // (`CreateUserPoolClient.CallbackURLs`).
+                "CallbackURLs": ["https://app.example.com/cb"],
             }),
             false,
         ),
@@ -460,6 +464,13 @@ async fn a_redirect_url_reaches_a_non_loopback_host_over_https_only() {
             );
             members.insert("AllowedOAuthFlows".to_string(), json!(["code"]));
             members.insert("AllowedOAuthScopes".to_string(), json!(["openid"]));
+            // A client allowing a redirect-based grant registers a callback URL,
+            // so every row carries one the other rules admit; the row's own URL
+            // replaces it where the member under test IS the callback list.
+            members.insert(
+                "CallbackURLs".to_string(),
+                json!(["https://app.example.com/cb"]),
+            );
             if member == "DefaultRedirectURI" {
                 // "The default redirect URI ... must be in the CallbackURLs
                 // list" (`DefaultRedirectURI` in this service's model).

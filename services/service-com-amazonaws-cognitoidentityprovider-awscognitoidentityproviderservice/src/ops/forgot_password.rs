@@ -547,6 +547,17 @@ fn trigger_failed(failure: crate::state::lambda_triggers::Failure) -> ForgotPass
             })
             .into()
         }
+        // A function that RETURNED output this service cannot read as the trigger's event
+        // answered nothing: Amazon Cognito "encounters an invalid Lambda response" (this
+        // service's model), so that is what this call answers.
+        crate::state::lambda_triggers::Failure::Unrecognized(message) => {
+            ForgotPasswordErrorModeled::InvalidLambdaResponseException(
+                InvalidLambdaResponseException {
+                    message: Some(message),
+                },
+            )
+            .into()
+        }
     }
 }
 
@@ -573,6 +584,17 @@ fn migration_failed(failure: crate::state::lambda_triggers::Failure) -> ForgotPa
             ForgotPasswordErrorModeled::UnexpectedLambdaException(UnexpectedLambdaException {
                 message: Some(message),
             })
+            .into()
+        }
+        // A function that RETURNED output this service cannot read as the trigger's event
+        // answered nothing: Amazon Cognito "encounters an invalid Lambda response" (this
+        // service's model), so that is what this call answers.
+        crate::state::lambda_triggers::Failure::Unrecognized(message) => {
+            ForgotPasswordErrorModeled::InvalidLambdaResponseException(
+                InvalidLambdaResponseException {
+                    message: Some(message),
+                },
+            )
             .into()
         }
     }

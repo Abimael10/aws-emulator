@@ -231,23 +231,38 @@ impl Decision {
     }
 
     /// What the function answered, read out of the event it returned.
-    #[must_use]
-    pub fn read(answered: &Value) -> Self {
-        let asked = |member: &str| {
-            answered
+    ///
+    /// Each member is read in the type it was DELIVERED in: the event handed the function a
+    /// boolean for every member this trigger reads back ([`delivered_response`]), so a
+    /// boolean is what an answer states one as. A member the answer states as anything else
+    /// asks for neither the bypass nor the verification: there is no verdict in it to read,
+    /// which is an answer Amazon Cognito cannot use at all
+    /// ([`Failure::Unrecognized`]), and a member the answer leaves out asks for nothing, as
+    /// it was delivered.
+    pub fn read(answered: &Value) -> Result<Self, Failure> {
+        let asked = |member: &str| -> Result<bool, Failure> {
+            match answered
                 .get("response")
                 .and_then(|response| response.get(member))
-                .and_then(Value::as_bool)
-                .unwrap_or(false)
+            {
+                None | Some(Value::Null) => Ok(false),
+                Some(Value::Bool(asked)) => Ok(*asked),
+                Some(_) => Err(Failure::Unrecognized(
+                    super::UNRECOGNIZABLE_OUTPUT_MESSAGE.to_string(),
+                )),
+            }
         };
-        Self {
-            confirm_user: asked(AUTO_CONFIRM_USER),
-            verified_attributes: AUTO_VERIFY_MEMBERS
-                .iter()
-                .filter(|(member, _)| asked(member))
-                .map(|(_, attribute)| *attribute)
-                .collect(),
+        let confirm_user = asked(AUTO_CONFIRM_USER)?;
+        let mut verified_attributes = Vec::new();
+        for (member, attribute) in AUTO_VERIFY_MEMBERS {
+            if asked(member)? {
+                verified_attributes.push(attribute);
+            }
         }
+        Ok(Self {
+            confirm_user,
+            verified_attributes,
+        })
     }
 
     /// Apply this decision to `user`, the account the registration is about to store.
@@ -290,16 +305,18 @@ impl Decision {
 ///
 /// Every failure is the registering operation's to report, because this trigger GATES it: the
 /// function evaluates an account that does not exist yet, so an invocation that reached no
-/// function, one that was not answered inside the trigger budget, and a function that RAN AND
-/// REPORTED AN ERROR each leave the operation nothing to store ([`super::invoke_gating`]).
+/// function, one that was not answered inside the trigger budget, a function that RAN AND
+/// REPORTED AN ERROR ([`super::invoke_gating`]) and one that answered something there is no
+/// verdict to read in ([`Decision::read`]) each leave the operation nothing to store.
 pub async fn invoke_pre_sign_up(
     ctx: &::smithy_server_runtime::OperationContext<'_>,
     dispatch: Option<&Dispatch>,
 ) -> Result<Decision, Failure> {
     match dispatch {
-        Some(dispatch) => super::invoke_gating(ctx, dispatch)
-            .await
-            .map(|answered| Decision::read(&answered)),
+        Some(dispatch) => {
+            let answered = super::invoke_gating(ctx, dispatch).await?;
+            Decision::read(&answered)
+        }
         None => Ok(Decision::none()),
     }
 }
@@ -333,11 +350,11 @@ mod tests {
     type DecisionRow = (&'static str, Value, (bool, Vec<&'static str>));
 
     /// The decision read out of an answered event: what the function asked for, and nothing
-    /// for a member it did not state as a boolean.
+    /// for a member it did not state at all.
     #[test]
     fn the_decision_is_what_the_function_answered() {
         // (case, the response half the function answered with, expected decision)
-        let rows: [DecisionRow; 9] = [
+        let rows: [DecisionRow; 7] = [
             (
                 "a function that bypassed the confirmation alone",
                 ::serde_json::json!({ "autoConfirmUser": true }),
@@ -372,16 +389,6 @@ mod tests {
                 (false, vec![]),
             ),
             (
-                "a function that stated a member as text",
-                ::serde_json::json!({ "autoConfirmUser": "true" }),
-                (false, vec![]),
-            ),
-            (
-                "a function that stated a member as a number",
-                ::serde_json::json!({ "autoConfirmUser": 1 }),
-                (false, vec![]),
-            ),
-            (
                 "a function that answered an empty response half",
                 ::serde_json::json!({}),
                 (false, vec![]),
@@ -396,13 +403,50 @@ mod tests {
         for (case, response, (confirm_user, verified_attributes)) in rows {
             let answered = ::serde_json::json!({ "response": response });
             let read = Decision::read(&answered);
-            let expected = Decision {
+            let expected = Ok(Decision {
                 confirm_user,
                 verified_attributes,
-            };
+            });
             assert_eq!(
                 read, expected,
                 "case {case:?}: expected {expected:?}, got {read:?}"
+            );
+        }
+    }
+
+    /// A member answered in a type the event did not deliver it in carries no verdict, so
+    /// the answer is one this service cannot read at all.
+    #[test]
+    fn a_member_answered_in_another_type_is_an_answer_that_cannot_be_read() {
+        // The rows differ along WHICH member carries the wrong type and which JSON type it
+        // is, across every member this trigger reads back.
+        let rows = [
+            (
+                "the confirmation stated as text",
+                ::serde_json::json!({ "autoConfirmUser": "true" }),
+            ),
+            (
+                "the confirmation stated as a number",
+                ::serde_json::json!({ "autoConfirmUser": 1 }),
+            ),
+            (
+                "the email verification stated as an object",
+                ::serde_json::json!({ "autoVerifyEmail": { "asked": true } }),
+            ),
+            (
+                "the phone verification stated as a list",
+                ::serde_json::json!({ "autoVerifyPhone": [true] }),
+            ),
+        ];
+        for (case, response) in rows {
+            let answered = ::serde_json::json!({ "response": response });
+            let read = Decision::read(&answered);
+            assert_eq!(
+                read,
+                Err(Failure::Unrecognized(
+                    super::super::UNRECOGNIZABLE_OUTPUT_MESSAGE.to_string()
+                )),
+                "case {case:?}: expected an answer that cannot be read, got {read:?}"
             );
         }
     }
@@ -423,7 +467,7 @@ mod tests {
             let read = Decision::read(&answered);
             assert_eq!(
                 read,
-                Decision::none(),
+                Ok(Decision::none()),
                 "case {case:?}: expected nothing decided, got {read:?}"
             );
         }

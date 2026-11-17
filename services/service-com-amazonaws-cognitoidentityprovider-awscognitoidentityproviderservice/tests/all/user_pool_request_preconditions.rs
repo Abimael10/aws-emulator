@@ -46,6 +46,25 @@ const AUTHORIZATION: &str = "AWS4-HMAC-SHA256 \
 /// (`SmsConfigurationType.SnsCallerArn`).
 const SNS_CALLER_ARN: &str = "arn:aws:iam::000000000000:role/sms-caller";
 
+/// The SMS delivery path a pool whose MFA mode is `ON` or `OPTIONAL` carries: the
+/// caller its messages leave through and the phone number it verifies — "the
+/// `CreateUserPool` operation supports only SMS MFA configuration. If you set
+/// `MfaConfiguration` to either of these values, include an `SmsConfiguration` in
+/// the same request" (`CreateUserPool.MfaConfiguration` in this service's model),
+/// so a row that leaves a pool with MFA on carries both.
+fn sms_delivery() -> Vec<(String, Value)> {
+    vec![
+        (
+            "SmsConfiguration".to_string(),
+            json!({ "SnsCallerArn": SNS_CALLER_ARN }),
+        ),
+        (
+            "AutoVerifiedAttributes".to_string(),
+            json!(["phone_number"]),
+        ),
+    ]
+}
+
 /// A password satisfying a default pool's password policy.
 const GOOD_PASSWORD: &str = "Passw0rd!2024";
 
@@ -829,6 +848,9 @@ async fn an_update_of_a_created_pool_cannot_turn_its_mfa_on() {
         let mut create = Map::new();
         if let Some(mode) = created {
             create.insert("MfaConfiguration".to_string(), json!(mode));
+            for (member, value) in sms_delivery() {
+                create.insert(member, value);
+            }
         }
         let user_pool_id = pool(
             &router,
@@ -841,6 +863,11 @@ async fn an_update_of_a_created_pool_cannot_turn_its_mfa_on() {
         let mut members = Map::new();
         if let Some(mode) = requested {
             members.insert("MfaConfiguration".to_string(), json!(mode));
+            if *mode != "OFF" {
+                for (member, value) in sms_delivery() {
+                    members.insert(member, value);
+                }
+            }
         }
         let (status, payload) = call(
             &router,

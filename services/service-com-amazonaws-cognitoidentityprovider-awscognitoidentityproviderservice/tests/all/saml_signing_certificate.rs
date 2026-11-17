@@ -157,7 +157,12 @@ fn cases() -> Vec<Case> {
             pool_name: "signing-certificate-eu".to_string(),
             configuration: json!({
                 "MfaConfiguration": "OPTIONAL",
-                "AutoVerifiedAttributes": ["email"],
+                // A pool left with its MFA mode on carries the SMS delivery path
+                // that mode rests on (`CreateUserPool.MfaConfiguration`).
+                "SmsConfiguration": {
+                    "SnsCallerArn": "arn:aws:iam::000000000000:role/sms-caller",
+                },
+                "AutoVerifiedAttributes": ["email", "phone_number"],
             }),
             saml_provider: Some("EuropeSAML"),
         },

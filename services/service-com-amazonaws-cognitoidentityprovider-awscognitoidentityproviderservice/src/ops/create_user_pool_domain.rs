@@ -263,6 +263,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         }
 
+        // An Amazon Cognito PREFIX domain is a label in a namespace Amazon Web
+        // Services owns, so a prefix carrying one of the words reserved there is
+        // one no pool can be granted
+        // ([`crate::state::reserved_domain_prefix_word`]) — asked before the name
+        // is claimed, so nothing is stored. A CUSTOM domain is a name the caller
+        // already owns in its own namespace, so the reservation is not about it.
+        if input.custom_domain_config.is_none() {
+            if let Some(reserved) = crate::state::reserved_domain_prefix_word(&input.domain) {
+                return Err(invalid_parameter(
+                    crate::state::reserved_domain_prefix_message(reserved),
+                ));
+            }
+        }
+
         // A domain string resolves to one pool (`DescribeUserPoolDomain` takes
         // `Domain` alone), so a name any pool already holds is not free. This
         // spans the whole store, so it is checked before the pool this create

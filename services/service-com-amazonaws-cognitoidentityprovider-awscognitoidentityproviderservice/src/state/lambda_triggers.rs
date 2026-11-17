@@ -133,6 +133,24 @@ const TRIGGER_INVOCATION_BUDGET: ::std::time::Duration = ::std::time::Duration::
 /// function was not waited for any longer, so it gave no verdict.
 const TRIGGER_TIMEOUT_ERROR: &str = "Socket timeout while invoking Lambda function";
 
+/// How Amazon Cognito states that a function RETURNED something it cannot read as the
+/// trigger's answer ([`Failure::Unrecognized`]). One fixed sentence: it reports that the
+/// output was not the event the trigger is answered with, and quotes none of it back.
+pub const UNRECOGNIZABLE_OUTPUT_MESSAGE: &str = "Unrecognizable lambda output";
+
+/// How Amazon Cognito states that a function answered an event naming another user than the
+/// one it was handed ([`answers_another_username`]). Fixed text, quoting neither name.
+pub const USERNAME_MISMATCH_MESSAGE: &str =
+    "Invalid user name. User name in Lambda mismatches the actual username.";
+
+/// The event member naming the account a stage is about, which is the one the answer is
+/// matched on ([`answers_another_username`]).
+const USERNAME_MEMBER: &str = "userName";
+
+/// The half of a trigger event a function amends and answers with, which is what makes an
+/// answer readable as that event at all ([`answer_is_unreadable`]).
+const RESPONSE_HALF: &str = "response";
+
 /// The service principal Amazon Cognito invokes a user-pool trigger as, as a function's
 /// resource-based policy names one: "for Amazon Web Services services, the principal is a
 /// domain-style identifier that the service defines" (Lambda's `AddPermission$Principal`),
@@ -584,6 +602,11 @@ pub enum Failure {
     /// operation's `UnexpectedLambdaException` — "an unexpected exception with Lambda"
     /// (this service's model) — is what that amounts to.
     NotInvokable(String),
+    /// The function RAN and RETURNED, with output that is not the trigger's event: there is
+    /// no answer in it to read ([`answer_is_unreadable`]). The operation's
+    /// `InvalidLambdaResponseException` — "an invalid Lambda response" (this service's
+    /// model) — is what that amounts to.
+    Unrecognized(String),
 }
 
 /// What an invocation that was not a failure of the trigger left behind.
@@ -675,9 +698,19 @@ pub async fn fire_pre_token_generation(
         client_metadata,
     );
     match dispatch {
-        Some(dispatch) => invoke_gating(ctx, &dispatch)
-            .await
-            .map(|answered| TokenOverrides::read(&answered)),
+        Some(dispatch) => {
+            let answered = invoke_gating(ctx, &dispatch).await?;
+            // The overrides are read from the contract member that carries them, and each
+            // of those members is an object: one answered as anything else carries no
+            // overrides to read, so there is no answer in it to apply
+            // ([`token_overrides::answer_is_unreadable`]).
+            if token_overrides::answer_is_unreadable(&answered) {
+                return Err(Failure::Unrecognized(
+                    UNRECOGNIZABLE_OUTPUT_MESSAGE.to_string(),
+                ));
+            }
+            Ok(TokenOverrides::read(&answered))
+        }
         None => Ok(TokenOverrides::none()),
     }
 }
@@ -690,14 +723,57 @@ pub async fn fire_pre_token_generation(
 /// an outcome that has not happened yet, so an invocation that reached no function leaves
 /// the operation nothing to proceed on, and Amazon Cognito answers it with the operation's
 /// own Lambda error rather than the success the function never allowed.
+/// A function that returned output this service cannot read as the trigger's event answers
+/// nothing either: Amazon Cognito "encounters an invalid Lambda response" (this service's
+/// model for `InvalidLambdaResponseException`), so the operation is refused with that error
+/// and leaves nothing behind, rather than proceeding as if the trigger had approved it. The
+/// answer is the event it was HANDED, so the identity that event names is not the function's
+/// to rewrite either ([`answers_another_username`]).
 pub async fn invoke_gating(
     ctx: &::smithy_server_runtime::OperationContext<'_>,
     dispatch: &Dispatch,
 ) -> Result<Value, Failure> {
     match invoke(ctx, dispatch).await? {
+        Verdict::Answered(answer) if answer_is_unreadable(&answer) => Err(Failure::Unrecognized(
+            UNRECOGNIZABLE_OUTPUT_MESSAGE.to_string(),
+        )),
+        Verdict::Answered(answer) if answers_another_username(dispatch, &answer) => Err(
+            Failure::Unrecognized(USERNAME_MISMATCH_MESSAGE.to_string()),
+        ),
         Verdict::Answered(answer) => Ok(answer),
         Verdict::NoVerdict(message) => Err(Failure::NotInvokable(message)),
     }
+}
+
+/// Whether `answered` names a user other than the one `dispatch`'s event was delivered for.
+///
+/// The event names the account the stage is about (`userName`), and a function answers that
+/// same event: the account is the operation's, not the function's, so an answer stating
+/// another value for it — another name, or a value that is no name at all — is an answer
+/// about a user this operation is not serving, and there is nothing in it to apply. An answer
+/// that leaves the member out states nothing about it and is read as delivered.
+fn answers_another_username(dispatch: &Dispatch, answered: &Value) -> bool {
+    let Some(delivered) = dispatch.event.get(USERNAME_MEMBER).and_then(Value::as_str) else {
+        return false;
+    };
+    answered
+        .get(USERNAME_MEMBER)
+        .is_some_and(|answered| answered.as_str() != Some(delivered))
+}
+
+/// Whether `answered` is output this service cannot read a trigger's answer out of.
+///
+/// A trigger is answered with the EVENT it was handed: "triggers can modify the outcome of
+/// the operations that invoked them" (`LambdaConfigType` in this service's model), and what a
+/// function modifies is the response half the event is delivered with ([`event`] builds it,
+/// and each stage reads its verdict back out of it). Output that is not a document carrying
+/// that half — a payload that is no JSON object at all, one the function returned empty, or
+/// one naming other members entirely — holds no answer to read, whatever else it says, so
+/// nothing is read out of it and no verdict is invented for it.
+fn answer_is_unreadable(answered: &Value) -> bool {
+    !answered
+        .get(RESPONSE_HALF)
+        .is_some_and(Value::is_object)
 }
 
 /// Invoke the function of `dispatch` and report what the trigger leaves the operation to

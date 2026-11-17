@@ -372,6 +372,41 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         }
 
+        // An app client whose authorization server allows the code or implicit
+        // grant registers somewhere to deliver that grant's response, so an
+        // update that would leave it allowing one with no callback URL at all is
+        // refused ([`crate::state::redirect_grant_without_a_callback_url`]) —
+        // every member it judges is one this update replaces, and it is asked
+        // before anything is written.
+        if crate::state::redirect_grant_without_a_callback_url(
+            input.allowed_o_auth_flows_user_pool_client,
+            input.allowed_o_auth_flows.as_deref(),
+            input.callback_ur_ls.as_deref(),
+        ) {
+            return Err(invalid_oauth_flow(
+                crate::state::CALLBACK_URL_REQUIRED_MESSAGE.to_string(),
+            ));
+        }
+
+        // Every URL this app client would redirect a browser to is one the
+        // authorization server can redirect to, which a URI carrying a fragment
+        // component is not ([`crate::state::redirect_uri_with_a_fragment`]), the
+        // same question the create path asks — so one that carries a fragment
+        // leaves the stored URLs exactly as they were.
+        if let Some(url) = crate::state::redirect_uri_with_a_fragment(
+            input
+                .callback_ur_ls
+                .iter()
+                .flatten()
+                .chain(input.logout_ur_ls.iter().flatten())
+                .chain(input.default_redirect_uri.iter())
+                .map(String::as_str),
+        ) {
+            return Err(invalid_parameter(
+                crate::state::fragment_redirect_uri_message(url),
+            ));
+        }
+
         // Every URL this app client would redirect a browser to is one Amazon
         // Cognito registers: HTTPS, or cleartext to the loopback interface alone
         // ([`crate::state::http_redirect_uri`]), the same question the create path

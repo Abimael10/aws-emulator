@@ -24,6 +24,11 @@ const AUTHORIZATION: &str = "AWS4-HMAC-SHA256 \
 /// The region of [`AUTHORIZATION`], which every minted pool id must carry.
 const REGION: &str = "us-east-1";
 
+/// The Amazon SNS caller a pool's SMS messages are sent through
+/// (`SmsConfigurationType.SnsCallerArn`), which a pool whose MFA mode is on
+/// carries.
+const SMS_CALLER_ARN: &str = "arn:aws:iam::000000000000:role/sms-caller";
+
 /// A password satisfying a default pool's password policy.
 ///
 /// `pub(crate)`, with the three helpers below it: the suite that reads an issued identity
@@ -577,6 +582,10 @@ async fn a_created_pool_and_client_read_back_through_describe() {
             "PoolName": "describe-pool",
             "UserPoolTags": { "owner": "platform" },
             "MfaConfiguration": "OPTIONAL",
+            // A pool left with its MFA mode on carries the SMS delivery path that
+            // mode rests on (`CreateUserPool.MfaConfiguration`).
+            "SmsConfiguration": { "SnsCallerArn": SMS_CALLER_ARN },
+            "AutoVerifiedAttributes": ["phone_number"],
         }),
     )
     .await["UserPool"]
@@ -746,6 +755,10 @@ async fn every_created_pool_gets_a_unique_id_and_the_documented_defaults() {
             json!({
                 "PoolName": "protected",
                 "MfaConfiguration": "OPTIONAL",
+                // The SMS delivery path the mode rests on
+                // (`CreateUserPool.MfaConfiguration`).
+                "SmsConfiguration": { "SnsCallerArn": SMS_CALLER_ARN },
+                "AutoVerifiedAttributes": ["phone_number"],
                 "DeletionProtection": "ACTIVE",
             }),
         ),

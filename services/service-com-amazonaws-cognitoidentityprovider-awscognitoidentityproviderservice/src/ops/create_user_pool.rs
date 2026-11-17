@@ -442,6 +442,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 crate::state::SMS_CONFIGURATION_REQUIRED_MESSAGE.to_string(),
             ));
         }
+        // A pool whose MFA mode this create turns on challenges over the one
+        // factor this surface configures, so it takes that factor's whole
+        // delivery path — an SMS caller to send through and the phone number
+        // auto-verified — rather than being stored as a pool that demands a
+        // second factor it could never deliver
+        // ([`crate::state::mfa_without_sms_delivery`], the same question
+        // `UpdateUserPool` asks of the same values).
+        if crate::state::mfa_without_sms_delivery(
+            &pool.mfa_configuration,
+            pool.sms_configuration.as_ref(),
+            &pool.auto_verified_attributes,
+        ) {
+            return Err(invalid_parameter(
+                crate::state::MFA_SMS_CONFIGURATION_REQUIRED_MESSAGE.to_string(),
+            ));
+        }
         // A pool sends SMS by assuming the role its `SmsConfiguration` names, so a
         // role that does not let Amazon Cognito assume it is refused rather than
         // stored as a delivery path that could never send

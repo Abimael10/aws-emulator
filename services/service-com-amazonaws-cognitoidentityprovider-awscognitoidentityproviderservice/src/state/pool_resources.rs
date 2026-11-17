@@ -158,6 +158,48 @@ impl UserPoolDomain {
     }
 }
 
+/// The words an Amazon Cognito prefix domain may not contain
+/// ([`domain_prefix_is_reserved`]).
+///
+/// A prefix domain is a label in a namespace Amazon Web Services owns — "a prefix
+/// value of `myprefix` for a user pool in the `us-east-1` Region results in a
+/// domain of `myprefix.auth.us-east-1.amazoncognito.com`"
+/// (`CreateUserPoolDomain.Domain` in this service's model) — so the names of the
+/// cloud, the company and the service itself are reserved there: a host under
+/// them would speak for Amazon Web Services to every browser that reached it.
+pub const RESERVED_DOMAIN_PREFIX_WORDS: [&str; 3] = ["aws", "amazon", "cognito"];
+
+/// The message `CreateUserPoolDomain` carries when the prefix the request asks
+/// for contains one of [`RESERVED_DOMAIN_PREFIX_WORDS`]
+/// ([`reserved_domain_prefix_message`]).
+///
+/// The reserved WORD the prefix contains is the one value the refusal reports —
+/// it is what the caller has to take out — and the rest is fixed text; the prefix
+/// itself is not quoted back.
+#[must_use]
+pub fn reserved_domain_prefix_message(reserved: &str) -> String {
+    format!("Domain cannot contain reserved word: {reserved}")
+}
+
+/// The reserved word `domain` contains, when it is an Amazon Cognito prefix a user
+/// pool cannot be granted, and `None` for a prefix that contains none
+/// ([`RESERVED_DOMAIN_PREFIX_WORDS`]).
+///
+/// The question is asked of the prefix as a whole rather than of its hyphenated
+/// parts: the word is unavailable wherever it appears in the label, so a prefix
+/// that merely embeds one is refused too, and the word reported is the first of
+/// the reserved ones the prefix carries. The prefix's own spelling is already
+/// lowercase — `DomainType`'s pattern admits lowercase letters, digits and hyphens
+/// alone — and the comparison is made without case regardless, so nothing turns on
+/// how the request spelled it.
+#[must_use]
+pub fn reserved_domain_prefix_word(domain: &str) -> Option<&'static str> {
+    let domain = domain.to_ascii_lowercase();
+    RESERVED_DOMAIN_PREFIX_WORDS
+        .into_iter()
+        .find(|reserved| domain.contains(reserved))
+}
+
 /// The bucket the static files of the hosted UI of a domain in `region` are
 /// served from: `DomainDescriptionType.S3Bucket`, "The Amazon S3 bucket where
 /// the static files for this domain are stored".

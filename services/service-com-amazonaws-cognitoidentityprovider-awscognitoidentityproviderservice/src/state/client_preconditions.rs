@@ -45,6 +45,94 @@ pub fn oauth_configuration_incomplete(
             || allowed_oauth_scopes.is_none_or(<[String]>::is_empty))
 }
 
+/// The `OAuthFlowType` values whose response the authorization server delivers by
+/// REDIRECTING the browser back to the application: `code`, which "provides an
+/// authorization code as the response", and `implicit`, which issues "the access
+/// token, and the ID token when scopes like `openid` and `profile` are requested,
+/// directly to your user" (`CreateUserPoolClient.AllowedOAuthFlows` in this
+/// service's model). The third value of that enumeration is the
+/// machine-to-machine grant, issued "from the `/oauth2/token` endpoint directly to
+/// a non-person user", which redirects nobody.
+const REDIRECT_OAUTH_FLOWS: [&str; 2] = ["code", "implicit"];
+
+/// The message an app-client write is refused with when it allows a
+/// redirect-based grant while registering no URL to redirect to
+/// ([`redirect_grant_without_a_callback_url`]). Fixed text: it names the member
+/// the request is missing a value for and the grants that require it, which are
+/// the same for every such request.
+pub const CALLBACK_URL_REQUIRED_MESSAGE: &str =
+    "CallbackUrls can not be empty when code flow or implicit flow is selected";
+
+/// Whether the configuration a write would leave the app client with allows a
+/// grant whose response is delivered by redirect ([`REDIRECT_OAUTH_FLOWS`]) while
+/// registering no callback URL to deliver it to.
+///
+/// A callback URL is where "you want to send your users' browsers after they
+/// complete authentication", and "Amazon Cognito doesn't accept authorization
+/// requests with `redirect_uri` values that aren't in the list of `CallbackURLs`
+/// that you provide" (`CreateUserPoolClient.CallbackURLs` in this service's
+/// model) — so an authorization server that allows the code or implicit grant and
+/// registers no such URL can answer no authorization request at all, and the
+/// write is refused rather than stored.
+///
+/// Judged over the configuration as the caller left it, whichever operation wrote
+/// it: an app client whose authorization server is off
+/// (`AllowedOAuthFlowsUserPoolClient`, "this parameter must have a value of `true`
+/// before you can configure … `AllowedOAuthFlows`") runs no such server, so it is
+/// judged by neither member, exactly as [`oauth_configuration_incomplete`] leaves
+/// it alone.
+#[must_use]
+pub fn redirect_grant_without_a_callback_url(
+    allowed_oauth_flows_user_pool_client: bool,
+    allowed_oauth_flows: Option<&[String]>,
+    callback_urls: Option<&[String]>,
+) -> bool {
+    allowed_oauth_flows_user_pool_client
+        && allowed_oauth_flows.is_some_and(|flows| {
+            flows
+                .iter()
+                .any(|flow| REDIRECT_OAUTH_FLOWS.contains(&flow.as_str()))
+        })
+        && callback_urls.is_none_or(<[String]>::is_empty)
+}
+
+/// The message an app-client write is refused with when a URL it registers for a
+/// browser redirect carries a fragment component
+/// ([`redirect_uri_with_a_fragment`]).
+///
+/// The offending URL is the one value such a refusal reports, taken verbatim from
+/// the member the request carried it in; the rest is fixed text.
+#[must_use]
+pub fn fragment_redirect_uri_message(url: &str) -> String {
+    format!("{url} cannot use fragment")
+}
+
+/// The first URL among `urls` that the authorization server could not redirect a
+/// browser to because it carries a fragment component, and `None` when none of
+/// them does.
+///
+/// "A redirect URI must meet the following requirements: … Not include a fragment
+/// component" (`CreateUserPoolClient.CallbackURLs` in this service's model, citing
+/// OAuth 2.0's redirection endpoint): the authorization server appends its
+/// response to the URI it redirects to, and a browser keeps a fragment to itself,
+/// so a URI carrying one is not one an app client can register, however the
+/// request spelled it.
+///
+/// The URL is read by the tree's URL parser rather than scanned here, so what
+/// counts as the fragment is what a browser would resolve. A value that is no
+/// absolute URL at all carries no component to judge, and is left to the member's
+/// own constraints. `urls` is every URL the write would leave the app client with,
+/// in the order the request listed them, so the refusal names the first offending
+/// one wherever the caller put it.
+#[must_use]
+pub fn redirect_uri_with_a_fragment<'a>(
+    urls: impl IntoIterator<Item = &'a str>,
+) -> Option<&'a str> {
+    urls.into_iter().find(|url| {
+        ::url::Url::parse(url).is_ok_and(|parsed| parsed.fragment().is_some())
+    })
+}
+
 /// The message an app-client write is refused with when a URL it registers for a
 /// browser redirect is a cleartext one ([`http_redirect_uri`]).
 ///

@@ -846,6 +846,18 @@ fn trigger_failed(failure: crate::state::lambda_triggers::Failure) -> AdminCreat
             })
             .into()
         }
+        // A function that RETURNED output this service cannot read as the trigger's event
+        // answered nothing: Amazon Cognito "encounters an invalid Lambda response" (this
+        // service's model), so that is what this call answers, and the account the trigger
+        // was to evaluate is not stored.
+        crate::state::lambda_triggers::Failure::Unrecognized(message) => {
+            AdminCreateUserErrorModeled::InvalidLambdaResponseException(
+                InvalidLambdaResponseException {
+                    message: Some(message),
+                },
+            )
+            .into()
+        }
     }
 }
 

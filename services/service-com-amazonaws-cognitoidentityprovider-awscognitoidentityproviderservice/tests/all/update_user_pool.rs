@@ -119,8 +119,12 @@ fn rich_create_request() -> Value {
             }
         },
         "AdminCreateUserConfig": { "AllowAdminCreateUserOnly": true, "UnusedAccountValidityDays": 2 },
-        "AutoVerifiedAttributes": ["email"],
+        "AutoVerifiedAttributes": ["email", "phone_number"],
         "MfaConfiguration": "OPTIONAL",
+        // A pool left with its MFA mode on carries the SMS delivery path that mode
+        // rests on, which is the caller its messages leave through and the phone
+        // number it verifies (`CreateUserPool.MfaConfiguration`).
+        "SmsConfiguration": { "SnsCallerArn": SNS_CALLER_ARN },
         "DeletionProtection": "ACTIVE",
         "UserPoolTier": "PLUS",
         "LambdaConfig": { "PreSignUp": TRIGGER_PRE_SIGN_UP },
@@ -326,6 +330,11 @@ fn update_cases() -> Vec<UpdateCase> {
                     "SignInPolicy": { "AllowedFirstAuthFactors": ["PASSWORD", "WEB_AUTHN"] }
                 },
                 "MfaConfiguration": "ON",
+                // The delivery path the mode rests on
+                // (`UpdateUserPool.MfaConfiguration`), which this update replaces
+                // along with every other member.
+                "SmsConfiguration": { "SnsCallerArn": SNS_CALLER_ARN },
+                "AutoVerifiedAttributes": ["phone_number"],
                 "DeletionProtection": "ACTIVE",
                 // The plan the row leaves the pool on has to include the
                 // sign-in policy it configures: a first authentication factor
@@ -344,6 +353,8 @@ fn update_cases() -> Vec<UpdateCase> {
                     json!(["PASSWORD", "WEB_AUTHN"]),
                 ),
                 ("MfaConfiguration", json!("ON")),
+                ("SmsConfiguration.SnsCallerArn", json!(SNS_CALLER_ARN)),
+                ("AutoVerifiedAttributes", json!(["phone_number"])),
                 ("DeletionProtection", json!("ACTIVE")),
                 ("UserPoolTier", json!("ESSENTIALS")),
             ]),

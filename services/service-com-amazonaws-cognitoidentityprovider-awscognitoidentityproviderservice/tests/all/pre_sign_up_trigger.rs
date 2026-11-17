@@ -71,6 +71,15 @@ const CLIENT_ID_NOT_APPLICABLE: &str = "CLIENT_ID_NOT_APPLICABLE";
 const ACTIVE_BUDGET: Duration = Duration::from_secs(60);
 const LOOK_AGAIN: Duration = Duration::from_millis(50);
 
+/// How long a row that judges a function's ANSWER keeps asking while the invocation does not
+/// reach the function at all inside Amazon Cognito's own trigger budget. Generous, and a
+/// deadline rather than a sleep: what the row waits for is an answer to judge.
+const ANSWERED_BY: Duration = Duration::from_secs(120);
+
+/// How many times such a row asks at most, so a function that answers nothing fails the row
+/// on the answer it gave rather than keeping it asking to the deadline.
+const ASK_AGAIN_AT_MOST: usize = 4;
+
 /// Cognito and Lambda over ONE shared engine, as `core/router/src/lib.rs` mounts them, so
 /// Cognito's in-process callback reaches this very Lambda.
 fn router() -> MultiServiceRouter {
@@ -230,6 +239,36 @@ async fn lambda_get(router: &MultiServiceRouter, uri: &str) -> Value {
         .expect("the test request is well formed");
     let response = router.dispatch(request).await;
     serde_json::from_slice(&response.into_body()).unwrap_or(Value::Null)
+}
+
+/// Invoke `name` DIRECTLY once, with an event shaped as this trigger's, so the rows that
+/// follow do not pay the runtime's first-call cost inside Amazon Cognito's own trigger
+/// budget. The answer is not read: what this buys is a runtime that has already run, so a
+/// warm-up that does not come back inside a generous bound is simply left behind — the rows
+/// ask for their own answer regardless.
+async fn warm(router: &MultiServiceRouter, name: &str) {
+    let request = http::Request::builder()
+        .method("POST")
+        .uri(format!("{FUNCTIONS_URI}/{name}/invocations"))
+        .header("host", format!("lambda.{REGION}.amazonaws.com"))
+        .header("content-type", "application/json")
+        .header("authorization", authorization("lambda"))
+        .body(Bytes::from(
+            json!({
+                "triggerSource": "PreSignUp_SignUp",
+                "version": EVENT_VERSION,
+                "userName": "warm-up",
+                "request": { "userAttributes": {}, "validationData": {} },
+                "response": {
+                    "autoConfirmUser": false,
+                    "autoVerifyEmail": false,
+                    "autoVerifyPhone": false,
+                },
+            })
+            .to_string(),
+        ))
+        .expect("the test request is well formed");
+    let _ = tokio::time::timeout(ACTIVE_BUDGET, router.dispatch(request)).await;
 }
 
 /// The handler the trigger function runs: it CHECKS the event against what the caller stated
@@ -653,9 +692,192 @@ async fn an_administrative_create_is_evaluated_by_the_same_trigger() {
     }
 }
 
-/// RULE: this trigger GATES the registration, so a function that fails registers nobody — the
-/// operation answers its own modelled Lambda error, stating the trigger and what the failure
-/// was, and the pool holds no such user afterwards.
+/// The handler a row of [`an_answer_that_is_not_the_event_registers_nobody`] runs: it answers
+/// with whatever the caller's validation data asked for, which is either the event it was
+/// handed or one of the malformed answers that event cannot be read out of.
+///
+/// It imports nothing: every name it uses is the language's own.
+const ANSWERING_HANDLER: &str = r#"
+def handler(event, context):
+    asked = event["request"].get("validationData", {}).get("answer", "the-event")
+    if asked == "text-instead-of-a-document":
+        return "not an event at all"
+    if asked == "no-output":
+        return None
+    if asked == "a-list":
+        return [event]
+    if asked == "other-members":
+        return {"ok": True, "statusCode": 200}
+    if asked == "a-response-half-that-is-not-an-object":
+        return {"response": "autoConfirmUser"}
+    if asked == "the-confirmation-as-text":
+        event["response"]["autoConfirmUser"] = "true"
+    elif asked == "the-confirmation-as-a-number":
+        event["response"]["autoConfirmUser"] = 1
+    elif asked == "the-email-verification-as-an-object":
+        event["response"]["autoVerifyEmail"] = {"asked": True}
+    elif asked == "another-user":
+        event["userName"] = 42
+    return event
+"#;
+
+/// RULE: a function answers with the EVENT it was handed — the identity that event names and
+/// every response member in the type it was delivered in — so an answer this service cannot
+/// read a verdict out of is an invalid Lambda response: the registration is refused with that
+/// modelled error and the pool holds no such user, exactly as a function that raised registers
+/// nobody.
+#[tokio::test]
+async fn an_answer_that_is_not_the_event_registers_nobody() {
+    let router = router();
+    let function = create_function(&router, "pre-sign-up-answer", ANSWERING_HANDLER).await;
+    // The runtime has already run once by the time a row fires the trigger, so no row
+    // spends Amazon Cognito's trigger budget on the first call's start-up.
+    warm(&router, "pre-sign-up-answer").await;
+    let (user_pool_id, client_id) = pool_with_client(
+        &router,
+        "answering",
+        json!({ "LambdaConfig": { "PreSignUp": function } }),
+    )
+    .await;
+
+    // The one sentence an answer with no verdict in it earns, whatever shape it took.
+    const UNRECOGNIZABLE: &str = "Unrecognizable lambda output";
+    // The sentence an answer naming another user earns.
+    const ANOTHER_USER: &str =
+        "Invalid user name. User name in Lambda mismatches the actual username.";
+
+    // The rows differ along WHAT the function answered: output that is no document at all
+    // (text, nothing, a list), a document carrying no response half or one that is not an
+    // object, a response member stated in a type the event did not deliver it in (each
+    // member, each wrong type), the envelope's own identity rewritten, and — the control —
+    // the event exactly as delivered.
+    //
+    // (case, what the function answers, the message the registration is refused with)
+    let rows: [(&str, &str, Option<&str>); 10] = [
+        (
+            "output that is text rather than a document",
+            "text-instead-of-a-document",
+            Some(UNRECOGNIZABLE),
+        ),
+        ("no output at all", "no-output", Some(UNRECOGNIZABLE)),
+        ("output that is a list", "a-list", Some(UNRECOGNIZABLE)),
+        (
+            "a document carrying other members entirely",
+            "other-members",
+            Some(UNRECOGNIZABLE),
+        ),
+        (
+            "a response half that is not an object",
+            "a-response-half-that-is-not-an-object",
+            Some(UNRECOGNIZABLE),
+        ),
+        (
+            "the confirmation answered as text",
+            "the-confirmation-as-text",
+            Some(UNRECOGNIZABLE),
+        ),
+        (
+            "the confirmation answered as a number",
+            "the-confirmation-as-a-number",
+            Some(UNRECOGNIZABLE),
+        ),
+        (
+            "the email verification answered as an object",
+            "the-email-verification-as-an-object",
+            Some(UNRECOGNIZABLE),
+        ),
+        (
+            "an event naming another user than the one delivered",
+            "another-user",
+            Some(ANOTHER_USER),
+        ),
+        ("the event exactly as delivered", "the-event", None),
+    ];
+
+    for (index, (case, answer, refused_with)) in rows.into_iter().enumerate() {
+        // Both registering stages reach this trigger, so every row is driven through each.
+        for (stage, prefix) in [("SignUp", "signed"), ("AdminCreateUser", "invited")] {
+            // What the row asks is about the ANSWER a function gave, so the row is asked
+            // again — with a username of its own — while the invocation did not reach the
+            // function at all inside Amazon Cognito's own trigger budget, which is a
+            // refusal about the invocation and no answer to judge. Bounded by a generous
+            // deadline rather than by how fast the host runs, and asked again immediately:
+            // nothing here waits out a span.
+            let deadline = Instant::now() + ANSWERED_BY;
+            for attempt in 0.. {
+                let username = format!("{prefix}{index}x{attempt}");
+                let email = format!("{username}@example.test");
+                let statements: Vec<(&str, &str)> = vec![("answer", answer)];
+                let request = if stage == "SignUp" {
+                    json!({
+                        "ClientId": client_id,
+                        "Username": username,
+                        "Password": GOOD_PASSWORD,
+                        "UserAttributes": [{ "Name": "email", "Value": email }],
+                        "ValidationData": validation_data(&statements),
+                    })
+                } else {
+                    json!({
+                        "UserPoolId": user_pool_id,
+                        "Username": username,
+                        "TemporaryPassword": GOOD_PASSWORD,
+                        "UserAttributes": [{ "Name": "email", "Value": email }],
+                        "ValidationData": validation_data(&statements),
+                    })
+                };
+                let (status, answered) = cognito(&router, stage, &request).await;
+                if refusal(&answered).0 == "UnexpectedLambdaException"
+                    && attempt + 1 < ASK_AGAIN_AT_MOST
+                {
+                    assert!(
+                        Instant::now() < deadline,
+                        "case {case:?} ({stage}): the trigger function never answered within \
+                         {ANSWERED_BY:?}, got {status} ({answered})"
+                    );
+                    continue;
+                }
+                let (read_status, read_body) = cognito(
+                    &router,
+                    "AdminGetUser",
+                    &json!({ "UserPoolId": user_pool_id, "Username": username }),
+                )
+                .await;
+
+                let Some(message) = refused_with else {
+                    assert_eq!(
+                        status, 200,
+                        "case {case:?} ({stage}): a function that answered the event registers \
+                         the user, got {status} ({answered})"
+                    );
+                    assert_eq!(
+                        read_status, 200,
+                        "case {case:?} ({stage}): the registered user must read back, got \
+                         {read_status} ({read_body})"
+                    );
+                    break;
+                };
+
+                let (code, stated) = refusal(&answered);
+                assert_eq!(
+                    (status, code.as_str(), stated.as_str()),
+                    (400, "InvalidLambdaResponseException", message),
+                    "case {case:?} ({stage}): expected HTTP 400 InvalidLambdaResponseException \
+                     {message:?}, got {status} ({answered})"
+                );
+                // The trigger sits before the account exists, so a refused registration
+                // leaves nothing behind.
+                assert_eq!(
+                    refusal(&read_body).0,
+                    "UserNotFoundException",
+                    "case {case:?} ({stage}): expected the pool to hold no such user, got \
+                     {read_status} ({read_body})"
+                );
+                break;
+            }
+        }
+    }
+}
+
 #[tokio::test]
 async fn a_failing_pre_sign_up_function_registers_nobody() {
     let router = router();
