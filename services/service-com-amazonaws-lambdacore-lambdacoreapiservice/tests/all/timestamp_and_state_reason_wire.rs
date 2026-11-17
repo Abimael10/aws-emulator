@@ -23,8 +23,23 @@
 //!    the clock settles it, `DELETING` once a delete starts — and both resources that
 //!    model the member (the connector and one of its versions).
 //!
+//! 3. Rule 2 over EVERY status this control plane reports, not just `State`: a status
+//!    member is reported with the narrative member that explains it, whether the status was
+//!    set by the call itself or by the clock when a transition fell due, and the narrative
+//!    states the event behind the status it accompanies. The pairs this service models on a
+//!    connector are `State`/`StateReason` and `LastUpdateStatus`/`LastUpdateStatusReason`
+//!    (`smithy_query(query="operation",operation="GetNetworkConnector")`), and an update is
+//!    the event both of them answer to: it restates the connector's `StateReason`, states
+//!    the in-flight update narrative, and hands the clock the narrative of the status it
+//!    settles on. The rows below span what the update changed, which identifier form named
+//!    the connector, how many updates it has had, which operation reports the members, and
+//!    both sides of the instant the update falls due.
+//!
 //! The harness (router, request helpers, the clock wait) is the sibling suite's; it is
 //! `pub(crate)` there so both suites drive the emulator the same way.
+
+use std::sync::Arc;
+use std::time::SystemTime;
 
 use aws_smithy_schema::traits::TimestampFormat;
 use aws_smithy_types::date_time::Format;
@@ -34,10 +49,13 @@ use service_com_amazonaws_lambdacore_lambdacoreapiservice::ops::types::{
     GetNetworkConnectorOutput, NetworkConnectorSummary, NetworkConnectorVersionSummary,
     UpdateNetworkConnectorOutput,
 };
+use smithy_server_runtime::MultiServiceRouter;
 
+use super::lifecycle_convergence::{reschedule, ALREADY_DUE, NOT_YET_DUE};
 use super::network_connector_lifecycle::{
-    at, create, delete, emulator, expected_arn, get, list, list_versions, minimal_create, text,
-    update, vpc_egress, wait_for_the_clock, Answer,
+    at, create, delete, emulator, emulator_with_engine, expected_arn, get, list, list_versions,
+    minimal_configuration, minimal_create, text, update, vpc_egress, wait_for_the_clock, Answer,
+    OPERATOR_ROLE,
 };
 
 /// Assert that the JSON value at `pointer` is the wire form a `date-time` member requires:
@@ -371,5 +389,422 @@ async fn a_reported_state_always_carries_the_reason_for_it() {
         deleting_reason, active_reason,
         "the state changed, so the reason naming the event that set it changed too, got \
          {deleting_reason:?}"
+    );
+}
+
+// --- RULE 3: every reported status comes with the narrative that explains it -------------
+
+/// Every (status, narrative) member pair a connector's description reports, from
+/// `smithy_query(query="operation",operation="GetNetworkConnector")`: `State` with
+/// `StateReason`, and `LastUpdateStatus` with `LastUpdateStatusReason`.
+const STATUS_NARRATIVE_PAIRS: [(&str, &str); 2] = [
+    ("/State", "/StateReason"),
+    ("/LastUpdateStatus", "/LastUpdateStatusReason"),
+];
+
+/// Two of the three `NetworkConnectorLastUpdateStatus` values (`[Failed, InProgress,
+/// Successful]`): the one an accepted update carries while it is in flight, and the one it
+/// settles on. `Failed` is reached by no update this control plane accepts.
+const IN_PROGRESS: &str = "InProgress";
+const SUCCESSFUL: &str = "Successful";
+
+/// The narrative reported beside [`IN_PROGRESS`]: an update that has been accepted and has
+/// not settled yet. Fixed text — the status it explains has no request- or state-derived
+/// part, so nothing of this sentence varies.
+const IN_FLIGHT_UPDATE_NARRATIVE: &str = "Update in progress";
+
+/// The narrative reported beside [`SUCCESSFUL`], once the update in flight has settled.
+const SETTLED_UPDATE_NARRATIVE: &str = "Update was successful";
+
+/// The `StateReason` of a connector whose latest lifecycle event is an accepted update:
+/// `StateReason` explains the connector's current state, and an update is the event that
+/// last moved it.
+const UPDATE_INITIATED_NARRATIVE: &str = "Update initiated";
+
+/// An `OperatorRole` that is not the one `minimal_create` stored, so an update carrying it
+/// alone is a configuration CHANGE. Its spelling is what `NetworkConnectorRoleArn`'s
+/// pattern admits.
+const CHANGED_OPERATOR_ROLE: &str =
+    "arn:aws:iam::000000000000:role/LambdaNetworkConnectorOperatorTwo";
+
+/// How a case names the connector: every form `UpdateNetworkConnector` accepts ("you can
+/// specify the connector ID, name, or full ARN").
+#[derive(Clone, Copy, Debug)]
+enum NamedBy {
+    Name,
+    Id,
+    Arn,
+}
+
+/// Every form, so no row's shape can be special-cased.
+const EVERY_FORM: [NamedBy; 3] = [NamedBy::Name, NamedBy::Id, NamedBy::Arn];
+
+/// The connector's identity as the create reported it, in each form an identifier takes.
+struct Identity {
+    name: String,
+    id: String,
+    arn: String,
+}
+
+impl Identity {
+    /// This connector, spelled the way `form` names it.
+    fn spelled(&self, form: NamedBy) -> &str {
+        match form {
+            NamedBy::Name => &self.name,
+            NamedBy::Id => &self.id,
+            NamedBy::Arn => &self.arn,
+        }
+    }
+}
+
+/// RULE 3, the pairing itself: a status member and the narrative member that explains it
+/// are reported TOGETHER. A reported status comes with human-readable text for it, and a
+/// narrative is never reported for a status the record does not hold.
+fn assert_paired(case: &str, body: &Value, status_pointer: &str, narrative_pointer: &str) {
+    let status = at(body, status_pointer);
+    let narrative = at(body, narrative_pointer);
+    match status.as_str() {
+        Some(status) => {
+            let Some(narrative) = narrative.as_str() else {
+                panic!(
+                    "case {case:?}: {status_pointer} is {status:?}, so {narrative_pointer} must \
+                     explain it, got {narrative:?}"
+                );
+            };
+            assert!(
+                !narrative.trim().is_empty(),
+                "case {case:?}: {narrative_pointer} must be human-readable text, got \
+                 {narrative:?}"
+            );
+        }
+        None => assert_eq!(
+            narrative,
+            Value::Null,
+            "case {case:?}: {status_pointer} is not reported ({status:?}), so there is no status \
+             for {narrative_pointer} to explain, got {narrative:?}"
+        ),
+    }
+}
+
+/// Every pair of [`STATUS_NARRATIVE_PAIRS`], checked by [`assert_paired`].
+fn assert_every_pair(case: &str, body: &Value) {
+    for (status_pointer, narrative_pointer) in STATUS_NARRATIVE_PAIRS {
+        assert_paired(case, body, status_pointer, narrative_pointer);
+    }
+}
+
+/// Create a connector whose provisioning has already fallen due, so it accepts an update,
+/// and answer its identity in every form.
+async fn connector_ready_to_update(
+    router: &MultiServiceRouter,
+    engine: &Arc<engine::InMemoryEngine>,
+    case: &str,
+    name: &str,
+) -> Identity {
+    let created = create(router, minimal_create(name)).await;
+    assert_eq!(
+        created.status, 202,
+        "case {case:?}: creating {name:?} must succeed, got {} with {:?}",
+        created.status, created.body
+    );
+    reschedule(engine, name, case, SystemTime::now() - ALREADY_DUE);
+    Identity {
+        name: name.to_string(),
+        id: text(&created.body, "/Id"),
+        arn: text(&created.body, "/Arn"),
+    }
+}
+
+/// The update requests a case drives, differing along what the update CHANGES — the two
+/// members `UpdateNetworkConnector` takes, each alone and both together.
+fn changing_requests() -> Vec<(&'static str, Value)> {
+    vec![
+        (
+            "a changed configuration",
+            json!({ "Configuration": changed_configuration() }),
+        ),
+        (
+            "a changed operator role",
+            json!({ "OperatorRole": CHANGED_OPERATOR_ROLE }),
+        ),
+        (
+            "a changed configuration and operator role",
+            json!({
+                "Configuration": changed_configuration(),
+                "OperatorRole": CHANGED_OPERATOR_ROLE,
+            }),
+        ),
+    ]
+}
+
+/// RULE 3 on the accepting call: the 202 of an accepted update reports the transient
+/// `LastUpdateStatus` with the narrative for it, whatever the update changed and whichever
+/// identifier form named the connector.
+#[tokio::test]
+async fn an_accepted_update_answers_the_in_flight_status_with_its_narrative() {
+    for (change, request) in changing_requests() {
+        for form in EVERY_FORM {
+            let case = format!("{change}, named by {form:?}");
+            let (router, engine) = emulator_with_engine();
+            let connector =
+                connector_ready_to_update(&router, &engine, &case, "narrated-update").await;
+
+            let updated = update(&router, connector.spelled(form), request.clone()).await;
+            assert_eq!(
+                updated.status, 202,
+                "case {case:?}: an ACTIVE connector accepts the update, got {} with {:?}",
+                updated.status, updated.body
+            );
+            assert_paired(
+                &case,
+                &updated.body,
+                "/LastUpdateStatus",
+                "/LastUpdateStatusReason",
+            );
+            assert_eq!(
+                text(&updated.body, "/LastUpdateStatus"),
+                IN_PROGRESS,
+                "case {case:?}: the call that starts the update carries the transient status, \
+                 got {:?}",
+                at(&updated.body, "/LastUpdateStatus")
+            );
+            assert_eq!(
+                text(&updated.body, "/LastUpdateStatusReason"),
+                IN_FLIGHT_UPDATE_NARRATIVE,
+                "case {case:?}: the in-flight status is reported with its own narrative, got \
+                 {:?}",
+                at(&updated.body, "/LastUpdateStatusReason")
+            );
+        }
+    }
+}
+
+/// RULE 3 on the read: once an update is accepted, a description of the connector states
+/// that update as the connector's latest lifecycle event and reports the update status with
+/// its narrative — the in-flight one until the update falls due, the settled one from the
+/// first call at or after that instant, with the pairing holding on both sides of it.
+///
+/// The rows span every identifier form, two looks on each side of the due instant (a read
+/// neither advances nor spends what the clock owes), and a SECOND update, which restates
+/// the in-flight narrative rather than leaving the settled one standing.
+#[tokio::test]
+async fn a_read_after_an_update_reports_the_update_as_the_latest_event() {
+    let case = "the first update";
+    let (router, engine) = emulator_with_engine();
+    let connector = connector_ready_to_update(&router, &engine, case, "narrated-read").await;
+
+    // The creation narrative is what the connector carries before any update, so the
+    // restatement below is a change rather than the text it already had.
+    let before = get(&router, &connector.name).await;
+    assert_every_pair("before any update", &before.body);
+    let creation_narrative = text(&before.body, "/StateReason");
+    assert!(
+        !creation_narrative.is_empty(),
+        "case {case:?}: a created connector reports the narrative of its creation, got {:?}",
+        at(&before.body, "/StateReason")
+    );
+    assert_eq!(
+        at(&before.body, "/LastUpdateStatus"),
+        Value::Null,
+        "case {case:?}: a connector no update has touched reports no update status, got {:?}",
+        at(&before.body, "/LastUpdateStatus")
+    );
+
+    let updated = update(
+        &router,
+        &connector.name,
+        json!({ "Configuration": changed_configuration() }),
+    )
+    .await;
+    assert_eq!(
+        updated.status, 202,
+        "case {case:?}: the update is accepted, got {} with {:?}",
+        updated.status, updated.body
+    );
+
+    // While the update is still owed, every form reports the in-flight status with its
+    // narrative, and the connector's own StateReason states the update.
+    reschedule(
+        &engine,
+        &connector.name,
+        case,
+        SystemTime::now() + NOT_YET_DUE,
+    );
+    for look in 1..=2 {
+        for form in EVERY_FORM {
+            let case = format!("{case}, in flight, look {look} by {form:?}");
+            let reported = get(&router, connector.spelled(form)).await;
+            assert_eq!(
+                reported.status, 200,
+                "case {case:?}: expected HTTP 200, got {} with {:?}",
+                reported.status, reported.body
+            );
+            assert_every_pair(&case, &reported.body);
+            assert_eq!(
+                text(&reported.body, "/LastUpdateStatus"),
+                IN_PROGRESS,
+                "case {case:?}: the update the clock still owes is reported in flight, got {:?}",
+                at(&reported.body, "/LastUpdateStatus")
+            );
+            assert_eq!(
+                text(&reported.body, "/LastUpdateStatusReason"),
+                IN_FLIGHT_UPDATE_NARRATIVE,
+                "case {case:?}: the in-flight status is reported with its narrative, got {:?}",
+                at(&reported.body, "/LastUpdateStatusReason")
+            );
+            assert_eq!(
+                text(&reported.body, "/StateReason"),
+                UPDATE_INITIATED_NARRATIVE,
+                "case {case:?}: the accepted update is the connector's latest lifecycle event, \
+                 so StateReason states it instead of {creation_narrative:?}, got {:?}",
+                at(&reported.body, "/StateReason")
+            );
+        }
+    }
+
+    // From the instant the update falls due, the status the clock reached is reported with
+    // ITS narrative — and the state narrative still names the event that set the state.
+    reschedule(
+        &engine,
+        &connector.name,
+        case,
+        SystemTime::now() - ALREADY_DUE,
+    );
+    for look in 1..=2 {
+        for form in EVERY_FORM {
+            let case = format!("{case}, settled, look {look} by {form:?}");
+            let settled = get(&router, connector.spelled(form)).await;
+            assert_every_pair(&case, &settled.body);
+            assert_eq!(
+                text(&settled.body, "/LastUpdateStatus"),
+                SUCCESSFUL,
+                "case {case:?}: the update the clock owed has settled, got {:?}",
+                at(&settled.body, "/LastUpdateStatus")
+            );
+            assert_eq!(
+                text(&settled.body, "/LastUpdateStatusReason"),
+                SETTLED_UPDATE_NARRATIVE,
+                "case {case:?}: the status the clock reached carries its own narrative, got {:?}",
+                at(&settled.body, "/LastUpdateStatusReason")
+            );
+            assert_eq!(
+                text(&settled.body, "/StateReason"),
+                UPDATE_INITIATED_NARRATIVE,
+                "case {case:?}: the update is still the event that set the connector's state, \
+                 got {:?}",
+                at(&settled.body, "/StateReason")
+            );
+        }
+    }
+
+    // A second update is a second event: the narrative is restated for it, not written once
+    // and left at the previous update's outcome.
+    let case = "the second update";
+    let again = update(
+        &router,
+        &connector.id,
+        json!({ "OperatorRole": CHANGED_OPERATOR_ROLE }),
+    )
+    .await;
+    assert_eq!(
+        again.status, 202,
+        "case {case:?}: the second update is accepted, got {} with {:?}",
+        again.status, again.body
+    );
+    assert_eq!(
+        text(&again.body, "/LastUpdateStatusReason"),
+        IN_FLIGHT_UPDATE_NARRATIVE,
+        "case {case:?}: a further update states the in-flight narrative again, got {:?}",
+        at(&again.body, "/LastUpdateStatusReason")
+    );
+    reschedule(
+        &engine,
+        &connector.name,
+        case,
+        SystemTime::now() + NOT_YET_DUE,
+    );
+    let in_flight_again = get(&router, &connector.arn).await;
+    assert_every_pair(case, &in_flight_again.body);
+    assert_eq!(
+        text(&in_flight_again.body, "/LastUpdateStatusReason"),
+        IN_FLIGHT_UPDATE_NARRATIVE,
+        "case {case:?}: a read of the second update in flight reports its narrative, not the \
+         previous update's outcome, got {:?}",
+        at(&in_flight_again.body, "/LastUpdateStatusReason")
+    );
+    reschedule(
+        &engine,
+        &connector.name,
+        case,
+        SystemTime::now() - ALREADY_DUE,
+    );
+    let settled_again = get(&router, &connector.arn).await;
+    assert_eq!(
+        text(&settled_again.body, "/LastUpdateStatusReason"),
+        SETTLED_UPDATE_NARRATIVE,
+        "case {case:?}: the second update settles with the settled narrative, got {:?}",
+        at(&settled_again.body, "/LastUpdateStatusReason")
+    );
+}
+
+/// RULE 3 the other way round: a narrative is reported only where there is a status for it
+/// to explain. A connector no update has touched reports neither update member, and a
+/// request that changes nothing ("a no-op update returns the current version number")
+/// starts no update, so it states no update narrative either.
+#[tokio::test]
+async fn an_update_narrative_is_reported_only_where_an_update_status_is() {
+    let case = "a connector no update has touched";
+    let (router, engine) = emulator_with_engine();
+    let connector = connector_ready_to_update(&router, &engine, case, "never-updated").await;
+
+    for form in EVERY_FORM {
+        let case = format!("{case}, named by {form:?}");
+        let reported = get(&router, connector.spelled(form)).await;
+        assert_every_pair(&case, &reported.body);
+        assert_eq!(
+            at(&reported.body, "/LastUpdateStatusReason"),
+            Value::Null,
+            "case {case:?}: there is no update status to explain, so no narrative is \
+             reported, got {:?}",
+            at(&reported.body, "/LastUpdateStatusReason")
+        );
+    }
+
+    // The no-op: the very configuration and role the connector already holds.
+    let case = "an update that changes nothing";
+    let unchanged = update(
+        &router,
+        &connector.id,
+        json!({
+            "Configuration": minimal_configuration(),
+            "OperatorRole": OPERATOR_ROLE,
+        }),
+    )
+    .await;
+    assert_eq!(
+        unchanged.status, 202,
+        "case {case:?}: a no-op update is accepted, got {} with {:?}",
+        unchanged.status, unchanged.body
+    );
+    assert_paired(
+        case,
+        &unchanged.body,
+        "/LastUpdateStatus",
+        "/LastUpdateStatusReason",
+    );
+    let reported = get(&router, &connector.name).await;
+    assert_every_pair(case, &reported.body);
+    assert_eq!(
+        at(&reported.body, "/LastUpdateStatus"),
+        Value::Null,
+        "case {case:?}: a request that changed nothing started no update, got {:?}",
+        at(&reported.body, "/LastUpdateStatus")
+    );
+    assert_eq!(
+        at(&reported.body, "/LastUpdateStatusReason"),
+        Value::Null,
+        "case {case:?}: with no update status there is nothing for a narrative to explain, \
+         got {:?}",
+        at(&reported.body, "/LastUpdateStatusReason")
     );
 }

@@ -344,6 +344,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let provisioned = crate::state::PendingTransition {
             due: now + crate::state::LIFECYCLE_TRANSITION,
             change: crate::state::PendingChange::State(crate::state::STATE_ACTIVE.to_string()),
+            // The creation this call started is still the event that puts the
+            // connector in `ACTIVE`, so the narrative recorded below explains
+            // that state too and the transition states no new one.
+            reason: None,
         };
         let connector = crate::state::NetworkConnector {
             name: input.name.clone(),

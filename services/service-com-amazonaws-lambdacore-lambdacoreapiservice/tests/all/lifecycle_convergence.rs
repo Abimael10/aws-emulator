@@ -43,11 +43,15 @@ use super::network_connector_lifecycle::{
 
 /// How far in the past a case puts a due instant it wants already reached: long
 /// enough that the call under test cannot arrive before it.
-const ALREADY_DUE: Duration = Duration::from_secs(60);
+///
+/// `pub(crate)` with [`reschedule`]: the sibling suite
+/// `timestamp_and_state_reason_wire` decides its cases by the same clock rather than
+/// keeping a second copy of this arrangement.
+pub(crate) const ALREADY_DUE: Duration = Duration::from_secs(60);
 
 /// How far in the future a case puts a due instant it wants NOT reached: long
 /// enough that no call of a case can arrive after it.
-const NOT_YET_DUE: Duration = Duration::from_secs(3_600);
+pub(crate) const NOT_YET_DUE: Duration = Duration::from_secs(3_600);
 
 /// How long the one poll loop here keeps looking before it gives up. Generous: the
 /// condition is owed by the emulator's clock and nothing here measures how long it
@@ -99,7 +103,7 @@ fn owed_changes_fall_due_at(
 
 /// The same, asserting the call under test left the clock something to owe — a case
 /// that moved nothing would prove nothing.
-fn reschedule(engine: &Arc<engine::InMemoryEngine>, name: &str, case: &str, due: SystemTime) {
+pub(crate) fn reschedule(engine: &Arc<engine::InMemoryEngine>, name: &str, case: &str, due: SystemTime) {
     let moved = owed_changes_fall_due_at(engine, name, due);
     assert!(
         moved > 0,

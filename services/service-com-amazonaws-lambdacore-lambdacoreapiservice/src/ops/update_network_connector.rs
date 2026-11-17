@@ -448,23 +448,41 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     change: crate::state::PendingChange::State(
                         crate::state::STATE_ACTIVE.to_string(),
                     ),
+                    // This same update is why the version becomes `ACTIVE`, so
+                    // the reason recorded above still explains that state.
+                    reason: None,
                 }),
                 last_modified: now,
             },
         );
         connector.latest_version = version;
         connector.last_modified = now;
+        // This update is now the latest event in the connector's own lifecycle,
+        // so `StateReason` — "a human-readable explanation of the current
+        // state" — states it rather than the creation it has outlived. The
+        // `State` it explains is unchanged: "the connector remains in ACTIVE
+        // state during the update".
+        connector.state_reason = Some(crate::state::STATE_REASON_UPDATE_INITIATED.to_string());
         // "The connector remains in ACTIVE state during the update" and its
         // `LastUpdateStatus` "transitions through InProgress to Successful" —
-        // a transition the clock owes, not one a later call performs.
+        // a transition the clock owes, not one a later call performs. Each of
+        // those two statuses is reported with its own narrative, which is what
+        // `LastUpdateStatusReason` ("a human-readable explanation of the update
+        // status") carries: the in-flight one now, the settled one when the
+        // clock reaches it.
         connector.last_update_status = Some(crate::state::LAST_UPDATE_IN_PROGRESS.to_string());
-        connector.last_update_status_reason = None;
+        connector.last_update_status_reason =
+            Some(crate::state::LAST_UPDATE_REASON_IN_PROGRESS.to_string());
+        // `LastUpdateStatusReasonCode`'s values all name an update FAILURE
+        // (`InvalidSubnet`, `InternalError`, …), which no update this emulator
+        // accepts reaches, so no code describes this status.
         connector.last_update_status_reason_code = None;
         connector.pending_update = Some(crate::state::PendingTransition {
             due: settles_at,
             change: crate::state::PendingChange::State(
                 crate::state::LAST_UPDATE_SUCCESSFUL.to_string(),
             ),
+            reason: Some(crate::state::LAST_UPDATE_REASON_SUCCESSFUL.to_string()),
         });
 
         let output = UpdateNetworkConnectorOutput {

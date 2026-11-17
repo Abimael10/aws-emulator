@@ -74,10 +74,29 @@ pub const STATE_REASON_CONFIGURATION_UPDATE: &str = "Configuration update";
 /// `DELETING`: the deletion is the event that put it there.
 pub const STATE_REASON_DELETION_REQUESTED: &str = "Deletion requested";
 
+/// The `StateReason` a connector carries once `UpdateNetworkConnector` accepted a
+/// configuration change: "each configuration update creates a new immutable version", so
+/// that update is the latest event in the connector's own lifecycle and therefore what its
+/// `StateReason` explains until another event sets a new state.
+pub const STATE_REASON_UPDATE_INITIATED: &str = "Update initiated";
+
 /// `NetworkConnectorLastUpdateStatus$InProgress`.
 pub const LAST_UPDATE_IN_PROGRESS: &str = "InProgress";
 /// `NetworkConnectorLastUpdateStatus$Successful`.
 pub const LAST_UPDATE_SUCCESSFUL: &str = "Successful";
+
+/// The `LastUpdateStatusReason` reported beside [`LAST_UPDATE_IN_PROGRESS`].
+///
+/// `LastUpdateStatusReason` is "a human-readable explanation of the last update status", so
+/// a reported `LastUpdateStatus` comes with the narrative for it exactly as a reported
+/// `State` comes with its `StateReason`. No documented rule computes the text, and the
+/// status it explains has no request- or state-derived part, so the narrative is the short
+/// sentence naming what the status means: the update was accepted and has not settled.
+pub const LAST_UPDATE_REASON_IN_PROGRESS: &str = "Update in progress";
+
+/// The `LastUpdateStatusReason` reported beside [`LAST_UPDATE_SUCCESSFUL`]: the narrative of
+/// the status the clock sets once the update in flight finishes.
+pub const LAST_UPDATE_REASON_SUCCESSFUL: &str = "Update was successful";
 
 /// The largest page `ListNetworkConnectors` serves, and the page it serves when
 /// the request names no `MaxItems`.
@@ -173,6 +192,12 @@ pub enum PendingChange {
 pub struct PendingTransition {
     pub due: SystemTime,
     pub change: PendingChange,
+    /// The human-readable narrative to record beside the status this transition sets, so
+    /// the status the clock reaches is reported with the reason for it just as the status a
+    /// call sets is. `None` keeps the narrative already recorded, which is what a
+    /// transition that only completes the event that set it needs: a connector is `ACTIVE`
+    /// because the creation that provisioned it finished.
+    pub reason: Option<String>,
 }
 
 /// One immutable version of a connector: "each configuration update creates a
@@ -206,6 +231,9 @@ impl ConnectorVersion {
         }
         if let PendingChange::State(state) = &pending.change {
             self.state = state.clone();
+            if let Some(reason) = pending.reason.clone() {
+                self.state_reason = Some(reason);
+            }
         }
         self.pending = None;
     }
@@ -233,9 +261,14 @@ pub struct NetworkConnector {
     /// One of `NetworkConnectorLastUpdateStatus`'s values; unset until the
     /// connector has been updated at all.
     pub last_update_status: Option<String>,
+    /// The human-readable explanation of [`NetworkConnector::last_update_status`]: the
+    /// narrative of the update status reported beside it (see
+    /// [`LAST_UPDATE_REASON_IN_PROGRESS`]). Set by whatever sets `last_update_status`, so
+    /// the two are always reported together.
     pub last_update_status_reason: Option<String>,
     pub last_update_status_reason_code: Option<String>,
-    /// The `LastUpdateStatus` the clock owes once the update in flight finishes.
+    /// The `LastUpdateStatus`, and the narrative for it, the clock owes once the update in
+    /// flight finishes.
     pub pending_update: Option<PendingTransition>,
     pub last_modified: SystemTime,
     pub tags: BTreeMap<String, String>,
@@ -259,6 +292,9 @@ impl NetworkConnector {
                 match pending.change {
                     PendingChange::State(state) => {
                         self.state = state;
+                        if let Some(reason) = pending.reason {
+                            self.state_reason = Some(reason);
+                        }
                         self.pending = None;
                     }
                     PendingChange::Removal => return true,
@@ -270,6 +306,12 @@ impl NetworkConnector {
             if now >= pending.due {
                 if let PendingChange::State(status) = pending.change {
                     self.last_update_status = Some(status);
+                    // The status the clock reaches carries its own narrative, so the
+                    // member that explains `LastUpdateStatus` moves with it rather than
+                    // keeping the one the in-flight update stated.
+                    if let Some(reason) = pending.reason {
+                        self.last_update_status_reason = Some(reason);
+                    }
                 }
                 self.pending_update = None;
             }
