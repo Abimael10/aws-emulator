@@ -184,7 +184,10 @@ async fn published_service_codes(client: &Client) -> Vec<String> {
 /// A row only tests the rule while its code really is one the catalog does not publish —
 /// dropping a character off one published code can land on another — so every row is
 /// checked against the inventory and dropped if the catalog turns out to publish it.
-async fn unpublished_service_codes(client: &Client) -> Vec<(String, String)> {
+///
+/// `pub(crate)` so the suite that spans the refusal FACTS against each other
+/// (`refusal_fact_grading.rs`) drives this one table instead of a weaker copy of it.
+pub(crate) async fn unpublished_service_codes(client: &Client) -> Vec<(String, String)> {
     let published = published_service_codes(client).await;
     assert!(
         published.len() >= 2,

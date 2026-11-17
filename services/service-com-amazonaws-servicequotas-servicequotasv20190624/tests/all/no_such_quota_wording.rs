@@ -159,7 +159,10 @@ pub(crate) async fn catalog_services(client: &Client, wanted: usize) -> Vec<(Str
 /// `QuotaCode`), the shortest code the member allows, and a pair under a service the
 /// catalog publishes no quotas for at all. The services and the real codes come from
 /// the catalog read over the wire.
-async fn unheld_pairs(client: &Client) -> Vec<(String, String, String)> {
+///
+/// `pub(crate)` so the suite that spans the refusal FACTS against each other
+/// (`refusal_fact_grading.rs`) drives this one table instead of a copy of it.
+pub(crate) async fn unheld_pairs(client: &Client) -> Vec<(String, String, String)> {
     let catalog = catalog_services(client, 2).await;
     assert!(
         catalog.len() == 2,

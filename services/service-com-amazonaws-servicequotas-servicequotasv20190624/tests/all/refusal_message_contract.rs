@@ -69,7 +69,7 @@ use crate::auto_management::refused as answer;
 
 /// One quota of the catalog as the tables below name one: `(ServiceCode, QuotaCode, its
 /// AWS default value)`.
-type Quota = (String, String, f64);
+pub(crate) type Quota = (String, String, f64);
 
 /// `wanted` quotas the catalog publishes with `adjustable` as their `Adjustable`, each
 /// from a different service where the catalog has one, read over the wire (`ListServices`
@@ -78,7 +78,15 @@ type Quota = (String, String, f64);
 /// A quota is kept only when the account-wide read of it is served, because a quota that
 /// is adjustable for an individual resource only has no account plane for a write to land
 /// on and is refused for that instead of for the fact under test.
-async fn quotas_with_adjustable(client: &Client, adjustable: bool, wanted: usize) -> Vec<Quota> {
+///
+/// `pub(crate)` so the suite that spans the refusal FACTS against each other
+/// (`refusal_fact_grading.rs`) picks its quotas through this one reader instead of a copy
+/// of it.
+pub(crate) async fn quotas_with_adjustable(
+    client: &Client,
+    adjustable: bool,
+    wanted: usize,
+) -> Vec<Quota> {
     let mut picked: Vec<Quota> = Vec::new();
     for service in service_inventory(client).await {
         if picked.len() == wanted {

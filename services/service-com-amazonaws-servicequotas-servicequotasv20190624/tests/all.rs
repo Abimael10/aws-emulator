@@ -113,6 +113,8 @@ mod recorded_rows_access_analyzer_through_amplify;
 mod recorded_rows_config_through_signin;
 #[path = "all/recorded_rows_events_through_imagebuilder.rs"]
 mod recorded_rows_events_through_imagebuilder;
+#[path = "all/refusal_fact_grading.rs"]
+mod refusal_fact_grading;
 #[path = "all/refusal_message_contract.rs"]
 mod refusal_message_contract;
 #[path = "all/refusal_wording.rs"]
