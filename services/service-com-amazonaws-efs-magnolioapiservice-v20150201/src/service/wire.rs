@@ -13,11 +13,17 @@
 //! that body, and its own documentation states the rule; the handlers reach it through
 //! the [`FileSystemNotFound`] / [`ReplicationNotFound`] aliases.
 //!
-//! Every error shape in this service's model is a structure with a required `ErrorCode`
-//! and an OPTIONAL `Message` (target `ErrorMessage`, a plain string with no HTTP
-//! binding), some of them with one more required member naming the resource:
+//! Every error shape in this service's model is a structure with an `ErrorCode` and an
+//! OPTIONAL `Message` (target `ErrorMessage`, a plain string with no HTTP binding), some
+//! of them with one more required member naming the resource:
 //! `smithy_query(query="shape",shape="AccessPointAlreadyExists",
 //! model_path="services/service-com-amazonaws-efs-magnolioapiservice-v20150201/smithy-model/com-amazonaws-efs-magnolioapiservice-v20150201.json")`.
+//! The model marks that `ErrorCode` `@required` on most of them and OPTIONAL on six
+//! (`InvalidPolicyException`, `PolicyNotFound`, `ReplicationNotFound`,
+//! `ReplicationAlreadyExists`, `ConflictException`, `AvailabilityZonesMismatch`), and
+//! WHICH members a refusal body carries is the operation's own contract: a handler that
+//! leaves an optional member unset has it left out of the document, which is how
+//! `PutFileSystemPolicy`'s policy-validation refusal travels as the sentence alone.
 //! Most of this service's refusals DO carry a request-derived sentence (see
 //! [`crate::state::file_system_not_found_message`] and its neighbours), and one class —
 //! `AccessPointAlreadyExists` — carries none at all, because neither the model nor the

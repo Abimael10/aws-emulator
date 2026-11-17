@@ -219,6 +219,11 @@ fn bad_request(message: impl Into<String>) -> DescribeReplicationConfigurationsE
 /// configuration" — this read's refusal reports that the request's filter matched no
 /// replication configuration, so it carries the fixed sentence
 /// [`crate::state::NO_REPLICATIONS_FOUND_MESSAGE`] and names no id.
+///
+/// This read reports its class in the body as well: Amazon EFS answers this filter's
+/// not-found with the `ErrorCode` member the model leaves optional, while the same class
+/// on `DeleteReplicationConfiguration` carries the sentence alone (see
+/// [`crate::service::wire`]) — the member set is each operation's own contract.
 fn replication_not_found() -> DescribeReplicationConfigurationsError {
     DescribeReplicationConfigurationsErrorModeled::ReplicationNotFound(ReplicationNotFound {
         error_code: Some("ReplicationNotFound".to_string()),

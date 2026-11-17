@@ -1383,7 +1383,9 @@ pub fn replication_configuration_not_found_message(file_system_id: &str) -> Stri
 ///
 /// It carries NO sentence: the refusal reports the error class and nothing from the
 /// request or from state, so the `Message` member is absent (the error document still
-/// carries the key, as JSON `null` — see [`crate::service::wire`]). Built here once, so
+/// carries the key, as JSON `null` — see [`crate::service::wire`]). Its `ErrorCode`
+/// member, which the model leaves OPTIONAL, IS filled: the policy reads report their
+/// class in the body as well as in the `x-amzn-errortype` header. Built here once, so
 /// the backup-policy read and the file-system-policy read refuse identically.
 pub fn policy_not_found() -> PolicyNotFound {
     PolicyNotFound {

@@ -9,7 +9,7 @@
 //! instead of copying them.
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 use service_com_amazonaws_efs_magnolioapiservice_v20150201::state;
@@ -243,9 +243,43 @@ impl Emulator {
             created.status, created.body
         );
         let id = created.string("FileSystemId");
-        settle().await;
+        self.wait_until_available(&id).await;
         id
     }
+
+    /// Look again through `DescribeFileSystems` until `file_system_id` reports
+    /// `available` — the clock-owed end of the `creating` span ([`state::CREATING_FOR`])
+    /// — or until a deadline far longer than that span has passed.
+    ///
+    /// The CONDITION is polled rather than a fixed span slept for, so a suite that needs
+    /// a settled file system does not depend on how fast the host runs.
+    pub async fn wait_until_available(&self, file_system_id: &str) {
+        let deadline = Instant::now() + Duration::from_secs(60);
+        loop {
+            let reply = self
+                .describe_file_systems(&format!("FileSystemId={file_system_id}"))
+                .await;
+            if reply.get("FileSystems")[0]["LifeCycleState"].as_str() == Some("available") {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "file system {file_system_id}: never reached available, last read {:?}",
+                reply.body
+            );
+            tokio::time::sleep(POLL_INTERVAL).await;
+        }
+    }
+}
+
+/// How long a poll loop waits before looking again. It bounds nothing: the loop above
+/// runs until its CONDITION holds or its own generous deadline passes.
+const POLL_INTERVAL: Duration = Duration::from_millis(20);
+
+/// One IAM resource-policy document around `statement`, as the suites that submit a
+/// `FileSystemPolicy` build it.
+pub fn policy_document(statement: Value) -> Value {
+    json!({ "Version": "2012-10-17", "Statement": [statement] })
 }
 
 /// Wait past the clock-owed `creating` -> `available` transition. The handlers never

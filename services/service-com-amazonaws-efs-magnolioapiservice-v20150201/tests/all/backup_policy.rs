@@ -23,7 +23,8 @@ use crate::harness::{settle, Emulator, Reply};
 /// The whole `PolicyNotFound` refusal, asserted the same way wherever it is reached: the
 /// modelled status and error shape, and NO sentence — the member is present in the error
 /// document as JSON `null`, which is how a client tells "this class carries no sentence"
-/// from "the sentence is empty".
+/// from "the sentence is empty". Its `ErrorCode` member, optional in the model, IS
+/// filled: Amazon EFS answers the policy reads' not-found with the class in the body too.
 fn assert_policy_not_found(case: &str, reply: &Reply) {
     assert_eq!(
         reply.status, 404,

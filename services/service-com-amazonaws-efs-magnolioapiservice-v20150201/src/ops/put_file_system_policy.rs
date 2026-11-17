@@ -271,9 +271,15 @@ fn locks_out_policy_updates(document: &str, file_system_arn: &str) -> bool {
 /// A 400 `InvalidPolicyException`: "Returned if the FileSystemPolicy is malformed or
 /// contains an error such as a parameter value that is not valid or a missing required
 /// parameter. Returned in the case of a policy lockout safety check error."
+///
+/// Its body carries the SENTENCE ALONE: this operation answers its policy-validation
+/// refusal with the class in the `x-amzn-errortype` header and no `ErrorCode` member —
+/// the one error of this operation whose `ErrorCode` the model does NOT mark `@required`,
+/// unlike the sibling `BadRequest` — so the optional member is left absent rather than
+/// filled with a second copy of the shape's name.
 fn invalid_policy(message: impl Into<String>) -> PutFileSystemPolicyError {
     PutFileSystemPolicyErrorModeled::InvalidPolicyException(InvalidPolicyException {
-        error_code: Some("InvalidPolicyException".to_string()),
+        error_code: None,
         message: Some(message.into()),
     })
     .into()

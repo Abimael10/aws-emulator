@@ -31,10 +31,22 @@
 //! The rule is about the ERROR document only: the last test here pins that a SUCCESS
 //! body still omits the optional members it has no value for, which is what every AWS
 //! JSON response body does.
+//!
+//! The second rule this suite asserts is about the OTHER member every error document of
+//! this service can carry, `ErrorCode`: which members a refusal body carries is the
+//! OPERATION's own contract rather than a default read off the error shape. Amazon EFS
+//! answers `PutFileSystemPolicy`'s policy-validation refusal with the SENTENCE ALONE —
+//! that class is the one error of the operation whose `ErrorCode` the model does not mark
+//! `@required`
+//! (`smithy_query(query="shape",shape="InvalidPolicyException,BadRequest")`) — so the
+//! member is left out there and the class is read off `x-amzn-errortype`, while every
+//! class this service does report a code for, including the five others whose `ErrorCode`
+//! the model leaves optional, keeps it.
 
 use serde_json::{json, Value};
 
 use crate::file_system_lifecycle::{Emulator, Reply};
+use crate::harness::policy_document;
 
 /// What an error document's message member is expected to be.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -540,5 +552,334 @@ async fn a_success_body_omits_the_members_it_has_no_value_for() {
              got {:?}",
             listed[0].get(member)
         );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The `ErrorCode` member: carried where the refusal reports a code, left out
+// where the operation answers with the sentence alone.
+// ---------------------------------------------------------------------------
+
+/// What an error document's `ErrorCode` member is expected to be.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Code {
+    /// The refusal reports its class in the body: the member is present and names it.
+    Named,
+    /// The refusal carries the SENTENCE ALONE: the member is ABSENT, and the class is
+    /// read off `x-amzn-errortype`.
+    Absent,
+}
+
+/// The `ErrorCode` slot of an error document: the JSON value under the key, or `None`
+/// when the document carries NO such key at all — the difference this rule is about, and
+/// which a `body["ErrorCode"].as_str()` reader cannot see.
+fn error_code_slot(reply: &Reply) -> Option<Value> {
+    reply.body.as_object()?.get("ErrorCode").cloned()
+}
+
+/// Assert one error document's status, the class named in `x-amzn-errortype`, and whether
+/// the body carries the `ErrorCode` member.
+fn assert_code_member(case: &str, reply: &Reply, status: u16, class: &str, expected: Code) {
+    assert_eq!(
+        (reply.status, reply.error_type.as_deref()),
+        (status, Some(class)),
+        "case {case:?}: wrong refusal, body {:?}",
+        reply.body
+    );
+    let slot = error_code_slot(reply);
+    match expected {
+        Code::Named => assert_eq!(
+            slot.as_ref().and_then(Value::as_str),
+            Some(class),
+            "case {case:?}: this class reports its code in the body, so ErrorCode must \
+             name it, got {slot:?} in {:?}",
+            reply.body
+        ),
+        Code::Absent => assert_eq!(
+            slot, None,
+            "case {case:?}: this refusal carries the sentence alone, so the optional \
+             ErrorCode member must be absent, got {slot:?} in {:?}",
+            reply.body
+        ),
+    }
+}
+
+/// RULE: which members a refusal body carries is the OPERATION's contract, not a default
+/// read off the error shape — so `PutFileSystemPolicy`'s policy-validation refusal, the
+/// one class of that operation whose `ErrorCode` the model does not mark `@required`,
+/// travels as the sentence alone with its class in `x-amzn-errortype`, and the member is
+/// never filled with a second copy of the shape's name.
+///
+/// The table spans what the rule generalises over: for the policy-validation class, every
+/// element of the request that can earn the refusal (the lockout safety check and each
+/// clause of the policy grammar, with and without the bypass the grammar ignores); and
+/// beside it the classes whose `ErrorCode` this service DOES report — the `@required` ones
+/// of the same operation and of its neighbours, and all five other classes whose
+/// `ErrorCode` the model leaves optional — so the absence is pinned to the one class whose
+/// contract it is rather than to "an optional member" or to an empty body.
+#[tokio::test]
+async fn an_error_document_carries_error_code_only_where_the_refusal_reports_one() {
+    let efs = Emulator::new();
+    let mut rows: Vec<(String, Reply, u16, &str, Code)> = Vec::new();
+
+    // ---- `InvalidPolicyException`: the lockout safety check, and documents that are not
+    // IAM resource policies at all.
+    let policy_file_system = efs.available_file_system("code-member-policy").await;
+    let described = efs
+        .describe_file_systems(&format!("FileSystemId={policy_file_system}"))
+        .await;
+    let policy_file_system_arn = described.get("FileSystems")[0]["FileSystemArn"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    let lockout = policy_document(json!({
+        "Effect": "Deny",
+        "Principal": "*",
+        "Action": "elasticfilesystem:PutFileSystemPolicy",
+        "Resource": policy_file_system_arn,
+    }))
+    .to_string();
+    let refused_documents: Vec<(&str, String)> = vec![
+        ("the lockout safety check", lockout),
+        ("a document that is not JSON", "this is not a policy".to_string()),
+        ("a document that is a JSON scalar", "5".to_string()),
+        (
+            "a document with no Statement",
+            json!({ "Version": "2012-10-17" }).to_string(),
+        ),
+        (
+            "a policy version the language does not define",
+            json!({
+                "Version": "2020-01-01",
+                "Statement": [{
+                    "Effect": "Allow",
+                    "Principal": "*",
+                    "Action": "elasticfilesystem:ClientMount",
+                }],
+            })
+            .to_string(),
+        ),
+        (
+            "a statement that names no principal",
+            policy_document(json!({
+                "Effect": "Allow",
+                "Action": "elasticfilesystem:ClientMount",
+            }))
+            .to_string(),
+        ),
+    ];
+    for (case, document) in refused_documents {
+        // The grammar is judged before the lockout safety check, so the bypass changes
+        // nothing about the body of a document that is not a policy; the lockout row is
+        // the one the bypass would accept, so it is submitted without one.
+        let bypasses: &[bool] = if case == "the lockout safety check" {
+            &[false]
+        } else {
+            &[false, true]
+        };
+        for bypass in bypasses {
+            rows.push((
+                format!("PutFileSystemPolicy refused by {case} (bypass {bypass})"),
+                efs.put_file_system_policy(
+                    &policy_file_system,
+                    json!({ "Policy": document, "BypassPolicyLockoutSafetyCheck": bypass }),
+                )
+                .await,
+                400,
+                "InvalidPolicyException",
+                Code::Absent,
+            ));
+        }
+    }
+
+    // ---- `PolicyNotFound`: an OPTIONAL `ErrorCode` Amazon EFS DOES fill — both policy
+    // reads of a file system that carries neither kind of policy answer with the class in
+    // the body as well, so the absence above is this write's contract and not "every
+    // optional member".
+    rows.push((
+        "DescribeFileSystemPolicy before any policy is set".to_string(),
+        efs.describe_file_system_policy(&policy_file_system).await,
+        404,
+        "PolicyNotFound",
+        Code::Named,
+    ));
+    rows.push((
+        "DescribeBackupPolicy before any backup policy is set".to_string(),
+        efs.describe_backup_policy(&policy_file_system).await,
+        404,
+        "PolicyNotFound",
+        Code::Named,
+    ));
+
+    // ---- `AvailabilityZonesMismatch`: another class whose `ErrorCode` the model leaves
+    // optional and which this service fills — a One Zone file system takes a mount target
+    // only in its own Availability Zone.
+    let one_zone = efs
+        .create_file_system(json!({
+            "CreationToken": "code-member-one-zone",
+            "AvailabilityZoneName": "us-east-1b",
+        }))
+        .await;
+    assert_eq!(
+        one_zone.status, 201,
+        "CreateFileSystem (One Zone): expected 201, got {} {:?}",
+        one_zone.status, one_zone.body
+    );
+    let one_zone_id = one_zone.string("FileSystemId");
+    efs.wait_until_available(&one_zone_id).await;
+    rows.push((
+        "CreateMountTarget in another zone of a One Zone file system".to_string(),
+        efs.create_mount_target(json!({
+            "FileSystemId": one_zone_id,
+            "SubnetId": "subnet-0ccccccccccccccc1",
+        }))
+        .await,
+        400,
+        "AvailabilityZonesMismatch",
+        Code::Named,
+    ));
+
+    // ---- `ConflictException` and `ReplicationAlreadyExists`: two more optional
+    // `ErrorCode` members this service fills — a second configuration for a replicated
+    // source, and a protection change on its destination.
+    let source = efs.available_file_system("code-member-source").await;
+    let replicated = efs
+        .create_replication_configuration(&source, json!({ "Destinations": [{}] }))
+        .await;
+    assert_eq!(
+        replicated.status, 200,
+        "CreateReplicationConfiguration: expected 200, got {} {:?}",
+        replicated.status, replicated.body
+    );
+    let destination_id = replicated.body["Destinations"][0]["FileSystemId"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    efs.wait_until_available(&destination_id).await;
+    rows.push((
+        "CreateReplicationConfiguration for an already replicated source".to_string(),
+        efs.create_replication_configuration(&source, json!({ "Destinations": [{}] }))
+            .await,
+        409,
+        "ConflictException",
+        Code::Named,
+    ));
+    rows.push((
+        "UpdateFileSystemProtection on a replicated destination".to_string(),
+        efs.update_file_system_protection(
+            &destination_id,
+            json!({ "ReplicationOverwriteProtection": "ENABLED" }),
+        )
+        .await,
+        409,
+        "ReplicationAlreadyExists",
+        Code::Named,
+    ));
+
+    // ---- `ReplicationNotFound` on the replication READ, the last of the optional
+    // members: filled here, while the same class on the replication DELETE carries the
+    // sentence alone (see `replication_refusals`).
+    for unmatched in ["fs-00000000", "fs-0123456789abcdef"] {
+        rows.push((
+            format!("DescribeReplicationConfigurations filtered on {unmatched}"),
+            efs.describe_replication_configurations(&format!("FileSystemId={unmatched}"))
+                .await,
+            404,
+            "ReplicationNotFound",
+            Code::Named,
+        ));
+    }
+
+    // ---- The classes whose `ErrorCode` the model marks `@required`: the member travels,
+    // on the same operations and beside the absent ones.
+    let missing = "fs-00000000deadbeef";
+    let open_policy = policy_document(json!({
+        "Effect": "Allow",
+        "Principal": "*",
+        "Action": "elasticfilesystem:PutFileSystemPolicy",
+        "Resource": "*",
+    }))
+    .to_string();
+    rows.push((
+        "PutFileSystemPolicy on an unknown file system".to_string(),
+        efs.put_file_system_policy(missing, json!({ "Policy": open_policy.clone() }))
+            .await,
+        404,
+        "FileSystemNotFound",
+        Code::Named,
+    ));
+    let creating = efs
+        .create_file_system(json!({ "CreationToken": "code-member-creating" }))
+        .await;
+    let creating_id = creating.string("FileSystemId");
+    rows.push((
+        "PutFileSystemPolicy while the file system is creating".to_string(),
+        efs.put_file_system_policy(&creating_id, json!({ "Policy": open_policy }))
+            .await,
+        409,
+        "IncorrectFileSystemLifeCycleState",
+        Code::Named,
+    ));
+    rows.push((
+        "CreateFileSystem with a token already consumed".to_string(),
+        efs.create_file_system(json!({ "CreationToken": "code-member-creating" }))
+            .await,
+        409,
+        "FileSystemAlreadyExists",
+        Code::Named,
+    ));
+    rows.push((
+        "DescribeAccessPoints on an unknown access point".to_string(),
+        efs.describe_access_points("AccessPointId=fsap-00000000").await,
+        404,
+        "AccessPointNotFound",
+        Code::Named,
+    ));
+    rows.push((
+        "CreateAccessPoint with a RootDirectory and no Path".to_string(),
+        efs.create_access_point(json!({
+            "ClientToken": "code-member-no-path",
+            "FileSystemId": policy_file_system,
+            "RootDirectory": { "CreationInfo": {
+                "OwnerUid": 1, "OwnerGid": 1, "Permissions": "0755",
+            } },
+        }))
+        .await,
+        400,
+        "BadRequest",
+        Code::Named,
+    ));
+
+    // The table spans both sides of the rule: every error class of the refused operation
+    // and every other class of this service whose `ErrorCode` the model leaves optional
+    // sit beside the policy-validation refusal, so the absence asserted above is this
+    // one class's contract rather than a property of optional members or of empty bodies.
+    let absent = rows
+        .iter()
+        .filter(|(_, _, _, _, code)| *code == Code::Absent)
+        .count();
+    let optional_named: Vec<&str> = rows
+        .iter()
+        .filter(|(_, _, _, _, code)| *code == Code::Named)
+        .map(|(_, _, _, class, _)| *class)
+        .filter(|class| {
+            [
+                "PolicyNotFound",
+                "ReplicationNotFound",
+                "ReplicationAlreadyExists",
+                "ConflictException",
+                "AvailabilityZonesMismatch",
+            ]
+            .contains(class)
+        })
+        .collect();
+    assert!(
+        absent >= 4 && optional_named.len() >= 5,
+        "the table must span both sides of the rule, got {absent} absent rows and the \
+         optional-but-filled classes {optional_named:?}"
+    );
+
+    for (case, reply, status, class, expected) in &rows {
+        assert_code_member(case, reply, *status, class, *expected);
     }
 }

@@ -27,7 +27,7 @@
 use serde_json::{json, Value};
 use service_com_amazonaws_efs_magnolioapiservice_v20150201::state;
 
-use crate::harness::{settle, Emulator, Reply};
+use crate::harness::{policy_document as policy, settle, Emulator, Reply};
 
 /// The sentence the policy-lockout safety check refuses a request with, as AWS words it:
 /// fixed text that names the member bypassing the check and interpolates nothing from the
@@ -40,18 +40,15 @@ const LOCKOUT_MESSAGE: &str =
 /// policy.
 const POLICY_MANAGEMENT_ACTION: &str = "elasticfilesystem:PutFileSystemPolicy";
 
-/// One policy document around `statement`.
-fn policy(statement: Value) -> Value {
-    json!({ "Version": "2012-10-17", "Statement": [statement] })
-}
-
 /// The account segment of an ARN: `arn:<partition>:<service>:<region>:<account>:<rest>`.
 fn account_of(arn: &str) -> String {
     arn.split(':').nth(4).unwrap_or_default().to_string()
 }
 
-/// The whole `PolicyNotFound` refusal: the modelled status and error shape, and NO
-/// sentence — present in the error document as JSON `null`.
+/// The whole `PolicyNotFound` refusal: the modelled status and error shape, its
+/// `ErrorCode` member (optional in the model, and filled: Amazon EFS answers the policy
+/// reads' not-found with the class in the body too), and NO sentence — present in the
+/// error document as JSON `null`.
 fn assert_policy_not_found(case: &str, reply: &Reply) {
     assert_eq!(
         reply.status, 404,
@@ -64,6 +61,12 @@ fn assert_policy_not_found(case: &str, reply: &Reply) {
         "case {case:?}: expected the modelled PolicyNotFound, got {:?}",
         reply.error_type
     );
+    assert_eq!(
+        reply.string("ErrorCode"),
+        "PolicyNotFound",
+        "case {case:?}: unexpected ErrorCode, got {:?}",
+        reply.get("ErrorCode")
+    );
     assert!(
         reply.get("Message").is_null(),
         "case {case:?}: the refusal carries no sentence, got {:?}",
@@ -74,6 +77,9 @@ fn assert_policy_not_found(case: &str, reply: &Reply) {
 /// The whole `InvalidPolicyException` refusal: "Returned if the FileSystemPolicy is
 /// malformed or contains an error ... Returned in the case of a policy lockout safety
 /// check error."
+///
+/// Its body carries the sentence alone: this class's `ErrorCode` member is optional in
+/// the model and EFS leaves it out, the class travelling in `x-amzn-errortype` instead.
 fn assert_invalid_policy(case: &str, reply: &Reply, expected_message: Option<&str>) {
     assert_eq!(
         reply.status, 400,
@@ -87,10 +93,10 @@ fn assert_invalid_policy(case: &str, reply: &Reply, expected_message: Option<&st
         reply.error_type
     );
     assert_eq!(
-        reply.string("ErrorCode"),
-        "InvalidPolicyException",
-        "case {case:?}: unexpected ErrorCode, got {:?}",
-        reply.get("ErrorCode")
+        reply.body.as_object().and_then(|body| body.get("ErrorCode")),
+        None,
+        "case {case:?}: this class's optional ErrorCode member must be absent, got {:?}",
+        reply.body
     );
     let message = reply.string("Message");
     assert!(
