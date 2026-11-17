@@ -428,24 +428,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let output_owed = read
             .was_answered()
             .then(|| {
-                crate::state::import_job_output::output_location(
-                    &input.output_s3_uri,
-                    &input.datastore_id,
-                    &job_id,
+                crate::state::import_job_output::output_prefix(&input.output_s3_uri).map(
+                    |(bucket, prefix)| crate::state::import_job_output::JobOutput {
+                        state: crate::state::import_job_output::DeliveryState::Owed,
+                        region: region.clone(),
+                        bucket,
+                        prefix,
+                        objects: crate::state::import_job_output::job_output_objects(
+                            &input.datastore_id,
+                            &job_id,
+                            &read,
+                            &imported,
+                            failure.as_deref(),
+                        ),
+                    },
                 )
-                .map(|(bucket, key_prefix)| crate::state::import_job_output::JobOutput {
-                    state: crate::state::import_job_output::DeliveryState::Owed,
-                    region: region.clone(),
-                    bucket,
-                    key_prefix,
-                    objects: crate::state::import_job_output::job_output_objects(
-                        &input.datastore_id,
-                        &job_id,
-                        &read,
-                        &imported,
-                        failure.as_deref(),
-                    ),
-                })
             })
             .flatten();
         let owes_output = output_owed.is_some();

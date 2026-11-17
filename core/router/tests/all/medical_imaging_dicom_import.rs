@@ -1710,11 +1710,12 @@ async fn object_body(router: &MultiServiceRouter, case: &str, bucket: &str, key:
 /// nothing, reaches `FAILED` carrying the `message` the model documents for a failed
 /// import; every other job reaches `COMPLETED` and has written its output manifests
 /// beneath `<outputS3Uri>/<datastoreId>-DicomImport-<jobId>/` — the job summary of what it
-/// scanned, imported and refused, and one record per input file that landed in an image set
-/// or in none — before any read reports it finished. An object that is not a readable DICOM
-/// P10 file is one of those per-file failures and does not fail the job; a job that could
-/// not write its results reaches `FAILED` instead of reporting a success whose manifests are
-/// not there.
+/// scanned, imported and refused, and one manifest per result category naming the input
+/// files that landed in an image set, in none, or landed with a reservation, zero-byte for
+/// a category the job recorded nothing in — before any read reports it finished. An object
+/// that is not a readable DICOM P10 file is one of those per-file failures and does not
+/// fail the job; a job that could not write its results reaches `FAILED` instead of
+/// reporting a success whose manifests are not there.
 #[tokio::test]
 async fn a_finished_dicom_import_writes_the_manifests_of_what_it_read() {
     let router = emulator();
@@ -1840,19 +1841,32 @@ async fn a_finished_dicom_import_writes_the_manifests_of_what_it_read() {
         };
         let written = keys_under(&router, case, row.output_bucket, &folder).await;
 
-        // Exactly the objects the job had something to say in: the summary always, and a
-        // per-file manifest only where there were such files.
-        let mut expected_keys: BTreeSet<String> =
-            BTreeSet::from([format!("{folder}job-output-manifest.json")]);
-        if !expected.success_files.is_empty() {
-            expected_keys.insert(format!("{folder}SUCCESS/success.ndjson"));
-        }
-        if !expected.failure_files.is_empty() {
-            expected_keys.insert(format!("{folder}FAILURE/failure.ndjson"));
-        }
+        // The same objects whatever the job had to say: the summary, and one manifest per
+        // result category — zero-byte for a category this job recorded nothing in.
+        let expected_keys: BTreeSet<String> = BTreeSet::from([
+            format!("{folder}job-output-manifest.json"),
+            format!("{folder}SUCCESS/success.ndjson"),
+            format!("{folder}FAILURE/failure.ndjson"),
+            format!("{folder}WARNING/warning.ndjson"),
+        ]);
         assert_eq!(
             written, expected_keys,
             "case {case:?}: expected the job output objects {expected_keys:?}, got {written:?}"
+        );
+
+        // The write-access probe the service wrote directly at the prefix the submit
+        // named, which carries no content at all.
+        let probe = object_body(
+            &router,
+            case,
+            row.output_bucket,
+            &format!("{OUTPUT_PREFIX}.write_access_check_file.temp"),
+        )
+        .await;
+        assert!(
+            probe.is_empty(),
+            "case {case:?}: expected the write-access probe object to be zero-byte, got \
+             {probe:?}"
         );
 
         let summary_body = object_body(
@@ -1951,7 +1965,10 @@ async fn a_finished_dicom_import_writes_the_manifests_of_what_it_read() {
         );
 
         // The per-file manifests: one JSON record per line, naming the input file each
-        // outcome is about.
+        // outcome is about — and present, zero-byte, for a category the job recorded
+        // nothing in. Nothing here imports an object with a reservation, so the WARNING
+        // category is the one that is always empty.
+        let no_files: Vec<&'static str> = vec![];
         for (key, files, name_of) in [
             (
                 "SUCCESS/success.ndjson",
@@ -1959,11 +1976,15 @@ async fn a_finished_dicom_import_writes_the_manifests_of_what_it_read() {
                 "imageSetId",
             ),
             ("FAILURE/failure.ndjson", &expected.failure_files, "message"),
+            ("WARNING/warning.ndjson", &no_files, "message"),
         ] {
-            if files.is_empty() {
-                continue;
-            }
             let body = object_body(&router, case, row.output_bucket, &format!("{folder}{key}")).await;
+            assert_eq!(
+                body.is_empty(),
+                files.is_empty(),
+                "case {case:?}: expected {key} to be zero-byte exactly when the job recorded \
+                 nothing in it, got {body:?}"
+            );
             let records: Vec<Value> = body
                 .lines()
                 .filter(|line| !line.trim().is_empty())
@@ -1994,5 +2015,241 @@ async fn a_finished_dicom_import_writes_the_manifests_of_what_it_read() {
                 );
             }
         }
+    }
+}
+
+/// One row of the output-prefix table: the form the submit's `outputS3Uri` takes, and the
+/// key prefix the results therefore go under.
+struct PrefixCase {
+    case: &'static str,
+    /// The bucket the results go in — one of its own per row, so the listing of the prefix
+    /// is exactly one job's output.
+    bucket: &'static str,
+    /// What follows the bucket in `outputS3Uri`, with no leading `/`.
+    suffix: &'static str,
+    /// The key prefix the results go under: empty for a bucket root, ending in `/`
+    /// otherwise.
+    root: &'static str,
+    /// The study, series and SOP instance UIDs the row's one input file declares, under the
+    /// same root as the rest of this suite's files — one study per row, so no two rows
+    /// import into the same image set.
+    study_uid: &'static str,
+    series_uid: &'static str,
+    sop_uid: &'static str,
+}
+
+/// RULE: whatever one DICOM import job had to say, its completion leaves the SAME set of
+/// objects under the output prefix the submit named — the zero-byte write-access probe
+/// directly at that prefix, and beneath the job's own
+/// `<datastoreId>-DicomImport-<jobId>/` folder the job summary and one manifest per result
+/// category (SUCCESS, FAILURE, WARNING), zero-byte for a category the job recorded nothing
+/// in. A client reads a category's manifest to learn that the category is empty, so the
+/// object is there to be read rather than absent.
+///
+/// Pinned where it is observable: through Amazon S3's own `ListObjectsV2` of the output
+/// prefix, which mirrors what was stored, and through a `GetObject` of each object.
+///
+/// The rows vary the one thing the rule generalises over: the form the output prefix takes
+/// — a nested prefix, a prefix named without its trailing slash, and a bucket root.
+#[tokio::test]
+async fn a_finished_dicom_import_leaves_its_whole_result_set_under_the_output_prefix() {
+    let router = emulator();
+    let created = s3(&router, "PUT", &format!("/{BUCKET}"), &[], Bytes::new()).await;
+    assert_eq!(
+        created.status, 200,
+        "setup: CreateBucket must succeed, got {} with {:?}",
+        created.status,
+        created.text()
+    );
+    let role_arn = role(&router, "healthimaging-prefix", HEALTHIMAGING_TRUST).await;
+    let datastore_id = active_datastore(&router, "output prefix", "import-prefix-store").await;
+
+    for (index, row) in [
+        PrefixCase {
+            case: "a nested prefix",
+            bucket: "healthimaging-out-nested",
+            suffix: "/a/b/out/",
+            root: "a/b/out/",
+            study_uid: "1.2.826.0.1.3680043.9.7133.91",
+            series_uid: "1.2.826.0.1.3680043.9.7133.91.1",
+            sop_uid: "1.2.826.0.1.3680043.9.7133.91.1.1",
+        },
+        PrefixCase {
+            case: "a prefix named without its trailing slash",
+            bucket: "healthimaging-out-bare",
+            suffix: "/results",
+            root: "results/",
+            study_uid: "1.2.826.0.1.3680043.9.7133.92",
+            series_uid: "1.2.826.0.1.3680043.9.7133.92.1",
+            sop_uid: "1.2.826.0.1.3680043.9.7133.92.1.1",
+        },
+        PrefixCase {
+            case: "the bucket root",
+            bucket: "healthimaging-out-root",
+            suffix: "",
+            root: "",
+            study_uid: "1.2.826.0.1.3680043.9.7133.93",
+            series_uid: "1.2.826.0.1.3680043.9.7133.93.1",
+            sop_uid: "1.2.826.0.1.3680043.9.7133.93.1.1",
+        },
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let case = row.case;
+        let made = s3(&router, "PUT", &format!("/{}", row.bucket), &[], Bytes::new()).await;
+        assert_eq!(
+            made.status, 200,
+            "case {case:?}: CreateBucket({}) must succeed, got {} with {:?}",
+            row.bucket,
+            made.status,
+            made.text()
+        );
+
+        // One readable DICOM file under the input prefix: a job that imports it records a
+        // success and nothing in either other category, which is what makes the
+        // zero-byte-when-empty rule observable.
+        let input_prefix = format!("prefix-{index}/");
+        let instance = Instance {
+            key: "slice-1.dcm",
+            transfer_syntax: EXPLICIT_VR_LE,
+            study_uid: row.study_uid,
+            series_uid: row.series_uid,
+            sop_uid: row.sop_uid,
+            patient_id: "PID-PREFIX",
+            patient_name: "PREFIX^CASE",
+            modality: "CT",
+            study_description: None,
+            accession_number: None,
+            pixel_data: Some(PIXELS_A),
+        };
+        let staged = s3(
+            &router,
+            "PUT",
+            &format!("/{BUCKET}/{input_prefix}{}", instance.key),
+            &[("content-type", "application/dicom")],
+            Bytes::from(instance.part10()),
+        )
+        .await;
+        assert_eq!(
+            staged.status, 200,
+            "case {case:?}: PutObject({}) must succeed, got {} with {:?}",
+            instance.key,
+            staged.status,
+            staged.text()
+        );
+
+        let output_s3_uri = format!("s3://{}{}", row.bucket, row.suffix);
+        let submitted = imaging_ok(
+            &router,
+            case,
+            "POST",
+            &format!("/startDICOMImportJob/datastore/{datastore_id}"),
+            Some(json!({
+                "clientToken": format!("import-prefix-{index}"),
+                "dataAccessRoleArn": role_arn,
+                "inputS3Uri": format!("s3://{BUCKET}/{input_prefix}"),
+                "outputS3Uri": output_s3_uri,
+            })),
+        )
+        .await;
+        let job_id = submitted.string(&["jobId"]);
+        let settled = settled_job(&router, case, &datastore_id, &job_id).await;
+        assert_eq!(
+            settled, "COMPLETED",
+            "case {case:?}: expected the import to reach COMPLETED, got {settled:?}"
+        );
+
+        // The listing of the output prefix, which is what a client asserting on the output
+        // of a finished job reads.
+        let listed = s3(
+            &router,
+            "GET",
+            &format!("/{}?list-type=2&prefix={}", row.bucket, row.root),
+            &[],
+            Bytes::new(),
+        )
+        .await;
+        assert_eq!(
+            listed.status, 200,
+            "case {case:?}: ListObjectsV2 of the output prefix must succeed, got {} with {:?}",
+            listed.status,
+            listed.text()
+        );
+        let folder = format!("{}{datastore_id}-DicomImport-{job_id}/", row.root);
+        let expected_keys: BTreeSet<String> = BTreeSet::from([
+            format!("{}.write_access_check_file.temp", row.root),
+            format!("{folder}job-output-manifest.json"),
+            format!("{folder}SUCCESS/success.ndjson"),
+            format!("{folder}FAILURE/failure.ndjson"),
+            format!("{folder}WARNING/warning.ndjson"),
+        ]);
+        let keys: BTreeSet<String> = xml_elements(&listed.text(), "Key").into_iter().collect();
+        assert_eq!(
+            keys, expected_keys,
+            "case {case:?}: expected the output prefix to hold {expected_keys:?}, got {keys:?}"
+        );
+        let key_count = xml_element(&listed.text(), "KeyCount");
+        assert_eq!(
+            key_count.as_deref(),
+            Some(expected_keys.len().to_string().as_str()),
+            "case {case:?}: expected KeyCount {}, got {key_count:?}",
+            expected_keys.len()
+        );
+
+        // Every one of them is readable, and says what its category has to say: the probe
+        // and the two categories this job recorded nothing in carry no bytes, the success
+        // manifest names the file that landed, and the summary is the job's own.
+        for key in [
+            format!("{}.write_access_check_file.temp", row.root),
+            format!("{folder}FAILURE/failure.ndjson"),
+            format!("{folder}WARNING/warning.ndjson"),
+        ] {
+            let body = object_body(&router, case, row.bucket, &key).await;
+            assert!(
+                body.is_empty(),
+                "case {case:?}: expected {key} to be zero-byte, got {body:?}"
+            );
+        }
+        let success = object_body(
+            &router,
+            case,
+            row.bucket,
+            &format!("{folder}SUCCESS/success.ndjson"),
+        )
+        .await;
+        let records: Vec<Value> = success
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .map(|line| {
+                serde_json::from_str(line).unwrap_or_else(|error| {
+                    panic!("case {case:?}: every line of the success manifest must be JSON: {error}")
+                })
+            })
+            .collect();
+        let named: Vec<String> = records
+            .iter()
+            .map(|record| record["inputFile"].as_str().unwrap_or_default().to_string())
+            .collect();
+        assert_eq!(
+            named,
+            vec![format!("{input_prefix}{}", instance.key)],
+            "case {case:?}: expected the success manifest to name the file that landed, got \
+             {named:?}"
+        );
+        let summary_body = object_body(
+            &router,
+            case,
+            row.bucket,
+            &format!("{folder}job-output-manifest.json"),
+        )
+        .await;
+        let summary: Value = serde_json::from_str(&summary_body)
+            .unwrap_or_else(|error| panic!("case {case:?}: the job summary must be JSON: {error}"));
+        assert_eq!(
+            summary["jobSummary"]["jobId"].as_str(),
+            Some(job_id.as_str()),
+            "case {case:?}: expected the summary to name job {job_id}, got {summary:?}"
+        );
     }
 }

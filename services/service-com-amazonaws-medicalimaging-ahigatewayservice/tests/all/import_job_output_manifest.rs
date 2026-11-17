@@ -218,8 +218,6 @@ struct ManifestCase {
     objects: Vec<ScannedObject>,
     /// Whether the job failed, and with what message.
     failure: Option<&'static str>,
-    /// The keys the output must consist of, relative to the job's own folder.
-    expected_keys: Vec<&'static str>,
     /// The input files the SUCCESS manifest must name.
     expected_success: Vec<&'static str>,
     /// The input files the FAILURE manifest must name, each with the reason it states.
@@ -240,7 +238,6 @@ fn manifest_cases() -> Vec<ManifestCase> {
                 carried("in/b.dcm", "1.2.1", "1.2.1.1", "1.2.1.1.2"),
             ],
             failure: None,
-            expected_keys: vec!["job-output-manifest.json", "SUCCESS/success.ndjson"],
             expected_success: vec!["in/a.dcm", "in/b.dcm"],
             expected_failures: vec![],
             expected_counts: (2, 2, 1),
@@ -252,7 +249,6 @@ fn manifest_cases() -> Vec<ManifestCase> {
                 carried("in/b.dcm", "1.2.2", "1.2.2.2", "1.2.2.2.1"),
             ],
             failure: None,
-            expected_keys: vec!["job-output-manifest.json", "SUCCESS/success.ndjson"],
             expected_success: vec!["in/a.dcm", "in/b.dcm"],
             expected_failures: vec![],
             expected_counts: (2, 2, 2),
@@ -265,11 +261,6 @@ fn manifest_cases() -> Vec<ManifestCase> {
                 unplaceable("in/no-study.dcm"),
             ],
             failure: None,
-            expected_keys: vec![
-                "job-output-manifest.json",
-                "SUCCESS/success.ndjson",
-                "FAILURE/failure.ndjson",
-            ],
             expected_success: vec!["in/a.dcm"],
             expected_failures: vec![
                 (
@@ -287,7 +278,6 @@ fn manifest_cases() -> Vec<ManifestCase> {
                 skipped("in/two.bin", "The object is larger than this service imports"),
             ],
             failure: None,
-            expected_keys: vec!["job-output-manifest.json", "FAILURE/failure.ndjson"],
             expected_success: vec![],
             expected_failures: vec![
                 (
@@ -305,7 +295,6 @@ fn manifest_cases() -> Vec<ManifestCase> {
             case: "a job that found nothing to import",
             objects: vec![],
             failure: Some("The import job failed because nothing was there"),
-            expected_keys: vec!["job-output-manifest.json"],
             expected_success: vec![],
             expected_failures: vec![],
             expected_counts: (0, 0, 0),
@@ -316,10 +305,16 @@ fn manifest_cases() -> Vec<ManifestCase> {
 /// RULE (above): the output manifests are the record of what each scanned object
 /// contributed, so they name exactly the input files that landed in an image set and the
 /// ones that landed in none, and the job summary counts what was really read.
+///
+/// Whatever a job has to say, its output is the SAME set of objects: the write-access probe
+/// at the prefix the submit named, and beneath the job's own folder the summary and one
+/// manifest per result category — zero-byte for a category this job recorded nothing in,
+/// which is what tells a client reading that manifest that the category is empty.
 #[test]
 fn the_output_manifests_record_what_every_scanned_object_contributed() {
     let datastore_id = "0123456789abcdef0123456789abcdef";
     let job_id = "fedcba9876543210fedcba9876543210";
+    let folder = format!("{datastore_id}-DicomImport-{job_id}/");
     for row in manifest_cases() {
         let case = row.case;
         let mut read = ImportPrefixRead {
@@ -343,20 +338,58 @@ fn the_output_manifests_record_what_every_scanned_object_contributed() {
             &imported,
             row.failure,
         );
-        let keys: Vec<&str> = objects.iter().map(|(key, _, _)| *key).collect();
+        let keys: Vec<&str> = objects.iter().map(|(key, _, _)| key.as_str()).collect();
+        let expected_keys = vec![
+            ".write_access_check_file.temp".to_string(),
+            format!("{folder}job-output-manifest.json"),
+            format!("{folder}SUCCESS/success.ndjson"),
+            format!("{folder}FAILURE/failure.ndjson"),
+            format!("{folder}WARNING/warning.ndjson"),
+        ];
         assert_eq!(
-            keys, row.expected_keys,
-            "case {case:?}: expected the output objects {:?}, got {keys:?}",
-            row.expected_keys
+            keys, expected_keys,
+            "case {case:?}: expected the output objects {expected_keys:?}, got {keys:?}"
         );
 
         let body_of = |wanted: &str| -> String {
+            let wanted = format!("{folder}{wanted}");
             objects
                 .iter()
                 .find(|(key, _, _)| *key == wanted)
                 .map(|(_, _, body)| body.clone())
                 .unwrap_or_default()
         };
+        // The probe object carries no content: its presence at the prefix is the whole
+        // statement it makes.
+        let probe = objects
+            .iter()
+            .find(|(key, _, _)| key == ".write_access_check_file.temp")
+            .map(|(_, _, body)| body.clone())
+            .unwrap_or_default();
+        assert!(
+            probe.is_empty(),
+            "case {case:?}: expected the write-access probe object to be zero-byte, got \
+             {probe:?}"
+        );
+        // Nothing here imports an object with a reservation, so the WARNING category is
+        // the one that is always empty — and present all the same.
+        let warnings = body_of("WARNING/warning.ndjson");
+        assert!(
+            warnings.is_empty(),
+            "case {case:?}: expected the warning manifest to be zero-byte, got {warnings:?}"
+        );
+        for (category, empty) in [
+            ("SUCCESS/success.ndjson", row.expected_success.is_empty()),
+            ("FAILURE/failure.ndjson", row.expected_failures.is_empty()),
+        ] {
+            let body = body_of(category);
+            assert_eq!(
+                body.is_empty(),
+                empty,
+                "case {case:?}: expected {category} to be zero-byte exactly when the job \
+                 recorded nothing in it, got {body:?}"
+            );
+        }
         let summary: Value = serde_json::from_str(&body_of("job-output-manifest.json"))
             .unwrap_or_else(|error| panic!("case {case:?}: the job summary must be JSON: {error}"));
         let summary = summary["jobSummary"].clone();

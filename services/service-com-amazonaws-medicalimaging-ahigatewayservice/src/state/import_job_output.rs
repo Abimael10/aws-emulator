@@ -20,9 +20,13 @@
 //!   job — it is one of the individual failures the manifests carry;
 //! * a job that reaches a terminal status has WRITTEN those manifests beneath
 //!   `outputS3Uri`, under the one folder per job AWS HealthImaging names
-//!   `<datastoreId>-DicomImport-<jobId>` ([`output_location`]). They are the only record
+//!   `<datastoreId>-DicomImport-<jobId>` ([`output_location`]) — one per result category,
+//!   and zero-byte for a category the job recorded nothing in, because a client reads a
+//!   category's manifest to learn that the category is empty. They are the only record
 //!   of what each object contributed, so they are rendered from exactly what the import
-//!   read ([`job_output_objects`]) and from the image sets it materialised.
+//!   read ([`job_output_objects`]) and from the image sets it materialised. The prefix the
+//!   submit named itself carries the write-access probe object
+//!   ([`WRITE_ACCESS_CHECK_KEY`]) the service writes there to establish that it can.
 //!
 //! The write is a hop into ANOTHER service, so it cannot be made under this service's
 //! state lock and cannot be made by the clock. The job therefore CARRIES the output it
@@ -63,12 +67,21 @@ use super::{
 pub const JOB_OUTPUT_MANIFEST_KEY: &str = "job-output-manifest.json";
 
 /// The object naming every input file that landed in an image set, one JSON record per
-/// line. Written only by a job that imported at least one file.
+/// line.
 pub const JOB_OUTPUT_SUCCESS_KEY: &str = "SUCCESS/success.ndjson";
 
 /// The object naming every input file that landed in none, with the reason, one JSON
-/// record per line. Written only by a job that failed at least one file.
+/// record per line.
 pub const JOB_OUTPUT_FAILURE_KEY: &str = "FAILURE/failure.ndjson";
+
+/// The object naming every input file imported with a reservation, one JSON record per
+/// line.
+pub const JOB_OUTPUT_WARNING_KEY: &str = "WARNING/warning.ndjson";
+
+/// The zero-byte object a job writes DIRECTLY at the output prefix it was pointed at,
+/// which is how the service establishes that it can write there before it writes any
+/// result beneath it.
+pub const WRITE_ACCESS_CHECK_KEY: &str = ".write_access_check_file.temp";
 
 /// The `message` the job summary of a job that imported its input carries.
 pub const IMPORT_JOB_COMPLETED_SUMMARY: &str = "IMPORT_JOB_COMPLETED";
@@ -76,8 +89,12 @@ pub const IMPORT_JOB_COMPLETED_SUMMARY: &str = "IMPORT_JOB_COMPLETED";
 /// The media type of the job summary.
 const JSON_MEDIA_TYPE: &str = "application/json";
 
-/// The media type of the two line-per-record manifests.
+/// The media type of the line-per-record manifests.
 const NDJSON_MEDIA_TYPE: &str = "application/x-ndjson";
+
+/// The media type of the write-access probe object, which carries no content to type: the
+/// default an object store records for an object stored without one.
+const OCTET_STREAM_MEDIA_TYPE: &str = "binary/octet-stream";
 
 /// How many job-output deliveries this service may have in flight at once.
 ///
@@ -139,10 +156,33 @@ pub struct JobOutput {
     /// for.
     pub region: String,
     pub bucket: String,
-    /// The job's own output folder, ending in `/`.
-    pub key_prefix: String,
-    /// Each object's key WITHIN [`JobOutput::key_prefix`], its media type and its body.
-    pub objects: Vec<(&'static str, &'static str, String)>,
+    /// The output prefix the submit named, ending in `/`, or empty for a bucket root.
+    /// Every object below is keyed relative to it, so the write-access probe lands at this
+    /// prefix itself and the job's results land in the job's own folder beneath it.
+    pub prefix: String,
+    /// Each object's key RELATIVE to [`JobOutput::prefix`], its media type and its body.
+    pub objects: Vec<(String, &'static str, String)>,
+}
+
+/// The bucket one job's output goes in, and the key prefix the submit's `outputS3Uri`
+/// named within it — ending in `/` so a key appended to it lands beneath it, and empty
+/// when the URI names a bucket root.
+///
+/// `None` when `output_s3_uri` is not an S3 URI at all — which the member's `@pattern`
+/// has already ruled out by the time a handler reads it.
+pub fn output_prefix(output_s3_uri: &str) -> Option<(String, String)> {
+    let (bucket, prefix) = super::parse_s3_uri(output_s3_uri)?;
+    let prefix = match prefix.as_str() {
+        "" => String::new(),
+        prefix if prefix.ends_with('/') => prefix.to_string(),
+        prefix => format!("{prefix}/"),
+    };
+    Some((bucket, prefix))
+}
+
+/// The folder AWS HealthImaging names one import job's output after, ending in `/`.
+pub fn job_folder(datastore_id: &str, job_id: &str) -> String {
+    format!("{datastore_id}-DicomImport-{job_id}/")
 }
 
 /// The bucket and the key prefix one job's output objects go under:
@@ -156,14 +196,11 @@ pub fn output_location(
     datastore_id: &str,
     job_id: &str,
 ) -> Option<(String, String)> {
-    let (bucket, prefix) = super::parse_s3_uri(output_s3_uri)?;
-    let folder = format!("{datastore_id}-DicomImport-{job_id}/");
-    let key_prefix = match prefix.as_str() {
-        "" => folder,
-        prefix if prefix.ends_with('/') => format!("{prefix}{folder}"),
-        prefix => format!("{prefix}/{folder}"),
-    };
-    Some((bucket, key_prefix))
+    let (bucket, prefix) = output_prefix(output_s3_uri)?;
+    Some((
+        bucket,
+        format!("{prefix}{}", job_folder(datastore_id, job_id)),
+    ))
 }
 
 /// The terminal outcome one import has, given what the object store answered about its
@@ -205,8 +242,14 @@ pub fn unwritable_output_message(output_s3_uri: &str) -> String {
     )
 }
 
-/// The objects one job's output consists of: the job summary, and the per-file manifests
-/// of what each scanned object contributed.
+/// The objects one job's output consists of, each keyed RELATIVE to the output prefix the
+/// submit named ([`output_prefix`]): the write-access probe at that prefix itself, and
+/// beneath the job's own folder ([`job_folder`]) the job summary and one manifest per
+/// result category.
+///
+/// Every manifest a finished job owes is written whatever it has to say in it, because a
+/// client reads a category's manifest to learn that the category is empty: an absent
+/// object says nothing, a zero-byte one says the job recorded nothing in that category.
 ///
 /// Rendered from the read itself, so every count is of what was really scanned, imported
 /// and refused, and every image set named is one this import brought into existence.
@@ -216,7 +259,7 @@ pub fn job_output_objects(
     read: &ImportPrefixRead,
     imported: &[ImportedImageSet],
     failure: Option<&str>,
-) -> Vec<(&'static str, &'static str, String)> {
+) -> Vec<(String, &'static str, String)> {
     let mut imported_keys: BTreeSet<&str> = BTreeSet::new();
     let mut success = String::new();
     for image_set in imported {
@@ -271,18 +314,31 @@ pub fn job_output_objects(
                 .collect::<Vec<_>>(),
         },
     });
-    let mut objects = vec![(
-        JOB_OUTPUT_MANIFEST_KEY,
-        JSON_MEDIA_TYPE,
-        summary.to_string(),
-    )];
-    // Each per-file manifest is written by the job that has such files and not by one that
-    // has none: an empty manifest states nothing the summary does not.
-    if !success.is_empty() {
-        objects.push((JOB_OUTPUT_SUCCESS_KEY, NDJSON_MEDIA_TYPE, success));
-    }
-    if !failures.is_empty() {
-        objects.push((JOB_OUTPUT_FAILURE_KEY, NDJSON_MEDIA_TYPE, failures));
+    let folder = job_folder(datastore_id, job_id);
+    let mut objects = vec![
+        // FIRST, and directly at the prefix the submit named: a job that cannot write
+        // there has nowhere to put the results that follow.
+        (
+            WRITE_ACCESS_CHECK_KEY.to_string(),
+            OCTET_STREAM_MEDIA_TYPE,
+            String::new(),
+        ),
+        (
+            format!("{folder}{JOB_OUTPUT_MANIFEST_KEY}"),
+            JSON_MEDIA_TYPE,
+            summary.to_string(),
+        ),
+    ];
+    // One object per result category, zero-byte for a category this job recorded nothing
+    // in. Nothing here imports an object with a reservation — an object is read as a DICOM
+    // P10 file and placed, or it is one of the failures above — so the WARNING category is
+    // the one that is always empty.
+    for (key, body) in [
+        (JOB_OUTPUT_SUCCESS_KEY, success),
+        (JOB_OUTPUT_FAILURE_KEY, failures),
+        (JOB_OUTPUT_WARNING_KEY, String::new()),
+    ] {
+        objects.push((format!("{folder}{key}"), NDJSON_MEDIA_TYPE, body));
     }
     objects
 }
@@ -454,7 +510,7 @@ async fn deliver<Eng: Send + Sync + 'static>(
         let put = client
             .put_object()
             .bucket(&claim.bucket)
-            .key(format!("{}{key}", claim.key_prefix))
+            .key(format!("{}{key}", claim.prefix))
             .content_type(*media_type)
             .body(::aws_sdk_s3::primitives::ByteStream::from(
                 body.clone().into_bytes(),
@@ -464,7 +520,7 @@ async fn deliver<Eng: Send + Sync + 'static>(
         if let Err(error) = put {
             ::tracing::warn!(
                 bucket = ?claim.bucket,
-                key = ?claim.key_prefix,
+                key = ?claim.prefix,
                 detail = %::aws_smithy_types::error::display::DisplayErrorContext(&error),
                 "a DICOM import job's output could not be written to its output prefix"
             );
