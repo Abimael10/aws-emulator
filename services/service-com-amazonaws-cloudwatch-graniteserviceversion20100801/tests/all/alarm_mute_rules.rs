@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! End-to-end cover for the CloudWatch alarm mute rule loop: `PutAlarmMuteRule` creating and
-//! updating a rule, and `GetAlarmMuteRule` reading back what it persisted — including the
+//! updating a rule, `GetAlarmMuteRule` reading back what it persisted — including the
 //! `Status` the clock makes of the rule's own schedule and the not-found a name no rule carries
-//! is refused with.
+//! is refused with — and `DeleteAlarmMuteRule` removing it, after which no read reports it.
 //!
 //! Every table row is a distinct input along what the rule under test generalises over (which
 //! expression form the schedule states its instants in, how long its window stays open, which
@@ -983,9 +983,9 @@ async fn a_listing_the_store_cannot_serve_is_refused() {
         );
     }
 
-    // A token this service did not mint names no page. Rows differ along how the token misses:
-    // text that is no token at all, a truncated one, and one naming a rule in a listing of
-    // another shape.
+    // A token this service cannot read a cursor out of names no rule of this listing left to
+    // report, which is the EMPTY final page rather than a refusal. Rows differ along how the
+    // token misses: text that is no token at all, a truncated one, and one with text appended.
     let minted = text(
         &ok(&router, "ListAlarmMuteRules", &json!({"MaxRecords": 1})).await,
         "NextToken",
@@ -1009,18 +1009,14 @@ async fn a_listing_the_store_cannot_serve_is_refused() {
         )
         .await;
         assert_eq!(
-            (status, error_code(&body).as_str()),
-            (400, "InvalidNextToken"),
-            "case {case:?}: expected HTTP 400 InvalidNextToken, got {status} with {body}"
-        );
-        let got = error_message(&body);
-        assert_eq!(
-            got, "Invalid NextToken",
-            "case {case:?}: expected the service's own sentence, got {got:?} in {body}"
+            (status, listed_arns(&body).as_slice(), body.get("NextToken")),
+            (200, [].as_slice(), None),
+            "case {case:?}: expected HTTP 200 with an empty page that ends the walk, \
+             got {status} with {body}"
         );
     }
 
-    // The rules the store holds are untouched by the refusals.
+    // The rules the store holds are untouched by those reads.
     let listed = ok(&router, "ListAlarmMuteRules", &json!({})).await;
     assert_eq!(
         listed_arns(&listed).len(),
@@ -1086,5 +1082,290 @@ async fn a_read_reports_the_zone_the_rules_windows_are_read_in() {
         read["Rule"]["Schedule"]["Timezone"].as_str(),
         Some("UTC"),
         "case \"an update naming no zone\": expected the default zone, got {read}"
+    );
+}
+
+#[tokio::test]
+async fn a_deleted_mute_rule_is_reported_by_no_read() {
+    // The rule: a resource this store no longer holds is reported by NO read of it — "Deletes a
+    // specific alarm mute rule." (`DeleteAlarmMuteRule`) — so once a rule is deleted its reader
+    // answers the not-found it models ("The named resource does not exist.",
+    // `ResourceNotFoundException`, HTTP 404) and the listing no longer carries it, whatever the
+    // rule was configured like.
+    //
+    // Rows differ along what the deleted rule was: which expression form its schedule states its
+    // instants in (and so the `MuteType` derived from it), which status the clock makes of it, and
+    // whether it targeted an alarm — so no shape of rule is deletable only by accident.
+    let router = build_router();
+    let now = Utc::now();
+    ok(&router, "PutMetricAlarm", &put_alarm("WebServerCPUAlarm")).await;
+
+    let cases: Vec<(&str, &str, Value)> = vec![
+        (
+            "a recurring rule muting nothing in particular",
+            "deleted-recurring",
+            put_request("deleted-recurring", "cron(0 2 * * *)", "PT4H"),
+        ),
+        (
+            "a one-time rule whose window is still to open",
+            "deleted-one-time",
+            with_members(
+                put_request(
+                    "deleted-one-time",
+                    &at_expression(now + TimeDelta::days(2), Tz::UTC),
+                    "PT1H",
+                ),
+                json!({"Rule": {"Schedule": schedule(
+                    &at_expression(now + TimeDelta::days(2), Tz::UTC),
+                    "PT1H",
+                    Some("UTC"),
+                )}}),
+            ),
+        ),
+        (
+            "a rule that targets an alarm",
+            "deleted-targeted",
+            with_members(
+                put_request("deleted-targeted", "cron(* * * * *)", "PT1H"),
+                json!({"MuteTargets": {"AlarmNames": ["WebServerCPUAlarm"]}}),
+            ),
+        ),
+        (
+            "a rule that has already expired",
+            "deleted-expired",
+            with_members(
+                put_request("deleted-expired", "cron(0 2 * * *)", "PT4H"),
+                json!({"ExpireDate": (now - TimeDelta::days(1)).timestamp()}),
+            ),
+        ),
+    ];
+
+    for (case, _, request) in &cases {
+        let (status, body) = call(&router, "PutAlarmMuteRule", request).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected the rule to be written, got {status} with {body}"
+        );
+    }
+
+    // One rule is deleted at a time, so each row also states that deleting a rule leaves every
+    // other rule of the store exactly where it was.
+    let mut left: Vec<&str> = cases.iter().map(|(_, name, _)| *name).collect();
+    for (case, name, _) in &cases {
+        let read = stored_rule(&router, name).await;
+        assert_eq!(
+            text(&read, "Name").as_deref(),
+            Some(*name),
+            "case {case:?}: the rule must read back before it is deleted, got {read}"
+        );
+
+        let (status, body) = call(
+            &router,
+            "DeleteAlarmMuteRule",
+            &json!({"AlarmMuteRuleName": name}),
+        )
+        .await;
+        assert_eq!(
+            (status, &body),
+            (200, &json!({})),
+            "case {case:?}: expected HTTP 200 and an empty body, got {status} with {body}"
+        );
+
+        let (status, body) = call(
+            &router,
+            "GetAlarmMuteRule",
+            &json!({"AlarmMuteRuleName": name}),
+        )
+        .await;
+        assert_eq!(
+            (status, error_code(&body).as_str()),
+            (404, "ResourceNotFoundException"),
+            "case {case:?}: expected HTTP 404 ResourceNotFoundException after the delete, \
+             got {status} with {body}"
+        );
+        // The class is answered by its code alone, the resource named by the two members that
+        // carry it, exactly as a name nothing was ever created under is.
+        assert_eq!(
+            (
+                body.get("ResourceType").and_then(Value::as_str),
+                body.get("ResourceId").and_then(Value::as_str),
+                body.get("Message").and_then(Value::as_str),
+            ),
+            (Some("AlarmMuteRule"), Some(*name), None),
+            "case {case:?}: expected the resource named and no message, got {body}"
+        );
+
+        left.retain(|held| held != name);
+        let listed = ok(&router, "ListAlarmMuteRules", &json!({})).await;
+        let mut expected: Vec<String> = left.iter().map(|held| rule_arn(REGION, held)).collect();
+        expected.sort();
+        assert_eq!(
+            listed_arns(&listed),
+            expected,
+            "case {case:?}: expected the listing to hold {left:?} and nothing else, got {listed}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn deleting_a_mute_rule_is_idempotent_and_reaches_only_its_own_region() {
+    // The rule: a delete asks for the ABSENCE of the rule the name identifies IN THE REGION the
+    // request was signed for — "This operation is idempotent. If you delete a mute rule that does
+    // not exist, the operation succeeds without returning an error."
+    // (`DeleteAlarmMuteRule`), and a mute rule's name "must be unique within your Amazon Web
+    // Services account and region" (`PutAlarmMuteRuleInput$Name`) — so a name already absent is a
+    // clean success and the same name in another Region is another rule.
+    let router = build_router();
+    for region in [REGION, OTHER_REGION] {
+        let (status, body) = call_in_region(
+            &router,
+            region,
+            "PutAlarmMuteRule",
+            &put_request("torn-down", "cron(0 2 * * *)", "PT4H"),
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {region:?}: expected the rule to be written, got {status} with {body}"
+        );
+    }
+
+    // Rows differ along what the delete names: a rule the Region holds, that same name again, a
+    // name nothing was ever created under, and one that differs from a held rule only in case.
+    let cases: Vec<(&str, &str)> = vec![
+        ("the rule this Region holds", "torn-down"),
+        ("the same name a second time", "torn-down"),
+        ("a name nothing was created under", "never-created"),
+        ("a held name in another case", "TORN-DOWN"),
+    ];
+    for (case, name) in cases {
+        let (status, body) = call(
+            &router,
+            "DeleteAlarmMuteRule",
+            &json!({"AlarmMuteRuleName": name}),
+        )
+        .await;
+        assert_eq!(
+            (status, &body),
+            (200, &json!({})),
+            "case {case:?}: expected HTTP 200 and an empty body, got {status} with {body}"
+        );
+        let (status, body) = call(
+            &router,
+            "GetAlarmMuteRule",
+            &json!({"AlarmMuteRuleName": name}),
+        )
+        .await;
+        assert_eq!(
+            (status, error_code(&body).as_str()),
+            (404, "ResourceNotFoundException"),
+            "case {case:?}: expected the name to hold no rule afterwards, got {status} with {body}"
+        );
+    }
+
+    // The other Region's rule of that name is untouched: it still reads back, and it is still the
+    // only rule of that Region's listing.
+    let (status, read) = call_in_region(
+        &router,
+        OTHER_REGION,
+        "GetAlarmMuteRule",
+        &json!({"AlarmMuteRuleName": "torn-down"}),
+    )
+    .await;
+    assert_eq!(
+        (status, text(&read, "AlarmMuteRuleArn").as_deref()),
+        (200, Some(rule_arn(OTHER_REGION, "torn-down").as_str())),
+        "case \"the other Region's rule\": expected it untouched, got {status} with {read}"
+    );
+    let listed = call_in_region(&router, OTHER_REGION, "ListAlarmMuteRules", &json!({}))
+        .await
+        .1;
+    assert_eq!(
+        listed_arns(&listed),
+        vec![rule_arn(OTHER_REGION, "torn-down")],
+        "case \"the other Region's listing\": expected only that Region's rule, got {listed}"
+    );
+}
+
+#[tokio::test]
+async fn a_next_token_this_listing_cannot_resume_from_ends_the_walk() {
+    // The rule: a `NextToken` names a POSITION in the enumeration — "The token returned from a
+    // previous call to indicate where to continue retrieving results."
+    // (`ListAlarmMuteRulesInput$NextToken`) — and one this listing cannot read a cursor out of
+    // names no rule it holds left to report, which is the EMPTY page that ENDS a walk ("If this
+    // field is absent, there are no more results to retrieve.",
+    // `ListAlarmMuteRulesOutput$NextToken`), not a refusal that aborts it.
+    //
+    // Rows differ along the FORM of the value offered: no token at all, the empty string, a token
+    // this listing minted, and four shapes of value it cannot read a cursor out of (text that is
+    // no token, an opaque base64 blob of the kind another service's cursor travels in, a blob
+    // whose bytes are no text at all, and a truncated cursor).
+    let router = build_router();
+    let held: Vec<&str> = vec!["walk-rule-a", "walk-rule-b", "walk-rule-c"];
+    for name in &held {
+        ok(
+            &router,
+            "PutAlarmMuteRule",
+            &put_request(name, "cron(0 2 * * *)", "PT4H"),
+        )
+        .await;
+    }
+    let every_rule: Vec<String> = held.iter().map(|name| rule_arn(REGION, name)).collect();
+
+    // The cursor this listing mints for the second page, taken from a page of one.
+    let minted = text(
+        &ok(&router, "ListAlarmMuteRules", &json!({"MaxRecords": 1})).await,
+        "NextToken",
+    )
+    .unwrap_or_default();
+    let truncated = minted
+        .get(..minted.len().saturating_sub(1))
+        .unwrap_or_default()
+        .to_string();
+
+    let cases: Vec<(&str, Option<String>, Vec<String>)> = vec![
+        ("no token at all", None, every_rule.clone()),
+        ("the empty string", Some(String::new()), every_rule.clone()),
+        (
+            "the cursor this listing minted",
+            Some(minted.clone()),
+            every_rule.get(1..).unwrap_or_default().to_vec(),
+        ),
+        ("text that is no cursor", Some("not-a-token".to_string()), vec![]),
+        (
+            "an opaque blob of another service's form",
+            Some("eyJuZXh0Ijoibm90aGluZyJ9".to_string()),
+            vec![],
+        ),
+        ("a blob whose bytes are no text", Some("AAAA".to_string()), vec![]),
+        ("a minted cursor truncated", Some(truncated), vec![]),
+    ];
+
+    for (case, token, expected) in cases {
+        let request = match token.as_deref() {
+            None => json!({}),
+            Some(token) => json!({"NextToken": token}),
+        };
+        let (status, body) = call(&router, "ListAlarmMuteRules", &request).await;
+        assert_eq!(
+            (status, listed_arns(&body)),
+            (200, expected.clone()),
+            "case {case:?}: expected HTTP 200 with {expected:?}, got {status} with {body}"
+        );
+        if expected.is_empty() {
+            assert!(
+                body.get("NextToken").is_none(),
+                "case {case:?}: an empty page has no page after it, so no token is owed, \
+                 got {body}"
+            );
+        }
+    }
+
+    // None of those readings removed a rule: the store still holds every one of them.
+    let listed = ok(&router, "ListAlarmMuteRules", &json!({})).await;
+    assert_eq!(
+        listed_arns(&listed),
+        every_rule,
+        "case \"after the walk\": expected every stored rule, got {listed}"
     );
 }

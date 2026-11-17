@@ -2631,15 +2631,15 @@ pub fn resumable_page(token: Option<&str>) -> Option<String> {
 /// is what tells a caller which of the tokens it is holding was not accepted — so the sentence is
 /// built from the request rather than written out per operation.
 ///
-/// WHICH listings state it this way is a property of the operation, and two of this service's
-/// listings state the same class WITHOUT the token: the metric-stream listing and the alarm mute
-/// rule listing each carry the bare sentence their own recordings show
-/// (`crate::ops::list_metric_streams`, `crate::ops::list_alarm_mute_rules`), the
-/// Contributor Insights listings their coded one
-/// ([`insight_rule_records::invalid_page_token_message`]), and the alarm listing none at all
-/// because it serves the first page instead ([`resumable_page`]). So this is the sentence of
-/// the reads recorded quoting the token — the alarm HISTORY listing and the alarm CONTRIBUTOR
-/// read (`crate::ops::describe_alarm_contributors`) — not a fourth wording of one class.
+/// WHICH listings state it this way is a property of the operation, and one of this service's
+/// listings states the same class WITHOUT the token: the metric-stream listing carries the bare
+/// sentence its own recordings show (`crate::ops::list_metric_streams`), the Contributor Insights
+/// listings their coded one ([`insight_rule_records::invalid_page_token_message`]), and two reads
+/// refuse such a token not at all because they serve a page instead: the alarm listing the first
+/// page ([`resumable_page`]) and the alarm mute rule listing the empty page that ends a walk
+/// (`crate::ops::list_alarm_mute_rules`). So this is the sentence of the reads recorded quoting
+/// the token — the alarm HISTORY listing and the alarm CONTRIBUTOR read
+/// (`crate::ops::describe_alarm_contributors`) — not a fourth wording of one class.
 #[must_use]
 pub fn invalid_next_token_message(token: &str) -> String {
     format!("{INVALID_NEXT_TOKEN}{token}")

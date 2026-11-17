@@ -348,9 +348,9 @@ async fn listing_the_rules_changes_nothing_a_later_caller_sees() {
         ("filtered by status", json!({"Statuses": ["ACTIVE"]}), 200),
         ("a page of one", json!({"MaxRecords": 1}), 200),
         (
-            "a token that is not one",
+            "a token this listing cannot resume from",
             json!({"NextToken": "not-a-token"}),
-            400,
+            200,
         ),
         (
             "an alarm name nothing was created under",
