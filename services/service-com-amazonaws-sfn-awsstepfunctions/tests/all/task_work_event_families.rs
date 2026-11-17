@@ -29,10 +29,30 @@
 //! state's input means the work was never submitted, so the state records no lifecycle
 //! event for it at all and the execution fails on the state it was entered at.
 //!
+//! RULE: what each family's OUTCOME event reports is the result that form of `Resource`
+//! gives its state: a `Resource` naming the function reports the document the function
+//! RETURNED, bare, because the members around it on the wire — the status the call
+//! answered with, the version that ran — are facts of the API call and not of the
+//! function's output; the optimized integration's result is that call's own SDK response,
+//! which carries the returned document under its payload member beside those facts. So
+//! one execution naming the SAME function both ways reports two different results, each
+//! under its own family's succeeded event.
+//!
+//! RULE: an attempt is recorded per attempt. A `Retry` whose `ErrorEquals` names the
+//! class of the failure the work reported re-does the work, so the family writes its
+//! hand-over, start and failure once per attempt — `MaxAttempts` of them beside the first
+//! — and never an outcome event of the other kind; a retrier naming a class the failure
+//! is not leaves the state at one attempt. Once the attempts are spent the state's
+//! `Catch` routes the execution to its own `Next`, whose state then decides the
+//! execution's output, so the error document the work produced is never what the
+//! execution puts out.
+//!
 //! The rows differ along what the rule generalises over: the form of the `Resource` (a
 //! bare function ARN and the optimized `arn:aws:states:::lambda:invoke` integration, plus
 //! a non-Lambda integration), the outcome of the work (the function returned, the
-//! function raised), and whether the work was handed over at all.
+//! function raised), whether the work was handed over at all, the JSON type the function
+//! returned, and what a retrier names beside how many attempts it allows and the rate it
+//! grows its interval by.
 //!
 //! The harness (`Chain`, `given_function_of`, `ran`, `sfn`) is the one
 //! `lambda_task_control_flow` builds for the same two services; `tests/all.rs` is this
@@ -587,4 +607,401 @@ async fn each_lifecycle_transition_is_its_own_event_and_a_redrive_continues_the_
         "case {case:?}: expected the reverse order to be the same events read from the end, got \
          {reversed:?}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// What each family's OUTCOME event reports, for the two forms over one function
+// ---------------------------------------------------------------------------
+
+/// The handler the two-form rows invoke: what it RETURNS is decided by the `shape` its
+/// event carries, and the object form carries that event back inside the value it answers
+/// with, so each form's result is this run's own rather than anything fixed here.
+/// [`shaped`] is this handler in Rust, so a row's expectation is what the handler computes
+/// for the event that form handed it.
+const SHAPING_HANDLER: &str = r#"
+def handler(event, context):
+    shape = event.get("shape", "object")
+    tag = event.get("tag")
+    if shape == "list":
+        return [tag, 7]
+    if shape == "number":
+        return 7
+    if shape == "text":
+        return "seven for %s" % tag
+    if shape == "empty":
+        return {}
+    return {"tag": tag, "seven": 7, "saw": event}
+"#;
+
+/// What [`SHAPING_HANDLER`] returns for `event`, as the handler computes it.
+fn shaped(event: &Value) -> Value {
+    let tag = event.get("tag").cloned().unwrap_or(Value::Null);
+    match event
+        .get("shape")
+        .and_then(Value::as_str)
+        .unwrap_or("object")
+    {
+        "list" => json!([tag, 7]),
+        "number" => json!(7),
+        "text" => json!(format!("seven for {}", tag.as_str().unwrap_or_default())),
+        "empty" => json!({}),
+        _ => json!({ "tag": tag, "seven": 7, "saw": event }),
+    }
+}
+
+/// The members the invocation's own SDK response carries the returned document and the
+/// facts of the CALL under (`smithy_query(query="operation",operation="Invoke")` of the
+/// Lambda model: `Payload`, `StatusCode`, `ExecutedVersion`).
+const PAYLOAD_MEMBER: &str = "Payload";
+/// See [`PAYLOAD_MEMBER`].
+const STATUS_CODE_MEMBER: &str = "StatusCode";
+/// See [`PAYLOAD_MEMBER`].
+const EXECUTED_VERSION_MEMBER: &str = "ExecutedVersion";
+
+/// The status a served `RequestResponse` invocation answers with (`Invoke`'s
+/// `StatusCode`: "For the `RequestResponse` invocation type, this status code is 200").
+const SERVED_STATUS: u64 = 200;
+
+/// The version an UNQUALIFIED invocation runs, which that response names
+/// (`FunctionConfiguration$Version`: "the version of the Lambda function", `$LATEST` for
+/// the unpublished one).
+const UNQUALIFIED_VERSION: &str = "$LATEST";
+
+/// The JSON document the detail member `member` carries as text.
+fn document(detail: &Value, member: &str, case: &str) -> Value {
+    let text = detail
+        .get(member)
+        .and_then(Value::as_str)
+        .unwrap_or_else(|| panic!("case {case:?}: expected {member} on {detail}"));
+    serde_json::from_str(text).unwrap_or_else(|error| {
+        panic!("case {case:?}: expected {member} to carry a JSON document, got {error} for {text:?}")
+    })
+}
+
+/// A definition that invokes the SAME function twice, once in each form: the state's own
+/// `Resource` first, then the optimized integration, which is handed `optimized_event` as
+/// the function's event.
+fn two_form_definition(function: &str, optimized_event: &Value) -> Value {
+    json!({
+        "StartAt": "Direct",
+        "States": {
+            "Direct": { "Type": "Task", "Resource": function, "Next": "Optimized" },
+            "Optimized": {
+                "Type": "Task",
+                "Resource": "arn:aws:states:::lambda:invoke",
+                "Parameters": { "FunctionName": function, "Payload": optimized_event },
+                "End": true,
+            },
+        },
+    })
+}
+
+/// Each form's own family reports the result that form gives its state: the function's
+/// document bare under `LambdaFunctionSucceeded`, and the invocation's SDK response —
+/// that same document under its payload member, beside the status and the version the
+/// call answered with — under `TaskSucceeded`.
+///
+/// The rows differ along the JSON type the function returned, which is what pins the
+/// difference to the FORM rather than to the shape of one answer.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn each_form_of_one_function_reports_its_own_result_in_its_own_family() {
+    let chain = Chain::new();
+    let function = chain
+        .given_function_of("shaping", SHAPING_HANDLER, None)
+        .await;
+
+    for (index, shape) in ["object", "list", "number", "text", "empty"]
+        .into_iter()
+        .enumerate()
+    {
+        let case = format!("a function returning a {shape} document");
+        let case = case.as_str();
+        let direct_event = json!({ "shape": shape, "tag": "direct" });
+        let optimized_event = json!({ "shape": shape, "tag": "optimized" });
+        let described = chain
+            .ran(
+                case,
+                &format!("two-forms-{index}"),
+                &two_form_definition(&function, &optimized_event),
+                &direct_event,
+            )
+            .await;
+        assert_eq!(
+            described.get("status").and_then(Value::as_str),
+            Some("SUCCEEDED"),
+            "case {case:?}: expected both invocations to answer, got {described}"
+        );
+        let events = history(
+            &chain,
+            case,
+            &string(&described, "executionArn"),
+            json!({ "maxResults": 200 }),
+        )
+        .await;
+
+        // The state whose `Resource` named the function: its family's outcome event
+        // carries what the function RETURNED, bare — none of the members the call itself
+        // answered with sits in it.
+        let succeeded = detail(
+            &events,
+            "LambdaFunctionSucceeded",
+            "lambdaFunctionSucceededEventDetails",
+            case,
+        );
+        let returned = document(&succeeded, "output", case);
+        let expected = shaped(&direct_event);
+        assert_eq!(
+            returned, expected,
+            "case {case:?}: expected the function's own document {expected}, got {returned}"
+        );
+        for member in [PAYLOAD_MEMBER, STATUS_CODE_MEMBER, EXECUTED_VERSION_MEMBER] {
+            assert!(
+                returned.get(member).is_none(),
+                "case {case:?}: expected no {member} around the bare document, got {returned}"
+            );
+        }
+
+        // The state that asked for the optimized integration: its family's outcome event
+        // carries the invocation's SDK response, whose payload member is the document the
+        // function returned for the event THAT state handed it.
+        let task_succeeded = detail(&events, "TaskSucceeded", "taskSucceededEventDetails", case);
+        let envelope = document(&task_succeeded, "output", case);
+        let through_the_envelope = shaped(&optimized_event);
+        assert_eq!(
+            envelope.get(PAYLOAD_MEMBER),
+            Some(&through_the_envelope),
+            "case {case:?}: expected {through_the_envelope} under {PAYLOAD_MEMBER}, got {envelope}"
+        );
+        assert_eq!(
+            envelope.get(STATUS_CODE_MEMBER).and_then(Value::as_u64),
+            Some(SERVED_STATUS),
+            "case {case:?}: expected {STATUS_CODE_MEMBER} {SERVED_STATUS}, got {envelope}"
+        );
+        assert_eq!(
+            envelope
+                .get(EXECUTED_VERSION_MEMBER)
+                .and_then(Value::as_str),
+            Some(UNQUALIFIED_VERSION),
+            "case {case:?}: expected {EXECUTED_VERSION_MEMBER} {UNQUALIFIED_VERSION}, got \
+             {envelope}"
+        );
+        // The two forms really did report different results for the same function, which
+        // is what a client reading the history sees.
+        assert_ne!(
+            returned.get(PAYLOAD_MEMBER).is_some(),
+            envelope.get(PAYLOAD_MEMBER).is_some(),
+            "case {case:?}: expected the bare document and the envelope to differ, got \
+             {returned} and {envelope}"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// One triple of the family's events per ATTEMPT, and where the Catch routes
+// ---------------------------------------------------------------------------
+
+/// The state a row's catcher routes to, and the `Result` that state carries: what the
+/// execution puts out once the catcher took the failure over, which is the handling
+/// state's own document rather than anything the failed work produced.
+const RECOVERED_STATE: &str = "Recovered";
+
+/// See [`RECOVERED_STATE`].
+fn recovered_result() -> Value {
+    json!({ "recovered": true, "by": RECOVERED_STATE })
+}
+
+/// The wildcard the Amazon States Language documents for the class of failure a unit of
+/// work reports: "States.TaskFailed […] matches any known error name except
+/// States.Timeout".
+const TASK_FAILED_WILDCARD: &str = "States.TaskFailed";
+
+/// The class a retrier names in the row whose failure is NOT of it: the language's own
+/// timeout error, which is what a bound that ran out reports and never what a handler
+/// that raised reports.
+const TIMEOUT_ERROR: &str = "States.Timeout";
+
+/// One row: what the retrier names, how many further attempts it allows, the rate it
+/// grows its interval by, and how many attempts the state therefore makes.
+struct Retried {
+    case: &'static str,
+    retry_on: &'static str,
+    max_attempts: u64,
+    backoff_rate: f64,
+    attempts: usize,
+}
+
+/// A definition whose one `Task` state invokes `function` through its own ARN, retries as
+/// `row` asks and routes every failure it could not retry away to [`RECOVERED_STATE`].
+fn retried_definition(function: &str, row: &Retried) -> Value {
+    json!({
+        "StartAt": "Work",
+        "States": {
+            "Work": {
+                "Type": "Task",
+                "Resource": function,
+                "Retry": [{
+                    "ErrorEquals": [row.retry_on],
+                    "IntervalSeconds": 1,
+                    "BackoffRate": row.backoff_rate,
+                    "MaxAttempts": row.max_attempts,
+                }],
+                "Catch": [{ "ErrorEquals": ["States.ALL"], "Next": RECOVERED_STATE }],
+                "End": true,
+            },
+            RECOVERED_STATE: { "Type": "Pass", "Result": recovered_result(), "End": true },
+        },
+    })
+}
+
+/// Every detail of type `event_type` the history carries, in the order they happened.
+fn details(events: &[Value], event_type: &str, member: &str, case: &str) -> Vec<Value> {
+    events
+        .iter()
+        .filter(|event| event.get("type").and_then(Value::as_str) == Some(event_type))
+        .map(|event| {
+            event
+                .get(member)
+                .cloned()
+                .unwrap_or_else(|| panic!("case {case:?}: expected {member} on {event}"))
+        })
+        .collect()
+}
+
+/// A handler that raised fails the task, so the state's `Retry` re-does the work — one
+/// triple of the family's events per attempt, never an outcome of the other kind — and
+/// its `Catch` routes the execution to the handling state, whose own result is what the
+/// execution puts out.
+///
+/// The rows differ along what the retrier names (the language's wildcard for a failed unit
+/// of work, the class the run itself reported, and a class this failure is not), how many
+/// further attempts it allows and the rate it grows its interval by.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_retried_invocation_writes_its_family_s_events_once_per_attempt() {
+    let chain = Chain::new();
+    let function = chain
+        .given_function_of("retried-raiser", HANDLER_SOURCE, None)
+        .await;
+
+    let rows = [
+        Retried {
+            case: "the wildcard for a failed unit of work, retried twice with a growing interval",
+            retry_on: TASK_FAILED_WILDCARD,
+            max_attempts: 2,
+            backoff_rate: 2.0,
+            attempts: 3,
+        },
+        Retried {
+            case: "the class the run itself reported, retried once",
+            retry_on: RAISED_ERROR_TYPE,
+            max_attempts: 1,
+            backoff_rate: 1.5,
+            attempts: 2,
+        },
+        Retried {
+            case: "a class this failure is not, which leaves the state at one attempt",
+            retry_on: TIMEOUT_ERROR,
+            max_attempts: 3,
+            backoff_rate: 1.0,
+            attempts: 1,
+        },
+    ];
+
+    for (index, row) in rows.iter().enumerate() {
+        let case = row.case;
+        let described = chain
+            .ran(
+                case,
+                &format!("retried-{index}"),
+                &retried_definition(&function, row),
+                &json!({ "orderId": format!("o-{index}"), "mode": "raise" }),
+            )
+            .await;
+        // The catcher took the failure over, so the execution reached the handling state
+        // and put out THAT state's result — not the error document the run produced, and
+        // not an invocation's response.
+        assert_eq!(
+            described.get("status").and_then(Value::as_str),
+            Some("SUCCEEDED"),
+            "case {case:?}: expected the catcher to route the execution, got {described}"
+        );
+        let output = document(&described, "output", case);
+        assert_eq!(
+            output,
+            recovered_result(),
+            "case {case:?}: expected the handling state's own result, got {output}"
+        );
+
+        let events = history(
+            &chain,
+            case,
+            &string(&described, "executionArn"),
+            json!({ "maxResults": 200 }),
+        )
+        .await;
+        let present = event_types(&events);
+        // One triple of the family's own events per attempt, and no outcome event of the
+        // other kind whatever the work turned out to be.
+        for event_type in [
+            "LambdaFunctionScheduled",
+            "LambdaFunctionStarted",
+            "LambdaFunctionFailed",
+        ] {
+            assert_eq!(
+                positions(&events, event_type).len(),
+                row.attempts,
+                "case {case:?}: expected {} {event_type} events, got {present:?}",
+                row.attempts
+            );
+        }
+        for event_type in [
+            "LambdaFunctionSucceeded",
+            "TaskScheduled",
+            "TaskStarted",
+            "TaskFailed",
+            "TaskSucceeded",
+        ] {
+            assert_eq!(
+                positions(&events, event_type).len(),
+                0,
+                "case {case:?}: expected no {event_type} events, got {present:?}"
+            );
+        }
+        // Each attempt's failure carries the error document that run produced: the class
+        // it raised, and the message it built from this execution's own input.
+        for failed in details(
+            &events,
+            "LambdaFunctionFailed",
+            "lambdaFunctionFailedEventDetails",
+            case,
+        ) {
+            assert_eq!(
+                failed.get("error").and_then(Value::as_str),
+                Some(RAISED_ERROR_TYPE),
+                "case {case:?}: expected the failure to name {RAISED_ERROR_TYPE}, got {failed}"
+            );
+            let reported = document(&failed, "cause", case);
+            assert_eq!(
+                reported.get("errorType").and_then(Value::as_str),
+                Some(RAISED_ERROR_TYPE),
+                "case {case:?}: expected the run's own error document, got {reported}"
+            );
+            assert_eq!(
+                reported.get("errorMessage").and_then(Value::as_str),
+                Some(format!("order o-{index} cannot be processed").as_str()),
+                "case {case:?}: expected the message the handler built, got {reported}"
+            );
+        }
+        // And the execution ended at the handling state, which is where the catcher sent
+        // it rather than under the failure.
+        assert_eq!(
+            positions(&events, "PassStateEntered").len(),
+            1,
+            "case {case:?}: expected the handling state to be entered once, got {present:?}"
+        );
+        assert_eq!(
+            positions(&events, "ExecutionFailed").len(),
+            0,
+            "case {case:?}: expected no failure for the execution, got {present:?}"
+        );
+    }
 }

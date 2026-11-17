@@ -19,12 +19,19 @@
 //! 2. a document a state built ITSELF past that bound carries the same sentence naming
 //!    THAT state, wherever the service reports it — the execution's own cause where the
 //!    failure ended the execution, and the error output a catcher of that state was
-//!    handed where it took the failure over.
+//!    handed where it took the failure over;
+//! 3. the work a `Task` state's own `Resource` names is what that sentence names, so a
+//!    state whose `Resource` is a Lambda FUNCTION's ARN — whose unit of work is one
+//!    invocation and whose result is the document the function returned — names that
+//!    function's ARN, under its own family's failure event; and a result of exactly the
+//!    bytes a state's output may carry is inside the bound, so only one past it is
+//!    refused.
 //!
 //! Each table's rows differ along what its rule generalises over: which service answered
 //! the oversize result, which ACTION of that service was called and what the calling
-//! state is NAMED (rule 1), and which state type built the document and whether that
-//! state declares a `Catch` (rule 2).
+//! state is NAMED (rule 1), which state type built the document and whether that
+//! state declares a `Catch` (rule 2), and which function the invocation ran beside how
+//! many bytes that run returned (rule 3).
 //!
 //! The harness is `crate::map_result_writer`'s `Chain`, as
 //! `crate::s3_sdk_task_object_lifecycle` uses it: `tests/all.rs` is this binary's crate
@@ -34,7 +41,9 @@ use serde_json::{json, Map, Value};
 
 use service_com_amazonaws_sfn_awsstepfunctions::state::asl::{DATA_LIMIT_ERROR, MAX_PAYLOAD_BYTES};
 
+use crate::lambda_task_control_flow::Chain as LambdaChain;
 use crate::map_result_writer::{every_action, Chain, BUCKET};
+use crate::state_machine_lifecycle::string;
 
 /// What the service states about a result larger than a state's output may carry:
 /// RECORDED text, with the work that produced it named in it.
@@ -436,5 +445,173 @@ async fn a_document_a_state_built_past_the_bound_names_that_state_wherever_it_is
             "case {case:?}: expected the quota sentence naming {state:?} (catching: \
              {catching}), got {described:?}"
         );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Rule 3: an oversize INVOCATION result names the function the Resource named
+// ---------------------------------------------------------------------------
+
+/// The handler the rows below invoke: it returns a document whose one member is as many
+/// bytes as the EVENT asks for, so what sits inside the bound or past it is the size this
+/// row asked that run to produce rather than anything fixed here.
+const SIZING_HANDLER: &str = r#"
+def handler(event, context):
+    return {"blob": "p" * int(event["bytes"])}
+"#;
+
+/// What that document costs AROUND the blob itself, in the compact JSON text the bound is
+/// measured over: `{"blob":"` before it and `"}` after it.
+const AROUND_THE_BLOB: usize = r#"{"blob":""}"#.len();
+
+/// How long one of those invocations is given, as the function's own `Timeout`: well past
+/// what building one string needs on any host, because what is under test is the
+/// diagnosis of the document it returned and not how fast an interpreter builds it.
+const SIZING_TIMEOUT_SECONDS: u64 = 120;
+
+/// The events of one execution of a [`LambdaChain`], in the order the history reports
+/// them.
+async fn invocation_events(chain: &LambdaChain, case: &str, execution_arn: &str) -> Vec<Value> {
+    let answered = chain
+        .sfn(
+            case,
+            "GetExecutionHistory",
+            &json!({ "executionArn": execution_arn, "maxResults": 200 }),
+        )
+        .await;
+    answered
+        .get("events")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_else(|| panic!("case {case:?}: expected a history, got {answered:?}"))
+}
+
+/// A `Task` state whose `Resource` is the ARN of a Lambda function reports the document
+/// that function returned, so a run that returned a document past what a state's output
+/// may carry fails with the quota sentence naming THAT FUNCTION — repeated by its own
+/// family's failure event — while a run that returned exactly the bytes a state's output
+/// may carry is a result the state reports.
+///
+/// The rows differ along which function the invocation ran, which is the sentence's one
+/// variable part, and along how many bytes that run returned: exactly the bound, one byte
+/// past it, and far past it — the two refused rows reporting the identical sentence,
+/// which is what pins the observed size out of it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_oversize_invocation_result_names_the_function_the_resource_named() {
+    let chain = LambdaChain::new();
+    let first = chain
+        .given_function_of("oversize-first", SIZING_HANDLER, Some(SIZING_TIMEOUT_SECONDS))
+        .await;
+    let second = chain
+        .given_function_of(
+            "oversize-second",
+            SIZING_HANDLER,
+            Some(SIZING_TIMEOUT_SECONDS),
+        )
+        .await;
+
+    // (case, the function invoked, the bytes its run returns, whether the result is refused)
+    let rows: &[(&str, &str, usize, bool)] = &[
+        (
+            "a document of exactly the bytes a state's output may carry",
+            &first,
+            MAX_PAYLOAD_BYTES - AROUND_THE_BLOB,
+            false,
+        ),
+        (
+            "the same document, one byte past the bound",
+            &first,
+            MAX_PAYLOAD_BYTES - AROUND_THE_BLOB + 1,
+            true,
+        ),
+        (
+            "far past the bound, from another function",
+            &second,
+            MAX_PAYLOAD_BYTES + 50_000,
+            true,
+        ),
+    ];
+
+    for (index, (case, function, bytes, refused)) in rows.iter().enumerate() {
+        let definition = json!({
+            "StartAt": "Invoke",
+            "States": { "Invoke": { "Type": "Task", "Resource": function, "End": true } },
+        });
+        let described = chain
+            .ran(
+                case,
+                &format!("oversize-invocation-{index}"),
+                &definition,
+                &json!({ "bytes": bytes }),
+            )
+            .await;
+        let events = invocation_events(&chain, case, &string(&described, "executionArn")).await;
+        let present = event_types(&events);
+
+        if *refused {
+            let expected = too_large(function);
+            assert_eq!(
+                described.get("status").and_then(Value::as_str),
+                Some("FAILED"),
+                "case {case:?}: expected FAILED, got {described:?}"
+            );
+            assert_eq!(
+                failure(&described),
+                (Some(DATA_LIMIT_ERROR), Some(expected.as_str())),
+                "case {case:?}: expected the quota sentence naming {function:?}, got {described:?}"
+            );
+            // The family of the state's own work repeats that error and that cause, which
+            // is where a client reading the history reads them.
+            let failed = only_detail(
+                &events,
+                "LambdaFunctionFailed",
+                "lambdaFunctionFailedEventDetails",
+                case,
+            );
+            assert_eq!(
+                failure(&failed),
+                (Some(DATA_LIMIT_ERROR), Some(expected.as_str())),
+                "case {case:?}: expected the invocation's failure to carry the quota sentence, \
+                 got {failed:?}"
+            );
+            // Nothing succeeded for the state: the document never became its output.
+            assert_eq!(
+                present
+                    .iter()
+                    .filter(|kind| **kind == "LambdaFunctionSucceeded"
+                        || **kind == "TaskStateExited")
+                    .count(),
+                0,
+                "case {case:?}: expected no success for the state, got {present:?}"
+            );
+        } else {
+            assert_eq!(
+                described.get("status").and_then(Value::as_str),
+                Some("SUCCEEDED"),
+                "case {case:?}: expected a document on the bound to be a result, got \
+                 {described:?}"
+            );
+            let output = described
+                .get("output")
+                .and_then(Value::as_str)
+                .unwrap_or_else(|| panic!("case {case:?}: expected an output, got {described:?}"));
+            assert_eq!(
+                output.len(),
+                MAX_PAYLOAD_BYTES,
+                "case {case:?}: expected the run's document to sit exactly on the bound, got \
+                 {} bytes",
+                output.len()
+            );
+            assert_eq!(
+                serde_json::from_str::<Value>(output)
+                    .unwrap_or_else(|error| panic!("case {case:?}: the output is JSON: {error}"))
+                    .get("blob")
+                    .and_then(Value::as_str)
+                    .map(str::len),
+                Some(*bytes),
+                "case {case:?}: expected the blob the run built, got {} bytes of output",
+                output.len()
+            );
+        }
     }
 }
