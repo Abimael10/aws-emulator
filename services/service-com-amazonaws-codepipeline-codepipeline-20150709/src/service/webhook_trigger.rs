@@ -72,10 +72,7 @@ use std::time::SystemTime;
 
 use aws_smithy_runtime_api::http::{Request as RtRequest, Response as RtResponse, StatusCode};
 use aws_smithy_types::body::SdkBody;
-use service_common::data_plane_addressing::{
-    first_segment, reached_emulator_endpoint, served_endpoint_authority, url_authority,
-    EMULATOR_PATH_NAMESPACE,
-};
+use service_common::data_plane_addressing::{first_segment, EMULATOR_PATH_NAMESPACE};
 use smithy_server_runtime::{http, BoxFuture, ErasedOperation, OperationContext, Service};
 
 use crate::ops::types::{PipelineDeclaration, WebhookDefinition};
@@ -211,37 +208,16 @@ pub fn trigger_url(authority: &str, region: &str, token: &str) -> String {
 /// The trigger URL this service PUBLISHES for a webhook defined in `region`, resolved once
 /// when the webhook is created and stored, so every later read reports the same value.
 ///
-/// The address is the one this emulator is reached at, in the order every data plane served
-/// at the front door announces one in:
-///
-/// * the EMULATOR'S OWN endpoint the defining request addressed
-///   (`service_common::data_plane_addressing::reached_emulator_endpoint`) comes from a client
-///   that resolves nothing else, so the URL is published there;
-/// * a webhook defined through any other request on an emulator that IS served on a port
-///   (`served_endpoint_authority`) is published on that port, the one address this process
-///   answers on, so a webhook minted by an in-process call of another service publishes an
-///   address its caller can reach too;
-/// * an emulator served on no port at all has one base to name, the one
-///   `OperationContext::endpoint` reports for it, and the URL is published there — a host
-///   nothing resolves, which is the truth about an emulator that serves no port, rather than
-///   an AWS hostname this emulator does not answer on.
+/// The address is the one this emulator is reached at, read the way every URL this service
+/// announces reads it (`crate::state::announced_address`), so a webhook minted by an
+/// in-process call of another service and an action's deep link name the same host.
 #[must_use]
 pub fn announced_trigger_url(
     ctx: &OperationContext<'_>,
     region: &str,
     token: &str,
 ) -> String {
-    let base = ctx.endpoint();
-    let authority = reached_emulator_endpoint(
-        &ctx.parts().uri.to_string(),
-        ctx.parts()
-            .headers
-            .get(::http::header::HOST)
-            .and_then(|host| host.to_str().ok()),
-    )
-    .or_else(|| served_endpoint_authority(base.as_str()))
-    .unwrap_or_else(|| url_authority(base.as_str()).trim_end_matches('/').to_string());
-    trigger_url(&authority, region, token)
+    trigger_url(&crate::state::announced_authority(ctx), region, token)
 }
 
 /// Which webhook a trigger request addresses: the Region its URL was minted in and the

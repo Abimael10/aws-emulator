@@ -288,6 +288,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 if approved { "Succeeded" } else { "Failed" }.to_string(),
             );
             action.summary = Some(input.result.summary.clone());
+            // `ActionExecutionResult$externalExecutionId` is "the action provider's
+            // external ID for the action execution". The provider of a manual approval is
+            // this service's own approval record, and that record IS this action
+            // execution: its id is the id the provider names the decision by, so a client
+            // correlating the run with the provider side has the handle every other
+            // provider's run reports (a source provider's revision, an invoked run's id).
+            action.external_execution_id = Some(action.action_execution_id.clone());
             // `ActionExecution$lastUpdatedBy` is "the ARN of the user who last changed
             // the pipeline": the identity that ANSWERED this approval, which is the
             // principal this request speaks for.

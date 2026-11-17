@@ -2424,6 +2424,12 @@ async fn bounded_object_bytes(
     Ok(collected.freeze())
 }
 
+/// The fixed words the Amazon S3 source provider's summary for an action execution
+/// begins with, before the version of the object it delivered
+/// (`ActionExecutionResult$externalExecutionSummary` is "the action provider's summary for
+/// the action execution"; `ActionExecution$summary` reports the same text).
+const S3_SOURCE_SUMMARY_PREFIX: &str = "Amazon S3 version id: ";
+
 /// Read the source object and write it into the artifact store.
 async fn run_source(
     client: &::aws_sdk_s3::Client,
@@ -2503,13 +2509,26 @@ async fn run_source(
     if let Some(etag) = &etag {
         variables.insert("ETag".to_string(), etag.clone());
     }
+    // The revision this source resolved: the object's own version, or its entity tag for
+    // an object in a bucket that holds no versions.
+    let revision = version.clone().or(etag);
     JobOutcome::Done {
-        summary: format!("Source object s3://{bucket}/{key} delivered as the output artifact"),
-        revision: version.or(etag),
+        // `ActionExecutionResult$externalExecutionSummary` is "the action provider's
+        // summary for the action execution", so the text is the S3 source provider's own:
+        // the fixed words `Amazon S3 version id: ` and the version of the object it
+        // delivered. An object in a bucket that holds no versions has none to name, and
+        // the summary then says what the run did instead.
+        summary: match &version {
+            Some(version) => format!("{S3_SOURCE_SUMMARY_PREFIX}{version}"),
+            None => format!("Source object s3://{bucket}/{key} delivered as the output artifact"),
+        },
+        revision: revision.clone(),
         variables,
-        // The object's own version is the revision, not an external run: no system
-        // outside this emulator performed the action's work.
-        external_id: None,
+        // `ActionExecutionResult$externalExecutionId` is "the action provider's external ID
+        // for the action execution": for a SOURCE action that is the id the provider names
+        // the revision it delivered by, which is the revision itself — the same handle the
+        // CodeCommit source reports its commit as and the Amazon ECR source its digest.
+        external_id: revision,
     }
 }
 

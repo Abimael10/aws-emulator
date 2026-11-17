@@ -73,6 +73,9 @@ mod action_type_resolution;
 /// The deep links a reported action carries, resolved from the URL templates its action
 /// type publishes.
 pub mod action_urls;
+/// The address this service announces a URL a client DIALS on: the endpoint the request
+/// minting it reached this emulator at.
+pub mod announced_address;
 /// The one scanner over a text that refers to values by name — an action configuration's
 /// variable references and an action type's URL templates.
 pub mod references;
@@ -88,6 +91,7 @@ pub use job_records::*;
 // Named rather than a glob, so what `crate::state` publishes stays explicit — the same
 // way the re-exports below name what they take.
 pub use action_types::{validate_action_type_declaration, ActionTypeKey, ActionTypeRecord};
+pub use announced_address::announced_authority;
 pub use built_in_catalog::{
     BuiltInActionType, BuiltInConfigurationProperty, BUILT_IN_ACTION_TYPES,
     CATALOG_REGION_PLACEHOLDER,
@@ -3208,12 +3212,18 @@ impl ActionExecutionRecord {
     /// started, when it last changed and what its work produced.
     ///
     /// The input is the declaration's: the action's type id, its configured
-    /// `configuration`, the role it assumes (its own `roleArn` when it declares one,
-    /// else the pipeline's, which `ActionExecutionInput$roleArn` documents as "assumed
-    /// through the roleArn for the pipeline"), its Region, its variable namespace and
+    /// `configuration`, the role that performs it, its Region, its variable namespace and
     /// the input artifacts it consumes — each by the name the declaration gives it,
     /// with no `s3location`, because the location an input artifact was read at is the
     /// producing action's output rather than this action's declaration.
+    ///
+    /// `ActionExecutionInput$roleArn` is "the ARN of the IAM service role that PERFORMS the
+    /// declared action[, which] is assumed through the roleArn for the pipeline", so it is
+    /// reported for an action a service role performs — the action's own `roleArn` when it
+    /// declares one, else the pipeline's, which is what the second sentence names — and not
+    /// at all for an action no service role performs
+    /// ([`action_assumes_a_service_role`]), where the pipeline's role would attribute work
+    /// to a role that did not do it.
     ///
     /// `updatedBy` is the identity of the principal that last changed the run, which is
     /// recorded on the run itself when a caller's own call moved it.
@@ -3248,12 +3258,12 @@ impl ActionExecutionRecord {
                         resolved_configuration(configuration, execution)
                     }),
                 configuration,
-                role_arn: Some(
+                role_arn: action_assumes_a_service_role(action).then(|| {
                     action
                         .role_arn
                         .clone()
-                        .unwrap_or_else(|| declaration.role_arn.clone()),
-                ),
+                        .unwrap_or_else(|| declaration.role_arn.clone())
+                }),
                 region: action.region.clone().or(pipeline_region),
                 // `ActionExecutionInput$inputArtifacts` is "details of input artifacts of
                 // the action that correspond to the action execution": the list belongs
@@ -3297,6 +3307,21 @@ impl ActionExecutionRecord {
             output: self.output.clone(),
         }
     }
+}
+
+/// Whether `action`'s work is performed by an IAM SERVICE ROLE this service assumes, which
+/// is what `ActionExecutionInput$roleArn` names ("the ARN of the IAM service role that
+/// performs the declared action").
+///
+/// Every category the model declares (`smithy_query query="shape" shape="ActionCategory"`:
+/// `Source`, `Build`, `Deploy`, `Test`, `Invoke`, `Approval`, `Compute`) is work this
+/// service, or a provider it calls on the pipeline's behalf, performs under a role — except
+/// `Approval`, which is performed by the PRINCIPAL that answers it (`PutApprovalResult`
+/// records that principal as the run's `lastUpdatedBy`, and nothing assumes a role to hold
+/// a stage open). An approval therefore has no performing role to name, and naming the
+/// pipeline's would attribute the decision to a role that did not make it.
+pub fn action_assumes_a_service_role(action: &ActionDeclaration) -> bool {
+    action.action_type_id.category != driver::CATEGORY_APPROVAL
 }
 
 /// What an action's run produced, or `None` while it has produced nothing.
@@ -3498,7 +3523,21 @@ pub fn random_uuid_v4() -> String {
     rendered
 }
 
-/// A `SystemTime` as the wire timestamp type every modelled member uses.
+/// How many SUBSECOND digits a timestamp this service serializes carries.
+///
+/// `awsJson1_1` writes a `Timestamp` as epoch-seconds, and every CodePipeline timestamp
+/// AWS itself emits carries at most three fractional digits — millisecond resolution. The
+/// model types the member and says nothing about precision, so this is the recorded
+/// behaviour of the service rather than a modelled constraint: an SDK decoding these
+/// numbers at millisecond resolution, or a client comparing one response with another,
+/// sees a number shaped the way the service shapes it.
+const SUBSECOND_DIGITS: u32 = 3;
+
+/// A `SystemTime` as the wire timestamp type every modelled member uses, at the resolution
+/// this service serializes one at ([`SUBSECOND_DIGITS`]).
+///
+/// The one encoder for every timestamp this service reports, so no operation's projection
+/// can report an instant at a different precision from another's.
 pub fn to_date_time(time: SystemTime) -> ::aws_smithy_types::DateTime {
     let since_epoch = time
         .duration_since(SystemTime::UNIX_EPOCH)
@@ -3507,7 +3546,13 @@ pub fn to_date_time(time: SystemTime) -> ::aws_smithy_types::DateTime {
     // 2.9e11 years away) and `as` would wrap it into a negative timestamp, so the
     // conversion saturates instead: every representable instant converts exactly.
     let secs = i64::try_from(since_epoch.as_secs()).unwrap_or(i64::MAX);
-    ::aws_smithy_types::DateTime::from_secs_and_nanos(secs, since_epoch.subsec_nanos())
+    // Truncated rather than rounded, so the reported instant never moves ahead of the one
+    // the clock read: a value is reported at the start of the millisecond it fell in.
+    let scale = 10_u32.pow(9 - SUBSECOND_DIGITS);
+    ::aws_smithy_types::DateTime::from_secs_and_nanos(
+        secs,
+        (since_epoch.subsec_nanos() / scale) * scale,
+    )
 }
 
 /// Whether IAM positively reports that `role_arn` names no role.
