@@ -111,6 +111,37 @@ pub fn already_exists_message(request_id: Option<&str>) -> String {
     )
 }
 
+/// The wire code of the refusal of an association the OpsItem does not hold, which is the
+/// modelled exception's own shape name
+/// (`com.amazonaws.ssm#OpsItemRelatedItemAssociationNotFoundException`), and so what the
+/// envelope below names as its error code.
+pub const ASSOCIATION_NOT_FOUND_CODE: &str = "OpsItemRelatedItemAssociationNotFoundException";
+
+/// The HTTP status that refusal carries, which is the status the model declares for it
+/// (`DisassociateOpsItemRelatedItem`'s `OpsItemRelatedItemAssociationNotFoundException`,
+/// httpError 400), and so what the envelope below names as its status.
+pub const ASSOCIATION_NOT_FOUND_STATUS: u16 = 400;
+
+/// The fixed sentence a client reads for an association the OpsItem does not hold: the
+/// related item the request asked to have disassociated is not one this OpsItem carries, so
+/// there is no association of it to delete. Nothing of the request is in the sentence — the
+/// association id and the OpsItem id a client already holds are not restated.
+pub const ASSOCIATION_NOT_FOUND_BODY: &str = "Related Item to be disassociated not found.";
+
+/// How this service reports an association the OpsItem holds none of:
+/// [`ASSOCIATION_NOT_FOUND_BODY`] followed by the envelope this service appends to a
+/// refusal it words itself ([`super::with_sdk_error_envelope`]), whose only variable part
+/// is the serving response's own request id.
+///
+/// A function rather than a constant because that request id is minted per call.
+pub fn association_not_found_message() -> String {
+    super::with_sdk_error_envelope(
+        ASSOCIATION_NOT_FOUND_BODY,
+        ASSOCIATION_NOT_FOUND_STATUS,
+        ASSOCIATION_NOT_FOUND_CODE,
+    )
+}
+
 /// The bounds the modelled `OpsItemRelatedItemsMaxResults` carries (range 1..50).
 pub const MIN_RELATED_ITEM_PAGE_SIZE: i32 = 1;
 
@@ -333,6 +364,25 @@ impl ComAmazonawsSsmAmazonssmState {
                 return candidate;
             }
         }
+    }
+
+    /// Delete the association between `ops_item_id` and the related item
+    /// `association_id` names, returning the record that was removed, or `None` when that
+    /// OpsItem held no association under that id (so nothing was removed).
+    ///
+    /// Only the association is removed: the resource it pointed at belongs to another
+    /// service and the OpsItem itself keeps every other related item it carries.
+    pub fn remove_related_item(
+        &mut self,
+        region: &str,
+        ops_item_id: &str,
+        association_id: &str,
+    ) -> Option<RelatedItemRecord> {
+        self.ops_item_related_items.remove(&(
+            region.to_string(),
+            ops_item_id.to_string(),
+            association_id.to_string(),
+        ))
     }
 
     /// Store `record` as its OpsItem's association of that id.

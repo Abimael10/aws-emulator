@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! An OpsItem's related items end to end: `AssociateOpsItemRelatedItem` associates a
-//! resource with an OpsItem and `ListOpsItemRelatedItems` reports what was associated.
+//! resource with an OpsItem, `ListOpsItemRelatedItems` reports what was associated and
+//! `DisassociateOpsItemRelatedItem` deletes one of those associations again.
 //!
 //! Every case goes through the front door a client uses — the shared harness in
 //! `all/parameter_store.rs` ([`router`], [`call`], [`call_in_region`], [`error_code`])
@@ -14,10 +15,14 @@
 //! associations an OpsItem carries, which filter narrows the listing, the page size, the
 //! Region — rather than the single association a recorded unit happened to make.
 
+use std::sync::Arc;
+use std::time::{Duration, SystemTime};
+
 use serde_json::{json, Value};
+use service_com_amazonaws_ssm_amazonssm::state::ComAmazonawsSsmAmazonssmState;
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::parameter_store::{call, call_in_region, error_code, router, REGION};
+use crate::parameter_store::{call, call_in_region, error_code, router, router_with_engine, REGION};
 
 /// The association types "OpsCenter supports" (`smithy_query(query="doc",
 /// shape="AssociateOpsItemRelatedItemRequest", member="AssociationType")`: "OpsCenter
@@ -957,5 +962,384 @@ async fn a_listing_without_an_ops_item_spans_the_region() {
     assert!(
         reported.is_empty(),
         "case an OpsItem with nothing associated: expected no summary, got {reported:?}"
+    );
+}
+
+/// The fixed sentence Systems Manager words for
+/// `OpsItemRelatedItemAssociationNotFoundException`: the related item a disassociation
+/// asked for is not one the OpsItem carries. It carries nothing of the request.
+const ASSOCIATION_NOT_FOUND_SENTENCE: &str = "Related Item to be disassociated not found.";
+
+/// `DisassociateOpsItemRelatedItem` with `body`, returning `(status, body)`.
+async fn disassociate(router: &MultiServiceRouter, body: &Value) -> (u16, Value) {
+    call(router, "DisassociateOpsItemRelatedItem", body).await
+}
+
+/// `DisassociateOpsItemRelatedItem` of one association, asserting it succeeded and reported
+/// no members of its own: the modelled `DisassociateOpsItemRelatedItemResponse` carries
+/// none, so what a disassociation did is read back through the listing.
+async fn disassociate_ok(
+    router: &MultiServiceRouter,
+    case: &str,
+    ops_item_id: &str,
+    association_id: &str,
+) {
+    let (status, response) = disassociate(
+        router,
+        &json!({ "OpsItemId": ops_item_id, "AssociationId": association_id }),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "case {case}: DisassociateOpsItemRelatedItem must succeed, got {status} {response}"
+    );
+    assert_eq!(
+        response,
+        json!({}),
+        "case {case}: the response carries no members, got {response}"
+    );
+}
+
+/// The association ids a listing of `ops_item_id` reports, sorted so two sets compare.
+async fn reported_ids(router: &MultiServiceRouter, case: &str, ops_item_id: &str) -> Vec<String> {
+    let mut ids: Vec<String> = summaries(router, case, ops_item_id)
+        .await
+        .iter()
+        .filter_map(|summary| summary["AssociationId"].as_str().map(str::to_string))
+        .collect();
+    ids.sort();
+    ids
+}
+
+/// Associate `count` related items with a fresh OpsItem, returning the OpsItem and the
+/// association ids in the order they were made.
+///
+/// Each row of a disassociation table starts from its own OpsItem, so what one case deleted
+/// cannot be what the next case reads.
+async fn ops_item_with_related_items(
+    router: &MultiServiceRouter,
+    case: &str,
+    count: usize,
+) -> (String, Vec<String>) {
+    let ops_item_id = ops_item(router, case).await;
+    let mut association_ids = Vec::new();
+    for index in 0..count {
+        association_ids.push(
+            associate_ok(
+                router,
+                case,
+                &json!({
+                    "OpsItemId": ops_item_id,
+                    "AssociationType": ASSOCIATION_TYPES[index % ASSOCIATION_TYPES.len()],
+                    "ResourceType": RESOURCE_TYPES[index % RESOURCE_TYPES.len()],
+                    "ResourceUri": format!(
+                        "arn:aws:ssm:us-west-2:111122223333:document/Related-{index}"
+                    ),
+                }),
+            )
+            .await,
+        );
+    }
+    (ops_item_id, association_ids)
+}
+
+/// A disassociation deletes the ONE association it names and leaves every other related
+/// item of the OpsItem where it was: what the listing reports afterwards is what the
+/// deletion left persisted.
+#[tokio::test]
+async fn disassociating_a_related_item_deletes_only_that_association() {
+    let router = router();
+    // The rows differ along how many related items the OpsItem carries and WHICH of them is
+    // deleted — the first, a middle one and the last — so the rule is asserted over the
+    // class rather than on the single association a recording happened to delete.
+    for count in 1usize..=3 {
+        for removed in 0..count {
+            let case = format!("association {removed} of {count}");
+            let (ops_item_id, association_ids) =
+                ops_item_with_related_items(&router, &case, count).await;
+            disassociate_ok(&router, &case, &ops_item_id, &association_ids[removed]).await;
+
+            let mut survivors: Vec<String> = association_ids
+                .iter()
+                .enumerate()
+                .filter(|(index, _)| *index != removed)
+                .map(|(_, id)| id.clone())
+                .collect();
+            survivors.sort();
+            let reported = reported_ids(&router, &case, &ops_item_id).await;
+            assert_eq!(
+                reported, survivors,
+                "case {case}: the listing must report every association but the deleted one"
+            );
+        }
+    }
+}
+
+/// One row of the disassociation-refusal table: the request that cannot be served and the
+/// error it is answered with.
+struct DisassociationRefusal<'a> {
+    case: &'a str,
+    body: Value,
+    code: &'a str,
+}
+
+/// A disassociation that names no association this OpsItem holds — an OpsItem the Region
+/// holds none of, an id nothing minted, another OpsItem's association, one an earlier call
+/// already deleted, or one of another Region — is refused, and the associations the store
+/// does hold are untouched.
+#[tokio::test]
+async fn a_disassociation_that_names_nothing_held_is_refused() {
+    let router = router();
+    let (ops_item_id, association_ids) =
+        ops_item_with_related_items(&router, "an OpsItem to refuse disassociations on", 2).await;
+    let (other_ops_item, other_associations) =
+        ops_item_with_related_items(&router, "another OpsItem", 1).await;
+
+    // An association made at another Region's endpoint, to show a disassociation resolves
+    // against the Region the OpsItem lives in rather than across the store.
+    let elsewhere = "eu-central-1";
+    let elsewhere_ops_item = ops_item_in_region(&router, elsewhere, "an OpsItem elsewhere").await;
+    let (status, response) = call_in_region(
+        &router,
+        elsewhere,
+        "AssociateOpsItemRelatedItem",
+        &json!({
+            "OpsItemId": elsewhere_ops_item,
+            "AssociationType": "RelatesTo",
+            "ResourceType": "AWS::SSM::Document",
+            "ResourceUri": "arn:aws:ssm:eu-central-1:111122223333:document/Elsewhere",
+        }),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "case another Region: the association must succeed, got {status} {response}"
+    );
+    let elsewhere_association = response["AssociationId"]
+        .as_str()
+        .unwrap_or_else(|| panic!("case another Region: no AssociationId in {response}"))
+        .to_string();
+
+    // One association is deleted first, so the "already deleted" row names an id that WAS
+    // minted for this OpsItem and no longer resolves.
+    disassociate_ok(
+        &router,
+        "the deleted association",
+        &ops_item_id,
+        &association_ids[1],
+    )
+    .await;
+
+    let cases = vec![
+        DisassociationRefusal {
+            case: "an OpsItem id nothing created",
+            body: json!({
+                "OpsItemId": "oi-0123456789ab",
+                "AssociationId": association_ids[0],
+            }),
+            code: "OpsItemNotFoundException",
+        },
+        DisassociationRefusal {
+            case: "an association id nothing minted",
+            body: json!({
+                "OpsItemId": ops_item_id,
+                "AssociationId": "11111111-2222-3333-4444-555555555555",
+            }),
+            code: "OpsItemRelatedItemAssociationNotFoundException",
+        },
+        DisassociationRefusal {
+            case: "an association id that is not shaped like a minted one",
+            body: json!({ "OpsItemId": ops_item_id, "AssociationId": "not-an-association" }),
+            code: "OpsItemRelatedItemAssociationNotFoundException",
+        },
+        DisassociationRefusal {
+            case: "another OpsItem's association",
+            body: json!({
+                "OpsItemId": ops_item_id,
+                "AssociationId": other_associations[0],
+            }),
+            code: "OpsItemRelatedItemAssociationNotFoundException",
+        },
+        DisassociationRefusal {
+            case: "an association an earlier call already deleted",
+            body: json!({
+                "OpsItemId": ops_item_id,
+                "AssociationId": association_ids[1],
+            }),
+            code: "OpsItemRelatedItemAssociationNotFoundException",
+        },
+        DisassociationRefusal {
+            case: "an association of another Region",
+            body: json!({
+                "OpsItemId": elsewhere_ops_item,
+                "AssociationId": elsewhere_association,
+            }),
+            code: "OpsItemNotFoundException",
+        },
+    ];
+
+    for row in &cases {
+        let (status, response) = disassociate(&router, &row.body).await;
+        assert_eq!(
+            status, 400,
+            "case {}: must be refused with 400, got {status} {response}",
+            row.case
+        );
+        assert_eq!(
+            error_code(&response),
+            row.code,
+            "case {}: expected {}, got {response}",
+            row.case,
+            row.code
+        );
+    }
+
+    // A refused disassociation deletes nothing, in this Region or another.
+    assert_eq!(
+        reported_ids(&router, "after the refusals", &ops_item_id).await,
+        vec![association_ids[0].clone()],
+        "case after the refusals: the OpsItem keeps the association nothing deleted"
+    );
+    assert_eq!(
+        reported_ids(&router, "another OpsItem after the refusals", &other_ops_item).await,
+        vec![other_associations[0].clone()],
+        "case another OpsItem after the refusals: another OpsItem's association is untouched"
+    );
+    let (status, response) = call_in_region(
+        &router,
+        elsewhere,
+        "ListOpsItemRelatedItems",
+        &json!({ "OpsItemId": elsewhere_ops_item }),
+    )
+    .await;
+    assert_eq!(
+        (status, response["Summaries"][0]["AssociationId"].as_str()),
+        (200, Some(elsewhere_association.as_str())),
+        "case another Region after the refusals: {elsewhere} keeps its association, got \
+         {status} {response}"
+    );
+}
+
+/// The refusal of an association the OpsItem does not hold is worded as Systems Manager
+/// words this class — one fixed sentence plus the frame the service appends, whose only
+/// variable part is the serving response's own request id — so a client that matches the
+/// sentence sees what AWS sends.
+#[tokio::test]
+async fn an_association_not_found_refusal_is_worded_as_the_service_words_it() {
+    let router = router();
+    let (ops_item_id, association_ids) =
+        ops_item_with_related_items(&router, "an OpsItem for the refusal wording", 1).await;
+    let prefix = format!(
+        "{ASSOCIATION_NOT_FOUND_SENTENCE} (Service: AmazonSSM; Status Code: 400; Error Code: \
+         OpsItemRelatedItemAssociationNotFoundException; Request ID: "
+    );
+    let suffix = "; Proxy: null)";
+
+    // Two rows that differ in the value at fault, so the sentence is shown to carry no part
+    // of what the request named, and two calls, so the request id is shown to be the
+    // response's own rather than a constant.
+    let mut request_ids = Vec::new();
+    for named in [
+        "11111111-2222-3333-4444-555555555555".to_string(),
+        association_ids[0].clone(),
+    ] {
+        // The second row names an association that WAS this OpsItem's, deleted just now.
+        if named == association_ids[0] {
+            disassociate_ok(&router, "the wording case", &ops_item_id, &named).await;
+        }
+        let (status, response) = disassociate(
+            &router,
+            &json!({ "OpsItemId": ops_item_id, "AssociationId": named }),
+        )
+        .await;
+        assert_eq!(
+            status, 400,
+            "case {named}: must be refused with 400, got {status} {response}"
+        );
+        let message = response["Message"]
+            .as_str()
+            .unwrap_or_else(|| panic!("case {named}: no Message in {response}"))
+            .to_string();
+        assert!(
+            message.starts_with(&prefix) && message.ends_with(suffix),
+            "case {named}: expected {prefix:?} … {suffix:?}, got {message:?}"
+        );
+        assert!(
+            !message.contains(&named) && !message.contains(&ops_item_id),
+            "case {named}: the sentence carries nothing of the request, got {message:?}"
+        );
+        let request_id = message[prefix.len()..message.len() - suffix.len()].to_string();
+        assert!(
+            is_uuid(&request_id),
+            "case {named}: expected the response's own request id, got {request_id:?}"
+        );
+        request_ids.push(request_id);
+    }
+    assert_ne!(
+        request_ids[0], request_ids[1],
+        "case two refusals: each response carries its own request id, got {request_ids:?}"
+    );
+}
+
+/// How far out a case that is about an OpsItem whose delete has NOT settled moves the due
+/// instant of that delete.
+///
+/// The service stores a due instant and materialises the removal from it rather than
+/// sleeping for it, so a case about the state before it moves the instant instead of racing
+/// the window the service chose — the way this crate's delete suite moves it the other way
+/// to settle a delete. Nothing sleeps, and nothing in the case depends on how fast the host
+/// runs.
+const DELETE_HELD_PENDING: Duration = Duration::from_secs(3600);
+
+/// Hold the delete of `ops_item_id` in [`REGION`] pending for the rest of the case
+/// ([`DELETE_HELD_PENDING`]).
+fn hold_delete_pending(engine: &Arc<engine::InMemoryEngine>, ops_item_id: &str) {
+    let state = engine.state::<ComAmazonawsSsmAmazonssmState>();
+    let mut store = state.lock();
+    let held = store
+        .ops_item_mut(REGION, ops_item_id)
+        .unwrap_or_else(|| panic!("case {ops_item_id}: the deleting OpsItem must still be held"));
+    held.delete_due = Some(SystemTime::now() + DELETE_HELD_PENDING);
+}
+
+/// An OpsItem whose delete has been asked for and has not settled yet is still reported,
+/// but there is nothing left to edit about it: a disassociation held against it is refused
+/// as the conflict it is, and the association it named is still reported.
+#[tokio::test]
+async fn disassociating_from_an_ops_item_being_deleted_is_refused() {
+    let (router, engine) = router_with_engine();
+    let case = "an OpsItem being deleted";
+    let (ops_item_id, association_ids) = ops_item_with_related_items(&router, case, 1).await;
+    let (status, response) =
+        call(&router, "DeleteOpsItem", &json!({ "OpsItemId": ops_item_id })).await;
+    assert_eq!(
+        status, 200,
+        "case {case}: DeleteOpsItem must succeed, got {status} {response}"
+    );
+    hold_delete_pending(&engine, &ops_item_id);
+
+    let (status, response) = disassociate(
+        &router,
+        &json!({ "OpsItemId": ops_item_id, "AssociationId": association_ids[0] }),
+    )
+    .await;
+    assert_eq!(
+        status, 400,
+        "case {case}: must be refused with 400, got {status} {response}"
+    );
+    assert_eq!(
+        error_code(&response),
+        "OpsItemConflictException",
+        "case {case}: expected the conflict refusal, got {response}"
+    );
+    assert_eq!(
+        response["Message"].as_str(),
+        Some("The specified OpsItem is in the process of being deleted."),
+        "case {case}: expected the sentence the service words for this class, got {response}"
+    );
+    assert_eq!(
+        reported_ids(&router, case, &ops_item_id).await,
+        vec![association_ids[0].clone()],
+        "case {case}: the refused disassociation deleted nothing"
     );
 }

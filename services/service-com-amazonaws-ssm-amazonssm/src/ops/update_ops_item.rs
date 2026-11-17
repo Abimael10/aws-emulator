@@ -241,9 +241,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if held.is_deleting() {
             return Err(UpdateOpsItemErrorModeled::OpsItemConflictException(
                 OpsItemConflictException {
-                    message: Some(
-                        "The specified OpsItem is in the process of being deleted.".to_string(),
-                    ),
+                    message: Some(ops_items::OPS_ITEM_DELETING_MESSAGE.to_string()),
                 },
             )
             .into());

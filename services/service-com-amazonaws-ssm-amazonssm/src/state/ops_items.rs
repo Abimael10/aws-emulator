@@ -81,6 +81,13 @@ pub const OPS_ITEM_TERMINAL_STATUSES: &[&str] = &["Resolved", "Closed"];
 pub const OPS_ITEM_DELETE_SETTLES_AFTER: ::std::time::Duration =
     ::std::time::Duration::from_secs(10);
 
+/// What a client reads for a write held against an OpsItem whose delete has been asked for
+/// and has not settled yet, which is the one state `OpsItemConflictException` reports
+/// ("The specified OpsItem is in the process of being deleted"). Stated once here so every
+/// write that refuses for that reason serves one wording.
+pub const OPS_ITEM_DELETING_MESSAGE: &str =
+    "The specified OpsItem is in the process of being deleted.";
+
 /// The `Version` token a write of an OpsItem leaves on the record.
 ///
 /// `OpsItem$Version` is "the version of this OpsItem. Each time the OpsItem is edited the
