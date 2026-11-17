@@ -63,9 +63,14 @@ const PROTECTED_GLOBAL_CLUSTER: &str = "Cannot delete protected Global Cluster, 
 const ONLY_ONE_SNAPSHOT_MEMBER: &str =
     "Only one of SkipFinalSnapshot and FinalDBSnapshotIdentifier can be specified";
 
-/// A delete that names NEITHER of them.
+/// A delete of a DB INSTANCE that names NEITHER of them.
 const A_SNAPSHOT_MEMBER_IS_REQUIRED: &str =
     "FinalDBSnapshotIdentifier is required unless SkipFinalSnapshot is specified.";
+
+/// A delete of a DB CLUSTER that names NEITHER of them: the cluster API asks for one of the
+/// two in its own words.
+const A_CLUSTER_SNAPSHOT_MEMBER_IS_REQUIRED: &str =
+    "Please specify FinalDBSnapshotIdentifier or SkipFinalSnapshot";
 
 /// `RebootDBInstance` forcing a failover on an instance that is not configured for it.
 const FORCE_FAILOVER_NEEDS_MULTI_AZ: &str = "ForceFailover cannot be specified since the \
@@ -378,7 +383,7 @@ async fn a_refusal_of_what_the_request_carries_is_a_query_api_parameter_error() 
             params: params!["DBClusterIdentifier" => "emu-rcls-live"],
             status: 400,
             code: INVALID_PARAMETER_COMBINATION,
-            wording: Wording::Exact(A_SNAPSHOT_MEMBER_IS_REQUIRED.to_string()),
+            wording: Wording::Exact(A_CLUSTER_SNAPSHOT_MEMBER_IS_REQUIRED.to_string()),
         },
         // A member that cannot hold together with another member of the same request.
         Row {

@@ -12,7 +12,13 @@
 //! * A refusal naming the resource an operation's single SOURCE member points at is worded
 //!   about that source: the fixed framing names the member's role and the KIND of resource
 //!   the value named, and brackets the value exactly as the request passed it — not the
-//!   sentence a call whose own SUBJECT is that resource answers.
+//!   sentence a call whose own SUBJECT is that resource answers. The read replica's source
+//!   DB instance is the same rule on a request that carries TWO identifiers: the refusal
+//!   says the SOURCE was not found and carries the value `SourceDBInstanceIdentifier`
+//!   brought, while the generic instance lookup keeps its own sentence.
+//! * A state precondition about that source is the service's own FIXED sentence: the
+//!   read-replica create states the state a source has to be in and names neither the
+//!   source the request carried nor the status it is in.
 //! * An operation that resolves a resource it takes no identifier of its own for words the
 //!   not-found fault its own way; the resource type comes first and the request's identifier
 //!   follows the fixed phrase.
@@ -35,7 +41,12 @@
 //! Every call goes over the wire through the harness in `db_instances.rs`, so each assertion
 //! reads the XML the emulator itself answered with.
 
-use crate::db_instances::{call, emulator, expect_error, text, REGION};
+use smithy_server_runtime::MultiServiceRouter;
+
+use crate::db_instances::{
+    call, call_in, emulator, expect_error, expect_ok, optional_text, text, REGION,
+};
+use crate::lifecycle_poll_loops::poll_until;
 
 /// The canonical account id every generated emulator presents.
 const ACCOUNT: &str = "000000000000";
@@ -49,6 +60,9 @@ const DB_PARAMETER_GROUP_NOT_FOUND: &str = "DBParameterGroupNotFound";
 
 /// `DBInstanceNotFoundFault`'s `awsQueryError` code.
 const DB_INSTANCE_NOT_FOUND: &str = "DBInstanceNotFound";
+
+/// `InvalidDBInstanceStateFault`'s `awsQueryError` code.
+const INVALID_DB_INSTANCE_STATE: &str = "InvalidDBInstanceState";
 
 /// `DBClusterNotFoundFault`'s `awsQueryError` code.
 const DB_CLUSTER_NOT_FOUND: &str = "DBClusterNotFoundFault";
@@ -591,4 +605,407 @@ async fn an_unpublished_filter_name_is_refused_with_fixed_text_and_the_name() {
             row.case
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// The SOURCE DB instance of a read replica: the lookup, and the state it has to be in
+// ---------------------------------------------------------------------------
+
+/// The sentence the read-replica create answers for a SOURCE DB instance it cannot resolve:
+/// fixed text naming the SOURCE, then the value the request carried for it.
+fn read_replica_source_not_found(named: &str) -> String {
+    format!("The source instance could not be found: {named}")
+}
+
+/// The sentence a call whose single identifier names its SUBJECT answers for the same miss —
+/// the generic instance lookup, which the source role must not reuse.
+fn subject_instance_not_found(named: &str) -> String {
+    format!("DBInstance not found: {named}")
+}
+
+/// The FIXED sentence the read-replica create answers for a source that is not `available`:
+/// it names neither the source nor the status the source is in.
+const SOURCE_NOT_AVAILABLE: &str = "DB instance is not in the available state";
+
+/// `CreateDBInstance` with the automated backups a read replica's source needs ("its backup
+/// retention period must be greater than 0"), so a refusal below is about the source's
+/// existence or its status and never about its backups.
+async fn create_replica_source(
+    router: &MultiServiceRouter,
+    case: &str,
+    identifier: &str,
+    engine: &str,
+) {
+    expect_ok(
+        case,
+        call(
+            router,
+            "CreateDBInstance",
+            &[
+                ("DBInstanceIdentifier", identifier),
+                ("Engine", engine),
+                ("DBInstanceClass", "db.t3.micro"),
+                ("AllocatedStorage", "20"),
+                ("BackupRetentionPeriod", "1"),
+            ],
+        )
+        .await,
+    );
+}
+
+/// `DescribeDBInstances` for one identifier in `region`, as the status and the body.
+async fn read_instance(
+    router: &MultiServiceRouter,
+    region: &str,
+    identifier: &str,
+) -> (u16, String) {
+    call_in(
+        router,
+        region,
+        "DescribeDBInstances",
+        &[("DBInstanceIdentifier", identifier)],
+    )
+    .await
+}
+
+/// Poll `DescribeDBInstances` until the instance reports `status` — the condition the next
+/// call needs, rather than a fixed wait.
+async fn poll_for_status(
+    router: &MultiServiceRouter,
+    case: &str,
+    identifier: &str,
+    status: &str,
+) {
+    poll_until(
+        case,
+        &format!("{identifier} reporting {status}"),
+        || read_instance(router, REGION, identifier),
+        |http, body| {
+            http == 200 && optional_text(body, "DBInstanceStatus").as_deref() == Some(status)
+        },
+    )
+    .await;
+}
+
+/// `CreateDBInstanceReadReplica` of `source` into `replica`, signed for `region`.
+async fn create_read_replica(
+    router: &MultiServiceRouter,
+    region: &str,
+    replica: &str,
+    source: &str,
+) -> (u16, String) {
+    call_in(
+        router,
+        region,
+        "CreateDBInstanceReadReplica",
+        &[
+            ("DBInstanceIdentifier", replica),
+            ("SourceDBInstanceIdentifier", source),
+        ],
+    )
+    .await
+}
+
+/// A `SourceDBInstanceIdentifier` of exactly the 63 characters a DB instance identifier
+/// admits ("Must contain from 1 to 63 letters, numbers, or hyphens" —
+/// `smithy_query(query="doc", shape="CreateDBInstanceMessage",
+/// member="DBInstanceIdentifier")`), so the published upper bound of the value is a row.
+fn identifier_at_the_published_bound() -> String {
+    let mut identifier = String::from("e");
+    identifier.extend(std::iter::repeat_n('a', 62));
+    assert_eq!(
+        identifier.len(),
+        63,
+        "the row at the published bound must be 63 characters, got {}",
+        identifier.len()
+    );
+    identifier
+}
+
+/// One row of the source-lookup table: how the request names a source instance that is not
+/// there, the replica it would have minted, and the region the call is signed for.
+struct SourceInstanceCase {
+    case: &'static str,
+    replica: &'static str,
+    named: String,
+    region: &'static str,
+}
+
+#[tokio::test]
+async fn a_read_replica_create_reports_the_source_instance_it_could_not_find() {
+    let router = emulator();
+
+    // One stored, running source, so every refusal below is a decision about the identifier
+    // the request named rather than "this service holds no instance at all".
+    create_replica_source(&router, "the stored source", "emu-src-role-held", "mysql").await;
+    poll_for_status(&router, "the stored source", "emu-src-role-held", "available").await;
+    // And one created and then deleted, so a row can name an identifier that resolved a
+    // moment ago and resolves no longer.
+    create_replica_source(&router, "the deleted source", "emu-src-role-gone", "postgres").await;
+    expect_ok(
+        "delete the source the table names",
+        call(
+            &router,
+            "DeleteDBInstance",
+            &[
+                ("DBInstanceIdentifier", "emu-src-role-gone"),
+                ("SkipFinalSnapshot", "true"),
+            ],
+        )
+        .await,
+    );
+    poll_until(
+        "the deleted source",
+        "emu-src-role-gone leaving the store",
+        || read_instance(&router, REGION, "emu-src-role-gone"),
+        |http, _| http == 404,
+    )
+    .await;
+
+    // The rows differ along what the rule generalises over: the form the member carried (a
+    // plain identifier, the same one upper-cased, the instance's ARN), the LENGTH of the
+    // value (a single letter and the published 63-character bound), why the lookup resolves
+    // nothing (never created, deleted a moment ago, held only by another region) and the
+    // region the call is signed for.
+    let rows = [
+        SourceInstanceCase {
+            case: "a source identifier nothing created",
+            replica: "emu-src-role-replica-1",
+            named: "emu-src-role-absent".to_string(),
+            region: REGION,
+        },
+        SourceInstanceCase {
+            case: "the same identifier upper-cased",
+            replica: "emu-src-role-replica-2",
+            named: "EMU-SRC-ROLE-ABSENT".to_string(),
+            region: REGION,
+        },
+        SourceInstanceCase {
+            case: "the ARN form of an identifier nothing created",
+            replica: "emu-src-role-replica-3",
+            named: resource_arn("db", "emu-src-role-absent"),
+            region: REGION,
+        },
+        SourceInstanceCase {
+            case: "a single-letter identifier",
+            replica: "emu-src-role-replica-4",
+            named: "e".to_string(),
+            region: REGION,
+        },
+        SourceInstanceCase {
+            case: "an identifier at the published 63-character bound",
+            replica: "emu-src-role-replica-5",
+            named: identifier_at_the_published_bound(),
+            region: REGION,
+        },
+        SourceInstanceCase {
+            case: "a source deleted a moment ago",
+            replica: "emu-src-role-replica-6",
+            named: "emu-src-role-gone".to_string(),
+            region: REGION,
+        },
+        SourceInstanceCase {
+            case: "the stored source named from another region",
+            replica: "emu-src-role-replica-7",
+            named: "emu-src-role-held".to_string(),
+            region: "eu-central-1",
+        },
+    ];
+
+    for row in &rows {
+        let case = row.case;
+        let body = expect_error(
+            case,
+            create_read_replica(&router, row.region, row.replica, &row.named).await,
+            404,
+            DB_INSTANCE_NOT_FOUND,
+        );
+        let message = text(&body, "Message");
+        let expected = read_replica_source_not_found(&row.named);
+        assert_eq!(
+            message, expected,
+            "case {case:?}: expected the source-lookup sentence {expected:?}, got {message:?}"
+        );
+        let subject = subject_instance_not_found(&row.named);
+        assert_ne!(
+            message, subject,
+            "case {case:?}: the source lookup must not reuse the subject sentence {subject:?}"
+        );
+        // The refused create stored no replica under the identifier it would have minted.
+        expect_error(
+            case,
+            read_instance(&router, row.region, row.replica).await,
+            404,
+            DB_INSTANCE_NOT_FOUND,
+        );
+    }
+
+    // The same miss on a call whose SINGLE identifier names its subject: the generic
+    // instance-lookup sentence, which is what makes the rule above about the ROLE the
+    // identifier plays rather than about one house style.
+    for named in ["emu-src-role-absent", "emu-src-role-gone"] {
+        let case = format!("DescribeValidDBInstanceModifications on {named}");
+        let body = expect_error(
+            &case,
+            call(
+                &router,
+                "DescribeValidDBInstanceModifications",
+                &[("DBInstanceIdentifier", named)],
+            )
+            .await,
+            404,
+            DB_INSTANCE_NOT_FOUND,
+        );
+        let message = text(&body, "Message");
+        let expected = subject_instance_not_found(named);
+        assert_eq!(
+            message, expected,
+            "case {case:?}: expected the subject sentence {expected:?}, got {message:?}"
+        );
+    }
+
+    // The stored source was there throughout, and a replica of it is served: the refusals
+    // were about the lookup and nothing else.
+    let served = expect_ok(
+        "a replica of the stored source",
+        create_read_replica(&router, REGION, "emu-src-role-replica-ok", "emu-src-role-held")
+            .await,
+    );
+    assert_eq!(
+        optional_text(&served, "ReadReplicaSourceDBInstanceIdentifier").as_deref(),
+        Some("emu-src-role-held"),
+        "case \"a replica of the stored source\": got {served}"
+    );
+}
+
+/// One row of the source-state table: the engine the source runs, how the request names it,
+/// and the replica it would have minted. Every row's source is STOPPED — a status an
+/// instance stays in until a start is asked for, so the row's precondition is settled by
+/// polling for it and carries no timing assumption.
+struct SourceStateCase {
+    case: &'static str,
+    source: &'static str,
+    replica: &'static str,
+    engine: &'static str,
+    /// Whether the request names the source by its ARN rather than by its identifier.
+    by_arn: bool,
+}
+
+#[tokio::test]
+async fn a_source_instance_that_is_not_available_is_refused_with_one_fixed_sentence() {
+    let router = emulator();
+
+    // The rows differ along what the sentence must NOT vary with: the engine the source
+    // runs and the form the request named it by. The status is the one a test can establish
+    // without racing the clock — a transient status (a source still being created, which is
+    // what a caller replicating straight after a create meets) is the same guard on the same
+    // predicate, and the sentence it answers is this constant, which reports no status at
+    // all.
+    let rows = [
+        SourceStateCase {
+            case: "a mysql source that has been stopped",
+            source: "emu-src-state-stopped-mysql",
+            replica: "emu-src-state-replica-1",
+            engine: "mysql",
+            by_arn: false,
+        },
+        SourceStateCase {
+            case: "a postgres source that has been stopped, named by its ARN",
+            source: "emu-src-state-stopped-pg",
+            replica: "emu-src-state-replica-2",
+            engine: "postgres",
+            by_arn: true,
+        },
+        SourceStateCase {
+            case: "a mariadb source that has been stopped",
+            source: "emu-src-state-stopped-maria",
+            replica: "emu-src-state-replica-3",
+            engine: "mariadb",
+            by_arn: false,
+        },
+    ];
+
+    let mut sentences: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for row in &rows {
+        let case = row.case;
+        create_replica_source(&router, case, row.source, row.engine).await;
+        poll_for_status(&router, case, row.source, "available").await;
+        expect_ok(
+            case,
+            call(
+                &router,
+                "StopDBInstance",
+                &[("DBInstanceIdentifier", row.source)],
+            )
+            .await,
+        );
+        poll_for_status(&router, case, row.source, "stopped").await;
+        // The source really is in the status this row is about, read off the service's own
+        // report rather than assumed.
+        let reported = expect_ok(case, read_instance(&router, REGION, row.source).await);
+        let status = text(&reported, "DBInstanceStatus");
+        assert_eq!(
+            status, "stopped",
+            "case {case:?}: the row needs the source stopped, got {status:?}"
+        );
+
+        let named = if row.by_arn {
+            resource_arn("db", row.source)
+        } else {
+            row.source.to_string()
+        };
+        let body = expect_error(
+            case,
+            create_read_replica(&router, REGION, row.replica, &named).await,
+            400,
+            INVALID_DB_INSTANCE_STATE,
+        );
+        let message = text(&body, "Message");
+        assert_eq!(
+            message, SOURCE_NOT_AVAILABLE,
+            "case {case:?}: expected the fixed sentence {SOURCE_NOT_AVAILABLE:?}, got \
+             {message:?}"
+        );
+        assert!(
+            !message.contains(row.source) && !message.contains(status.as_str()),
+            "case {case:?}: the refusal must report neither the source nor its status, got \
+             {message:?}"
+        );
+        sentences.insert(message);
+        // The refused create stored no replica.
+        expect_error(
+            case,
+            read_instance(&router, REGION, row.replica).await,
+            404,
+            DB_INSTANCE_NOT_FOUND,
+        );
+    }
+    assert_eq!(
+        sentences.len(),
+        1,
+        "the guard answers ONE sentence for every source it refuses, got {sentences:?}"
+    );
+
+    // And the guard was about the STATE: the stopped source, started and running again,
+    // serves the identical call.
+    let restarted = "emu-src-state-stopped-mysql";
+    expect_ok(
+        "start the stopped source",
+        call(
+            &router,
+            "StartDBInstance",
+            &[("DBInstanceIdentifier", restarted)],
+        )
+        .await,
+    );
+    poll_for_status(&router, "the restarted source", restarted, "available").await;
+    let served = expect_ok(
+        "a replica of the restarted source",
+        create_read_replica(&router, REGION, "emu-src-state-replica-ok", restarted).await,
+    );
+    assert_eq!(
+        optional_text(&served, "ReadReplicaSourceDBInstanceIdentifier").as_deref(),
+        Some(restarted),
+        "case \"a replica of the restarted source\": got {served}"
+    );
 }

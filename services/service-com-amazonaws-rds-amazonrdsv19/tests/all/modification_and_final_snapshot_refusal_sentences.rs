@@ -19,11 +19,13 @@
 //! does name the identifier.
 //!
 //! The second rule: a delete that names NEITHER of its two final-snapshot members is
-//! refused `InvalidParameterCombination` (HTTP 400) with one fixed sentence naming the
-//! member the request has to carry and the member that waives it, whichever resource is
-//! being deleted and whatever the request named. The table spans the three deletes that
-//! carry the pair, several engines and cluster types, the spelling of the identifier, a
-//! resource the clock has not settled yet — and, for each row, the same call with
+//! refused `InvalidParameterCombination` (HTTP 400) with the fixed sentence the API FAMILY
+//! of the deleted resource words for that class — the instance-level deletes name the member
+//! the request has to carry and the member that waives it, while the cluster-level delete
+//! asks for one of the two — whatever the request named and whichever engine the resource
+//! runs. Neither sentence has a variable part. The table spans the three deletes that carry
+//! the pair, several engines and cluster types, the spelling of the identifier, a resource
+//! the clock has not settled yet — and, for each row, the same call with
 //! `SkipFinalSnapshot` named, which gets past the guard.
 //!
 //! Both sentences are spelled out HERE rather than taken from the code under test, so the
@@ -39,17 +41,21 @@ use service_com_amazonaws_rds_amazonrdsv19::state::db_cluster_identifier_max_len
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::db_cluster_subject_operations::{cluster_arn, create_available_cluster};
-use crate::db_instances::{
-    call, call_in, emulator, expect_error, expect_ok, text, wait_for_settle,
-};
+use crate::db_instances::{call, call_in, emulator, expect_error, expect_ok, optional_text, text};
+use crate::lifecycle_poll_loops::poll_until;
 
 /// The sentence the modification path answers `DBClusterNotFoundFault` with. It has no
 /// variable part at all: the identifier the request carried is deliberately absent.
 const MODIFY_NOT_FOUND: &str = "DBCluster not found";
 
-/// The sentence a delete that names neither of its two final-snapshot members answers.
+/// The sentence a delete of a DB INSTANCE that names neither of its two final-snapshot
+/// members answers.
 const FINAL_SNAPSHOT_REQUIRED: &str =
     "FinalDBSnapshotIdentifier is required unless SkipFinalSnapshot is specified.";
+
+/// The sentence a delete of a DB CLUSTER answers for the same missing pair.
+const CLUSTER_FINAL_SNAPSHOT_REQUIRED: &str =
+    "Please specify FinalDBSnapshotIdentifier or SkipFinalSnapshot";
 
 /// An identifier no call below ever creates a cluster for.
 const ABSENT: &str = "emu-fixed-absent-cluster";
@@ -138,7 +144,7 @@ fn modify_cases() -> Vec<ModifyCase> {
     ]
 }
 
-/// `DescribeDBClusters` for one identifier.
+/// `DescribeDBClusters` for one cluster.
 async fn describe_cluster(
     router: &MultiServiceRouter,
     identifier: &str,
@@ -151,11 +157,38 @@ async fn describe_cluster(
     .await
 }
 
+/// Poll `DescribeDBClusters` until the cluster reports `available` — the condition a row
+/// that expects the delete to acknowledge a running cluster needs, looked for rather than
+/// waited out.
+async fn poll_until_available(router: &MultiServiceRouter, case: &str, identifier: &str) {
+    poll_until(
+        case,
+        &format!("{identifier} reporting available"),
+        || describe_cluster(router, identifier),
+        |http, body| http == 200 && optional_text(body, "Status").as_deref() == Some("available"),
+    )
+    .await;
+}
+
+/// Poll `DescribeDBClusters` until the identifier names no cluster at all.
+async fn poll_until_gone(router: &MultiServiceRouter, case: &str, identifier: &str) {
+    poll_until(
+        case,
+        &format!("{identifier} leaving the store"),
+        || describe_cluster(router, identifier),
+        |http, _| http == 404,
+    )
+    .await;
+}
+
 #[tokio::test]
 async fn the_modification_path_words_its_not_found_fault_with_one_fixed_sentence() {
     let router = emulator();
     create_available_cluster(&router, PRESENT, "aurora-postgresql", &[]).await;
     create_available_cluster(&router, DELETED, "aurora-postgresql", &[]).await;
+    // The stored cluster is asserted to be untouched and RUNNING at the end, so that it is
+    // up is looked for rather than assumed of the span its create owes.
+    poll_until_available(&router, PRESENT, PRESENT).await;
     expect_ok(
         "delete the cluster the table names",
         call(
@@ -168,7 +201,7 @@ async fn the_modification_path_words_its_not_found_fault_with_one_fixed_sentence
         )
         .await,
     );
-    wait_for_settle();
+    poll_until_gone(&router, "delete the cluster the table names", DELETED).await;
 
     // The REPORT path, the same fault on the same store: its template DOES name the
     // identifier, which is what keeps the two roles distinct — one wording for both would
@@ -278,12 +311,14 @@ enum PastTheGuard {
     Fault { status: u16, code: &'static str },
 }
 
-/// One row of the delete table: the operation, the members that name its resource, and what
-/// the same call answers once `SkipFinalSnapshot` is named.
+/// One row of the delete table: the operation, the members that name its resource, the
+/// sentence its API family words the missing pair with, and what the same call answers once
+/// `SkipFinalSnapshot` is named.
 struct DeleteCase {
     case: &'static str,
     action: &'static str,
     params: Vec<(&'static str, String)>,
+    expected: &'static str,
     past_the_guard: PastTheGuard,
 }
 
@@ -331,6 +366,11 @@ async fn a_delete_that_names_neither_final_snapshot_member_answers_one_fixed_sen
         ],
     )
     .await;
+    // The two cluster rows expect the accepted delete to acknowledge a RUNNING cluster, so
+    // that each one is up is looked for rather than assumed of the span its create owes.
+    for identifier in ["emu-nofinal-aurora", "emu-nofinal-docdb"] {
+        poll_until_available(&router, identifier, identifier).await;
+    }
     // Created last and not waited out, so this row's delete arrives while the clock still
     // owes the instance its transition — a delete is taken whatever status it is in.
     expect_ok(
@@ -343,6 +383,7 @@ async fn a_delete_that_names_neither_final_snapshot_member_answers_one_fixed_sen
             case: "a MySQL DB instance",
             action: "DeleteDBInstance",
             params: owned(&[("DBInstanceIdentifier", "emu-nofinal-mysql")]),
+            expected: FINAL_SNAPSHOT_REQUIRED,
             past_the_guard: PastTheGuard::DeleteTaken {
                 status_member: "DBInstanceStatus",
                 status: "deleting",
@@ -352,6 +393,7 @@ async fn a_delete_that_names_neither_final_snapshot_member_answers_one_fixed_sen
             case: "a PostgreSQL DB instance named upper-cased",
             action: "DeleteDBInstance",
             params: owned(&[("DBInstanceIdentifier", "EMU-NOFINAL-UPPER")]),
+            expected: FINAL_SNAPSHOT_REQUIRED,
             past_the_guard: PastTheGuard::DeleteTaken {
                 status_member: "DBInstanceStatus",
                 status: "deleting",
@@ -361,6 +403,7 @@ async fn a_delete_that_names_neither_final_snapshot_member_answers_one_fixed_sen
             case: "a MariaDB instance the clock has not settled yet",
             action: "DeleteDBInstance",
             params: owned(&[("DBInstanceIdentifier", "emu-nofinal-fresh")]),
+            expected: FINAL_SNAPSHOT_REQUIRED,
             past_the_guard: PastTheGuard::DeleteTaken {
                 status_member: "DBInstanceStatus",
                 status: "deleting",
@@ -370,6 +413,7 @@ async fn a_delete_that_names_neither_final_snapshot_member_answers_one_fixed_sen
             case: "an Aurora PostgreSQL DB cluster",
             action: "DeleteDBCluster",
             params: owned(&[("DBClusterIdentifier", "emu-nofinal-aurora")]),
+            expected: CLUSTER_FINAL_SNAPSHOT_REQUIRED,
             past_the_guard: PastTheGuard::DeleteTaken {
                 status_member: "Status",
                 status: "available",
@@ -379,6 +423,7 @@ async fn a_delete_that_names_neither_final_snapshot_member_answers_one_fixed_sen
             case: "a DocumentDB cluster",
             action: "DeleteDBCluster",
             params: owned(&[("DBClusterIdentifier", "emu-nofinal-docdb")]),
+            expected: CLUSTER_FINAL_SNAPSHOT_REQUIRED,
             past_the_guard: PastTheGuard::DeleteTaken {
                 status_member: "Status",
                 status: "available",
@@ -391,6 +436,7 @@ async fn a_delete_that_names_neither_final_snapshot_member_answers_one_fixed_sen
                 ("DBInstanceIdentifier", "emu-nofinal-cdb"),
                 ("TenantDBName", "emutenant"),
             ]),
+            expected: FINAL_SNAPSHOT_REQUIRED,
             // The guard answers before the tenant database is resolved, so the same call
             // with `SkipFinalSnapshot` named reaches the lookup and reports the tenant
             // database it could not find.
@@ -411,10 +457,10 @@ async fn a_delete_that_names_neither_final_snapshot_member_answers_one_fixed_sen
             "InvalidParameterCombination",
         );
         let message = text(&refused, "Message");
+        let expected = row.expected;
         assert_eq!(
-            message, FINAL_SNAPSHOT_REQUIRED,
-            "case {case:?}: expected the fixed sentence {FINAL_SNAPSHOT_REQUIRED:?}, got \
-             {message:?}"
+            message, expected,
+            "case {case:?}: expected the fixed sentence {expected:?}, got {message:?}"
         );
         for (member, value) in &row.params {
             assert!(
@@ -448,8 +494,12 @@ async fn a_delete_that_names_neither_final_snapshot_member_answers_one_fixed_sen
         }
     }
     assert_eq!(
-        sentences.len(),
-        1,
-        "one refusal class, worded one way whichever resource is deleted, got {sentences:?}"
+        sentences,
+        BTreeSet::from([
+            FINAL_SNAPSHOT_REQUIRED.to_string(),
+            CLUSTER_FINAL_SNAPSHOT_REQUIRED.to_string(),
+        ]),
+        "one refusal class, worded one way per API family of the deleted resource, got \
+         {sentences:?}"
     );
 }

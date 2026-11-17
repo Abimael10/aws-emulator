@@ -877,14 +877,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // which is the same modelled 404 as one that was never there: a replica of a resource
         // that is gone is not stored.
         match &replicates {
-            ResolvedSource::Instance(source_identifier) => {
+            ResolvedSource::Instance(_) => {
                 let Some(source) = store.db_instances.get_mut(&source_key) else {
                     return Err(
                         CreateDBInstanceReadReplicaErrorModeled::DBInstanceNotFoundFault(
                             DBInstanceNotFoundFault {
-                                message: Some(format!(
-                                    "DBInstance not found: {source_identifier}"
-                                )),
+                                message: Some(
+                                    crate::state::read_replica_source_instance_not_found_message(
+                                        named_source.named(),
+                                    ),
+                                ),
                             },
                         )
                         .into(),
@@ -961,6 +963,17 @@ enum NamedSource {
     Cluster(String),
 }
 
+impl NamedSource {
+    /// The value the REQUEST carried for the source it named, in the form it named it —
+    /// which is the variable part of every refusal about that source, so a caller reads
+    /// back what it sent rather than what this store keyed the resource by.
+    fn named(&self) -> &str {
+        match self {
+            Self::Instance(named) | Self::Cluster(named) => named,
+        }
+    }
+}
+
 /// The source as this handler RESOLVED it: which kind of resource it is, and the identifier
 /// this store holds that resource under.
 ///
@@ -1033,7 +1046,9 @@ fn resolve_source_instance(
         return Err(
             CreateDBInstanceReadReplicaErrorModeled::DBInstanceNotFoundFault(
                 DBInstanceNotFoundFault {
-                    message: Some(format!("DBInstance not found: {named}")),
+                    message: Some(
+                        crate::state::read_replica_source_instance_not_found_message(named),
+                    ),
                 },
             )
             .into(),
@@ -1088,17 +1103,16 @@ fn resolve_source_instance(
     }
     // A source that is not up has no backup to build the replica from either: that is the
     // other state the modelled `InvalidDBInstanceStateFault` reports, and it is what a caller
-    // that replicates straight after a create sees.
+    // that replicates straight after a create sees. ONE fixed sentence
+    // ([`crate::state::READ_REPLICA_SOURCE_NOT_AVAILABLE_MESSAGE`]), which is why it carries
+    // neither the source the request named nor the status that source is in.
     if source.status != crate::state::DB_INSTANCE_STATUS_AVAILABLE {
         return Err(
             CreateDBInstanceReadReplicaErrorModeled::InvalidDBInstanceStateFault(
                 InvalidDBInstanceStateFault {
-                    message: Some(format!(
-                        "DB instance {} is in {} state but must be {} to be replicated",
-                        source.identifier,
-                        source.status,
-                        crate::state::DB_INSTANCE_STATUS_AVAILABLE
-                    )),
+                    message: Some(
+                        crate::state::READ_REPLICA_SOURCE_NOT_AVAILABLE_MESSAGE.to_string(),
+                    ),
                 },
             )
             .into(),

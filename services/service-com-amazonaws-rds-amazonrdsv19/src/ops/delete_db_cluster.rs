@@ -286,7 +286,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
             (false, None) => {
                 return Err(DeleteDBClusterError::invalid_parameter_combination(
-                    crate::state::FINAL_SNAPSHOT_MEMBER_REQUIRED,
+                    crate::state::CLUSTER_FINAL_SNAPSHOT_MEMBER_REQUIRED,
                 ));
             }
             _ => {}

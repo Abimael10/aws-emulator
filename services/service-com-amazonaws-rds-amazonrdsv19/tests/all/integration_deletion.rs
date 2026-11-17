@@ -247,14 +247,17 @@ async fn an_identifier_that_names_no_integration_is_the_modelled_not_found() {
         .await,
     );
     let held_arn = text(&created, "IntegrationArn");
-    wait_for_settle();
+    // Nothing below depends on the status the clock owes this integration: every row is a
+    // LOOKUP that resolves nothing, and the held integration is read back at the end by its
+    // ARN, which a create answers and no transition changes.
 
     // (case, the region the call is signed for, the identifier it names) — the ways an
-    // identifier can name no integration the account holds: a name nothing created, an ARN
-    // nothing created, and the held integration read from another region, since RDS is
-    // regional.
-    let rows: [(&str, &str, &str); 4] = [
+    // identifier can name no integration the account holds: a name nothing created, a near
+    // miss of the held name, an ARN nothing created, and the held integration read from
+    // another region, since RDS is regional.
+    let rows: [(&str, &str, &str); 5] = [
         ("a name nothing created", REGION, "no-such-integration"),
+        ("a near miss of the held name", REGION, "held-integratio"),
         (
             "an ARN nothing created",
             REGION,
@@ -265,32 +268,44 @@ async fn an_identifier_that_names_no_integration_is_the_modelled_not_found() {
     ];
 
     for (case, region, identifier) in rows {
-        let body = expect_error(
-            case,
-            call_in(
-                &router,
-                region,
-                "DeleteIntegration",
-                &[("IntegrationIdentifier", identifier)],
-            )
-            .await,
-            404,
-            "IntegrationNotFoundFault",
-        );
         // The refusal names the integration it could not find by the ARN that identifies
         // one integration of one account in one region: the value as the request spelled it
         // where that was already an ARN, and otherwise the ARN the name would have in the
-        // region the call was signed for.
-        let expected = if identifier.starts_with("arn:") {
+        // region the call was signed for. The two sentences after it are Amazon RDS's own
+        // fixed text, which tells the caller the identifier may be stale rather than
+        // malformed, so the whole message is pinned here.
+        let named = if identifier.starts_with("arn:") {
             identifier.to_string()
         } else {
             format!("arn:aws:rds:{region}:{ACCOUNT}:integration:{identifier}")
         };
-        assert_eq!(
-            text(&body, "Message"),
-            format!("Integration with identifier {expected} could not be found."),
-            "case {case:?}: got {body}"
+        let expected = format!(
+            "Integration with identifier {named} could not be found. The integration might \
+             have been deleted, or you provided an incorrect identifier. Check the \
+             integration identifier and try again."
         );
+        // The delete and the REPORT resolve the same integration, so the one fault is
+        // worded the one way by both of them.
+        for action in ["DeleteIntegration", "DescribeIntegrations"] {
+            let case = format!("{action}: {case}");
+            let body = expect_error(
+                &case,
+                call_in(
+                    &router,
+                    region,
+                    action,
+                    &[("IntegrationIdentifier", identifier)],
+                )
+                .await,
+                404,
+                "IntegrationNotFoundFault",
+            );
+            let message = text(&body, "Message");
+            assert_eq!(
+                message, expected,
+                "case {case:?}: expected the whole text {expected:?}, got {message:?}"
+            );
+        }
     }
 
     // Every refusal above left the integration that IS held exactly where it was.

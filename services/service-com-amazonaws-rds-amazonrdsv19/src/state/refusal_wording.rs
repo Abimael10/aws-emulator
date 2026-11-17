@@ -180,7 +180,8 @@ pub const CLUSTER_STILL_HAS_MEMBERS_MESSAGE: &str =
 /// snapshot with the SkipFinalShapshot parameter" "results in an error": exactly one of the
 /// two may be given, which is what the sentence states, naming both members and neither
 /// value. One constant for every delete that carries the pair, for the same reason as
-/// [`FINAL_SNAPSHOT_MEMBER_REQUIRED`], which answers the other direction of the rule.
+/// [`FINAL_SNAPSHOT_MEMBER_REQUIRED`] and [`CLUSTER_FINAL_SNAPSHOT_MEMBER_REQUIRED`], which
+/// answer the other direction of the rule.
 pub const ONLY_ONE_FINAL_SNAPSHOT_MEMBER: &str =
     "Only one of SkipFinalSnapshot and FinalDBSnapshotIdentifier can be specified";
 

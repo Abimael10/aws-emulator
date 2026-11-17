@@ -41,8 +41,10 @@ pub const INTEGRATION_STATUS_DELETING: &str = "deleting";
 /// name is rendered as the ARN it would name in `region`.
 ///
 /// The sentence is the one the modelled fault publishes for ITSELF — "the specified
-/// integration could not be found" — with the identifier it is about named in it. Stated
-/// once here so every operation that resolves an integration answers the one text.
+/// integration could not be found" — with the identifier it is about named in it, followed
+/// by the two sentences Amazon RDS adds to tell a caller the identifier may be STALE rather
+/// than malformed: all three are fixed text, and the identifier is the only variable part.
+/// Stated once here so every operation that resolves an integration answers the one text.
 pub fn integration_not_found_message(region: &str, named: &str) -> String {
     let identifier = if named.starts_with("arn:") {
         named.to_string()
@@ -53,7 +55,11 @@ pub fn integration_not_found_message(region: &str, named: &str) -> String {
             &format!("{ARN_RESOURCE_TYPE}:{named}"),
         )
     };
-    format!("Integration with identifier {identifier} could not be found.")
+    format!(
+        "Integration with identifier {identifier} could not be found. The integration might \
+         have been deleted, or you provided an incorrect identifier. Check the integration \
+         identifier and try again."
+    )
 }
 
 /// The ARN resource type of an integration, as `IntegrationArn`'s own pattern spells it

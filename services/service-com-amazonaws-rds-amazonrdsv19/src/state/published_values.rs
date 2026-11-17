@@ -293,6 +293,33 @@ pub const AUTOMATED_BACKUPS_NOT_ENABLED_MESSAGE: &str =
 pub const READ_REPLICA_OF_A_CLUSTER_MEMBER_MESSAGE: &str =
     "Cannot create a read replica for a DB Instance that belongs to a DB Cluster";
 
+/// How Amazon RDS words the `DBInstanceNotFoundFault` of a read replica whose SOURCE DB
+/// instance the store cannot resolve.
+///
+/// A read-replica create carries TWO instance identifiers — the replica it is to mint
+/// (`DBInstanceIdentifier`) and the instance it is to replicate
+/// (`SourceDBInstanceIdentifier`) — so the refusal states which of the two was not found:
+/// the fixed text names the SOURCE, and the only variable part is the value the request
+/// carried for it, after the colon and carried verbatim (the member admits an identifier
+/// and an ARN alike). It is the instance-level counterpart of the source CLUSTER's own
+/// sentence ([`crate::state::db_cluster_cannot_be_accessed_message`]) rather than the
+/// generic instance lookup the reports and the single-identifier calls answer.
+pub fn read_replica_source_instance_not_found_message(named: &str) -> String {
+    format!("The source instance could not be found: {named}")
+}
+
+/// How Amazon RDS refuses a read replica of a source DB instance that is not up: the
+/// replica is built from the source's automated backup, so a source still coming up, going
+/// down, stopped or on its way out cannot be replicated — [`DB_INSTANCE_STATUS_AVAILABLE`]
+/// is the one state it can be replicated in.
+///
+/// ONE fixed sentence, which is why it is a constant: the service names neither the source
+/// the request carried nor the status that source is in — the status is what a describe of
+/// the instance reports, not part of this sentence — so nothing of the request or the store
+/// is substituted into it, and a caller matching the text reads what the real service sends.
+pub const READ_REPLICA_SOURCE_NOT_AVAILABLE_MESSAGE: &str =
+    "DB instance is not in the available state";
+
 /// Whether a DB instance of `engine` is one a read replica can be created FROM.
 ///
 /// `CreateDBInstanceReadReplicaMessage$SourceDBInstanceIdentifier` states the constraint:
@@ -1313,17 +1340,30 @@ pub fn engine_takes_a_master_user_password(engine: &str) -> bool {
 /// the member's constraints, which the engine publishes none of.
 pub const INVALID_MASTER_PASSWORD_MESSAGE: &str = "Invalid master password";
 
-/// What a delete that names NEITHER of its two final-snapshot members is refused with.
+/// What a delete of a DB INSTANCE — or of a tenant database inside one — that names NEITHER
+/// of its two final-snapshot members is refused with.
 ///
 /// `SkipFinalSnapshot`: "If you set this value to false or don't specify it, RDS creates a
 /// DB cluster snapshot before it deletes the DB cluster … If SkipFinalSnapshot is disabled,
 /// you must specify a value for the FinalDBSnapshotIdentifier parameter" — exactly one of
 /// the two has to be given, which is what the sentence states: it names the member the
 /// request has to carry and the member that waives it, and nothing of the request or the
-/// store. One constant for every delete that carries the pair, so one refusal class is
-/// worded one way whichever resource is being deleted.
+/// store. One constant for the instance-level deletes that carry the pair, so neither can
+/// drift from the other; the CLUSTER-level delete words the same class its own way
+/// ([`CLUSTER_FINAL_SNAPSHOT_MEMBER_REQUIRED`]).
 pub const FINAL_SNAPSHOT_MEMBER_REQUIRED: &str =
     "FinalDBSnapshotIdentifier is required unless SkipFinalSnapshot is specified.";
+
+/// What a delete of a DB CLUSTER that names NEITHER of its two final-snapshot members is
+/// refused with.
+///
+/// The same rule as [`FINAL_SNAPSHOT_MEMBER_REQUIRED`] — "If SkipFinalSnapshot is disabled,
+/// you must specify a value for the FinalDBSnapshotIdentifier parameter" — worded as the
+/// cluster API words it: an imperative naming the two members and nothing else, with no
+/// terminal period. ENTIRELY fixed text, so no identifier, value or limit of the request or
+/// of the store is substituted into it.
+pub const CLUSTER_FINAL_SNAPSHOT_MEMBER_REQUIRED: &str =
+    "Please specify FinalDBSnapshotIdentifier or SkipFinalSnapshot";
 
 
 /// The `BackupRetentionPeriod` a DB cluster accepts ("Constraints: Must be a value from 1
