@@ -364,9 +364,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ::std::collections::BTreeMap::new();
         // The LOG CONFIGURATION of each bus these entries name, read here with the
         // rest of that bus's configuration: it decides which records the bus writes
-        // about the events it ingests, and those records are written with no lock
-        // held (see [`crate::state::bus_logs`]).
-        let mut bus_log_configs: ::std::collections::BTreeMap<String, Option<LogConfig>> =
+        // about the events it ingests and about the handovers it fails, and those
+        // records are written with no lock held (see [`crate::state::bus_logs`]).
+        // Keyed by Region AND name ([`bus_log_key`]), because a bus name is unique
+        // within a Region: a copy re-published onto a same-named bus of another
+        // Region is a different bus, with a configuration of its own.
+        let mut bus_log_configs: ::std::collections::BTreeMap<BusLogKey, Option<LogConfig>> =
             ::std::collections::BTreeMap::new();
         {
             let mut store = state.lock();
@@ -393,7 +396,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     let log_config = bus.and_then(|bus| bus.log_config.clone());
                     routing.insert(accepted.bus.clone(), compiled);
                     bus_keys.insert(accepted.bus.clone(), bus_key);
-                    bus_log_configs.insert(accepted.bus.clone(), log_config);
+                    bus_log_configs.insert(bus_log_key(&region, &accepted.bus), log_config);
                     archiving.insert(
                         accepted.bus.clone(),
                         store
@@ -470,7 +473,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // ingested just as much as one that reached a target.
             if let Some(record) = crate::state::bus_logs::ingest_record(
                 bus_log_configs
-                    .get(&accepted.bus)
+                    .get(&bus_log_key(&region, &accepted.bus))
                     .and_then(Option::as_ref),
                 &region,
                 &crate::state::bus_logs::IngestedEvent {
@@ -621,7 +624,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the same shape as the per-entry budget the routing pass above spends.
         let mut republished_matching =
             crate::state::event_pattern::Budget::new(crate::state::MAX_MATCH_BYTES_PER_ENTRY);
-        'dispatch: while let Some(dispatch) = dispatches.pop_front() {
+        // What each dispatched event WAS — the bus whose rules matched it, the
+        // Region those rules were read in and the envelope its targets were
+        // handed — kept by `EventId` so the records this bus owes about a handover
+        // that failed can be rendered once every pass has decided its own
+        // handovers ([`append_invocation_failures`]). Every dispatch carries an
+        // `EventId` of its own, a copy re-published onto another bus included (it
+        // is minted a new one, see [`republish`]), and the envelope is MOVED here
+        // rather than copied. What this holds is bounded by the request's delivery
+        // budget: a dispatch is queued only where a matched rule has a target, and
+        // every handover charges that budget for the text it hands over before it
+        // is made, so the envelopes kept here weigh no more than the bytes the
+        // request may deliver.
+        let mut dispatched: ::std::collections::BTreeMap<String, Dispatched> =
+            ::std::collections::BTreeMap::new();
+        while let Some(dispatch) = dispatches.pop_front() {
+            // Whether this request's delivery budget ran out part way through this
+            // event's targets: the remaining targets of this event, and every
+            // event still queued, are not handed anything — and what this event
+            // WAS is still recorded below, so the records the bus owes about the
+            // handovers already made are rendered for it.
+            let mut budget_spent = false;
             for rule in &dispatch.matched {
                 let rule_arn = crate::state::rule_arn(&dispatch.region, &dispatch.bus, &rule.name);
                 for target in &rule.targets {
@@ -706,7 +729,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                             // The request's delivery budget is spent: the
                             // remaining targets are not handed anything, and
                             // nothing is recorded for them either.
-                            Handed::BudgetSpent => break 'dispatch,
+                            Handed::BudgetSpent => {
+                                budget_spent = true;
+                                break;
+                            }
                         }
                     };
                     invocations.push(crate::state::TargetInvocation {
@@ -717,6 +743,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         outcome,
                     });
                 }
+                if budget_spent {
+                    break;
+                }
+            }
+            dispatched.insert(
+                dispatch.event_id.clone(),
+                Dispatched {
+                    bus: dispatch.bus,
+                    region: dispatch.region,
+                    envelope: dispatch.rendered,
+                },
+            );
+            if budget_spent {
+                break;
             }
         }
 
@@ -735,6 +775,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A copy re-published onto another bus was matched by THAT bus's rules,
         // so those rules triggered too, and are counted the same way.
         crate::state::count_rule_matches(cloudwatch.as_ref(), &republished).await;
+
+        // Every handover this request FAILED is a record the bus's own log
+        // configuration owes at its error level, rendered now that every pass has
+        // decided its handovers — the ones a queue's batched send decided included
+        // ([`queue_sends::flush`] above) — and written with the ingest records in
+        // the pass below.
+        append_invocation_failures(
+            &state,
+            &mut bus_log_configs,
+            &dispatched,
+            &invocations,
+            &mut bus_log_records,
+            now,
+        );
 
         // PASS 6 — under the lock once more, to append what came of each
         // handover: the invocation log is how a client observes a delivery that
@@ -882,6 +936,108 @@ fn bus_key_refusals<Eng: Send + Sync + 'static>(
         refusals.insert(bus.clone(), kms_store::invalid_state_message(key));
     }
     refusals
+}
+
+/// Which bus a stored log configuration belongs to: the Region it is held in and its
+/// name, because a bus name is unique WITHIN a Region — two Regions may each hold a
+/// bus of one name, with a configuration of its own.
+type BusLogKey = (String, String);
+
+/// The key the configuration of the bus `bus` of `region` is held under.
+fn bus_log_key(region: &str, bus: &str) -> BusLogKey {
+    (region.to_string(), bus.to_string())
+}
+
+/// One dispatched event, kept for the records its bus owes about the handovers
+/// that event's targets were made: which bus routed it, the Region that bus's
+/// rules and ARNs are read in, and the envelope the targets were handed.
+struct Dispatched {
+    bus: String,
+    region: String,
+    envelope: String,
+}
+
+/// Append to `records` the ERROR bus-log record each handover of this request
+/// that FAILED owes.
+///
+/// The rule: a bus whose `LogConfig$Level` covers the error records writes one
+/// `INVOCATION_FAILURE` record per target invocation that did not succeed,
+/// naming the rule and the target the handover was made under and the condition
+/// it failed with ([`crate::state::bus_logs::invocation_failure_record`]) — the
+/// one signal a client turning logging on has for a target that is not firing.
+/// The verdict it reports is the one the invocation log and the dead letter
+/// already carry, so the three cannot disagree about a delivery.
+///
+/// It is read off the invocation log rather than written where each handover was
+/// decided, so a handover a queue's batched send decided
+/// ([`queue_sends::flush`]) is reported exactly as one the delivery pass decided
+/// inline is. An outcome that was never ATTEMPTED is not a failure of the
+/// delivery — it is a target kind this emulator makes no call for — so nothing
+/// is written about it.
+///
+/// Takes this store's guard only to read the configuration of a bus the request
+/// did not itself name (one a copy was re-published onto), and never while a
+/// record is rendered.
+fn append_invocation_failures(
+    state: &::engine::ServiceState<crate::state::ComAmazonawsEventbridgeAwseventsState>,
+    configs: &mut ::std::collections::BTreeMap<BusLogKey, Option<LogConfig>>,
+    dispatched: &::std::collections::BTreeMap<String, Dispatched>,
+    invocations: &[crate::state::TargetInvocation],
+    records: &mut Vec<crate::state::bus_logs::BusLogRecord>,
+    now: ::std::time::SystemTime,
+) {
+    let failed: Vec<(&crate::state::TargetInvocation, &Dispatched, &str, &str)> = invocations
+        .iter()
+        .filter_map(|invocation| {
+            let crate::state::InvocationOutcome::Failed { code, message } = &invocation.outcome
+            else {
+                return None;
+            };
+            let dispatch = dispatched.get(&invocation.event_id)?;
+            Some((invocation, dispatch, code.as_str(), message.as_str()))
+        })
+        .collect();
+    if failed.is_empty() {
+        return;
+    }
+    // The configuration of every bus one of those handovers was made under, read
+    // ONCE each: the routing pass already read the buses this request's entries
+    // named, so this reads only a bus a copy was re-published onto.
+    {
+        let store = state.lock();
+        for (_, dispatch, ..) in &failed {
+            let key = bus_log_key(&dispatch.region, &dispatch.bus);
+            if configs.contains_key(&key) {
+                continue;
+            }
+            let config = store
+                .bus(&dispatch.region, &dispatch.bus)
+                .and_then(|bus| bus.log_config.clone());
+            configs.insert(key, config);
+        }
+    }
+    for (invocation, dispatch, code, message) in failed {
+        records.extend(crate::state::bus_logs::invocation_failure_record(
+            configs
+                .get(&bus_log_key(&dispatch.region, &dispatch.bus))
+                .and_then(Option::as_ref),
+            &dispatch.region,
+            &crate::state::bus_logs::FailedInvocation {
+                bus: &dispatch.bus,
+                event_id: &invocation.event_id,
+                rule_arn: &crate::state::rule_arn(
+                    &dispatch.region,
+                    &dispatch.bus,
+                    &invocation.rule,
+                ),
+                target_arn: &invocation.target_arn,
+                error_code: code,
+                error_message: message,
+                envelope: &dispatch.envelope,
+            },
+            now,
+        ));
+    }
 }
 
 /// A refused entry's result: no `EventId`, and the code and message saying why.
@@ -4598,401 +4754,10 @@ impl Clients {
     }
 }
 
+/// The unit tests of this module's own helpers.
+///
+/// The `#[path]` is what points the child at `ops/put_events/`, for the reason
+/// the api-destination module above gives.
 #[cfg(test)]
-mod tests {
-    use super::{invoked_under_target_role, kinesis_partition_key, sqs_queue, TargetKind};
-
-    /// One row of the table below: the case, the target's ARN, the kind that ARN
-    /// names, the IAM action its invocation performs, and whether a target of
-    /// that ARN's service is invoked under the target's own role.
-    type Row = (&'static str, String, Option<TargetKind>, Option<&'static str>, bool);
-
-    /// Which invocation a target ARN names, the IAM action that invocation
-    /// performs, and whether the target's `RoleArn` is what governs it — over a
-    /// TABLE of ARNs rather than one target: the rows differ along the service,
-    /// along the resource type within a service, and along the forms that name no
-    /// invocable resource at all.
-    ///
-    /// The kinds, and the action each needs, are the ones the EventBridge
-    /// targets reference states for them: `sqs:SendMessage` for a queue,
-    /// `lambda:InvokeFunction` for a function, `sns:Publish` for a topic,
-    /// `states:StartExecution` for a state machine, `kinesis:PutRecord` for a
-    /// data stream, `firehose:PutRecord` for a delivery stream and
-    /// `glue:notifyEvent` for a workflow. Which of them is
-    /// invoked under the target's role is that reference's other sentence: a role
-    /// for a state machine, a Kinesis data stream, a Firehose delivery stream and
-    /// a Glue workflow, a resource-based policy for a queue, a topic and a
-    /// function. That half is a question about the target's SERVICE rather than
-    /// about the resource it names — the role is assumed before the call is made
-    /// — so it is answered for an ARN naming no invocable resource too, and only
-    /// an ARN naming no service at all is governed by no role.
-    #[test]
-    fn a_target_arn_names_the_invocation_its_service_is_reached_by() {
-        let account = ::engine::emulator_account_id();
-        // (case, the target's ARN, the kind it names, the action it performs,
-        //  whether a target of its service is invoked under the target's role)
-        let rows: Vec<Row> = vec![
-            (
-                "an SQS queue",
-                format!("arn:aws:sqs:eu-west-2:{account}:orders"),
-                Some(TargetKind::Queue),
-                Some("sqs:SendMessage"),
-                false,
-            ),
-            (
-                "a FIFO queue, whose name carries a suffix",
-                format!("arn:aws:sqs:eu-west-2:{account}:orders.fifo"),
-                Some(TargetKind::Queue),
-                Some("sqs:SendMessage"),
-                false,
-            ),
-            (
-                "a Lambda function",
-                format!("arn:aws:lambda:eu-west-2:{account}:function:handler"),
-                Some(TargetKind::Function),
-                Some("lambda:InvokeFunction"),
-                false,
-            ),
-            (
-                "a Lambda function alias, which is still a function",
-                format!("arn:aws:lambda:eu-west-2:{account}:function:handler:live"),
-                Some(TargetKind::Function),
-                Some("lambda:InvokeFunction"),
-                false,
-            ),
-            (
-                "an SNS topic",
-                format!("arn:aws:sns:eu-west-2:{account}:fanout"),
-                Some(TargetKind::Topic),
-                Some("sns:Publish"),
-                false,
-            ),
-            (
-                "a Step Functions state machine",
-                format!("arn:aws:states:eu-west-2:{account}:stateMachine:flow"),
-                Some(TargetKind::StateMachine),
-                Some("states:StartExecution"),
-                true,
-            ),
-            (
-                "a Kinesis data stream",
-                format!("arn:aws:kinesis:eu-west-2:{account}:stream/telemetry"),
-                Some(TargetKind::Stream),
-                Some("kinesis:PutRecord"),
-                true,
-            ),
-            (
-                "a Glue workflow",
-                format!("arn:aws:glue:eu-west-2:{account}:workflow/nightly"),
-                Some(TargetKind::Workflow),
-                Some("glue:notifyEvent"),
-                true,
-            ),
-            // A resource WITHIN a workflow rather than the workflow: a run is
-            // not something an event is delivered to.
-            (
-                "a Glue workflow run",
-                format!("arn:aws:glue:eu-west-2:{account}:workflow/nightly/run/wr_1"),
-                None,
-                None,
-                true,
-            ),
-            // A resource of the same service that is not a workflow at all.
-            (
-                "a Glue table",
-                format!("arn:aws:glue:eu-west-2:{account}:table/sales/orders"),
-                None,
-                None,
-                true,
-            ),
-            // A resource WITHIN a stream rather than the stream: a consumer is
-            // not something a record is written to.
-            (
-                "a Kinesis stream consumer",
-                format!("arn:aws:kinesis:eu-west-2:{account}:stream/telemetry/consumer/reader"),
-                None,
-                None,
-                true,
-            ),
-            // A resource of a service this invokes, but not one it can invoke.
-            (
-                "a Step Functions activity",
-                format!("arn:aws:states:eu-west-2:{account}:activity:worker"),
-                None,
-                None,
-                true,
-            ),
-            (
-                "a Lambda layer",
-                format!("arn:aws:lambda:eu-west-2:{account}:layer:shared"),
-                None,
-                None,
-                false,
-            ),
-            (
-                "a CodePipeline pipeline",
-                format!("arn:aws:codepipeline:eu-west-2:{account}:orders-pipeline"),
-                Some(TargetKind::Pipeline),
-                Some("codepipeline:StartPipelineExecution"),
-                true,
-            ),
-            // Resources of that same service that are NOT a pipeline: each is keyed by a
-            // compound resource field, so no execution is started for it.
-            (
-                "a CodePipeline webhook",
-                format!("arn:aws:codepipeline:eu-west-2:{account}:webhook:on-push"),
-                None,
-                None,
-                true,
-            ),
-            (
-                "a CodePipeline custom action type",
-                format!("arn:aws:codepipeline:eu-west-2:{account}:actiontype:Build/Custom/1"),
-                None,
-                None,
-                true,
-            ),
-            // A CloudWatch Logs log group, in both forms of its ARN: the group
-            // alone and the group with everything under it, which is the ARN a
-            // client reads off `DescribeLogGroups`.
-            (
-                "a CloudWatch log group",
-                format!("arn:aws:logs:eu-west-2:{account}:log-group:/demo:*"),
-                Some(TargetKind::LogGroup),
-                Some("logs:PutLogEvents"),
-                false,
-            ),
-            (
-                "a CloudWatch log group named on its own",
-                format!("arn:aws:logs:eu-west-2:{account}:log-group:/demo"),
-                Some(TargetKind::LogGroup),
-                Some("logs:PutLogEvents"),
-                false,
-            ),
-            // A resource WITHIN a group is not the group, so no log event is
-            // written for it.
-            (
-                "a CloudWatch log stream",
-                format!("arn:aws:logs:eu-west-2:{account}:log-group:/demo:log-stream:one"),
-                None,
-                None,
-                false,
-            ),
-            // An Amazon Data Firehose delivery stream, which a record is put
-            // into, and a resource field that names no stream at all.
-            (
-                "a Firehose delivery stream",
-                format!("arn:aws:firehose:eu-west-2:{account}:deliverystream/orders"),
-                Some(TargetKind::DeliveryStream),
-                Some("firehose:PutRecord"),
-                true,
-            ),
-            (
-                "a Firehose resource that is not a delivery stream",
-                format!("arn:aws:firehose:eu-west-2:{account}:deliverystream"),
-                None,
-                None,
-                true,
-            ),
-            // Services with no invocation here at all.
-            (
-                "an ECS task definition",
-                format!("arn:aws:ecs:eu-west-2:{account}:task-definition/batch:1"),
-                None,
-                None,
-                true,
-            ),
-            (
-                "a value that is not an ARN",
-                "orders".to_string(),
-                None,
-                None,
-                false,
-            ),
-        ];
-
-        for (case, arn, expected, action, under_role) in rows {
-            let kind = TargetKind::of(&arn);
-            assert_eq!(
-                kind, expected,
-                "case {case:?}: expected {expected:?}, got {kind:?}"
-            );
-            assert_eq!(
-                kind.map(TargetKind::action),
-                action,
-                "case {case:?}: expected the action {action:?}, got {:?}",
-                kind.map(TargetKind::action)
-            );
-            let governed = invoked_under_target_role(&arn);
-            assert_eq!(
-                governed, under_role,
-                "case {case:?}: expected invoked-under-role {under_role}, got {governed}"
-            );
-        }
-    }
-
-    /// The url a queue ARN is addressed by, and the forms that address none.
-    #[test]
-    fn a_queue_arn_resolves_to_the_url_sqs_addresses_it_by() {
-        let account = ::engine::emulator_account_id();
-        let rows: Vec<(&str, String, Option<String>)> = vec![
-            (
-                "a queue of this account",
-                format!("arn:aws:sqs:eu-west-2:{account}:orders"),
-                Some(format!("https://sqs.eu-west-2.amazonaws.com/{account}/orders")),
-            ),
-            (
-                "a queue in another Region",
-                format!("arn:aws:sqs:us-east-1:{account}:orders"),
-                Some(format!("https://sqs.us-east-1.amazonaws.com/{account}/orders")),
-            ),
-            (
-                "an ARN of another service",
-                format!("arn:aws:sns:eu-west-2:{account}:orders"),
-                None,
-            ),
-            (
-                "an SQS ARN whose resource carries a separator",
-                format!("arn:aws:sqs:eu-west-2:{account}:orders/dead"),
-                None,
-            ),
-            ("a value that is not an ARN", "orders".to_string(), None),
-        ];
-        for (case, arn, expected) in rows {
-            let url = sqs_queue(&arn);
-            assert_eq!(
-                url, expected,
-                "case {case:?}: expected {expected:?}, got {url:?}"
-            );
-        }
-    }
-
-    /// An entry's `Detail` nests as deep as its CONTAINERS go: a container
-    /// delimiter inside a JSON string is text, not structure, so it does not
-    /// count — which is what lets the published nesting bound be charged on the
-    /// document before anything parses it. The rows differ along where the
-    /// delimiters sit, how the string around them is escaped, and whether the
-    /// deepest nesting is the first one reached.
-    #[test]
-    fn a_detail_nests_as_deep_as_its_containers_and_no_deeper() {
-        // (case, the document, the nesting depth it has)
-        let rows: Vec<(&str, &str, usize)> = vec![
-            ("no container at all", "7", 0),
-            ("a flat object", r#"{"a":1}"#, 1),
-            ("an object inside an object", r#"{"a":{"b":1}}"#, 2),
-            ("an array inside an object", r#"{"a":[1,2]}"#, 2),
-            ("arrays inside an array", r#"{"a":[[[1]]]}"#, 4),
-            ("delimiters inside a string value", r#"{"a":"{{{[[["}"#, 1),
-            ("an escaped quote before a delimiter", r#"{"a":"\"{"}"#, 1),
-            ("an escaped backslash ending the string", r#"{"a":"\\","b":{"c":1}}"#, 2),
-            ("the deepest of two siblings", r#"{"a":{"b":1},"c":{"d":{"e":1}}}"#, 3),
-            ("a delimiter in a KEY", r#"{"{a}":{"b":1}}"#, 2),
-        ];
-        for (case, document, depth) in rows {
-            let measured = crate::state::json_nesting_depth(document);
-            assert_eq!(
-                measured, depth,
-                "case {case:?}: expected a nesting depth of {depth}, got {measured}"
-            );
-        }
-    }
-
-    /// A `Detail` anywhere within the published nesting bound is JUDGED without
-    /// descending into it: the depth charge and the form check cost no stack, so
-    /// an entry is screened on the thread its request arrived on however deeply
-    /// it nests, and a document past the bound is refused without being read.
-    /// (Building the parse tree is the read that does descend, and it is reached
-    /// only for a document this has bounded.)
-    #[test]
-    fn a_detail_is_judged_without_descending_into_it() {
-        // A stack far smaller than any thread this emulator serves on, so the
-        // judgement is shown to cost no depth rather than to fit a large one.
-        const SMALL_STACK_BYTES: usize = 256 * 1024;
-        let deepest = crate::state::MAX_DETAIL_DEPTH;
-        let mut document = "1".to_string();
-        for _ in 0..deepest {
-            document = format!(r#"{{"a":{document}}}"#);
-        }
-        // One level past the bound, which must be refused rather than read.
-        let over = format!(r#"{{"a":{document}}}"#);
-        let judged = ::std::thread::Builder::new()
-            .stack_size(SMALL_STACK_BYTES)
-            .spawn(move || {
-                (
-                    crate::state::validate_detail(&document),
-                    crate::state::validate_detail(&over),
-                )
-            })
-            .expect("the probe thread starts")
-            .join()
-            .expect("the probe thread finishes");
-        assert_eq!(
-            judged,
-            (
-                Ok(()),
-                Err(crate::state::DetailRefusal::TooDeep(deepest + 1))
-            ),
-            "a Detail at and past {deepest} levels must be judged on a \
-             {SMALL_STACK_BYTES}-byte stack"
-        );
-    }
-
-    /// The partition key a Kinesis target's record is written under, for the
-    /// cases the wire-level table in `tests/all/kinesis_target_delivery.rs` does
-    /// NOT reach: the value types a delivered event's detail can hold beyond a
-    /// string, a number and an object (a whole array, a boolean, an explicit
-    /// null), a path whose own prefix names no container, a union of member
-    /// names, and a path past the length the shared reading of a path evaluates.
-    /// Every case the wire table already pins is left to it rather than restated
-    /// here.
-    ///
-    /// The rule: the key is the JSON text of the value
-    /// `KinesisParameters$PartitionKeyPath` selects from the delivered text, and
-    /// the empty JSON object when it selects no single value.
-    #[test]
-    fn a_kinesis_targets_record_is_keyed_on_what_its_path_selects() {
-        const EVENT_ID: &str = "11111111-2222-3333-4444-555555555555";
-        // Past the length the shared reading of a path evaluates (the wrapper
-        // `$['…']` adds five bytes to the name), so this row sits outside that
-        // bound rather than merely being long.
-        let long_path = format!(
-            "$['{}']",
-            "a".repeat(::service_common::json_reference_path::MAX_PATH_BYTES)
-        );
-        let delivered = ::serde_json::json!({
-            "id": EVENT_ID,
-            "source": "com.demo.orders",
-            "detail": {
-                "n": 7,
-                "tenant": "tenant-alpha",
-                "list": [1, 2],
-                "flag": true,
-                "nothing": ::serde_json::Value::Null,
-            },
-        })
-        .to_string();
-        // (case, the target's PartitionKeyPath, the key the record carries)
-        let rows: [(&str, &str, &str); 6] = [
-            ("a whole array", "$.detail.list", "[1,2]"),
-            ("a boolean", "$.detail.flag", "true"),
-            ("an explicit null", "$.detail.nothing", "null"),
-            ("a path under no container", "$.detail.n.deeper", "{}"),
-            // A union asks for a node LIST rather than one place, which this
-            // emulator does not follow: it selects nothing rather than being
-            // evaluated against the whole document.
-            ("a union of members", "$['n','tenant']", "{}"),
-            (
-                "a path longer than the shared reading evaluates",
-                long_path.as_str(),
-                "{}",
-            ),
-        ];
-        for (case, path, expected) in rows {
-            let key = kinesis_partition_key(Some(path), EVENT_ID, &delivered);
-            assert_eq!(
-                key, expected,
-                "case {case:?}: expected the partition key {expected:?}, got {key:?}"
-            );
-        }
-    }
-}
+#[path = "put_events/tests.rs"]
+mod tests;

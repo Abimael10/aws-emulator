@@ -82,6 +82,11 @@ pub const ERROR_LOGS_LOG_TYPE: &str = "ERROR_LOGS";
 /// client has that the bus received an event, as opposed to never seeing it or dropping it.
 pub const EVENT_INGEST_SUCCESS: &str = "EVENT_INGEST_SUCCESS";
 
+/// The `message_type` of the record a bus writes for a target invocation that did NOT
+/// succeed: the one signal a client has that an event the bus routed never reached the
+/// target the rule pointed it at.
+pub const INVOCATION_FAILURE: &str = "INVOCATION_FAILURE";
+
 /// The record member naming the resource the record is about: the bus's own ARN.
 const RESOURCE_ARN_FIELD: &str = "resource_arn";
 
@@ -117,6 +122,26 @@ const DETAIL_TYPE_DETAIL: &str = "detail_type";
 /// The `details` member carrying the published event's own `Detail`, written only under
 /// [`INCLUDE_DETAIL_FULL`].
 const EVENT_DETAIL_DETAIL: &str = "event_detail";
+
+/// The `details` member naming the rule whose `EventPattern` matched the event the failed
+/// invocation was carrying, by its ARN.
+const RULE_ARN_DETAIL: &str = "rule_arn";
+
+/// The `details` member naming the target the failed invocation was made on, by its `Arn`.
+const TARGET_ARN_DETAIL: &str = "target_arn";
+
+/// The `details` member naming the status the invocation ENDED on — the condition the dead
+/// letter of that delivery carries beside it ([`super::NO_PERMISSIONS`] and its
+/// neighbours), which for a failed invocation is what withheld it.
+const FINAL_INVOCATION_STATUS_DETAIL: &str = "final_invocation_status";
+
+/// The `details` member carrying what that condition reported: the sentence the target's own
+/// service, or the authorization that withheld the call, gave for it.
+const ERROR_MESSAGE_DETAIL: &str = "error_message";
+
+/// The `details` member carrying what the target was to be HANDED — the event envelope, or
+/// the text the target asked for instead — written only under [`INCLUDE_DETAIL_FULL`].
+const TARGET_INPUT_DETAIL: &str = "target_input";
 
 /// One record a bus's log configuration owes about one event.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -293,6 +318,87 @@ pub fn ingest_record(
         log_level: LOG_LEVEL_INFO.to_string(),
         message_type: EVENT_INGEST_SUCCESS.to_string(),
         event_id: event.event_id.to_string(),
+        at,
+        details,
+    })
+}
+
+/// One invocation of a rule's target that FAILED, as the record about it reports it: which
+/// bus routed the event, which event it was, the rule and the target the handover was made
+/// under, and the condition it failed with.
+#[derive(Debug, Clone, Copy)]
+pub struct FailedInvocation<'a> {
+    /// The bus whose rule matched the event — the resource the record is about.
+    pub bus: &'a str,
+    /// The `EventId` of the event that was not delivered.
+    pub event_id: &'a str,
+    /// The ARN of the rule whose match made this handover.
+    pub rule_arn: &'a str,
+    /// The `Arn` of the target the handover was made on.
+    pub target_arn: &'a str,
+    /// The condition EventBridge reports for the failure, which is the status the
+    /// invocation ended on.
+    pub error_code: &'a str,
+    /// What that condition reported.
+    pub error_message: &'a str,
+    /// What the target was to be handed — the event envelope, or the text the target asked
+    /// for instead — carried only where the configuration asks for it
+    /// ([`includes_detail`]).
+    pub envelope: &'a str,
+}
+
+/// The [`INVOCATION_FAILURE`] record a bus owes for one handover that failed, or `None` when
+/// that bus's configuration writes none.
+///
+/// The record is written at [`LOG_LEVEL_ERROR`], so a bus configured at that level writes it
+/// while writing no informational record at all — which is the whole point of the error
+/// level: a client that turns on logging to find out why a target is not firing is told what
+/// withheld the invocation and on which rule and target.
+#[must_use]
+pub fn invocation_failure_record(
+    config: Option<&LogConfig>,
+    region: &str,
+    failure: &FailedInvocation<'_>,
+    at: SystemTime,
+) -> Option<BusLogRecord> {
+    if !emitted_at_level(config, LOG_LEVEL_ERROR) {
+        return None;
+    }
+    let mut details = ::serde_json::Map::new();
+    details.insert(
+        RULE_ARN_DETAIL.to_string(),
+        failure.rule_arn.to_string().into(),
+    );
+    details.insert(
+        TARGET_ARN_DETAIL.to_string(),
+        failure.target_arn.to_string().into(),
+    );
+    details.insert(
+        FINAL_INVOCATION_STATUS_DETAIL.to_string(),
+        failure.error_code.to_string().into(),
+    );
+    details.insert(
+        ERROR_MESSAGE_DETAIL.to_string(),
+        failure.error_message.to_string().into(),
+    );
+    // What the target was to be handed is "detailed event information", so it travels under
+    // the same configuration member that decides whether an ingest record carries the
+    // event's own detail: a bus configured to keep the event out of its logs keeps it out of
+    // this record too. It travels as the TEXT the delivery would have sent, exactly as the
+    // event's own detail does in an ingest record, so a consumer reads what the target would
+    // have received rather than a re-serialization of it.
+    if includes_detail(config) {
+        details.insert(
+            TARGET_INPUT_DETAIL.to_string(),
+            failure.envelope.to_string().into(),
+        );
+    }
+    Some(BusLogRecord {
+        bus: failure.bus.to_string(),
+        bus_arn: event_bus_arn(region, failure.bus),
+        log_level: LOG_LEVEL_ERROR.to_string(),
+        message_type: INVOCATION_FAILURE.to_string(),
+        event_id: failure.event_id.to_string(),
         at,
         details,
     })
@@ -539,6 +645,77 @@ mod tests {
             "case the carried detail: expected the published Detail, got {}",
             parsed[DETAILS_FIELD]
         );
+    }
+
+    /// RULE: the record about a handover that failed is an ERROR one naming the rule, the
+    /// target and the status the invocation ended on — and it carries what the target was to
+    /// be handed only under `IncludeDetail` `FULL`.
+    #[test]
+    fn a_failed_handover_is_reported_at_the_error_level() {
+        // One row per (configured level, `IncludeDetail`) pair: a bus at `OFF` writes no
+        // error record, and every level that covers them writes one.
+        let envelope = r#"{"id":"7f2c","detail":{"qty":2}}"#;
+        let failure = FailedInvocation {
+            bus: "orders",
+            event_id: "7f2c",
+            rule_arn: "arn:aws:events:eu-west-2:000000000000:rule/orders/to-audit",
+            target_arn: "arn:aws:logs:eu-west-2:000000000000:log-group:/aws/events/audit",
+            error_code: super::NO_PERMISSIONS,
+            error_message: "not authorized to perform: logs:PutLogEvents",
+            envelope,
+        };
+        for (level, include_detail, written, carries_input) in [
+            (LOG_LEVEL_OFF, INCLUDE_DETAIL_FULL, false, false),
+            (LOG_LEVEL_ERROR, INCLUDE_DETAIL_FULL, true, true),
+            (LOG_LEVEL_ERROR, "NONE", true, false),
+            (LOG_LEVEL_INFO, INCLUDE_DETAIL_FULL, true, true),
+            (LOG_LEVEL_TRACE, "NONE", true, false),
+        ] {
+            let case = format!("a bus at {level} with {include_detail} detail");
+            let record = invocation_failure_record(
+                Some(&config(level, include_detail)),
+                "eu-west-2",
+                &failure,
+                SystemTime::UNIX_EPOCH,
+            );
+            let Some(record) = record else {
+                assert!(!written, "case {case}: expected a record, got none");
+                continue;
+            };
+            assert!(written, "case {case}: expected no record, got {record:?}");
+            assert_eq!(
+                (record.message_type.as_str(), record.log_level.as_str()),
+                (INVOCATION_FAILURE, LOG_LEVEL_ERROR),
+                "case {case}: expected an {INVOCATION_FAILURE} record at {LOG_LEVEL_ERROR}, \
+                 got {record:?}"
+            );
+            for (member, expected) in [
+                (RULE_ARN_DETAIL, ::serde_json::json!(failure.rule_arn)),
+                (TARGET_ARN_DETAIL, ::serde_json::json!(failure.target_arn)),
+                (
+                    FINAL_INVOCATION_STATUS_DETAIL,
+                    ::serde_json::json!(failure.error_code),
+                ),
+                (
+                    ERROR_MESSAGE_DETAIL,
+                    ::serde_json::json!(failure.error_message),
+                ),
+            ] {
+                assert_eq!(
+                    record.details.get(member),
+                    Some(&expected),
+                    "case {case}: expected the {member} detail to be {expected}, got {:?}",
+                    record.details
+                );
+            }
+            let carried = record.details.get(TARGET_INPUT_DETAIL);
+            let expected = carries_input.then(|| ::serde_json::json!(envelope));
+            assert_eq!(
+                carried,
+                expected.as_ref(),
+                "case {case}: expected the carried input {expected:?}, got {carried:?}"
+            );
+        }
     }
 
     /// RULE: a record's own level selects the log types a delivery source carries it under.
