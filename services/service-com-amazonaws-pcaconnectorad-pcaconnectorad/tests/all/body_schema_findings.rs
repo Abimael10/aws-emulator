@@ -37,14 +37,14 @@ use super::pattern_refusal_messages::{
 };
 
 /// `DirectoryId`'s modelled expression, as the model declares it.
-const DIRECTORY_ID_PATTERN: &str = r"^d-[0-9a-f]{10}$";
+pub const DIRECTORY_ID_PATTERN: &str = r"^d-[0-9a-f]{10}$";
 
 /// `CertificateAuthorityArn`'s modelled expression.
-const CERTIFICATE_AUTHORITY_ARN_PATTERN: &str =
+pub const CERTIFICATE_AUTHORITY_ARN_PATTERN: &str =
     r"^arn:[\w-]+:acm-pca:[\w-]+:[0-9]+:certificate-authority\/[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}$";
 
 /// `SecurityGroupId`'s modelled expression — the list's ELEMENT, not the list.
-const SECURITY_GROUP_ID_PATTERN: &str = r"^(?:sg-[0-9a-f]{8}|sg-[0-9a-f]{17})$";
+pub const SECURITY_GROUP_ID_PATTERN: &str = r"^(?:sg-[0-9a-f]{8}|sg-[0-9a-f]{17})$";
 
 /// `GroupSecurityIdentifier`'s modelled expression.
 const GROUP_SID_PATTERN: &str = r"^S-[0-9]-([0-9]+-){1,14}[0-9]+$";
@@ -57,7 +57,7 @@ const CLIENT_TOKEN_PATTERN: &str = r"^[!-~]+$";
 const CLIENT_TOKEN_MAX_LENGTH: usize = 64;
 
 /// `SecurityGroupIds`' modelled `@length` minimum.
-const SECURITY_GROUP_IDS_MIN: usize = 1;
+pub const SECURITY_GROUP_IDS_MIN: usize = 1;
 
 /// The values `AccessRight` admits, in the order the model declares them.
 const ACCESS_RIGHT_VALUES: [&str; 2] = ["ALLOW", "DENY"];
@@ -90,12 +90,12 @@ fn well_formed_template_arn() -> String {
 /// One finding of the bracketed list: a string outside the expression its schema declares,
 /// which quotes the expression as the MODEL writes it — anchors included, because this is
 /// the schema's own expression and not the per-member clause's rendering of it.
-fn regex_finding(pattern: &str, value: &str) -> String {
+pub fn regex_finding(pattern: &str, value: &str) -> String {
     format!("ECMA 262 regex \"{pattern}\" does not match input string \"{value}\"")
 }
 
 /// One finding for an ARRAY carrying fewer elements than its schema admits.
-fn array_finding(min: usize, found: usize) -> String {
+pub fn array_finding(min: usize, found: usize) -> String {
     format!("array is too short: must have at least {min} elements but instance has {found} elements")
 }
 
@@ -121,7 +121,7 @@ fn enum_finding(value: &str, permitted: &[&str]) -> String {
 
 /// The whole message a body refusal states: the validator's bracketed list over the
 /// findings, in the order the operation's input declares the members that carried them.
-fn report(findings: &[String]) -> String {
+pub fn report(findings: &[String]) -> String {
     format!("[{}]", findings.join(", "))
 }
 

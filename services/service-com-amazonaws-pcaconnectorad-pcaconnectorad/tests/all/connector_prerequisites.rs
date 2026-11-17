@@ -17,12 +17,23 @@
 //! [`super::harness`] with a `DirectoryId` the member's `@pattern`
 //! `^d-[0-9a-f]{10}$` admits, so what refuses it is the handler's lookup and not the
 //! boundary validator.
+//!
+//! The other half of this suite is the layer that stands IN FRONT of that lookup: a
+//! request whose body carries a value a modelled constraint does not admit never reaches
+//! the prerequisite at all, and is refused with 400 `ValidationException` whose message is
+//! the validating layer's bracketed findings — no member path and no error-count prefix
+//! ([`super::body_schema_findings`] pins that wording across this service's operations;
+//! here it is pinned where it meets the prerequisite, including the order of the two).
 
 use std::time::{Duration, SystemTime};
 
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
+use super::body_schema_findings::{
+    array_finding, regex_finding, report, CERTIFICATE_AUTHORITY_ARN_PATTERN,
+    DIRECTORY_ID_PATTERN, SECURITY_GROUP_IDS_MIN, SECURITY_GROUP_ID_PATTERN,
+};
 use super::directory_registration_authorization::set_deleted_due;
 use super::harness::{
     call, encode_label, register_directory, router, router_with_engine, ACCOUNT, REGION,
@@ -371,5 +382,237 @@ async fn a_refused_create_consumes_neither_the_client_token_nor_a_connector_slot
         listed,
         vec![arn.clone()],
         "one token over three calls must leave exactly one connector, got {listed:?}"
+    );
+}
+
+/// The message a refusal states, whichever of the two layers answered it: the validating
+/// layer in front of this service renders its findings under `message`, and this model's
+/// own error shapes declare a required `Message`
+/// (`smithy_query(query="shape",shape="ValidationException,ResourceNotFoundException")`).
+fn refusal_message(parsed: &Value) -> &str {
+    parsed["message"]
+        .as_str()
+        .or_else(|| parsed["Message"].as_str())
+        .unwrap_or_default()
+}
+
+/// One request whose BODY carries a value a modelled constraint does not admit, paired
+/// with the whole message the validating layer states for it.
+///
+/// Every row names a directory this service holds no registration for, so a row answered
+/// with the prerequisite's 404 instead of these findings would be the ordering breaking:
+/// the body is checked against the model before the handler resolves anything.
+fn constraint_rows() -> Vec<(&'static str, Value, String)> {
+    // The row whose other members are all admitted, so each case below breaks exactly one
+    // thing and its finding is the whole message.
+    let admitted = &ROWS[0];
+    let a_role_arn = format!("arn:aws:iam::{ACCOUNT}:role/not-a-certificate-authority");
+    vec![
+        (
+            "a word where the directory id's expression is required",
+            {
+                let mut body = admitted.body();
+                body["DirectoryId"] = json!("not-a-directory");
+                body
+            },
+            report(&[regex_finding(DIRECTORY_ID_PATTERN, "not-a-directory")]),
+        ),
+        (
+            "upper-case hex in the directory id, which the expression admits lower-case only",
+            {
+                let mut body = admitted.body();
+                body["DirectoryId"] = json!("d-ABCDEF0123");
+                body
+            },
+            report(&[regex_finding(DIRECTORY_ID_PATTERN, "d-ABCDEF0123")]),
+        ),
+        (
+            "no security group at all, one below the list's modelled minimum",
+            {
+                let mut body = admitted.body();
+                body["VpcInformation"]["SecurityGroupIds"] = json!([]);
+                body
+            },
+            report(&[array_finding(SECURITY_GROUP_IDS_MIN, 0)]),
+        ),
+        (
+            "two security groups, the second outside the element's expression",
+            {
+                let mut body = admitted.body();
+                body["VpcInformation"]["SecurityGroupIds"] =
+                    json!(["sg-0123456789abcdef0", "sg-not-a-group"]);
+                body
+            },
+            report(&[regex_finding(SECURITY_GROUP_ID_PATTERN, "sg-not-a-group")]),
+        ),
+        (
+            "a role ARN where an acm-pca certificate-authority ARN is required",
+            {
+                let mut body = admitted.body();
+                body["CertificateAuthorityArn"] = json!(a_role_arn);
+                body
+            },
+            report(&[regex_finding(
+                CERTIFICATE_AUTHORITY_ARN_PATTERN,
+                &a_role_arn,
+            )]),
+        ),
+    ]
+}
+
+/// The parts of the per-member envelope a body finding states NONE of: the count prefix,
+/// the requirement clause, and the member path the framework names.
+const ENVELOPE_PARTS: [&str; 4] = [
+    "validation error",
+    "failed to satisfy constraint",
+    "directoryId",
+    "vpcInformation.securityGroupIds",
+];
+
+#[tokio::test]
+async fn a_body_outside_a_modelled_constraint_is_refused_in_the_validators_own_words() {
+    let router = router();
+    for (case, body, expected) in constraint_rows() {
+        let (status, code, parsed) = create_connector(&router, &body).await;
+        assert_eq!(
+            status, 400,
+            "case {case:?}: a body outside a modelled constraint is refused with 400, \
+             got {status} / {code:?} / {parsed}"
+        );
+        assert_eq!(
+            code, "ValidationException",
+            "case {case:?}: expected ValidationException, got {code:?} / {parsed}"
+        );
+        let message = refusal_message(&parsed);
+        assert_eq!(
+            message, expected,
+            "case {case:?}: expected message {expected:?}, got {message:?}"
+        );
+        for absent in ENVELOPE_PARTS {
+            assert!(
+                !message.contains(absent),
+                "case {case:?}: a body finding states no {absent:?}, got {message:?}"
+            );
+        }
+    }
+
+    // Neither layer's refusal mints anything, so the read path still serves nothing.
+    let listed = listed_arns(&router).await;
+    assert!(
+        listed.is_empty(),
+        "a refused create must persist no connector, got {listed:?}"
+    );
+}
+
+/// The two refusals come from two layers, and the body one does not depend on the
+/// prerequisite: with the directory the rows name REGISTERED, the same bodies earn the
+/// same findings, while the body every constraint admits is accepted.
+#[tokio::test]
+async fn the_constraint_findings_are_unchanged_once_the_directory_is_registered() {
+    let router = router();
+    let admitted = &ROWS[0];
+    register_directory(&router, admitted.directory_id).await;
+
+    let (status, code, parsed) = create_connector(&router, &admitted.body()).await;
+    assert_eq!(
+        status, 202,
+        "setup {:?}: the body every constraint admits must be accepted once the directory \
+         is registered, got {status} / {code:?} / {parsed}",
+        admitted.case
+    );
+    let accepted = parsed["ConnectorArn"]
+        .as_str()
+        .unwrap_or_else(|| panic!("setup: no ConnectorArn: {parsed}"))
+        .to_string();
+
+    for (case, body, expected) in constraint_rows() {
+        let (status, code, parsed) = create_connector(&router, &body).await;
+        let message = refusal_message(&parsed);
+        assert_eq!(
+            (status, code.as_str(), message),
+            (400, "ValidationException", expected.as_str()),
+            "case {case:?}: a registered directory changes nothing about a body finding, \
+             got {status} / {code:?} / {parsed}"
+        );
+    }
+
+    let listed = listed_arns(&router).await;
+    assert_eq!(
+        listed,
+        vec![accepted.clone()],
+        "only the accepted create may be stored, got {listed:?}"
+    );
+}
+
+/// The whole ladder for ONE request, in the order the layers stand: a body outside a
+/// modelled constraint is refused with the validator's findings; the same request with
+/// every value admitted is refused with the prerequisite's modelled 404; and once the
+/// directory carries a registration the create is accepted and reads back. Each step
+/// changes exactly one thing about the request or the store.
+#[tokio::test]
+async fn a_create_passes_the_constraint_layer_then_the_prerequisite_then_is_accepted() {
+    let router = router();
+    // A directory no other case in this suite names, pattern-admitted and unregistered.
+    let directory_id = "d-5566778899";
+    let mut body = json!({
+        "DirectoryId": directory_id,
+        "CertificateAuthorityArn": format!(
+            "arn:aws:acm-pca:{REGION}:{ACCOUNT}:certificate-authority/\
+             33333333-4444-5555-6666-777777777777"
+        ),
+        "VpcInformation": { "SecurityGroupIds": ["sg-abcdef01"] },
+    });
+
+    let broken = {
+        let mut broken = body.clone();
+        broken["VpcInformation"]["SecurityGroupIds"] = json!([]);
+        broken
+    };
+    let (status, code, parsed) = create_connector(&router, &broken).await;
+    let expected = report(&[array_finding(SECURITY_GROUP_IDS_MIN, 0)]);
+    assert_eq!(
+        (status, code.as_str(), refusal_message(&parsed)),
+        (400, "ValidationException", expected.as_str()),
+        "step \"an empty security group list\": expected {expected:?}, \
+         got {status} / {code:?} / {parsed}"
+    );
+
+    body["ClientToken"] = json!("token-constraint-then-prerequisite");
+    let (status, code, parsed) = create_connector(&router, &body).await;
+    assert_refusal(
+        "every value admitted, the directory unregistered",
+        directory_id,
+        status,
+        &code,
+        &parsed,
+    );
+    assert!(
+        listed_arns(&router).await.is_empty(),
+        "neither refusal may persist a connector"
+    );
+
+    register_directory(&router, directory_id).await;
+    let (status, code, parsed) = create_connector(&router, &body).await;
+    assert_eq!(
+        status, 202,
+        "step \"the directory registered\": expected the modelled 202, \
+         got {status} / {code:?} / {parsed}"
+    );
+    let arn = parsed["ConnectorArn"]
+        .as_str()
+        .unwrap_or_else(|| panic!("step \"the directory registered\": no ConnectorArn: {parsed}"))
+        .to_string();
+    let (status, code, read) = call(
+        &router,
+        "GET",
+        &format!("/connectors/{}", encode_label(&arn)),
+        None,
+    )
+    .await;
+    assert_eq!(
+        (status, read["Connector"]["DirectoryId"].as_str()),
+        (200, Some(directory_id)),
+        "the accepted create must read back against the directory it named, \
+         got {status} / {code:?} / {read}"
     );
 }
