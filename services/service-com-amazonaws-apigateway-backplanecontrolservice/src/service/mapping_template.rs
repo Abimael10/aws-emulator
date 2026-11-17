@@ -38,8 +38,9 @@
 //!   state (`parseJson`, `validateProperty`), so a rendering of one would be guesswork. The
 //!   `$util` conversions whose output a published standard DOES state exactly are performed:
 //!   the `application/x-www-form-urlencoded` encode and decode, by the maintained coder for
-//!   that format, and the JavaScript string escape, by the rule that language's own grammar
-//!   gives for a string literal;
+//!   that format, the base64 encode and decode, by the maintained coder for the alphabet and
+//!   padding RFC 4648 states, and the JavaScript string escape, by the rule that language's
+//!   own grammar gives for a string literal;
 //! * a `$input` reference to the payload where the call has no payload the template can
 //!   read (see [`TemplateInputs::payload`]);
 //! * a directive that is neither a binding nor a choice (`#foreach`, `#macro`, `#parse`, a
@@ -960,12 +961,12 @@ impl Render<'_> {
                     .ok_or_else(unresolved)
             }
             // "$util" — "contains utility functions", each documented with the conversion
-            // it performs. The three whose output a published standard STATES exactly are
-            // performed — the two form-encoding conversions by the maintained coder for that
-            // format, and the JavaScript string escape by the rule that language's own
-            // grammar gives ([`escaped_as_javascript`]); every other `$util` method
-            // (`parseJson`, `validateProperty`) stays unresolved, for the reason the module
-            // docs give.
+            // it performs. The conversions whose output a published standard STATES exactly
+            // are performed — the two form-encoding conversions and the two base64
+            // conversions by the maintained coders for those formats, and the JavaScript
+            // string escape by the rule that language's own grammar gives
+            // ([`escaped_as_javascript`]); every other `$util` method (`parseJson`,
+            // `validateProperty`) stays unresolved, for the reason the module docs give.
             "util" => match reference.steps.as_slice() {
                 [Step::Call(method, arguments)] => {
                     let argument = self.one_argument(arguments)?.ok_or_else(unresolved)?;
@@ -990,6 +991,27 @@ impl Render<'_> {
                         // a caller's own text inside a quoted string of the document it
                         // renders.
                         "escapeJavaScript" => Ok(text(escaped_as_javascript(&argument))),
+                        // "$util.base64Encode(data) — Encodes the data into a base64-encoded
+                        // string", by the maintained coder for the format, over the standard
+                        // alphabet and padding RFC 4648 states — which is the encoding every
+                        // AWS api carrying a blob in a JSON document reads.
+                        "base64Encode" => Ok(text(::base64::Engine::encode(
+                            &::base64::engine::general_purpose::STANDARD,
+                            argument.as_bytes(),
+                        ))),
+                        // "$util.base64Decode(data) — Decodes the data from a base64-encoded
+                        // string." Text that is not that encoding, and bytes that are not
+                        // the text a template writes into a document, decode to nothing this
+                        // module can render, so such a reference stays unresolved rather than
+                        // rendering a guess.
+                        "base64Decode" => ::base64::Engine::decode(
+                            &::base64::engine::general_purpose::STANDARD,
+                            argument.as_bytes(),
+                        )
+                        .ok()
+                        .and_then(|bytes| String::from_utf8(bytes).ok())
+                        .map(text)
+                        .ok_or_else(unresolved),
                         _ => Err(unresolved()),
                     }
                 }
@@ -1262,6 +1284,15 @@ mod tests {
             (
                 r#"{"lastBody":"$util.escapeJavaScript($input.body)"}"#,
                 r#"{"lastBody":"{\"id\":\"a1\",\"qty\":2,\"nested\":{\"deep\":\"value\"}}"}"#,
+            ),
+            // The two base64 conversions, which is what puts a payload in the blob member of
+            // the document an integration request renders, and reads one back out.
+            ("$util.base64Encode('a b&c')", "YSBiJmM="),
+            ("$util.base64Decode('YSBiJmM=')", "a b&c"),
+            ("$util.base64Encode('')", ""),
+            (
+                "$util.base64Decode($util.base64Encode($input.body))",
+                r#"{"id":"a1","qty":2,"nested":{"deep":"value"}}"#,
             ),
             // The stage and the context.
             ("$stageVariables.backend", "beta"),

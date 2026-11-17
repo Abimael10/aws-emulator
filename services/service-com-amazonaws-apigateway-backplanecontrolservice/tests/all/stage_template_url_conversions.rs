@@ -1,13 +1,16 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! The `$util` conversions a mapping template may apply: the
-//! `application/x-www-form-urlencoded` ENCODE and DECODE, and the JavaScript string ESCAPE.
+//! `application/x-www-form-urlencoded` ENCODE and DECODE, the BASE64 encode and decode, and
+//! the JavaScript string ESCAPE.
 //!
 //! RULE: a mapping template is rendered by resolving its references against the call, and a
 //! `$util` method whose conversion is stated EXACTLY is one of those references —
 //! `$util.urlEncode(String)` "converts a string into 'application/x-www-form-urlencoded'
 //! format", `$util.urlDecode(String)` "decodes an 'application/x-www-form-urlencoded' string
-//! back into its original form" and `$util.escapeJavaScript()` "escapes the characters in a
+//! back into its original form", `$util.base64Encode(data)` "encodes the data into a
+//! base64-encoded string", `$util.base64Decode(data)` "decodes the data from a base64-encoded
+//! string" and `$util.escapeJavaScript()` "escapes the characters in a
 //! string using JavaScript string rules" — so the text it produces is that format's or that
 //! language's own encoding of the value, whatever the value carries. A `$util` method whose
 //! output the documentation does not state is a reference this emulator resolves nothing for,
@@ -19,13 +22,15 @@
 //! ("for testing without actually invoking the backend", `IntegrationType`), and the
 //! integration response echoes that answer. The same rendering is what an `AWS` integration
 //! to a QUERY api sends as its request, which the cross-service suite
-//! `core/router/tests/all/apigateway_sqs_service_integration.rs` pins.
+//! `core/router/tests/all/apigateway_sqs_service_integration.rs` pins — and what an `AWS`
+//! integration to a JSON-RPC api sends as the blob member of its input document, which
+//! `core/router/tests/all/apigateway_kinesis_service_integration.rs` pins.
 //!
 //! The rows vary what the rule generalises over: WHICH conversion is applied, and the value
 //! it is applied to — one needing no escaping, one carrying the characters that are
 //! significant in that format (`&`, `=`, `+`, `%`, a space) or in a string literal (a quote,
 //! a backslash), one carrying characters outside ASCII, the empty value, and a round trip of
-//! the two form conversions.
+//! the two form conversions and of the two base64 conversions.
 
 use serde_json::json;
 
@@ -110,6 +115,60 @@ fn rows() -> Vec<Row> {
             template: "MessageBody=$util.urlEncode($input.params('v'))",
             sent: "a%26b",
             expected: Some("MessageBody=a%26b"),
+        },
+        Row {
+            case: "a base64 encode of a value needing no padding",
+            template: "$util.base64Encode($input.params('v'))",
+            sent: "abc",
+            expected: Some("YWJj"),
+        },
+        Row {
+            case: "a base64 encode whose length asks for one padding character",
+            template: "$util.base64Encode($input.params('v'))",
+            sent: "ab",
+            expected: Some("YWI="),
+        },
+        Row {
+            case: "a base64 encode whose length asks for two padding characters",
+            template: "$util.base64Encode($input.params('v'))",
+            sent: "a",
+            expected: Some("YQ=="),
+        },
+        Row {
+            case: "a base64 encode of characters outside ASCII, which encodes their UTF-8",
+            template: "$util.base64Encode($input.params('v'))",
+            sent: "caf%C3%A9",
+            expected: Some("Y2Fmw6k="),
+        },
+        Row {
+            case: "a base64 encode of the empty value",
+            template: "$util.base64Encode($input.params('absent'))",
+            sent: "plain",
+            expected: Some(""),
+        },
+        Row {
+            case: "a base64 decode of a padded encoding",
+            template: "$util.base64Decode($input.params('v'))",
+            sent: "YWI%3D",
+            expected: Some("ab"),
+        },
+        Row {
+            case: "a round trip of the two base64 conversions, which is the value itself",
+            template: "$util.base64Decode($util.base64Encode($input.params('v')))",
+            sent: "a%26b%3Dc%20d",
+            expected: Some("a&b=c d"),
+        },
+        Row {
+            case: "a base64 decode of text that is not that encoding at all",
+            template: "$util.base64Decode($input.params('v'))",
+            sent: "not%20base64%21",
+            expected: None,
+        },
+        Row {
+            case: "a base64 encode inside the blob member of a rendered JSON document",
+            template: r#"{"Data":"$util.base64Encode($input.params('v'))"}"#,
+            sent: "abc",
+            expected: Some(r#"{"Data":"YWJj"}"#),
         },
         Row {
             case: "the JavaScript escape of a value a quoted string can carry as it stands",

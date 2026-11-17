@@ -22,9 +22,11 @@
 //! * AMAZON SQS, whose queue actions the `path` form addresses by the queue
 //!   (`path/{account-id}/{queue-name}`) and whose action and parameters the integration
 //!   request then carries as its own query api's wire form does ([`sqs`]);
-//! * AMAZON DYNAMODB, whose actions the `action` form names and whose inputs the
-//!   integration request carries in its BODY, as that service's own JSON api's wire form
-//!   does ([`dynamodb`]);
+//! * EVERY AWS JSON-RPC API, whose operation the `action` form names and whose inputs the
+//!   integration request carries in its BODY, as that protocol's wire form does — one rule
+//!   over the wire facts each such api's own model publishes ([`json_rpc`]), rather than a
+//!   reading per service: the table api ([`dynamodb`]) and the data-stream api
+//!   ([`kinesis`]);
 //! * AMAZON SNS, whose actions the `action` form names and whose parameters the integration
 //!   request then carries as its own query api's wire form does ([`sns`]) — the `path` form
 //!   of a `uri` naming it addresses that api's root, which is where every action of it is
@@ -88,7 +90,8 @@
 //! selected is the status the CALLER sees. Its response template renders the body when it
 //! declares one, read off what the backend answered; with no template the backend's own
 //! bytes and content type are what the caller gets, which is what passing a response
-//! through means.
+//! through means — so an api that declares no error mapping of its own still hands its
+//! caller the body the service refused the call with.
 
 use std::collections::BTreeMap;
 
@@ -111,6 +114,8 @@ use super::{
 };
 
 mod dynamodb;
+mod json_rpc;
+mod kinesis;
 mod query_form;
 mod sns;
 mod sqs;
@@ -396,8 +401,8 @@ fn addressed_call(
     if let Some(queue) = sqs::addressed_queue(integration, default_region, call) {
         return Some(queue.map(ServiceCall::Queue));
     }
-    if let Some(table) = dynamodb::addressed_table(integration, default_region, call) {
-        return Some(table.map(ServiceCall::Table));
+    if let Some(json_rpc) = json_rpc::addressed(integration, default_region, call) {
+        return Some(json_rpc.map(ServiceCall::JsonRpc));
     }
     if let Some(topic) = sns::addressed_topic(integration, default_region, call) {
         return Some(topic.map(ServiceCall::Topic));
@@ -417,8 +422,9 @@ enum ServiceCall {
     Bucket(BucketCall),
     /// An Amazon SQS queue action.
     Queue(sqs::QueueCall),
-    /// An Amazon DynamoDB table action.
-    Table(dynamodb::TableCall),
+    /// One operation of an AWS JSON-RPC api, named by the `action` form of the `uri`
+    /// ([`json_rpc`]).
+    JsonRpc(json_rpc::Call),
     /// An Amazon SNS topic action.
     Topic(sns::TopicCall),
 }
@@ -437,7 +443,7 @@ impl ServiceCall {
             Self::Object(object) => &object.region,
             Self::Bucket(bucket) => &bucket.region,
             Self::Queue(queue) => queue.region(),
-            Self::Table(table) => table.region(),
+            Self::JsonRpc(call) => call.region(),
             Self::Topic(topic) => topic.region(),
         }
     }
@@ -452,7 +458,7 @@ impl ServiceCall {
             Self::Object(object) => object.action.iam_action().to_string(),
             Self::Bucket(bucket) => bucket.action.iam_action().to_string(),
             Self::Queue(queue) => queue.iam_action().to_string(),
-            Self::Table(table) => table.iam_action(),
+            Self::JsonRpc(call) => call.iam_action(),
             Self::Topic(topic) => topic.iam_action(),
         }
     }
@@ -464,7 +470,7 @@ impl ServiceCall {
             Self::Object(object) => object.object_arn(),
             Self::Bucket(bucket) => bucket.bucket_arn(),
             Self::Queue(queue) => queue.queue_arn(),
-            Self::Table(table) => table.table_arn(),
+            Self::JsonRpc(call) => call.resource_arn(),
             Self::Topic(topic) => topic.topic_arn(),
         }
     }
@@ -496,7 +502,7 @@ impl ServiceCall {
                 ),
             },
             Self::Queue(queue) => sqs::access_denied(queue),
-            Self::Table(table) => dynamodb::access_denied(table, principal),
+            Self::JsonRpc(call) => json_rpc::access_denied(call, principal),
             Self::Topic(topic) => sns::access_denied(topic, principal),
         }
     }
@@ -511,7 +517,7 @@ impl ServiceCall {
             Self::Object(object) => answered_by_s3(ctx, object, call).await,
             Self::Bucket(bucket) => answered_by_s3_bucket(ctx, bucket).await,
             Self::Queue(queue) => sqs::answered(ctx, queue, call).await,
-            Self::Table(table) => dynamodb::answered(ctx, table).await,
+            Self::JsonRpc(json) => json_rpc::answered(ctx, json).await,
             Self::Topic(topic) => sns::answered(ctx, topic).await,
         }
     }
@@ -1125,7 +1131,8 @@ fn s3_client(ctx: &OperationContext<'_>, region: &str) -> ::aws_sdk_s3::Client {
 }
 
 /// The integration response a backend answer of `status` maps to: the one whose
-/// `selectionPattern` matches that status, and otherwise the one that declares no pattern.
+/// `selectionPattern` matches that status, and otherwise the one that declares no pattern —
+/// the api's DEFAULT, which is the catch-all for every answer no pattern selects.
 ///
 /// `pub(super)` because the step that MAPS an answer to the method response is applied once
 /// per request, including a request the stage's cache answers, and lives beside this module
@@ -1706,6 +1713,10 @@ mod tests {
         }
     }
 
+    /// RULE: the integration response a backend answer maps to is the one whose
+    /// `selectionPattern` matches the status it answered with, and otherwise the response
+    /// declaring NO pattern — the api's DEFAULT, which is the catch-all for every answer no
+    /// pattern selects.
     #[test]
     fn a_selection_pattern_chooses_by_the_status_the_backend_answered() {
         // Rows differ along the status answered and the patterns stored: a class pattern,
@@ -1729,14 +1740,25 @@ mod tests {
             ),
             ..GetIntegrationOutput::default()
         };
-        let cases = [
-            ("a 200 answer maps to the response with no pattern", 200_u16, "200"),
+        /// (case, the status the backend answered, the integration response that maps it)
+        type Row<'a> = (&'a str, u16, &'a str);
+        let cases: &[Row<'_>] = &[
+            ("a 200 answer maps to the response with no pattern", 200, "200"),
             ("a 403 answer maps to the 4xx class", 403, "403"),
             ("a 404 answer maps to the same 4xx class", 404, "403"),
             ("a 503 answer maps to the 5xx class", 503, "500"),
-            ("a 302 answer matches no pattern and falls back", 302, "200"),
+            (
+                "another success the one pattern-less response is the default for",
+                201,
+                "200",
+            ),
+            (
+                "a redirect no pattern selects, which the pattern-less default catches",
+                302,
+                "200",
+            ),
         ];
-        for (case, status, expected) in &cases {
+        for (case, status, expected) in cases {
             let selected = selected_response(&integration, *status)
                 .unwrap_or_else(|| panic!("case {case:?}: expected a selected response"));
             assert_eq!(
@@ -1744,6 +1766,26 @@ mod tests {
                 Some(*expected),
                 "case {case:?}: expected the {expected} integration response, got {:?}",
                 selected.status_code
+            );
+        }
+    }
+
+    /// RULE: an api that declares no integration response at all maps no backend answer,
+    /// whatever its status — there is nothing for the call to be answered through.
+    #[test]
+    fn an_api_declaring_no_integration_response_maps_nothing() {
+        let integration = GetIntegrationOutput::default();
+        // (case, the status answered)
+        let cases: &[(&str, u16)] = &[
+            ("a success with nothing to map it", 200),
+            ("a refusal with nothing to map it", 400),
+        ];
+        for (case, status) in cases.iter().copied() {
+            let selected = selected_response(&integration, status);
+            assert!(
+                selected.is_none(),
+                "case {case:?}: expected no integration response to map it, got {:?}",
+                selected.map(|response| response.status_code.clone())
             );
         }
     }

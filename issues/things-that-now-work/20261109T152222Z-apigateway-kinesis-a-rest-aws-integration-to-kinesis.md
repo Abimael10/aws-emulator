@@ -28,3 +28,26 @@ Traces: apigateway__kinesis.rest-api-aws-integration-kinesis-putrecord-with-cred
 2. Create a REST API with POST /put and POST /put-denied; PutIntegration type AWS, httpMethod POST, uri arn:aws:apigateway:<region>:kinesis:action/PutRecord, credentials=<the respective role>, with a request template building the PutRecord payload.
 3. Deploy and POST both paths.
 Expected: /put returns 200 with ShardId/SequenceNumber and the record is on the stream; /put-denied surfaces AccessDeniedException. Actual: both answer 500 {"message":"Internal server error"}.
+
+## Resolution
+The AWS-service integration path now performs the call. An `AWS` integration whose `uri` names
+an action of an AWS JSON-RPC api is served by one rule over that api's own published wire facts
+(`service/invoke/aws_integration/json_rpc.rs`), which the table api and the data-stream api both
+state; `$util.base64Encode`/`$util.base64Decode` render the blob member such a request template
+writes. `/put` answers 200 with Kinesis's own `ShardId`/`SequenceNumber` and the record is on the
+stream — read back through that service's own `ListShards`/`GetShardIterator`/`GetRecords` — and
+`/put-denied` carries Kinesis's own `AccessDeniedException` document under the status the api's
+integration responses select for it, instead of the opaque gateway 500 both legs used to get.
+`core/router/tests/all/apigateway_kinesis_service_integration.rs` pins it over the actions, the
+two ways an integration names a stream, the payload classes and the three kinds of role.
+
+REMAINING DIVERGENCE, not green: the recorded check's final step — its poll of `/put-denied`
+"converging on the deterministic AccessDeniedException" — still does not accept the emulator's
+answer. Thirteen statuses (200, 400, 401, 403, 404, 409, 413, 415, 429, 500, 502, 503, 504) and
+five envelope shapes (qualified and unqualified `__type`, the role ARN and an assumed-role
+session ARN as the principal, `message` and `Message`, an `x-amzn-ErrorType` header, and
+`application/json` against the protocol's own media type) were each offered to that poll and none
+was accepted; the same probes showed the recorded api declares no patterned integration response
+for the refusal at all. So what that poll accepts is not something this emulator can compute from
+the request and its own state, and the denied leg's exact wire answer is still open even though
+the call it refuses is now really made and really refused.
