@@ -167,6 +167,18 @@ impl Input {
         self.text_list(name)
     }
 
+    /// A member whose shape is a STRUCTURE, read as the members it holds; `None` where the
+    /// document carries none.
+    pub(super) fn structure(&self, name: &str) -> Result<Option<Self>, Refusal> {
+        match self.members.get(name) {
+            None | Some(Value::Null) => Ok(None),
+            Some(Value::Object(members)) => Ok(Some(self.nested(members))),
+            Some(other) => Err(Refusal::NotMade(format!(
+                "the call's {name} must be a structure, got {other}"
+            ))),
+        }
+    }
+
     /// A member whose shape is a LIST OF STRUCTURES, read as one document per entry; an empty
     /// list where the document carries the member as none at all.
     pub(super) fn structures(&self, name: &str) -> Result<Vec<Self>, Refusal> {
@@ -611,5 +623,50 @@ mod tests {
             input.required_structures("Absent").is_err(),
             "case \"a required list the call omits\": expected a call that was not made"
         );
+    }
+
+    /// RULE: a member whose shape is an `integer` is sent only with a value that shape can
+    /// carry, so a number outside its range stops the call rather than being sent clamped —
+    /// a clamped value would make a call asking for something other than what the handler
+    /// asked for. The rows differ along where the value sits relative to that range: inside
+    /// it, on each bound of the shape, one past each bound, and absent altogether.
+    #[test]
+    fn a_number_outside_the_integer_shapes_range_stops_the_call() {
+        let ceiling = i64::from(i32::MAX);
+        let floor = i64::from(i32::MIN);
+        // `None` is a call that was not made; `Some(None)` a call carrying no value at all.
+        let rows: [(&str, String, Option<Option<i32>>); 6] = [
+            ("a value inside the range", "5".to_string(), Some(Some(5))),
+            (
+                "the largest value the shape carries",
+                ceiling.to_string(),
+                Some(Some(i32::MAX)),
+            ),
+            (
+                "the smallest value the shape carries",
+                floor.to_string(),
+                Some(Some(i32::MIN)),
+            ),
+            ("one past the largest", (ceiling + 1).to_string(), None),
+            ("one past the smallest", (floor - 1).to_string(), None),
+            ("no value at all", "null".to_string(), Some(None)),
+        ];
+        for (case, held, expected) in rows {
+            let input = Input::read(SERVICE, &format!(r#"{{"MaxItems":{held}}}"#))
+                .expect("the row's document is an object");
+            let answered = input.integer("MaxItems");
+            match expected {
+                Some(carried) => assert_eq!(
+                    answered.ok(),
+                    Some(carried),
+                    "case {case:?}: expected the call to carry {carried:?}"
+                ),
+                None => assert!(
+                    answered.is_err(),
+                    "case {case:?}: expected a call that was not made, got {:?}",
+                    answered.ok()
+                ),
+            }
+        }
     }
 }
