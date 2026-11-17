@@ -122,6 +122,16 @@ pub const STATUS_FAILED: &str = "Failed";
 /// enum).
 pub const STATUS_CANCELLED: &str = "Cancelled";
 
+/// The `StopType` that CANCELS the automation: "The stop request type … The default type
+/// is Cancel" (`StopAutomationExecutionRequest$Type`). From the modelled `StopType` enum.
+pub const STOP_TYPE_CANCEL: &str = "Cancel";
+
+/// The `StopType` that COMPLETES the automation (same enum), which is what tells the two
+/// types apart: the automation ends where it stands either way, cancelled by the one and
+/// completed by the other — and a completion is a request only an `Interactive` automation
+/// admits, because only such an automation is waiting for its caller to run the rest of it.
+pub const STOP_TYPE_COMPLETE: &str = "Complete";
+
 /// The `AutomationExecutionStatus` values an execution never leaves again: a read of one
 /// reports it unchanged however long after it ended.
 pub const TERMINAL_STATUSES: &[&str] = &[STATUS_SUCCESS, STATUS_FAILED, STATUS_CANCELLED];
@@ -340,6 +350,18 @@ pub fn invalid_filter_value_message(key: &str, value: &str, takes: &str) -> Stri
     format!("The following filter value is not valid: {value}. The {key} filter key takes {takes}.")
 }
 
+/// Why a stop does not apply to the execution it named, which is what the refusal it is
+/// answered with words ([`stop_not_valid_message`], [`complete_not_interactive_message`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StopRefused {
+    /// The execution has already reached a terminal status, so it is running nothing to
+    /// stop.
+    Ended,
+    /// The stop asked for the automation to be COMPLETED and the automation is not running
+    /// in `Interactive` mode, which is the one mode a completion is supported in.
+    NotInteractive,
+}
+
 /// What one entry into a step did to the walk.
 enum Walked {
     /// The step is running and has not ended: the walk stops here and the execution stays
@@ -482,7 +504,13 @@ impl StepExecutionRecord {
     /// The modelled `StepExecution` for this step: the runbook's own declaration beside
     /// what the walk did. A member nothing has produced is left unset rather than filled
     /// in — a step that has not started reports no window, and one that ran no action
-    /// reports no outputs and no response.
+    /// reports no response.
+    ///
+    /// The two PARAMETER MAPS a step carries are the exception: `Outputs` and
+    /// `OverriddenParameters` are on the wire for every step a read reports, empty for a
+    /// step that produced no output and for one nothing overrode a parameter of, rather
+    /// than being left out — so a client that indexes either map finds it on every step of
+    /// every read.
     pub fn to_step_execution(&self) -> StepExecution {
         StepExecution {
             step_name: Some(self.definition.name.clone()),
@@ -504,12 +532,12 @@ impl StepExecutionRecord {
                     .map(|(name, value)| (name.clone(), value.clone()))
                     .collect()
             }),
-            outputs: (!self.outputs.is_empty()).then(|| {
+            outputs: Some(
                 self.outputs
                     .iter()
                     .map(|(name, values)| (name.clone(), values.clone()))
-                    .collect()
-            }),
+                    .collect(),
+            ),
             response: None,
             failure_message: self.failure_message.clone(),
             warning_message: None,
@@ -519,7 +547,10 @@ impl StepExecutionRecord {
                 details: None,
             }),
             step_execution_id: Some(self.step_execution_id.clone()),
-            overridden_parameters: None,
+            // "A user-specified list of parameters to override when running a step": the
+            // runbook's own steps are what this walk runs, and nothing overrides a
+            // parameter of one, so the map is empty — and reported empty.
+            overridden_parameters: Some(::std::collections::HashMap::new()),
             is_end: self.definition.is_end,
             next_step: self.definition.next_step.clone(),
             is_critical: Some(self.definition.critical()),
@@ -821,24 +852,13 @@ impl AutomationExecutionRecord {
         {
             return Walked::Waiting;
         }
-        let variables = self.variables(now);
+        let resolved = match self.open_step(index, now) {
+            Ok(resolved) => resolved,
+            Err(walked) => return walked,
+        };
         let Some(definition) = self.steps.get(index).map(|step| step.definition.clone()) else {
             return Walked::Moved(None);
         };
-        let mut budget = self.resolved_input_budget;
-        let resolved = match runbook::resolve_inputs(&definition.inputs, &variables, &mut budget) {
-            Ok(resolved) => resolved,
-            Err(why) => return self.fail_step(index, now, why),
-        };
-        self.resolved_input_budget = budget;
-        if let Some(step) = self.steps.get_mut(index) {
-            step.inputs = resolved
-                .iter()
-                .map(|(name, value)| (name.clone(), runbook::rendered(value)))
-                .collect();
-            step.status = STATUS_IN_PROGRESS.to_string();
-            step.started_at = Some(now);
-        }
         match definition.action.as_str() {
             ACTION_BRANCH => self.run_branch(index, now, &resolved),
             ACTION_SLEEP => self.run_sleep(index, now, &definition.name, &resolved),
@@ -875,6 +895,35 @@ impl AutomationExecutionRecord {
                 ),
             ),
         }
+    }
+
+    /// OPEN the step at `index`: the values the execution holds are resolved into it and its
+    /// window opens, which is what starting a step is — and what every step this store
+    /// reports as started has had done to it. `Err` is what the walk does with a step whose
+    /// references could not be resolved at all.
+    ///
+    /// Opening a step runs NOTHING of its action: what the action does is
+    /// [`Self::start_step`]'s, and a step a stop ends is opened and never run.
+    fn open_step(&mut self, index: usize, now: SystemTime) -> Result<Map<String, Value>, Walked> {
+        let variables = self.variables(now);
+        let Some(definition) = self.steps.get(index).map(|step| step.definition.clone()) else {
+            return Err(Walked::Moved(None));
+        };
+        let mut budget = self.resolved_input_budget;
+        let resolved = match runbook::resolve_inputs(&definition.inputs, &variables, &mut budget) {
+            Ok(resolved) => resolved,
+            Err(why) => return Err(self.fail_step(index, now, why)),
+        };
+        self.resolved_input_budget = budget;
+        if let Some(step) = self.steps.get_mut(index) {
+            step.inputs = resolved
+                .iter()
+                .map(|(name, value)| (name.clone(), runbook::reported(value)))
+                .collect();
+            step.status = STATUS_IN_PROGRESS.to_string();
+            step.started_at = Some(now);
+        }
+        Ok(resolved)
     }
 
     /// Decide an `aws:branch` step's choice and go where it points.
@@ -1264,31 +1313,119 @@ impl AutomationExecutionRecord {
         self.carry_on(walked, now);
     }
 
-    /// STOP the step execution `step_execution_id` names, which stops the automation with
-    /// it: `true` when that id names the step this execution STANDS at and that step has
-    /// not ended.
+    /// STOP the step `step_name` names, which stops the automation with it: `true` when
+    /// that name is the step this execution STANDS at and that step has not ended.
     ///
-    /// "For the StopStep signal type, you must send the step execution ID as the payload",
-    /// and stopping the step the automation stands at is stopping the automation — there is
-    /// no later step to go to once the one it stands at has been cancelled. A step the walk
-    /// has not reached is running nothing to stop, so its id names no step this signal
-    /// applies to.
-    pub fn stop_step(&mut self, step_execution_id: &str, now: SystemTime) -> bool {
-        let Some(index) = self.current.filter(|index| {
-            self.steps.get(*index).is_some_and(|step| {
-                step.step_execution_id == step_execution_id && !is_terminal(&step.status)
+    /// Stopping the step the automation stands at is stopping the automation — there is no
+    /// later step to go to once the one it stands at has been cancelled. A step the walk has
+    /// not reached is running nothing to stop, so its name names no step this signal applies
+    /// to.
+    pub fn stop_step(&mut self, step_name: &str, now: SystemTime) -> bool {
+        let names_the_step_it_stands_at = self.current.is_some_and(|index| {
+            self.steps.get(index).is_some_and(|step| {
+                step.definition.name == step_name && !is_terminal(&step.status)
             })
-        }) else {
+        });
+        if !names_the_step_it_stands_at {
             return false;
-        };
-        self.end_step(index, now, STATUS_CANCELLED);
-        if let Some(step) = self.steps.get_mut(index) {
-            step.host_action = None;
+        }
+        self.end_where_it_stands(now, STATUS_CANCELLED);
+        true
+    }
+
+    /// STOP this execution — "Stop an Automation that is currently running" — as the
+    /// `StopType` `stop_type` asks for, or why the stop does not apply to it.
+    ///
+    /// Either type ends the automation WHERE IT STANDS: the step it was standing at is ended
+    /// with it, and no step after that one is ever entered, whatever the runbook's own flow
+    /// members say. What the two differ in is the outcome the automation is left with —
+    /// [`STOP_TYPE_CANCEL`], the type a request naming none is served, CANCELS it, and
+    /// [`STOP_TYPE_COMPLETE`] COMPLETES it — and a completion is a request only an
+    /// `Interactive` automation admits: such an automation is waiting for its caller to run
+    /// each of its steps, so completing it is saying the rest will not be run, while an
+    /// automation running itself has nothing for a caller to complete.
+    ///
+    /// A cancellation reaches the automation a start answered even inside the span this
+    /// emulator picks it up over ([`Self::open_the_step_it_is_stopped_at`]).
+    pub fn stop(&mut self, stop_type: &str, now: SystemTime) -> Result<(), StopRefused> {
+        if self.ended() {
+            return Err(StopRefused::Ended);
+        }
+        if stop_type == STOP_TYPE_COMPLETE {
+            if self.mode != EXECUTION_MODE_INTERACTIVE {
+                return Err(StopRefused::NotInteractive);
+            }
+            self.end_where_it_stands(now, STATUS_SUCCESS);
+            return Ok(());
+        }
+        self.open_the_step_it_is_stopped_at(now);
+        self.end_where_it_stands(now, STATUS_CANCELLED);
+        Ok(())
+    }
+
+    /// Open the step a stop is about to end ([`Self::open_step`]) when nothing has opened it
+    /// yet, so the step the automation is stopped at reports the values that were resolved
+    /// into it and the window it was stopped in.
+    ///
+    /// "Stop an Automation that is currently running": what a stop is of is a RUNNING
+    /// automation, and the automation a start answered is running its first step from the
+    /// instant the service picks it up ([`PICKUP_DELAY`] is this emulator's own span for
+    /// that, not a wait the service makes a caller see) — so a stop that reaches the
+    /// automation inside that span stops it at that first step rather than recording it
+    /// stopped at a step nothing ever resolved. An `Interactive` automation is the one
+    /// exception: its steps run when its caller starts them, so a step no caller started is
+    /// a step that was never opened.
+    ///
+    /// Nothing of the step's action is RUN here, and nothing later is entered: the step is
+    /// opened and ended in the same instant.
+    fn open_the_step_it_is_stopped_at(&mut self, now: SystemTime) {
+        if self.status != STATUS_PENDING
+            || self.runnable_at.is_none()
+            || self.mode == EXECUTION_MODE_INTERACTIVE
+        {
+            return;
+        }
+        self.status = STATUS_IN_PROGRESS.to_string();
+        let standing = self.current.filter(|index| {
+            self.steps
+                .get(*index)
+                .is_some_and(|step| step.status == STATUS_PENDING)
+        });
+        if let Some(index) = standing {
+            // The walk this would have carried on with is not run: whatever resolving the
+            // step's inputs came to, the step is ended with the automation below.
+            let _ = self.open_step(index, now);
+        }
+    }
+
+    /// End this execution where it stands at `status`: the step it was standing at is ended
+    /// `Cancelled` with it, and nothing later is entered.
+    ///
+    /// The step the automation STANDS at is ended whether or not the walk had started it —
+    /// nothing is going to run it to its own end once the automation has ended, which is
+    /// what a cancelled step is — and it is ended as it stands: a step that had started
+    /// keeps the instant it started at and the inputs that were resolved into it, and one
+    /// that had not reports neither. The steps the walk never reached keep their `Pending`
+    /// status: the automation ended before it came to them.
+    fn end_where_it_stands(&mut self, now: SystemTime, status: &str) {
+        let standing = self.current.filter(|index| {
+            self.steps
+                .get(*index)
+                .is_some_and(|step| !is_terminal(&step.status))
+        });
+        if let Some(index) = standing {
+            self.end_step(index, now, STATUS_CANCELLED);
+            if let Some(step) = self.steps.get_mut(index) {
+                // Nothing is left to run for a step that has been cancelled: the host run
+                // it was parked for and the transition it was waiting on are given up with
+                // it.
+                step.host_action = None;
+                step.instance_state = None;
+            }
         }
         self.current = None;
-        self.status = STATUS_CANCELLED.to_string();
+        self.status = status.to_string();
         self.ended_at = Some(now);
-        true
     }
 
     /// Carry the walk on from what one step came to.
@@ -1379,6 +1516,13 @@ impl AutomationExecutionRecord {
     /// The modelled `AutomationExecution` for this execution: every member either echoed
     /// from the start as it was received, resolved by the start, or written by the walk. A
     /// member nothing has produced is left unset rather than invented.
+    ///
+    /// The exception is the four members an automation ALWAYS carries — its `Parameters`,
+    /// its `Outputs`, its `Targets` and its `ResolvedTargets` — which are on the wire for
+    /// every execution a read reports, holding nothing for a start that supplied no
+    /// parameter, a runbook that declares no output and a start that named no target,
+    /// rather than being left out: a client that indexes any of them finds it on every
+    /// read.
     pub fn to_automation_execution(&self) -> AutomationExecution {
         let running = self.running_step();
         AutomationExecution {
@@ -1397,18 +1541,16 @@ impl AutomationExecutionRecord {
             // Every step this execution holds is reported, so the list is never the
             // truncated one `DescribeAutomationStepExecutions` exists for.
             step_executions_truncated: false,
-            parameters: (!self.supplied_parameters.is_empty()).then(|| {
+            parameters: Some(
                 self.supplied_parameters
                     .iter()
                     .map(|(name, values)| (name.clone(), values.clone()))
-                    .collect()
-            }),
+                    .collect(),
+            ),
             // "The list of execution outputs as defined in the Automation runbook": the
             // outputs the runbook declares, carrying what the steps that produced them
             // selected out of their own actions' answers.
-            outputs: Some(self.projected_outputs())
-                .filter(|projected| !projected.is_empty())
-                .map(|projected| projected.into_iter().collect()),
+            outputs: Some(self.projected_outputs().into_iter().collect()),
             failure_message: self.failure_message.clone(),
             warning_message: None,
             mode: Some(self.mode.clone()),
@@ -1417,9 +1559,9 @@ impl AutomationExecutionRecord {
             current_step_name: running.map(|step| step.definition.name.clone()),
             current_action: running.map(|step| step.definition.action.clone()),
             target_parameter_name: self.target_parameter_name.clone(),
-            targets: (!self.targets.is_empty()).then(|| self.targets.clone()),
+            targets: Some(self.targets.clone()),
             target_maps: (!self.target_maps.is_empty()).then(|| self.target_maps.clone()),
-            resolved_targets: (!self.resolved_target_values.is_empty()).then(|| ResolvedTargets {
+            resolved_targets: Some(ResolvedTargets {
                 parameter_values: Some(self.resolved_target_values.clone()),
                 truncated: false,
             }),
@@ -1864,11 +2006,24 @@ pub fn resolved_parameters(
     resolved
 }
 
-/// The refusal `SendAutomationSignal` answers for an execution id this endpoint holds no
-/// execution for: a FIXED sentence with no variable parts, which is how Systems Manager
-/// words this one — the id a caller sent is not repeated back to it.
-pub const SIGNAL_EXECUTION_NOT_FOUND_MESSAGE: &str =
-    "The input automation execution does not exist.";
+/// The refusal an execution-scoped Automation operation answers for an execution id this
+/// endpoint holds no execution for: a FIXED sentence with no variable parts, which is how
+/// Systems Manager words this one — the id a caller sent is not repeated back to it.
+///
+/// One wording for the whole slice, because it is one refusal: the read of an execution,
+/// the report of its steps, a signal to it and a stop of it all carry this sentence in the
+/// `AutomationExecutionNotFoundException` they answer with.
+pub const EXECUTION_NOT_FOUND_MESSAGE: &str = "The input automation execution does not exist.";
+
+/// The refusal a signal whose type needs the STEP it is about is answered with when the
+/// payload names none.
+///
+/// The signal type is the one variable part and it comes from the request; the rest is the
+/// fixed text Systems Manager words this refusal with, which names the payload member it
+/// wants — `StepName` — for every signal type that is about one step.
+pub fn signal_step_name_required_message(signal_type: &str) -> String {
+    format!("One StepName is required when signal type is {signal_type}.")
+}
 
 /// The refusal it answers for a signal naming a step the runbook does not declare.
 ///
@@ -1908,16 +2063,36 @@ pub const SIGNAL_NOT_VALID: &str =
 pub const SIGNAL_STEP_EXECUTION_NOT_FOUND_MESSAGE: &str =
     "The specified step name and execution ID don't exist. Verify the information and try again.";
 
+/// The refusal a STOP of an execution that is running nothing to stop is answered with, as
+/// the modelled `InvalidAutomationStatusUpdateException` words it ("The specified update
+/// status operation isn't valid.") — a fixed sentence with no variable parts.
+pub const STOP_NOT_VALID_MESSAGE: &str = "The specified update status operation isn't valid.";
+
+/// The refusal a stop asking for an automation to be COMPLETED is answered with when that
+/// automation is not running in `Interactive` mode: a completion is the one stop type only
+/// that mode admits.
+///
+/// The execution the request named and the `ExecutionMode` it is running in are the variable
+/// parts — the first from the request, the second from this store; the rest is the fixed
+/// text Systems Manager words this refusal with.
+pub fn complete_not_interactive_message(execution_id: &str, mode: &str) -> String {
+    format!(
+        "Failed to complete automation {execution_id}, automation is running in {mode} mode. \
+         Completion request is only supported in {EXECUTION_MODE_INTERACTIVE} mode"
+    )
+}
+
 /// How an operation that runs or previews an Automation runbook words the miss of a
 /// runbook name: a name no document of this Region carries, and a document of that name
 /// that is no Automation runbook, are the same miss — there is no Automation runbook of
 /// that name to run.
 ///
-/// Worded here rather than in either handler so the two operations that resolve a runbook
-/// (`StartAutomationExecution`, `StartExecutionPreview`) cannot word one refusal two ways.
-pub fn runbook_not_found_message(document_name: &str) -> String {
-    format!("Document {document_name} does not exist.")
-}
+/// A FIXED sentence with no variable parts, which is how Systems Manager words this one:
+/// the name a caller sent is not repeated back to it. Worded here rather than in either
+/// handler so the two operations that resolve a runbook (`StartAutomationExecution`,
+/// `StartExecutionPreview`) cannot word one refusal two ways.
+pub const RUNBOOK_NOT_FOUND_MESSAGE: &str =
+    "Invalid input for field document name, expected valid document in account.";
 
 /// The same, for a version selector the resolved runbook holds no version for.
 pub fn runbook_version_not_found_message(document_name: &str, version: &str) -> String {

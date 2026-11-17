@@ -62,7 +62,16 @@
 //!
 //! Both paths go through [`refusal::stated_refusal`], so the same request cannot be
 //! answered with different words depending on which of them caught it.
+//!
+//! ## What this service adds to an ANSWER
+//!
+//! [`StatedPerOperation`] is also where the member the live wire renders on every step
+//! execution, and this checkout's model declares none of, is written onto a success body
+//! ([`recorded_response_members`]): a member the model does not declare cannot be a field of
+//! a generated shape, so it cannot be written by the handler or by the shape's own
+//! projection. Nothing else about an answer is touched here.
 
+mod recorded_response_members;
 mod refusal;
 
 use aws_smithy_runtime_api::http::{Request as RtRequest, Response as RtResponse};
@@ -403,7 +412,13 @@ where
                 record_refusal(ctx, O::NAME, &code, &response, started.elapsed());
                 return response;
             }
-            self.operation.run(svc, req, ctx).await
+            // A read that reports STEP EXECUTIONS also carries the member the live wire
+            // renders on each of them, which the model declares none of (see
+            // [`recorded_response_members`]); every other answer passes through.
+            recorded_response_members::with_served_success_body(
+                O::NAME,
+                self.operation.run(svc, req, ctx).await,
+            )
         })
     }
 

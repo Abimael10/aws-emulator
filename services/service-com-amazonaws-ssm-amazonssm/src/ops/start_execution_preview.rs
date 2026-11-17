@@ -160,9 +160,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // resolved through the endpoint the start was signed for by the one lookup every
         // document read of this service uses.
         let runbook_not_found = || {
-            invalid(crate::state::automation::runbook_not_found_message(
-                &input.document_name,
-            ))
+            invalid(crate::state::automation::RUNBOOK_NOT_FOUND_MESSAGE.to_string())
         };
         let Some(document) = store.resolve_document_for_request(&input.document_name, &region, now)
         else {

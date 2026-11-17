@@ -235,9 +235,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let runbook_not_found = || {
             StartAutomationExecutionErrorModeled::AutomationDefinitionNotFoundException(
                 AutomationDefinitionNotFoundException {
-                    message: Some(crate::state::automation::runbook_not_found_message(
-                        &input.document_name,
-                    )),
+                    message: Some(
+                        crate::state::automation::RUNBOOK_NOT_FOUND_MESSAGE.to_string(),
+                    ),
                 },
             )
         };

@@ -373,8 +373,10 @@ async fn an_execute_aws_api_step_calls_the_api_it_names_and_selects_its_outputs(
             }),
             outputs: json!([]),
             projected: vec![],
-            expected: Value::Null,
-            expected_projection: Value::Null,
+            // The two parameter maps a read always carries, holding nothing: the step
+            // declared no output, and the runbook projects none.
+            expected: json!({}),
+            expected_projection: json!({}),
         },
     ];
 
@@ -516,8 +518,12 @@ async fn an_api_that_refuses_the_call_fails_the_step_with_its_own_refusal() {
             "case {case:?}: expected the failure to carry the {expected_code} refusal of \
              {api}, got {failure:?}"
         );
-        assert!(
-            execution["Outputs"].is_null() && step(&execution, "call")["Outputs"].is_null(),
+        assert_eq!(
+            (
+                &execution["Outputs"],
+                &step(&execution, "call")["Outputs"]
+            ),
+            (&json!({}), &json!({})),
             "case {case:?}: expected no outputs for a call that was refused, got {execution}"
         );
     }
@@ -784,8 +790,9 @@ async fn an_execute_script_step_computes_its_outputs_in_the_declared_runtime() {
                     "case {case:?}: expected the failure to name {failure_names:?}, got \
                      {failure:?}"
                 );
-                assert!(
-                    execution["Outputs"].is_null() && compute["Outputs"].is_null(),
+                assert_eq!(
+                    (&execution["Outputs"], &compute["Outputs"]),
+                    (&json!({}), &json!({})),
                     "case {case:?}: expected no outputs for a script that produced none, got \
                      {execution}"
                 );
@@ -872,9 +879,11 @@ async fn one_steps_outputs_are_what_the_next_steps_references_resolve() {
             json!({"compute.value": [written], "persist.Version": ["1"]}),
             "case {case:?}: expected the projected outputs of both steps, got {execution}"
         );
+        // A step's `Inputs` reports each resolved value as the JSON literal it is, so a
+        // resolved string carries its own quotes.
         assert_eq!(
             step(&execution, "persist")["Inputs"]["Value"],
-            json!(written),
+            json!(format!("\"{written}\"")),
             "case {case:?}: expected the resolved input of the next step to be the computed \
              value, got {execution}"
         );
@@ -1112,52 +1121,63 @@ async fn a_signal_the_execution_is_waiting_for_carries_the_walk_on() {
 }
 
 /// A signal the execution's own state does not admit is refused as the modelled invalid
-/// signal, and a `StopStep` stops the step execution its payload names.
+/// signal, and a `StopStep` stops the step its payload names.
 #[tokio::test]
 async fn a_signal_the_state_does_not_admit_is_refused_and_a_stop_step_stops_the_step() {
     let (router, engine) = service();
     let (id, step_name) = waiting(&router, &engine, "the paused execution", "Paused", "aws:pause").await;
-    let waiting_step_execution_id = text(
-        &step(&read(&router, "the paused execution", &id).await, &step_name),
-        "StepExecutionId",
-    );
 
     // One row per signal this execution's state does not admit: an approval of a step that
     // is no approval, a resume of a step the execution is not waiting at, a resume with no
-    // step named at all, a revoke of an automation that is no change request, and a stop of
-    // a step execution this execution does not hold.
-    let rows = vec![
+    // step named at all, a revoke of an automation that is no change request, a stop naming
+    // no step at all, and a stop of a step this execution is not standing at.
+    //
+    // The third member is the message the refusal must carry, where that message is the
+    // service's own sentence for the fault rather than the class's: a signal that is about
+    // one step and names none is refused by the payload member it wants.
+    let rows: Vec<(&str, Value, &str, Option<&str>)> = vec![
         (
             "an approval of a step that is no approval",
             json!({"SignalType": "Approve"}),
             "InvalidAutomationSignalException",
+            None,
         ),
         (
             "a resume naming a step the execution is not waiting at",
             json!({"SignalType": "Resume", "Payload": {"StepName": ["after"]}}),
             "InvalidAutomationSignalException",
+            None,
         ),
         (
             "a resume naming no step at all",
             json!({"SignalType": "Resume"}),
             "InvalidAutomationSignalException",
+            Some("One StepName is required when signal type is Resume."),
         ),
         (
             "a revoke of an automation that is no change request",
             json!({"SignalType": "Revoke"}),
             "InvalidAutomationSignalException",
+            None,
         ),
         (
-            "a stop of a step execution this execution does not hold",
+            "a stop naming no step at all",
+            json!({"SignalType": "StopStep"}),
+            "InvalidAutomationSignalException",
+            Some("One StepName is required when signal type is StopStep."),
+        ),
+        (
+            "a stop of a step this execution is not standing at",
             json!({
                 "SignalType": "StopStep",
-                "Payload": {"StepExecutionId": [UNKNOWN_EXECUTION_ID]},
+                "Payload": {"StepName": ["after"]},
             }),
             "AutomationStepNotFoundException",
+            None,
         ),
     ];
 
-    for (case, signal, expected_code) in rows {
+    for (case, signal, expected_code, expected_message) in rows {
         let mut body = json!({"AutomationExecutionId": &id});
         for (member, value) in signal.as_object().cloned().unwrap_or_default() {
             body[member] = value;
@@ -1168,6 +1188,14 @@ async fn a_signal_the_state_does_not_admit_is_refused_and_a_stop_step_stops_the_
             (400, expected_code),
             "case {case:?}: expected the {expected_code} refusal, got {status} with {refused}"
         );
+        if let Some(expected_message) = expected_message {
+            assert_eq!(
+                error_message(&refused),
+                expected_message,
+                "case {case:?}: expected the refusal to name the payload member it wants, \
+                 got {refused}"
+            );
+        }
         assert_eq!(
             text(&read(&router, case, &id).await, "AutomationExecutionStatus"),
             "Waiting",
@@ -1182,7 +1210,7 @@ async fn a_signal_the_state_does_not_admit_is_refused_and_a_stop_step_stops_the_
         &json!({
             "AutomationExecutionId": &id,
             "SignalType": "StopStep",
-            "Payload": {"StepExecutionId": [waiting_step_execution_id]},
+            "Payload": {"StepName": [&step_name]},
         }),
     )
     .await;

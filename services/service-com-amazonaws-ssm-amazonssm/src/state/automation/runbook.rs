@@ -384,8 +384,16 @@ pub fn resolve_inputs(
 }
 
 /// One value as a step's `Inputs` reports it: "Fully-resolved values passed into the step
-/// before execution" (`StepExecution$Inputs`), a map of string to STRING, so a scalar is
-/// reported as its own text and a list or mapping as the JSON it is.
+/// before execution" (`StepExecution$Inputs`), a map of string to STRING, so each resolved
+/// value is reported as the JSON LITERAL it is — a string inside its own quotes, a number,
+/// list or mapping as the JSON it was declared as.
+pub fn reported(value: &Value) -> String {
+    value.to_string()
+}
+
+/// One value as the WALK reads it: the text the value carries, which is what a step's own
+/// action is run with — the span an `aws:sleep` waits out, the instance ids an
+/// `aws:changeInstanceState` names, the sides a branch condition compares.
 pub fn rendered(value: &Value) -> String {
     match value {
         Value::String(text) => text.clone(),

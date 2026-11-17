@@ -814,7 +814,9 @@ async fn a_report_refuses_what_it_cannot_serve() {
         (
             400,
             "AutomationExecutionNotFoundException".to_string(),
-            format!("Automation execution {UNKNOWN_EXECUTION_ID} does not exist.")
+            // AWS's sentence for this class is FIXED text: the id the request sent is not
+            // repeated back in it.
+            "The input automation execution does not exist.".to_string()
         ),
         "case \"an unknown execution\": expected the modelled not-found refusal, got {status} \
          with {refused:?}"

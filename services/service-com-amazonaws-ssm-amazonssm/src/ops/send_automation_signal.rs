@@ -186,6 +186,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // signal needs — is not worded into the message, because the wording of this class
         // is the service's and not this emulator's; it is recorded beside the refusal
         // instead.
+        //
+        // The ONE thing this class does word is the payload member a signal that is about
+        // one STEP needs: a signal type that names a step and a payload that names none is
+        // refused by the member it wants
+        // (`crate::state::automation::signal_step_name_required_message`).
+        let step_name_required = || {
+            SendAutomationSignalError::from(
+                SendAutomationSignalErrorModeled::InvalidAutomationSignalException(
+                    InvalidAutomationSignalException {
+                        message: Some(
+                            crate::state::automation::signal_step_name_required_message(
+                                signal_type,
+                            ),
+                        ),
+                    },
+                ),
+            )
+        };
         let not_valid = |why: &str| {
             ::tracing::debug!(
                 operation = "SendAutomationSignal",
@@ -220,8 +238,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     SendAutomationSignalErrorModeled::AutomationExecutionNotFoundException(
                         AutomationExecutionNotFoundException {
                             message: Some(
-                                crate::state::automation::SIGNAL_EXECUTION_NOT_FOUND_MESSAGE
-                                    .to_string(),
+                                crate::state::automation::EXECUTION_NOT_FOUND_MESSAGE.to_string(),
                             ),
                         },
                     )
@@ -238,7 +255,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // rather than of how far the walk has got.
                 SIGNAL_RESUME | SIGNAL_START_STEP => {
                     let Some(step_name) = named(STEP_NAME_PAYLOAD) else {
-                        return Err(not_valid("the payload names no step"));
+                        return Err(step_name_required());
                     };
                     if !execution
                         .steps
@@ -308,12 +325,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         );
                     }
                 }
-                // "For the StopStep signal type, you must send the step execution ID as the
-                // payload", and stopping the step the automation stands at stops the
+                // A `StopStep` signal is about ONE step too, and the payload member it is
+                // named by is the same one: a stop that names no step is refused by that
+                // member, and stopping the step the automation stands at stops the
                 // automation with it.
                 SIGNAL_STOP_STEP => {
-                    let Some(step_execution_id) = named(STEP_EXECUTION_ID_PAYLOAD) else {
-                        return Err(not_valid("the payload names no step execution"));
+                    let Some(step_name) = named(STEP_NAME_PAYLOAD) else {
+                        return Err(step_name_required());
                     };
                     // "The signal isn't valid for the current Automation execution": an
                     // execution that has ended is running no step for a stop to reach.
@@ -325,7 +343,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     else {
                         return Err(not_valid(NO_LONGER_HELD));
                     };
-                    if !execution.stop_step(&step_execution_id, now) {
+                    if !execution.stop_step(&step_name, now) {
                         return Err(
                             SendAutomationSignalErrorModeled::AutomationStepNotFoundException(
                                 AutomationStepNotFoundException {
@@ -393,14 +411,11 @@ const SIGNAL_REJECT: &str = "Reject";
 /// The `SignalType` that stops the step execution its payload names (same enum).
 const SIGNAL_STOP_STEP: &str = "StopStep";
 
-/// The payload member naming the step a `Resume` or `StartStep` signal is about: "you must
+/// The payload member naming the step a signal that is about one step is about: "you must
 /// send the name of the Automation step to start or resume as the payload. For example:
-/// StepName="step1"" (`SendAutomationSignalRequest$Payload`).
+/// StepName="step1"" (`SendAutomationSignalRequest$Payload`), which is the member a
+/// `StopStep` signal is held to as well.
 const STEP_NAME_PAYLOAD: &str = "StepName";
-
-/// The payload member naming the step execution a `StopStep` signal is about: "you must send
-/// the step execution ID as the payload" (same member).
-const STEP_EXECUTION_ID_PAYLOAD: &str = "StepExecutionId";
 
 /// The payload member carrying the comment an `Approve` or `Reject` signal may send: "the
 /// payload is an optional comment that you can send with the signal type. For example:

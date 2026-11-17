@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op StopAutomationExecution
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `StopAutomationExecution`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`StopAutomationExecution::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Stop an Automation that is currently running: the execution `StartAutomationExecution`
+//! persisted (`crate::state::automation`) is stopped where it stands, so the read of it
+//! that follows reports it cancelled.
 //!
 //! ## Shape of an operation
 //!
@@ -65,7 +60,6 @@
 //! * `InternalServerError` (HTTP 500) — An error occurred on the server side.
 //! * `InvalidAutomationStatusUpdateException` (HTTP 400) — The specified update status
 //!   operation isn't valid.
-
 #[allow(unused_imports)]
 use super::types::*;
 
@@ -139,18 +133,112 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `StopAutomationExecution` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(StopAutomationExecutionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("StopAutomationExecution"))
+        // `AutomationExecutionId`'s length and `Type`'s value set are MODELLED constraints,
+        // so the centralized walk has already refused anything outside them. What is left
+        // is what the model cannot say: whether this endpoint holds that execution, and
+        // whether it is running anything to stop.
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            StopAutomationExecutionErrorModeled::InternalServerError(InternalServerError {
+                message: Some("the automation execution store is unavailable".to_string()),
+            })
+        })?;
+        let region = crate::state::request_region(ctx.parts());
+        // Everything the execution was already owed is performed before the stop is
+        // applied, so the state it is applied to is the state the clock had already brought
+        // it to — a step the walk parked at runs whether or not anybody polled, and an
+        // execution that had already succeeded is not stopped as if it were still running
+        // (`crate::state::automation::actions`).
+        crate::state::automation::actions::advance_automation_actions(
+            &*self.engine,
+            ctx,
+            &region,
+            Some(&input.automation_execution_id),
+        )
+        .await;
+        // What a step whose work is Amazon EC2's has reached in that service is owed at the
+        // same instant whether or not anybody called, and only a CALL can learn it — so it
+        // is driven here too, off the store lock
+        // (`crate::state::automation::instance_state`).
+        crate::state::automation::instance_state::drive_due(&*self.engine, ctx).await;
+
+        // "The stop request type. Valid types include the following: Cancel and Complete.
+        // The default type is Cancel."
+        let stop_type = input
+            .r#type
+            .as_deref()
+            .filter(|stop_type| !stop_type.is_empty())
+            .unwrap_or(crate::state::automation::STOP_TYPE_CANCEL)
+            .to_string();
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        store.materialize_due(now);
+        // "There is no automation execution information for the requested automation
+        // execution ID": an id this endpoint holds no execution for names nothing to stop,
+        // and nothing is created for it.
+        let Some(execution) = store.automation_execution_mut(&region, &input.automation_execution_id)
+        else {
+            return Err(
+                StopAutomationExecutionErrorModeled::AutomationExecutionNotFoundException(
+                    AutomationExecutionNotFoundException {
+                        message: Some(
+                            crate::state::automation::EXECUTION_NOT_FOUND_MESSAGE.to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        };
+        // "Stop an Automation that is currently running": an execution that has already
+        // ended is running nothing to stop, and a COMPLETION is a request only an
+        // `Interactive` automation admits — both are the one modelled class for a status
+        // update that is not a valid one (`InvalidAutomationStatusUpdateException`), each
+        // worded the way Systems Manager words it
+        // (`crate::state::automation::STOP_NOT_VALID_MESSAGE`,
+        // `crate::state::automation::complete_not_interactive_message`).
+        let mode = execution.mode.clone();
+        if let Err(refused) = execution.stop(&stop_type, now) {
+            let status = execution.status.clone();
+            ::tracing::debug!(
+                operation = "StopAutomationExecution",
+                region = %region,
+                execution = %input.automation_execution_id,
+                stop_type = %stop_type,
+                status = %status,
+                mode = %mode,
+                "a stop does not apply to the automation execution it named"
+            );
+            let message = match refused {
+                crate::state::automation::StopRefused::Ended => {
+                    crate::state::automation::STOP_NOT_VALID_MESSAGE.to_string()
+                }
+                crate::state::automation::StopRefused::NotInteractive => {
+                    crate::state::automation::complete_not_interactive_message(
+                        &input.automation_execution_id,
+                        &mode,
+                    )
+                }
+            };
+            return Err(
+                StopAutomationExecutionErrorModeled::InvalidAutomationStatusUpdateException(
+                    InvalidAutomationStatusUpdateException {
+                        message: Some(message),
+                    },
+                )
+                .into(),
+            );
+        }
+        ::tracing::debug!(
+            operation = "StopAutomationExecution",
+            region = %region,
+            execution = %input.automation_execution_id,
+            stop_type = %stop_type,
+            status = %execution.status,
+            "a stop was applied to an automation execution"
+        );
+
+        // "Stop an Automation that is currently running": the answer carries nothing but
+        // the success itself.
+        Ok(StopAutomationExecutionOutput {})
     }
 }

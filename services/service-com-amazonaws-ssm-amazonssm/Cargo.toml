@@ -19,7 +19,10 @@ aws-smithy-types = { workspace = true }
 tokio = { workspace = true, features = ["time", "sync"] }
 bytes = { workspace = true }
 http = { workspace = true }
-serde_json = { workspace = true }
+# `raw_value` is what lets the one body this service writes a member onto be read and
+# written back value by value as the BYTES it already carried, so nothing else about it —
+# a timestamp's own digits above all — is re-rendered (`service::recorded_response_members`).
+serde_json = { workspace = true, features = ["raw_value"] }
 tracing = { workspace = true }
 # `PutParameter`'s AllowedPattern is a regular expression the value must satisfy.
 # The floor matches the version the vendored framework pins, so the tree resolves one.

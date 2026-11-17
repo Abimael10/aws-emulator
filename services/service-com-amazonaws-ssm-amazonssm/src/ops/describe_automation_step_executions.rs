@@ -257,10 +257,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(
                 DescribeAutomationStepExecutionsErrorModeled::AutomationExecutionNotFoundException(
                     AutomationExecutionNotFoundException {
-                        message: Some(format!(
-                            "Automation execution {} does not exist.",
-                            input.automation_execution_id
-                        )),
+                        message: Some(
+                            crate::state::automation::EXECUTION_NOT_FOUND_MESSAGE.to_string(),
+                        ),
                     },
                 )
                 .into(),

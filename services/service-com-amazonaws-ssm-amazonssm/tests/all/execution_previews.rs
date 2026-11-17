@@ -763,12 +763,16 @@ async fn a_start_that_resolves_nothing_is_refused_and_persists_nothing() {
         (
             "a name no document carries",
             json!({"DocumentName": "No-Such-Runbook"}),
-            "Document No-Such-Runbook does not exist.".to_string(),
+            // A runbook that resolves to nothing is refused with AWS's FIXED sentence,
+            // which repeats no part of the request.
+            "Invalid input for field document name, expected valid document in account."
+                .to_string(),
         ),
         (
             "a document that is no Automation runbook",
             json!({"DocumentName": PUBLISHED_COMMAND}),
-            format!("Document {PUBLISHED_COMMAND} does not exist."),
+            "Invalid input for field document name, expected valid document in account."
+                .to_string(),
         ),
         (
             "a version the runbook does not hold",

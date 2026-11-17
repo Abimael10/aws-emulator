@@ -247,7 +247,7 @@ const ACCEPTED_VALUE_SETS: &StatedEnumValueSets<'static> = &[
 /// requirement it broke, and nothing of what the caller sent.
 ///
 /// Recorded behaviour of this service, and recorded for every member and every constraint
-/// class of these five:
+/// class of these six:
 ///
 /// * `DescribeSessions` — fixture
 ///   `ssm-sshp-traj-session-manager-ssh-document-and-state-mistakes`, step `task#3` (a
@@ -272,6 +272,10 @@ const ACCEPTED_VALUE_SETS: &StatedEnumValueSets<'static> = &[
 ///   `Value at 'filters.1.member.operator' …`) and `ssm-ops-item-events-error-paths`, step
 ///   `task#1` (a filter VALUE outside what an OpsItem id may be, stated at the values member
 ///   with no value either).
+/// * `DescribeAutomationStepExecutions` — fixture
+///   `ssm-automation-signal-stopstep-and-invalid-filter-error`, step `task#5` (a filter
+///   `Key` outside `StepExecutionFilterKey`, stated
+///   `Value at 'filters.1.member.key' …`).
 ///
 /// So the decision belongs to the OPERATION rather than to one member, one list position
 /// or one constraint class — and every OTHER operation quotes the value the framework
@@ -285,6 +289,7 @@ const VALUELESS_OPERATIONS: &[&str] = &[
     "DescribeInstanceProperties",
     "StartExecutionPreview",
     "ListOpsItemEvents",
+    "DescribeAutomationStepExecutions",
 ];
 
 /// Whether the clauses of a refusal of `operation` state no value: it is one of

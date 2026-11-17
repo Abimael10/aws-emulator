@@ -56,6 +56,15 @@ const PUBLISHED_RUNBOOK: &str = "AWS-ConfigureS3BucketVersioning";
 /// runbook at all.
 const PUBLISHED_COMMAND: &str = "AWS-RunShellScript";
 
+/// The sentence Systems Manager refuses a start whose `DocumentName` resolves to no
+/// Automation runbook with: FIXED text, with no part of the request in it.
+const RUNBOOK_NOT_FOUND: &str =
+    "Invalid input for field document name, expected valid document in account.";
+
+/// The sentence it refuses a read of an execution id it holds no execution for with: FIXED
+/// text too, with the id the request named nowhere in it.
+const EXECUTION_NOT_FOUND: &str = "The input automation execution does not exist.";
+
 /// A router with just this service mounted, and the engine it was mounted on — the handle
 /// a case reads the store through and moves the clock with.
 fn service() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
@@ -497,11 +506,12 @@ async fn an_execution_reports_what_the_start_supplied_and_what_it_resolved() {
             "case {case:?}: expected the instant the execution started, got {execution}"
         );
         // "The list of execution outputs as defined in the Automation runbook": nothing
-        // has produced one, so none is reported.
-        assert!(
-            execution["Outputs"].is_null() && execution["FailureMessage"].is_null(),
-            "case {case:?}: expected no outputs and no failure for a Pending execution, got \
-             {execution}"
+        // has produced one, so the member a read always carries holds nothing.
+        assert_eq!(
+            (&execution["Outputs"], &execution["FailureMessage"]),
+            (&json!({}), &Value::Null),
+            "case {case:?}: expected empty outputs and no failure for a Pending execution, \
+             got {execution}"
         );
         let _ = &engine;
     }
@@ -593,8 +603,9 @@ async fn a_step_whose_action_this_emulator_does_not_run_fails_the_execution() {
             );
         }
         // Nothing is reported for work that did not happen: no output, no response code.
-        assert!(
-            only["Outputs"].is_null() && only["ResponseCode"].is_null(),
+        assert_eq!(
+            (&only["Outputs"], &only["ResponseCode"]),
+            (&json!({}), &Value::Null),
             "case {case:?}: expected no output for a step that ran nothing, got {only}"
         );
         // The step's inputs WERE resolved — that happens before the action — so they are
@@ -901,13 +912,13 @@ async fn a_start_that_resolves_nothing_is_refused_and_persists_nothing() {
             "a name no document carries",
             json!({"DocumentName": "No-Such-Runbook"}),
             "AutomationDefinitionNotFoundException",
-            "No-Such-Runbook",
+            RUNBOOK_NOT_FOUND,
         ),
         (
             "a document that is no Automation runbook",
             json!({"DocumentName": PUBLISHED_COMMAND}),
             "AutomationDefinitionNotFoundException",
-            PUBLISHED_COMMAND,
+            RUNBOOK_NOT_FOUND,
         ),
         (
             "a version the runbook does not hold",
@@ -986,6 +997,17 @@ async fn a_start_that_resolves_nothing_is_refused_and_persists_nothing() {
             message.contains(says),
             "case {case:?}: expected the refusal to name {says:?}, got {message:?}"
         );
+        // The sentence for a runbook that resolves to nothing is FIXED: the name the
+        // request sent is not repeated back in it.
+        if expected_code == "AutomationDefinitionNotFoundException" {
+            let named = body["DocumentName"].as_str().unwrap_or("<unset>");
+            assert_eq!(
+                (message.as_str(), message.contains(named)),
+                (RUNBOOK_NOT_FOUND, false),
+                "case {case:?}: expected the fixed sentence with no part of the request in \
+                 it, got {message:?}"
+            );
+        }
         assert_eq!(
             stored(&engine),
             held,
@@ -1012,9 +1034,12 @@ async fn a_start_that_resolves_nothing_is_refused_and_persists_nothing() {
             (400, "AutomationExecutionNotFoundException"),
             "case {case:?}: expected the modelled miss, got {status} with {response}"
         );
-        assert!(
-            error_message(&response).contains(execution_id),
-            "case {case:?}: expected the refusal to name the id asked for, got {response}"
+        let message = error_message(&response);
+        assert_eq!(
+            (message.as_str(), message.contains(execution_id)),
+            (EXECUTION_NOT_FOUND, false),
+            "case {case:?}: expected the fixed sentence with the id nowhere in it, got \
+             {response}"
         );
     }
 }

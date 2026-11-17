@@ -497,7 +497,15 @@ async fn a_registered_runbook_is_runnable_and_only_an_absent_one_is_not() {
     );
     assert_eq!(
         body["Message"].as_str(),
-        Some(format!("Document {absent} does not exist.").as_str()),
-        "case {case:?}: expected the refusal to word the missing document, got {body}"
+        Some("Invalid input for field document name, expected valid document in account."),
+        "case {case:?}: expected AWS's fixed sentence for a runbook that resolves to \
+         nothing, got {body}"
+    );
+    assert!(
+        !body["Message"]
+            .as_str()
+            .is_some_and(|message| message.contains(absent)),
+        "case {case:?}: the fixed sentence must not repeat the name the request sent, got \
+         {body}"
     );
 }

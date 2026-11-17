@@ -187,6 +187,18 @@ async fn the_valueless_operations_state_no_value() {
     /// `InstancePropertyFilterOperator`, listed as this service lists it.
     const NODE_FILTER_OPERATOR: &str = "NotEqual, BeginWith, Equal, LessThan, GreaterThan";
 
+    /// `StepExecutionFilterKey` (`smithy_query(query="shape",shape="StepExecutionFilterKey")`
+    /// declares the nine values), listed as this service lists them — which is neither the
+    /// model's declaration order nor lexicographic.
+    const STEP_EXECUTION_FILTER_KEY: &str =
+        "ParentStepIteration, StepExecutionId, ParentStepIteratorValue, StartTimeAfter, \
+         StartTimeBefore, Action, StepName, ParentStepExecutionId, StepExecutionStatus";
+
+    /// A well-formed `AutomationExecutionId` (the modelled length is exactly 36), so the
+    /// rows below break ONE constraint each: the boundary refusal happens before anything
+    /// looks for an execution of that id.
+    const AN_EXECUTION_ID: &str = "99999999-8888-7777-6666-555555555555";
+
     /// One well-formed managed-node filter, for the cases that refuse a LATER element.
     fn node_filter(operator: &str) -> Value {
         json!({ "Key": "PlatformTypes", "Values": ["Windows"], "Operator": operator })
@@ -315,6 +327,35 @@ async fn the_valueless_operations_state_no_value() {
                 "CommandId, DocumentName, ExecutionStage, InvokedBefore, InstanceId, \
                  InvokedAfter, Status",
             ),
+        ),
+        (
+            "a step-execution filter key in the first element",
+            "DescribeAutomationStepExecutions",
+            json!({
+                "AutomationExecutionId": AN_EXECUTION_ID,
+                "Filters": [{ "Key": "NotARealFilterKey", "Values": ["x"] }],
+            }),
+            valueless_enum_clause("filters.1.member.key", STEP_EXECUTION_FILTER_KEY),
+        ),
+        (
+            "the same member in the second element",
+            "DescribeAutomationStepExecutions",
+            json!({
+                "AutomationExecutionId": AN_EXECUTION_ID,
+                "Filters": [
+                    { "Key": "StepName", "Values": ["stand"] },
+                    { "Key": "StepExecutionStatuses", "Values": ["Cancelled"] },
+                ],
+            }),
+            valueless_enum_clause("filters.2.member.key", STEP_EXECUTION_FILTER_KEY),
+        ),
+        (
+            "a page size over the step report's maximum",
+            "DescribeAutomationStepExecutions",
+            json!({ "AutomationExecutionId": AN_EXECUTION_ID, "MaxResults": 51 }),
+            "Value at 'maxResults' failed to satisfy constraint: Member must have value less \
+             than or equal to 50"
+                .to_string(),
         ),
     ];
 
