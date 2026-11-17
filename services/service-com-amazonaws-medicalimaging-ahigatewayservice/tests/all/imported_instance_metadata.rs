@@ -15,6 +15,12 @@
 //! (`StoredTransferSyntaxUID`) and, for an instance holding pixel data, the checksum
 //! algorithm those frames are summed with (`ChecksumType`).
 //!
+//! RULE 4: the instance level carries those members and no other — and the checksum type it
+//! names is the algorithm the frame checksums beside it were REALLY computed with, so a
+//! client can verify a frame's checksum from the document alone.
+//! `the_instance_level_carries_the_members_the_document_has_and_names_its_checksum_type`
+//! is that rule's test.
+//!
 //! RULE 2: what is reported ABOUT an image frame is computed from the pixel data that frame
 //! holds — its size in bytes, the checksum of it at the resolution the instance declares,
 //! and the smallest and largest SAMPLE in it, which is stated only when the stored bytes
@@ -89,8 +95,28 @@ const IMPLEMENTATION_CLASS: &str = "1.2.826.0.1.3680043.8.498.1";
 /// service holds, so the document and the frame read agree.
 const STORED_TRANSFER_SYNTAX: &str = "1.2.840.10008.1.2.4.202";
 
-/// The checksum algorithm the document must name beside a frame's checksums.
+/// The checksum algorithm the document must name beside a frame's checksums: the one the
+/// service really sums a frame's pixel data with, which this suite verifies by recomputing
+/// a reported checksum with it.
 const CHECKSUM_TYPE: &str = "CRC32";
+
+/// The members the aggregated metadata document has at the INSTANCE level, which RULE 4
+/// holds an instance object to: the instance's DICOM attributes, the value representation
+/// of each, the transfer syntax its stored pixel data is served in, its image frames, and
+/// the checksum type of that pixel data.
+///
+/// The last two belong to an instance that HOLDS pixel data: an instance holding none has
+/// no frames to report and no checksum to name a type for.
+const INSTANCE_LEVEL_MEMBERS: [&str; 5] = [
+    "ChecksumType",
+    "DICOM",
+    "DICOMVRs",
+    "ImageFrames",
+    "StoredTransferSyntaxUID",
+];
+
+/// The instance-level members only an instance holding pixel data carries.
+const PIXEL_DATA_MEMBERS: [&str; 2] = ["ChecksumType", "ImageFrames"];
 
 /// The patient, study and series identifiers every file below carries, so one case's
 /// content cannot be read as another's.
@@ -1167,5 +1193,249 @@ async fn an_attribute_larger_than_the_bound_is_refused_and_not_imported() {
             "1",
             "case {name:?}: a refused write must mint no version, got {read:?}"
         );
+    }
+}
+
+/// The member names `level` carries, sorted — what an instance object of the served
+/// document is held to.
+fn member_names(level: &Value) -> Vec<&str> {
+    let mut names: Vec<&str> = level
+        .as_object()
+        .map(|object| object.keys().map(String::as_str).collect())
+        .unwrap_or_default();
+    names.sort_unstable();
+    names
+}
+
+/// RULE 4 (above), over the table: whatever an import leaves in an image set, each instance
+/// object of the served document carries the members the document has at that level and
+/// nothing besides — and the checksum type it names is the algorithm the frame checksums
+/// beside it were really computed with, which this test verifies by recomputing a reported
+/// checksum with that very algorithm.
+///
+/// The rows differ along what the rule generalises over: how many SOP instances the image
+/// set holds, whether an instance holds pixel data at all (and so has a frame to sum), the
+/// transfer syntax the data set is encoded in, how wide its samples are, and whether the
+/// bytes stored are the raster the instance declares.
+#[tokio::test]
+async fn the_instance_level_carries_the_members_the_document_has_and_names_its_checksum_type() {
+    let with_pixel_data = two_instance_case();
+    let mut without_pixel_data = two_instance_case();
+    without_pixel_data.pixel_data = None;
+    without_pixel_data.sample_range = None;
+    let mut eight_bit = two_instance_case();
+    eight_bit.transfer_syntax = IMPLICIT_VR_LE;
+    eight_bit.rows = 2;
+    eight_bit.columns = 2;
+    eight_bit.bits_allocated = 8;
+    eight_bit.bits_stored = 8;
+    eight_bit.high_bit = 7;
+    eight_bit.pixel_data = Some(PIXELS_8_UNSIGNED);
+    let mut short_of_the_raster = two_instance_case();
+    short_of_the_raster.rows = 4;
+    short_of_the_raster.columns = 4;
+    short_of_the_raster.pixel_data = Some(PIXELS_SHORT_OF_THE_RASTER);
+
+    // (the case, each imported instance as its SOP Instance UID and the data set it carries)
+    let rows: Vec<(&str, Vec<(&str, &Case)>)> = vec![
+        (
+            "one instance of 16-bit unsigned pixel data",
+            vec![(SOP_UID, &with_pixel_data)],
+        ),
+        (
+            "implicit VR, 8-bit pixel data",
+            vec![(SOP_UID, &eight_bit)],
+        ),
+        (
+            "pixel data that is not the raster the instance declares",
+            vec![(SOP_UID, &short_of_the_raster)],
+        ),
+        (
+            "an instance holding no pixel data",
+            vec![(SOP_UID, &without_pixel_data)],
+        ),
+        (
+            "two instances, one holding pixel data and one not",
+            vec![
+                (SOP_UID, &with_pixel_data),
+                (OTHER_SOP_UID, &without_pixel_data),
+            ],
+        ),
+    ];
+
+    for (index, (name, imported)) in rows.iter().enumerate() {
+        let emulator = Emulator::new();
+        let datastore_id = emulator
+            .active_datastore(
+                &format!("instance.members.{index}"),
+                &format!("token-instance-members-{index}"),
+            )
+            .await;
+        let files: Vec<Vec<u8>> = imported
+            .iter()
+            .map(|(sop_uid, case)| case.part10(sop_uid).0)
+            .collect();
+        let (image_set_id, _) = seed_imported_image_set(&emulator, name, &datastore_id, &files);
+
+        let read = document(
+            &get_image_set_metadata(&emulator, &datastore_id, &image_set_id, None).await,
+            name,
+        );
+
+        for (sop_uid, case) in imported {
+            let instance = at(
+                &read,
+                &["Study", "Series", SERIES_UID, "Instances", sop_uid],
+            );
+            // An instance the image set holds no pixel data of has no frames to report and
+            // no checksum to name a type for; every other member of the level is served
+            // from what the import stored.
+            let mut expected: Vec<&str> = INSTANCE_LEVEL_MEMBERS
+                .iter()
+                .copied()
+                .filter(|member| {
+                    !PIXEL_DATA_MEMBERS.contains(member) || case.pixel_data.is_some()
+                })
+                .collect();
+            expected.sort_unstable();
+            assert_eq!(
+                member_names(&instance),
+                expected,
+                "case {name:?}: expected instance {sop_uid:?} to carry {expected:?} and \
+                 nothing besides, got {instance}"
+            );
+
+            // What was computed about the frame is reported inside the frame's own entry:
+            // the checksum of the pixel data it holds, at the raster the instance declares.
+            // The type named at the instance level is the algorithm it was summed with, so
+            // recomputing the checksum with that algorithm must give the reported value.
+            let frames = &instance["ImageFrames"];
+            let checksum_type = &instance["ChecksumType"];
+            match case.pixel_data {
+                None => {
+                    assert!(
+                        frames.is_null(),
+                        "case {name:?}: instance {sop_uid:?} holds no pixel data, so it has no \
+                         frames to report, got {frames}"
+                    );
+                    assert!(
+                        checksum_type.is_null(),
+                        "case {name:?}: instance {sop_uid:?} has no checksum to name a type \
+                         for, got {checksum_type}"
+                    );
+                }
+                Some(pixels) => {
+                    assert_eq!(
+                        checksum_type,
+                        &json!(CHECKSUM_TYPE),
+                        "case {name:?}: expected instance {sop_uid:?} to name the checksum \
+                         type {CHECKSUM_TYPE:?}, got {checksum_type}"
+                    );
+                    let checksums = &frames[0]["PixelDataChecksumFromBaseToFullResolution"];
+                    // `crc32` is the named algorithm, computed here over the very bytes the
+                    // frame holds — so this asserts the document names the algorithm its
+                    // checksums were really summed with, not merely that it names one.
+                    let expected_checksums = json!([{
+                        "Width": case.columns,
+                        "Height": case.rows,
+                        "Checksum": crc32(pixels),
+                    }]);
+                    assert_eq!(
+                        checksums,
+                        &expected_checksums,
+                        "case {name:?}: expected instance {sop_uid:?} to report its frame's \
+                         checksums as {expected_checksums}, summed with the type it names, \
+                         got {checksums}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// RULE 4, the other half: the instance level is COMPUTED from what the image set holds, so
+/// a caller writing a member of its own there cannot move what the service computes — the
+/// checksum type stays the algorithm the frames were summed with — while a name the document
+/// has nothing at is served from where it was written, and under no other instance.
+///
+/// The rows differ along the name written: the one the document already computes at that
+/// level, and another name entirely.
+#[tokio::test]
+async fn a_caller_written_instance_member_never_moves_the_computed_checksum_type() {
+    let case = "a caller-written instance member";
+    let base = two_instance_case();
+    let emulator = Emulator::new();
+    let datastore_id = emulator
+        .active_datastore("instance.written", "token-instance-written")
+        .await;
+    let files = vec![base.part10(SOP_UID).0, base.part10(OTHER_SOP_UID).0];
+    let (image_set_id, _) = seed_imported_image_set(&emulator, case, &datastore_id, &files);
+
+    let written = json!({
+        "SchemaVersion": "1.1",
+        "Study": { "Series": { SERIES_UID: { "Instances": { SOP_UID: {
+            "ChecksumType": "SPOOFED",
+            "PixelDataChecksumAlgorithmRevision": 7,
+        } } } } },
+    });
+    let updated = update_metadata(
+        &emulator,
+        &datastore_id,
+        &image_set_id,
+        "1",
+        dicom_updates(Some(&written), None),
+        &[],
+    )
+    .await;
+    assert_eq!(
+        updated.status, 200,
+        "case {case:?}: expected HTTP 200 from UpdateImageSetMetadata, got {updated:?}"
+    );
+    poll_until_landed(&emulator, case, &datastore_id, &image_set_id, "2").await;
+
+    let read = document(
+        &get_image_set_metadata(&emulator, &datastore_id, &image_set_id, None).await,
+        case,
+    );
+    // (the member written, what the document must serve at it, whether the caller's value
+    // is the one served)
+    for (member, expected, from_the_caller) in [
+        ("ChecksumType", json!(CHECKSUM_TYPE), false),
+        ("PixelDataChecksumAlgorithmRevision", json!(7), true),
+    ] {
+        let path = ["Study", "Series", SERIES_UID, "Instances", SOP_UID, member];
+        assert_eq!(
+            at(&read, &path),
+            expected,
+            "case {case:?}: expected {member:?} to be served as {expected} (the caller's own \
+             value: {from_the_caller}), got {}",
+            at(&read, &path)
+        );
+        let elsewhere = [
+            "Study",
+            "Series",
+            SERIES_UID,
+            "Instances",
+            OTHER_SOP_UID,
+            member,
+        ];
+        if from_the_caller {
+            assert!(
+                at(&read, &elsewhere).is_null(),
+                "case {case:?}: expected {member:?} under no instance it was not written \
+                 for, got {} for {OTHER_SOP_UID:?}",
+                at(&read, &elsewhere)
+            );
+        } else {
+            // The instance the update did not name reports the computed value too: it is
+            // computed per instance from the frames that instance holds.
+            assert_eq!(
+                at(&read, &elsewhere),
+                expected,
+                "case {case:?}: expected the untouched instance to report {member:?} as \
+                 {expected}, got {}",
+                at(&read, &elsewhere)
+            );
+        }
     }
 }

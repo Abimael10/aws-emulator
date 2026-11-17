@@ -237,6 +237,13 @@ fn study_attributes(tags: &DICOMTags) -> Value {
 ///
 /// Ordered: the instances by UID and each instance's frames by identifier, so the one
 /// document is served byte for byte however the maps holding them are laid out.
+///
+/// An instance carries the members the document has at that level: its DICOM attributes,
+/// the value representation of each, the transfer syntax its stored pixel data is served
+/// in, its image frames, and the checksum type of that pixel data. What is computed ABOUT a
+/// frame is reported inside that frame's own entry — its size, its sample range and the
+/// checksum of it — and the type named beside them is the algorithm those checksums were
+/// really computed with, so a client can verify one from the document alone.
 fn instances(image_set: &ImageSet, attributes: &ImageSetAttributes) -> Value {
     let mut frames_of_instance: BTreeMap<&str, Vec<&ImageFrame>> = BTreeMap::new();
     for frame in image_set.image_frames.values() {
@@ -333,9 +340,13 @@ fn instances(image_set: &ImageSet, attributes: &ImageSetAttributes) -> Value {
         if !image_frames.is_empty() {
             instance.insert("ImageFrames".to_string(), Value::Array(image_frames));
         }
-        // The algorithm the frame checksums above were computed with, named beside them so
-        // a client can verify one.
         if checksummed {
+            // The checksum type of the instance's stored pixel data, beside the transfer
+            // syntax that pixel data is stored in: it names the algorithm the frame
+            // checksums ABOVE were really computed with
+            // ([`crate::state::pixel_data_checksum`]), so the document can never name a
+            // type the checksums beside it were not summed with. An instance whose frames
+            // carry no checksum has no type to name.
             instance.insert(
                 "ChecksumType".to_string(),
                 Value::String(PIXEL_DATA_CHECKSUM_TYPE.to_string()),

@@ -25,9 +25,13 @@ use ::std::collections::BTreeMap;
 
 use ::serde_json::Value;
 
-/// The checksum algorithm [`PixelDataChecksum::checksum`] is computed with, which the
-/// aggregated metadata document names beside the checksums themselves — a 32-bit cyclic
-/// redundancy check, as [`pixel_data_checksum`] computes it.
+/// The checksum algorithm [`pixel_data_checksum`] computes a frame's
+/// [`PixelDataChecksum::checksum`] with — a 32-bit cyclic redundancy check.
+///
+/// Named HERE, beside the computation, so the one place the algorithm is chosen is the one
+/// place it is named: the aggregated metadata document reports this as the checksum type of
+/// an instance's stored pixel data, and so can never name a type the checksums it carries
+/// were not summed with.
 pub const PIXEL_DATA_CHECKSUM_TYPE: &str = "CRC32";
 
 /// The DICOM transfer syntax UID this service reports the pixel data it STORES as being in.
