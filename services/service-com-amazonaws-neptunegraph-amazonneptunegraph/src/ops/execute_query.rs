@@ -10,7 +10,8 @@
 //! the graph only through the trait `crate::state::StoredGraph` implements over the
 //! stored data: nothing here interprets the query text itself, and nothing is
 //! synthesised to look computed. The engine's own subset is read-only openCypher, so a
-//! query it cannot read is refused with the position it could not read it at.
+//! query it cannot read is refused with the position it could not read it at and the
+//! constructs its grammar could have continued the text with there.
 //!
 //! ## Shape of an operation
 //!
@@ -305,7 +306,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let payload = match ::tokio::time::timeout(timeout, evaluating).await {
             Ok(Ok(Ok(payload))) => payload,
             Ok(Ok(Err(refused))) => {
-                return Err(query_refusal(&input.query_string, refused).into());
+                return Err(query_refusal(refused).into());
             }
             // The evaluation answered nothing at all: a panic inside it is a failure of
             // this service rather than of the request.
@@ -365,10 +366,11 @@ const INTERNAL_LIMIT_REASON: &str = "INTERNAL_LIMIT_EXCEEDED";
 /// Each kind is a different fact about the request, so each carries the error and the
 /// modelled reason that states it:
 ///
-/// * a text that does not PARSE is refused before anything is evaluated, stating where
-///   the text could not be read ([`crate::state::syntax_refusal`]), and one that parses
-///   and cannot be EVALUATED is refused for the argument it names — both statements
-///   about the request, which is why neither is a conflict and nothing is persisted;
+/// * a text that does not PARSE is refused before anything is evaluated, with the
+///   sentence the data plane worded where the text could not be read
+///   ([`crate::state::QueryFailure::Malformed`]), and one that parses and cannot be
+///   EVALUATED is refused for the argument it names — both statements about the request,
+///   which is why neither is a conflict and nothing is persisted;
 /// * a text longer or more deeply nested than this service reads is refused as the
 ///   oversized query it is, before it is parsed, and one naming a CLAUSE this engine has
 ///   no grammar for is refused as the unsupported operation it is rather than as a text
@@ -381,21 +383,20 @@ const INTERNAL_LIMIT_REASON: &str = "INTERNAL_LIMIT_EXCEEDED";
 ///   past the rows this service answers with under the one that names an internal limit.
 ///   Each is reported rather than truncated, so no caller reads a short result as a
 ///   complete one.
-fn query_refusal(query: &str, refused: crate::state::QueryFailure) -> ExecuteQueryErrorModeled {
+fn query_refusal(refused: crate::state::QueryFailure) -> ExecuteQueryErrorModeled {
     match refused {
-        crate::state::QueryFailure::Refused(::cypher_parser::CypherError::Syntax {
-            message,
-            position,
-        }) => ExecuteQueryErrorModeled::ValidationException(ValidationException {
-            message: crate::state::syntax_refusal(query, &message, position),
-            reason: Some(MALFORMED_QUERY_REASON.to_string()),
-        }),
-        crate::state::QueryFailure::Refused(::cypher_parser::CypherError::Execution {
-            message,
-        }) => ExecuteQueryErrorModeled::ValidationException(ValidationException {
-            message,
-            reason: Some(ILLEGAL_ARGUMENT_REASON.to_string()),
-        }),
+        crate::state::QueryFailure::Malformed(refusal) => {
+            ExecuteQueryErrorModeled::ValidationException(ValidationException {
+                message: refusal,
+                reason: Some(MALFORMED_QUERY_REASON.to_string()),
+            })
+        }
+        crate::state::QueryFailure::Rejected(message) => {
+            ExecuteQueryErrorModeled::ValidationException(ValidationException {
+                message,
+                reason: Some(ILLEGAL_ARGUMENT_REASON.to_string()),
+            })
+        }
         crate::state::QueryFailure::TooLong {
             characters,
             ceiling,

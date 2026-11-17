@@ -15,8 +15,9 @@
 //! What the engine decides and what this module decides are kept apart:
 //!
 //! * whether the query is WELL FORMED, and what it evaluates to, is the engine's —
-//!   including the position a malformed query is refused at, which this module only
-//!   words ([`syntax_refusal`]);
+//!   including the position a malformed query is refused at and the constructs that
+//!   could have stood there, both of which this module only words
+//!   ([`syntax_refusal`], [`expected_alternatives`]);
 //! * how a node, an edge property or a result row is SPELLED on the wire is this
 //!   service's, because that is the service's own protocol ([`run_query`]).
 //!
@@ -297,9 +298,23 @@ impl GraphProvider for StoredGraph<'_> {
         if !self.budget.charge(1) {
             return CypherValue::Null;
         }
-        self.node(node)
+        let Some(stored) = self
+            .node(node)
             .and_then(|stored| stored.properties.get(prop))
-            .map_or(CypherValue::Null, engine_value)
+        else {
+            return CypherValue::Null;
+        };
+        // A value the engine can EXPAND costs what it can expand TO: `UNWIND` over a
+        // stored list makes one row per element, and the engine builds those rows
+        // without asking the provider anything further, so every element handed over is
+        // charged HERE — before the value is — and a query chaining expansions pays for
+        // each row it carries forward. A value the budget cannot afford is not handed
+        // over at all, which stops the evaluation exactly as a question it cannot afford
+        // does.
+        if !self.budget.charge(value_elements(stored)) {
+            return CypherValue::Null;
+        }
+        engine_value(stored)
     }
 
     fn node_id(&self, node: Self::NodeId) -> String {
@@ -373,9 +388,14 @@ pub fn parse_query(query: &str) -> Result<::cypher_parser::Query, ::cypher_parse
 /// the operation reports each one through the modelled error that states it.
 #[derive(Debug)]
 pub enum QueryFailure {
-    /// The text could not be read as openCypher, or the query it reads as could not be
-    /// evaluated.
-    Refused(::cypher_parser::CypherError),
+    /// The text could not be READ as openCypher: the sentence stating what the parse
+    /// stopped on, what the grammar could have continued the text with there, and where
+    /// in the text that was ([`syntax_refusal`]).
+    Malformed(String),
+    /// The query was read and could not be EVALUATED — an unknown function, an argument
+    /// of a type it cannot be applied to: the engine's own statement about the query it
+    /// did read.
+    Rejected(String),
     /// The query text is longer than this emulator reads
     /// ([`super::MAX_QUERY_STRING_CHARS`]).
     TooLong { characters: usize, ceiling: usize },
@@ -391,6 +411,25 @@ pub enum QueryFailure {
     /// The evaluation was stopped before it had answered: it asked for more of the graph
     /// than one query may read, or the span it was given ran out.
     Stopped(Stopped),
+}
+
+impl QueryFailure {
+    /// How the engine's own refusal of `query` is reported.
+    ///
+    /// A text the engine could not READ is worded HERE rather than by the operation:
+    /// this is where the query text is, and it runs off the request path, so composing
+    /// the sentence — which asks the parser what its grammar admits at the position the
+    /// parse stopped at, a fixed number of parses of a text already bounded by
+    /// [`super::MAX_QUERY_STRING_CHARS`] and [`MAX_QUERY_NESTING_DEPTH`] — happens on the
+    /// same thread, under the same permit, as the evaluation it stands in for.
+    fn refused(query: &str, refused: ::cypher_parser::CypherError) -> Self {
+        match refused {
+            ::cypher_parser::CypherError::Syntax { message, position } => {
+                Self::Malformed(syntax_refusal(query, &message, position))
+            }
+            ::cypher_parser::CypherError::Execution { message } => Self::Rejected(message),
+        }
+    }
 }
 
 /// The most rows one query's result may carry.
@@ -446,20 +485,26 @@ pub static QUERY_SLOTS: ::tokio::sync::Semaphore =
 /// not a failure one caller's query may cause.
 pub const QUERY_STACK_BYTES: usize = 16 * 1024 * 1024;
 
-/// How deep `query`'s brackets nest, read off the token stream the engine's own lexer
-/// produces.
+/// How deep `query`'s brackets nest.
 ///
 /// Not a parse — the engine owns that — but the one measurement that has to be taken
 /// BEFORE one: how far a parser reading this text would descend. It is counted over the
-/// ENGINE'S tokens rather than over the raw characters, so what this measures and what
-/// the parser then recurses through cannot disagree: the lexer is what decides where a
-/// string literal and a comment start and end, and a bracket inside either of them is
-/// not a token at all. A text the lexer cannot read tokenises to nothing and nests
-/// nothing; the parse that follows refuses it for the same reason the lexer did.
+/// ENGINE'S tokens where the text tokenises, so what this measures and what the parser
+/// then recurses through cannot disagree: the lexer is what decides where a string
+/// literal and a comment start and end, and a bracket inside either of them is not a
+/// token at all.
+///
+/// A text the lexer CANNOT read tokenises to nothing, and the bound still has to hold
+/// for it: a prefix of such a text is handed back to the parser when a refusal states
+/// what could have continued it ([`expected_alternatives`]), and that prefix can lex
+/// cleanly. So the brackets are then counted off the characters instead
+/// ([`character_nesting`]), which can only OVER-state the depth of a text that is
+/// already not a query — the safe direction for a bound whose job is to keep a parser
+/// from descending through a caller's text.
 #[must_use]
 pub fn nesting_depth(query: &str) -> usize {
     let Ok(tokens) = ::cypher_parser::lexer::tokenize(query) else {
-        return 0;
+        return character_nesting(query);
     };
     let mut depth: usize = 0;
     let mut deepest: usize = 0;
@@ -474,6 +519,25 @@ pub fn nesting_depth(query: &str) -> usize {
             ::cypher_parser::lexer::TokenKind::RParen
             | ::cypher_parser::lexer::TokenKind::RBracket
             | ::cypher_parser::lexer::TokenKind::RBrace => depth = depth.saturating_sub(1),
+            _ => {}
+        }
+    }
+    deepest
+}
+
+/// How deep the brackets of a text the lexer could not read nest, counted off its
+/// CHARACTERS: every opening bracket of the language descends and every closing one
+/// returns, wherever it stands.
+fn character_nesting(query: &str) -> usize {
+    let mut depth: usize = 0;
+    let mut deepest: usize = 0;
+    for character in query.chars() {
+        match character {
+            '(' | '[' | '{' => {
+                depth += 1;
+                deepest = deepest.max(depth);
+            }
+            ')' | ']' | '}' => depth = depth.saturating_sub(1),
             _ => {}
         }
     }
@@ -546,11 +610,15 @@ const ALIAS_KEYWORD: &str = "AS";
 /// they have to be bounded from the text instead. What is measured is deliberately
 /// INDEPENDENT of where each `UNWIND` reads from — a list written in place, a variable a
 /// `WITH` bound to one, an alias of an alias — because the question is only how many rows
-/// the text could possibly expand to: the longest list literal the text contains, raised
-/// to the number of `UNWIND` clauses that could each expand one. No list a query expands
-/// can be longer than the longest one it writes, so this cannot be under-counted by a
-/// binding, and it saturates rather than wrapping, so a text that would answer more rows
-/// than a `usize` counts reports the largest count.
+/// the text's OWN literals could expand to: the longest list literal the text contains,
+/// raised to the number of `UNWIND` clauses that could each expand one. It saturates
+/// rather than wrapping, so a text that would answer more rows than a `usize` counts
+/// reports the largest count.
+///
+/// A list the query reads out of the GRAPH is not measurable from the text at all, and
+/// is not measured here: those are charged to the work budget by the element, as the
+/// provider hands them over ([`StoredGraph::property`]), which is what bounds the rows
+/// an expansion of a stored list can build.
 #[must_use]
 pub fn literal_rows(query: &str) -> usize {
     use ::cypher_parser::lexer::TokenKind;
@@ -658,12 +726,13 @@ pub fn run_query(
         Err(refused) => {
             return Err(match unsupported_clause(query) {
                 Some(clause) => QueryFailure::Unsupported { clause },
-                None => QueryFailure::Refused(refused),
+                None => QueryFailure::refused(query, refused),
             });
         }
     };
     let graph = StoredGraph::over_within(data, MAX_QUERY_WORK_UNITS, deadline);
-    let results = ::cypher_parser::execute(&graph, &parsed).map_err(QueryFailure::Refused)?;
+    let results = ::cypher_parser::execute(&graph, &parsed)
+        .map_err(|refused| QueryFailure::refused(query, refused))?;
     // The evaluation may have been stopped while it was building: what the engine was
     // left holding is a SHORT answer, so the limit that stopped it is reported and the
     // rows are dropped.
@@ -696,6 +765,26 @@ pub fn query_run_timeout(requested_milliseconds: Option<i32>) -> ::std::time::Du
     requested.map_or(super::DEFAULT_QUERY_TIMEOUT, |asked| {
         asked.min(super::DEFAULT_QUERY_TIMEOUT)
     })
+}
+
+/// How many ELEMENTS a stored value carries, through the lists and maps it nests: what
+/// an expansion of that value could make rows over.
+///
+/// A scalar carries none — it makes one row wherever it stands, which the question that
+/// returned it is already charged for. A list or a map carries its own entries plus
+/// whatever those nest, counted saturating so no stored value can make this wrap.
+fn value_elements(stored: &::serde_json::Value) -> usize {
+    match stored {
+        ::serde_json::Value::Array(items) => items.iter().fold(items.len(), |counted, item| {
+            counted.saturating_add(value_elements(item))
+        }),
+        ::serde_json::Value::Object(entries) => {
+            entries.values().fold(entries.len(), |counted, entry| {
+                counted.saturating_add(value_elements(entry))
+            })
+        }
+        _ => 0,
+    }
 }
 
 /// One stored property as the engine's value domain holds it.
@@ -811,35 +900,221 @@ fn node_value(id: &str, label: &str, data: &GraphData) -> ::serde_json::Value {
 }
 
 /// The sentence a query the parser could not read is refused with: what was found where
-/// the parser could not continue, what it was looking for there, and WHERE in the query
-/// text that was — as a line, a column and the byte offset the parser reported.
+/// the parser could not continue, the ALTERNATIVES that could have stood there instead,
+/// and WHERE in the query text that was — as a line, a column and an offset, all three
+/// counted in characters of the submitted text.
 ///
 /// The position is reported in all three forms because a client fixing a query needs the
-/// line and column, while the offset is what the parser itself decided at; the clause
-/// about what was expected is the engine's own, since what may follow a given prefix is
-/// the grammar's statement and not this service's.
+/// line and column, while the offset is what the parser itself decided at. What could
+/// have stood there is the GRAMMAR's statement and not this service's, so it is not
+/// worded here either: it is asked of the engine, by reading the caller's own text up to
+/// the position and offering the parser each construct the language is written with
+/// ([`expected_alternatives`]). Only when the grammar admits nothing at all at that
+/// position does the engine's own report of what it was looking for stand in its place.
 #[must_use]
 pub fn syntax_refusal(query: &str, message: &str, position: usize) -> String {
     // A position past the end of the text, or inside a multi-byte character, is a
     // position this wording cannot split the text at: it is taken back to the nearest
     // character boundary at or before it, so no caller's text can make this panic.
-    let offset = (0..=position.min(query.len()))
+    let boundary = (0..=position.min(query.len()))
         .rev()
         .find(|at| query.is_char_boundary(*at))
         .unwrap_or_default();
-    let before = query.get(..offset).unwrap_or_default();
+    let before = query.get(..boundary).unwrap_or_default();
+    // The position is counted in CHARACTERS of the submitted text, so what a refusal
+    // states is what a reader of that text counts to rather than how many bytes it
+    // happens to be written in.
     let line = before.matches('\n').count() + 1;
     let column = before
         .rfind('\n')
-        .map_or(offset, |start| offset - start - 1)
-        + 1;
-    let found = query
-        .get(offset..)
-        .unwrap_or_default()
+        .map_or(before, |start| &before[start + 1..])
         .chars()
-        .next()
-        .map_or_else(String::new, |found| found.to_string());
-    format!("Invalid input '{found}': {message} (line {line}, column {column} (offset: {offset}))")
+        .count()
+        + 1;
+    let offset = before.chars().count();
+    let found = found_input(query, boundary);
+    let expected = expected_alternatives(query, boundary)
+        .unwrap_or_else(|| engine_expectation(message).to_string());
+    format!(
+        "Invalid input '{found}': expected {expected} (line {line}, column {column} \
+         (offset: {offset}))"
+    )
+}
+
+/// What a parser names the end of the text it was reading, which is what a query stopped
+/// at its own end is reported with instead of a character.
+const END_OF_INPUT: &str = "EOI";
+
+/// The input a refusal reports it could not use: the CHARACTER the parse stopped on, or
+/// [`END_OF_INPUT`] when it stopped at the end of the text.
+///
+/// A control character is reported escaped, so a refusal cannot carry a line break of
+/// the caller's own choosing into whatever renders it.
+fn found_input(query: &str, offset: usize) -> String {
+    let Some(found) = query.get(offset..).and_then(|rest| rest.chars().next()) else {
+        return END_OF_INPUT.to_string();
+    };
+    if found.is_control() {
+        return found.escape_debug().to_string();
+    }
+    found.to_string()
+}
+
+/// What the engine said it was looking for, with the `expected ` the sentence already
+/// carries taken off its front, so the refusal states it once.
+fn engine_expectation(message: &str) -> &str {
+    message.strip_prefix(EXPECTED_PREFIX).unwrap_or(message)
+}
+
+/// How a parser's report, and this sentence, introduce what could have stood at the
+/// position a parse stopped.
+const EXPECTED_PREFIX: &str = "expected ";
+
+/// One construct a query may continue with, as a refusal NAMES it and as the engine's
+/// grammar is ASKED about it.
+#[derive(Debug)]
+struct Continuation {
+    /// How a refusal names this alternative: a literal token in quotes, as the grammar
+    /// spells it, and anything else by the construct it is.
+    name: &'static str,
+    /// The shortest text that starts this construct. It is appended to the text the
+    /// parser had read and the whole is parsed again: the construct may stand at that
+    /// position exactly when the parser reads past it rather than stopping where it
+    /// stopped before.
+    probe: &'static str,
+    /// Whether the probe is spelled as a WORD. A position that takes a variable takes
+    /// every word, so naming each keyword there would say nothing about the grammar:
+    /// these are asked about only where no variable may stand.
+    a_word: bool,
+}
+
+impl Continuation {
+    /// A construct named by what it is, or by the token it is, asked about everywhere.
+    const fn construct(name: &'static str, probe: &'static str) -> Self {
+        Self { name, probe, a_word: false }
+    }
+
+    /// A construct spelled as a word of the language, asked about only where a variable
+    /// cannot stand (see [`Continuation::a_word`]).
+    const fn keyword(name: &'static str) -> Self {
+        Self { name, probe: name, a_word: true }
+    }
+}
+
+/// The text that stands for a VARIABLE, whose acceptance decides whether the keywords
+/// are asked about at all.
+const VARIABLE_PROBE: &str = "variable";
+
+/// Every construct one position of a query is asked about, in the order a refusal lists
+/// them.
+///
+/// Source: the constructs of the openCypher grammar the engine reads — the two forms of
+/// text a parse skips (whitespace and a comment), the parts a pattern is built from
+/// (`Variable`, `NodeLabels`, `Properties`, `NodePattern`, `RelationshipPattern`), the
+/// literals an expression is written with, the tokens that close or continue one, and
+/// the clause and operator keywords of the read-only subset this engine accepts (see the
+/// module docs, and [`UNSUPPORTED_CLAUSES`] for the clauses outside it).
+///
+/// WHICH of them may stand at a given position is not stated here and could not be: it
+/// is decided by parsing the caller's own text with each probe appended
+/// ([`expected_alternatives`]), so the list a refusal carries is the grammar's answer for
+/// that one position in that one text.
+const CONTINUATIONS: &[Continuation] = &[
+    Continuation::construct("whitespace", " "),
+    Continuation::construct("comment", "/* comment */"),
+    Continuation::construct("a variable", VARIABLE_PROBE),
+    Continuation::construct("node labels", ":Label"),
+    Continuation::construct("a property map", "{ key: 0 }"),
+    Continuation::construct("a node pattern", "(node)"),
+    Continuation::construct("a relationship pattern", "-[relationship]->(node)"),
+    Continuation::construct("a number", "0"),
+    Continuation::construct("a string", "'text'"),
+    Continuation::construct("a list", "[0]"),
+    Continuation::construct("')'", ")"),
+    Continuation::construct("']'", "]"),
+    Continuation::construct("'}'", "}"),
+    Continuation::construct("','", ","),
+    Continuation::construct("'.'", "."),
+    Continuation::keyword("MATCH"),
+    Continuation::keyword("OPTIONAL MATCH"),
+    Continuation::keyword("UNWIND"),
+    Continuation::keyword("WITH"),
+    Continuation::keyword("WHERE"),
+    Continuation::keyword("RETURN"),
+    Continuation::keyword("AS"),
+    Continuation::keyword("DISTINCT"),
+    Continuation::keyword("ORDER BY"),
+    Continuation::keyword("SKIP"),
+    Continuation::keyword("LIMIT"),
+    Continuation::keyword("AND"),
+    Continuation::keyword("OR"),
+    Continuation::keyword("NOT"),
+];
+
+/// What the engine's grammar allows at `offset` of `query`, worded as a refusal lists
+/// alternatives: `a, b or c`.
+///
+/// The question is asked of the PARSER, never answered from a table: the text the parser
+/// had already read is `query` up to `offset`, so each construct of [`CONTINUATIONS`] is
+/// appended to exactly that text and the whole is parsed again ([`continues`]). What
+/// comes back is the set of constructs the grammar can continue the caller's own text
+/// with at that position — the ones the parse that failed was looking for.
+///
+/// `None` when the grammar admits nothing there, which is what a text the lexer itself
+/// could not read looks like: there is then no alternative to list, and the engine's own
+/// report of what it wanted stands instead.
+#[must_use]
+pub fn expected_alternatives(query: &str, offset: usize) -> Option<String> {
+    let read = query.get(..offset)?;
+    // The text read so far is handed BACK to the parser below, so the bound on how deep
+    // a text this service parses holds here too, measured on that prefix: it is a text
+    // of the caller's own choosing, and nothing may descend through it past the depth
+    // one query may nest. A prefix past the bound is left to the engine's own report of
+    // what it was looking for.
+    if nesting_depth(read) > MAX_QUERY_NESTING_DEPTH {
+        return None;
+    }
+    let a_variable_fits = continues(read, VARIABLE_PROBE);
+    let named: Vec<&'static str> = CONTINUATIONS
+        .iter()
+        .filter(|continuation| !(continuation.a_word && a_variable_fits))
+        .filter(|continuation| continues(read, continuation.probe))
+        .map(|continuation| continuation.name)
+        .collect();
+    match named.split_last() {
+        None => None,
+        Some((last, [])) => Some((*last).to_string()),
+        Some((last, before)) => Some(format!("{} or {last}", before.join(", "))),
+    }
+}
+
+/// Whether the grammar can continue the text `read` with `probe`.
+///
+/// It can exactly when a parse of the two together gets PAST the probe: either it reads
+/// the whole text, or it stops at or after the probe's end, which is a position the probe
+/// itself was read to. A parse that stops where `read` already ended was stopped by the
+/// probe, so that construct cannot stand there.
+///
+/// A bare projection is read behind the clause that binds one row, exactly as
+/// [`parse_query`] reads one, so the alternatives of such a query are the ones ITS
+/// reading allows rather than the ones a text without a projection would allow.
+fn continues(read: &str, probe: &str) -> bool {
+    let offered = format!("{read}{probe}");
+    let through = offered.len();
+    if parses_through(&offered, through) {
+        return true;
+    }
+    let behind = format!("{ONE_ROW_CLAUSE} {offered}");
+    parses_through(&behind, through + ONE_ROW_CLAUSE.len() + 1)
+}
+
+/// Whether a parse of `text` read it to at least `through`.
+fn parses_through(text: &str, through: usize) -> bool {
+    match ::cypher_parser::parse(text) {
+        Ok(_) => true,
+        Err(::cypher_parser::CypherError::Syntax { position, .. }) => position >= through,
+        Err(_) => false,
+    }
 }
 
 #[cfg(test)]
@@ -1347,5 +1622,197 @@ mod tests {
                 "case {case:?}: expected {expected:?} in the refusal, got {worded:?}"
             );
         }
+    }
+
+    /// RULE: what a refusal lists as expected is the GRAMMAR's answer for that one
+    /// position — the constructs a parse of the caller's own text can continue with
+    /// there — so each listed alternative really can stand at that position, and
+    /// positions the grammar reads differently are answered differently.
+    #[test]
+    fn the_alternatives_are_the_grammars_answer_at_one_position() {
+        // (case, the text, the offset a parse of it stops at, a construct the grammar
+        // admits at that offset)
+        let rows: &[(&str, &str, usize, &str)] = &[
+            ("an unclosed node pattern", "MATCH (n RETURN n", 9, "')'"),
+            ("before any clause", "!!!", 0, "MATCH"),
+            ("after a complete pattern", "MATCH (n) !", 10, "RETURN"),
+            ("an unclosed list", "UNWIND [0 AS x RETURN x", 10, "']'"),
+        ];
+        for (case, query, offset, admitted) in rows {
+            let listed = expected_alternatives(query, *offset).unwrap_or_else(|| {
+                panic!("case {case:?}: expected the grammar to admit something at {offset}")
+            });
+            assert!(
+                listed.split(", ").any(|named| named == *admitted)
+                    || listed.ends_with(&format!(" or {admitted}"))
+                    || listed == *admitted,
+                "case {case:?}: expected {admitted:?} among the alternatives, got {listed:?}"
+            );
+        }
+        // Two positions the grammar reads differently cannot be answered with one list:
+        // inside an unclosed node pattern only the rest of that pattern may follow,
+        // while before any clause only a clause may start.
+        let inside = expected_alternatives("MATCH (n RETURN n", 9)
+            .expect("the grammar admits the rest of a node pattern");
+        let before = expected_alternatives("!!!", 0).expect("the grammar admits a clause");
+        assert_ne!(
+            inside, before,
+            "expected the alternatives to differ between positions, got {inside:?} at both"
+        );
+    }
+
+    /// RULE: every variable part of the refusal comes from the SUBMITTED text, so the
+    /// same defect written at another position is reported at that position, with the
+    /// same input and the same alternatives.
+    #[test]
+    fn the_same_defect_moved_through_the_text_is_reported_where_it_now_is() {
+        let query = "MATCH (n RETURN n";
+        let at = 9;
+        let here = syntax_refusal(query, "expected something else", at);
+        assert_eq!(
+            here,
+            format!(
+                "Invalid input 'R': expected {} (line 1, column 10 (offset: 9))",
+                expected_alternatives(query, at).expect("the grammar admits something there")
+            ),
+            "expected the refusal to state the input, the alternatives and the position"
+        );
+        // The same text after a line of its own: the input and the alternatives are the
+        // same facts, the position is the one the text now has.
+        let moved = format!("// a comment\n{query}");
+        let shifted = at + "// a comment\n".len();
+        let there = syntax_refusal(&moved, "expected something else", shifted);
+        assert_eq!(
+            there,
+            format!(
+                "Invalid input 'R': expected {} (line 2, column 10 (offset: {shifted}))",
+                expected_alternatives(&moved, shifted)
+                    .expect("the grammar admits something there")
+            ),
+            "expected the moved text to be reported at its own position, got {there:?}"
+        );
+        // A position is counted in CHARACTERS of the submitted text, so a multi-byte
+        // character ahead of the defect moves it by ONE however many bytes it is
+        // written with.
+        let wide = format!("// é\n{query}");
+        let wide_bytes = "// é\n".len() + at;
+        let worded = syntax_refusal(&wide, "expected something else", wide_bytes);
+        assert!(
+            worded.ends_with("(line 2, column 10 (offset: 14))"),
+            "expected the position to be counted in characters, got {worded:?}"
+        );
+    }
+
+    /// RULE: a text stopped at its own end reports the end of the input rather than a
+    /// character it does not have.
+    #[test]
+    fn a_text_that_stops_at_its_end_reports_the_end_of_the_input() {
+        for (case, query, offset) in [
+            ("the end of the text", "MATCH (n) RETURN", 16),
+            ("past the end of the text", "MATCH", 99),
+        ] {
+            let worded = syntax_refusal(query, "expected something else", offset);
+            assert!(
+                worded.starts_with("Invalid input 'EOI': expected "),
+                "case {case:?}: expected the end of the input to be named, got {worded:?}"
+            );
+        }
+    }
+
+    /// RULE: how deep a text nests is measured for EVERY text a caller sends, whether or
+    /// not the lexer can read it, and no text past that bound is handed to a parser —
+    /// neither to run it nor to find out what could have continued it.
+    #[test]
+    fn a_text_the_lexer_cannot_read_is_measured_for_depth_too() {
+        let data = two_cities();
+        let brackets = "(".repeat(MAX_QUERY_NESTING_DEPTH + 1);
+        // (case, a text nesting one level past the bound) — the second carries a
+        // character no query is written with after its brackets, which is the text the
+        // engine's lexer may refuse outright.
+        let rows: &[(&str, String)] = &[
+            (
+                "a text the lexer can read",
+                format!("MATCH {brackets} RETURN 1 AS one"),
+            ),
+            ("a text the lexer may refuse", format!("{brackets}\u{0}")),
+        ];
+        for (case, query) in rows {
+            assert!(
+                nesting_depth(query) > MAX_QUERY_NESTING_DEPTH,
+                "case {case:?}: expected the depth to be measured past the bound, got {}",
+                nesting_depth(query)
+            );
+            let refused = run_query(&data, query, soon());
+            assert!(
+                matches!(refused, Err(QueryFailure::TooDeep { .. })),
+                "case {case:?}: expected the text to be refused for its depth, got \
+                 {refused:?}"
+            );
+            // And the wording of a refusal descends through no such text either: the
+            // alternatives are left to the engine's own report instead.
+            assert!(
+                expected_alternatives(query, brackets.len()).is_none(),
+                "case {case:?}: expected no parse of a text past the depth bound"
+            );
+        }
+    }
+
+    /// RULE: what an evaluation may be handed is charged for what it can EXPAND to, so a
+    /// query chaining expansions over a list the GRAPH holds is stopped while it is
+    /// building rows rather than after — a list a query reads is not measurable from its
+    /// text, so the elements are charged as the graph hands them over.
+    #[test]
+    fn an_expansion_of_a_stored_list_is_charged_for_its_elements() {
+        /// A graph holding one node whose `items` property is a list of `elements`
+        /// numbers, written through the store's own writer.
+        fn one_list(elements: usize) -> GraphData {
+            let mut data = GraphData::empty(::std::time::SystemTime::UNIX_EPOCH);
+            data.insert_node(
+                "n1",
+                GraphNode {
+                    labels: BTreeSet::from([String::from("bag")]),
+                    properties: BTreeMap::from([(
+                        String::from("items"),
+                        ::serde_json::Value::Array(
+                            (0..elements)
+                                .map(|item| ::serde_json::Value::from(item as i64))
+                                .collect(),
+                        ),
+                    )]),
+                },
+                ::std::time::SystemTime::UNIX_EPOCH,
+            )
+            .expect("the node fits the store");
+            data
+        }
+
+        // A short list is expanded and answered, which is what makes the row below a
+        // statement about the BOUND rather than about the clause.
+        let few = one_list(3);
+        let answered = run_query(&few, "MATCH (n) UNWIND n.items AS item RETURN item", soon())
+            .expect("a short stored list is expanded");
+        let payload: ::serde_json::Value =
+            ::serde_json::from_slice(&answered).expect("the payload is JSON");
+        assert_eq!(
+            payload[RESULTS_MEMBER].as_array().map(Vec::len),
+            Some(3),
+            "case \"a short stored list\": expected one row per element, got {payload}"
+        );
+
+        // The same text over a list long enough that chaining its expansions would build
+        // more rows than one evaluation may be handed: the budget is spent on the
+        // elements as they are handed over, so the evaluation is stopped.
+        let many = one_list(100);
+        let stopped = run_query(
+            &many,
+            "MATCH (n) UNWIND n.items AS a UNWIND n.items AS b UNWIND n.items AS c \
+             RETURN a, b, c",
+            soon(),
+        );
+        assert!(
+            matches!(stopped, Err(QueryFailure::Stopped(Stopped::Exhausted))),
+            "case \"a chained expansion of a stored list\": expected the evaluation to be \
+             stopped while it was being handed the elements, got {stopped:?}"
+        );
     }
 }

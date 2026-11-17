@@ -907,3 +907,147 @@ async fn authorization_is_decided_before_the_graph_is_resolved() {
          {syntax_status}: {syntax_body}"
     );
 }
+
+/// The sentence this endpoint words a parse refusal with, as a pattern over its variable
+/// parts: the input the parse stopped on, the alternatives the grammar admitted at that
+/// position, and the position as a line, a column and an offset.
+///
+/// Source: the form the openCypher endpoint states this class of refusal in —
+/// `Invalid input '<input>': expected <alternatives> (line <line>, column <column>
+/// (offset: <offset>))`.
+const REFUSAL_SENTENCE: &str = r"^Invalid input '(?<input>.*)': expected (?<expected>.+) \(line (?<line>\d+), column (?<column>\d+) \(offset: (?<offset>\d+)\)\)$";
+
+/// What a refusal names where the parse stopped at the end of the submitted text.
+const END_OF_INPUT: &str = "EOI";
+
+#[tokio::test]
+async fn a_parse_refusal_states_the_input_the_alternatives_and_the_position() {
+    let (router, _engine) = emulator();
+    let (graph_id, _) = graph_in_service(&router, "query-refusal-wording").await;
+    let sentence = regex::Regex::new(REFUSAL_SENTENCE).expect("the refusal pattern compiles");
+
+    // Texts no openCypher grammar accepts, spanning what the rule generalises over:
+    // WHAT is still open where the parse stops (a node pattern, a list, a projection,
+    // nothing at all), WHERE it stops (mid-line, at the end of the text, on a later
+    // line) and whether the text ahead of it is ASCII.
+    let malformed: &[(&str, &str)] = &[
+        ("an unclosed node pattern", "MATCH (n RETURN n"),
+        ("a text that is no query at all", "!!!"),
+        ("a projection with nothing to project", "MATCH (n) RETURN"),
+        ("a break on the second line", "MATCH (n)\nRETRUN n"),
+        ("an unclosed list", "UNWIND [0 AS x RETURN x"),
+        (
+            "a break after multi-byte text",
+            "MATCH (n) WHERE n.name = 'é' RETRUN n",
+        ),
+    ];
+
+    let mut listed: BTreeSet<String> = BTreeSet::new();
+    for (case, query) in malformed {
+        let (status, body) = execute_query(&router, &graph_id, query).await;
+        assert_eq!(
+            status, 400,
+            "case {case:?}: expected 400, got {status}: {body}"
+        );
+        assert_eq!(
+            error_code(&body),
+            "ValidationException",
+            "case {case:?}: unexpected error code in {body}"
+        );
+        assert_eq!(
+            body["reason"],
+            json!("MALFORMED_QUERY"),
+            "case {case:?}: expected the MALFORMED_QUERY reason, got {body}"
+        );
+        let message = body["message"].as_str().unwrap_or_default();
+        let stated = sentence.captures(message).unwrap_or_else(|| {
+            panic!("case {case:?}: expected the refusal sentence, got {message:?}")
+        });
+
+        // Every variable part is a reading of the SUBMITTED text, so the test reads that
+        // text itself rather than trusting the sentence: the offset is a character
+        // position in the query, the line and the column are that same position, and the
+        // input is the character standing there (escaped when it is a control
+        // character), or the end of the input when the text ends there.
+        let offset: usize = stated["offset"]
+            .parse()
+            .unwrap_or_else(|_| panic!("case {case:?}: expected an offset, got {message:?}"));
+        let characters: Vec<char> = query.chars().collect();
+        assert!(
+            offset <= characters.len(),
+            "case {case:?}: expected a position within the {} characters submitted, got \
+             {offset}",
+            characters.len()
+        );
+        let read = &characters[..offset];
+        let line = read.iter().filter(|character| **character == '\n').count() + 1;
+        let column = read
+            .iter()
+            .rev()
+            .take_while(|character| **character != '\n')
+            .count()
+            + 1;
+        assert_eq!(
+            stated["line"].parse::<usize>().ok(),
+            Some(line),
+            "case {case:?}: expected line {line} for offset {offset}, got {message:?}"
+        );
+        assert_eq!(
+            stated["column"].parse::<usize>().ok(),
+            Some(column),
+            "case {case:?}: expected column {column} for offset {offset}, got {message:?}"
+        );
+        let input = characters.get(offset).map_or_else(
+            || END_OF_INPUT.to_string(),
+            |found| {
+                if found.is_control() {
+                    found.escape_debug().to_string()
+                } else {
+                    found.to_string()
+                }
+            },
+        );
+        assert_eq!(
+            &stated["input"], &input,
+            "case {case:?}: expected the input at offset {offset} to be reported, got \
+             {message:?}"
+        );
+
+        // The alternatives are the grammar's own, so each is named rather than quoted
+        // out of a parser's internal wording, and none of them is empty.
+        let alternatives = stated["expected"].to_string();
+        for alternative in alternatives
+            .split(", ")
+            .flat_map(|part| part.split(" or "))
+        {
+            assert!(
+                !alternative.trim().is_empty() && !alternative.contains('`'),
+                "case {case:?}: expected each alternative to be named, got \
+                 {alternatives:?}"
+            );
+        }
+        listed.insert(alternatives);
+    }
+
+    // The list is the grammar's answer for ONE position, so texts that stop at different
+    // positions cannot all be answered with the same list.
+    assert!(
+        listed.len() > 1,
+        "expected the alternatives to be read off the grammar at each position, got \
+         {listed:?}"
+    );
+
+    // And none of the refusals disturbed the graph or the session: the projection that
+    // reads nothing of the graph still answers its one row.
+    let (status, payload) = execute_query(&router, &graph_id, "RETURN 1 AS one").await;
+    assert_eq!(
+        status, 200,
+        "case \"a projection after the refusals\": expected 200, got {status}: {payload}"
+    );
+    assert_eq!(
+        Value::Array(rows("a projection after the refusals", &payload)),
+        json!([{"one": 1}]),
+        "case \"a projection after the refusals\": expected the one projected row, got \
+         {payload}"
+    );
+}
