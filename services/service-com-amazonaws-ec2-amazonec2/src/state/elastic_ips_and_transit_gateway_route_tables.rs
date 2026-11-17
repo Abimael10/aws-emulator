@@ -1272,6 +1272,23 @@ pub const LAUNCH_TEMPLATE_VERSION_LATEST: &str = "$Latest";
 /// sentence as [`LAUNCH_TEMPLATE_VERSION_LATEST`].
 pub const LAUNCH_TEMPLATE_VERSION_DEFAULT: &str = "$Default";
 
+/// The tag Amazon EC2 itself puts on an instance it launched FROM a launch template, naming
+/// the template the launch read: "if you launch an instance from a launch template, Amazon EC2
+/// adds the system tags `aws:ec2launchtemplate:id` and `aws:ec2launchtemplate:version` to the
+/// instance" (the launch template documentation's own account of them).
+///
+/// It is the account's one record of WHICH template version produced an instance — nothing
+/// else of the launch keeps it — and it is the SERVICE's to set: a caller cannot write a tag
+/// under the reserved `aws:` prefix. Public because every launch that reads a template applies
+/// it, including the one Amazon EC2 Auto Scaling makes for a group's capacity change, so
+/// neither path can spell the key differently.
+pub const LAUNCH_TEMPLATE_ID_TAG: &str = "aws:ec2launchtemplate:id";
+
+/// The tag beside it, naming the VERSION the launch resolved — the number, never the `$Latest`
+/// or `$Default` word a request may float on, since the instance ran one version. See
+/// [`LAUNCH_TEMPLATE_ID_TAG`].
+pub const LAUNCH_TEMPLATE_VERSION_TAG: &str = "aws:ec2launchtemplate:version";
+
 /// Refuse a request the service answers no member-specific code for: HTTP 400
 /// `InvalidRequest`.
 pub fn invalid_request<E>(message: impl Into<String>) -> Scaffolded<E> {

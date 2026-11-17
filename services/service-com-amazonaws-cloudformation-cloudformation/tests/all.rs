@@ -45,6 +45,10 @@ mod apigatewayv2_api_property_updates;
 mod application_auto_scaling_resources;
 #[path = "all/auto_emptied_bucket_deletion.rs"]
 mod auto_emptied_bucket_deletion;
+// The scaling policy an `AWS::AutoScaling::ScalingPolicy` declares, read back through the wire
+// of the service that owns it.
+#[path = "all/autoscaling_scaling_policy_resources.rs"]
+mod autoscaling_scaling_policy_resources;
 #[path = "all/backup_gateway_hypervisor_resource_type.rs"]
 mod backup_gateway_hypervisor_resource_type;
 #[path = "all/bedrock_data_source_identity.rs"]
@@ -179,6 +183,10 @@ mod delete_stack_set;
 mod denied_replacement_identity;
 #[path = "all/deployed_group_handoff.rs"]
 mod deployed_group_handoff;
+// What becomes of a deployed Auto Scaling group: the drift a client probes for, and the
+// teardown of the estate its instances were launched into.
+#[path = "all/deployed_fleet_drift_and_teardown.rs"]
+mod deployed_fleet_drift_and_teardown;
 #[path = "all/detect_resource_drift.rs"]
 mod detect_resource_drift;
 #[path = "all/drift_and_resource_reads.rs"]

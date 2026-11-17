@@ -236,6 +236,11 @@ mod service_discovery;
 /// own NAMES live here, beside the arms that provision them
 /// ([`super::template::return_values`] names the two whose identity their create answers).
 pub(super) mod application_auto_scaling;
+/// Where `AWS::AutoScaling::ScalingPolicy` is provisioned — the catalogue's own arm
+/// ([`crate::state::provisioner::auto_scaling_policies`]) — beside the guard that keeps the
+/// type to ONE owner, so no module reached earlier by [`owner_for`] can shadow it
+/// ([`autoscaling_scaling_policy`]).
+mod autoscaling_scaling_policy;
 /// The two CloudFront types a stack declares — the distribution and the origin access
 /// control its origins reach a private bucket with: created in Amazon CloudFront itself
 /// ([`cloudfront_resources`]).

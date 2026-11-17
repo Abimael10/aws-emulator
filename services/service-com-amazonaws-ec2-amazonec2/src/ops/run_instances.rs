@@ -402,6 +402,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // launch below — after the launch template has been overlaid — because a template
         // expresses those same facts, so the combination holds whichever side of the launch
         // each half came from.
+        //
+        // A launch template carries the launch parameters this handler resolves, so a launch
+        // that names one is answered from the template VERSION it names, overlaid with the
+        // members the request itself carries — "any additional parameters that you specify
+        // for the new instance overwrite the corresponding parameters included in the launch
+        // template" (`RunInstancesRequest$LaunchTemplate`). The overlay happens HERE, before
+        // anything else is read, so every check, ceiling, refusal and write below sees ONE
+        // launch: a template-driven launch and the equivalent spelled-out one cannot be
+        // served differently.
+        //
+        // The launch template this launch READ, as it resolved it: the template's id and the
+        // version NUMBER, which every instance the launch mints carries as the two system tags
+        // Amazon EC2 adds for a template launch ([`crate::state::LAUNCH_TEMPLATE_ID_TAG`]).
+        let mut launched_template: Option<(String, i64)> = None;
         let mut input = match input.launch_template.clone() {
             None => input,
             Some(specification) => {
@@ -461,6 +475,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         }
                         Err(refusal) => return Err(refusal),
                     };
+                    // The pair this launch resolved, kept for the two system tags every
+                    // instance it mints carries.
+                    launched_template = Some((launch_template_id.clone(), version));
                     record
                         .versions
                         .get(&version)
@@ -946,6 +963,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 let Some(key) = tag.key.clone() else { continue };
                 tags.insert(key, tag.value.clone().unwrap_or_default());
             }
+        }
+        // A launch that READ A LAUNCH TEMPLATE adds the two system tags Amazon EC2 puts on an
+        // instance launched from one, naming the template and the version it read
+        // ([`crate::state::LAUNCH_TEMPLATE_ID_TAG`]): they are the service's own, so they are
+        // written after the caller's and cannot be set — or overwritten — by a request.
+        if let Some((launch_template_id, version)) = launched_template.as_ref() {
+            tags.insert(
+                crate::state::LAUNCH_TEMPLATE_ID_TAG.to_string(),
+                launch_template_id.clone(),
+            );
+            tags.insert(
+                crate::state::LAUNCH_TEMPLATE_VERSION_TAG.to_string(),
+                version.to_string(),
+            );
         }
 
         // Each instance retains a copy of EVERY caller-chosen string of the launch —

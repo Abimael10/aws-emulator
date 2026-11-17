@@ -442,6 +442,20 @@ async fn the_templates_instance_tags_reach_the_launched_instance() {
             status, 200,
             "case {case:?}: expected HTTP 200 from the launch, got {status} with body {body}"
         );
+        // Beside the caller's own tags, an instance launched FROM A LAUNCH TEMPLATE carries
+        // the two system tags Amazon EC2 adds for one, naming the template and the version
+        // the launch read — the account's one record of which template version produced the
+        // instance, which no `TagSpecifications` entry of the request or the template sets.
+        let expected: BTreeMap<String, String> = expected
+            .into_iter()
+            .chain([
+                (
+                    "aws:ec2launchtemplate:id".to_string(),
+                    launch_template_id.clone(),
+                ),
+                ("aws:ec2launchtemplate:version".to_string(), "1".to_string()),
+            ])
+            .collect();
         let minted = launched(case, &body);
         assert_eq!(
             minted.tags, expected,

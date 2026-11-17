@@ -29,6 +29,7 @@ mod client_error_refusal_wording;
 mod cross_region_target_group_attachment;
 #[path = "all/delete_notification_configuration.rs"]
 mod delete_notification_configuration;
+// `DeletePolicy`: which policy a delete addresses, and what it retires with it.
 #[path = "all/delete_policy.rs"]
 mod delete_policy;
 #[path = "all/describe_lifecycle_hooks_projection.rs"]
@@ -67,6 +68,9 @@ mod launch_configurations_are_unavailable;
 mod launch_instances;
 #[path = "all/launch_source_instance_profile.rs"]
 mod launch_source_instance_profile;
+// The launch-template system tags Amazon EC2 puts on an instance a group launched.
+#[path = "all/launched_instance_launch_template_tags.rs"]
+mod launched_instance_launch_template_tags;
 #[path = "all/launch_template_instance_profiles.rs"]
 mod launch_template_instance_profiles;
 #[path = "all/launch_template_option_sets.rs"]

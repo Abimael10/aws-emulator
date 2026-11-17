@@ -178,6 +178,33 @@ pub fn launch<Eng: Send + Sync + 'static>(
         .map(|tag| (tag.key.clone(), tag.value.clone().unwrap_or_default()))
         .collect();
     tags.insert(GROUP_NAME_TAG.to_string(), request.group_name.to_string());
+    // An instance launched FROM A LAUNCH TEMPLATE carries the two system tags Amazon EC2 adds
+    // for one, naming the template and the version this launch read
+    // ([`ec2::LAUNCH_TEMPLATE_ID_TAG`]) — the account's one record of which template version
+    // produced the instance. A group that launches from a launch CONFIGURATION read no
+    // template, so its instances carry neither.
+    if let Some(specification) = launched_template.as_ref() {
+        if let Some(launch_template_id) = specification
+            .launch_template_id
+            .as_deref()
+            .filter(|id| !id.is_empty())
+        {
+            tags.insert(
+                ec2::LAUNCH_TEMPLATE_ID_TAG.to_string(),
+                launch_template_id.to_string(),
+            );
+        }
+        if let Some(version) = specification
+            .version
+            .as_deref()
+            .filter(|version| !version.is_empty())
+        {
+            tags.insert(
+                ec2::LAUNCH_TEMPLATE_VERSION_TAG.to_string(),
+                version.to_string(),
+            );
+        }
+    }
 
     let instance_type = parameters
         .instance_type

@@ -821,8 +821,8 @@ pub(crate) async fn in_service_instance_ids(
 
 /// The Auto Scaling group as that service reports it NOW, or `None` where it reports no such
 /// group: the scalar members of the one entry `DescribeAutoScalingGroups` answers for the
-/// name, which are named exactly as this type's properties are (`MinSize`, `MaxSize`,
-/// `DesiredCapacity`, `HealthCheckType`, `VPCZoneIdentifier`) beside the group's own ARN.
+/// name, in the spellings this TYPE declares them in
+/// ([`auto_scaling_group_as_the_type_spells_it`]), beside the group's own ARN.
 ///
 /// This is both the read the create confirms itself with and the ACTUAL configuration drift
 /// detection compares the declared one against. An awsQuery answer carries each group as a
@@ -851,5 +851,127 @@ pub(super) async fn describe_auto_scaling_group(
         .get("AutoScalingGroupName")
         .and_then(Value::as_str)
         .is_some_and(|reported_name| reported_name == name)
-        .then_some(Value::Object(reported)))
+        .then(|| Value::Object(auto_scaling_group_as_the_type_spells_it(reported))))
+}
+
+/// The group Amazon EC2 Auto Scaling reported, in the spellings `AWS::AutoScaling::AutoScalingGroup`
+/// declares its properties in: the INVERSE of the two translations the create applies
+/// ([`AUTO_SCALING_GROUP_RENAMED_PROPERTIES`] and [`comma_separated_subnets`]).
+///
+/// What this read is compared against is the DECLARATION, so a property the owning API spells
+/// differently has to come back under the name — and in the shape — the type states it in: the
+/// type's `Cooldown` is that API's `DefaultCooldown`, and its `VPCZoneIdentifier` is "a list of
+/// subnet IDs" where the API reports "one or more comma-separated subnet IDs". Without the
+/// projection a group placed in subnets is reported as having drifted from the very
+/// declaration it was created from, and a changed cooldown as no drift at all.
+fn auto_scaling_group_as_the_type_spells_it(reported: Map<String, Value>) -> Map<String, Value> {
+    let mut reported = reported;
+    for (property, member) in AUTO_SCALING_GROUP_RENAMED_PROPERTIES {
+        if let Some(value) = reported.remove(*member) {
+            reported.insert((*property).to_string(), value);
+        }
+    }
+    if let Some(subnets) = reported
+        .get(VPC_ZONE_IDENTIFIER)
+        .and_then(Value::as_str)
+        .map(ToString::to_string)
+    {
+        let listed: Vec<Value> = subnets
+            .split(',')
+            .filter(|subnet| !subnet.is_empty())
+            .map(|subnet| Value::String(subnet.to_string()))
+            .collect();
+        reported.insert(VPC_ZONE_IDENTIFIER.to_string(), Value::Array(listed));
+    }
+    reported
+}
+
+/// The property an Auto Scaling group states the subnets it places instances in, which the
+/// type declares as a LIST and the API takes and reports as one comma-separated string.
+const VPC_ZONE_IDENTIFIER: &str = "VPCZoneIdentifier";
+
+/// The tag Amazon EC2 Auto Scaling puts on every instance it launches, naming the group the
+/// instance belongs to: "Amazon EC2 Auto Scaling automatically adds the
+/// `aws:autoscaling:groupName` tag to the instances it launches".
+///
+/// It is how the instances of a group a stack has DELETED are found: the group itself is gone
+/// from that service the moment the delete answers, while its instances are still being
+/// terminated in Amazon EC2 ([`auto_scaling_group_removal`]). Spelled here rather than
+/// imported, because this crate reaches every owning service over its own WIRE and links
+/// none of them.
+const GROUP_NAME_TAG: &str = "aws:autoscaling:groupName";
+
+/// The instance states an instance a termination has not finished taking away is in: every
+/// `InstanceStateName` but `terminated`, which is the one state in which an instance "holds
+/// nothing any more" — the reading Amazon EC2's own delete of a subnet and of a security group
+/// makes of its instances.
+const NOT_YET_TERMINATED: &[&str] = &[
+    "pending",
+    "running",
+    "shutting-down",
+    "stopping",
+    "stopped",
+];
+
+/// The state reported for a group whose instances Amazon EC2 is still terminating, where that
+/// service reports no state for one of them: the word a terminating instance carries.
+const SHUTTING_DOWN: &str = "shutting-down";
+
+/// Whether Amazon EC2 Auto Scaling has finished removing the group a stack deleted: whether
+/// Amazon EC2 has finished terminating the instances that group was holding.
+///
+/// The delete terminates them as it answers ([`delete_auto_scaling_group`] sends
+/// `ForceDelete`), and a termination is not instant: Amazon EC2 reports the instance
+/// `shutting-down` and takes it to `terminated` on its own clock, and until it gets there the
+/// instance holds the SUBNET it was placed in and the security groups it ran with. So the
+/// resource is still being removed while any of those instances is left, which is what keeps
+/// a stack from deleting the network it launched them into while they are still in it — a
+/// delete that service would refuse for a dependency this very teardown is removing.
+///
+/// The instances are found by the tag Amazon EC2 Auto Scaling puts on each of them
+/// ([`GROUP_NAME_TAG`]), because the group itself is gone from that service already, and only
+/// the ones that have not reached `terminated` are counted ([`NOT_YET_TERMINATED`]).
+pub(super) async fn auto_scaling_group_removal(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    name: &str,
+) -> Result<Removal, Refusal> {
+    let mut parameters = vec![
+        ("Filter.1.Name".to_string(), format!("tag:{GROUP_NAME_TAG}")),
+        ("Filter.1.Value.1".to_string(), name.to_string()),
+        (
+            "Filter.2.Name".to_string(),
+            "instance-state-name".to_string(),
+        ),
+    ];
+    for (index, state) in NOT_YET_TERMINATED.iter().enumerate() {
+        parameters.push((
+            format!("Filter.2.Value.{}", index + 1),
+            (*state).to_string(),
+        ));
+    }
+    let answered = call_query(
+        ctx,
+        EC2_SIGNING_NAME,
+        region,
+        EC2_API_VERSION,
+        "DescribeInstances",
+        &parameters,
+    )
+    .await?;
+    let still_there = xml_element(&answered, "instanceId")
+        .filter(|instance_id| !instance_id.is_empty())
+        .is_some();
+    if !still_there {
+        return Ok(Removal::Gone);
+    }
+    // The state Amazon EC2 reports the instance in, read as a child of its own
+    // `<instanceState>` so no other element of the answer is mistaken for it.
+    let reported = xml_scalar_children(&answered, "instanceState")
+        .get("name")
+        .and_then(Value::as_str)
+        .filter(|state| !state.is_empty())
+        .unwrap_or(SHUTTING_DOWN)
+        .to_string();
+    Ok(Removal::Pending(reported))
 }

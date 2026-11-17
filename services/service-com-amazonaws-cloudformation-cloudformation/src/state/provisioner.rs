@@ -2762,6 +2762,16 @@ impl Provisioner {
             Self::NeptuneGraphGraphSnapshot => {
                 graph_snapshot_removal(ctx, region, physical_resource_id).await
             }
+            // `DeleteAutoScalingGroup` with `ForceDelete` terminates the instances the group
+            // was holding as it answers, and a termination is not instant: each of those
+            // instances holds the subnet it was placed in and the security groups it ran with
+            // until Amazon EC2 reports it `terminated`, so the resource is still being removed
+            // while any of them is left — which is what keeps a stack from deleting the network
+            // it launched them into while they are still in it
+            // ([`compute_fleet::auto_scaling_group_removal`]).
+            Self::AutoScalingGroup => {
+                auto_scaling_group_removal(ctx, region, physical_resource_id).await
+            }
             _ => Ok(Removal::Gone),
         }
     }
