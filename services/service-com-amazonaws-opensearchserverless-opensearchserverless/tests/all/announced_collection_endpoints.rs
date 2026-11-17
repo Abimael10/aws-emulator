@@ -37,22 +37,24 @@ use crate::collection_lifecycle::text;
 /// This service's SigV4 signing name, which is what routes a control-plane request to it
 /// and the name a client signs a data-plane request with
 /// (`smithy_query(query="service_info")` -> `sigv4Name`).
-const SIGNING_NAME: &str = "aoss";
+pub(crate) const SIGNING_NAME: &str = "aoss";
 
 /// The region every request below is signed for.
-const REGION: &str = "us-west-2";
+pub(crate) const REGION: &str = "us-west-2";
 
 /// The `X-Amz-Target` prefix from this crate's `OPERATIONS.md` wire-protocol section.
 const TARGET_PREFIX: &str = "OpenSearchServerless";
 
 /// The path AWS's OpenSearch Dashboards endpoint adds to a collection endpoint.
-const DASHBOARDS_PATH: &str = "/_dashboards";
+pub(crate) const DASHBOARDS_PATH: &str = "/_dashboards";
 
 /// One emulator carrying only this service, with the engine the handlers write kept so a
 /// test can drive the address a collection is published on, and served at `base` when the
 /// emulator is served on a port at all (`MultiServiceRouter::set_url_base`, which is what
 /// `OperationContext::endpoint` reports).
-fn emulator_served_at(base: Option<&str>) -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
+pub(crate) fn emulator_served_at(
+    base: Option<&str>,
+) -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     // The suite exercises the published address, not SigV4: a request carries a credential
@@ -69,7 +71,7 @@ fn emulator_served_at(base: Option<&str>) -> (MultiServiceRouter, Arc<engine::In
 
 /// Call `operation` with `body` as a client that addressed `host`; answer its HTTP status
 /// and parsed body.
-async fn call_at(
+pub(crate) async fn call_at(
     router: &MultiServiceRouter,
     host: &str,
     operation: &str,
@@ -147,7 +149,7 @@ async fn active_collection_at(
 
 /// Admit traffic to the endpoints of every collection of this emulator. Idempotent, so a
 /// suite that creates several collections calls it per collection.
-async fn admit_network_access(router: &MultiServiceRouter, host: &str) {
+pub(crate) async fn admit_network_access(router: &MultiServiceRouter, host: &str) {
     /// The one network policy this suite reaches its collections through.
     const NETWORK_POLICY_NAME: &str = "net-every-collection";
 
@@ -188,21 +190,32 @@ async fn admit_network_access(router: &MultiServiceRouter, host: &str) {
 ///
 /// The `CREATING -> ACTIVE` move is owed by the clock, so this looks again until the
 /// collection reports ACTIVE or a generous deadline passes; nothing asserts on how long it
-/// took.
-async fn await_active(router: &MultiServiceRouter, host: &str, id: &str) -> Value {
-    for _ in 0..200 {
+/// took, and the deadline is long enough that a loaded host polling several collections
+/// still reaches it.
+pub(crate) async fn await_active(router: &MultiServiceRouter, host: &str, id: &str) -> Value {
+    /// How long a collection is given to settle before the wait is called a failure:
+    /// several times over the few seconds the `CREATING -> ACTIVE` move is owed in, so a
+    /// busy host still reaches the condition, and short enough that a collection which
+    /// never settles fails the suite promptly.
+    const DEADLINE: Duration = Duration::from_secs(15);
+
+    let started = tokio::time::Instant::now();
+    loop {
         let detail = read_collection(router, host, id).await;
         if text(&detail, "status") == "ACTIVE" {
             return detail;
         }
+        assert!(
+            started.elapsed() < DEADLINE,
+            "case {id} at {host}: the collection never reached ACTIVE, last read {detail}"
+        );
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    panic!("case {id} at {host}: the collection never reached ACTIVE");
 }
 
 /// The four endpoints a collection publishes, in the order `CollectionDetail` carries
 /// them: the collection endpoint, its Dashboards endpoint, and the FIPS pair.
-fn published(detail: &Value) -> Vec<(&'static str, String)> {
+pub(crate) fn published(detail: &Value) -> Vec<(&'static str, String)> {
     vec![
         ("collectionEndpoint", text(detail, "collectionEndpoint")),
         ("dashboardEndpoint", text(detail, "dashboardEndpoint")),
@@ -217,9 +230,83 @@ fn published(detail: &Value) -> Vec<(&'static str, String)> {
     ]
 }
 
+/// Assert that every endpoint `detail` publishes is an address THIS emulator answers the
+/// collection on, and answer its collection endpoint — the one address the four members
+/// name.
+///
+/// The one statement of the rule for every suite that reads a `CollectionDetail`: each
+/// member is an HTTPS address naming no AWS host, carrying the port it is served on and the
+/// authority of this collection's own address; the Dashboards endpoint is the collection
+/// endpoint plus the documented path, the FIPS pair names that same address, and a client
+/// can OPEN every one of them.
+pub(crate) fn assert_published_addresses(case: &str, detail: &Value) -> String {
+    let endpoint = text(detail, "collectionEndpoint");
+    for (member, url) in published(detail) {
+        assert!(
+            url.starts_with("https://"),
+            "case {case:?}: {member} must be an HTTPS address, got {url:?}"
+        );
+        // AWS's own `<id>.<region>.aoss[-fips].amazonaws.com` hosts resolve nowhere on the
+        // machine this emulator runs on, so no published address may name one.
+        assert!(
+            !url.contains("amazonaws.com"),
+            "case {case:?}: {member} must not name an AWS host, got {url:?}"
+        );
+        let authority = authority_of(&url);
+        assert!(
+            authority
+                .rsplit(':')
+                .next()
+                .is_some_and(|port| port.parse::<u16>().is_ok_and(|port| port != 0)),
+            "case {case:?}: {member} must name the port it is served on, got {url:?}"
+        );
+        assert_eq!(
+            authority,
+            authority_of(&endpoint),
+            "case {case:?}: {member} must name the address this collection is served at \
+             ({}), got {url:?}",
+            authority_of(&endpoint)
+        );
+        // The address is OPEN: a client can connect to it. The listener binds the interface
+        // the core chose (loopback unless the operator asked otherwise), so the connection
+        // is made to the loopback address of the published port.
+        let addr = socket_addr_of(&url);
+        let opened = match addr.ip() {
+            std::net::IpAddr::V4(_) => {
+                std::net::TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, addr.port()))
+            }
+            std::net::IpAddr::V6(_) => {
+                std::net::TcpStream::connect((std::net::Ipv6Addr::LOCALHOST, addr.port()))
+            }
+        };
+        assert!(
+            opened.is_ok(),
+            "case {case:?}: {member} must be an address a client can open, got {addr} \
+             refusing the connection: {opened:?}"
+        );
+    }
+    // The Dashboards endpoint is the collection endpoint plus the documented path, and the
+    // FIPS pair names the one address this emulator serves the collection at.
+    let expected: Vec<String> = vec![
+        endpoint.clone(),
+        format!("{endpoint}{DASHBOARDS_PATH}"),
+        endpoint.clone(),
+        format!("{endpoint}{DASHBOARDS_PATH}"),
+    ];
+    let reported: Vec<String> = published(detail)
+        .into_iter()
+        .map(|(_member, url)| url)
+        .collect();
+    assert_eq!(
+        reported, expected,
+        "case {case:?}: expected the published endpoints {expected:?}, got {reported:?}"
+    );
+    endpoint
+}
+
 /// The `host:port` a published endpoint addresses — the authority a client dials, with any
 /// path dropped.
-fn authority_of(url: &str) -> String {
+pub(crate) fn authority_of(url: &str) -> String {
     let after_scheme = url.strip_prefix("https://").unwrap_or(url);
     after_scheme
         .split('/')
@@ -229,7 +316,7 @@ fn authority_of(url: &str) -> String {
 }
 
 /// The socket address a published endpoint names, so a test can open a connection to it.
-fn socket_addr_of(url: &str) -> std::net::SocketAddr {
+pub(crate) fn socket_addr_of(url: &str) -> std::net::SocketAddr {
     use std::net::ToSocketAddrs;
 
     let authority = authority_of(url);
@@ -243,7 +330,7 @@ fn socket_addr_of(url: &str) -> std::net::SocketAddr {
 /// One OpenSearch REST request a client sends to a published endpoint: `method path` with
 /// `body`, answered by the listener that endpoint is published on
 /// (`state::collection_plane` hands every request there to this one function).
-fn through_endpoint(
+pub(crate) fn through_endpoint(
     engine: &Arc<engine::InMemoryEngine>,
     collection_id: &str,
     endpoint: &str,
@@ -271,7 +358,7 @@ fn through_endpoint(
 /// One OpenSearch REST request sent to the emulator's own FRONT DOOR addressed to `host`,
 /// which is how a client reaches a collection whose published authority it carries in the
 /// `Host` header: no RPC target, because the OpenSearch REST API has none.
-async fn rest_at_front_door(
+pub(crate) async fn rest_at_front_door(
     router: &MultiServiceRouter,
     host: &str,
     method: &str,
@@ -299,7 +386,7 @@ async fn rest_at_front_door(
 
 /// A `knn_vector` index body of `dimensions` dimensions — the index a Bedrock knowledge/// base requires to exist in the collection, and the body the recorded `indices.create`
 /// carries.
-fn knn_index_body(dimensions: usize) -> Value {
+pub(crate) fn knn_index_body(dimensions: usize) -> Value {
     json!({
         "settings": { "index": { "knn": true } },
         "mappings": { "properties": {
@@ -373,63 +460,11 @@ async fn every_published_collection_endpoint_is_an_address_this_emulator_serves(
         let id = text(&detail, "id");
         let endpoint = text(&detail, "collectionEndpoint");
 
-        // 1. Every published endpoint is an address this emulator answers on, and none of
-        //    them is one of AWS's own hosts.
-        for (member, url) in published(&detail) {
-            assert!(
-                url.starts_with("https://"),
-                "case {case:?}: {member} must be an HTTPS address, got {url:?}"
-            );
-            assert!(
-                !url.contains("amazonaws.com"),
-                "case {case:?}: {member} must not name an AWS host, got {url:?}"
-            );
-            let authority = authority_of(&url);
-            assert!(
-                authority.rsplit(':').next().is_some_and(|port| port
-                    .parse::<u16>()
-                    .is_ok_and(|port| port != 0)),
-                "case {case:?}: {member} must name the port it is served on, got {url:?}"
-            );
-        }
-        // The Dashboards endpoint is the collection endpoint plus the documented path, and
-        // the FIPS pair names the one address this emulator serves the collection at.
-        let expected: Vec<String> = vec![
-            endpoint.clone(),
-            format!("{endpoint}{DASHBOARDS_PATH}"),
-            endpoint.clone(),
-            format!("{endpoint}{DASHBOARDS_PATH}"),
-        ];
-        let reported: Vec<String> = published(&detail)
-            .into_iter()
-            .map(|(_member, url)| url)
-            .collect();
-        assert_eq!(
-            reported, expected,
-            "case {case:?}: expected the published endpoints {expected:?}, got {reported:?}"
-        );
+        // 1. Every published endpoint is an address this emulator answers on, none of them
+        //    is one of AWS's own hosts, and each is OPEN.
+        assert_published_addresses(case, &detail);
 
-        // 2. The address is OPEN: a client can connect to it. The listener binds the
-        //    interface the core chose (loopback unless the operator asked otherwise), so
-        //    the connection is made to the loopback address of the published port.
-        for (member, url) in published(&detail) {
-            let addr = socket_addr_of(&url);
-            let opened = match addr.ip() {
-                std::net::IpAddr::V4(_) => {
-                    std::net::TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, addr.port()))
-                }
-                std::net::IpAddr::V6(_) => {
-                    std::net::TcpStream::connect((std::net::Ipv6Addr::LOCALHOST, addr.port()))
-                }
-            };
-            assert!(
-                opened.is_ok(),
-                "case {case:?}: {member} must be an address a client can open, got {addr} \
-                 refusing the connection: {opened:?}"
-            );
-        }
-
-        // 3. The address SERVES the collection's OpenSearch REST surface at its root: the
+        // 2. The address SERVES the collection's OpenSearch REST surface at its root: the
         //    vector index a knowledge base requires is created there and read back.
         let index = "bedrock-knowledge-base-index";
         let (status, created) = through_endpoint(
@@ -463,7 +498,7 @@ async fn every_published_collection_endpoint_is_an_address_this_emulator_serves(
             "case {case:?}: GET {endpoint}/{index} must report the index, got {read}"
         );
 
-        // 4. The emulator's own FRONT DOOR answers the same request addressed to the
+        // 3. The emulator's own FRONT DOOR answers the same request addressed to the
         //    collection's published authority, port and all — the addressing a client that
         //    was handed the endpoint earlier, or that reaches this process on one socket,
         //    still sends.
@@ -486,7 +521,7 @@ async fn every_published_collection_endpoint_is_an_address_this_emulator_serves(
              published authority names, got {read}"
         );
 
-        // 5. The control plane keeps reporting the same addresses on a later read, so a
+        // 4. The control plane keeps reporting the same addresses on a later read, so a
         //    client that stored the endpoint keeps dialling the one this emulator serves.
         let again = read_collection(&router, &host, &id).await;
         assert_eq!(

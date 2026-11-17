@@ -29,6 +29,8 @@ mod account_settings_write_outcome;
 mod announced_collection_endpoints;
 #[path = "all/audit_capture.rs"]
 mod audit_capture;
+#[path = "all/batch_get_collection_published_endpoints.rs"]
+mod batch_get_collection_published_endpoints;
 #[path = "all/batch_selector_rule.rs"]
 mod batch_selector_rule;
 #[path = "all/client_error_status.rs"]
