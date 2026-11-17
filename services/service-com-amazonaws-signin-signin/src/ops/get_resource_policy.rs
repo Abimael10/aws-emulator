@@ -3,8 +3,9 @@
 //! @op GetResourcePolicy
 //! Renders the account's SignIn resource-based policy from the stored permission
 //! statements: one policy statement per stored statement, in mint order, carrying the
-//! condition keys that statement was created with. With nothing stored the document
-//! carries an empty statement list.
+//! condition keys that statement was created with. An account that has no such policy
+//! is answered `ResourceNotFoundException`: the absence of a policy is a missing
+//! resource, not an empty document.
 //!
 //! ## Shape of an operation
 //!
@@ -156,8 +157,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // A read: the document is rendered from what the store holds, and nothing is
-        // written.
-        let signin_resource_based_policy = state.lock().to_policy();
+        // written. An account with no policy at all has a MISSING resource rather than
+        // an empty document, which is what the one error this operation models says.
+        let Some(signin_resource_based_policy) = state.lock().resource_policy() else {
+            return Err(GetResourcePolicyErrorModeled::ResourceNotFoundException(
+                crate::state::resource_not_found(),
+            )
+            .into());
+        };
         Ok(GetResourcePolicyOutput {
             signin_resource_based_policy,
         })

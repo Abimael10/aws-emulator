@@ -68,26 +68,29 @@ const SERVED_OR_REFUSED_BY_THIS_SERVICE: &[(u16, Option<&str>)] = &[
 /// is called on both sides of the put. `CreateOAuth2Token` (the anonymous `/v1/token`
 /// route) is still a scaffold stub filed as its own issue, so the answer it owes is
 /// this service's own 501 — which is still this service answering, which is what this
-/// suite is about.
+/// suite is about. The resource-policy rows owe a modelled REFUSAL rather than a
+/// success: the account has no SignIn resource-based policy (both readers answer 404)
+/// and writing one is an action AWS grants no caller (the put answers
+/// `AccessDeniedException`). Each is this service answering, which is the rule here.
 fn sequence() -> Vec<Call<'static>> {
     vec![
         Call {
             operation: "GetResourcePolicy",
             uri: "/get-resource-policy",
             body: json!({}),
-            accepted: SERVED,
+            accepted: &[(404, Some("ResourceNotFoundException"))],
         },
         Call {
             operation: "ListResourcePermissionStatements",
             uri: "/list-resource-permission-statements",
             body: json!({"maxResults": 25}),
-            accepted: SERVED,
+            accepted: &[(404, Some("ResourceNotFoundException"))],
         },
         Call {
             operation: "PutResourcePermissionStatement",
             uri: "/put-resource-permission-statement",
             body: json!({"sourceIp": "203.0.113.1"}),
-            accepted: SERVED,
+            accepted: &[(400, Some("AccessDeniedException"))],
         },
         Call {
             operation: "DeleteResourcePermissionStatement",

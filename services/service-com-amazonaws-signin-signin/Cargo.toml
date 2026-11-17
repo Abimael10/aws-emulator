@@ -26,6 +26,17 @@ tracing = { workspace = true }
 # STS service mints one with. Already in this workspace's dependency set, so the
 # service adds no new locked crate.
 sha2 = { workspace = true }
+# `validation_message::aws_validation_refusal`: how AWS quotes a `@pattern`
+# requirement back in a constraint-violation message on a JSON protocol — without the
+# anchors the model wraps the expression in. Shared by every such service
+# (`service::override_refusal`) rather than spelled per service.
+service-common = { path = "../common" }
+# Whether the caller is authorized for the AWS Organizations entity a
+# console-authorization call names is Organizations' own fact about its own resources:
+# `state::caller_is_authorized_for_target` READS the organization and its roots out of
+# that control plane's store through the one shared engine, rather than keeping a second
+# copy of a roster this service is never told about.
+service-com-amazonaws-organizations-awsorganizationsv20161128 = { workspace = true }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

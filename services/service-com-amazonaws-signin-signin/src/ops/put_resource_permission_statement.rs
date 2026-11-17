@@ -1,10 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PutResourcePermissionStatement
-//! Mints one permission statement of the account's SignIn resource-based policy from the
-//! condition members the request carries, stores it, and returns the id it stored.
-//! `@idempotent` with an `@idempotencyToken`: a repeated put under one `clientToken`
-//! answers with the statement that token first created.
+//! Refuses every request with the service-common `AccessDeniedException`: writing a
+//! statement of the account's SignIn resource-based policy is an action AWS grants no
+//! caller of this API, whatever its IAM grants and whether or not it carries a
+//! `clientToken`, so no statement is ever created. A request that breaks the one
+//! cross-member rule `requestedRegion` documents is still refused as invalid first —
+//! validating a request is not authorizing it.
 //!
 //! ## Shape of an operation
 //!
@@ -172,24 +174,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
-        let Some(state) = crate::state::service_state(&*self.engine) else {
-            return Err(
-                PutResourcePermissionStatementErrorModeled::InternalServerException(
-                    InternalServerException {
-                        error: crate::state::SERVER_ERROR_CODE.to_string(),
-                        message: "the signin permission statement store is unavailable"
-                            .to_string(),
-                    },
-                )
-                .into(),
-            );
-        };
-
+        // The engine is reachable from `&self` (constructor-injected) and `ctx` carries
+        // the request metadata; this handler needs neither, because the decision below
+        // is the same for every caller and reads no state.
+        let _ = (ctx, &self.engine);
         // The one cross-member rule the model cannot express, stated by
         // `requestedRegion`'s own documentation: "AWS region where the VPC and VPC
         // endpoint reside Required when sourceVpc or signinSourceVpce/consoleSourceVpce
-        // is provided."
+        // is provided." It is judged before the authorization decision below, the way
+        // the boundary validator judges the modelled constraints before any handler
+        // runs: a malformed request is refused as malformed.
         let names_vpc_network = input.source_vpc.is_some()
             || input.signin_source_vpce.is_some()
             || input.console_source_vpce.is_some();
@@ -205,61 +199,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
-        let mut store = state.lock();
-
-        // `@idempotencyToken`: the same token names the same statement, so a retried
-        // put reports the first one rather than minting a second. A token whose
-        // statement has since been deleted names nothing, and mints a new one.
-        let replayed = input
-            .client_token
-            .as_deref()
-            .and_then(|token| store.statement_idempotency.get(token))
-            .filter(|id| store.permission_statements.contains_key(id.as_str()))
-            .cloned();
-        if let Some(statement_id) = replayed {
-            return Ok(PutResourcePermissionStatementOutput { statement_id });
-        }
-
-        // The store is bounded: past its quota a put is refused rather than adding
-        // another record. `ServiceQuotaExceededException` is the modelled refusal for
-        // exactly this.
-        if store.permission_statements.len() >= crate::state::PERMISSION_STATEMENT_QUOTA {
-            return Err(
-                PutResourcePermissionStatementErrorModeled::ServiceQuotaExceededException(
-                    ServiceQuotaExceededException {
-                        error: crate::state::QUOTA_ERROR_CODE.to_string(),
-                        message: format!(
-                            "the SignIn resource-based policy of account {} already holds the \
-                             maximum of {} permission statements",
-                            ::engine::emulator_account_id(),
-                            crate::state::PERMISSION_STATEMENT_QUOTA
-                        ),
-                    },
-                )
-                .into(),
-            );
-        }
-
-        let statement_id = store.mint_statement_id();
-        let statement = crate::state::PermissionStatement {
-            statement_id: statement_id.clone(),
-            source_vpc: input.source_vpc,
-            signin_source_vpce: input.signin_source_vpce,
-            console_source_vpce: input.console_source_vpce,
-            vpc_source_ip: input.vpc_source_ip,
-            source_ip: input.source_ip,
-            requested_region: input.requested_region,
-            excluded_principal: input.excluded_principal,
-        };
-        store
-            .permission_statements
-            .insert(statement_id.clone(), statement);
-        if let Some(token) = input.client_token {
-            store
-                .statement_idempotency
-                .insert(token, statement_id.clone());
-        }
-
-        Ok(PutResourcePermissionStatementOutput { statement_id })
+        // Writing the account's SignIn resource-based policy is not an action this API
+        // performs for a caller: it is denied for every principal, which is why the
+        // refusal consults neither the caller's identity nor its `clientToken` and why
+        // it is answered BEFORE the resource-policy state is touched — nothing is
+        // created, so every later read of that policy reports exactly what it held
+        // before the call. The other operations of this surface are unaffected: this is
+        // a refusal of one action, not of the caller.
+        Err(
+            PutResourcePermissionStatementErrorModeled::AccessDeniedException(
+                crate::state::no_access_to_api(Self::NAME),
+            )
+            .into(),
+        )
     }
 }

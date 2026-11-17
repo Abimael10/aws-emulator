@@ -1,40 +1,57 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! The SignIn resource-permission statement and console-authorization configuration,
-//! end to end over HTTP.
+//! The account's SignIn resource-based policy and its permission statements, end to end
+//! over HTTP, plus the console-authorization store's bound and the wording of a
+//! constraint refusal.
 //!
 //! Every assertion goes through the router, so each case exercises routing,
 //! deserialization, the handler, the persisted state and serialization — the same path a
-//! client takes. The rules under test are the ones the service states for its two
-//! resources: a permission statement is whatever the put stored, every reader
-//! (`ListResourcePermissionStatements`, `GetResourcePolicy`) computes its answer from
-//! those records, and a console-authorization configuration is reported exactly as the
-//! put persisted it.
+//! client takes.
+//!
+//! The rules under test here are the ones this surface states:
+//!
+//! * `PutResourcePermissionStatement` is an action AWS grants no caller: every request
+//!   is refused with `AccessDeniedException`, whatever it carries, and nothing is
+//!   created. A case that needs a statement in place therefore seeds one in the store
+//!   ([`crate::signin_harness::seed_statement`]) and drives the reader over HTTP;
+//! * the account's policy is the document its statements make up, so an account with no
+//!   statement at all has NO policy: both readers of it answer
+//!   `ResourceNotFoundException` rather than an empty document or an empty page;
+//! * every reader projects exactly the records the store holds — the statement ids, the
+//!   condition keys each one carries, the page `maxResults` cuts;
+//! * a value outside a member's `@pattern` is refused quoting that pattern as the
+//!   service publishes it, without the anchors the model wraps it in.
 
 use std::sync::Arc;
 
-use bytes::Bytes;
 use serde_json::{json, Map, Value};
 use service_com_amazonaws_signin_signin::state::{
     CONSOLE_AUTHORIZATION_TARGET_QUOTA, PERMISSION_STATEMENT_QUOTA,
 };
-use service_com_amazonaws_signin_signin::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
 
-/// A SigV4 credential scope naming this service — what routes a request to signin.
-const SIGNED_FOR_SIGNIN: &str = "AWS4-HMAC-SHA256 \
-     Credential=AKIDEXAMPLE/20260101/us-east-1/signin/aws4_request, \
-     SignedHeaders=host, Signature=abc";
-
-/// The account id the emulator answers for, and the target a console-authorization call
-/// addresses when it names none.
-const EMULATOR_ACCOUNT: &str = "000000000000";
+use crate::signin_harness::{post, router_over, seed_statement, Answer};
 
 /// The policy language version an AWS resource-based policy document declares.
 const POLICY_VERSION: &str = "2012-10-17";
 
-/// The condition operator and AWS global condition key each `PutResourcePermissionStatement`
-/// member is expressed with, as `(member, operator, condition key)`.
+/// The fixed sentence AWS states for a resource-policy resource the account does not
+/// have. Spelled out here rather than imported, so the crate's own constant is what this
+/// compares against.
+const RESOURCE_NOT_FOUND_MESSAGE: &str = "Requested resource not found";
+
+/// The fixed sentence AWS states for the one action on this surface it grants no caller.
+/// Its only variable part is the action's own name.
+const NO_ACCESS_MESSAGE: &str = "No Access to PutResourcePermissionStatement API";
+
+/// `OAuth2ErrorCode`'s member for a refusal of a resource that is not there.
+const NOT_FOUND_CODE: &str = "RESOURCE_NOT_FOUND";
+
+/// `OAuth2ErrorCode`'s member for a caller that may not perform the operation.
+const INSUFFICIENT_PERMISSIONS_CODE: &str = "INSUFFICIENT_PERMISSIONS";
+
+/// The condition operator and AWS global condition key each permission-statement member
+/// is expressed with, as `(member, operator, condition key)`.
 ///
 /// Spelled out here rather than imported from the crate, so a wrong mapping in
 /// `src/state.rs` fails this test. Source: `ConditionBlock` is modelled
@@ -52,213 +69,13 @@ const CONDITION_MAPPING: &[(&str, &str, &str)] = &[
     ("excludedPrincipal", "ArnNotEquals", "aws:PrincipalArn"),
 ];
 
-/// The scope each form of `TargetId` implies, as `(target, scope)`.
+/// The condition members a statement can carry, as `(case, members)`.
 ///
-/// Written here from `TargetId`'s own pattern
-/// `^(\d{12}|o-[a-z0-9]{10}|r-[0-9a-z]{4,32})$` — an account id, an AWS Organizations
-/// organization id and an organizational root id — with a root id at each published bound
-/// of `TargetId`'s `@length(min: 12, max: 32)`, which is the narrower of the two
-/// constraints on a root id.
-fn target_scope_cases() -> Vec<(&'static str, String, &'static str)> {
+/// The rows differ in which members are present, how many, and of which kind — the
+/// dimensions the condition projection generalises over — and they are the same rows the
+/// put is refused for, so one set of inputs covers both rules.
+fn statement_cases() -> Vec<(&'static str, Value)> {
     vec![
-        ("a 12-digit account id", "123456789012".to_string(), "ACCOUNT"),
-        (
-            "the emulator's own account id",
-            EMULATOR_ACCOUNT.to_string(),
-            "ACCOUNT",
-        ),
-        (
-            "an organization id",
-            "o-abc1234567".to_string(),
-            "ORGANIZATION",
-        ),
-        (
-            "another organization id",
-            "o-0zzzzzzzz9".to_string(),
-            "ORGANIZATION",
-        ),
-        (
-            "a root id at the 12-character length floor",
-            "r-0123456789".to_string(),
-            "ROOT",
-        ),
-        (
-            "a root id at the 32-character length ceiling",
-            format!("r-{}", "a".repeat(30)),
-            "ROOT",
-        ),
-    ]
-}
-
-/// `StatementId`'s `^[A-Za-z0-9+/]{64}=?$`, checked here rather than through the crate's
-/// own predicate so a wrong predicate cannot make this test pass.
-fn matches_statement_id_pattern(value: &str) -> bool {
-    let body = value.strip_suffix('=').unwrap_or(value);
-    body.len() == 64
-        && body
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '+' || c == '/')
-}
-
-/// One emulator: a router carrying only this service, over one shared engine.
-fn emulator() -> MultiServiceRouter {
-    let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
-    let mut router = MultiServiceRouter::new();
-    router.set_request_authentication(false);
-    router.register_service(EmulatedService::new(engine));
-    router
-}
-
-/// What the emulator answered: the HTTP status and the JSON body.
-struct Answer {
-    status: u16,
-    body: Value,
-}
-
-impl Answer {
-    /// The wire error code (`__type`), or the empty string on a success.
-    fn error_code(&self) -> &str {
-        let code = self.body["__type"].as_str().unwrap_or_default();
-        code.rsplit('#').next().unwrap_or_default()
-    }
-
-    /// The `statementId` a put reported, or the empty string.
-    fn statement_id(&self) -> String {
-        self.body["statementId"]
-            .as_str()
-            .unwrap_or_default()
-            .to_string()
-    }
-
-    /// The `sid` of every statement a list page carries, in order.
-    fn sids(&self) -> Vec<String> {
-        self.body["permissionStatements"]
-            .as_array()
-            .map(|items| {
-                items
-                    .iter()
-                    .map(|item| item["sid"].as_str().unwrap_or_default().to_string())
-                    .collect()
-            })
-            .unwrap_or_default()
-    }
-
-    /// The `nextToken` a list page carries, if any.
-    fn next_token(&self) -> Option<String> {
-        self.body["nextToken"].as_str().map(str::to_string)
-    }
-
-    /// The `Statement` list of a rendered policy document.
-    fn policy_statements(&self) -> Vec<Value> {
-        self.body["signinResourceBasedPolicy"]["Statement"]
-            .as_array()
-            .cloned()
-            .unwrap_or_default()
-    }
-}
-
-async fn call(router: &MultiServiceRouter, uri: &str, body: Value) -> Answer {
-    let payload = body.to_string();
-    let request = ::http::Request::builder()
-        .method("POST")
-        .uri(uri)
-        .header("host", "signin.us-east-1.amazonaws.com")
-        .header("authorization", SIGNED_FOR_SIGNIN)
-        .header("content-type", "application/json")
-        .body(Bytes::from(payload))
-        .expect("the test request is well formed");
-
-    let response = router.dispatch(request).await;
-    let status = response.status().as_u16();
-    let bytes = response.into_body();
-    let body = if bytes.is_empty() {
-        Value::Null
-    } else {
-        serde_json::from_slice(&bytes).unwrap_or_else(|error| {
-            panic!(
-                "POST {uri} answered a body that is not JSON ({error}): {:?}",
-                String::from_utf8_lossy(&bytes)
-            )
-        })
-    };
-    Answer { status, body }
-}
-
-async fn put_statement(router: &MultiServiceRouter, request: Value) -> Answer {
-    call(router, "/put-resource-permission-statement", request).await
-}
-
-async fn list_statements(router: &MultiServiceRouter, request: Value) -> Answer {
-    call(router, "/list-resource-permission-statements", request).await
-}
-
-async fn get_policy(router: &MultiServiceRouter) -> Answer {
-    call(router, "/get-resource-policy", json!({})).await
-}
-
-async fn delete_statement(router: &MultiServiceRouter, request: Value) -> Answer {
-    call(router, "/delete-resource-permission-statement", request).await
-}
-
-async fn put_configuration(router: &MultiServiceRouter, request: Value) -> Answer {
-    call(router, "/put-console-authorization-configuration", request).await
-}
-
-async fn get_configuration(router: &MultiServiceRouter, request: Value) -> Answer {
-    call(router, "/get-console-authorization-configuration", request).await
-}
-
-/// The condition block a put request's members must be reported with: `Value::Null` when
-/// the request carries no condition member at all.
-fn expected_condition(request: &Value) -> Value {
-    let mut block: Map<String, Value> = Map::new();
-    for (member, operator, key) in CONDITION_MAPPING {
-        let Some(value) = request.get(*member).and_then(Value::as_str) else {
-            continue;
-        };
-        let operator_entry = block
-            .entry((*operator).to_string())
-            .or_insert_with(|| Value::Object(Map::new()));
-        let keys = operator_entry
-            .as_object_mut()
-            .expect("a condition operator holds a map of condition keys");
-        keys.entry((*key).to_string())
-            .or_insert_with(|| Value::Array(Vec::new()))
-            .as_array_mut()
-            .expect("a condition key holds a list of values")
-            .push(json!(value));
-    }
-    if block.is_empty() {
-        Value::Null
-    } else {
-        Value::Object(block)
-    }
-}
-
-/// Every statement the store holds, listed with the largest page the model admits.
-async fn all_statements(router: &MultiServiceRouter) -> Vec<Value> {
-    let answer = list_statements(router, json!({"maxResults": 100})).await;
-    assert_eq!(
-        answer.status, 200,
-        "a list must be served, got {} with {:?}",
-        answer.status, answer.body
-    );
-    answer.body["permissionStatements"]
-        .as_array()
-        .cloned()
-        .unwrap_or_default()
-}
-
-/// A put stores the statement it reports: the id it answers names a statement
-/// `ListResourcePermissionStatements` reports with exactly the condition keys the request
-/// supplied, and `GetResourcePolicy` renders that same condition block into the account's
-/// policy document.
-///
-/// The rows differ in which condition members the request carries, how many, and of which
-/// kind — the dimensions the projection generalises over.
-#[tokio::test]
-async fn a_put_stores_the_statement_every_reader_reports() {
-    let cases = [
         ("no condition member at all", json!({})),
         (
             "a VPC and its region",
@@ -301,45 +118,287 @@ async fn a_put_stores_the_statement_every_reader_reports() {
                 "excludedPrincipal": "arn:aws:iam::123456789012:root",
             }),
         ),
+    ]
+}
+
+/// One emulator and the engine behind it, so a case can seed the store the handlers
+/// answer from.
+fn emulator() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
+    let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
+    (router_over(Arc::clone(&engine)), engine)
+}
+
+async fn put_statement(router: &MultiServiceRouter, request: Value) -> Answer {
+    post(router, "/put-resource-permission-statement", request).await
+}
+
+async fn list_statements(router: &MultiServiceRouter, request: Value) -> Answer {
+    post(router, "/list-resource-permission-statements", request).await
+}
+
+async fn get_policy(router: &MultiServiceRouter) -> Answer {
+    post(router, "/get-resource-policy", json!({})).await
+}
+
+async fn delete_statement(router: &MultiServiceRouter, request: Value) -> Answer {
+    post(router, "/delete-resource-permission-statement", request).await
+}
+
+async fn put_configuration(router: &MultiServiceRouter, request: Value) -> Answer {
+    post(router, "/put-console-authorization-configuration", request).await
+}
+
+async fn get_configuration(router: &MultiServiceRouter, request: Value) -> Answer {
+    post(router, "/get-console-authorization-configuration", request).await
+}
+
+/// The `sid` of every statement a list page carries, in order.
+fn sids(answer: &Answer) -> Vec<String> {
+    answer.body["permissionStatements"]
+        .as_array()
+        .map(|items| {
+            items
+                .iter()
+                .map(|item| item["sid"].as_str().unwrap_or_default().to_string())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The `nextToken` a list page carries, if any.
+fn next_token(answer: &Answer) -> Option<String> {
+    answer.body["nextToken"].as_str().map(str::to_string)
+}
+
+/// The `Statement` list of a rendered policy document.
+fn policy_statements(answer: &Answer) -> Vec<Value> {
+    answer.body["signinResourceBasedPolicy"]["Statement"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+}
+
+/// The condition block a statement's members must be reported with: `Value::Null` when
+/// it carries no condition member at all.
+fn expected_condition(members: &Value) -> Value {
+    let mut block: Map<String, Value> = Map::new();
+    for (member, operator, key) in CONDITION_MAPPING {
+        let Some(value) = members.get(*member).and_then(Value::as_str) else {
+            continue;
+        };
+        let operator_entry = block
+            .entry((*operator).to_string())
+            .or_insert_with(|| Value::Object(Map::new()));
+        let keys = operator_entry
+            .as_object_mut()
+            .expect("a condition operator holds a map of condition keys");
+        keys.entry((*key).to_string())
+            .or_insert_with(|| Value::Array(Vec::new()))
+            .as_array_mut()
+            .expect("a condition key holds a list of values")
+            .push(json!(value));
+    }
+    if block.is_empty() {
+        Value::Null
+    } else {
+        Value::Object(block)
+    }
+}
+
+/// Every statement the store holds, listed with the largest page the model admits.
+async fn all_statements(router: &MultiServiceRouter) -> Vec<Value> {
+    let answer = list_statements(router, json!({"maxResults": 100})).await;
+    assert_eq!(
+        answer.status, 200,
+        "a list must be served, got {} with {:?}",
+        answer.status, answer.body
+    );
+    answer.body["permissionStatements"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+}
+
+/// Assert that `answer` is the 404 `ResourceNotFoundException` a resource-policy
+/// resource the account does not have earns, worded as AWS words it.
+fn assert_resource_not_found(case: &str, answer: &Answer) {
+    assert_eq!(
+        (
+            answer.status,
+            answer.error_code(),
+            answer.error_member(),
+            answer.message()
+        ),
+        (
+            404,
+            "ResourceNotFoundException",
+            NOT_FOUND_CODE,
+            RESOURCE_NOT_FOUND_MESSAGE
+        ),
+        "case {case:?}: expected 404 ResourceNotFoundException / \
+         {RESOURCE_NOT_FOUND_MESSAGE:?}, got {} with {:?}",
+        answer.status,
+        answer.body
+    );
+}
+
+/// Writing a statement of the account's SignIn resource-based policy is an action AWS
+/// grants no caller: every well-formed request is refused with `AccessDeniedException`
+/// and no statement is created — so the account still has no policy afterwards.
+///
+/// The rows span what the refusal generalises over: which condition members the request
+/// carries and how many, whether it carries a `clientToken` at all, and how many times
+/// the same request is retried under the same token.
+#[tokio::test]
+async fn a_put_of_a_permission_statement_is_denied_for_every_request() {
+    let (router, _engine) = emulator();
+
+    // `ClientToken` is `@length(1..64)` with pattern `^[!-~]+$`, so the token rows span a
+    // one-character token, a 64-character one, punctuation the pattern admits, and no
+    // token at all — each retried a different number of times, since an
+    // `@idempotencyToken` is exactly what a caller would expect to change the answer.
+    let token_cases: Vec<(&str, Option<String>, usize)> = vec![
+        ("no clientToken", None, 2),
+        ("a one-character token", Some("t".to_string()), 2),
+        ("a 64-character token", Some("k".repeat(64)), 3),
+        ("punctuation only", Some("!~/+=".to_string()), 4),
+        (
+            "a token used once",
+            Some("single-attempt".to_string()),
+            1,
+        ),
     ];
 
-    let router = emulator();
-    let mut created = Vec::new();
-    for (case, request) in &cases {
-        let answer = put_statement(&router, request.clone()).await;
-        assert_eq!(
-            answer.status, 200,
-            "case {case:?}: a put must be accepted, got {} with {:?}",
-            answer.status, answer.body
-        );
-        let statement_id = answer.statement_id();
-        assert!(
-            matches_statement_id_pattern(&statement_id),
-            "case {case:?}: statementId must satisfy ^[A-Za-z0-9+/]{{64}}=?$, got \
-             {statement_id:?}"
-        );
-        created.push((case, request.clone(), statement_id));
+    for (statement_case, members) in statement_cases() {
+        for (token_case, token, attempts) in &token_cases {
+            let mut request = members.clone();
+            if let Some(token) = token {
+                request["clientToken"] = json!(token);
+            }
+            for attempt in 0..*attempts {
+                let answer = put_statement(&router, request.clone()).await;
+                assert_eq!(
+                    (
+                        answer.status,
+                        answer.error_code(),
+                        answer.error_member(),
+                        answer.message()
+                    ),
+                    (
+                        400,
+                        "AccessDeniedException",
+                        INSUFFICIENT_PERMISSIONS_CODE,
+                        NO_ACCESS_MESSAGE
+                    ),
+                    "case {statement_case:?} with {token_case:?}, attempt {attempt}: the \
+                     put must be denied with {NO_ACCESS_MESSAGE:?}, got {} with {:?}",
+                    answer.status,
+                    answer.body
+                );
+                assert!(
+                    answer.body["statementId"].is_null(),
+                    "case {statement_case:?} with {token_case:?}: a denied put must \
+                     report no statementId, got {:?}",
+                    answer.body
+                );
+            }
+        }
     }
 
-    let mut ids: Vec<&String> = created.iter().map(|(_, _, id)| id).collect();
-    ids.sort();
-    ids.dedup();
+    // Nothing was created, so the account still has no policy at all: both readers of it
+    // report the resource missing.
+    assert_resource_not_found("the policy after every put was denied", &get_policy(&router).await);
+    assert_resource_not_found(
+        "the statement list after every put was denied",
+        &list_statements(&router, json!({"maxResults": 25})).await,
+    );
+}
+
+/// An account with no permission statement has no SignIn resource-based policy: both
+/// readers of it refuse with `ResourceNotFoundException` rather than reporting a document
+/// nothing created or a page that cannot be told from "no policy at all". Once a
+/// statement is there both are served, and once the last one is deleted both refuse
+/// again.
+#[tokio::test]
+async fn the_policy_readers_refuse_an_account_that_has_no_policy() {
+    // The list rows span the page controls a caller can send: no `maxResults`, each
+    // published bound of its `@range(min: 1, max: 100)`, a value in between, and a
+    // `nextToken` — the resource has to exist before any of them means anything.
+    let list_requests = [
+        ("no page control at all", json!({})),
+        ("the smallest page", json!({"maxResults": 1})),
+        ("a page of twenty-five", json!({"maxResults": 25})),
+        ("the largest page", json!({"maxResults": 100})),
+        (
+            "a continuation token",
+            json!({"nextToken": "0".repeat(64)}),
+        ),
+    ];
+
+    let (router, engine) = emulator();
+
+    assert_resource_not_found("the policy of an account with no statement", &get_policy(&router).await);
+    for (case, request) in &list_requests {
+        assert_resource_not_found(case, &list_statements(&router, request.clone()).await);
+    }
+
+    // One statement is enough for the account to HAVE a policy.
+    let statement_id = seed_statement(&engine, &json!({"sourceIp": "192.0.2.10"}));
+    let policy = get_policy(&router).await;
     assert_eq!(
-        ids.len(),
-        created.len(),
-        "each put must store its own statement, got {created:?}"
+        (policy.status, policy_statements(&policy).len()),
+        (200, 1),
+        "with a statement stored the policy must be served, got {} with {:?}",
+        policy.status,
+        policy.body
+    );
+    let listed = list_statements(&router, json!({"maxResults": 25})).await;
+    assert_eq!(
+        (listed.status, sids(&listed)),
+        (200, vec![statement_id.clone()]),
+        "with a statement stored the list must be served, got {} with {:?}",
+        listed.status,
+        listed.body
     );
 
-    // Every stored statement is reported by the list, with the conditions its put
-    // supplied — read in a request of its own, so the answer can only come from state.
+    // And deleting the last statement takes the policy away again — the absence is a
+    // missing resource, not an empty document.
+    assert_eq!(
+        delete_statement(&router, json!({"statementId": statement_id}))
+            .await
+            .status,
+        200,
+        "the delete of the one stored statement must be accepted"
+    );
+    assert_resource_not_found("the policy after the last statement was deleted", &get_policy(&router).await);
+    for (case, request) in &list_requests {
+        assert_resource_not_found(
+            &format!("{case} after the last statement was deleted"),
+            &list_statements(&router, request.clone()).await,
+        );
+    }
+}
+
+/// Every reader projects the statements the policy holds: the list reports each one with
+/// exactly the condition keys it carries, and `GetResourcePolicy` renders those same
+/// condition blocks into the account's policy document.
+#[tokio::test]
+async fn every_reader_projects_the_statements_the_policy_holds() {
+    let (router, engine) = emulator();
+    let cases = statement_cases();
+    let stored: Vec<(&str, Value, String)> = cases
+        .iter()
+        .map(|(case, members)| (*case, members.clone(), seed_statement(&engine, members)))
+        .collect();
+
     let listed = all_statements(&router).await;
     assert_eq!(
         listed.len(),
-        created.len(),
-        "the list must report exactly the {} statements that were put, got {listed:?}",
-        created.len()
+        stored.len(),
+        "the list must report exactly the {} statements the store holds, got {listed:?}",
+        stored.len()
     );
-    for (case, request, statement_id) in &created {
+    for (case, members, statement_id) in &stored {
         let summary = listed
             .iter()
             .find(|item| item["sid"].as_str() == Some(statement_id.as_str()))
@@ -348,8 +407,8 @@ async fn a_put_stores_the_statement_every_reader_reports() {
             });
         assert_eq!(
             summary["condition"],
-            expected_condition(request),
-            "case {case:?}: expected the condition keys the put supplied, got {:?}",
+            expected_condition(members),
+            "case {case:?}: expected the condition keys the statement carries, got {:?}",
             summary["condition"]
         );
     }
@@ -368,15 +427,15 @@ async fn a_put_stores_the_statement_every_reader_reports() {
         "the policy must declare its language version, got {:?}",
         policy.body
     );
-    let rendered = policy.policy_statements();
+    let rendered = policy_statements(&policy);
     assert_eq!(
         rendered.len(),
-        created.len(),
+        stored.len(),
         "the policy must carry one statement per stored permission statement, got \
          {rendered:?}"
     );
-    for (case, request, _) in &created {
-        let expected = expected_condition(request);
+    for (case, members, _) in &stored {
+        let expected = expected_condition(members);
         let matches = rendered
             .iter()
             .filter(|statement| statement["Condition"] == expected)
@@ -389,95 +448,17 @@ async fn a_put_stores_the_statement_every_reader_reports() {
     }
 }
 
-/// `clientToken` is an `@idempotencyToken` on an `@idempotent` operation: the same token
-/// always names the statement it first created, a different token names a different one,
-/// and no token at all stores a new statement every time.
-#[tokio::test]
-async fn a_repeated_put_with_one_client_token_stores_one_statement() {
-    // `ClientToken` is `@length(1..64)` with pattern `^[!-~]+$`, so the rows span a
-    // one-character token, a 64-character one and punctuation the pattern admits, each
-    // repeated a different number of times.
-    let cases: Vec<(&str, String, usize)> = vec![
-        ("a one-character token", "t".to_string(), 2),
-        ("a 64-character token", "k".repeat(64), 3),
-        ("punctuation only", "!~/+=".to_string(), 4),
-        ("a token repeated once", "single-attempt".to_string(), 1),
-    ];
-
-    let router = emulator();
-    let mut distinct = Vec::new();
-    for (case, token, attempts) in &cases {
-        let request = json!({
-            "sourceIp": "203.0.113.1",
-            "clientToken": token,
-        });
-        let mut ids = Vec::new();
-        for attempt in 0..*attempts {
-            let answer = put_statement(&router, request.clone()).await;
-            assert_eq!(
-                answer.status, 200,
-                "case {case:?}: attempt {attempt} must be accepted, got {} with {:?}",
-                answer.status, answer.body
-            );
-            ids.push(answer.statement_id());
-        }
-        let first = ids[0].clone();
-        assert!(
-            ids.iter().all(|id| id == &first),
-            "case {case:?}: every attempt under one clientToken must answer the same \
-             statementId, got {ids:?}"
-        );
-        distinct.push(first);
-    }
-
-    // Two puts carrying no token at all are two statements.
-    let untokened_first = put_statement(&router, json!({"sourceIp": "203.0.113.2"}))
-        .await
-        .statement_id();
-    let untokened_second = put_statement(&router, json!({"sourceIp": "203.0.113.2"}))
-        .await
-        .statement_id();
-    assert_ne!(
-        untokened_first, untokened_second,
-        "a put with no clientToken must store a new statement every time"
-    );
-    distinct.push(untokened_first);
-    distinct.push(untokened_second);
-
-    let mut unique = distinct.clone();
-    unique.sort();
-    unique.dedup();
-    assert_eq!(
-        unique.len(),
-        distinct.len(),
-        "distinct client tokens must name distinct statements, got {distinct:?}"
-    );
-
-    let listed: Vec<String> = all_statements(&router)
-        .await
-        .iter()
-        .map(|item| item["sid"].as_str().unwrap_or_default().to_string())
-        .collect();
-    let mut expected = distinct.clone();
-    expected.sort();
-    let mut actual = listed.clone();
-    actual.sort();
-    assert_eq!(
-        actual, expected,
-        "the store must hold exactly one statement per distinct token, got {listed:?}"
-    );
-}
-
 /// `maxResults` bounds a page and `nextToken` resumes exactly where the previous page
 /// ended, with no token on the last page; paging reports every stored statement once, in
-/// the order the list reports them, and listing is a read: it leaves the store alone.
+/// mint order, and listing is a read: it leaves the store alone.
 #[tokio::test]
 async fn the_list_pages_at_max_results() {
     // Rows differ in how many statements are stored and how large a page is asked for,
-    // including the published bounds of `maxResults`' `@range(min: 1, max: 100)`.
+    // including the published bounds of `maxResults`' `@range(min: 1, max: 100)`. Every
+    // row holds at least one statement, since an account with none has no policy to page
+    // over at all (that case is its own test above).
     let cases = [
-        ("nothing stored, smallest page", 0usize, Some(1)),
-        ("one statement, smallest page", 1, Some(1)),
+        ("one statement, smallest page", 1usize, Some(1)),
         ("five statements, smallest page", 5, Some(1)),
         ("five statements, page of two", 5, Some(2)),
         ("six statements, page of three", 6, Some(3)),
@@ -486,20 +467,13 @@ async fn the_list_pages_at_max_results() {
     ];
 
     for (case, stored, max_results) in cases {
-        let router = emulator();
+        let (router, engine) = emulator();
         let mut minted = Vec::new();
         for index in 0..stored {
-            let answer = put_statement(
-                &router,
-                json!({"sourceIp": format!("198.51.100.{index}")}),
-            )
-            .await;
-            assert_eq!(
-                answer.status, 200,
-                "case {case:?}: put {index} must be accepted, got {} with {:?}",
-                answer.status, answer.body
-            );
-            minted.push(answer.statement_id());
+            minted.push(seed_statement(
+                &engine,
+                &json!({"sourceIp": format!("198.51.100.{index}")}),
+            ));
         }
 
         let mut seen: Vec<String> = Vec::new();
@@ -519,7 +493,7 @@ async fn the_list_pages_at_max_results() {
                 "case {case:?}: page {pages} must be served, got {} with {:?}",
                 answer.status, answer.body
             );
-            let page = answer.sids();
+            let page = sids(&answer);
             if let Some(max) = max_results {
                 assert!(
                     page.len() <= usize::try_from(max).expect("a positive page size"),
@@ -529,7 +503,7 @@ async fn the_list_pages_at_max_results() {
             }
             seen.extend(page);
             pages += 1;
-            match answer.next_token() {
+            match next_token(&answer) {
                 Some(next) => token = Some(next),
                 None => break,
             }
@@ -546,17 +520,8 @@ async fn the_list_pages_at_max_results() {
             "case {case:?}: paging must report each of the {stored} statements exactly \
              once, got {seen:?}"
         );
-        let mut sorted_seen = seen.clone();
-        sorted_seen.sort();
-        let mut sorted_minted = minted.clone();
-        sorted_minted.sort();
         assert_eq!(
-            sorted_seen, sorted_minted,
-            "case {case:?}: paging must report exactly the statements that were put"
-        );
-        assert_eq!(
-            seen,
-            minted,
+            seen, minted,
             "case {case:?}: paging must report the statements in mint order, got {seen:?}"
         );
 
@@ -577,9 +542,9 @@ async fn the_list_pages_at_max_results() {
     // mints never take, and a value its mint has not reached. The store holds two
     // statements here, so a page IS available — what is refused is the token, not the
     // query.
-    let router = emulator();
+    let (router, engine) = emulator();
     for index in 0..2 {
-        put_statement(&router, json!({"sourceIp": format!("192.0.2.{index}")})).await;
+        seed_statement(&engine, &json!({"sourceIp": format!("192.0.2.{index}")}));
     }
     for (case, token) in [
         ("not a statement id at all", "not-a-token".to_string()),
@@ -598,22 +563,17 @@ async fn the_list_pages_at_max_results() {
     ] {
         let refused = list_statements(&router, json!({"nextToken": token})).await;
         assert_eq!(
-            refused.status, 400,
+            (refused.status, refused.error_code()),
+            (400, "ValidationException"),
             "case {case:?}: an unissued nextToken must be refused, got {} with {:?}",
-            refused.status, refused.body
-        );
-        assert_eq!(
-            refused.error_code(),
-            "ValidationException",
-            "case {case:?}: expected ValidationException, got {:?}",
+            refused.status,
             refused.body
         );
     }
 
     // And the token this operation DID issue is served.
     let first_page = list_statements(&router, json!({"maxResults": 1})).await;
-    let issued = first_page
-        .next_token()
+    let issued = next_token(&first_page)
         .expect("a page bounded below the store size carries a nextToken");
     let resumed = list_statements(&router, json!({"nextToken": issued.clone()})).await;
     assert_eq!(
@@ -629,18 +589,15 @@ async fn the_list_pages_at_max_results() {
 /// the same success.
 #[tokio::test]
 async fn a_delete_removes_the_statement_from_every_reader() {
-    let router = emulator();
-    let mut ids = Vec::new();
-    for index in 0..4 {
-        ids.push(
-            put_statement(
-                &router,
-                json!({"sourceIp": format!("192.0.2.{index}"), "requestedRegion": "us-east-1"}),
+    let (router, engine) = emulator();
+    let ids: Vec<String> = (0..4)
+        .map(|index| {
+            seed_statement(
+                &engine,
+                &json!({"sourceIp": format!("192.0.2.{index}"), "requestedRegion": "us-east-1"}),
             )
-            .await
-            .statement_id(),
-        );
-    }
+        })
+        .collect();
 
     // Delete them one at a time, checking both readers after each.
     for (index, id) in ids.clone().into_iter().enumerate() {
@@ -651,52 +608,38 @@ async fn a_delete_removes_the_statement_from_every_reader() {
             answer.status, answer.body
         );
 
-        let remaining: Vec<String> = all_statements(&router)
-            .await
-            .iter()
-            .map(|item| item["sid"].as_str().unwrap_or_default().to_string())
-            .collect();
         let expected: Vec<String> = ids[index + 1..].to_vec();
-        assert_eq!(
-            remaining, expected,
-            "case {index}: the list must report exactly the statements still stored"
-        );
-        assert_eq!(
-            get_policy(&router).await.policy_statements().len(),
-            expected.len(),
-            "case {index}: the policy must carry one statement per statement still stored"
-        );
+        if expected.is_empty() {
+            // The last statement is gone, so the account has no policy at all again.
+            assert_resource_not_found("the list after the last delete", &list_statements(&router, json!({})).await);
+            assert_resource_not_found("the policy after the last delete", &get_policy(&router).await);
+        } else {
+            let remaining: Vec<String> = all_statements(&router)
+                .await
+                .iter()
+                .map(|item| item["sid"].as_str().unwrap_or_default().to_string())
+                .collect();
+            assert_eq!(
+                remaining, expected,
+                "case {index}: the list must report exactly the statements still stored"
+            );
+            assert_eq!(
+                policy_statements(&get_policy(&router).await).len(),
+                expected.len(),
+                "case {index}: the policy must carry one statement per statement still stored"
+            );
+        }
 
         // A second delete of the same id, with no token to replay, is a 404.
-        let again = delete_statement(&router, json!({"statementId": id})).await;
-        assert_eq!(
-            again.status, 404,
-            "case {index}: deleting an already deleted statement must answer 404, got {} \
-             with {:?}",
-            again.status, again.body
-        );
-        assert_eq!(
-            again.error_code(),
-            "ResourceNotFoundException",
-            "case {index}: expected ResourceNotFoundException, got {:?}",
-            again.body
+        assert_resource_not_found(
+            &format!("case {index}: deleting an already deleted statement"),
+            &delete_statement(&router, json!({"statementId": id})).await,
         );
     }
 
-    // An empty store renders a policy with an empty statement list, not a canned one.
-    let policy = get_policy(&router).await;
-    assert_eq!(
-        policy.policy_statements(),
-        Vec::<Value>::new(),
-        "with nothing stored the policy must carry an empty statement list, got {:?}",
-        policy.body
-    );
-
     // A retried delete under the token that removed the statement answers the same
     // success rather than the 404 an unknown id earns.
-    let doomed = put_statement(&router, json!({"sourceIp": "192.0.2.9"}))
-        .await
-        .statement_id();
+    let doomed = seed_statement(&engine, &json!({"sourceIp": "192.0.2.9"}));
     for attempt in 0..3 {
         let answer = delete_statement(
             &router,
@@ -726,14 +669,10 @@ async fn a_delete_removes_the_statement_from_every_reader() {
     for (case, statement_id, status, code) in cases {
         let answer = delete_statement(&router, json!({"statementId": statement_id})).await;
         assert_eq!(
-            answer.status, status,
-            "case {case:?}: expected HTTP {status} for {statement_id:?}, got {} with {:?}",
-            answer.status, answer.body
-        );
-        assert_eq!(
-            answer.error_code(),
-            code,
-            "case {case:?}: expected {code}, got {:?}",
+            (answer.status, answer.error_code()),
+            (status, code),
+            "case {case:?}: expected HTTP {status} {code} for {statement_id:?}, got {} with {:?}",
+            answer.status,
             answer.body
         );
     }
@@ -741,21 +680,26 @@ async fn a_delete_removes_the_statement_from_every_reader() {
 
 /// `requestedRegion` documents the one cross-member rule the model cannot express:
 /// "Required when sourceVpc or signinSourceVpce/consoleSourceVpce is provided". A put
-/// that names a VPC or a VPC endpoint without it is refused and stores nothing; a put
-/// that names neither is accepted without it.
+/// that names a VPC or a VPC endpoint without it is refused as INVALID — validating a
+/// request is not authorizing it — while a put that satisfies the rule reaches the
+/// authorization decision and is denied. Either way nothing is stored.
 #[tokio::test]
 async fn a_vpc_member_requires_the_requested_region() {
     let cases = [
-        ("a VPC alone", json!({"sourceVpc": "vpc-0123abcd"}), 400),
+        (
+            "a VPC alone",
+            json!({"sourceVpc": "vpc-0123abcd"}),
+            "ValidationException",
+        ),
         (
             "the SignIn endpoint alone",
             json!({"signinSourceVpce": "vpce-0123abcd"}),
-            400,
+            "ValidationException",
         ),
         (
             "the console endpoint alone",
             json!({"consoleSourceVpce": "vpce-0123abcd"}),
-            400,
+            "ValidationException",
         ),
         (
             "a VPC and both endpoints, no region",
@@ -764,326 +708,54 @@ async fn a_vpc_member_requires_the_requested_region() {
                 "signinSourceVpce": "vpce-0123abcd",
                 "consoleSourceVpce": "vpce-4567efgh",
             }),
-            400,
+            "ValidationException",
         ),
         (
             "a VPC with its region",
             json!({"sourceVpc": "vpc-0123abcd", "requestedRegion": "us-east-1"}),
-            200,
+            "AccessDeniedException",
         ),
         (
             "the console endpoint with its region",
             json!({"consoleSourceVpce": "vpce-0123abcd", "requestedRegion": "sa-east-1"}),
-            200,
+            "AccessDeniedException",
         ),
-        ("an address, no region", json!({"sourceIp": "192.0.2.1"}), 200),
+        (
+            "an address, no region",
+            json!({"sourceIp": "192.0.2.1"}),
+            "AccessDeniedException",
+        ),
         (
             "a VPC address, no region",
             json!({"vpcSourceIp": "10.1.2.3"}),
-            200,
+            "AccessDeniedException",
         ),
         (
             "an excluded principal, no region",
             json!({"excludedPrincipal": "arn:aws:iam::123456789012:user/Alice"}),
-            200,
+            "AccessDeniedException",
         ),
         (
             "a region on its own",
             json!({"requestedRegion": "ap-south-1"}),
-            200,
+            "AccessDeniedException",
         ),
-        ("no member at all", json!({}), 200),
+        ("no member at all", json!({}), "AccessDeniedException"),
     ];
 
-    let router = emulator();
-    let mut accepted = 0usize;
-    for (case, request, status) in cases {
+    let (router, _engine) = emulator();
+    for (case, request, code) in cases {
         let answer = put_statement(&router, request.clone()).await;
         assert_eq!(
-            answer.status, status,
-            "case {case:?}: expected HTTP {status}, got {} with {:?}",
-            answer.status, answer.body
-        );
-        if status == 400 {
-            assert_eq!(
-                answer.error_code(),
-                "ValidationException",
-                "case {case:?}: expected ValidationException, got {:?}",
-                answer.body
-            );
-        } else {
-            accepted += 1;
-        }
-        assert_eq!(
-            all_statements(&router).await.len(),
-            accepted,
-            "case {case:?}: only an accepted put may store a statement"
-        );
-    }
-}
-
-/// The store is bounded: past its quota a put is refused with the modelled
-/// `ServiceQuotaExceededException` instead of growing the state, and a delete frees room
-/// for exactly one more.
-///
-/// The bound is imported because the test has to know where it lies; what is asserted is
-/// the behaviour at it, not the number.
-#[tokio::test]
-async fn the_permission_statement_store_is_bounded_by_its_quota() {
-    let router = emulator();
-    for index in 0..PERMISSION_STATEMENT_QUOTA {
-        let answer = put_statement(&router, json!({})).await;
-        assert_eq!(
-            answer.status, 200,
-            "put {index} of {PERMISSION_STATEMENT_QUOTA} must be accepted, got {} with {:?}",
-            answer.status, answer.body
-        );
-    }
-
-    let refused = put_statement(&router, json!({})).await;
-    assert_eq!(
-        refused.status, 402,
-        "a put past the quota must be refused, got {} with {:?}",
-        refused.status, refused.body
-    );
-    assert_eq!(
-        refused.error_code(),
-        "ServiceQuotaExceededException",
-        "expected ServiceQuotaExceededException, got {:?}",
-        refused.body
-    );
-
-    let first = all_statements(&router)
-        .await
-        .first()
-        .and_then(|item| item["sid"].as_str().map(str::to_string))
-        .expect("the store holds statements");
-    assert_eq!(
-        delete_statement(&router, json!({"statementId": first}))
-            .await
-            .status,
-        200,
-        "the delete that frees quota must be accepted"
-    );
-    assert_eq!(
-        put_statement(&router, json!({})).await.status,
-        200,
-        "a put must be accepted again once a statement has been deleted"
-    );
-}
-
-/// A console-authorization configuration is whatever the put persisted for that target:
-/// the get reports it in a request of its own, the scope follows the form of the
-/// `targetId`, a target that was never configured is a 404, and a request naming no
-/// target addresses the caller's own account.
-#[tokio::test]
-async fn a_console_authorization_configuration_round_trips_per_target() {
-    let router = emulator();
-
-    // Nothing is configured yet, so every target is missing — never a default.
-    for (case, target_id, _) in target_scope_cases() {
-        let answer = get_configuration(&router, json!({"targetId": target_id})).await;
-        assert_eq!(
-            answer.status, 404,
-            "case {case:?}: an unconfigured target must answer 404, got {} with {:?}",
-            answer.status, answer.body
-        );
-        assert_eq!(
-            answer.error_code(),
-            "ResourceNotFoundException",
-            "case {case:?}: expected ResourceNotFoundException, got {:?}",
+            (answer.status, answer.error_code()),
+            (400, code),
+            "case {case:?}: expected HTTP 400 {code}, got {} with {:?}",
+            answer.status,
             answer.body
         );
-    }
-
-    for (case, target_id, scope) in target_scope_cases() {
-        let written = put_configuration(&router, json!({"targetId": target_id})).await;
-        assert_eq!(
-            written.status, 200,
-            "case {case:?}: a put must be accepted, got {} with {:?}",
-            written.status, written.body
-        );
-        assert_eq!(
-            written.body["targetId"],
-            json!(target_id),
-            "case {case:?}: the put must report the target it configured, got {:?}",
-            written.body
-        );
-        assert_eq!(
-            written.body["scope"],
-            json!(scope),
-            "case {case:?}: expected scope {scope:?}, got {:?}",
-            written.body
-        );
-        assert_eq!(
-            written.body["consoleAuthorizationEnabled"],
-            json!(true),
-            "case {case:?}: a put enables console authorization, got {:?}",
-            written.body
-        );
-
-        // A separate request must observe exactly what was stored.
-        let read = get_configuration(&router, json!({"targetId": target_id})).await;
-        assert_eq!(
-            read.status, 200,
-            "case {case:?}: the configured target must be served, got {} with {:?}",
-            read.status, read.body
-        );
-        assert_eq!(
-            read.body, written.body,
-            "case {case:?}: the get must report what the put persisted"
-        );
-
-        // And a repeated put is idempotent: the same three members, one record.
-        let again = put_configuration(&router, json!({"targetId": target_id})).await;
-        assert_eq!(
-            again.body, written.body,
-            "case {case:?}: a repeated put must report the same configuration"
-        );
-    }
-
-    // A target nothing configured is still missing, even with others stored.
-    let unconfigured = get_configuration(&router, json!({"targetId": "999999999999"})).await;
-    assert_eq!(
-        unconfigured.status, 404,
-        "a target nothing configured must answer 404, got {} with {:?}",
-        unconfigured.status, unconfigured.body
-    );
-
-    // Absent a `targetId` the target is the caller's own account.
-    let defaulted = put_configuration(&router, json!({})).await;
-    assert_eq!(
-        defaulted.status, 200,
-        "a put naming no target must be accepted, got {} with {:?}",
-        defaulted.status, defaulted.body
-    );
-    assert_eq!(
-        defaulted.body["targetId"],
-        json!(EMULATOR_ACCOUNT),
-        "a put naming no target must configure the caller's own account, got {:?}",
-        defaulted.body
-    );
-    let read_defaulted = get_configuration(&router, json!({})).await;
-    assert_eq!(
-        read_defaulted.body, defaulted.body,
-        "a get naming no target must report the caller's own account's configuration"
-    );
-    assert_eq!(
-        get_configuration(&router, json!({"targetId": EMULATOR_ACCOUNT}))
-            .await
-            .body,
-        defaulted.body,
-        "naming the caller's account explicitly must read the same record"
-    );
-}
-
-/// A `targetId` the model's pattern does not admit is refused, and nothing is stored for
-/// it.
-#[tokio::test]
-async fn a_malformed_target_id_is_refused() {
-    // Rows span the ways a value can fall outside
-    // `^(\d{12}|o-[a-z0-9]{10}|r-[0-9a-z]{4,32})$` and its `@length(12..32)`.
-    let cases = [
-        ("eleven digits", "12345678901".to_string()),
-        ("thirteen digits", "1234567890123".to_string()),
-        ("an organization id one character short", "o-abc123456".to_string()),
-        ("an organization id with upper case", "o-ABC1234567".to_string()),
-        (
-            "a root id one character under the length floor",
-            "r-012345678".to_string(),
-        ),
-        (
-            "a root id one character over the length ceiling",
-            format!("r-{}", "a".repeat(31)),
-        ),
-        ("a root id with too few characters after the prefix", "r-abc".to_string()),
-        ("a word", "not-a-target".to_string()),
-    ];
-
-    let router = emulator();
-    for (case, target_id) in cases {
-        for (operation, answer) in [
-            (
-                "put",
-                put_configuration(&router, json!({"targetId": target_id.clone()})).await,
-            ),
-            (
-                "get",
-                get_configuration(&router, json!({"targetId": target_id.clone()})).await,
-            ),
-        ] {
-            assert_eq!(
-                answer.status, 400,
-                "case {case:?}: {operation} of {target_id:?} must be refused, got {} with {:?}",
-                answer.status, answer.body
-            );
-            assert_eq!(
-                answer.error_code(),
-                "ValidationException",
-                "case {case:?}: {operation} expected ValidationException, got {:?}",
-                answer.body
-            );
-        }
-    }
-}
-
-/// The console-authorization store is bounded: once it holds its quota of distinct
-/// targets, a put naming a NEW target is refused with a modelled error and stores
-/// nothing, while a put naming a target already stored is an update and is still served.
-///
-/// The bound is imported because the test has to know where it lies; what is asserted is
-/// the behaviour at it, not the number.
-#[tokio::test]
-async fn the_console_authorization_store_is_bounded_by_its_quota() {
-    let router = emulator();
-    // Rows are distinct 12-digit account ids, the `TargetId` form with the largest key
-    // space, so each put takes on one more target.
-    for index in 0..CONSOLE_AUTHORIZATION_TARGET_QUOTA {
-        let target_id = format!("{:012}", index + 1);
-        let answer = put_configuration(&router, json!({"targetId": target_id})).await;
-        assert_eq!(
-            answer.status, 200,
-            "target {target_id} ({index} of {CONSOLE_AUTHORIZATION_TARGET_QUOTA}) must be \
-             configured, got {} with {:?}",
-            answer.status, answer.body
-        );
-    }
-
-    // One target too many: refused, and nothing is stored for it.
-    let over = format!("{:012}", CONSOLE_AUTHORIZATION_TARGET_QUOTA + 1);
-    let refused = put_configuration(&router, json!({"targetId": over})).await;
-    assert_eq!(
-        refused.status, 429,
-        "a put naming a new target past the quota must be refused, got {} with {:?}",
-        refused.status, refused.body
-    );
-    assert_eq!(
-        refused.error_code(),
-        "TooManyRequestsError",
-        "expected TooManyRequestsError, got {:?}",
-        refused.body
-    );
-    let missing = get_configuration(&router, json!({"targetId": over})).await;
-    assert_eq!(
-        missing.status, 404,
-        "a refused put must store nothing for {over}, got {} with {:?}",
-        missing.status, missing.body
-    );
-
-    // A target the store already holds is an update: it grows nothing, so it is served.
-    for target_id in ["000000000001", "000000000100"] {
-        let updated = put_configuration(&router, json!({"targetId": target_id})).await;
-        assert_eq!(
-            updated.status, 200,
-            "updating the already configured {target_id} must be served, got {} with {:?}",
-            updated.status, updated.body
-        );
-        assert_eq!(
-            get_configuration(&router, json!({"targetId": target_id}))
-                .await
-                .body,
-            updated.body,
-            "the get of {target_id} must report what the update persisted"
+        assert_resource_not_found(
+            &format!("case {case:?}: no refused put may store a statement"),
+            &list_statements(&router, json!({})).await,
         );
     }
 }
@@ -1093,14 +765,12 @@ async fn the_console_authorization_store_is_bounded_by_its_quota() {
 /// evicted by the bound answers the 404 an unknown id earns.
 #[tokio::test]
 async fn a_delete_retry_survives_the_bound_on_the_retry_record() {
-    let router = emulator();
+    let (router, engine) = emulator();
     // More create/delete cycles than the record can hold, so the bound is exercised.
     let cycles = PERMISSION_STATEMENT_QUOTA + 5;
     let mut deleted: Vec<(String, String)> = Vec::with_capacity(cycles);
     for index in 0..cycles {
-        let statement_id = put_statement(&router, json!({"sourceIp": "192.0.2.1"}))
-            .await
-            .statement_id();
+        let statement_id = seed_statement(&engine, &json!({"sourceIp": "192.0.2.1"}));
         let token = format!("delete-{index}");
         let answer = delete_statement(
             &router,
@@ -1133,20 +803,218 @@ async fn a_delete_retry_survives_the_bound_on_the_retry_record() {
     // The oldest token was evicted to keep the record bounded, so its retry is a 404 —
     // the same answer any id the store does not hold earns.
     let (oldest_token, oldest_id) = &deleted[0];
-    let expired = delete_statement(
-        &router,
-        json!({"statementId": oldest_id, "clientToken": oldest_token}),
-    )
-    .await;
-    assert_eq!(
-        expired.status, 404,
-        "a retry under the evicted token {oldest_token:?} must answer 404, got {} with {:?}",
-        expired.status, expired.body
+    assert_resource_not_found(
+        &format!("a retry under the evicted token {oldest_token:?}"),
+        &delete_statement(
+            &router,
+            json!({"statementId": oldest_id, "clientToken": oldest_token}),
+        )
+        .await,
     );
+}
+
+/// A value outside its member's `@pattern` is refused quoting the expression the service
+/// publishes — the model's pattern WITHOUT the `^`/`$` it wraps it in to turn Smithy's
+/// find into a whole-value match.
+///
+/// Each row is `(case, route, request, member path, the pattern as the message must
+/// quote it)`. The patterns are the `@pattern` of each member as this service's Smithy
+/// model declares it, with the anchors dropped — source: `smithy_query(query="operation",
+/// operation="DeleteResourcePermissionStatement,PutResourcePermissionStatement,
+/// ListResourcePermissionStatements,GetConsoleAuthorizationConfiguration")`. The rows span
+/// several operations and every kind of pattern on this surface: an alphabet with a fixed
+/// count, a character class, an alternation, a bounded repetition and a star, so the
+/// rendering cannot be keyed to one member.
+#[tokio::test]
+async fn a_pattern_constrained_member_quotes_the_pattern_without_its_anchors() {
+    let cases: Vec<(&str, &str, Value, &str, &str)> = vec![
+        (
+            "a statement id the alphabet does not admit",
+            "/delete-resource-permission-statement",
+            json!({"statementId": "not-a-valid-sid!!"}),
+            "statementId",
+            "[A-Za-z0-9+/]{64}=?",
+        ),
+        (
+            "a client token with a space in it",
+            "/delete-resource-permission-statement",
+            json!({"statementId": "A".repeat(64), "clientToken": "bad token"}),
+            "clientToken",
+            "[!-~]+",
+        ),
+        (
+            "a VPC id that is not hexadecimal",
+            "/put-resource-permission-statement",
+            json!({"sourceVpc": "vpc-zzzzzzzz", "requestedRegion": "us-east-1"}),
+            "sourceVpc",
+            "vpc-([0-9a-f]{8}|[0-9a-f]{17})",
+        ),
+        (
+            "a VPC endpoint id in upper case",
+            "/put-resource-permission-statement",
+            json!({"consoleSourceVpce": "vpce-ABCDEFGH", "requestedRegion": "us-east-1"}),
+            "consoleSourceVpce",
+            "vpce-[a-z0-9]{8,20}",
+        ),
+        (
+            "a region in upper case",
+            "/put-resource-permission-statement",
+            json!({"requestedRegion": "US-EAST-1"}),
+            "requestedRegion",
+            r"[a-z]{2}(-[a-z]+)+-\d+",
+        ),
+        (
+            "an excluded principal that is not one of the admitted ARN forms",
+            "/put-resource-permission-statement",
+            json!({"excludedPrincipal": "arn:aws:iam::123456789012:group/Admins"}),
+            "excludedPrincipal",
+            "arn:aws:((iam::[0-9]{12}:role/[a-zA-Z0-9_+=,.@-]{1,64})|(iam::[0-9]{12}:user/[a-zA-Z0-9_+=,.@-]{1,64})|(sts::[0-9]{12}:federated-user/[a-zA-Z0-9_+=,.@-]{2,193})|(iam::[0-9]{12}:root))",
+        ),
+        (
+            "a continuation token with a character the token alphabet excludes",
+            "/list-resource-permission-statements",
+            json!({"nextToken": "not a token"}),
+            "nextToken",
+            "[-a-zA-Z0-9+=/_]*",
+        ),
+    ];
+
+    let (router, _engine) = emulator();
+    for (case, route, request, member, pattern) in cases {
+        let answer = post(&router, route, request.clone()).await;
+        assert_eq!(
+            (answer.status, answer.error_code()),
+            (400, "ValidationException"),
+            "case {case:?}: expected 400 ValidationException, got {} with {:?}",
+            answer.status,
+            answer.body
+        );
+        let value = request[member]
+            .as_str()
+            .expect("every row sends the offending member as a string");
+        let expected = format!(
+            "1 validation error detected: Value '{value}' at '{member}' failed to satisfy \
+             constraint: Member must satisfy regular expression pattern: {pattern}"
+        );
+        assert_eq!(
+            answer.message(),
+            expected,
+            "case {case:?}: expected {expected:?}, got {:?}",
+            answer.message()
+        );
+    }
+}
+
+/// A `targetId` the model's pattern does not admit is refused, and nothing is stored for
+/// it. The refusal quotes `TargetId`'s pattern unanchored, like every other
+/// pattern-constrained member.
+#[tokio::test]
+async fn a_malformed_target_id_is_refused() {
+    // `TargetId`'s own pattern, with the anchors dropped — the expression the refusal
+    // must quote (source: `smithy_query(query="shape", shape="TargetId")`).
+    const TARGET_ID_PATTERN: &str = r"(\d{12}|o-[a-z0-9]{10}|r-[0-9a-z]{4,32})";
+    // Rows span the ways a value of a length `TargetId`'s `@length(12..32)` admits can
+    // still fall outside its pattern, so the pattern is the one requirement broken and
+    // the message carries exactly one finding.
+    let cases = [
+        ("thirteen digits", "1234567890123".to_string()),
+        ("an organization id one character too long", "o-abc12345678".to_string()),
+        ("an organization id with upper case", "o-ABC1234567".to_string()),
+        ("a word", "not-a-target".to_string()),
+        ("a root id with an upper-case suffix", "r-ABCDEFGHIJ".to_string()),
+    ];
+
+    let (router, _engine) = emulator();
+    for (case, target_id) in cases {
+        for (operation, answer) in [
+            (
+                "put",
+                put_configuration(&router, json!({"targetId": target_id.clone()})).await,
+            ),
+            (
+                "get",
+                get_configuration(&router, json!({"targetId": target_id.clone()})).await,
+            ),
+        ] {
+            assert_eq!(
+                (answer.status, answer.error_code()),
+                (400, "ValidationException"),
+                "case {case:?}: {operation} of {target_id:?} must be refused, got {} with {:?}",
+                answer.status,
+                answer.body
+            );
+            assert_eq!(
+                answer.message(),
+                format!(
+                    "1 validation error detected: Value '{target_id}' at 'targetId' failed \
+                     to satisfy constraint: Member must satisfy regular expression pattern: \
+                     {TARGET_ID_PATTERN}"
+                ),
+                "case {case:?}: the {operation}'s refusal must quote TargetId's pattern \
+                 unanchored, got {:?}",
+                answer.message()
+            );
+        }
+    }
+}
+
+/// The console-authorization store is bounded: once it holds its quota of distinct
+/// targets, a put naming a NEW target is refused with a modelled error and stores
+/// nothing, while a put naming a target already configured conflicts with the state that
+/// target is in.
+///
+/// The bound is imported because the test has to know where it lies; what is asserted is
+/// the behaviour at it, not the number.
+#[tokio::test]
+async fn the_console_authorization_store_is_bounded_by_its_quota() {
+    let (router, _engine) = emulator();
+    // Rows are distinct 12-digit account ids, the `TargetId` form with the largest key
+    // space, so each put takes on one more target.
+    for index in 0..CONSOLE_AUTHORIZATION_TARGET_QUOTA {
+        let target_id = format!("{:012}", index + 1);
+        let answer = put_configuration(&router, json!({"targetId": target_id})).await;
+        assert_eq!(
+            answer.status, 200,
+            "target {target_id} ({index} of {CONSOLE_AUTHORIZATION_TARGET_QUOTA}) must be \
+             configured, got {} with {:?}",
+            answer.status, answer.body
+        );
+    }
+
+    // One target too many: refused, and nothing is stored for it.
+    let over = format!("{:012}", CONSOLE_AUTHORIZATION_TARGET_QUOTA + 1);
+    let refused = put_configuration(&router, json!({"targetId": over})).await;
     assert_eq!(
-        expired.error_code(),
-        "ResourceNotFoundException",
-        "expected ResourceNotFoundException, got {:?}",
-        expired.body
+        (refused.status, refused.error_code()),
+        (429, "TooManyRequestsError"),
+        "a put naming a new target past the quota must be refused, got {} with {:?}",
+        refused.status,
+        refused.body
     );
+    let missing = get_configuration(&router, json!({"targetId": over})).await;
+    assert_eq!(
+        missing.status, 404,
+        "a refused put must store nothing for {over}, got {} with {:?}",
+        missing.status, missing.body
+    );
+
+    // A target the store already holds is not a quota question at all: it conflicts with
+    // the state that target is already in.
+    for target_id in ["000000000001", "000000000100"] {
+        let conflicted = put_configuration(&router, json!({"targetId": target_id})).await;
+        assert_eq!(
+            (conflicted.status, conflicted.error_code()),
+            (409, "ConflictException"),
+            "a put of the already configured {target_id} must conflict, got {} with {:?}",
+            conflicted.status,
+            conflicted.body
+        );
+        assert_eq!(
+            get_configuration(&router, json!({"targetId": target_id}))
+                .await
+                .status,
+            200,
+            "the refused put must leave {target_id} configured"
+        );
+    }
 }

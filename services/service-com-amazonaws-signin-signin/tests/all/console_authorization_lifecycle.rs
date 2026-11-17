@@ -1,30 +1,73 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! The console-authorization configuration's whole lifecycle, end to end over HTTP:
+//! The console-authorization configuration's whole lifecycle, end to end over HTTP, and
+//! the two refusals that guard it.
+//!
 //! `PutConsoleAuthorizationConfiguration` enables it for a target,
 //! `GetConsoleAuthorizationConfiguration` reports what the put persisted, and
 //! `DeleteConsoleAuthorizationConfiguration` releases it — reporting that target with
 //! `consoleAuthorizationEnabled` false, after which the target is missing again.
 //!
-//! The rule under test is the one the three operations state together: the
-//! configuration of a target is exactly what the writes left there, so a delete reports
-//! the target it released as no longer enabled and every later read of that target —
-//! another get, another delete — answers `ResourceNotFoundException`. The rows differ
-//! along what the rule generalises over: which alternative of `TargetId`'s pattern the
-//! target matches (account id, organization id, organizational root id, at both
-//! published length bounds), and whether the request names a target at all.
+//! Three rules are under test here:
+//!
+//! * the configuration of a target is exactly what the writes left there, so a delete
+//!   reports the target it released as no longer enabled and every later read of that
+//!   target — another get, another delete — answers `ResourceNotFoundException` with the
+//!   fixed sentence AWS states for a configuration that is not there;
+//! * the put is a CREATE: a target whose console authorization is already enabled is a
+//!   `ConflictException`, and the conflict tracks that STATE, so the identical put is
+//!   served again once a delete has cleared it;
+//! * a target naming an AWS Organizations entity is served only to a caller authorized
+//!   for it — the management account of the organization that entity belongs to — and is
+//!   `AccessDeniedException` to anyone else, on the write and on the reads alike.
+//!
+//! The rows differ along what the rules generalise over: which alternative of
+//! `TargetId`'s pattern the target matches (account id, organization id, organizational
+//! root id, at both published length bounds), whether the request names a target at all,
+//! and which of the three operations is called.
 
 use serde_json::{json, Value};
 
-use crate::signin_harness::{post, Answer, EMULATOR_ACCOUNT};
+use crate::signin_harness::{
+    configured_targets, emulator_with_organization, post, Answer, WithOrganization,
+    EMULATOR_ACCOUNT,
+};
 
-/// The scope each form of `TargetId` implies, as `(case, targetId, scope)`.
+/// The fixed sentence AWS states for a target that has no console-authorization
+/// configuration. Spelled out here rather than imported, so the crate's own constant is
+/// what this compares against.
+const NOT_FOUND_MESSAGE: &str = "Console authorization configuration not found";
+
+/// The fixed sentence AWS states when the target is already configured.
+const ALREADY_EXISTS_MESSAGE: &str = "Configuration already exists";
+
+/// The fixed sentence AWS states for a call scoped to an organization the caller has no
+/// authority over.
+const NOT_AUTHORIZED_MESSAGE: &str = "Caller is not authorized for this organization";
+
+/// `OAuth2ErrorCode`'s member for a refusal of a resource that is not there.
+const NOT_FOUND_CODE: &str = "RESOURCE_NOT_FOUND";
+
+/// `OAuth2ErrorCode`'s member for a conflict with the current state.
+const CONFLICT_CODE: &str = "CONFLICT";
+
+/// `OAuth2ErrorCode`'s member for a caller that may not perform the operation.
+const INSUFFICIENT_PERMISSIONS_CODE: &str = "INSUFFICIENT_PERMISSIONS";
+
+/// One target the caller IS authorized for, as `(case, request, targetId, scope)`.
 ///
 /// Written from `TargetId`'s own pattern `^(\d{12}|o-[a-z0-9]{10}|r-[0-9a-z]{4,32})$` —
-/// an account id, an AWS Organizations organization id and an organizational root id —
-/// with a root id at each published bound of `TargetId`'s `@length(min: 12, max: 32)`,
-/// which is the narrower of the two constraints on a root id.
-fn target_cases() -> Vec<(&'static str, Value, String, &'static str)> {
+/// an account id, an AWS Organizations organization id and an organizational root id.
+/// The organization row is the id the Organizations control plane minted for the
+/// emulated account's own organization, read back from `with`, because an `o-` id of
+/// another organization is one this caller has no authority over.
+///
+/// A root id is absent here on purpose: `TargetId` also carries `@length(min: 12, max:
+/// 32)`, and an Organizations root id is `r-` plus the 8 characters `RootId`'s own
+/// `^r-[0-9a-z]{4,32}$` admits, so the root of the caller's organization is 10 characters
+/// and this member cannot carry it at all. The ROOT form is exercised where it IS
+/// expressible — as a foreign target, below.
+fn authorized_targets(with: &WithOrganization) -> Vec<(&'static str, Value, String, &'static str)> {
     vec![
         (
             "a 12-digit account id",
@@ -39,22 +82,31 @@ fn target_cases() -> Vec<(&'static str, Value, String, &'static str)> {
             "ACCOUNT",
         ),
         (
-            "an organization id",
-            json!({"targetId": "o-abc1234567"}),
-            "o-abc1234567".to_string(),
+            "the caller's own organization id",
+            json!({"targetId": with.organization_id.clone()}),
+            with.organization_id.clone(),
             "ORGANIZATION",
         ),
+    ]
+}
+
+/// Every `TargetId` of an Organizations form that names no entity of the caller's own
+/// organization, as `(case, targetId)`.
+///
+/// The rows span both Organizations alternatives of the pattern and, for a root id, each
+/// published bound of `TargetId`'s `@length(min: 12, max: 32)` — the narrower of the two
+/// constraints on a root id — so no row can be passing because of one id's shape.
+fn foreign_targets() -> Vec<(&'static str, String)> {
+    vec![
+        ("an organization id", "o-00000000zz".to_string()),
+        ("another organization id", "o-abc1234567".to_string()),
         (
             "a root id at the 12-character length floor",
-            json!({"targetId": "r-0123456789"}),
             "r-0123456789".to_string(),
-            "ROOT",
         ),
         (
             "a root id at the 32-character length ceiling",
-            json!({"targetId": format!("r-{}", "a".repeat(30))}),
             format!("r-{}", "a".repeat(30)),
-            "ROOT",
         ),
     ]
 }
@@ -83,35 +135,50 @@ async fn delete_configuration(
 /// The three members every one of the three operations reports, as a comparable triple.
 fn reported(answer: &Answer) -> (String, String, Option<bool>) {
     (
-        answer.body["targetId"].as_str().unwrap_or_default().to_string(),
+        answer.body["targetId"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string(),
         answer.body["scope"].as_str().unwrap_or_default().to_string(),
         answer.body["consoleAuthorizationEnabled"].as_bool(),
     )
 }
 
+/// Assert that `answer` is the 404 `ResourceNotFoundException` a missing configuration
+/// earns, worded as AWS words it.
+fn assert_not_found(case: &str, reader: &str, answer: &Answer) {
+    assert_eq!(
+        (
+            answer.status,
+            answer.error_code(),
+            answer.error_member(),
+            answer.message()
+        ),
+        (404, "ResourceNotFoundException", NOT_FOUND_CODE, NOT_FOUND_MESSAGE),
+        "case {case:?}: the {reader} of an unconfigured target must answer 404 \
+         ResourceNotFoundException / {NOT_FOUND_MESSAGE:?}, got {} with {:?}",
+        answer.status,
+        answer.body
+    );
+}
+
 #[tokio::test]
 async fn the_configuration_of_a_target_is_what_the_writes_left_there() {
-    let router = crate::signin_harness::emulator();
+    let with = emulator_with_organization();
+    let router = &with.router;
 
-    for (case, request, target_id, scope) in target_cases() {
+    for (case, request, target_id, scope) in authorized_targets(&with) {
         // Nothing is configured for this target yet, so BOTH readers report it missing —
         // the delete included, which is what makes a cleanup path able to tell "there was
         // nothing to release" from "released".
         for (reader, answer) in [
-            ("get", get_configuration(&router, request.clone()).await),
-            ("delete", delete_configuration(&router, request.clone()).await),
+            ("get", get_configuration(router, request.clone()).await),
+            ("delete", delete_configuration(router, request.clone()).await),
         ] {
-            assert_eq!(
-                (answer.status, answer.error_code()),
-                (404, "ResourceNotFoundException"),
-                "case {case:?}: an unconfigured target must answer 404 \
-                 ResourceNotFoundException to the {reader}, got {} with {:?}",
-                answer.status,
-                answer.body
-            );
+            assert_not_found(case, reader, &answer);
         }
 
-        let written = put_configuration(&router, request.clone()).await;
+        let written = put_configuration(router, request.clone()).await;
         assert_eq!(
             written.status, 200,
             "case {case:?}: a put must be accepted, got {} with {:?}",
@@ -125,7 +192,7 @@ async fn the_configuration_of_a_target_is_what_the_writes_left_there() {
         );
 
         // A request of its own observes exactly what the put persisted.
-        let read = get_configuration(&router, request.clone()).await;
+        let read = get_configuration(router, request.clone()).await;
         assert_eq!(
             (read.status, reported(&read)),
             (200, (target_id.clone(), scope.to_string(), Some(true))),
@@ -134,9 +201,35 @@ async fn the_configuration_of_a_target_is_what_the_writes_left_there() {
             read.body
         );
 
+        // The put is a create: the target is already enabled, so a second one conflicts
+        // with the state it is in and leaves that state alone.
+        let conflicted = put_configuration(router, request.clone()).await;
+        assert_eq!(
+            (
+                conflicted.status,
+                conflicted.error_code(),
+                conflicted.error_member(),
+                conflicted.message()
+            ),
+            (409, "ConflictException", CONFLICT_CODE, ALREADY_EXISTS_MESSAGE),
+            "case {case:?}: a second put must answer 409 ConflictException / \
+             {ALREADY_EXISTS_MESSAGE:?}, got {} with {:?}",
+            conflicted.status,
+            conflicted.body
+        );
+        let unchanged = get_configuration(router, request.clone()).await;
+        assert_eq!(
+            (unchanged.status, reported(&unchanged)),
+            (200, (target_id.clone(), scope.to_string(), Some(true))),
+            "case {case:?}: the refused second put must leave the configuration enabled, \
+             got {} with {:?}",
+            unchanged.status,
+            unchanged.body
+        );
+
         // The delete reports the target it released, with console authorization no
         // longer enabled — the state it just left the target in.
-        let released = delete_configuration(&router, request.clone()).await;
+        let released = delete_configuration(router, request.clone()).await;
         assert_eq!(
             (released.status, reported(&released)),
             (200, (target_id.clone(), scope.to_string(), Some(false))),
@@ -149,18 +242,23 @@ async fn the_configuration_of_a_target_is_what_the_writes_left_there() {
         // And the release really happened: the target is missing again to every reader,
         // so a repeated delete is a 404 rather than a second success.
         for (reader, answer) in [
-            ("get", get_configuration(&router, request.clone()).await),
-            ("delete", delete_configuration(&router, request.clone()).await),
+            ("get", get_configuration(router, request.clone()).await),
+            ("delete", delete_configuration(router, request.clone()).await),
         ] {
-            assert_eq!(
-                (answer.status, answer.error_code()),
-                (404, "ResourceNotFoundException"),
-                "case {case:?}: after the delete the {reader} must answer 404 \
-                 ResourceNotFoundException, got {} with {:?}",
-                answer.status,
-                answer.body
-            );
+            assert_not_found(case, reader, &answer);
         }
+
+        // The conflict tracked the enabled state, not the target: with that state
+        // cleared, the identical put is served again.
+        let again = put_configuration(router, request.clone()).await;
+        assert_eq!(
+            (again.status, reported(&again)),
+            (200, (target_id.clone(), scope.to_string(), Some(true))),
+            "case {case:?}: the identical put must be served once the delete has cleared \
+             the configuration, got {} with {:?}",
+            again.status,
+            again.body
+        );
     }
 }
 
@@ -168,11 +266,12 @@ async fn the_configuration_of_a_target_is_what_the_writes_left_there() {
 /// delete cannot be answering from anything but the per-target records.
 #[tokio::test]
 async fn a_delete_releases_only_the_target_it_names() {
-    let router = crate::signin_harness::emulator();
-    let cases = target_cases();
+    let with = emulator_with_organization();
+    let router = &with.router;
+    let cases = authorized_targets(&with);
 
     for (case, request, ..) in &cases {
-        let written = put_configuration(&router, request.clone()).await;
+        let written = put_configuration(router, request.clone()).await;
         assert_eq!(
             written.status, 200,
             "case {case:?}: a put must be accepted, got {} with {:?}",
@@ -181,7 +280,7 @@ async fn a_delete_releases_only_the_target_it_names() {
     }
 
     for (index, (case, request, target_id, scope)) in cases.iter().enumerate() {
-        let released = delete_configuration(&router, request.clone()).await;
+        let released = delete_configuration(router, request.clone()).await;
         assert_eq!(
             (released.status, reported(&released)),
             (200, (target_id.clone(), (*scope).to_string(), Some(false))),
@@ -193,7 +292,7 @@ async fn a_delete_releases_only_the_target_it_names() {
         // Every target not yet deleted is still enabled; every one already deleted is
         // still gone.
         for (other, other_request, other_target, other_scope) in &cases[index + 1..] {
-            let read = get_configuration(&router, other_request.clone()).await;
+            let read = get_configuration(router, other_request.clone()).await;
             assert_eq!(
                 (read.status, reported(&read)),
                 (
@@ -206,14 +305,140 @@ async fn a_delete_releases_only_the_target_it_names() {
             );
         }
         for (earlier, earlier_request, ..) in &cases[..=index] {
-            let read = get_configuration(&router, earlier_request.clone()).await;
+            let read = get_configuration(router, earlier_request.clone()).await;
+            assert_not_found(earlier, "get", &read);
+        }
+    }
+}
+
+/// An `o-`/`r-` target that names no entity of the caller's own organization is a target
+/// the caller has no authority over: every one of the three operations refuses it with
+/// `AccessDeniedException`, and the refused put records nothing for it.
+#[tokio::test]
+async fn an_organizations_target_the_caller_does_not_own_is_denied() {
+    let with = emulator_with_organization();
+    let router = &with.router;
+
+    for (case, target_id) in foreign_targets() {
+        let request = json!({"targetId": target_id});
+        for (operation, answer) in [
+            ("put", put_configuration(router, request.clone()).await),
+            ("get", get_configuration(router, request.clone()).await),
+            ("delete", delete_configuration(router, request.clone()).await),
+        ] {
             assert_eq!(
-                (read.status, read.error_code()),
-                (404, "ResourceNotFoundException"),
-                "case {case:?}: {earlier:?} was already released and must stay missing, \
-                 got {} with {:?}",
-                read.status,
-                read.body
+                (
+                    answer.status,
+                    answer.error_code(),
+                    answer.error_member(),
+                    answer.message()
+                ),
+                (
+                    400,
+                    "AccessDeniedException",
+                    INSUFFICIENT_PERMISSIONS_CODE,
+                    NOT_AUTHORIZED_MESSAGE
+                ),
+                "case {case:?}: the {operation} of {target_id:?} must be denied with \
+                 {NOT_AUTHORIZED_MESSAGE:?}, got {} with {:?}",
+                answer.status,
+                answer.body
+            );
+        }
+    }
+
+    assert_eq!(
+        configured_targets(&with.engine),
+        Vec::<String>::new(),
+        "a denied put must record no configuration at all"
+    );
+
+    // The caller's OWN organization is served, so the refusal above is about authority
+    // over the entity and not about the form of the id.
+    let written = put_configuration(router, json!({"targetId": with.organization_id.clone()})).await;
+    assert_eq!(
+        written.status,
+        200,
+        "the caller's own organization {:?} must be served, got {} with {:?}",
+        with.organization_id,
+        written.status,
+        written.body
+    );
+}
+
+/// With no Organizations control plane to resolve an entity through, no `o-`/`r-` target
+/// is the caller's: the authorization check fails CLOSED rather than admitting the
+/// request. An account-form target is unaffected — it names no Organizations entity.
+#[tokio::test]
+async fn an_organizations_target_is_denied_when_no_organization_is_recorded() {
+    let router = crate::signin_harness::emulator();
+
+    for (case, target_id) in foreign_targets() {
+        let answer = put_configuration(&router, json!({"targetId": target_id})).await;
+        assert_eq!(
+            (answer.status, answer.error_code(), answer.message()),
+            (400, "AccessDeniedException", NOT_AUTHORIZED_MESSAGE),
+            "case {case:?}: with no organization recorded, {target_id:?} must be denied, \
+             got {} with {:?}",
+            answer.status,
+            answer.body
+        );
+    }
+
+    let served = put_configuration(&router, json!({"targetId": EMULATOR_ACCOUNT})).await;
+    assert_eq!(
+        served.status, 200,
+        "an account-form target names no organization and must still be served, got {} \
+         with {:?}",
+        served.status,
+        served.body
+    );
+}
+
+/// The not-found refusal is worded as AWS words it: the fixed sentence in full, with no
+/// part of the request interpolated into it — whichever reader answers it, and whether
+/// the target was never configured or was configured and released.
+#[tokio::test]
+async fn a_missing_configuration_is_refused_in_aws_s_own_words() {
+    let with = emulator_with_organization();
+    let router = &with.router;
+
+    for (case, request, target_id, _) in authorized_targets(&with) {
+        // Never configured.
+        for (reader, answer) in [
+            ("get", get_configuration(router, request.clone()).await),
+            ("delete", delete_configuration(router, request.clone()).await),
+        ] {
+            assert_not_found(case, reader, &answer);
+            assert!(
+                !answer.message().contains(&target_id),
+                "case {case:?}: the {reader}'s refusal must interpolate no part of the \
+                 request, got {:?}",
+                answer.message()
+            );
+        }
+
+        // Configured and then released: the same sentence, from the same two readers.
+        assert_eq!(
+            put_configuration(router, request.clone()).await.status,
+            200,
+            "case {case:?}: a put must be accepted"
+        );
+        assert_eq!(
+            delete_configuration(router, request.clone()).await.status,
+            200,
+            "case {case:?}: the delete must be accepted"
+        );
+        for (reader, answer) in [
+            ("get", get_configuration(router, request.clone()).await),
+            ("delete", delete_configuration(router, request.clone()).await),
+        ] {
+            assert_not_found(case, reader, &answer);
+            assert!(
+                !answer.message().contains(&target_id),
+                "case {case:?}: the {reader}'s refusal after the delete must interpolate \
+                 no part of the request, got {:?}",
+                answer.message()
             );
         }
     }

@@ -6,7 +6,9 @@
 //! automatic scope detection": the request carries no state beyond the target, so the put
 //! records console authorization as ENABLED for that target and derives `scope` from the
 //! form of the `targetId` (account id, organization or organizational root). Absent a
-//! `targetId` the target is the caller's own account.
+//! `targetId` the target is the caller's own account. It is a create and not an upsert: a
+//! target already enabled is a `ConflictException`, and an AWS Organizations target the
+//! caller has no authority over is an `AccessDeniedException`.
 //!
 //! ## Shape of an operation
 //!
@@ -193,6 +195,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         };
 
+        // Authorization comes before the write: console authorization for an AWS
+        // Organizations entity is the entity's organization's to configure, so a target
+        // the caller has no authority over is denied and nothing is recorded for it.
+        if !crate::state::caller_is_authorized_for_target(&*self.engine, &target_id) {
+            return Err(
+                PutConsoleAuthorizationConfigurationErrorModeled::AccessDeniedException(
+                    crate::state::not_authorized_for_organization(),
+                )
+                .into(),
+            );
+        }
+
         let configuration = crate::state::ConsoleAuthorizationConfiguration {
             target_id,
             scope: scope.to_string(),
@@ -204,11 +218,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let key = configuration.target_id.clone();
         let mut store = state.lock();
 
+        // The put is a create, not an upsert: it conflicts with the state an already
+        // enabled target is in, which is what the model declares `ConflictException`
+        // for ("request conflicts with current state"). The conflict tracks that STATE
+        // and not the target, so the identical put is served again once
+        // `DeleteConsoleAuthorizationConfiguration` has cleared it.
+        if store
+            .console_auth_configs
+            .get(&key)
+            .is_some_and(|stored| stored.console_authorization_enabled)
+        {
+            return Err(
+                PutConsoleAuthorizationConfigurationErrorModeled::ConflictException(
+                    crate::state::configuration_already_exists(),
+                )
+                .into(),
+            );
+        }
+
         // The store is bounded by `CONSOLE_AUTHORIZATION_TARGET_QUOTA`, and this check
         // dominates the insert below: `TargetId`'s key space is effectively unlimited,
         // so a put naming a target the store does NOT already hold is refused once that
-        // many distinct targets are configured. A put naming a stored target is an
-        // update, grows nothing, and is always served.
+        // many distinct targets are configured.
         if !store.console_auth_configs.contains_key(&key)
             && store.console_auth_configs.len() >= crate::state::CONSOLE_AUTHORIZATION_TARGET_QUOTA
         {

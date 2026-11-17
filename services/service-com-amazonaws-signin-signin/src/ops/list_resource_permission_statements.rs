@@ -2,10 +2,12 @@
 
 //! @op ListResourcePermissionStatements
 //! Enumerates the stored permission statements as `PermissionStatementSummary`, in mint
-//! order, each carrying the condition keys its put supplied:
+//! order, each carrying the condition keys it was created with:
 //! `@paginated(items: permissionStatements)`, so a page is cut at `maxResults` and
 //! `nextToken` carries the statement id the next page resumes at — absent on the last
-//! page.
+//! page. An account with no SignIn resource-based policy is answered
+//! `ResourceNotFoundException` rather than a page: there is no policy to enumerate the
+//! statements of.
 //!
 //! ## Shape of an operation
 //!
@@ -188,6 +190,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .expect("a page size clamped into 1..=100 fits in usize");
 
         let store = state.lock();
+
+        // The statements this enumerates are the statements of the account's SignIn
+        // resource-based policy, so an account that has no such policy has nothing to
+        // page over: that is a MISSING resource, which the modelled
+        // `ResourceNotFoundException` is what states — never an empty page, which would
+        // make 'no policy at all' indistinguishable from 'a policy with no statements'.
+        if !store.has_resource_policy() {
+            return Err(
+                ListResourcePermissionStatementsErrorModeled::ResourceNotFoundException(
+                    crate::state::resource_not_found(),
+                )
+                .into(),
+            );
+        }
 
         // The token is the statement id the next page starts at. Its own pattern
         // `^[-a-zA-Z0-9+=/_]*$` is wider than the ids this service mints, so a token

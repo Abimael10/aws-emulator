@@ -4,7 +4,8 @@
 //! Releases the console-authorization configuration of one target: the record the put
 //! stored is removed and the operation reports that target with console authorization no
 //! longer enabled. A target nothing is stored for is reported missing, so a repeated
-//! delete answers `ResourceNotFoundException` rather than a second success.
+//! delete answers `ResourceNotFoundException` rather than a second success. An AWS
+//! Organizations target the caller has no authority over is an `AccessDeniedException`.
 //!
 //! ## Shape of an operation
 //!
@@ -187,6 +188,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
+        // Authorization comes before the release, exactly as it does on the put and the
+        // get: the configuration of an AWS Organizations entity is not the caller's to
+        // release unless the entity is its organization's.
+        if !crate::state::caller_is_authorized_for_target(&*self.engine, &target_id) {
+            return Err(
+                DeleteConsoleAuthorizationConfigurationErrorModeled::AccessDeniedException(
+                    crate::state::not_authorized_for_organization(),
+                )
+                .into(),
+            );
+        }
+
         // The release: the stored record is removed, and what this call reports is read
         // off the record it removed, with `consoleAuthorizationEnabled` false — the state
         // this call leaves the target in. A target the store does not hold is reported
@@ -195,7 +208,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(removed) = state.lock().console_auth_configs.remove(&target_id) else {
             return Err(
                 DeleteConsoleAuthorizationConfigurationErrorModeled::ResourceNotFoundException(
-                    crate::state::configuration_not_found(&target_id),
+                    crate::state::configuration_not_found(),
                 )
                 .into(),
             );

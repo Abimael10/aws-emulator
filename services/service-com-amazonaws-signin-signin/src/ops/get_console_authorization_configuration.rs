@@ -4,7 +4,8 @@
 //! Reports the console-authorization configuration
 //! `PutConsoleAuthorizationConfiguration` persisted for a target. Absent a `targetId` the
 //! target is the caller's own account; a target that was never configured is a
-//! `ResourceNotFoundException`.
+//! `ResourceNotFoundException`, and an AWS Organizations target the caller has no
+//! authority over is an `AccessDeniedException`.
 //!
 //! ## Shape of an operation
 //!
@@ -171,6 +172,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let target_id = crate::state::requested_target(input.target_id);
+        // Authorization comes before the read, exactly as it does on the write path:
+        // the configuration of an AWS Organizations entity is not the caller's to see
+        // unless the entity is its organization's.
+        if !crate::state::caller_is_authorized_for_target(&*self.engine, &target_id) {
+            return Err(
+                GetConsoleAuthorizationConfigurationErrorModeled::AccessDeniedException(
+                    crate::state::not_authorized_for_organization(),
+                )
+                .into(),
+            );
+        }
+
         // A read: the answer is whatever the put stored for this target, and a target
         // nothing was stored for is reported missing rather than defaulted.
         let Some((target_id, scope, console_authorization_enabled)) = state
@@ -181,7 +194,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         else {
             return Err(
                 GetConsoleAuthorizationConfigurationErrorModeled::ResourceNotFoundException(
-                    crate::state::configuration_not_found(&target_id),
+                    crate::state::configuration_not_found(),
                 )
                 .into(),
             );

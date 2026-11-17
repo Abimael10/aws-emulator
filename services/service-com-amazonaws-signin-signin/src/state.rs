@@ -5,10 +5,13 @@
 //! Three resources live here, and every implemented handler of this service
 //! reads and writes exactly these records:
 //!
-//! * the **resource-permission statement** — `PutResourcePermissionStatement`
-//!   mints one, `ListResourcePermissionStatements` enumerates them,
-//!   `GetResourcePolicy` renders them as the account's SignIn resource-based
-//!   policy document and `DeleteResourcePermissionStatement` removes one;
+//! * the **resource-permission statement** — a statement of the account's SignIn
+//!   resource-based policy: `ListResourcePermissionStatements` enumerates them,
+//!   `GetResourcePolicy` renders them as that policy document and
+//!   `DeleteResourcePermissionStatement` removes one.
+//!   `PutResourcePermissionStatement`, the only operation of this service that
+//!   would write one, is an action AWS grants no caller (see that handler), so it
+//!   writes nothing here;
 //! * the **console-authorization configuration** —
 //!   `PutConsoleAuthorizationConfiguration` persists one per target,
 //!   `GetConsoleAuthorizationConfiguration` reports it back and
@@ -24,8 +27,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use sha2::{Digest, Sha256};
 
 use crate::ops::types::{
-    IntrospectOAuth2TokenWithIAMOutput, PermissionStatementSummary, PolicyStatement,
-    ResourceNotFoundException, SigninResourceBasedPolicy, TooManyRequestsError, ValidationException,
+    AccessDeniedException, ConflictException, IntrospectOAuth2TokenWithIAMOutput,
+    PermissionStatementSummary, PolicyStatement, ResourceNotFoundException,
+    SigninResourceBasedPolicy, TooManyRequestsError, ValidationException,
 };
 
 /// The `Version` of the rendered `SigninResourceBasedPolicy`.
@@ -42,17 +46,14 @@ pub const POLICY_VERSION: &str = "2012-10-17";
 /// `@range(min: 1, max: 100)`.
 pub const STATEMENT_PAGE_LIMIT: i32 = 100;
 
-/// How many permission statements the store holds before
-/// `PutResourcePermissionStatement` refuses with the modelled
-/// `ServiceQuotaExceededException`.
+/// How many permission statements this emulator's store is sized for.
 ///
-/// This is the emulator's OWN bound on the store, not a claim about any
-/// account's limit: AWS bounds a resource-based policy by its document size and
-/// publishes no statement count, and this emulator models neither Service Quotas
-/// nor an account's adjustments. It is what stops the state growing without end —
-/// every record it holds is released by `DeleteResourcePermissionStatement`,
-/// which also forgets that statement's client tokens, so the token maps cannot
-/// outgrow this bound either.
+/// This is the emulator's OWN bound, not a claim about any account's limit: AWS
+/// bounds a resource-based policy by its document size and publishes no statement
+/// count, and this emulator models neither Service Quotas nor an account's
+/// adjustments. It is what keeps the state bounded: it caps the delete-retry
+/// record ([`ComAmazonawsSigninSigninState::remember_deletion`]), which mirrors the
+/// statement store, so repeated deletes cannot grow the state without end.
 pub const PERMISSION_STATEMENT_QUOTA: usize = 100;
 
 /// How many DISTINCT targets the console-authorization store holds before
@@ -62,10 +63,9 @@ pub const PERMISSION_STATEMENT_QUOTA: usize = 100;
 /// store, not a claim about any account's limit: AWS publishes no maximum number
 /// of console-authorization targets and this emulator models neither Service
 /// Quotas nor an account's adjustments. It is what stops the map growing without
-/// end, since `TargetId`'s key space is effectively unlimited: a put naming a
-/// target the store already holds is an update and always allowed, while a put
-/// naming a NEW target past this bound is refused. Every record it holds is
-/// released by `DeleteConsoleAuthorizationConfiguration`.
+/// end, since `TargetId`'s key space is effectively unlimited: a put naming a NEW
+/// target past this bound is refused. Every record it holds is released by
+/// `DeleteConsoleAuthorizationConfiguration`.
 pub const CONSOLE_AUTHORIZATION_TARGET_QUOTA: usize = 100;
 
 /// The `error` code the model documents for `ValidationException`: "Will be
@@ -75,6 +75,14 @@ pub const VALIDATION_ERROR_CODE: &str = "INVALID_REQUEST";
 /// The `error` code the model documents for `ResourceNotFoundException`: "Will be
 /// RESOURCE_NOT_FOUND".
 pub const NOT_FOUND_ERROR_CODE: &str = "RESOURCE_NOT_FOUND";
+
+/// The `error` code the model documents for `ConflictException`: "Will be CONFLICT".
+pub const CONFLICT_ERROR_CODE: &str = "CONFLICT";
+
+/// The `error` code `AccessDeniedException` carries when the caller is not permitted to
+/// perform the operation: `OAuth2ErrorCode`'s `INSUFFICIENT_PERMISSIONS`, documented
+/// "Insufficient permissions to perform this operation".
+pub const INSUFFICIENT_PERMISSIONS_ERROR_CODE: &str = "INSUFFICIENT_PERMISSIONS";
 
 /// The `error` code the model documents for `ServiceQuotaExceededException`:
 /// "Will be SERVICE_QUOTA_EXCEEDED".
@@ -287,8 +295,8 @@ pub const ROOT_SCOPE: &str = "ROOT";
 pub struct PermissionStatement {
     /// `StatementId`'s `^[A-Za-z0-9+/]{64}=?$`, minted by
     /// [`ComAmazonawsSigninSigninState::mint_statement_id`] and stored here: it
-    /// is what `PutResourcePermissionStatement` returns and what
-    /// `DeleteResourcePermissionStatement` names.
+    /// is what `ListResourcePermissionStatements` reports as a statement's `sid`
+    /// and what `DeleteResourcePermissionStatement` names.
     pub statement_id: String,
     pub source_vpc: Option<String>,
     pub signin_source_vpce: Option<String>,
@@ -542,18 +550,15 @@ pub fn inactive_token() -> IntrospectOAuth2TokenWithIAMOutput {
 /// Per-service state for com-amazonaws-signin-signin. A handler reaches it through [`service_state`].
 #[derive(Default)]
 pub struct ComAmazonawsSigninSigninState {
-    /// Every permission statement, keyed by its id. Ids are minted in a
-    /// lexicographically increasing sequence, so a `BTreeMap` holds them in
-    /// mint order — which is what gives `ListResourcePermissionStatements` the
+    /// Every permission statement, keyed by its id. Ids sort in mint order in a
+    /// `BTreeMap` — which is what gives `ListResourcePermissionStatements` the
     /// stable total order its pagination token indexes into, and
     /// `GetResourcePolicy` a deterministic document.
     pub permission_statements: BTreeMap<String, PermissionStatement>,
     /// A `PutResourcePermissionStatement` `clientToken` to the statement that
-    /// token created, so a repeated put answers with the first statement
-    /// instead of minting a second one. Bounded by the store it points into: an
-    /// entry is only written beside a newly minted statement (itself capped by
-    /// [`PERMISSION_STATEMENT_QUOTA`]) and is dropped when that statement is
-    /// deleted.
+    /// token created. Nothing writes it: `PutResourcePermissionStatement` is an
+    /// action AWS grants no caller, so no statement is ever created under a token.
+    /// It is kept because it is what a delete forgets the tokens of.
     pub statement_idempotency: HashMap<String, String>,
     /// A `DeleteResourcePermissionStatement` `clientToken` to the statement it
     /// removed, so a retried delete answers the same success rather than a 404.
@@ -635,7 +640,6 @@ impl ComAmazonawsSigninSigninState {
 
     /// True when `token` is a pagination token this service could have issued:
     /// one of the statement ids [`Self::mint_statement_id`] has already minted.
-    ///
     /// `ListResourcePermissionStatements`' `nextToken` is modelled
     /// `^[-a-zA-Z0-9+=/_]*$`, far wider than the ids this service mints, so this
     /// is what separates a token the caller got from a page of this operation
@@ -650,20 +654,31 @@ impl ComAmazonawsSigninSigninState {
                 .is_ok_and(|value| (1..=u128::from(self.statement_id_seq)).contains(&value))
     }
 
+    /// Whether the account HAS a SignIn resource-based policy at all.
+    ///
+    /// The policy is not a resource of its own on this service's surface: it is the
+    /// document the account's permission statements make up, so the account has one
+    /// exactly while at least one statement is stored. With nothing stored the policy
+    /// is MISSING, not empty, and every reader of it answers the modelled
+    /// `ResourceNotFoundException` rather than a document nothing created.
+    pub fn has_resource_policy(&self) -> bool {
+        !self.permission_statements.is_empty()
+    }
+
     /// Render the account's SignIn resource-based policy from the stored
     /// statements: one policy statement per stored permission statement, in
-    /// mint order. With nothing stored the policy carries an empty statement
-    /// list — the account has a policy, it just permits nothing extra.
-    pub fn to_policy(&self) -> SigninResourceBasedPolicy {
-        SigninResourceBasedPolicy {
-            version: Some(POLICY_VERSION.to_string()),
-            statement: Some(
-                self.permission_statements
-                    .values()
-                    .map(PermissionStatement::to_policy_statement)
-                    .collect(),
-            ),
-        }
+    /// mint order — or `None` when the account has no policy at all.
+    pub fn resource_policy(&self) -> Option<SigninResourceBasedPolicy> {
+        self.has_resource_policy()
+            .then(|| SigninResourceBasedPolicy {
+                version: Some(POLICY_VERSION.to_string()),
+                statement: Some(
+                    self.permission_statements
+                        .values()
+                        .map(PermissionStatement::to_policy_statement)
+                        .collect(),
+                ),
+            })
     }
 
     /// The token record `value` names, whatever its kind: both operations that
@@ -783,22 +798,118 @@ pub fn scope_for_target(target_id: &str) -> Option<&'static str> {
     None
 }
 
-/// The `ResourceNotFoundException` payload for a statement id that names no
-/// stored statement.
-pub fn statement_not_found(statement_id: &str) -> ResourceNotFoundException {
+/// What AWS states for a resource of the account's SignIn resource-based policy the
+/// account does not have — the policy itself, or a statement of it.
+///
+/// Fixed text in full: the sentence names the resource class and interpolates no part
+/// of the request, so the id a caller asked for is reported by the status and the error
+/// code alone.
+pub const RESOURCE_NOT_FOUND_MESSAGE: &str = "Requested resource not found";
+
+/// What AWS states for a target that has no console-authorization configuration.
+/// Fixed text in full, with no part of the request in it.
+pub const CONFIGURATION_NOT_FOUND_MESSAGE: &str = "Console authorization configuration not found";
+
+/// What AWS states when console authorization is already configured for the target a
+/// put names. Fixed text in full, with no part of the request in it.
+pub const CONFIGURATION_EXISTS_MESSAGE: &str = "Configuration already exists";
+
+/// What AWS states for a call scoped to an AWS Organizations entity the caller has no
+/// authority over. Fixed text in full, with no part of the request in it.
+pub const ORGANIZATION_NOT_AUTHORIZED_MESSAGE: &str =
+    "Caller is not authorized for this organization";
+
+/// The `ResourceNotFoundException` payload for a resource-policy resource the account
+/// does not have: the policy document itself, or a statement id that names no stored
+/// statement.
+pub fn resource_not_found() -> ResourceNotFoundException {
     ResourceNotFoundException {
         error: NOT_FOUND_ERROR_CODE.to_string(),
-        message: format!("no permission statement with statementId {statement_id}"),
+        message: RESOURCE_NOT_FOUND_MESSAGE.to_string(),
     }
 }
 
 /// The `ResourceNotFoundException` payload for a target whose console
-/// authorization was never configured.
-pub fn configuration_not_found(target_id: &str) -> ResourceNotFoundException {
+/// authorization is not configured.
+pub fn configuration_not_found() -> ResourceNotFoundException {
     ResourceNotFoundException {
         error: NOT_FOUND_ERROR_CODE.to_string(),
-        message: format!("no console authorization configuration for targetId {target_id}"),
+        message: CONFIGURATION_NOT_FOUND_MESSAGE.to_string(),
     }
+}
+
+/// The `ConflictException` payload for a put naming a target whose console
+/// authorization is already enabled: the request conflicts with the state the target is
+/// already in, which is what the model documents this error for ("request conflicts
+/// with current state").
+pub fn configuration_already_exists() -> ConflictException {
+    ConflictException {
+        error: CONFLICT_ERROR_CODE.to_string(),
+        message: CONFIGURATION_EXISTS_MESSAGE.to_string(),
+    }
+}
+
+/// The `AccessDeniedException` payload for a call scoped to an AWS Organizations entity
+/// the caller is not authorized for — see [`caller_is_authorized_for_target`].
+pub fn not_authorized_for_organization() -> AccessDeniedException {
+    AccessDeniedException {
+        error: INSUFFICIENT_PERMISSIONS_ERROR_CODE.to_string(),
+        message: ORGANIZATION_NOT_AUTHORIZED_MESSAGE.to_string(),
+    }
+}
+
+/// The `AccessDeniedException` payload for an API no caller of this service is granted:
+/// the action's own name, which is the one variable part of the sentence.
+pub fn no_access_to_api(api: &str) -> AccessDeniedException {
+    AccessDeniedException {
+        error: INSUFFICIENT_PERMISSIONS_ERROR_CODE.to_string(),
+        message: format!("No Access to {api} API"),
+    }
+}
+
+/// Whether the caller may act on the console-authorization configuration of
+/// `target_id`.
+///
+/// An AWS Organizations entity — an organization (`o-`) or an organizational root
+/// (`r-`) — belongs to exactly one organization, and console authorization for it is
+/// that organization's management account's to configure, so a target naming an entity
+/// the emulator's Organizations control plane does not record for the caller's own
+/// organization is one the caller has no authority over. A 12-digit account target
+/// names no Organizations entity and carries no such requirement.
+///
+/// Fails CLOSED: an engine that records no organization — one the Organizations control
+/// plane is not mounted on — makes no entity the caller's, and an authorization check
+/// that cannot run must not admit the request.
+///
+/// A one-directional, guard-free READ of the Organizations store: it takes that store's
+/// lock, holds no other while it does, hands back an owned decision and writes nothing,
+/// so it is called with NO guard of this service's own store held.
+pub fn caller_is_authorized_for_target<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    target_id: &str,
+) -> bool {
+    if !matches!(
+        scope_for_target(target_id),
+        Some(ORGANIZATION_SCOPE | ROOT_SCOPE)
+    ) {
+        return true;
+    }
+    let Some(organizations) =
+        ::service_com_amazonaws_organizations_awsorganizationsv20161128::state::service_state(
+            engine,
+        )
+    else {
+        return false;
+    };
+    let organizations = organizations.lock();
+    let Some(organization) = organizations
+        .organization
+        .as_ref()
+        .filter(|organization| organization.master_account_id == ::engine::emulator_account_id())
+    else {
+        return false;
+    };
+    organization.id == target_id || organizations.roots.iter().any(|root| root.id == target_id)
 }
 
 /// The `TooManyRequestsError` payload for a put that would take the
