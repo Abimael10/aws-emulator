@@ -56,6 +56,9 @@ mod saml_federation;
 #[path = "all/saml_relayed_refusal.rs"]
 mod saml_relayed_refusal;
 
+#[path = "all/saml_session_duration.rs"]
+mod saml_session_duration;
+
 #[path = "all/saml_signature_refusal_message.rs"]
 mod saml_signature_refusal_message;
 
