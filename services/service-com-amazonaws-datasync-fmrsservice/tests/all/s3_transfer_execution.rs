@@ -1844,3 +1844,298 @@ impl Aws {
         tags
     }
 }
+
+/// One source object the destination already holds with identical content, for a
+/// destination that is only partly in step with its source.
+const SYNCED_OBJECT: &[(&str, &[u8])] = &[("top.txt", b"the top level object")];
+
+/// One row of the skip-and-verify accounting table.
+struct AccountingRow {
+    case: &'static str,
+    source: &'static [(&'static str, &'static [u8])],
+    /// What the destination bucket already holds, staged by the object store itself
+    /// rather than by a transfer.
+    destination: &'static [(&'static str, &'static [u8])],
+    options: Value,
+    includes: Option<Value>,
+    /// How many source objects the task's filters admit: the set that has to partition
+    /// into the files this run transferred and the files it skipped.
+    admitted: i64,
+    files_transferred: i64,
+    files_skipped: i64,
+    files_verified: i64,
+    bytes_moved: i64,
+    /// What the destination bucket must hold once the run is over.
+    expected_destination: &'static [(&'static str, &'static [u8])],
+    /// Whether every object the destination already held must still carry the integrity
+    /// record and modification time it had before the run.
+    destination_untouched: bool,
+}
+
+/// RULE: the files a task's filters admit PARTITION into the ones an execution
+/// transferred and the ones it skipped — a file it did not have to move, because the
+/// destination already holds it identically or the task's `OverwriteMode` protects the
+/// copy there, is counted in `FilesSkipped` — and verification still covers every
+/// admitted file, skipped ones included, so a run that moved nothing reports what it
+/// compared rather than zero across the board.
+///
+/// The rows differ along what the rule generalises over: how much of the destination is
+/// already in step with the source (all of it, one key, none of it, an empty source), the
+/// two `TransferMode` values, the `OverwriteMode` that protects the destination, the
+/// `VerifyMode` that verifies nothing, and a filter that narrows the admitted set.
+#[tokio::test]
+async fn an_execution_partitions_the_files_it_admits_into_transferred_and_skipped() {
+    let rows = vec![
+        AccountingRow {
+            case: "a destination already in step with its source",
+            source: SOURCE_OBJECTS,
+            destination: SOURCE_OBJECTS,
+            options: json!({ "TransferMode": "CHANGED" }),
+            includes: None,
+            admitted: 3,
+            files_transferred: 0,
+            files_skipped: 3,
+            files_verified: 3,
+            bytes_moved: 0,
+            expected_destination: SOURCE_OBJECTS,
+            destination_untouched: true,
+        },
+        AccountingRow {
+            case: "one key already in step, the rest still to move",
+            source: SOURCE_OBJECTS,
+            destination: SYNCED_OBJECT,
+            options: json!({ "TransferMode": "CHANGED" }),
+            includes: None,
+            admitted: 3,
+            files_transferred: 2,
+            files_skipped: 1,
+            files_verified: 3,
+            bytes_moved: total_bytes(NESTED_OBJECTS),
+            expected_destination: SOURCE_OBJECTS,
+            destination_untouched: false,
+        },
+        AccountingRow {
+            case: "a destination holding different content skips nothing",
+            source: SOURCE_OBJECTS,
+            destination: STALE_OBJECTS,
+            options: json!({ "TransferMode": "CHANGED", "OverwriteMode": "ALWAYS" }),
+            includes: None,
+            admitted: 3,
+            files_transferred: 3,
+            files_skipped: 0,
+            files_verified: 3,
+            bytes_moved: total_bytes(SOURCE_OBJECTS),
+            expected_destination: SOURCE_OBJECTS,
+            destination_untouched: false,
+        },
+        AccountingRow {
+            case: "transfer all moves even what is already in step",
+            source: SOURCE_OBJECTS,
+            destination: SOURCE_OBJECTS,
+            options: json!({ "TransferMode": "ALL" }),
+            includes: None,
+            admitted: 3,
+            files_transferred: 3,
+            files_skipped: 0,
+            files_verified: 3,
+            bytes_moved: total_bytes(SOURCE_OBJECTS),
+            expected_destination: SOURCE_OBJECTS,
+            destination_untouched: false,
+        },
+        AccountingRow {
+            case: "a filter keeps what it excludes out of the accounting",
+            source: SOURCE_OBJECTS,
+            destination: SOURCE_OBJECTS,
+            options: json!({ "TransferMode": "CHANGED" }),
+            includes: Some(json!([{ "FilterType": "SIMPLE_PATTERN", "Value": "/nested" }])),
+            admitted: 2,
+            files_transferred: 0,
+            files_skipped: 2,
+            files_verified: 2,
+            bytes_moved: 0,
+            expected_destination: SOURCE_OBJECTS,
+            destination_untouched: true,
+        },
+        AccountingRow {
+            case: "the copies the overwrite mode protects are skipped and not verified",
+            source: SOURCE_OBJECTS,
+            destination: STALE_OBJECTS,
+            options: json!({
+                "TransferMode": "CHANGED",
+                "OverwriteMode": "NEVER",
+                "VerifyMode": "NONE",
+            }),
+            includes: None,
+            admitted: 3,
+            files_transferred: 0,
+            files_skipped: 3,
+            files_verified: 0,
+            bytes_moved: 0,
+            expected_destination: STALE_OBJECTS,
+            destination_untouched: true,
+        },
+        AccountingRow {
+            case: "an empty source admits nothing, so nothing is skipped",
+            source: &[],
+            destination: SOURCE_OBJECTS,
+            options: json!({ "TransferMode": "CHANGED" }),
+            includes: None,
+            admitted: 0,
+            files_transferred: 0,
+            files_skipped: 0,
+            files_verified: 0,
+            bytes_moved: 0,
+            expected_destination: SOURCE_OBJECTS,
+            destination_untouched: true,
+        },
+    ];
+
+    for row in rows {
+        let case = row.case;
+        let aws = Aws::new();
+        let (source_bucket, destination_bucket) = ("accounting-source", "accounting-destination");
+        aws.seed_bucket(source_bucket, row.source, case).await;
+        aws.seed_bucket(destination_bucket, row.destination, case)
+            .await;
+        let role_arn = aws.create_role(&[source_bucket, destination_bucket]).await;
+        let source = aws
+            .create_location(source_bucket, None, &role_arn, case)
+            .await;
+        let destination = aws
+            .create_location(destination_bucket, None, &role_arn, case)
+            .await;
+
+        let before = destination_fingerprints(&aws, destination_bucket, case).await;
+
+        let mut request = json!({
+            "SourceLocationArn": source,
+            "DestinationLocationArn": destination,
+            "Name": "accounting-task",
+            "Options": row.options,
+        });
+        if let Some(includes) = &row.includes {
+            request["Includes"] = includes.clone();
+        }
+        let created = aws.ok("CreateTask", request, case).await;
+        let task_arn = created["TaskArn"]
+            .as_str()
+            .unwrap_or_else(|| panic!("case {case:?}: expected a TaskArn, got {created}"))
+            .to_string();
+
+        let execution_arn = aws.start_execution(&task_arn, case).await;
+        let finished = aws.await_terminal(&execution_arn, case).await;
+
+        let status = finished["Status"].as_str().unwrap_or_default();
+        assert_eq!(
+            status, "SUCCESS",
+            "case {case:?}: expected the execution to end \"SUCCESS\", got {status:?} in \
+             {finished}"
+        );
+        for (counter, expected) in [
+            ("FilesTransferred", row.files_transferred),
+            ("FilesSkipped", row.files_skipped),
+            ("FilesVerified", row.files_verified),
+            ("BytesTransferred", row.bytes_moved),
+            ("BytesWritten", row.bytes_moved),
+            ("FilesDeleted", 0),
+        ] {
+            let actual = finished[counter].as_i64();
+            assert_eq!(
+                actual,
+                Some(expected),
+                "case {case:?}: expected {counter} {expected}, got {actual:?} in {finished}"
+            );
+        }
+
+        // The partition itself: every admitted file is accounted for exactly once, as a
+        // file this run moved or as one it skipped.
+        let transferred = finished["FilesTransferred"].as_i64().unwrap_or_default();
+        let skipped = finished["FilesSkipped"].as_i64().unwrap_or_default();
+        assert_eq!(
+            transferred + skipped,
+            row.admitted,
+            "case {case:?}: expected the {admitted} admitted files to partition into \
+             transferred and skipped, got {transferred} + {skipped} in {finished}",
+            admitted = row.admitted
+        );
+
+        // What the destination bucket holds is the other half of the answer: a run that
+        // reports files skipped must have left them where they were, not removed them.
+        let held = aws.bucket_contents(destination_bucket).await;
+        let mut expected: Vec<(String, Vec<u8>)> = row
+            .expected_destination
+            .iter()
+            .map(|(key, body)| ((*key).to_string(), body.to_vec()))
+            .collect();
+        expected.sort_by(|left, right| left.0.cmp(&right.0));
+        assert_eq!(
+            held.len(),
+            expected.len(),
+            "case {case:?}: expected {count} destination objects, got {keys:?}",
+            count = expected.len(),
+            keys = held.iter().map(|(key, _)| key.clone()).collect::<Vec<_>>()
+        );
+        for ((actual_key, actual_body), (expected_key, expected_body)) in
+            held.iter().zip(expected.iter())
+        {
+            assert_eq!(
+                actual_key, expected_key,
+                "case {case:?}: expected the destination to hold {expected_key:?}, got \
+                 {actual_key:?}"
+            );
+            assert_eq!(
+                String::from_utf8_lossy(actual_body),
+                String::from_utf8_lossy(expected_body),
+                "case {case:?}: wrong bytes at {actual_key:?}"
+            );
+        }
+
+        if row.destination_untouched {
+            let after = destination_fingerprints(&aws, destination_bucket, case).await;
+            assert_eq!(
+                after, before,
+                "case {case:?}: a run that moved nothing must leave every destination \
+                 object as the object store wrote it, got {after:?} where it held {before:?}"
+            );
+        }
+    }
+}
+
+/// The integrity record and modification time Amazon S3 reports for every object of
+/// `bucket`, by key: what a write into the destination would change.
+async fn destination_fingerprints(
+    aws: &Aws,
+    bucket: &str,
+    case: &str,
+) -> BTreeMap<String, (String, String)> {
+    let listed = aws
+        .s3()
+        .list_objects_v2()
+        .bucket(bucket)
+        .send()
+        .await
+        .unwrap_or_else(|error| {
+            panic!("case {case:?}: Amazon S3 must list {bucket}, got {error:?}")
+        });
+    let mut held = BTreeMap::new();
+    for object in listed.contents() {
+        let key = object.key().unwrap_or_default().to_string();
+        let head = aws
+            .s3()
+            .head_object()
+            .bucket(bucket)
+            .key(&key)
+            .send()
+            .await
+            .unwrap_or_else(|error| {
+                panic!("case {case:?}: Amazon S3 must report {key:?}, got {error:?}")
+            });
+        let etag = head.e_tag().unwrap_or_default().to_string();
+        let modified = head
+            .last_modified()
+            .map(|at| at.secs().to_string())
+            .unwrap_or_default();
+        held.insert(key, (etag, modified));
+    }
+    held
+}

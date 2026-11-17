@@ -4,8 +4,9 @@
 //!
 //! A tag is a key-value pair held BY a resource, so there is no tag store of its own:
 //! every taggable resource this service holds already carries the list a create stored
-//! ([`super::Location::tags`], [`super::Task::tags`], [`super::TaskExecution::tags`]),
-//! and `TagResource`, `UntagResource` and `ListTagsForResource` all write and read that
+//! ([`super::agents::Agent::tags`], [`super::Location::tags`], [`super::Task::tags`],
+//! [`super::TaskExecution::tags`]), and `TagResource`, `UntagResource` and
+//! `ListTagsForResource` all write and read that
 //! one list. This module owns the three things those operations have to agree on: which
 //! resource an ARN addresses, how a key already held is replaced rather than repeated,
 //! and how an ARN that resolves to no resource of this account is refused.
@@ -13,8 +14,8 @@
 //! The kinds of resource an ARN may address are the alternatives of the model's
 //! `TaggableResourceArn` pattern: an agent, a transfer task, a task execution nested
 //! under its task, a transfer location, a storage system and a discovery job nested
-//! under its system. This service stores locations, tasks and task executions, so an
-//! ARN of any other kind resolves to nothing — the service holds a resource only
+//! under its system. This service stores agents, locations, tasks and task executions, so
+//! an ARN of any other kind resolves to nothing — the service holds a resource only
 //! because a create stored it.
 
 use crate::ops::types::{InvalidRequestException, TagListEntry};
@@ -151,6 +152,7 @@ impl ComAmazonawsDatasyncFmrsserviceState {
     pub fn resource_tags(&self, arn: &str) -> Result<&[TagListEntry], TagRefusal> {
         let kind = TaggableKind::of(arn);
         let held = match kind {
+            TaggableKind::Agent => self.agents.get(arn).map(|agent| &agent.tags),
             TaggableKind::Location => self.locations.get(arn).map(|location| &location.tags),
             TaggableKind::Task => self.tasks.get(arn).map(|task| &task.tags),
             TaggableKind::TaskExecution => self
@@ -158,7 +160,7 @@ impl ComAmazonawsDatasyncFmrsserviceState {
                 .get(arn)
                 .map(|execution| &execution.tags),
             // No store holds a resource of these kinds, so no ARN of one resolves.
-            TaggableKind::Agent | TaggableKind::StorageSystem | TaggableKind::DiscoveryJob => None,
+            TaggableKind::StorageSystem | TaggableKind::DiscoveryJob => None,
         };
         held.map(Vec::as_slice)
             .ok_or_else(|| TagRefusal::not_found(kind, arn))
@@ -170,6 +172,7 @@ impl ComAmazonawsDatasyncFmrsserviceState {
     pub fn resource_tags_mut(&mut self, arn: &str) -> Result<&mut Vec<TagListEntry>, TagRefusal> {
         let kind = TaggableKind::of(arn);
         let held = match kind {
+            TaggableKind::Agent => self.agents.get_mut(arn).map(|agent| &mut agent.tags),
             TaggableKind::Location => self
                 .locations
                 .get_mut(arn)
@@ -179,7 +182,7 @@ impl ComAmazonawsDatasyncFmrsserviceState {
                 .task_executions
                 .get_mut(arn)
                 .map(|execution| &mut execution.tags),
-            TaggableKind::Agent | TaggableKind::StorageSystem | TaggableKind::DiscoveryJob => None,
+            TaggableKind::StorageSystem | TaggableKind::DiscoveryJob => None,
         };
         held.ok_or_else(|| TagRefusal::not_found(kind, arn))
     }

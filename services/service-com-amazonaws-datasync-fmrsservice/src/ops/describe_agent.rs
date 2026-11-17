@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeAgent
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeAgent`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeAgent::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the agent an `AgentArn` names, resolved through the one agent resolution of
+//! this service (`crate::state::agents`) — so an ARN no agent of this account answers to
+//! is refused here in exactly the words every other operation of the agent surface uses.
 //!
 //! ## Shape of an operation
 //!
@@ -159,18 +154,35 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeAgent` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeAgentErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeAgent"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(DescribeAgentErrorModeled::InternalException(InternalException {
+                message: Some("the DataSync emulator could not reach its state store".to_string()),
+                error_code: None,
+            })
+            .into());
+        };
+
+        // A pure read: this service holds an agent only because an activation stored it,
+        // and no transition is ever owed on one, so nothing is written here.
+        let store = state.lock();
+        let agent = store
+            .agent(&input.agent_arn)
+            .map_err(DescribeAgentErrorModeled::InvalidRequestException)?;
+
+        Ok(DescribeAgentOutput {
+            agent_arn: Some(agent.arn.clone()),
+            name: agent.name.clone(),
+            status: Some(crate::state::agents::AGENT_STATUS_ONLINE.to_string()),
+            last_connection_time: Some(crate::state::as_timestamp(agent.last_connection_time)),
+            creation_time: Some(crate::state::as_timestamp(agent.creation_time)),
+            endpoint_type: Some(agent.endpoint_type.clone()),
+            private_link_config: agent.private_link_config.clone(),
+            // `Platform` is "the platform-related details about the agent, such as the
+            // version number" of the agent SOFTWARE deployed in the caller's storage
+            // environment. No such deployment stands behind an agent this emulator
+            // activated, so it reports no version for one rather than a made-up one.
+            platform: None,
+        })
     }
 }

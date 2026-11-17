@@ -422,8 +422,9 @@ async fn prepare(callback: &EmbeddedEmulator, due: &DuePhase) -> PhaseOutcome {
     }
 
     let (source, destination) = listings(callback, due).await;
-    let selected = selected(due, &source, &destination);
-    let (writable, _protected) = partition_by_overwrite_mode(due, &selected, &destination);
+    let admitted = admitted(due, &source);
+    let selected = selected(due, &admitted, &destination);
+    let writable = writable_by_overwrite_mode(due, &selected, &destination);
     counters.estimated_files_to_transfer = writable.len() as i64;
     counters.estimated_bytes_to_transfer = writable.iter().map(|object| object.size).sum();
     counters.estimated_files_to_delete = deletable(due, &source, &destination).len() as i64;
@@ -452,9 +453,10 @@ async fn prepare(callback: &EmbeddedEmulator, due: &DuePhase) -> PhaseOutcome {
 /// (`Options$TransferMode`): the source object's content type and `x-amz-meta-*` user
 /// metadata unless the task's `ObjectMetadata` is `NONE`, its tag set unless `ObjectTags`
 /// is `NONE`, and a [`LAST_MODIFIED_METADATA_KEY`] entry either way. Every byte counter is
-/// the number of bytes that moved. An object the task's `OverwriteMode` protects is
-/// counted as skipped and not written, and a task configured not to preserve deleted files
-/// deletes the destination objects its source no longer holds.
+/// the number of bytes that moved. An admitted file this transfer did not have to move —
+/// one the destination already holds identically, or one the task's `OverwriteMode`
+/// protects — is counted as skipped and not written, and a task configured not to preserve
+/// deleted files deletes the destination objects its source no longer holds.
 async fn transfer(callback: &EmbeddedEmulator, due: &DuePhase) -> PhaseOutcome {
     let mut counters = due.counters;
     let (source, destination) = listings(callback, due).await;
@@ -463,8 +465,9 @@ async fn transfer(callback: &EmbeddedEmulator, due: &DuePhase) -> PhaseOutcome {
     else {
         return PhaseOutcome::succeeded(counters);
     };
-    let selected = selected(due, &source, &destination);
-    let (writable, skipped) = partition_by_overwrite_mode(due, &selected, &destination);
+    let admitted = admitted(due, &source);
+    let selected = selected(due, &admitted, &destination);
+    let writable = writable_by_overwrite_mode(due, &selected, &destination);
 
     // Counted here and ASSIGNED below, so what this phase records is the work of this
     // pass over the two locations rather than a running total.
@@ -474,7 +477,7 @@ async fn transfer(callback: &EmbeddedEmulator, due: &DuePhase) -> PhaseOutcome {
     let mut files_deleted = 0;
 
     let client = ::service_common::s3_client::s3_client(callback, &due.region);
-    for object in writable {
+    for object in &writable {
         let Some(read) = source_object(&client, due, source_endpoint, object).await else {
             // An object the source would not answer about is one this transfer did not
             // move, and nothing here reports bytes it did not move.
@@ -543,7 +546,16 @@ async fn transfer(callback: &EmbeddedEmulator, due: &DuePhase) -> PhaseOutcome {
         }
     }
 
-    counters.files_skipped = skipped.len() as i64;
+    // Every file the task admits that this transfer did not have to move is one it
+    // SKIPPED: the two reasons a transfer leaves an admitted file where it is are that
+    // the destination already holds it identically (what `TransferMode CHANGED` compares
+    // for) and that the task's `OverwriteMode` protects the copy already there. Both are
+    // the same thing to an observer — a file this run did not move and did not need to.
+    // A file it DID have to move is therefore not skipped, whether or not the move
+    // succeeded: an object the source would not answer about is reported as neither
+    // transferred nor skipped, for the reason the module docs give — an answer this
+    // emulator did not get establishes nothing about that file.
+    counters.files_skipped = admitted.len().saturating_sub(writable.len()) as i64;
     counters.files_transferred = files_transferred;
     counters.bytes_transferred = bytes_transferred;
     counters.bytes_written = bytes_written;
@@ -933,12 +945,13 @@ fn matches_pattern(pattern: &str, path: &str) -> bool {
 /// destination does not hold or holds with different content.
 fn selected<'a>(
     due: &DuePhase,
-    source: &'a Listing,
+    admitted: &[&'a ListedObject],
     destination: &Listing,
 ) -> Vec<&'a ListedObject> {
     let all = transfer_mode(due) == TRANSFER_MODE_ALL;
-    admitted(due, source)
-        .into_iter()
+    admitted
+        .iter()
+        .copied()
         .filter(|object| {
             all || destination
                 .get(&object.relative_key)
@@ -947,23 +960,23 @@ fn selected<'a>(
         .collect()
 }
 
-/// The selected objects split by what the task's `OverwriteMode` allows: the ones that
-/// will be written, and the ones it protects.
+/// The selected objects the task's `OverwriteMode` allows this run to write.
 ///
 /// `NEVER` "doesn't overwrite data in the destination location even if the source data
-/// has changed", so an object the destination already holds is skipped rather than
-/// written — which is also why it is not among the files the execution expects to
-/// transfer.
-fn partition_by_overwrite_mode<'a>(
+/// has changed", so an object the destination already holds is left where it is rather
+/// than written — which is also why it is not among the files the execution expects to
+/// transfer, and why the transfer step counts it as skipped.
+fn writable_by_overwrite_mode<'a>(
     due: &DuePhase,
     selected: &[&'a ListedObject],
     destination: &Listing,
-) -> (Vec<&'a ListedObject>, Vec<&'a ListedObject>) {
+) -> Vec<&'a ListedObject> {
     let never = due.options.overwrite_mode.as_deref() == Some(OVERWRITE_MODE_NEVER);
     selected
         .iter()
         .copied()
-        .partition(|object| !(never && destination.contains_key(&object.relative_key)))
+        .filter(|object| !(never && destination.contains_key(&object.relative_key)))
+        .collect()
 }
 
 /// The destination objects a task configured not to preserve deleted files removes:

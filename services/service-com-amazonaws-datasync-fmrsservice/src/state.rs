@@ -3,8 +3,12 @@
 //! Engine state for the com-amazonaws-datasync-fmrsservice service.
 //!
 //! This module owns the DataSync resources the handlers in `src/ops/` share —
-//! transfer locations, transfer tasks and task executions — plus the pieces of
-//! behaviour that cannot live in any single operation file:
+//! activated agents, transfer locations, transfer tasks and task executions — plus the
+//! pieces of behaviour that cannot live in any single operation file:
+//!
+//! * the agents this account has activated and the one resolution every operation that
+//!   names one shares ([`agents`]), so a read, a rename and a delete refuse an ARN no
+//!   agent answers to in the same words.
 //!
 //! * [`ComAmazonawsDatasyncFmrsserviceState::advance_clock`], which materialises the
 //!   transitions the clock has already made due (a task leaving `CREATING`, an
@@ -32,6 +36,7 @@
 //! Resource ids are minted from monotonic counters held here, so every ARN this
 //! service hands out is also stored here and can be resolved again.
 
+pub mod agents;
 pub mod bucket_access_role;
 pub mod listing;
 pub mod tagging;
@@ -86,7 +91,8 @@ pub const LIST_DEFAULT_PAGE_SIZE: usize = 100;
 /// [`ComAmazonawsDatasyncFmrsserviceState::at_capacity`] — rather than growing the map.
 pub const MAX_LOCATIONS: usize = 10_000;
 
-/// The ceiling on stored transfer tasks. See [`MAX_LOCATIONS`].
+/// The ceiling on stored transfer tasks. See [`MAX_LOCATIONS`]. The agent store's own
+/// ceiling is [`agents::MAX_AGENTS`].
 pub const MAX_TASKS: usize = 10_000;
 
 /// The ceiling on stored task executions. See [`MAX_LOCATIONS`]. It also bounds the
@@ -97,6 +103,7 @@ pub const MAX_TASK_EXECUTIONS: usize = 10_000;
 /// One of the per-request stores a create call grows, for asking whether it is full.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ResourceStore {
+    Agents,
     Locations,
     Tasks,
     TaskExecutions,
@@ -106,6 +113,7 @@ impl ResourceStore {
     /// How many records this store holds at most.
     const fn ceiling(self) -> usize {
         match self {
+            Self::Agents => agents::MAX_AGENTS,
             Self::Locations => MAX_LOCATIONS,
             Self::Tasks => MAX_TASKS,
             Self::TaskExecutions => MAX_TASK_EXECUTIONS,
@@ -115,6 +123,7 @@ impl ResourceStore {
     /// How a refusal names what this store holds.
     const fn resources(self) -> &'static str {
         match self {
+            Self::Agents => "agents",
             Self::Locations => "transfer locations",
             Self::Tasks => "transfer tasks",
             Self::TaskExecutions => "task executions",
@@ -683,12 +692,15 @@ impl TaskExecution {
 /// Per-service state for com-amazonaws-datasync-fmrsservice. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsDatasyncFmrsserviceState {
+    /// Activated agents by `AgentArn`.
+    pub agents: HashMap<String, agents::Agent>,
     /// Transfer locations by `LocationArn`.
     pub locations: HashMap<String, Location>,
     /// Transfer tasks by `TaskArn`.
     pub tasks: HashMap<String, Task>,
     /// Task executions by `TaskExecutionArn`.
     pub task_executions: HashMap<String, TaskExecution>,
+    next_agent_seq: u64,
     next_location_seq: u64,
     next_task_seq: u64,
     next_execution_seq: u64,
@@ -778,6 +790,7 @@ impl ComAmazonawsDatasyncFmrsserviceState {
     /// client error, so every store's ceiling is worded the same way.
     pub fn at_capacity(&self, store: ResourceStore) -> Option<String> {
         let held = match store {
+            ResourceStore::Agents => self.agents.len(),
             ResourceStore::Locations => self.locations.len(),
             ResourceStore::Tasks => self.tasks.len(),
             ResourceStore::TaskExecutions => self.task_executions.len(),

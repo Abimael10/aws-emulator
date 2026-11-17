@@ -6,10 +6,12 @@
 //! (400), so the CLASS of a refusal travels in that error's two code members — `errorCode`
 //! and `datasyncErrorCode`, always the same value — and a resource this service holds no
 //! record of has its own class per resource kind: `LocationNotFound` for a transfer
-//! location, `SyncSetNotFound` for a transfer task. The message identifies the resource the
+//! location, `SyncSetNotFound` for a transfer task, and none at all for an agent, for which
+//! this service publishes no discriminator. The message identifies the resource the
 //! way the SURFACE that raised the refusal addresses one: an operation of the task surface
 //! by the bare resource id, an operation of the location surface by the ARN the request
-//! carried. Neither names the request member that held the value.
+//! carried, an operation of the agent surface by the bare `agent-…` id and the two reasons
+//! it resolves to nothing. None of them names the request member that held the value.
 //!
 //! A refusal is about STATE, not about the shape of an ARN: a resource this service minted
 //! resolves, and the same ARN stops resolving once the resource is deleted.
@@ -360,4 +362,270 @@ async fn a_resource_resolves_until_it_is_deleted() {
         "the deleted location",
     )
     .await;
+}
+
+/// A call that must be refused as naming an agent this account does not hold: HTTP 400,
+/// the one modelled client error, the agent surface's whole message, and NO class
+/// discriminator in either code member — this service publishes none for the agent kind.
+async fn refused_as_absent_agent(
+    router: &MultiServiceRouter,
+    operation: &str,
+    body: Value,
+    agent_arn: &str,
+    case: &str,
+) {
+    let (status, parsed) = call(router, operation, body).await;
+    assert_eq!(
+        status, 400,
+        "case {case:?}: expected {operation} to answer 400, got {status} with {parsed}"
+    );
+    assert!(
+        parsed["__type"]
+            .as_str()
+            .unwrap_or_default()
+            .ends_with("InvalidRequestException"),
+        "case {case:?}: expected an InvalidRequestException from {operation}, got {parsed}"
+    );
+    assert_eq!(
+        parsed["message"].as_str(),
+        Some(
+            format!(
+                "{agent} does not exist or has been deleted.",
+                agent = resource_id(agent_arn)
+            )
+            .as_str()
+        ),
+        "case {case:?}: wrong refusal wording from {operation}, got {parsed}"
+    );
+    for member in ["errorCode", "datasyncErrorCode"] {
+        assert!(
+            parsed[member].is_null(),
+            "case {case:?}: the agent surface publishes no not-found class, so {member} \
+             must be absent from {operation}, got {parsed}"
+        );
+    }
+}
+
+/// An agent activated through `CreateAgent`, returned by ARN.
+async fn given_agent(router: &MultiServiceRouter, activation_key: &str, case: &str) -> String {
+    let created = ok(
+        router,
+        "CreateAgent",
+        json!({ "ActivationKey": activation_key, "AgentName": case }),
+        case,
+    )
+    .await;
+    created["AgentArn"]
+        .as_str()
+        .unwrap_or_else(|| panic!("case {case:?}: expected an AgentArn, got {created}"))
+        .to_string()
+}
+
+/// RULE: an operation of the AGENT surface — one whose own addressed resource is the
+/// agent — refuses an `AgentArn` this account holds no agent for with the modelled client
+/// error (400), identifying the agent by the bare `agent-…` id the request carried and
+/// stating the two reasons it resolves to nothing.
+///
+/// The rows differ along which operation of that surface was called — a read, a rename and
+/// a delete — and which unheld agent id it named, including one of another Region.
+#[tokio::test]
+async fn the_agent_surface_refuses_an_agent_it_never_activated() {
+    let router = service();
+    let absent = never_minted("agent/agent-0abcdef1234567890");
+    let other_absent = never_minted("agent/agent-1234567890abcdef0");
+    let other_region =
+        format!("arn:aws:datasync:eu-central-1:{account}:agent/agent-abcdef01234567890", account = engine::emulator_account_id());
+
+    // (case, operation, the extra members it carries, the ARN it named)
+    let rows: [(&str, &str, Value, &String); 5] = [
+        ("a read", "DescribeAgent", json!({}), &absent),
+        ("a rename", "UpdateAgent", json!({ "Name": "renamed" }), &absent),
+        ("a delete", "DeleteAgent", json!({}), &absent),
+        ("another unheld agent", "DescribeAgent", json!({}), &other_absent),
+        (
+            "an unheld agent of another Region",
+            "DescribeAgent",
+            json!({}),
+            &other_region,
+        ),
+    ];
+
+    for (case, operation, extra, arn) in rows {
+        let mut body = json!({ "AgentArn": arn });
+        if let Some(members) = extra.as_object() {
+            for (member, value) in members {
+                body[member] = value.clone();
+            }
+        }
+        refused_as_absent_agent(&router, operation, body, arn, case).await;
+    }
+}
+
+/// RULE: the agent refusal reports STATE: an agent this service activated resolves and
+/// reads back as what the activation stored, the rename it was given shows up on the next
+/// read, and the SAME ARN stops resolving — in the same words an ARN that never named an
+/// agent earns — once the delete removes it.
+///
+/// The two activations differ along what the request states: one names only its activation
+/// key, the other a name and the VPC service endpoint members, which is what decides the
+/// agent's `EndpointType` and whether it reports a `PrivateLinkConfig`.
+#[tokio::test]
+async fn an_activated_agent_resolves_until_it_is_deleted() {
+    let router = service();
+
+    // (case, the activation request, the EndpointType it earns, whether it reports a
+    // PrivateLinkConfig)
+    let rows: [(&str, Value, &str, bool); 2] = [
+        (
+            "a public activation",
+            json!({ "ActivationKey": "AAAAA-BBBBB-CCCCC-DDDDD-EEEEE", "AgentName": "first" }),
+            "PUBLIC",
+            false,
+        ),
+        (
+            "an activation over a VPC service endpoint",
+            json!({
+                "ActivationKey": "FFFFF-GGGGG-HHHHH-IIIII-JJJJJ",
+                "AgentName": "second",
+                "VpcEndpointId": "vpce-0123456789abcdef0",
+                "SubnetArns": ["arn:aws:ec2:us-west-2:000000000000:subnet/subnet-01234567"],
+                "SecurityGroupArns": [
+                    "arn:aws:ec2:us-west-2:000000000000:security-group/sg-01234567",
+                ],
+            }),
+            "PRIVATE_LINK",
+            true,
+        ),
+    ];
+
+    for (case, activation, endpoint_type, private_link) in rows {
+        let name = activation["AgentName"].as_str().unwrap_or_default().to_string();
+        let created = ok(&router, "CreateAgent", activation.clone(), case).await;
+        let agent_arn = created["AgentArn"]
+            .as_str()
+            .unwrap_or_else(|| panic!("case {case:?}: expected an AgentArn, got {created}"))
+            .to_string();
+
+        let described = ok(
+            &router,
+            "DescribeAgent",
+            json!({ "AgentArn": &agent_arn }),
+            case,
+        )
+        .await;
+        assert_eq!(
+            described["AgentArn"].as_str(),
+            Some(agent_arn.as_str()),
+            "case {case:?}: expected the agent to read back under its own ARN, got {described}"
+        );
+        assert_eq!(
+            described["Name"].as_str(),
+            Some(name.as_str()),
+            "case {case:?}: expected the stored name {name:?}, got {described}"
+        );
+        assert_eq!(
+            described["Status"].as_str(),
+            Some("ONLINE"),
+            "case {case:?}: an activated agent is ONLINE, got {described}"
+        );
+        assert_eq!(
+            described["EndpointType"].as_str(),
+            Some(endpoint_type),
+            "case {case:?}: expected EndpointType {endpoint_type:?}, got {described}"
+        );
+        assert_eq!(
+            described["PrivateLinkConfig"]["VpcEndpointId"].as_str(),
+            activation["VpcEndpointId"].as_str(),
+            "case {case:?}: expected the activation's VPC endpoint reported back, got \
+             {described}"
+        );
+        assert_eq!(
+            described["PrivateLinkConfig"].is_object(),
+            private_link,
+            "case {case:?}: expected a PrivateLinkConfig reported = {private_link}, got \
+             {described}"
+        );
+        assert!(
+            described["CreationTime"].is_number() && described["LastConnectionTime"].is_number(),
+            "case {case:?}: an activated agent reports when it was activated and last \
+             heard from, got {described}"
+        );
+
+        // A rename is what the next read reports, and it resolves the same ARN.
+        ok(
+            &router,
+            "UpdateAgent",
+            json!({ "AgentArn": &agent_arn, "Name": "renamed" }),
+            case,
+        )
+        .await;
+        let renamed = ok(
+            &router,
+            "DescribeAgent",
+            json!({ "AgentArn": &agent_arn }),
+            case,
+        )
+        .await;
+        assert_eq!(
+            renamed["Name"].as_str(),
+            Some("renamed"),
+            "case {case:?}: expected the rename to be what the read reports, got {renamed}"
+        );
+
+        // Deleting the agent is what makes the refusal due, in the agent surface's one
+        // wording — and a second delete of the same ARN is refused the same way.
+        ok(
+            &router,
+            "DeleteAgent",
+            json!({ "AgentArn": &agent_arn }),
+            case,
+        )
+        .await;
+        for operation in ["DescribeAgent", "DeleteAgent"] {
+            refused_as_absent_agent(
+                &router,
+                operation,
+                json!({ "AgentArn": &agent_arn }),
+                &agent_arn,
+                case,
+            )
+            .await;
+        }
+    }
+}
+
+/// RULE: agents are a store of their own, so one activation's agent is not another's: each
+/// ARN resolves to the agent it names, and deleting one leaves the other resolving.
+#[tokio::test]
+async fn each_activated_agent_resolves_to_its_own_record() {
+    let router = service();
+    let first = given_agent(&router, "AAAAA-BBBBB-CCCCC-DDDDD-EEEEE", "first").await;
+    let second = given_agent(&router, "KKKKK-LLLLL-MMMMM-NNNNN-OOOOO", "second").await;
+    assert_ne!(
+        first, second,
+        "case \"two activations\": each activation mints its own agent, got {first} twice"
+    );
+
+    ok(&router, "DeleteAgent", json!({ "AgentArn": &first }), "first").await;
+    refused_as_absent_agent(
+        &router,
+        "DescribeAgent",
+        json!({ "AgentArn": &first }),
+        &first,
+        "the deleted agent",
+    )
+    .await;
+    let described = ok(
+        &router,
+        "DescribeAgent",
+        json!({ "AgentArn": &second }),
+        "the agent that stayed",
+    )
+    .await;
+    assert_eq!(
+        described["AgentArn"].as_str(),
+        Some(second.as_str()),
+        "case \"the agent that stayed\": deleting one agent leaves the other resolving, \
+         got {described}"
+    );
 }
