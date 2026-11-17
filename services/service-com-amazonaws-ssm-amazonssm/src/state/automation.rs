@@ -2116,6 +2116,19 @@ pub fn unresolvable_target_key_message(key: &str) -> String {
     )
 }
 
+/// How an automation start words the refusal of a request that supplies BOTH `Targets` and
+/// `TargetMaps`, which name the targets two ways at once.
+///
+/// A FIXED sentence with no variable parts: it names the two members and nothing the
+/// caller sent, and it terminates with a period. Systems Manager words this one refusal
+/// differently per input family — an association's create and update word it as
+/// [`super::associations::TARGETS_AND_TARGET_MAPS`] — so the automation wording lives
+/// here, where both operations that take automation execution inputs
+/// (`StartAutomationExecution`, `StartExecutionPreview`) read it and so cannot word one
+/// refusal two ways.
+pub const TARGETS_AND_TARGET_MAPS_MESSAGE: &str =
+    "Targets and TargetMaps cannot both be provided.";
+
 /// Why the start's `TargetParameterName`, `Targets` and `TargetMaps` cannot hold together,
 /// or `None` when they can.
 ///
@@ -2144,7 +2157,7 @@ pub fn target_rejection(
         _ => {}
     }
     if !targets.is_empty() && target_maps > 0 {
-        return Some("Targets and TargetMaps can't both be specified".to_string());
+        return Some(TARGETS_AND_TARGET_MAPS_MESSAGE.to_string());
     }
     let name = target_parameter_name?;
     let declares = declared
