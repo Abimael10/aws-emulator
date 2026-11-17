@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetCalendarState
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetCalendarState`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Report the state of one or more Change Calendar documents at an instant — a READ of this
+//! service's document slice, which writes nothing of its own. This is the ONLY file to
+//! touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetCalendarState::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Each name the request states is resolved by the one lookup every document read uses
+//! ([`crate::state::ComAmazonawsSsmAmazonssmState::resolve_document_for_request`]), so a
+//! calendar is reached by name or by ARN through the endpoint the request was signed for; a
+//! name no document is held under is `InvalidDocument` and a document of another type is
+//! `InvalidDocumentType`. The state itself is worked out from the iCalendar entry that
+//! document's default version persisted ([`crate::state::change_calendar`]), so what a
+//! create or an update of the calendar wrote is what this read reports.
 //!
 //! ## Shape of an operation
 //!
@@ -163,18 +165,122 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetCalendarState` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetCalendarStateErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetCalendarState"))
+        use crate::state::change_calendar;
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            GetCalendarStateErrorModeled::InternalServerError(InternalServerError {
+                message: Some("the document store is unavailable".to_string()),
+            })
+        })?;
+
+        // `CalendarNames` is required, so the walk has already refused a request that
+        // states none at all; a request that states an EMPTY list names no calendar whose
+        // state could be reported, which is a bad request rather than a vacuous OPEN.
+        if input.calendar_names.is_empty() {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                "1 validation error detected: Value '[]' at 'calendarNames' failed to satisfy \
+                 constraint: Member must have length greater than or equal to 1",
+            ));
+        }
+        // The request states the list of calendars, so the work one call asks for grows
+        // with it; past the emulator's own bound the read is refused rather than served
+        // slowly. Named as the emulator's, the way this crate's other total guards are.
+        if input.calendar_names.len() > change_calendar::MAX_CALENDARS_PER_READ {
+            return Err(crate::scaffolded::Scaffolded::validation(format!(
+                "This emulator reads at most {} calendars in one request; the request names {}",
+                change_calendar::MAX_CALENDARS_PER_READ,
+                input.calendar_names.len()
+            )));
+        }
+
+        let now = ::std::time::SystemTime::now();
+        // "If you don't specify a value or AtTime, the current time is used."
+        let (at, at_time) = match change_calendar::requested_instant(input.at_time.as_deref(), now)
+        {
+            Ok(instant) => instant,
+            Err(why) => return Err(crate::scaffolded::Scaffolded::validation(why)),
+        };
+
+        // Each name is resolved the way EVERY document read resolves one — by name or by
+        // ARN, through the endpoint the request was signed for — so a calendar a caller
+        // created here is reached by either spelling and a name no document is held under
+        // names no calendar. The content read is the document's DEFAULT version, the one a
+        // read that names no version resolves to.
+        let region = crate::state::request_region(ctx.parts());
+        // The occurrences every calendar of THIS read may be expanded to come out of one
+        // budget, so the work a read asks for is bounded across the calendars it names
+        // rather than per calendar.
+        let mut budget = change_calendar::OccurrenceBudget::for_one_read();
+        let mut views = Vec::with_capacity(input.calendar_names.len());
+        for name in &input.calendar_names {
+            // The occurrence walk below is the work this read does, and it is bounded
+            // rather than long; yielding once per calendar still leaves the runtime an
+            // await point between them, so a health check, a timeout or a shutdown lands
+            // while a read of many calendars is in flight.
+            ::tokio::task::yield_now().await;
+            let record = {
+                let mut store = state.lock();
+                store.resolve_document_for_request(name, &region, now)
+            };
+            let Some(record) = record else {
+                return Err(GetCalendarStateErrorModeled::InvalidDocument(
+                    InvalidDocument {
+                        message: Some(change_calendar::calendar_not_found_message(name)),
+                    },
+                )
+                .into());
+            };
+            // "The names or Amazon Resource Names (ARNs) of the Change Calendar type
+            // documents" — a document of any other type holds no calendar entry at all, so
+            // this refusal says that a document of the name DOES exist and that its type is
+            // not the calendar type.
+            if record.document_type != change_calendar::CHANGE_CALENDAR_DOCUMENT_TYPE {
+                return Err(GetCalendarStateErrorModeled::InvalidDocumentType(
+                    InvalidDocumentType {
+                        message: Some(change_calendar::not_a_calendar_message(name)),
+                    },
+                )
+                .into());
+            }
+            let Some(version) = record.select(crate::state::DOCUMENT_VERSION_DEFAULT) else {
+                return Err(GetCalendarStateErrorModeled::InternalServerError(
+                    InternalServerError {
+                        message: Some("the calendar document holds no version".to_string()),
+                    },
+                )
+                .into());
+            };
+            // The entry itself, and the spans its events cover around the instant asked
+            // about. A calendar entry this service does not read — or one that names more
+            // occurrences than a read walks — is refused rather than answered from part of
+            // it, since a partial expansion reports a state the calendar does not have.
+            let unsupported = |why: String| {
+                GetCalendarStateErrorModeled::UnsupportedCalendarException(
+                    UnsupportedCalendarException {
+                        message: Some(format!(
+                            "The calendar entry contained in SSM document {} isn't supported: \
+                             {why}",
+                            record.name
+                        )),
+                    },
+                )
+            };
+            let calendar =
+                change_calendar::parse_calendar(&version.content).map_err(unsupported)?;
+            views.push(calendar.view(at, &mut budget).map_err(unsupported)?);
+        }
+
+        // "If you specify more than one calendar in a request, the command returns the
+        // status of OPEN only if all calendars in the request are open."
+        let report = change_calendar::state_at(&views, at);
+        Ok(GetCalendarStateOutput {
+            state: Some(change_calendar::calendar_state_name(report.open).to_string()),
+            at_time: Some(at_time),
+            // "The time … that the calendar state will change": a calendar nothing
+            // changes within the search horizon reports none.
+            next_transition_time: report
+                .next_transition
+                .map(change_calendar::rendered_instant),
+        })
     }
 }

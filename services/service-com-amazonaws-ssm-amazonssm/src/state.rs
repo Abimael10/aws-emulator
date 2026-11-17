@@ -196,6 +196,10 @@ pub mod cloud_connectors;
 /// Rendering a persisted document's content in the `DocumentFormat` a read asks for.
 pub mod document_format;
 
+/// The Change Calendar entry a document of that type carries, and the state it leaves a
+/// calendar in at one instant.
+pub mod change_calendar;
+
 /// Which operating-system platforms a document's own content leaves it compatible with.
 pub mod document_platforms;
 

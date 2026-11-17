@@ -93,6 +93,15 @@ roxmltree = "0.20"
 # An awsQuery request's parameters are a form body, so each one is percent-encoded the way
 # an AWS SDK sends it and the SigV4 canonical request assumes.
 percent-encoding = "2"
+# A Change Calendar document's content is an iCalendar (RFC 5545) entry, so `GetCalendarState`
+# reads it with this maintained iCalendar reader — line unfolding, parameters and escaping
+# included — rather than with a hand-written one.
+icalendar = "0.17"
+# The RRULE of a recurring calendar entry, expanded by the maintained RFC 5545 recurrence
+# implementation rather than by a hand-written one.
+rrule = "0.14"
+# An entry's `DURATION` is an ISO-8601 duration, read by the maintained ISO-8601 reader.
+iso8601 = "0.6"
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

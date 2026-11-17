@@ -5130,6 +5130,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "icalendar"
+version = "0.17.17"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2fe2f2ca4a82ec12ebd129ca664030add9b80d17a2b79ce885884fefb1c650e6"
+dependencies = [
+ "chrono",
+ "iso8601",
+ "nom 8.0.0",
+ "nom-language",
+ "uuid",
+]
+
+[[package]]
 name = "ice_code"
 version = "0.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5501,6 +5514,15 @@ name = "is_terminal_polyfill"
 version = "1.70.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a6cb138bb79a146c1bd460005623e142ef0181e3d0219cb493e02f7d08a35695"
+
+[[package]]
+name = "iso8601"
+version = "0.6.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4ffd3254cf2b0fc53e38414bdba99719f3e269db8a6519731b68a3a90040c41b"
+dependencies = [
+ "nom 8.0.0",
+]
 
 [[package]]
 name = "iso8601-duration"
@@ -6631,6 +6653,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "df9761775871bdef83bee530e60050f7e54b1105350d6884eb0fb4f46c2f9405"
 dependencies = [
  "memchr",
+]
+
+[[package]]
+name = "nom-language"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2de2bc5b451bfedaef92c90b8939a8fff5770bdcc1fafd6239d086aab8fa6b29"
+dependencies = [
+ "nom 8.0.0",
 ]
 
 [[package]]
@@ -8244,6 +8275,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cee271d0eeba64f0915b846cb7ae02e16faf3dfdffdca91731101d9d30fe3423"
 dependencies = [
  "cc",
+]
+
+[[package]]
+name = "rrule"
+version = "0.14.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "720acfb4980b9d8a6a430f6d7a11933e701ebbeba5eee39cc9d8c5f932aaff74"
+dependencies = [
+ "chrono",
+ "chrono-tz",
+ "log",
+ "regex",
+ "thiserror 2.0.21",
 ]
 
 [[package]]
@@ -20641,9 +20685,12 @@ dependencies = [
  "cron",
  "hex",
  "http",
+ "icalendar",
+ "iso8601",
  "percent-encoding",
  "regex",
  "roxmltree",
+ "rrule",
  "serde_json",
  "service-com-amazonaws-ec2-amazonec2",
  "service-com-amazonaws-iam-awsidentitymanagementv20100508",
