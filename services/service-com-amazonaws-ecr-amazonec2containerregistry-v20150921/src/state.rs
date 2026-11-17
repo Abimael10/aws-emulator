@@ -1353,11 +1353,11 @@ impl PreviewedImage {
     }
 }
 
-/// How an `imageIds` entry reads in a message ABOUT AN IMAGE THE LOOKUP RESOLVED: ECR
-/// renders the requested `ImageIdentifier` with both members spelled out and an absent one
-/// as `null`, so a caller sees the entry exactly as it sent it. A message about a lookup
-/// that resolved NOTHING renders the identifier that resolution leaves instead
-/// ([`unresolved_identifier_description`]).
+/// How an `imageIds` entry reads in a message: ECR renders the requested
+/// `ImageIdentifier` with both members spelled out and an absent one as `null`, so a
+/// caller sees the entry exactly as it sent it — whether or not the lookup resolved
+/// anything, because the identifier a refusal states is what the request addressed the
+/// image by and nothing of the registry's own.
 ///
 /// The public-registry service renders it identically
 /// (`service-com-amazonaws-ecrpublic-spencerfrontendservice`'s
@@ -1383,40 +1383,8 @@ pub fn identifier_members(id: &ImageIdentifier) -> String {
     )
 }
 
-/// How an `imageIds` entry reads in a message whose lookup RESOLVED NO IMAGE: the
-/// identifier the failed resolution leaves, which is not the one the request sent.
-///
-/// A resolution that found nothing clears the TAG it was looking for, so the tag reads as
-/// unset whether or not the request carried one; and an identifier whose digest the
-/// request did not carry reads it as the unset `sha256` digest
-/// ([`UNSET_IMAGE_DIGEST`]) rather than as absent, because the digest is what the
-/// resolution ends up addressing the image by. A digest the request DID carry is the one
-/// it carried: that lookup had a digest, the repository simply holds no image under it.
-///
-/// Every operation that refuses with `ImageNotFoundException` renders the identifier
-/// through this one function ([`Repo::resolve_image`] is where they all word it), so the
-/// echo cannot differ between them. A lookup that DID resolve a tag — one whose tag names
-/// another stored image — keeps [`identifier_description`]'s echo of the request: nothing
-/// cleared that tag.
-pub fn unresolved_identifier_description(id: &ImageIdentifier) -> String {
-    format!(
-        "imageId {}",
-        identifier_members_of(
-            id.image_digest.as_deref().unwrap_or(UNSET_IMAGE_DIGEST),
-            UNSET_IDENTIFIER_MEMBER,
-        )
-    )
-}
-
 /// How a member of a rendered `ImageIdentifier` reads when it holds no value.
 const UNSET_IDENTIFIER_MEMBER: &str = "null";
-
-/// How the DIGEST of a rendered `ImageIdentifier` reads when the identifier holds none:
-/// the algorithm this registry addresses content with ([`content_digest`]) over an
-/// all-zero digest value — 64 zero hex digits, the width a `sha256` digest has — which is
-/// what an unset fixed-width digest renders as.
-const UNSET_IMAGE_DIGEST: &str =
-    "sha256:0000000000000000000000000000000000000000000000000000000000000000";
 
 /// The brace expression itself, the one place its spelling is written: both members of an
 /// `ImageIdentifier` named and quoted, in the order the shape declares them.
@@ -2352,18 +2320,18 @@ impl Repo {
                  '{}' must be of the form <algorithm>:<hex digest>",
                 id.image_digest.as_deref().unwrap_or_default()
             ))),
-            // Nothing resolved, so the identifier the refusal echoes is the one the
-            // failed resolution leaves rather than the request's entry; see
-            // [`unresolved_identifier_description`].
+            // Nothing resolved, so there is no stored image to read an identifier off:
+            // the refusal echoes the request's own entry, which is the only identifier
+            // the call named the image by.
             Err(ImageLookupFailure::ImageNotFound) => Err(Fault::ImageNotFound(
                 not_within_repository(
-                    &format!("image with {}", unresolved_identifier_description(id)),
+                    &format!("image with {}", identifier_description(id)),
                     &self.name,
                     &self.registry_id,
                 ),
             )),
-            // The tag DID resolve — to another stored image — so nothing cleared it, and
-            // the identifier reads as the request sent it.
+            // The two halves disagree — the tag names another stored image — and the
+            // identifier reads as the request sent it, as every other refusal's does.
             Err(ImageLookupFailure::ImageTagDoesNotMatchDigest) => Err(Fault::ImageNotFound(
                 not_within_repository(
                     &format!("image with {}", identifier_description(id)),

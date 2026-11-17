@@ -13,8 +13,8 @@
 //!    against and the registry, then the verdict;
 //! 2. a resource HELD INSIDE a repository that the registry does not hold is reported
 //!    `within` that repository, whatever kind of resource it is — and for an IMAGE the
-//!    `imageId` it states is the identifier the failed resolution leaves, not the entry
-//!    the request sent;
+//!    `imageId` it states is the entry the request sent, both members spelled out and an
+//!    absent one as `null`;
 //! 3. a continuation token this listing never minted is stated in the
 //!    parameter-and-constraint form, naming the parameter's API label, and does not echo
 //!    the token;
@@ -24,6 +24,10 @@
 //!    polices for that value class;
 //! 6. a replication destination that IS the source registry states the constraint, with
 //!    no value from the request.
+//!
+//! Class 2 is carried by three suites: the frame itself, the `imageId` echo in a repository
+//! holding no image, and the same echo in one holding stored, tagged images, where an
+//! identifier read off the store would differ from the request's entry.
 //!
 //! Each suite is a TABLE whose rows differ along what its rule generalises over — the
 //! verdict and the operation, the kind of resource and how it was addressed, the shape of
@@ -36,6 +40,7 @@
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
+use crate::image_storage_class_identification::given_tagged_image;
 use crate::wire::{
     call, call_in_region, emulator, given_layer, layer_digest, ok, refused, REGION, REGISTRY_ID,
 };
@@ -48,16 +53,12 @@ const INVALID_PARAMETER: &str = "InvalidParameterException";
 /// this registry never issued, so it passes the boundary and resolves to nothing.
 const UNISSUED_UPLOAD_ID: &str = "3b9f1c7a-6d42-4e18-8b05-7c2a9f4d6e13";
 
-/// A well-formed `LayerDigest` nothing was ever pushed under. Not the all-zero digest:
-/// that is the digest a refusal renders for an identifier carrying NONE
-/// ([`UNSET_IMAGE_DIGEST`]), so a row sending it would not show whose digest was echoed.
+/// A well-formed `LayerDigest` nothing was ever pushed under.
 const UNSTORED_DIGEST: &str =
     "sha256:1c7f3e5a9b2d48061f3a7c5e9d2b4860af13c7e592b4d80617a3c5e9d2b48061";
 
-/// The digest a refusal renders for an identifier that carries NONE: `sha256:` followed
-/// by 64 zero hex digits, the width a `sha256` digest has.
-const UNSET_IMAGE_DIGEST: &str =
-    "sha256:0000000000000000000000000000000000000000000000000000000000000000";
+/// How a member of a rendered identifier reads when the request carried none.
+const UNSET_MEMBER: &str = "null";
 
 /// A second well-formed digest nothing was pushed under, so the digest a refusal states
 /// cannot be one value this suite happens to use everywhere.
@@ -249,8 +250,8 @@ async fn an_upload_refusal_names_the_upload_the_repository_and_the_registry() {
 /// whether the resource exists elsewhere in the registry. The reported instance is the
 /// first row.
 ///
-/// What an IMAGE refusal names the identifier as is the next suite's rule: the identifier
-/// the failed resolution leaves, not the request's entry.
+/// What an IMAGE refusal names the identifier as is the next suite's rule: the entry the
+/// request sent.
 #[tokio::test]
 async fn a_resource_missing_inside_a_repository_is_reported_within_it() {
     let router = emulator();
@@ -292,7 +293,7 @@ async fn a_resource_missing_inside_a_repository_is_reported_within_it() {
             "DescribeImages",
             json!({"repositoryName": "within-mine", "imageIds": [{"imageTag": "absent"}]}),
             "ImageNotFoundException",
-            format!("image with imageId {{imageDigest:'{UNSET_IMAGE_DIGEST}', imageTag:'null'}}"),
+            format!("image with imageId {{imageDigest:'{UNSET_MEMBER}', imageTag:'absent'}}"),
         ),
         (
             "an image addressed by both",
@@ -302,7 +303,7 @@ async fn a_resource_missing_inside_a_repository_is_reported_within_it() {
                 "imageIds": [{"imageDigest": UNSTORED_DIGEST, "imageTag": "absent"}],
             }),
             "ImageNotFoundException",
-            format!("image with imageId {{imageDigest:'{UNSTORED_DIGEST}', imageTag:'null'}}"),
+            format!("image with imageId {{imageDigest:'{UNSTORED_DIGEST}', imageTag:'absent'}}"),
         ),
     ];
 
@@ -352,10 +353,10 @@ fn image_lookups(repository: &str, id: &Value) -> Vec<(&'static str, Value)> {
     ]
 }
 
-/// The `imageId` an image-not-found refusal states is the identifier the FAILED RESOLUTION
-/// leaves, not the entry the request sent: a tag that matched no image is cleared and
-/// reads `null`, and an identifier the request gave no digest reads the unset `sha256`
-/// digest.
+/// The `imageId` an image-not-found refusal states is the entry the REQUEST sent, with
+/// both members spelled out and a member the request did not carry rendered as `null`: a
+/// refusal addresses the image the way the call named it, and a failed resolution has no
+/// stored identifier to report instead.
 ///
 /// The rows differ along what the rule generalises over: which members the identifier
 /// carries (a tag alone, a digest alone, both), the shape of the tag (the shortest and the
@@ -364,7 +365,7 @@ fn image_lookups(repository: &str, id: &Value) -> Vec<(&'static str, Value)> {
 /// the rule belongs to the resolution rather than to one operation. The reported instance
 /// is a tag-only lookup on `DescribeImages`.
 #[tokio::test]
-async fn an_image_refusal_states_the_identifier_the_resolution_leaves() {
+async fn an_image_refusal_states_the_identifier_the_request_sent() {
     // `ImageTag` is `@length(1..300)` (`smithy_query(query="shape", shape="ImageTag")`),
     // so a tag of one character and one of 300 are both well formed and reach the lookup.
     let longest_tag = "t".repeat(300);
@@ -375,44 +376,44 @@ async fn an_image_refusal_states_the_identifier_the_resolution_leaves() {
         (
             "a tag nothing carries",
             json!({"imageTag": "latest"}),
-            UNSET_IMAGE_DIGEST,
-            "null",
+            UNSET_MEMBER,
+            "latest",
         ),
         (
             "the shortest tag the model admits",
             json!({"imageTag": "a"}),
-            UNSET_IMAGE_DIGEST,
-            "null",
+            UNSET_MEMBER,
+            "a",
         ),
         (
             "the longest tag the model admits",
             json!({"imageTag": longest_tag.clone()}),
-            UNSET_IMAGE_DIGEST,
-            "null",
+            UNSET_MEMBER,
+            longest_tag.as_str(),
         ),
         (
             "a tag carrying separators",
             json!({"imageTag": "release-1.2_3"}),
-            UNSET_IMAGE_DIGEST,
-            "null",
+            UNSET_MEMBER,
+            "release-1.2_3",
         ),
         (
             "a digest nothing was pushed under",
             json!({"imageDigest": UNSTORED_DIGEST}),
             UNSTORED_DIGEST,
-            "null",
+            UNSET_MEMBER,
         ),
         (
             "another digest nothing was pushed under",
             json!({"imageDigest": OTHER_UNSTORED_DIGEST}),
             OTHER_UNSTORED_DIGEST,
-            "null",
+            UNSET_MEMBER,
         ),
         (
             "a digest and a tag, neither of which resolves",
             json!({"imageDigest": UNSTORED_DIGEST, "imageTag": "absent"}),
             UNSTORED_DIGEST,
-            "null",
+            "absent",
         ),
     ];
 
@@ -435,6 +436,175 @@ async fn an_image_refusal_states_the_identifier_the_resolution_leaves() {
             )
             .await;
         }
+    }
+}
+
+/// The same rule in a repository that HOLDS stored, tagged images: the identifier a refusal
+/// states is still the request's entry, even where half of it resolves — a stored digest
+/// whose tag nothing carries, a stored digest carrying another image's tag, an unstored
+/// digest beside a tag that does resolve. These are the cases where an identifier read off
+/// the store would differ from the one the request sent.
+///
+/// The rows differ along which member resolves and which does not, and along which of the two
+/// stored images each half names, crossed with every operation that resolves an identifier.
+/// The admitted side closes the table: the identifiers the stored images really carry still
+/// resolve, so each refusal is about the entry its row sent.
+#[tokio::test]
+async fn an_image_refusal_echoes_the_request_in_a_repository_holding_images() {
+    let repository = "resolution-populated";
+    let router = emulator();
+    given_repository(&router, "the populated repository", repository).await;
+    let live = given_tagged_image(&router, "the first stored image", repository, "live", "live").await;
+    let other =
+        given_tagged_image(&router, "the second stored image", repository, "other", "other").await;
+
+    // (case, the identifier sent, the digest the refusal must state, the tag it must state)
+    let rows: Vec<(&str, Value, &str, &str)> = vec![
+        (
+            "a stored digest with a tag nothing carries",
+            json!({"imageDigest": live.clone(), "imageTag": "never-pushed"}),
+            live.as_str(),
+            "never-pushed",
+        ),
+        (
+            "a stored digest with another stored image's tag",
+            json!({"imageDigest": live.clone(), "imageTag": "other"}),
+            live.as_str(),
+            "other",
+        ),
+        (
+            "an unstored digest with a stored tag",
+            json!({"imageDigest": UNSTORED_DIGEST, "imageTag": "live"}),
+            UNSTORED_DIGEST,
+            "live",
+        ),
+        (
+            "the second image's digest with the first one's tag",
+            json!({"imageDigest": other.clone(), "imageTag": "live"}),
+            other.as_str(),
+            "live",
+        ),
+        (
+            "a tag nothing carries, in a repository that holds images",
+            json!({"imageTag": "never-pushed"}),
+            UNSET_MEMBER,
+            "never-pushed",
+        ),
+    ];
+
+    for (case, id, digest, tag) in rows {
+        for (operation, request) in image_lookups(repository, &id) {
+            let case = format!("{case} on {operation}");
+            let expected = not_within_sentence(
+                &format!("image with imageId {{imageDigest:'{digest}', imageTag:'{tag}'}}"),
+                repository,
+            );
+            assert_refusal(
+                &router,
+                &case,
+                operation,
+                &request,
+                "ImageNotFoundException",
+                &expected,
+            )
+            .await;
+        }
+    }
+
+    // The admitted side: every identifier a stored image really carries resolves to it, read
+    // back through the operation that reports an image's details.
+    for (case, id, digest) in [
+        ("the first image by tag", json!({"imageTag": "live"}), &live),
+        (
+            "the first image by digest",
+            json!({"imageDigest": live.clone()}),
+            &live,
+        ),
+        (
+            "the second image by digest and tag",
+            json!({"imageDigest": other.clone(), "imageTag": "other"}),
+            &other,
+        ),
+    ] {
+        let answer = ok(
+            &router,
+            case,
+            "DescribeImages",
+            &json!({"repositoryName": repository, "imageIds": [id]}),
+        )
+        .await;
+        let reported = answer
+            .pointer("/imageDetails/0/imageDigest")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        assert_eq!(
+            reported, digest,
+            "case {case:?}: expected the stored image {digest:?} to resolve, got {answer:?}"
+        );
+    }
+}
+
+/// The identifier a refusal echoed is the one that RESOLVES once an image carries it: the
+/// same request, unchanged, is refused while nothing carries the tag and reports the stored
+/// image afterwards — while another tag the push did not attach is still refused, echoed as
+/// it was sent.
+///
+/// The rows differ along the spelling of the tag the request asks by, which the rule does not
+/// depend on.
+#[tokio::test]
+async fn the_echoed_identifier_resolves_once_an_image_carries_it() {
+    for (index, tag) in ["pending", "v1.2_3-rc", "z"].iter().enumerate() {
+        let repository = format!("resolution-round-trip-{index:02}");
+        let router = emulator();
+        given_repository(&router, tag, &repository).await;
+        let request = json!({"repositoryName": repository, "imageIds": [{"imageTag": tag}]});
+
+        assert_refusal(
+            &router,
+            &format!("before the push, by {tag:?}"),
+            "DescribeImages",
+            &request,
+            "ImageNotFoundException",
+            &not_within_sentence(
+                &format!("image with imageId {{imageDigest:'{UNSET_MEMBER}', imageTag:'{tag}'}}"),
+                &repository,
+            ),
+        )
+        .await;
+
+        let digest = given_tagged_image(&router, tag, &repository, tag, tag).await;
+        let answer = ok(
+            &router,
+            &format!("after the push, by {tag:?}"),
+            "DescribeImages",
+            &request,
+        )
+        .await;
+        let reported = answer
+            .pointer("/imageDetails/0/imageDigest")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        assert_eq!(
+            reported, digest,
+            "case {tag:?}: expected the echoed identifier to resolve after the push, got \
+             {answer:?}"
+        );
+
+        let absent = format!("{tag}-absent");
+        assert_refusal(
+            &router,
+            &format!("another tag after the push, by {absent:?}"),
+            "DescribeImages",
+            &json!({"repositoryName": repository, "imageIds": [{"imageTag": absent}]}),
+            "ImageNotFoundException",
+            &not_within_sentence(
+                &format!(
+                    "image with imageId {{imageDigest:'{UNSET_MEMBER}', imageTag:'{absent}'}}"
+                ),
+                &repository,
+            ),
+        )
+        .await;
     }
 }
 

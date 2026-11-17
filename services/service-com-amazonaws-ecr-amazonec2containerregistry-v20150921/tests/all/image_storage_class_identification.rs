@@ -34,7 +34,10 @@ const STANDARD: &str = "STANDARD";
 /// Push one image carrying `tag` into `repository`, answering the digest the registry
 /// addresses it by. `salt` gives each image of a suite its own blob, so no two images of a
 /// case collide on a digest.
-async fn given_tagged_image(
+///
+/// `pub(crate)` so the sibling suite that needs a repository holding real images pushes them
+/// through this one sequence rather than a second copy of it.
+pub(crate) async fn given_tagged_image(
     router: &MultiServiceRouter,
     case: &str,
     repository: &str,
@@ -98,21 +101,14 @@ fn image_id(digest: Option<&str>, tag: Option<&str>) -> Value {
 
 /// A well-formed content digest nothing in the repository was pushed under: the
 /// `sha256:<64 hex>` form a registry addresses a blob by, so it is the IDENTIFIER that
-/// misses and not the digest's form. Not the all-zero digest: that is what a refusal
-/// renders for an identifier carrying NO digest ([`UNSET_IMAGE_DIGEST`]), so a request
-/// sending it would not show whose digest was echoed.
+/// misses and not the digest's form.
 const UNSTORED_DIGEST: &str =
     "sha256:1c7f3e5a9b2d48061f3a7c5e9d2b4860af13c7e592b4d80617a3c5e9d2b48061";
 
-/// The digest a refusal renders for an identifier that carries NONE: `sha256:` followed
-/// by 64 zero hex digits, the width a `sha256` digest has.
-const UNSET_IMAGE_DIGEST: &str =
-    "sha256:0000000000000000000000000000000000000000000000000000000000000000";
-
 /// The wording ECR refuses an unresolvable `imageId` with, spelled out here rather than
 /// imported so a wrong message in the implementation fails this test. `digest` and `tag`
-/// are rendered as the message states them, so each row states the identifier the failed
-/// resolution leaves rather than the one it sent.
+/// are rendered as the message states them, so each row states the identifier the request
+/// sent.
 fn image_not_found_message(repository: &str, digest: &str, tag: &str) -> String {
     format!(
         "The image with imageId {{imageDigest:'{digest}', imageTag:'{tag}'}} does not exist \
@@ -121,7 +117,7 @@ fn image_not_found_message(repository: &str, digest: &str, tag: &str) -> String 
     )
 }
 
-/// How a member of a rendered identifier reads when the resolution left it unset.
+/// How a member of a rendered identifier reads when the request carried none.
 const UNSET_MEMBER: &str = "null";
 
 /// Every form an `imageId` may take lands on the same stored image, and the answer reports
@@ -343,9 +339,8 @@ async fn an_unresolvable_request_is_refused_and_changes_nothing() {
                 "targetStorageClass": ARCHIVE,
             }),
             "ImageNotFoundException",
-            // Nothing resolved: the tag that matched no image is cleared, and the
-            // identifier had no digest of its own to report.
-            image_not_found_message(repository, UNSET_IMAGE_DIGEST, UNSET_MEMBER),
+            // The tag the request carried, with the digest it never had left unset.
+            image_not_found_message(repository, UNSET_MEMBER, absent_tag),
         ),
         (
             "digest and tag naming different images",
@@ -355,7 +350,7 @@ async fn an_unresolvable_request_is_refused_and_changes_nothing() {
                 "targetStorageClass": ARCHIVE,
             }),
             "ImageNotFoundException",
-            // The tag DID resolve, to the other stored image, so nothing cleared it.
+            // Both halves as the request sent them: the tag names the other stored image.
             image_not_found_message(repository, &digest, other_tag),
         ),
         (

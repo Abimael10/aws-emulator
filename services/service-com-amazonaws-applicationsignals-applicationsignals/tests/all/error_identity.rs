@@ -7,11 +7,11 @@
 //! 1. An error about a service level objective that cannot be RESOLVED identifies it by its
 //!    ARN, and reports the resource's capitalised type name — never the bare name the
 //!    request happened to send and never the lower-case segment an ARN spells.
-//! 2. A create refused because the name it sent is already stored identifies NOTHING: the
-//!    fixed sentence of that error class carries neither the name the request sent nor the
-//!    ARN of the record that holds it, and it is the same sentence whatever the refused
-//!    request looks like and wherever it was signed. The record it conflicts with stays
-//!    addressable by the ARN the create that won returned.
+//! 2. A create refused because the name it sent is already stored identifies the STORED
+//!    record: the sentence of that error class states that record's own ARN, read off the
+//!    record rather than minted from the refused request, so it is the same sentence
+//!    whatever the refused request looks like and wherever it was signed. The record it
+//!    conflicts with stays addressable by that ARN, which the create that won returned.
 //! 3. A constraint-violation message states the member path and the requirement it
 //!    violated, in AWS's `N validation error(s) detected: ` envelope, with no echo of the
 //!    rejected value and with a `@pattern` requirement rendered without the `^`/`$` anchors
@@ -32,9 +32,9 @@ use crate::slo_lifecycle::{
 // owns that rule.
 use crate::refusal_wording::assert_work_item_wording;
 // The sentence a create whose name is already stored is refused with, and the assertion that
-// it identifies nothing: owned by the suite that holds this service's refusal prose and
+// it names the stored record: owned by the suite that holds this service's refusal prose and
 // applied here to this suite's rows too, so the two cannot drift.
-use crate::refusal_prose::assert_identifies_nothing;
+use crate::refusal_prose::assert_names_the_stored_slo;
 
 /// The `ResourceType` every SLO failure reports: the resource's type NAME, capitalised.
 const SLO_RESOURCE_TYPE: &str = "Slo";
@@ -156,15 +156,15 @@ async fn a_missing_slo_is_identified_by_its_arn_on_every_read_write_and_delete()
     }
 }
 
-/// Rule 2: a create under a name already stored is refused with the fixed sentence of that
-/// error class, which identifies nothing — while the record it conflicts with stays
-/// addressable by the ARN the create that won returned.
+/// Rule 2: a create under a name already stored is refused with the sentence of that error
+/// class, which identifies the stored record by its ARN — the same ARN the create that won
+/// returned, by which that record stays addressable.
 ///
 /// The rows differ along the name's form and along the rest of the repeated request, which
 /// the wording must not depend on: a different description, the other (mutually
 /// exclusive) SLI config, a goal and burn rates the stored record does not carry.
 #[tokio::test]
-async fn a_repeated_create_conflicts_without_identifying_the_stored_slo() {
+async fn a_repeated_create_conflicts_and_identifies_the_stored_slo() {
     // Name forms drawn from the modelled `ServiceLevelObjectiveName` pattern
     // `^[0-9A-Za-z][-._0-9A-Za-z ]{0,126}[0-9A-Za-z]$`, including its shortest spelling and
     // one of its maximum length.
@@ -218,16 +218,12 @@ async fn a_repeated_create_conflicts_without_identifying_the_stored_slo() {
                 "case {name:?}/{index}: expected a ConflictException, got {error}"
             );
             let message = error["Message"].as_str().unwrap_or_default();
-            assert_identifies_nothing(
-                &format!("{name:?}/{index}"),
-                message,
-                &[name, stored_arn.as_str(), "arn:", ACCOUNT, REGION],
-            );
+            assert_names_the_stored_slo(&format!("{name:?}/{index}"), message, &stored_arn);
         }
 
         // The ARN the winning create returned addresses the record the store really holds: a
         // Get by that ARN answers the SLO under this name, so the identifier the refused
-        // caller does NOT read is still the resource's.
+        // caller read is the resource's own.
         let (status, fetched) =
             call(&router, "GET", &format!("/slo/{}", arn_path_segment(name)), None).await;
         assert_eq!(
@@ -281,8 +277,8 @@ async fn create_signed_in(
 }
 
 /// Rule 2, the other half: the sentence does not depend on the refused request at all — a
-/// duplicate create signed in another region reads the identical fixed sentence, and it names
-/// no ARN, neither the stored record's nor one this request's own credential scope would mint.
+/// duplicate create signed in another region reads the identical sentence, naming the STORED
+/// record's ARN rather than the one this request's own credential scope would mint.
 ///
 /// The rows differ along the region the duplicate create is signed in, including the region
 /// the stored record itself carries, and along the name's form.
@@ -325,11 +321,16 @@ async fn a_conflict_sentence_does_not_depend_on_the_refused_request() {
                  {error}"
             );
             let message = error["Message"].as_str().unwrap_or_default();
-            assert_identifies_nothing(
-                &label,
-                message,
-                &[name, stored_arn.as_str(), "arn:", region, ACCOUNT],
-            );
+            assert_names_the_stored_slo(&label, message, &stored_arn);
+            // The ARN is the STORED record's, so a region this request was signed in but the
+            // record does not carry is nowhere in the sentence.
+            if region != REGION {
+                assert!(
+                    !message.contains(region),
+                    "case {label}: expected the stored record's ARN, which carries no \
+                     {region:?}, got {message:?}"
+                );
+            }
         }
     }
 }
