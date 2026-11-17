@@ -1158,33 +1158,59 @@ pub const MAX_NEXT_TOKEN: usize = 16384;
 /// list identity a pagination cursor is minted against: a cursor names an element of ONE
 /// list, so it must not be accepted for a list selected by a different filter.
 ///
+/// What names the list is the SELECTION, not the request's spelling of it. The sources are
+/// applied as a SET — a registration is selected when its source is one of those named —
+/// so two requests naming the same sources in another order, or naming one of them twice,
+/// select exactly the same list and must render alike: hence the canonical set below.
+///
 /// Every component is LENGTH-PREFIXED, so no two different selections can render to the
 /// same signature.
 pub fn source_filter_signature(sources: &[String]) -> String {
-    length_prefixed(sources.iter().cloned())
+    length_prefixed(canonical_set(sources.iter().cloned()))
 }
 
 /// The same rendering for a `FilterList` selection, so the `Filters`-driven lists get
 /// cursors that name an element of the list THAT selection produced.
 ///
-/// Each filter contributes its name, its operator and its values, every component
-/// length-prefixed, closed by the number of values it carried — so neither a different
-/// grouping of the same components nor a different operator can render the same
-/// signature.
+/// Each filter is rendered as the selection it MEANS rather than as the request spelled
+/// it, the way [`filter_selects`] applies it: an absent `Operator` renders as the equality
+/// it stands for ([`OPERATOR_EQUAL`]), and the `Values` render as the set they are
+/// compared as (`Values` is `uniqueItems` in the model, and every operator compares the
+/// values held against the values named without regard to their order). The filters
+/// themselves are a set too, because [`filters_select`] selects what satisfies every one
+/// of them, whatever their order and however often one of them is repeated.
+///
+/// Every component is LENGTH-PREFIXED, each filter's own rendering included — which is
+/// what closes one filter against the next — so no two different selections can render to
+/// the same signature.
 pub fn filter_signature(filters: &[Filter]) -> String {
-    let mut signature = String::new();
-    for filter in filters {
-        signature.push_str(&length_prefixed(
-            [
-                filter.name.clone().unwrap_or_default(),
-                filter.operator.clone().unwrap_or_default(),
-            ]
-            .into_iter()
-            .chain(filter.values.clone().unwrap_or_default()),
-        ));
-        signature.push_str(&format!("/{}", filter.values.as_ref().map_or(0, Vec::len)));
-    }
-    signature
+    length_prefixed(canonical_set(filters.iter().map(canonical_filter)))
+}
+
+/// One filter rendered as the selection it means: the member its `Name` addresses, the
+/// comparison it asks for (the default one when it names none) and the set of values it
+/// compares against.
+fn canonical_filter(filter: &Filter) -> String {
+    length_prefixed(
+        [
+            filter.name.clone().unwrap_or_default(),
+            filter
+                .operator
+                .clone()
+                .unwrap_or_else(|| OPERATOR_EQUAL.to_string()),
+        ]
+        .into_iter()
+        .chain(canonical_set(filter.values.clone().unwrap_or_default())),
+    )
+}
+
+/// `components` as the SET they are applied as: ordered, with a repeat dropped, so any two
+/// spellings of one set render identically.
+fn canonical_set(components: impl IntoIterator<Item = String>) -> Vec<String> {
+    let mut canonical: Vec<String> = components.into_iter().collect();
+    canonical.sort();
+    canonical.dedup();
+    canonical
 }
 
 /// Render `components` so that no two different sequences render alike: each is prefixed

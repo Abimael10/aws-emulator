@@ -8,6 +8,12 @@
 //!   it has the shape, the size and the framing of a minted one — names no position and is
 //!   refused with a `ValidationException`, while the cursor a page handed out resumes the
 //!   walk after the element that page reported last.
+//! * the list a cursor belongs to is the SELECTION the request means, not the spelling it
+//!   arrived in: two requests that select the same elements by the same comparisons — an
+//!   absent `Filter$Operator` and the equality it stands for, a set of values or of
+//!   filters or of sources in another order or with a repeat, an absent and an empty
+//!   selection — continue ONE walk, while a request meaning another selection is refused
+//!   the cursor.
 //!
 //! All three paged lists of this service share ONE cursor path
 //! (`crate::state::paginate`), so each row below drives it through a different one of them:
@@ -357,5 +363,238 @@ async fn a_cursor_the_listing_did_not_mint_is_refused_by_every_paged_list() {
             "case {case:?}: expected the page to resume after {element:?}, got {:?}",
             reported[0]
         );
+    }
+}
+
+/// The paged list labelled `label`, from [`LISTINGS`].
+fn listing(label: &str) -> &'static Listing {
+    LISTINGS
+        .iter()
+        .find(|listing| listing.label == label)
+        .unwrap_or_else(|| panic!("{label} is one of this service's paged lists"))
+}
+
+/// One page of `listing` under `selection` — the selection members (`Filters`, or
+/// `SubscriptionProviderSources`) exactly as a request spells them — with `max_results` as
+/// the page size and `token` as the continuation.
+async fn select(
+    h: &Harness,
+    listing: &Listing,
+    selection: &Value,
+    max_results: Option<i32>,
+    token: Option<&str>,
+) -> Reply {
+    let mut body = selection.clone();
+    if let Some(max_results) = max_results {
+        body["MaxResults"] = json!(max_results);
+    }
+    if let Some(token) = token {
+        body["NextToken"] = json!(token);
+    }
+    call(h, listing.path, &body).await
+}
+
+/// Pairs of requests spelling ONE selection two ways: what the row varies, the list it
+/// drives, and the two spellings' selection members.
+///
+/// The rows span what the equivalence generalises over: the default comparison spelled out
+/// or left absent, the order of a set of values, the order of a set of filters, a repeat of
+/// a component of a set, and an absent selection against an empty one — each on a list that
+/// selects on `Filters` and, where it applies, on the one that selects on
+/// `SubscriptionProviderSources`.
+fn one_selection_two_spellings() -> Vec<(&'static str, &'static Listing, Value, Value)> {
+    let instances = listing("ListLinuxSubscriptionInstances");
+    let subscriptions = listing("ListLinuxSubscriptions");
+    let providers = listing("ListRegisteredSubscriptionProviders");
+    vec![
+        (
+            "an absent Operator and the Equal it means",
+            instances,
+            json!({ "Filters": [{ "Name": "Status", "Values": ["running"] }] }),
+            json!({ "Filters": [{ "Name": "Status", "Values": ["running"], "Operator": "Equal" }] }),
+        ),
+        (
+            "the Values of an Equal filter in another order",
+            instances,
+            json!({ "Filters": [{ "Name": "InstanceID", "Values": ["i-0a1", "i-0b2", "i-0c3"], "Operator": "Equal" }] }),
+            json!({ "Filters": [{ "Name": "InstanceID", "Values": ["i-0c3", "i-0a1", "i-0b2"], "Operator": "Equal" }] }),
+        ),
+        (
+            "the Values of a Contains filter in another order",
+            instances,
+            json!({ "Filters": [{ "Name": "Region", "Values": ["us-west", "eu-"], "Operator": "Contains" }] }),
+            json!({ "Filters": [{ "Name": "Region", "Values": ["eu-", "us-west"], "Operator": "Contains" }] }),
+        ),
+        (
+            "two filters in another order",
+            instances,
+            json!({ "Filters": [
+                { "Name": "Status", "Values": ["running"] },
+                { "Name": "AccountID", "Values": ["000000000000"] },
+            ] }),
+            json!({ "Filters": [
+                { "Name": "AccountID", "Values": ["000000000000"] },
+                { "Name": "Status", "Values": ["running"] },
+            ] }),
+        ),
+        (
+            "one filter named once and twice",
+            instances,
+            json!({ "Filters": [{ "Name": "Status", "Values": ["running"] }] }),
+            json!({ "Filters": [
+                { "Name": "Status", "Values": ["running"] },
+                { "Name": "Status", "Values": ["running"] },
+            ] }),
+        ),
+        (
+            "an absent Filters and an empty one",
+            instances,
+            json!({}),
+            json!({ "Filters": [] }),
+        ),
+        (
+            "an absent Operator and the Equal it means",
+            subscriptions,
+            json!({ "Filters": [{ "Name": "Subscription", "Values": ["RHEL", "Ubuntu Pro"] }] }),
+            json!({ "Filters": [{ "Name": "Subscription", "Values": ["RHEL", "Ubuntu Pro"], "Operator": "Equal" }] }),
+        ),
+        (
+            "the Values of an Equal filter in another order",
+            subscriptions,
+            json!({ "Filters": [{ "Name": "Subscription", "Values": ["RHEL", "Ubuntu Pro"], "Operator": "Equal" }] }),
+            json!({ "Filters": [{ "Name": "Subscription", "Values": ["Ubuntu Pro", "RHEL"], "Operator": "Equal" }] }),
+        ),
+        (
+            "one source named once and twice",
+            providers,
+            json!({ "SubscriptionProviderSources": ["RedHat"] }),
+            json!({ "SubscriptionProviderSources": ["RedHat", "RedHat"] }),
+        ),
+        (
+            "an absent source list and an empty one",
+            providers,
+            json!({}),
+            json!({ "SubscriptionProviderSources": [] }),
+        ),
+    ]
+}
+
+#[tokio::test]
+async fn one_walk_continues_whichever_way_its_selection_is_spelled() {
+    let h = seeded().await;
+
+    for (variation, listing, one, other) in one_selection_two_spellings() {
+        let case = &format!("{}: {variation}", listing.label);
+
+        // What makes the two spellings one list: each selects the same elements, in the
+        // same order, so a cursor naming a position in one names a position in the other.
+        let whole = reported(&select(&h, listing, &one, None, None).await, listing, case);
+        let whole_other = reported(
+            &select(&h, listing, &other, None, None).await,
+            listing,
+            case,
+        );
+        assert_eq!(
+            whole, whole_other,
+            "case {case:?}: the two spellings must select the same list, got {whole:?} and \
+             {whole_other:?}"
+        );
+        assert!(
+            whole.len() >= 2,
+            "case {case:?}: a row has to select at least two elements for a page size of \
+             one to truncate, got {whole:?}"
+        );
+
+        // The walk, with the spelling ALTERNATING from page to page: every cursor is
+        // minted under one spelling and sent back under the other, in both directions, and
+        // the walk still reports the selected list exactly once, in order.
+        let mut spellings = [&one, &other].into_iter().cycle();
+        let mut walked: Vec<String> = Vec::new();
+        let mut token: Option<String> = None;
+        loop {
+            let selection = spellings.next().expect("the spellings cycle is endless");
+            let reply = select(&h, listing, selection, Some(1), token.as_deref()).await;
+            walked.extend(reported(&reply, listing, case));
+            token = next_token(&reply, case);
+            assert!(
+                walked.len() <= whole.len(),
+                "case {case:?}: the walk did not terminate, reported {walked:?} of {whole:?}"
+            );
+            if token.is_none() {
+                break;
+            }
+        }
+        assert_eq!(
+            walked, whole,
+            "case {case:?}: the alternating walk must report the selected list exactly \
+             once, in order, expected {whole:?}, got {walked:?}"
+        );
+    }
+}
+
+/// Pairs of requests meaning two DIFFERENT selections: what the row varies, the list it
+/// drives, and the two selections — the second selecting other elements than the first, so
+/// a cursor naming a position in one names no position in the other.
+fn two_selections() -> Vec<(&'static str, &'static Listing, Value, Value)> {
+    let instances = listing("ListLinuxSubscriptionInstances");
+    let subscriptions = listing("ListLinuxSubscriptions");
+    vec![
+        (
+            "the same values compared with another Operator",
+            instances,
+            json!({ "Filters": [{ "Name": "Status", "Values": ["running"] }] }),
+            json!({ "Filters": [{ "Name": "Status", "Values": ["running"], "Operator": "NotEqual" }] }),
+        ),
+        (
+            "Contains against the Equal of the same value",
+            instances,
+            json!({ "Filters": [{ "Name": "Region", "Values": ["us-west"], "Operator": "Contains" }] }),
+            json!({ "Filters": [{ "Name": "Region", "Values": ["us-west"], "Operator": "Equal" }] }),
+        ),
+        (
+            "another member addressed",
+            instances,
+            json!({ "Filters": [{ "Name": "Status", "Values": ["running"] }] }),
+            json!({ "Filters": [{ "Name": "InstanceID", "Values": ["i-0a1"] }] }),
+        ),
+        (
+            "another set of values",
+            subscriptions,
+            json!({ "Filters": [{ "Name": "Subscription", "Values": ["RHEL", "Ubuntu Pro"] }] }),
+            json!({ "Filters": [{ "Name": "Subscription", "Values": ["SUSE Linux Enterprise Server"] }] }),
+        ),
+    ]
+}
+
+#[tokio::test]
+async fn a_cursor_is_refused_by_a_request_meaning_another_selection() {
+    let h = seeded().await;
+
+    for (variation, listing, one, other) in two_selections() {
+        let case = &format!("{}: {variation}", listing.label);
+
+        // What makes them two lists: they report different elements.
+        let whole = reported(&select(&h, listing, &one, None, None).await, listing, case);
+        let whole_other = reported(
+            &select(&h, listing, &other, None, None).await,
+            listing,
+            case,
+        );
+        assert_ne!(
+            whole, whole_other,
+            "case {case:?}: the two selections must report different lists, both reported \
+             {whole:?}"
+        );
+
+        let first = select(&h, listing, &one, Some(1), None).await;
+        let token = next_token(&first, case).unwrap_or_else(|| {
+            panic!(
+                "case {case:?}: expected a NextToken on a truncated page, got {:?}",
+                first.body
+            )
+        });
+        select(&h, listing, &other, Some(1), Some(&token))
+            .await
+            .error(case, 400, "ValidationException");
     }
 }
