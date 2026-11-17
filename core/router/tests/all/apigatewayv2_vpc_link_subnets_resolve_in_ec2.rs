@@ -42,12 +42,12 @@ const REGION: &str = "us-west-2";
 const EC2_API_VERSION: &str = "2016-11-15";
 
 /// The collection URI `CreateVpcLink` is bound to (`POST /v2/vpclinks`).
-const VPC_LINKS: &str = "/v2/vpclinks";
+pub(crate) const VPC_LINKS: &str = "/v2/vpclinks";
 
 /// One emulator carrying Amazon EC2 and API Gateway v2 over ONE shared engine, as the
 /// production router mounts them, plus the engine itself so a case can assert on what a
 /// refused create did NOT write.
-fn emulator() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
+pub(crate) fn emulator() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
@@ -70,14 +70,14 @@ fn authorization(signing_name: &str) -> String {
 }
 
 /// One answer: its HTTP status and its body as JSON (`Value::Null` when it is not JSON).
-struct Reply {
-    status: u16,
-    body: Value,
+pub(crate) struct Reply {
+    pub(crate) status: u16,
+    pub(crate) body: Value,
 }
 
 impl Reply {
     /// The wire error code (`__type` of the restJson1 error envelope), or `""` on success.
-    fn error_code(&self) -> &str {
+    pub(crate) fn error_code(&self) -> &str {
         self.body
             .get("__type")
             .and_then(Value::as_str)
@@ -85,7 +85,7 @@ impl Reply {
     }
 
     /// The error envelope's message, or `""` when there is none.
-    fn message(&self) -> &str {
+    pub(crate) fn message(&self) -> &str {
         self.body
             .get("message")
             .and_then(Value::as_str)
@@ -94,7 +94,7 @@ impl Reply {
 }
 
 /// Call one API Gateway v2 operation over its restJson1 wire.
-async fn apigateway(
+pub(crate) async fn apigateway(
     router: &MultiServiceRouter,
     method: &str,
     uri: &str,
@@ -145,13 +145,13 @@ async fn ec2(router: &MultiServiceRouter, action: &str, params: &[(&str, &str)])
 }
 
 /// One VPC of the account with the subnets EC2 minted in it.
-struct Vpc {
-    id: String,
-    subnets: Vec<String>,
+pub(crate) struct Vpc {
+    pub(crate) id: String,
+    pub(crate) subnets: Vec<String>,
 }
 
 /// Create one VPC carrying one subnet per entry of `zones`, through EC2's own operations.
-async fn ec2_vpc(router: &MultiServiceRouter, second_octet: u8, zones: &[&str]) -> Vpc {
+pub(crate) async fn ec2_vpc(router: &MultiServiceRouter, second_octet: u8, zones: &[&str]) -> Vpc {
     let cidr = format!("10.{second_octet}.0.0/16");
     let id = element(&ec2(router, "CreateVpc", &[("CidrBlock", &cidr)]).await, "vpcId");
     let mut subnets = Vec::new();
@@ -175,7 +175,7 @@ async fn ec2_vpc(router: &MultiServiceRouter, second_octet: u8, zones: &[&str]) 
 }
 
 /// A `CreateVpcLink` body naming `subnets`.
-fn create_body(name: &str, subnets: &[String]) -> Value {
+pub(crate) fn create_body(name: &str, subnets: &[String]) -> Value {
     json!({ "name": name, "subnetIds": subnets })
 }
 
@@ -189,7 +189,7 @@ fn stored_links(engine: &engine::InMemoryEngine) -> usize {
 }
 
 /// Values that name no subnet of the account, in both of EC2's published id forms.
-fn unresolvable_subnet_ids() -> Vec<(&'static str, String)> {
+pub(crate) fn unresolvable_subnet_ids() -> Vec<(&'static str, String)> {
     vec![
         (
             "EC2's 17-hex id form",
