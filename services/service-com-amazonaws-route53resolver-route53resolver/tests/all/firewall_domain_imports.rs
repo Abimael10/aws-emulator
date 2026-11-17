@@ -37,7 +37,7 @@ use service_com_amazonaws_route53resolver_route53resolver::state::{
 use service_com_amazonaws_s3_amazons3::state::{service_state as s3_state, Object};
 use smithy_server_runtime::MultiServiceRouter;
 
-use super::harness::{call, error_type, ok, string_member, REGION};
+use super::harness::{call, call_in_region, error_type, ok, string_member, REGION};
 
 /// The bucket every case below stores its domain file in, held by the account
 /// in [`REGION`] — "the file must be in an S3 bucket that's in the same Region
@@ -190,42 +190,6 @@ pub(crate) async fn settle(router: &MultiServiceRouter, id: &str, case: &str) {
         );
         tokio::time::sleep(POLL_INTERVAL).await;
     }
-}
-
-/// Call one operation with a credential scope naming `region`, and return
-/// `(http status, parsed body)` — the Region is what roots this service's ARNs
-/// and what the download failure names, so a case that varies it signs for it.
-async fn call_in_region(
-    router: &MultiServiceRouter,
-    region: &str,
-    operation: &str,
-    body: Value,
-) -> (u16, Value) {
-    let request = http::Request::builder()
-        .method("POST")
-        .uri("/")
-        .header("content-type", "application/x-amz-json-1.1")
-        .header("x-amz-target", format!("Route53Resolver.{operation}"))
-        .header(
-            "authorization",
-            format!(
-                "AWS4-HMAC-SHA256 Credential=AKIDTESTONLY/20261021/{region}/route53resolver/aws4_request, \
-                 SignedHeaders=host;x-amz-date, Signature=not-verified-in-this-test"
-            ),
-        )
-        .body(bytes::Bytes::from(
-            serde_json::to_vec(&body).expect("the request body serializes"),
-        ))
-        .expect("a well-formed request");
-
-    let response = router.dispatch(request).await;
-    let status = response.status().as_u16();
-    let parsed = if response.body().is_empty() {
-        Value::Null
-    } else {
-        serde_json::from_slice(response.body()).unwrap_or(Value::Null)
-    };
-    (status, parsed)
 }
 
 /// Start one import that must be accepted, and assert it reports the step an

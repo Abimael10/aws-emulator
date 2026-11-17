@@ -649,6 +649,34 @@ pub async fn call_tracing(
     body: Value,
     tracing: Option<&str>,
 ) -> (u16, Value) {
+    call_in_region_tracing(router, REGION, operation, body, tracing).await
+}
+
+/// Call one operation with a credential scope naming `region`, and return
+/// `(http status, parsed body)`.
+///
+/// The Region is what this service's ARNs are rooted in and what a refusal
+/// about a Region names, so a suite whose cases vary it signs for it here
+/// instead of writing a second copy of the signing string.
+pub async fn call_in_region(
+    router: &MultiServiceRouter,
+    region: &str,
+    operation: &str,
+    body: Value,
+) -> (u16, Value) {
+    call_in_region_tracing(router, region, operation, body, None).await
+}
+
+/// The one request every call of this harness makes: one awsJson1_1 `POST /`
+/// addressed to `operation`, signed for `region`, carrying the tracing header
+/// `tracing` when the caller sends one.
+async fn call_in_region_tracing(
+    router: &MultiServiceRouter,
+    region: &str,
+    operation: &str,
+    body: Value,
+    tracing: Option<&str>,
+) -> (u16, Value) {
     let mut builder = http::Request::builder()
         .method("POST")
         .uri("/")
@@ -659,7 +687,7 @@ pub async fn call_tracing(
         .header(
             "authorization",
             format!(
-                "AWS4-HMAC-SHA256 Credential=AKIDTESTONLY/20261021/{REGION}/route53resolver/aws4_request, \
+                "AWS4-HMAC-SHA256 Credential=AKIDTESTONLY/20261021/{region}/route53resolver/aws4_request, \
                  SignedHeaders=host;x-amz-date, Signature=not-verified-in-this-test"
             ),
         );

@@ -16,7 +16,9 @@
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
-use super::harness::{call, emulator, error_type, ok, string_member, ACCOUNT, REGION};
+use service_com_amazonaws_route53resolver_route53resolver::state::MANAGED_FIREWALL_DOMAIN_LIST_PUBLISHER_ACCOUNT;
+
+use super::harness::{call, emulator, error_type, ok, string_member, REGION};
 
 /// The domain lists Route 53 Resolver DNS Firewall publishes to every account —
 /// `(Name, Category, ManagedListType)` — in the order this emulator reports
@@ -163,10 +165,19 @@ async fn the_published_lists_are_visible_without_any_create() {
             id.starts_with("rslvr-fdl-") && !id.is_empty() && id.len() <= 64,
             "case {case:?}: a domain list Id is rslvr-fdl-<hex> inside ResourceId's length 1..64, got {id:?}"
         );
+        // A list the service publishes is a resource of the SERVICE, not of the
+        // account that can see it, so its ARN is rooted in the publishing
+        // service's own account and not in the account this emulator serves,
+        // which is what a list this account created carries — the identity side
+        // of the rule pinned in `super::managed_firewall_domain_lists`.
         assert_eq!(
             string_member(item, "Arn"),
-            format!("arn:aws:route53resolver:{REGION}:{ACCOUNT}:firewall-domain-list/{id}"),
-            "case {case:?}: the Arn must be rooted in the signed region and this id, got {item}"
+            format!(
+                "arn:aws:route53resolver:{REGION}:\
+                 {MANAGED_FIREWALL_DOMAIN_LIST_PUBLISHER_ACCOUNT}:firewall-domain-list/{id}"
+            ),
+            "case {case:?}: the Arn must carry the publishing service's account, the signed region \
+             and this id, got {item}"
         );
         assert_eq!(
             string_member(item, "ManagedOwnerName"),

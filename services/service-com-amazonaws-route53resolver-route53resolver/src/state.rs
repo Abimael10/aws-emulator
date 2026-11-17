@@ -2638,6 +2638,23 @@ pub fn firewall_domain_is_wellformed(domain: &str) -> bool {
 /// 1..512).
 pub const MANAGED_FIREWALL_DOMAIN_LIST_OWNER: &str = "Route 53 Resolver DNS Firewall";
 
+/// The AWS account DNS Firewall publishes its own domain lists from, which is
+/// the account field of every published list's `Arn`.
+///
+/// A list DNS Firewall publishes is a resource of the SERVICE, not of the
+/// account that can see it — that is what `ManagedOwnerName`
+/// ([`MANAGED_FIREWALL_DOMAIN_LIST_OWNER`]) says about it — so its ARN is rooted
+/// in the service's own publishing account and is the same string for every
+/// caller, never in the account this emulator serves
+/// (`::engine::emulator_account_id`, which is what `::engine::emulator_arn`
+/// stamps into a resource THIS account owns).
+///
+/// Source: the published DNS Firewall catalog, whose publishing account and list
+/// ids ([`ManagedFirewallDomainList::published_id`]) are identifiers AWS
+/// publishes for the service's own lists and nothing derives; they carry no
+/// account of any caller and name nothing of this emulator's.
+pub const MANAGED_FIREWALL_DOMAIN_LIST_PUBLISHER_ACCOUNT: &str = "229214028842";
+
 /// `DomainListType` values, the model's whole enum
 /// (`smithy_query(query="shape",shape="DomainListType")`).
 pub const DOMAIN_LIST_TYPE_THREAT: &str = "THREAT";
@@ -2655,6 +2672,15 @@ pub const DOMAIN_LIST_TYPE_CONTENT: &str = "CONTENT";
 pub struct ManagedFirewallDomainList {
     /// The list's `Name`, which is also how AWS publishes it.
     pub name: &'static str,
+    /// The `Id` DNS Firewall publishes this list under: the service's own
+    /// identifier for it, identical for every account and every process that
+    /// reads the list, and derived from nothing of the caller's. It has the
+    /// `rslvr-fdl-<hex>` form of every domain list id
+    /// ([`mint_firewall_domain_list_id`]) and fits `ResourceId` (length 1..64).
+    ///
+    /// Source: the published catalog cited on
+    /// [`MANAGED_FIREWALL_DOMAIN_LIST_PUBLISHER_ACCOUNT`].
+    pub published_id: &'static str,
     /// The `ManagedListType` this list reports: "the type of the managed domain
     /// list, for example `THREAT`".
     pub managed_list_type: &'static str,
@@ -2677,46 +2703,52 @@ pub struct ManagedFirewallDomainList {
 pub const MANAGED_FIREWALL_DOMAIN_LISTS: &[ManagedFirewallDomainList] = &[
     ManagedFirewallDomainList {
         name: "AWSManagedDomainsMalwareDomainList",
+        published_id: "rslvr-fdl-fe17696f22a445f6",
         managed_list_type: DOMAIN_LIST_TYPE_THREAT,
         category: "Malware",
     },
     ManagedFirewallDomainList {
         name: "AWSManagedDomainsBotnetCommandandControl",
+        published_id: "rslvr-fdl-c80983a1f0284c99",
         managed_list_type: DOMAIN_LIST_TYPE_THREAT,
         category: "Botnet/Command and Control",
     },
     ManagedFirewallDomainList {
         name: "AWSManagedDomainsAggregateThreatList",
+        published_id: "rslvr-fdl-d252ee1944404e15",
         managed_list_type: DOMAIN_LIST_TYPE_THREAT,
         category: "Aggregate Threat List",
     },
     ManagedFirewallDomainList {
         name: "AWSManagedDomainsAmazonGuardDutyThreatList",
+        published_id: "rslvr-fdl-23584f0fb4c24ebb",
         managed_list_type: DOMAIN_LIST_TYPE_THREAT,
         category: "Amazon GuardDuty Threat List",
     },
 ];
 
 impl ManagedFirewallDomainList {
-    /// This list's `Id`, derived from its name so that every read of it — in any
-    /// process, in any region — reports the same id, exactly as a published
-    /// resource must. The form is [`mint_firewall_domain_list_id`]'s
-    /// (`rslvr-fdl-<hex>`), so an id is recognisable as a domain list's and fits
-    /// `ResourceId` (length 1..64).
-    pub fn id(&self) -> String {
-        let mut hasher = Sha256::new();
-        hasher.update(b"managed-firewall-domain-list/v1");
-        feed_field(&mut hasher, self.name.as_bytes());
-        format!("rslvr-fdl-{}", hex::encode(&hasher.finalize()[..8]))
+    /// This list's `Id`: the one DNS Firewall publishes it under
+    /// ([`Self::published_id`]), so every read of it — by any account, in any
+    /// process — reports the same id, exactly as a published resource must, and
+    /// nothing of the caller's reaches it.
+    pub fn id(&self) -> &'static str {
+        self.published_id
     }
 
-    /// This list's `Arn`, rooted in the region the request was signed for, as
-    /// every ARN this service reports is.
+    /// This list's `Arn`: the published id under the service's own publishing
+    /// account ([`MANAGED_FIREWALL_DOMAIN_LIST_PUBLISHER_ACCOUNT`]) in the
+    /// region the request was signed for.
+    ///
+    /// The account field is the publisher's and NOT this emulator's, because the
+    /// list is not a resource of the account reading it — an ARN in the caller's
+    /// account would contradict the `ManagedOwnerName` the same entry reports.
+    /// So this does not go through `::engine::emulator_arn`, which exists to
+    /// root a resource of THIS account.
     pub fn arn(&self, region: &str) -> String {
-        ::engine::emulator_arn(
-            ARN_NAMESPACE,
-            region,
-            &format!("firewall-domain-list/{}", self.id()),
+        format!(
+            "arn:aws:{ARN_NAMESPACE}:{region}:{MANAGED_FIREWALL_DOMAIN_LIST_PUBLISHER_ACCOUNT}:firewall-domain-list/{}",
+            self.id()
         )
     }
 
@@ -2724,7 +2756,7 @@ impl ManagedFirewallDomainList {
     /// `ListFirewallDomainLists` reports.
     pub fn to_metadata(&self, region: &str) -> FirewallDomainListMetadata {
         FirewallDomainListMetadata {
-            id: Some(self.id()),
+            id: Some(self.id().to_string()),
             arn: Some(self.arn(region)),
             name: Some(self.name.to_string()),
             // `CreatorRequestId` is "a unique string defined by you to identify
@@ -2744,7 +2776,7 @@ impl ManagedFirewallDomainList {
     /// `ListFirewallDomainLists` reported resolves to the same list.
     pub fn to_domain_list(&self, region: &str) -> FirewallDomainList {
         FirewallDomainList {
-            id: Some(self.id()),
+            id: Some(self.id().to_string()),
             arn: Some(self.arn(region)),
             name: Some(self.name.to_string()),
             // `DomainCount` is "the number of domain names that are specified
