@@ -2,8 +2,10 @@
 
 //! @op StartQueryExecution
 //! IMPLEMENTED: authorizes the caller against the ARN of the workgroup the request names,
-//! then runs the submitted SQL on this service's in-process SQL engine, persists
-//! the execution and the result set it produced, and answers with the id it minted —
+//! then runs the submitted SQL on this service's in-process SQL engine — or, for an
+//! `EXECUTE <statement_name> USING <arguments>` submission, the query statement the named
+//! workgroup's prepared statement holds, with those arguments bound to its placeholders —
+//! persists the execution and the result set it produced, and answers with the id it minted —
 //! the same id, and no second execution, for a repeated `ClientRequestToken`.
 //!
 //! ## Shape of an operation
@@ -225,12 +227,74 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .clone()
                 .unwrap_or_else(|| crate::state::DEFAULT_QUERY_DATABASE.to_string()),
         };
-        // The statement is READ before any lock is taken — what it is, what it addresses
-        // and how it runs; what it computes is the catalog's and the engine's own answer
-        // below. Reading it is the first half of PLANNING the query, so the span is
-        // measured; the other half is the resolution the run does against the catalog.
+        // `EXECUTE <statement_name> [USING <argument>, …]` runs a PREPARED STATEMENT, which
+        // a workgroup holds under that name: the statement that is planned and run is the
+        // stored `QueryStatement`, with the `USING` arguments bound to its placeholders in
+        // order, while the text the client submitted stays the query string this execution
+        // reports. The name resolves in the workgroup THIS submission names — a statement
+        // is addressed by its name together with its workgroup — so a workgroup that holds
+        // no statement under it refuses the submission here and mints no execution. The
+        // same statement read beside this one is `crate::ops::get_prepared_statement`'s.
+        //
+        // The submitted text is PARSED once, here: reading what the statement is is the
+        // first half of planning the query, so the whole span — the parse, the prepared
+        // statement this parse says has to be resolved, and the reading of the statement
+        // that will run — is measured as one, because every part of it is work this call
+        // did before the engine was handed anything.
         let planning_started = ::std::time::Instant::now();
-        let reading = catalog_sql::statement::read(&query_string, &query_context);
+        let parsed = catalog_sql::statement::parse_statements(&query_string);
+        let execute = catalog_sql::statement::execution_of(parsed.as_deref());
+        let prepared_statement = match &execute {
+            None => None,
+            Some(execute) => {
+                let store = state.lock();
+                // A workgroup this account does not hold, and one that runs no queries at
+                // all, are refused below by the checks every submission is judged by, so
+                // nothing is resolved against such a workgroup's store here.
+                if store.holds_work_group(&work_group) && !store.work_group_is_disabled(&work_group)
+                {
+                    let Some(record) = store
+                        .prepared_statements
+                        .statement(&work_group, &execute.statement_name)
+                    else {
+                        return Err(invalid_request(
+                            crate::state::PREPARED_STATEMENT_NOT_FOUND_IN_WORK_GROUP,
+                        ));
+                    };
+                    Some(record.query_statement.clone())
+                } else {
+                    None
+                }
+            }
+        };
+        // What BINDS to the statement's placeholders: the `USING` arguments of an `EXECUTE`,
+        // and otherwise the `ExecutionParameters` the request carried — "applied
+        // sequentially to the parameters in the query in the order in which the parameters
+        // occur", which is the one rule both forms bind by.
+        let bound_parameters = match &execute {
+            Some(execute) if !execute.arguments.is_empty() => execute.arguments.clone(),
+            _ => execution_parameters.clone(),
+        };
+
+        // What RUNS, and what reading it established: the statement the submission carried,
+        // read off the parse already made of it, or the one the prepared statement it named
+        // stands for, which is text this submission did not carry and so is read on its own.
+        let (statement_sql, reading) = match prepared_statement {
+            Some(stored) => {
+                let reading = catalog_sql::statement::read(&stored, &query_context);
+                (stored, reading)
+            }
+            None => {
+                let reading = catalog_sql::statement::read_parsed(
+                    &query_string,
+                    parsed,
+                    &query_context,
+                );
+                (query_string.clone(), reading)
+            }
+        };
+        // The whole of the reading this call did, which is the planning the run adds the
+        // catalog resolution to when it reports.
         let read_time = planning_started.elapsed();
         // A submission is PARSED before it is accepted, so text that is not a statement
         // of this language is refused here rather than accepted and failed later: no
@@ -239,7 +303,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if reading.statements.is_none() {
             return Err(StartQueryExecutionError::invalid_request(
                 catalog_sql::grammar::ERROR_CODE_MALFORMED_QUERY,
-                catalog_sql::grammar::malformed_statement(&query_string),
+                catalog_sql::grammar::malformed_statement(&statement_sql),
             ));
         }
         // What the statement DECLARES is judged here too: a definition Athena could never
@@ -252,6 +316,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 message,
             ));
         }
+        // The KIND of statement this execution reports is the kind the client SUBMITTED:
+        // an `EXECUTE` is reported as an `EXECUTE`, and in the class Athena puts that
+        // statement in — the one that queries or changes DATA, which is also the only class
+        // a statement a prepared statement stands for belongs to, since a prepared statement
+        // holds a query rather than a definition. Every other submission is the kind the
+        // reading of it established.
+        let (statement_type, substatement_type) = match &execute {
+            Some(_) => (
+                Some(query_engine::STATEMENT_TYPE_DML),
+                Some(catalog_sql::statement::SUBSTATEMENT_EXECUTE),
+            ),
+            None => (reading.statement_type, reading.substatement_type),
+        };
         // WHO may read the tables this statement names is Lake Formation's answer, resolved
         // BEFORE the statement is planned: the resolution that consults it runs on a
         // blocking thread, and the question is put to Lake Formation over the in-process
@@ -358,8 +435,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             let record = crate::state::QueryExecutionRecord {
                 id: id.clone(),
                 query_string: query_string.clone(),
-                statement_type: reading.statement_type.map(str::to_string),
-                substatement_type: reading.substatement_type.map(str::to_string),
+                statement_type: statement_type.map(str::to_string),
+                substatement_type: substatement_type.map(str::to_string),
                 work_group,
                 context,
                 result_configuration,
@@ -393,8 +470,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // One statement, or text this parser could not read at all — in which case
             // the engine is the one that reports why.
             Some(1) | None => {
-                let sql = query_string.clone();
-                let parameters = execution_parameters.clone();
+                let sql = statement_sql.clone();
+                let parameters = bound_parameters.clone();
                 let engine = ::std::sync::Arc::clone(&self.engine);
                 // The statement runs on a blocking thread: the catalog's store, the
                 // object store and the SQL engine are all synchronous, and the engine is

@@ -76,6 +76,12 @@ pub const SUBSTATEMENT_CREATE_VIEW: &str = "CREATE_VIEW";
 pub const SUBSTATEMENT_DROP_TABLE: &str = "DROP_TABLE";
 /// The `SubstatementType` of a statement that drops a view.
 pub const SUBSTATEMENT_DROP_VIEW: &str = "DROP_VIEW";
+/// The `SubstatementType` of a statement that RUNS a prepared statement.
+///
+/// The kind reported is the kind of statement the client SUBMITTED: an `EXECUTE` is an
+/// `EXECUTE`, whatever the prepared statement it runs happens to be, and it belongs to the
+/// `StatementType` class that queries or changes data.
+pub const SUBSTATEMENT_EXECUTE: &str = "EXECUTE";
 
 /// The database an `information_schema` relation addresses: the schema every SQL engine
 /// reports its own catalog through, which Athena serves out of the Data Catalog.
@@ -431,7 +437,21 @@ pub enum Projection {
 
 /// Read `sql` as the one statement it carries, and plan how to run it.
 pub fn read(sql: &str, context: &QueryContext) -> Reading {
-    let Some(mut statements) = parse_statements(sql) else {
+    read_parsed(sql, parse_statements(sql), context)
+}
+
+/// The same reading, out of a parse of `sql` the caller ALREADY made.
+///
+/// A caller that has to know what the text is before it can decide which statement to read
+/// — the one that resolves an `EXECUTE` against a workgroup's prepared statements
+/// ([`execution_of`]) — parses the submitted text once and reads it here, so the submitted
+/// text is never parsed twice.
+pub fn read_parsed(
+    sql: &str,
+    parsed: Option<Vec<SqlStatement>>,
+    context: &QueryContext,
+) -> Reading {
+    let Some(mut statements) = parsed else {
         // A database definition carrying the clauses Hive's DDL grammar takes and the
         // general parser does not read is still that statement, so it is read as one
         // rather than handed to the engine as text (see [`super::hive_database`]).
@@ -485,6 +505,63 @@ pub fn read(sql: &str, context: &QueryContext) -> Reading {
         counts_rows,
         plan: plan_of(statement, context),
     }
+}
+
+/// What an `EXECUTE` submission names: the prepared statement whose own query statement
+/// is the one that runs, and the arguments bound to that statement's placeholders.
+///
+/// A prepared statement is not a statement of this language at all — its name resolves in
+/// the WORKGROUP the submission names, which this layer knows nothing about — so reading
+/// one establishes only what the text says, and the statement it stands for is resolved by
+/// the caller that holds the workgroup's store.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Execution {
+    /// The prepared statement's name, as the statement wrote it.
+    pub statement_name: String,
+    /// The `USING` arguments, each as the SQL literal the submission wrote it as, in the
+    /// order they were written — which is the order they bind in.
+    pub arguments: Vec<String>,
+}
+
+/// What the `EXECUTE <statement_name> [USING <argument>, …]` submission `parsed` carries
+/// names, or `None` for a parse that is not one.
+///
+/// Read off the PARSE, like every other fact about a submitted statement here, so the name
+/// and the arguments are the grammar's own and never a scan of the submitted text: an
+/// argument is carried as the literal it was written as, which is how a bound value
+/// arrives on this service's other parameter path (`ExecutionParameters`), and is BOUND
+/// rather than interpolated when the statement runs.
+#[must_use]
+pub fn execution_of(parsed: Option<&[SqlStatement]>) -> Option<Execution> {
+    // A query execution runs ONE statement, so a parse carrying another count is no
+    // `EXECUTE` of this grammar.
+    let [
+        SqlStatement::Execute {
+            name: Some(name),
+            parameters,
+            using,
+            ..
+        },
+    ] = parsed?
+    else {
+        return None;
+    };
+    // A form that carries its arguments other than in a `USING` clause is not the form
+    // Athena's grammar has for running a prepared statement, so it is left to the engine
+    // to report as the statement it is.
+    if !parameters.is_empty() {
+        return None;
+    }
+    // A prepared statement is addressed by ONE name: a qualified name names no prepared
+    // statement this service could hold.
+    let parts = idents_of(name);
+    let [statement_name] = parts.as_slice() else {
+        return None;
+    };
+    Some(Execution {
+        statement_name: statement_name.value.clone(),
+        arguments: using.iter().map(ToString::to_string).collect(),
+    })
 }
 
 /// The statements `sql` parses as, or `None` when no dialect this crate reads can parse

@@ -53,6 +53,8 @@ mod notebook_create;
 mod notebook_import_export;
 #[path = "all/notebook_session_listing.rs"]
 mod notebook_session_listing;
+#[path = "all/prepared_statement_execution.rs"]
+mod prepared_statement_execution;
 #[path = "all/prepared_statement_lifecycle.rs"]
 mod prepared_statement_lifecycle;
 #[path = "all/query_execution_detail.rs"]

@@ -24,7 +24,7 @@
 use std::collections::BTreeMap;
 use std::time::SystemTime;
 
-use crate::ops::types::PreparedStatement;
+use crate::ops::types::{PreparedStatement, PreparedStatementSummary};
 
 /// How many prepared statements one workgroup holds in this emulator.
 ///
@@ -132,6 +132,16 @@ impl PreparedStatementRecord {
         }
     }
 
+    /// The record as the modelled `PreparedStatementSummary` a LISTING reports it as: "the
+    /// name and last modified time of the prepared statement", which is that shape's whole
+    /// membership.
+    pub fn to_summary(&self) -> PreparedStatementSummary {
+        PreparedStatementSummary {
+            statement_name: Some(self.statement_name.clone()),
+            last_modified_time: Some(::aws_smithy_types::DateTime::from(self.last_modified_time)),
+        }
+    }
+
     /// How many bytes of caller-supplied text this record holds — the size
     /// [`MAX_PREPARED_STATEMENT_BYTES_TOTAL`] bounds the sum of.
     pub fn stored_bytes(&self) -> usize {
@@ -185,6 +195,21 @@ impl PreparedStatementRegistry {
         name: &str,
     ) -> Option<&mut PreparedStatementRecord> {
         self.by_work_group.get_mut(work_group)?.get_mut(name)
+    }
+
+    /// Every statement `work_group` holds, as the summaries a listing reports, in NAME
+    /// order — the order the registry holds one workgroup's statements in, which is what
+    /// makes a page of this listing independent of how the registry was filled.
+    pub fn summaries_in(&self, work_group: &str) -> Vec<PreparedStatementSummary> {
+        self.by_work_group
+            .get(work_group)
+            .map(|statements| {
+                statements
+                    .values()
+                    .map(PreparedStatementRecord::to_summary)
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     /// How many statements `work_group` holds — the count
@@ -277,6 +302,17 @@ impl PreparedStatementRegistry {
             .unwrap_or_default()
     }
 }
+
+/// The refusal message a `StartQueryExecution` submitting `EXECUTE <name> …` in a
+/// workgroup that holds no prepared statement under that name answers with.
+///
+/// A prepared statement is addressed by its name TOGETHER WITH a workgroup, so the
+/// workgroup a submission names is where its `EXECUTE` resolves — and a submission whose
+/// statement that workgroup does not hold is refused by the submission itself rather than
+/// minted as an execution. Wholly fixed text: neither the statement name nor the workgroup
+/// is interpolated into it, so every such submission states this one sentence.
+pub const PREPARED_STATEMENT_NOT_FOUND_IN_WORK_GROUP: &str =
+    "PreparedStatement was not found in workGroup";
 
 /// The refusal message a READ of a prepared statement the named workgroup does not hold
 /// answers with.
