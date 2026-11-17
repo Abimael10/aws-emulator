@@ -240,8 +240,17 @@ impl Service for LegacyDirectoryLambda {
             .is_some_and(|value| value.contains(LAMBDA_SCOPE))
     }
 
-    fn override_operation(&self, _req: &RtRequest) -> Option<&dyn ErasedOperation> {
-        Some(&self.invocation)
+    /// Only the INVOCATION route is served by the stand-in function. Amazon Cognito also
+    /// READS the function before it invokes it — the record Lambda holds and the
+    /// resource-based policy that decides whether the invocation may be made at all — and a
+    /// read is not an invocation, so this stand-in neither answers one nor records it.
+    fn override_operation(&self, req: &RtRequest) -> Option<&dyn ErasedOperation> {
+        req.uri()
+            .split('?')
+            .next()
+            .unwrap_or_default()
+            .ends_with("/invocations")
+            .then_some(&self.invocation as &dyn ErasedOperation)
     }
 }
 

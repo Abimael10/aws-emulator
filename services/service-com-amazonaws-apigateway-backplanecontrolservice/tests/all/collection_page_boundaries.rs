@@ -13,7 +13,9 @@
 //!
 //! * a collection that holds no element reports NO page member — the success envelope
 //!   alone, with no cursor and no echoed page size beside it — across every
-//!   listing of this service, whatever the collection is of;
+//!   listing of this service whose own recorded answer leaves the member out (the
+//!   deployments collection's does not: it is asserted by
+//!   `crate::deployment_collection`, which owns that collection's own answer);
 //! * a limited page of an API's documentation parts holds the parts at the first
 //!   ADDRESSES the request's filters select, and reports the address of the part it
 //!   carries on at as its cursor, so the part a page reports and the cursor beside it
@@ -83,7 +85,9 @@ async fn a_collection_that_holds_no_element_reports_no_page_member() {
     // account's own, an API's children, and a domain name's mappings — so what is asserted
     // is the envelope rather than one listing's handler. Left out: the collections an
     // account or an API is CREATED holding (a REST API's models and gateway responses, the
-    // SDK-type catalog), which never hold nothing.
+    // SDK-type catalog), which never hold nothing, and the DEPLOYMENTS collection, whose
+    // own recorded answer carries the member as an empty list
+    // (`crate::deployment_collection`).
     let rows: Vec<(&str, String)> = vec![
         ("GetApiKeys", "/apikeys".to_string()),
         ("GetUsagePlans", "/usageplans".to_string()),
@@ -102,7 +106,6 @@ async fn a_collection_that_holds_no_element_reports_no_page_member() {
             "GetRequestValidators",
             format!("/restapis/{api}/requestvalidators"),
         ),
-        ("GetDeployments", format!("/restapis/{api}/deployments")),
         (
             "GetDocumentationParts",
             format!("/restapis/{api}/documentation/parts"),

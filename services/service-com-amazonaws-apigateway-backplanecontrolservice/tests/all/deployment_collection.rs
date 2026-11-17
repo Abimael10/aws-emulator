@@ -10,7 +10,9 @@
 //!
 //! The rule under test: the collection reports every stored deployment of the named API
 //! in creation order, oldest first, one `position`/`limit` page at a time, each entry
-//! being the record the single-deployment read reports; it changes nothing. So the tests
+//! being the record the single-deployment read reports; it changes nothing. The page member
+//! is reported whatever the page holds, so a listing whose page came out empty is a success
+//! carrying an EMPTY `items` list. So the tests
 //! assert over SETS of inputs — a table of deployment shapes and counts (including none
 //! at all), the whole documented page-size range with one value past each bound, a cursor
 //! that names nothing, and APIs that own the collection and APIs that do not.
@@ -352,6 +354,69 @@ async fn the_collection_belongs_to_the_api_that_owns_it() {
         404,
         "NotFoundException",
         "GetDeployments after DeleteRestApi",
+    );
+}
+
+#[tokio::test]
+async fn the_page_member_is_reported_whatever_the_page_holds() {
+    let gateway = Gateway::new();
+    let api = api_with_a_method(&gateway, "deployment-page-member").await;
+
+    // An api that never held a deployment: the member is THERE, carrying nothing — a client
+    // reads "nothing is deployed" off a list it can count, which is the answer recorded for
+    // this collection, rather than off a member that is not in the document at all.
+    let empty = get_deployments(&gateway, &api, "").await;
+    assert_eq!(
+        empty.body["item"],
+        json!([]),
+        "case \"an api that never held a deployment\": expected the empty page member, got {:?}",
+        empty.body
+    );
+
+    // The populated pages beside it: the member reports one element, then two, in creation
+    // order.
+    let first =
+        create_deployment(&gateway, &api, "CreateDeployment(page member 1)", json!({})).await;
+    let one = get_deployments(&gateway, &api, "").await;
+    assert_eq!(
+        reported_ids(&one.body, "one deployment"),
+        vec![first.clone()],
+        "case \"one deployment\": expected the page member to carry it, got {:?}",
+        one.body
+    );
+    let second =
+        create_deployment(&gateway, &api, "CreateDeployment(page member 2)", json!({})).await;
+    let both = get_deployments(&gateway, &api, "").await;
+    assert_eq!(
+        reported_ids(&both.body, "two deployments"),
+        vec![first.clone(), second.clone()],
+        "case \"two deployments\": expected both in creation order, got {:?}",
+        both.body
+    );
+
+    // An api a caller EMPTIED again: the page came out empty a second way, and it is the
+    // same answer.
+    for deployment in [&first, &second] {
+        let deleted = gateway
+            .call(
+                "DELETE",
+                &format!("/restapis/{api}/deployments/{deployment}"),
+                None,
+            )
+            .await;
+        assert_eq!(
+            deleted.status, 202,
+            "case \"an api a caller emptied\": expected 202 from DeleteDeployment, got {} with \
+             {:?}",
+            deleted.status, deleted.body
+        );
+    }
+    let emptied = get_deployments(&gateway, &api, "").await;
+    assert_eq!(
+        emptied.body["item"],
+        json!([]),
+        "case \"an api a caller emptied\": expected the empty page member, got {:?}",
+        emptied.body
     );
 }
 

@@ -250,6 +250,11 @@ async fn create_function(router: &MultiServiceRouter, name: &str, source: &str) 
         );
         tokio::time::sleep(LOOK_AGAIN).await;
     }
+    // Amazon Cognito invokes a trigger as its OWN service principal, so the function's
+    // resource-based policy has to admit it — the grant AWS asks for on every function a
+    // pool's `LambdaConfig` names, written through the one spelling of it this crate has
+    // (`crate::trigger_invoke_permission`, the suite that owns that rule).
+    crate::trigger_invoke_permission::grant_cognito_trigger_invoke(router, REGION, name).await;
     created["FunctionArn"]
         .as_str()
         .unwrap_or_else(|| panic!("CreateFunction must mint an ARN, got {created}"))

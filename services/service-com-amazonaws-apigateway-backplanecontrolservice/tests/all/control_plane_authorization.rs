@@ -18,7 +18,9 @@
 //! at all, every action of the service, the exact verb on the exact resource, the verb on
 //! another resource, another service's actions, an explicit deny beside a grant of
 //! everything), the VERB the request used — which is what the action is named after, so a
-//! grant of one verb must not cover another — the PRINCIPAL the credential speaks for (an
+//! grant of one verb must not cover another — the SPELLING of the request line the resource is
+//! read off (the origin form a hand-written client sends and the absolute form an AWS SDK
+//! sends, each with and without a query string), the PRINCIPAL the credential speaks for (an
 //! assumed-role session, the account's own published credential), and the OPERATION, from a
 //! read of one record to a write of a collection, so the decision is the plane's rather than
 //! one handler's.
@@ -36,8 +38,8 @@
 //! (`src/service/invoke/execute_api_authorization.rs`). The sibling
 //! `control_plane_fidelity_rules` suite carries ONE row over that gate — a session denied the
 //! call it makes — among the ten rules it pins; what is added here is the TABLE the rule
-//! generalises over: every reading of a document, every verb, and the records a refused write
-//! did not leave behind.
+//! generalises over: every reading of a document, every verb, every spelling of the request
+//! line the resource is read off, and the records a refused write did not leave behind.
 
 use std::time::SystemTime;
 
@@ -400,6 +402,115 @@ async fn the_verb_and_the_path_of_the_request_name_the_action_and_the_resource()
          {} with {:?}",
         refused_response.status, refused_response.body
     );
+}
+
+/// The host this service answers on in the Region every row signs for, which is the
+/// authority an AWS SDK puts in the request line it sends.
+const SERVICE_HOST: &str = "apigateway.us-east-1.amazonaws.com";
+
+/// Every spelling of ONE request's URI, which is the request line a client puts on the wire:
+/// the origin form a hand-written client sends, and the ABSOLUTE form an AWS SDK sends —
+/// scheme, authority and path — each with and without a query string, since a query carries
+/// the request's parameters rather than the resource it addresses.
+fn spellings(path: &str, query: &str) -> Vec<(String, String)> {
+    vec![
+        ("the origin form".to_string(), path.to_string()),
+        (
+            "the origin form with a query string".to_string(),
+            format!("{path}?{query}"),
+        ),
+        (
+            "the absolute form an AWS SDK sends".to_string(),
+            format!("https://{SERVICE_HOST}{path}"),
+        ),
+        (
+            "the absolute form with a query string".to_string(),
+            format!("https://{SERVICE_HOST}{path}?{query}"),
+        ),
+    ]
+}
+
+#[tokio::test]
+async fn the_resource_the_decision_names_is_the_requests_path_whatever_its_request_line() {
+    let gateway = Gateway::new();
+    let method = Method::stand_up(&gateway, "control-plane-authorization-request-line").await;
+    given_session(&gateway);
+
+    // The paths differ along what they address — the whole collection, one api, and one
+    // record deep inside it — and each is asked for under every spelling of the request
+    // line, with a parameter the operation publishes as the query string.
+    let paths: Vec<(&str, String, &str)> = vec![
+        ("GetRestApis", "/restapis".to_string(), "limit=500"),
+        (
+            "GetRestApi",
+            format!("/restapis/{}", method.api),
+            "limit=500",
+        ),
+        (
+            "GetMethodResponse",
+            method.method_response_path(),
+            "limit=500",
+        ),
+    ];
+
+    // A grant written the way a developer writes one for this plane: the verb, on the ARN of
+    // the api-gateway path PREFIX the calls address.
+    given_policy(
+        &gateway,
+        Entity::Role,
+        Some(&allow("apigateway:GET", &apigateway_arn("/restapis*"))),
+    );
+    for (operation, path, query) in &paths {
+        for (form, uri) in spellings(path, query) {
+            let case = format!("{operation} under {form}");
+            let answered = call_as(&gateway, SESSION_KEY_ID, "GET", &uri, None).await;
+            let (status, error, body) = (answered.status, answered.error.clone(), answered.body);
+            assert_eq!(
+                (status, error.as_deref()),
+                (200, None),
+                "case {case:?}: expected the grant on the path's own ARN to serve {uri:?}, got \
+                 {status} {error:?} with {body:?}"
+            );
+        }
+    }
+
+    // The same calls under a grant naming ANOTHER api's resources: each is refused, and the
+    // sentence names the ARN of the request's own PATH — not its scheme, not its authority
+    // and not its query string — which is the resource a statement would have to name to
+    // allow it.
+    given_policy(
+        &gateway,
+        Entity::Role,
+        Some(&allow(
+            "apigateway:GET",
+            &apigateway_arn("/restapis/other0000/*"),
+        )),
+    );
+    for (operation, path, query) in &paths {
+        for (form, uri) in spellings(path, query) {
+            let case = format!("{operation} under {form}");
+            let refused = call_as(&gateway, SESSION_KEY_ID, "GET", &uri, None).await;
+            let (status, error, body) = (refused.status, refused.error.clone(), refused.body);
+            assert_eq!(
+                (status, error.as_deref()),
+                (403, Some(ACCESS_DENIED)),
+                "case {case:?}: expected 403 {ACCESS_DENIED} for {uri:?}, got {status} \
+                 {error:?} with {body:?}"
+            );
+            let message = string_member(&body, "message", &case);
+            assert_eq!(
+                message,
+                not_authorized(
+                    &session_arn(),
+                    "apigateway:GET",
+                    &apigateway_arn(path),
+                    "because no identity-based policy allows the apigateway:GET action",
+                ),
+                "case {case:?}: expected the refusal to name the ARN of the request's path, got \
+                 {message:?}"
+            );
+        }
+    }
 }
 
 #[tokio::test]

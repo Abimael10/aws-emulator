@@ -31,6 +31,24 @@
 //! The function is invoked over the in-process callback into this same emulator
 //! ([`lambda_client`]), so a trigger reaches only a function this emulator itself holds,
 //! and every invocation is bounded by [`TRIGGER_INVOCATION_BUDGET`].
+//!
+//! ## Who the invocation is made as, and what refuses it
+//!
+//! Amazon Cognito invokes a trigger's function as its OWN service principal
+//! ([`SERVICE_PRINCIPAL`]) rather than as the caller of the operation that fired the
+//! trigger, so the grant that admits the invocation is the FUNCTION's resource-based policy —
+//! the document `AddPermission` writes and `GetPolicy` reports — and it is read from Lambda
+//! itself rather than kept a second time here. The decision is
+//! [`::service_common::iam_authorization`], the tree's one evaluation of policy documents,
+//! taken on [`INVOKE_FUNCTION_ACTION`] over the function Lambda reports, with the POOL's own
+//! ARN as the `aws:SourceArn` and its account as the `aws:SourceAccount` such a grant is
+//! narrowed by — which is how a permission added for one pool admits its triggers and no
+//! other pool's. A function whose policy admits this service nothing is NOT invoked, and the
+//! operation that fired the trigger reports that it could not be ([`Failure::NotInvokable`]).
+//!
+//! Nothing is refused on evidence this emulator does not have: an emulator with no Lambda to
+//! ask, and a function Lambda answers nothing about, each leave the invocation to be made and
+//! reported on its own answer.
 
 use std::collections::HashMap;
 
@@ -114,6 +132,32 @@ const TRIGGER_INVOCATION_BUDGET: ::std::time::Duration = ::std::time::Duration::
 /// The error an invocation that outlived [`TRIGGER_INVOCATION_BUDGET`] carries: the
 /// function was not waited for any longer, so it gave no verdict.
 const TRIGGER_TIMEOUT_ERROR: &str = "Socket timeout while invoking Lambda function";
+
+/// The service principal Amazon Cognito invokes a user-pool trigger as, as a function's
+/// resource-based policy names one: "for Amazon Web Services services, the principal is a
+/// domain-style identifier that the service defines" (Lambda's `AddPermission$Principal`),
+/// and the identifier this service is published under is its own endpoint prefix.
+const SERVICE_PRINCIPAL: &str = "cognito-idp.amazonaws.com";
+
+/// The IAM action invoking a function performs, which is not the operation's own name:
+/// Lambda's `Invoke` "requires permission for the `lambda:InvokeFunction` action".
+const INVOKE_FUNCTION_ACTION: &str = "lambda:InvokeFunction";
+
+/// The condition key a grant narrowed to the ONE resource the invocation is made for names
+/// that resource by, which for a user-pool trigger is the pool's own ARN.
+const SOURCE_ARN_KEY: &str = "aws:SourceArn";
+
+/// The condition key a grant narrowed to the account that owns that resource names it by.
+const SOURCE_ACCOUNT_KEY: &str = "aws:SourceAccount";
+
+/// The code Lambda answers for a function it holds no record of, and for a function that
+/// carries no resource-based policy at all.
+const LAMBDA_RESOURCE_NOT_FOUND: &str = "ResourceNotFoundException";
+
+/// The class an invocation no policy in force on the function allows is refused with, which
+/// is the error class Amazon Cognito reports for a trigger it could not invoke
+/// ([`invocation_failed_message`]): IAM's own authorization failure.
+const ACCESS_DENIED_EXCEPTION: &str = "AccessDeniedException";
 
 /// Which completed confirmation fires a post-confirmation event, which is what the
 /// event's `triggerSource` reports: the trigger's name and the operation that reached it.
@@ -200,6 +244,12 @@ pub struct Dispatch {
     region: String,
     trigger: &'static str,
     event: Value,
+    /// The ARN of the POOL whose trigger this invocation serves: the `aws:SourceArn` a
+    /// grant to this service's principal is narrowed by ([`SOURCE_ARN_KEY`]).
+    source_arn: String,
+    /// The account that pool belongs to, read off its own ARN: the `aws:SourceAccount` such
+    /// a grant is narrowed by ([`SOURCE_ACCOUNT_KEY`]).
+    source_account: String,
 }
 
 impl Dispatch {
@@ -419,11 +469,16 @@ fn dispatch(
     let region = ::service_common::arn::region_of(&function_arn, LAMBDA_ARN_NAMESPACE)
         .unwrap_or(pool.region.as_str())
         .to_string();
+    let source_account = ::service_common::arn::parse(&pool.arn)
+        .map(|parsed| parsed.account.to_string())
+        .unwrap_or_default();
     Dispatch {
         function_arn,
         region,
         trigger,
         event,
+        source_arn: pool.arn.clone(),
+        source_account,
     }
 }
 
@@ -557,6 +612,19 @@ fn failure_message(trigger: &str, error: &str) -> String {
     }
 }
 
+/// How Amazon Cognito states a trigger whose invocation could not be MADE at all: the
+/// trigger's name, then the CLASS of error the invocation was refused with.
+///
+/// A different sentence from [`failure_message`], because it is about a different thing: that
+/// one reports what the function or Lambda said about an invocation that was issued, while
+/// this one reports that there was no invocation to say anything about. The fixed text is
+/// `" invocation failed due to error "` around the error class, terminated once; the variable
+/// parts are the trigger the pool configured and the class the refusal carried.
+#[must_use]
+fn invocation_failed_message(trigger: &str, error_class: &str) -> String {
+    format!("{trigger} invocation failed due to error {error_class}.")
+}
+
 /// Fire the pre-authentication trigger of a sign-in of `username` in `user_pool_id`, and
 /// report what it leaves the sign-in to answer.
 ///
@@ -639,7 +707,9 @@ pub async fn invoke_gating(
 /// invoked them" (`LambdaConfigType`), which the invoking operation can only honour by
 /// waiting for the function's answer — for as long as
 /// [`TRIGGER_INVOCATION_BUDGET`] and no longer, so a function that does not answer fails
-/// the trigger instead of holding the caller.
+/// the trigger instead of holding the caller. That budget is ONE deadline for the whole
+/// dispatch: the reads that decide whether the invocation may be made at all and the
+/// invocation itself share it.
 ///
 /// Call it with the state lock RELEASED: the operation's own writes are already persisted,
 /// and holding the lock across the invocation would make every other request of this
@@ -648,6 +718,21 @@ pub async fn invoke(
     ctx: &::smithy_server_runtime::OperationContext<'_>,
     dispatch: &Dispatch,
 ) -> Result<Verdict, Failure> {
+    // ONE deadline for the whole dispatch, which is what Amazon Cognito's budget is: the
+    // reads below and the invocation after them share it, so a Lambda that answers neither
+    // holds the operation no longer than one that does not answer the invocation alone.
+    let deadline = ::tokio::time::Instant::now() + TRIGGER_INVOCATION_BUDGET;
+    // The function's OWN policy decides whether this service may invoke it at all (see the
+    // module docs), so a function that admits it nothing is not invoked and the trigger
+    // failed: there is no answer to report and none is invented. A read given up on at the
+    // deadline establishes nothing.
+    let asked = ::tokio::time::timeout_at(deadline, refused_by_the_function(ctx, dispatch)).await;
+    if let Ok(Some(error_class)) = asked {
+        return Err(Failure::NotInvokable(invocation_failed_message(
+            dispatch.trigger,
+            &error_class,
+        )));
+    }
     let invocation = lambda_client(ctx, &dispatch.region)
         .invoke()
         .function_name(&dispatch.function_arn)
@@ -659,7 +744,7 @@ pub async fn invoke(
     // The budget is Amazon Cognito's own, not the function's: a function still running
     // when it elapses is not waited for any longer, and the invocation it was given up on
     // produced no verdict.
-    let Ok(answer) = ::tokio::time::timeout(TRIGGER_INVOCATION_BUDGET, invocation).await else {
+    let Ok(answer) = ::tokio::time::timeout_at(deadline, invocation).await else {
         return Err(Failure::NotInvokable(failure_message(
             dispatch.trigger,
             TRIGGER_TIMEOUT_ERROR,
@@ -714,6 +799,74 @@ pub async fn invoke(
     // function's is not read — the trigger runs after the outcome it could have modified —
     // and a gating function's is handed back to the operation it gates.
     Ok(Verdict::Answered(answered_event(output.payload())))
+}
+
+/// The CLASS of error this service's invocation of `dispatch`'s function is refused with, or
+/// `None` when nothing refuses it.
+///
+/// Amazon Cognito invokes a trigger as its own service principal, so the only document that
+/// can admit the invocation is the FUNCTION's own resource-based policy, read from Lambda
+/// itself. The two readings, in order:
+///
+/// * the function AS LAMBDA HOLDS IT, whose ARN is the resource a statement grants on. A
+///   function Lambda answers nothing about — an emulator with no Lambda mounted, a record it
+///   holds none of — establishes nothing here, so nothing is refused on it and the
+///   invocation below reports whatever Lambda says about it.
+/// * its resource-based policy. A function Lambda holds and reports no policy for carries
+///   none at all, so no document grants this service the invocation; every other failure of
+///   that read establishes nothing.
+async fn refused_by_the_function(
+    ctx: &::smithy_server_runtime::OperationContext<'_>,
+    dispatch: &Dispatch,
+) -> Option<String> {
+    use ::aws_smithy_types::error::metadata::ProvideErrorMetadata;
+
+    let client = lambda_client(ctx, &dispatch.region);
+    let function_arn = client
+        .get_function_configuration()
+        .function_name(&dispatch.function_arn)
+        .send()
+        .await
+        .ok()?
+        .function_arn?;
+    let document = match client
+        .get_policy()
+        .function_name(&dispatch.function_arn)
+        .send()
+        .await
+    {
+        Ok(answer) => answer.policy.unwrap_or_default(),
+        Err(error) if error.code() == Some(LAMBDA_RESOURCE_NOT_FOUND) => String::new(),
+        Err(_) => return None,
+    };
+    if invocation_is_allowed(&document, &function_arn, dispatch) {
+        return None;
+    }
+    // The class an unauthorized invocation is refused with, which is what the operation that
+    // fired the trigger reports: no policy in force on the function allows this service's
+    // principal the invoking action, which is IAM's own `AccessDeniedException`.
+    Some(ACCESS_DENIED_EXCEPTION.to_string())
+}
+
+/// Whether the resource-based policy `document` in force on the function `function_arn`
+/// allows this service's principal to invoke it for the pool `dispatch` serves a trigger of.
+///
+/// Decided by the shared IAM evaluation, in the condition context a call made as a service
+/// principal on behalf of one resource carries: the pool's own ARN and its account.
+fn invocation_is_allowed(document: &str, function_arn: &str, dispatch: &Dispatch) -> bool {
+    use ::service_common::iam_authorization::{resource_decision, Decision, Request};
+
+    let principals = [SERVICE_PRINCIPAL.to_string()];
+    let context = [
+        (SOURCE_ARN_KEY.to_string(), dispatch.source_arn.clone()),
+        (
+            SOURCE_ACCOUNT_KEY.to_string(),
+            dispatch.source_account.clone(),
+        ),
+    ];
+    let request = Request::new(INVOKE_FUNCTION_ACTION, function_arn, &principals)
+        .with_context(&context);
+    resource_decision(document, &request) == Decision::Allowed
 }
 
 /// The document a returning function answered with, or `Value::Null` for a function that

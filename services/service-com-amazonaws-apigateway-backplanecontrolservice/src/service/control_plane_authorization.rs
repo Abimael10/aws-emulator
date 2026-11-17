@@ -79,10 +79,30 @@ pub fn action_for(http_method: &str) -> String {
 /// this call by.
 #[must_use]
 pub fn judged_resource(ctx: &OperationContext<'_>, req: &RtRequest) -> String {
-    // The PATH alone: the query string carries the request's parameters, not the resource
-    // it addresses, so a statement naming the resource cannot be made to depend on them.
-    let path = req.uri().split('?').next().unwrap_or_default();
-    crate::state::service_arn(&crate::state::request_region(ctx.parts()), path)
+    crate::state::service_arn(&crate::state::request_region(ctx.parts()), judged_path(req))
+}
+
+/// The PATH of a control-plane request, which is the resource portion of the ARN the
+/// decision is taken over — whichever form the request LINE carries it in.
+///
+/// A request this seam is handed carries its URI as a `&str`, and an AWS SDK sends the
+/// ABSOLUTE form (`https://apigateway.{region}.amazonaws.com/restapis`), which is what
+/// every call made by an SDK client of this emulator — a handler's own call among them —
+/// puts on the wire; a client that sends the origin form (`/restapis`) addresses the same
+/// resource. So the scheme and the authority are dropped, through the one reader of a whole
+/// request URI's path this tree has ([`::service_common::uri_path`]), and a statement
+/// naming the resource decides both forms alike.
+///
+/// The QUERY is dropped FIRST, and for two reasons: it carries the request's parameters
+/// rather than the resource it addresses, so a statement naming the resource cannot be made
+/// to depend on them; and a query VALUE may itself carry `://`, which a scheme scan over the
+/// whole URI would mistake for the authority.
+///
+/// Borrowed from the request rather than copied out of it, so the seam allocates nothing per
+/// request.
+fn judged_path(req: &RtRequest) -> &str {
+    let without_query = req.uri().split('?').next().unwrap_or_default();
+    ::service_common::uri_path(without_query)
 }
 
 /// `Some(denial)` when IAM does not allow this request's action on the resource it names,

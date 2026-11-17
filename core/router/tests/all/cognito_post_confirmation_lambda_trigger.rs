@@ -185,6 +185,25 @@ async fn create_function(router: &MultiServiceRouter, name: &str) -> String {
         status, 201,
         "case {name:?}: expected HTTP 201 from Lambda CreateFunction, got {status} ({created})"
     );
+    // Cognito invokes a trigger as its OWN service principal, so the function's
+    // resource-based policy has to admit it: `AddPermission` writes the grant AWS asks for on
+    // every function a pool's `LambdaConfig` names.
+    let (status, granted) = rest(
+        router,
+        "lambda",
+        "POST",
+        &format!("/2015-03-31/functions/{name}/policy"),
+        json!({
+            "StatementId": "cognito-idp-trigger-invoke",
+            "Action": "lambda:InvokeFunction",
+            "Principal": "cognito-idp.amazonaws.com",
+        }),
+    )
+    .await;
+    assert_eq!(
+        status, 201,
+        "case {name:?}: expected HTTP 201 from Lambda AddPermission, got {status} ({granted})"
+    );
     created["FunctionArn"]
         .as_str()
         .unwrap_or_else(|| panic!("CreateFunction must mint an ARN, got {created}"))

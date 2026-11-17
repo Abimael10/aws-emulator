@@ -5,7 +5,7 @@
 //!
 //! Every case drives the real wire path — a `restJson1` HTTP request through the
 //! multi-service router into the mounted service — so what is asserted is what a client
-//! sees, not what a handler returns. [`Gateway`], `create_api`, `make_deployable` and
+//! sees, not what a handler returns. [`Gateway`], `create_api` and
 //! `string_member` are this crate's one wire-test harness, reused from
 //! `rest_api_lifecycle`; a domain name comes through `domain_name_collection`, a deployed
 //! stage through `base_path_mapping`, a snapshot through `documentation_versions` and a
@@ -15,7 +15,10 @@
 //! The rule, asserted over a TABLE of collections rather than one listing: a paginated
 //! collection of this service writes its page member — `item` on the wire — exactly when
 //! that page holds an element, so a collection emptied of its last element answers with the
-//! success envelope and NO page member, on every collection alike.
+//! success envelope and NO page member, on every collection whose own recorded answer leaves
+//! that member out. The DEPLOYMENTS collection's does not — it carries the member as an empty
+//! list — so its emptied answer is asserted by `crate::deployment_collection`, which owns
+//! that collection.
 //!
 //! Each row reaches the empty collection by DELETING the one element it created, not by
 //! never creating one, so what is asserted is the answer a collection makes once it is
@@ -27,20 +30,20 @@ use serde_json::{json, Value};
 use crate::base_path_mapping::deployed_api;
 use crate::documentation_versions::create_version;
 use crate::domain_name_collection::created_domain;
-use crate::rest_api_lifecycle::{create_api, make_deployable, string_member, Gateway};
+use crate::rest_api_lifecycle::{create_api, string_member, Gateway};
 use crate::vpc_links::{create_vpc_link, target_arn};
 
-/// Every collection this suite empties, named by the operation that lists it. Three of
-/// them — `GetDeployments`, `GetDocumentationVersions` and `GetVpcLinks` — are
-/// API-scoped, API-scoped and account-level respectively; `GetBasePathMappings` hangs off
-/// a domain name.
+/// Every collection this suite empties, named by the operation that lists it. Two of
+/// them — `GetDocumentationVersions` and `GetVpcLinks` — are API-scoped and account-level
+/// respectively; `GetBasePathMappings` hangs off a domain name. The deployments collection
+/// is not among them: its own recorded answer carries the page member as an empty list, so
+/// `crate::deployment_collection` asserts its emptied answer instead.
 const COLLECTIONS: &[&str] = &[
     "GetRestApis",
     "GetApiKeys",
     "GetUsagePlans",
     "GetClientCertificates",
     "GetVpcLinks",
-    "GetDeployments",
     "GetDocumentationVersions",
     "GetBasePathMappings",
 ];
@@ -134,26 +137,6 @@ async fn emptied(gateway: &Gateway, collection: &str) -> String {
             let id = string_member(&answer.body, "id", collection);
             deleted(gateway, &format!("/vpclinks/{id}"), collection).await;
             "/vpclinks".to_string()
-        }
-        "GetDeployments" => {
-            let (api, _root) = create_api(gateway, "emptied-deployments").await;
-            make_deployable(gateway, &api).await;
-            let deployment = created(
-                gateway,
-                &format!("/restapis/{api}/deployments"),
-                json!({}),
-                201,
-                collection,
-            )
-            .await;
-            let id = string_member(&deployment, "id", collection);
-            deleted(
-                gateway,
-                &format!("/restapis/{api}/deployments/{id}"),
-                collection,
-            )
-            .await;
-            format!("/restapis/{api}/deployments")
         }
         "GetDocumentationVersions" => {
             let (api, _root) = create_api(gateway, "emptied-versions").await;

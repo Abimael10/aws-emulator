@@ -4,6 +4,12 @@
 //! IMPLEMENTED: lists the stored `Deployment`s of `restApiId` in creation order — the
 //! oldest first — one `position`/`limit` page at a time. Reads only.
 //!
+//! The page member is reported whatever the page holds: an api that holds no deployment is
+//! answered an EMPTY `items` list, which is the answer recorded for this collection — a
+//! client reads "nothing is deployed" off a list it can count rather than off an absent
+//! member. The collections whose own recorded answer leaves the member out are served by
+//! [`crate::state::Page::reported_items`] instead.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -162,7 +168,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })?;
         // This operation models no `embed` member — only `GetDeployment` does — so no
         // listed deployment reports an `apiSummary`.
-        let items = page
+        let items: Vec<_> = page
             .ids
             .iter()
             .filter_map(|id| api.deployments.get(id))
@@ -170,7 +176,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .collect();
         Ok(Paged::new(
             GetDeploymentsOutput {
-                items: page.reported_items(items),
+                // THIS collection reports its page member whatever the page holds: the
+                // recorded answer for an api that holds no deployment carries the member as
+                // an EMPTY list, so a client reading it to decide whether anything has been
+                // deployed finds a list rather than nothing. That is a fact about this
+                // collection, which is why it is not
+                // [`crate::state::Page::reported_items`] — the collections whose recorded
+                // answer leaves the member out keep leaving it out.
+                items: Some(items),
                 position: page.next_position.clone(),
             },
             page.echoed_limit(),
