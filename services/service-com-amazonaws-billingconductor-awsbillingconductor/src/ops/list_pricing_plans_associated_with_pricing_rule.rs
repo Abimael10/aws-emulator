@@ -3,7 +3,11 @@
 //! @op ListPricingPlansAssociatedWithPricingRule
 //! REPORTS, for the pricing rule the request names, the pricing plans that associate
 //! that rule IN THE BILLING PERIOD the request asks about, and writes nothing
-//! (`@readonly`). The association is held on the PLAN record
+//! (`@readonly`). The rule is the resource the request REFERENCES, so its existence is
+//! resolved in that same period
+//! (`crate::state::ComAmazonawsBillingconductorAwsbillingconductorState::pricing_rule_exists_in`):
+//! a period this account held no such rule in earns the modelled 404, not a 200 with no
+//! associations. The association is held on the PLAN record
 //! (`crate::state::PricingPlanRecord::pricing_rule_associations`), so this is the
 //! inverse index of `ListPricingRulesAssociatedToPricingPlan`, derived from the same
 //! stored associations through `pricing_plans_referencing_rule` — the very set
@@ -176,12 +180,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // and both name one rule.
         let pricing_rule_arn = crate::state::normalize_pricing_rule_arn(&input.pricing_rule_arn);
 
+        // "The pricing plan billing period for which associations will be listed":
+        // the read is scoped to ONE period, and an association is in force only from
+        // the period it was made in onward. A request that names no period asks about
+        // the current one.
+        let billing_period = input
+            .billing_period
+            .clone()
+            .unwrap_or_else(crate::state::current_billing_period);
+
         // The associations of a rule nobody created are not an empty set: the rule is
-        // the resource the request references, so a rule this account does not hold is
-        // the modelled 404. There are no AWS-managed pricing rules — the
-        // `PricingRuleArn` pattern allows only a 12-digit account segment — so what is
-        // stored is the whole universe of rules.
-        if !state.pricing_rules.contains_key(&pricing_rule_arn) {
+        // the resource the request references, so a rule this account does not hold IN
+        // THE PERIOD BEING READ is the modelled 404 — the same answer the period-scoped
+        // listing of the rules gives by leaving the rule out of that period
+        // (`crate::state::ComAmazonawsBillingconductorAwsbillingconductorState::pricing_rule_exists_in`).
+        // There are no AWS-managed pricing rules — the `PricingRuleArn` pattern allows
+        // only a 12-digit account segment — so what is stored is the whole universe of
+        // rules.
+        if !state.pricing_rule_exists_in(&pricing_rule_arn, &billing_period) {
             return Err(
                 ListPricingPlansAssociatedWithPricingRuleErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {
@@ -193,15 +209,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into(),
             );
         }
-
-        // "The pricing plan billing period for which associations will be listed":
-        // the read is scoped to ONE period, and an association is in force only from
-        // the period it was made in onward. A request that names no period asks about
-        // the current one.
-        let billing_period = input
-            .billing_period
-            .clone()
-            .unwrap_or_else(crate::state::current_billing_period);
 
         // The plans that associate this rule in that period, as FULL plan ARNs:
         // `pricing_plans` is keyed by that ARN and ordered by it, so the sequence is

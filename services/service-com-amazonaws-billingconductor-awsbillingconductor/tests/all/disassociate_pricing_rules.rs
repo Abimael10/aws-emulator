@@ -31,7 +31,9 @@
 
 use serde_json::{json, Value};
 
-use crate::pricing_rule_association_periods::{arns, shift_period, Emulator};
+use crate::pricing_rule_association_periods::{
+    arns, assert_no_such_resource_in_period, shift_period, Emulator,
+};
 
 /// `PUT /disassociate-pricing-rules` — the operation's modelled HTTP binding
 /// (`smithy_query(query="operation", operation="DisassociatePricingRules")`).
@@ -115,12 +117,26 @@ async fn disassociate(em: &Emulator, plan: &str, rules: &[String]) -> (u16, Valu
 
 /// The rules the plan associates in `period` (`None` names no period, i.e. the current
 /// one), as the service reports them.
+///
+/// The plan is the resource this read references, so a period this account held no such
+/// plan in is refused with the modelled 404 and reports no association at all.
 async fn rules_of(em: &Emulator, case: &str, plan: &str, period: Option<&str>) -> Vec<String> {
     let mut body = json!({"PricingPlanArn": plan});
     if let Some(period) = period {
         body["BillingPeriod"] = json!(period);
     }
     let (status, answered) = em.post(LIST_RULES_OF_PLAN, &body).await;
+    if !em.plan_existed_in(plan, period) {
+        assert_no_such_resource_in_period(
+            case,
+            "ListPricingRulesAssociatedToPricingPlan",
+            status,
+            &answered,
+            "pricingplan",
+            period,
+        );
+        return Vec::new();
+    }
     assert_eq!(
         status, 200,
         "case {case:?}: ListPricingRulesAssociatedToPricingPlan expected 200, got {status} \
@@ -130,12 +146,26 @@ async fn rules_of(em: &Emulator, case: &str, plan: &str, period: Option<&str>) -
 }
 
 /// The plans the rule is associated with in `period`, as the service reports them.
+///
+/// The rule is the resource this read references, so a period this account held no such
+/// rule in is refused with the modelled 404 and reports no association at all.
 async fn plans_of(em: &Emulator, case: &str, rule: &str, period: Option<&str>) -> Vec<String> {
     let mut body = json!({"PricingRuleArn": rule});
     if let Some(period) = period {
         body["BillingPeriod"] = json!(period);
     }
     let (status, answered) = em.post(LIST_PLANS_OF_RULE, &body).await;
+    if !em.rule_existed_in(rule, period) {
+        assert_no_such_resource_in_period(
+            case,
+            "ListPricingPlansAssociatedWithPricingRule",
+            status,
+            &answered,
+            "pricingrule",
+            period,
+        );
+        return Vec::new();
+    }
     assert_eq!(
         status, 200,
         "case {case:?}: ListPricingPlansAssociatedWithPricingRule expected 200, got {status} \

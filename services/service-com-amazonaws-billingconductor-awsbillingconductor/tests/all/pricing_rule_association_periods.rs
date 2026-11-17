@@ -13,6 +13,12 @@
 //! `PricingRuleListElement.AssociatedPricingPlanCount`). A read that names no period
 //! asks about the current one.
 //!
+//! Each of those two listings REFERENCES one resource — the plan it addresses, the rule
+//! it addresses — and resolves it in the period being read, so a period in which this
+//! account held no such resource is refused with the modelled 404 rather than answered
+//! with an empty association set ([`assert_no_such_resource_in_period`]); only a period
+//! the resource existed in reports "no association in force".
+//!
 //! Each table's rows differ along what the rule generalises over: the period an
 //! association started in (the epoch month, a December, a January, a far-future
 //! month, and both spellings of one month the modelled `BillingPeriod` pattern
@@ -373,21 +379,81 @@ impl Emulator {
         self.create_rule_in(rule_arn, period);
     }
 
+    /// The billing period a stored pricing plan was CREATED in, derived from the stored
+    /// instant the way the service derives it, or `None` when the store holds no such
+    /// plan — which exists in no period at all.
+    ///
+    /// An AWS-managed plan is held by no account and created by no call, so it has no
+    /// creation period; [`Self::plan_existed_in`] answers for it separately.
+    pub(crate) fn plan_creation_period(&self, plan_arn: &str) -> Option<String> {
+        let arn = normalize_plan(plan_arn);
+        let state = self.engine.state::<BillingConductorState>();
+        let state = state.lock();
+        state
+            .pricing_plans
+            .get(&arn)
+            .map(|plan| period_of_instant(plan.creation_time_millis))
+    }
+
+    /// The billing period a stored pricing rule was CREATED in, or `None` when the store
+    /// holds no such rule.
+    pub(crate) fn rule_creation_period(&self, rule_arn: &str) -> Option<String> {
+        let arn = normalize_rule(rule_arn);
+        let state = self.engine.state::<BillingConductorState>();
+        let state = state.lock();
+        state
+            .pricing_rules
+            .get(&arn)
+            .map(|rule| period_of_instant(rule.creation_time_millis))
+    }
+
+    /// Did the pricing plan the request addresses exist in the billing period the read
+    /// asks about — is it one of the plans that period reports?
+    ///
+    /// A resource exists in no period before the one it was created in, and a read that
+    /// names no period asks about the current one. An AWS-managed plan is there without
+    /// any call creating it, so it exists in every period.
+    pub(crate) fn plan_existed_in(&self, plan_arn: &str, period: Option<&str>) -> bool {
+        if is_aws_managed_plan(&normalize_plan(plan_arn)) {
+            return true;
+        }
+        self.plan_creation_period(plan_arn)
+            .is_some_and(|created| asks_about(period) >= period_months(&created))
+    }
+
+    /// Did the pricing rule the request addresses exist in the billing period the read
+    /// asks about? There are no AWS-managed pricing rules, so what is stored is the whole
+    /// universe of rules ([`Self::plan_existed_in`] for the plan side).
+    pub(crate) fn rule_existed_in(&self, rule_arn: &str, period: Option<&str>) -> bool {
+        self.rule_creation_period(rule_arn)
+            .is_some_and(|created| asks_about(period) >= period_months(&created))
+    }
+
     /// The rule ARNs `ListPricingRulesAssociatedToPricingPlan` reports for `plan` in
     /// `period` (`None` names no period at all).
+    ///
+    /// The plan is the resource that read REFERENCES, so a period this account held no
+    /// such plan in is answered with the modelled 404 rather than with an empty set of
+    /// associations ([`assert_no_such_resource_in_period`]), and the associations such a
+    /// period reports are none.
     pub(crate) async fn rules_for_plan(
         &self,
         case: &str,
         plan: &str,
         period: Option<&str>,
     ) -> Vec<String> {
-        let mut body = json!({"PricingPlanArn": plan});
-        if let Some(period) = period {
-            body["BillingPeriod"] = json!(period);
+        let (status, answer) = self.rules_for_plan_response(plan, period).await;
+        if !self.plan_existed_in(plan, period) {
+            assert_no_such_resource_in_period(
+                case,
+                "ListPricingRulesAssociatedToPricingPlan",
+                status,
+                &answer,
+                "pricingplan",
+                period,
+            );
+            return Vec::new();
         }
-        let (status, answer) = self
-            .post("/list-pricing-rules-associated-to-pricing-plan", &body)
-            .await;
         assert_eq!(
             status, 200,
             "case {case}: ListPricingRulesAssociatedToPricingPlan expected 200, got {status} \
@@ -396,40 +462,79 @@ impl Emulator {
         arns(&answer, "PricingRuleArns")
     }
 
+    /// The raw answer of `ListPricingRulesAssociatedToPricingPlan`: the status and the
+    /// parsed body, for a caller that asserts the refusal itself.
+    pub(crate) async fn rules_for_plan_response(
+        &self,
+        plan: &str,
+        period: Option<&str>,
+    ) -> (u16, Value) {
+        let mut body = json!({"PricingPlanArn": plan});
+        if let Some(period) = period {
+            body["BillingPeriod"] = json!(period);
+        }
+        self.post("/list-pricing-rules-associated-to-pricing-plan", &body)
+            .await
+    }
+
     /// The plan ARNs `ListPricingPlansAssociatedWithPricingRule` reports for `rule`
     /// in `period`.
+    ///
+    /// The rule is the resource that read REFERENCES, so a period this account held no
+    /// such rule in is answered with the modelled 404 — the same rule the plan side
+    /// answers by ([`Self::rules_for_plan`]).
     pub(crate) async fn plans_for_rule(
         &self,
         case: &str,
         rule: &str,
         period: Option<&str>,
     ) -> Vec<String> {
-        let (status, plans) = self.plans_for_rule_answer(rule, period).await;
+        let (status, answer) = self.plans_for_rule_response(rule, period).await;
+        if !self.rule_existed_in(rule, period) {
+            assert_no_such_resource_in_period(
+                case,
+                "ListPricingPlansAssociatedWithPricingRule",
+                status,
+                &answer,
+                "pricingrule",
+                period,
+            );
+            return Vec::new();
+        }
         assert_eq!(
             status, 200,
             "case {case}: ListPricingPlansAssociatedWithPricingRule expected 200, got {status} \
-             with {plans:?}"
+             with {answer:?}"
         );
-        plans
+        arns(&answer, "PricingPlanArns")
     }
 
     /// The STATUS `ListPricingPlansAssociatedWithPricingRule` answers for `rule` in
     /// `period`, beside the plan ARNs it reports — the rule-side reader as an existence
-    /// probe too, since it answers the modelled 404 for a rule the store does not hold
-    /// (`tests/all/pricing_rule_delete_reader_agreement.rs`).
+    /// probe too, since it answers the modelled 404 for a rule the period it is read for
+    /// held none of (`tests/all/pricing_rule_delete_reader_agreement.rs`).
     pub(crate) async fn plans_for_rule_answer(
         &self,
         rule: &str,
         period: Option<&str>,
     ) -> (u16, Vec<String>) {
+        let (status, answer) = self.plans_for_rule_response(rule, period).await;
+        (status, arns(&answer, "PricingPlanArns"))
+    }
+
+    /// The raw answer of `ListPricingPlansAssociatedWithPricingRule`: the status and the
+    /// parsed body.
+    pub(crate) async fn plans_for_rule_response(
+        &self,
+        rule: &str,
+        period: Option<&str>,
+    ) -> (u16, Value) {
         let mut body = json!({"PricingRuleArn": rule});
         if let Some(period) = period {
             body["BillingPeriod"] = json!(period);
         }
-        let (status, answer) = self
-            .post("/list-pricing-plans-associated-with-pricing-rule", &body)
-            .await;
-        (status, arns(&answer, "PricingPlanArns"))
+        self.post("/list-pricing-plans-associated-with-pricing-rule", &body)
+            .await
     }
 
     /// The `Size` `ListPricingPlans` reports for `plan` in `period`.
@@ -576,6 +681,82 @@ pub(crate) fn arns(body: &Value, member: &str) -> Vec<String> {
 /// from so an expectation holds whatever month the suite runs in.
 fn current_period() -> String {
     service_com_amazonaws_billingconductor_awsbillingconductor::state::current_billing_period()
+}
+
+/// The billing period an instant falls in, derived the way the service derives the
+/// creation period of a stored resource from its `CreationTime`.
+fn period_of_instant(millis: i64) -> String {
+    service_com_amazonaws_billingconductor_awsbillingconductor::state::billing_period_at(millis)
+}
+
+/// A `PricingPlanArn` in either spelling the modelled pattern allows, as the full ARN the
+/// store keys plans by.
+fn normalize_plan(plan_arn: &str) -> String {
+    service_com_amazonaws_billingconductor_awsbillingconductor::state::normalize_pricing_plan_arn(
+        plan_arn,
+    )
+}
+
+/// A `PricingRuleArn` in either spelling the modelled pattern allows, as the full ARN the
+/// store keys rules by.
+fn normalize_rule(rule_arn: &str) -> String {
+    service_com_amazonaws_billingconductor_awsbillingconductor::state::normalize_pricing_rule_arn(
+        rule_arn,
+    )
+}
+
+/// Is this the ARN of a pricing plan Amazon Web Services owns — one that exists without
+/// any call creating it, and so in every billing period?
+fn is_aws_managed_plan(plan_arn: &str) -> bool {
+    service_com_amazonaws_billingconductor_awsbillingconductor::state::is_aws_managed_pricing_plan(
+        plan_arn,
+    )
+}
+
+/// The billing period a read asks about, as a month count: the one it names, or the
+/// current one when it names none.
+fn asks_about(period: Option<&str>) -> i64 {
+    period
+        .map(period_months)
+        .unwrap_or_else(|| period_months(&current_period()))
+}
+
+/// RULE: a period-scoped association read resolves the resource it REFERENCES in the
+/// period being read, so a period in which this account held no such resource is answered
+/// with the modelled `ResourceNotFoundException` (HTTP 404) rather than with a 200
+/// reporting no association — the same answer the period-scoped LISTING of that resource
+/// gives by leaving it out of that period.
+pub(crate) fn assert_no_such_resource_in_period(
+    case: &str,
+    operation: &str,
+    status: u16,
+    body: &Value,
+    resource_type: &str,
+    period: Option<&str>,
+) {
+    assert_eq!(
+        status, 404,
+        "case {case}: {operation} read for {period:?} names a {resource_type} that period held \
+         none of, so the modelled 404 is expected, got {status} with {body:?}"
+    );
+    let code = body
+        .get("__type")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .rsplit('#')
+        .next()
+        .unwrap_or_default()
+        .to_string();
+    assert_eq!(
+        code, "ResourceNotFoundException",
+        "case {case}: {operation} read for {period:?} must be refused with the modelled \
+         ResourceNotFoundException, got {code:?} in {body:?}"
+    );
+    assert_eq!(
+        body["ResourceType"].as_str(),
+        Some(resource_type),
+        "case {case}: the refusal must name the resource type it could not resolve, got {body:?}"
+    );
 }
 
 /// The periods an association starting in `start` must and must not be reported for:

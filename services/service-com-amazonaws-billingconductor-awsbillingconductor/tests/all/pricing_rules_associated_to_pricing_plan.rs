@@ -9,8 +9,8 @@
 //! pricing rules whose association with that plan is in force in the `BillingPeriod`
 //! asked about — each as its FULL rule ARN, deduplicated, in ARN order, bounded by
 //! the request's `MaxResults` with a `NextToken` naming the rest — while a plan this
-//! account does not hold is refused with the modelled 404. Nothing is written: a
-//! later caller sees exactly what an earlier one did.
+//! account did not hold IN THE PERIOD BEING READ is refused with the modelled 404.
+//! Nothing is written: a later caller sees exactly what an earlier one did.
 //!
 //! The period dimension itself — which periods report an association that started in
 //! a given one — is the subject of `tests/all/pricing_rule_association_periods.rs`.
@@ -28,6 +28,8 @@ use service_com_amazonaws_billingconductor_awsbillingconductor::{
 };
 use smithy_server_runtime::MultiServiceRouter;
 use std::sync::Arc;
+
+use crate::pricing_rule_association_periods::shift_period;
 
 /// `POST /list-pricing-rules-associated-to-pricing-plan` — the operation's modelled
 /// HTTP binding (`smithy_query(query="operation",
@@ -372,9 +374,45 @@ async fn the_reported_period_is_the_one_the_request_named_and_otherwise_absent()
     // derived rather than written down.
     let started_in = current_period();
 
-    // Rows differ along the period asked for: months at each end of the modelled
-    // `BillingPeriod` pattern, a past year and a future one.
-    for period in ["2020-01", "2026-09", "2026-10", "2031-12"] {
+    // Rows differ along the period asked for: the epoch month, the period before the
+    // plan was created, that period itself, the next one, a year and a month on, and a
+    // far-future month — so both sides of the period-scoped rule are covered.
+    for period in [
+        "1970-01".to_string(),
+        shift_period(&started_in, -1),
+        started_in.clone(),
+        shift_period(&started_in, 1),
+        shift_period(&started_in, 13),
+        "9999-12".to_string(),
+    ] {
+        let period = period.as_str();
+        if !period_at_or_after(period, &started_in) {
+            // The plan is the resource this read REFERENCES, and it is resolved in the
+            // period being read: a period this account held no such plan in is the
+            // modelled 404 rather than a 200 reporting no association.
+            let (status, body) = em.list(&plan, None, None, Some(period)).await;
+            assert_eq!(
+                status, 404,
+                "case {period:?}: the period held no such pricing plan, so the modelled 404 \
+                 is expected, got {status} with {body:?}"
+            );
+            assert_eq!(
+                error_code(&body),
+                "ResourceNotFoundException",
+                "case {period:?}: expected ResourceNotFoundException, got {body:?}"
+            );
+            assert_eq!(
+                body["ResourceType"].as_str(),
+                Some("pricingplan"),
+                "case {period:?}: the refusal must name the resource type, got {body:?}"
+            );
+            assert_eq!(
+                body["ResourceId"].as_str(),
+                Some(plan.as_str()),
+                "case {period:?}: the refusal must name the plan asked for, got {body:?}"
+            );
+            continue;
+        }
         let (status, body) = em.list(&plan, None, None, Some(period)).await;
         assert_eq!(
             status, 200,
@@ -391,16 +429,11 @@ async fn the_reported_period_is_the_one_the_request_named_and_otherwise_absent()
             "case {period:?}: the reported period must satisfy the modelled YYYY-MM form, \
              got {body:?}"
         );
-        let expected: Vec<String> = if period_at_or_after(period, &started_in) {
-            vec![rule.clone()]
-        } else {
-            vec![]
-        };
         assert_eq!(
             reported(&body),
-            expected,
+            vec![rule.clone()],
             "case {period:?}: an association that started in {started_in} must be reported \
-             from that period onward and not before; expected {expected:?}, got {body:?}"
+             from that period onward; expected {rule:?}, got {body:?}"
         );
     }
 

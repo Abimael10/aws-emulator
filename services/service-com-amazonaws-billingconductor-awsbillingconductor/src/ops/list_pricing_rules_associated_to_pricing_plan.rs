@@ -9,10 +9,12 @@
 //!
 //! The order the answers are decided in:
 //!
-//! 1. a plan this account does not hold is `ResourceNotFoundException` (404). This
-//!    service stores ONE account's plans, keyed by the ARN it minted for them, so a
-//!    `PricingPlanArn` carrying another account's id is a plan this store does not
-//!    hold and is answered the same 404;
+//! 1. a plan this account does not hold IN THE PERIOD BEING READ is
+//!    `ResourceNotFoundException` (404) — a plan exists in no period before the one it
+//!    was created in, so a period that held no such plan has no associations of it to
+//!    report rather than none in force. This service stores ONE account's plans, keyed by
+//!    the ARN it minted for them, so a `PricingPlanArn` carrying another account's id is
+//!    a plan this store does not hold and is answered the same 404;
 //! 2. an AWS-managed plan (`BasicPricingPlan` / `Passthrough`) exists without the
 //!    caller having created it and carries no rule of the caller's, so it reports
 //!    an empty association set;
@@ -199,6 +201,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let Some(rule_arns) = state.associated_pricing_rule_arns(&pricing_plan_arn, &billing_period)
         else {
+            // The plan is the resource this read references, and whether it exists is
+            // asked of the period being read: a period this account held no such plan in
+            // is the modelled 404 rather than a 200 reporting no association.
             return Err(
                 ListPricingRulesAssociatedToPricingPlanErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {

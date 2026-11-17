@@ -3889,9 +3889,45 @@ impl ComAmazonawsBillingconductorAwsbillingconductorState {
             .unwrap_or(i64::MAX)
     }
 
+    /// Did the pricing rule `rule_arn` exist in `billing_period` — is it one of the rules
+    /// a read scoped to that period reports?
+    ///
+    /// The same question the period-scoped LISTING of the rules answers for a whole
+    /// period ([`VersionedResource::exists_in`], which `ListPricingRules` filters on),
+    /// asked about the ONE rule a read addresses by ARN, so a read of one rule cannot
+    /// disagree with the listing of the period it asks about: a rule exists from the
+    /// period it was created in on. There are no AWS-managed pricing rules — the
+    /// `PricingRuleArn` pattern allows only a 12-digit account segment — so what is
+    /// stored is the whole universe of rules, and an ARN this account holds no rule for
+    /// names no rule in any period at all.
+    pub fn pricing_rule_exists_in(&self, rule_arn: &str, billing_period: &str) -> bool {
+        self.pricing_rules
+            .get(rule_arn)
+            .is_some_and(|rule| rule.exists_in(billing_period))
+    }
+
+    /// Did the pricing plan `plan_arn` exist in `billing_period` — is it one of the plans
+    /// a read scoped to that period reports?
+    ///
+    /// The period-scoped half of [`Self::pricing_plan_exists`], and the plan-side twin of
+    /// [`Self::pricing_rule_exists_in`]: a stored plan exists from the period it was
+    /// created in on ([`VersionedResource::exists_in`]), while an AWS-managed plan exists
+    /// without the caller creating it and so exists in every period.
+    pub fn pricing_plan_exists_in(&self, plan_arn: &str, billing_period: &str) -> bool {
+        is_aws_managed_pricing_plan(plan_arn)
+            || self
+                .pricing_plans
+                .get(plan_arn)
+                .is_some_and(|plan| plan.exists_in(billing_period))
+    }
+
     /// True when the pricing plan ARN can be used by a billing group: either the
     /// caller created it, or it is one of the AWS-managed plans the
     /// `PricingPlanFullArn` pattern names.
+    ///
+    /// Asked of the LIVE store, which is the period every write lands in: a stored plan
+    /// exists in the current billing period whenever it exists at all. A read scoped to
+    /// another period asks [`Self::pricing_plan_exists_in`] instead.
     pub fn pricing_plan_exists(&self, arn: &str) -> bool {
         is_aws_managed_pricing_plan(arn) || self.pricing_plans.contains_key(arn)
     }
@@ -3985,7 +4021,13 @@ impl ComAmazonawsBillingconductorAwsbillingconductorState {
 
     /// The pricing rules associated with the plan `plan_arn` names IN
     /// `billing_period`: FULL rule ARNs, deduplicated and in ARN order, or `None`
-    /// when this account has no such plan.
+    /// when this account held no such plan IN THAT PERIOD.
+    ///
+    /// The plan is the resource such a read references, and whether it exists is asked of
+    /// the period the read is scoped to ([`Self::pricing_plan_exists_in`]), not of the
+    /// live store: a period before the plan was created held no such plan, so it has no
+    /// associations to report rather than an empty set of them — the same answer the
+    /// period-scoped listing of the plans gives by leaving the plan out.
     ///
     /// An association is in force from the billing period it was made in onward, so a
     /// period before it started reports it not at all — see
@@ -3999,10 +4041,15 @@ impl ComAmazonawsBillingconductorAwsbillingconductorState {
         plan_arn: &str,
         billing_period: &str,
     ) -> Option<Vec<String>> {
-        match self.pricing_plans.get(plan_arn) {
-            Some(plan) => Some(plan.associated_rule_arns(billing_period)),
-            None => is_aws_managed_pricing_plan(plan_arn).then(Vec::new),
+        if !self.pricing_plan_exists_in(plan_arn, billing_period) {
+            return None;
         }
+        Some(
+            self.pricing_plans
+                .get(plan_arn)
+                .map(|plan| plan.associated_rule_arns(billing_period))
+                .unwrap_or_default(),
+        )
     }
 
     /// The rules a request's `PricingRuleArns` names, as FULL rule ARNs — or the

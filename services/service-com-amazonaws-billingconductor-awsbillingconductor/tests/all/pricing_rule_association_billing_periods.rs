@@ -11,7 +11,9 @@
 //! `PricingRuleListElement.AssociatedPricingPlanCount`) and the pages a `MaxResults`
 //! read walks (`tests/all/pricing_rule_association_period_subsets.rs`). A period in
 //! which no association is in force reports the list member not at all, because both
-//! listings model it `@length(min: 1)`.
+//! listings model it `@length(min: 1)` — and a period in which the resource the read
+//! ADDRESSES did not exist at all is refused with the modelled 404 instead, since there
+//! is no such plan or rule then to report associations of.
 //!
 //! `tests/all/pricing_rule_association_periods.rs` owns the rule for ONE association
 //! against the period it started in, and owns the harness both suites drive; this
@@ -22,7 +24,9 @@
 
 use serde_json::json;
 
-use crate::pricing_rule_association_periods::{arns, period_months, Emulator};
+use crate::pricing_rule_association_periods::{
+    arns, assert_no_such_resource_in_period, period_months, Emulator,
+};
 
 /// `ListPricingPlansAssociatedWithPricingRule` — the plans one rule is associated with.
 const PLANS_FOR_RULE: &str = "/list-pricing-plans-associated-with-pricing-rule";
@@ -70,6 +74,9 @@ pub(crate) fn in_force(rules: &[String], period: &str) -> Vec<String> {
 
 /// `ListPricingRulesAssociatedToPricingPlan` for one period: the reported rule ARNs,
 /// and whether the response carried the member at all.
+///
+/// A period in which the plan this read addresses did not exist is refused with the
+/// modelled 404 instead, and reports no association and no member.
 async fn rules_for_plan(
     em: &Emulator,
     case: &str,
@@ -82,6 +89,17 @@ async fn rules_for_plan(
             &json!({"PricingPlanArn": plan, "BillingPeriod": period}),
         )
         .await;
+    if !em.plan_existed_in(plan, Some(period)) {
+        assert_no_such_resource_in_period(
+            case,
+            "ListPricingRulesAssociatedToPricingPlan",
+            status,
+            &body,
+            "pricingplan",
+            Some(period),
+        );
+        return (Vec::new(), false);
+    }
     assert_eq!(
         status, 200,
         "case {case}: ListPricingRulesAssociatedToPricingPlan expected 200, got {status} \
@@ -95,6 +113,9 @@ async fn rules_for_plan(
 
 /// `ListPricingPlansAssociatedWithPricingRule` for one period: the reported plan ARNs,
 /// and whether the response carried the member at all.
+///
+/// A period in which the rule this read addresses did not exist is refused with the
+/// modelled 404 instead, and reports no association and no member.
 async fn plans_for_rule(
     em: &Emulator,
     case: &str,
@@ -107,6 +128,17 @@ async fn plans_for_rule(
             &json!({"PricingRuleArn": rule, "BillingPeriod": period}),
         )
         .await;
+    if !em.rule_existed_in(rule, Some(period)) {
+        assert_no_such_resource_in_period(
+            case,
+            "ListPricingPlansAssociatedWithPricingRule",
+            status,
+            &body,
+            "pricingrule",
+            Some(period),
+        );
+        return (Vec::new(), false);
+    }
     assert_eq!(
         status, 200,
         "case {case}: ListPricingPlansAssociatedWithPricingRule expected 200, got {status} \

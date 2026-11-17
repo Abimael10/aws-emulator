@@ -9,9 +9,10 @@
 //! plans whose association with that rule is in force in the `BillingPeriod` asked
 //! about — each as its FULL plan ARN, deduplicated, in ARN order, bounded by the
 //! request's `MaxResults` with a `NextToken` naming the rest — while a rule this
-//! account does not hold is refused with the modelled 404. It is the inverse index of
-//! `ListPricingRulesAssociatedToPricingPlan` over one set of associations, so the two
-//! agree. Nothing is written: a later caller sees exactly what an earlier one did.
+//! account did not hold IN THE PERIOD BEING READ is refused with the modelled 404. It is
+//! the inverse index of `ListPricingRulesAssociatedToPricingPlan` over one set of
+//! associations, so the two agree. Nothing is written: a later caller sees exactly what
+//! an earlier one did.
 //!
 //! Every table's rows differ along what the rule generalises over: how many plans
 //! associate the rule (0, 1, 2, 3, 12), the spelling each association was recorded
@@ -26,6 +27,8 @@ use service_com_amazonaws_billingconductor_awsbillingconductor::{
 };
 use smithy_server_runtime::MultiServiceRouter;
 use std::sync::Arc;
+
+use crate::pricing_rule_association_periods::shift_period;
 
 /// `POST /list-pricing-plans-associated-with-pricing-rule` — the operation's modelled
 /// HTTP binding (`smithy_query(query="operation",
@@ -220,6 +223,27 @@ fn is_billing_period(value: &str) -> bool {
             .parse::<u32>()
             .is_ok_and(|month| (1..=12).contains(&month))
         && (1..=2).contains(&month.len())
+}
+
+/// The billing period the service calls current, read from the same clock it answers
+/// from, so an expectation holds whatever month the suite runs in. Every resource this
+/// suite creates is created by a call made now, so this is the first period that holds
+/// it.
+fn current_period() -> String {
+    service_com_amazonaws_billingconductor_awsbillingconductor::state::current_billing_period()
+}
+
+/// The one-digit month spelling of a `YYYY-MM` period, which the modelled
+/// `BillingPeriod` pattern `^\d{4}-(0?[1-9]|1[012])$` allows beside the padded form, so
+/// the two spell ONE period.
+fn one_digit_month(period: &str) -> String {
+    let (year, month) = period
+        .split_once('-')
+        .expect("a billing period is spelled YYYY-MM");
+    let month: u32 = month
+        .parse()
+        .expect("a billing period has a numeric month");
+    format!("{year}-{month}")
 }
 
 /// How one plan of a table row spells the rule it associates.
@@ -473,33 +497,31 @@ async fn the_reported_period_is_the_one_the_request_named_and_otherwise_absent()
         .create_plan("period-plan", std::slice::from_ref(&rule))
         .await;
 
-    // The association this test made starts in the billing period the create ran in,
-    // so a period before that reports it not at all and a period from it onward
-    // reports it — whatever month the clock says.
-    let started_in =
-        service_com_amazonaws_billingconductor_awsbillingconductor::state::current_billing_period();
-    let period_key = |value: &str| -> (u32, u32) {
-        let (year, month) = value
-            .split_once('-')
-            .expect("a test period is spelled YYYY-MM");
-        (
-            year.parse().expect("a test period has a numeric year"),
-            month.parse().expect("a test period has a numeric month"),
-        )
-    };
+    // The rule and the association this test made both start in the billing period the
+    // create ran in, so the periods this read is SERVED for are that one and every later
+    // one — a period before it held no such rule at all, which
+    // [`a_period_that_held_no_such_rule_is_refused_with_the_modelled_not_found`] owns.
+    let started_in = current_period();
 
-    // Rows differ along the period asked for: months at each end of the modelled
-    // `BillingPeriod` pattern, a past year and a future one, and the one-digit month
-    // form the pattern also allows (`0?[1-9]`).
-    for period in ["2020-01", "2026-9", "2026-10", "2031-12"] {
-        let (status, body) = em.list(&rule, None, None, Some(period)).await;
+    // Rows differ along the period asked for: the period the rule was created in, the
+    // next one, a year and a month on, a far-future month, and the one-digit month form
+    // the modelled pattern also allows (`0?[1-9]`).
+    let rows = [
+        shift_period(&started_in, 0),
+        shift_period(&started_in, 1),
+        shift_period(&started_in, 13),
+        "9999-12".to_string(),
+        one_digit_month(&started_in),
+    ];
+    for period in rows {
+        let (status, body) = em.list(&rule, None, None, Some(&period)).await;
         assert_eq!(
             status, 200,
             "case {period:?}: expected 200, got {status} with {body:?}"
         );
         assert_eq!(
             body["BillingPeriod"].as_str(),
-            Some(period),
+            Some(period.as_str()),
             "case {period:?}: the response must name the period the request asked about, \
              got {body:?}"
         );
@@ -508,16 +530,11 @@ async fn the_reported_period_is_the_one_the_request_named_and_otherwise_absent()
             "case {period:?}: the reported period must satisfy the modelled YYYY-MM form, \
              got {body:?}"
         );
-        let expected: Vec<String> = if period_key(period) >= period_key(&started_in) {
-            vec![plan.clone()]
-        } else {
-            vec![]
-        };
         assert_eq!(
             reported(&body),
-            expected,
+            vec![plan.clone()],
             "case {period:?}: an association that started in {started_in} must be reported \
-             from that period onward and not before; expected {expected:?}, got {body:?}"
+             from that period onward; expected {plan:?}, got {body:?}"
         );
     }
 
@@ -846,5 +863,166 @@ async fn deleting_a_plan_or_a_rule_is_reflected_in_what_the_read_reports() {
         error_code(&body),
         "ResourceNotFoundException",
         "case \"the rule deleted\": expected ResourceNotFoundException, got {body:?}"
+    );
+}
+
+/// RULE: this listing is scoped to ONE billing period, and the pricing rule it names is
+/// the resource it REFERENCES, so whether that rule exists is resolved IN the period
+/// being read: a period this account held no such rule in is refused with the modelled
+/// `ResourceNotFoundException` (404), exactly as the period-scoped listing of the rules
+/// leaves the rule out of that period. Only a period the rule DID exist in reports "no
+/// plan associates it" — a 200 that omits `PricingPlanArns`. The inverse listing
+/// resolves the plan it addresses the same way.
+///
+/// Rows differ along how far before the rule's creation period the read is (one month,
+/// two, a year and a month, and the epoch month), along the spelling of the rule ARN
+/// (bare id and full ARN), along the month spelling of the period, and along the page
+/// size the request carries — a refusal about the resource precedes the page.
+#[tokio::test]
+async fn a_period_that_held_no_such_rule_is_refused_with_the_modelled_not_found() {
+    let em = Emulator::new();
+    let rule = em.create_rule("Unborn-Rule").await;
+    let plan = em
+        .create_plan("unborn-plan", std::slice::from_ref(&rule))
+        .await;
+    // A create happens NOW, so the period the calls above ran in is the first period
+    // that holds either resource.
+    let created_in = current_period();
+
+    let earlier: Vec<(String, String)> = vec![
+        ("the period before".to_string(), shift_period(&created_in, -1)),
+        (
+            "two periods before".to_string(),
+            shift_period(&created_in, -2),
+        ),
+        (
+            "a year and a month before".to_string(),
+            shift_period(&created_in, -13),
+        ),
+        ("the epoch month".to_string(), "1970-01".to_string()),
+        (
+            "the one-digit spelling of the period before".to_string(),
+            one_digit_month(&shift_period(&created_in, -1)),
+        ),
+    ];
+
+    for (how, period) in &earlier {
+        for (spelled_how, spelled) in [
+            ("the full ARN", rule.clone()),
+            ("the bare id", resource_id(&rule)),
+        ] {
+            for max_results in [None, Some(1), Some(MAX_RESULTS_CEILING)] {
+                let case =
+                    format!("{how} ({period:?}) by {spelled_how}, MaxResults={max_results:?}");
+                let (status, body) = em.list(&spelled, max_results, None, Some(period)).await;
+                assert_eq!(
+                    status, 404,
+                    "case {case}: the period held no such pricing rule, so the modelled 404 is \
+                     expected, got {status} with {body:?}"
+                );
+                assert_eq!(
+                    error_code(&body),
+                    "ResourceNotFoundException",
+                    "case {case}: expected ResourceNotFoundException, got {body:?}"
+                );
+                assert_eq!(
+                    body["ResourceType"].as_str(),
+                    Some("pricingrule"),
+                    "case {case}: the refusal must name the resource type, got {body:?}"
+                );
+                assert_eq!(
+                    body["ResourceId"].as_str(),
+                    Some(rule.as_str()),
+                    "case {case}: the refusal must name the rule asked for, got {body:?}"
+                );
+                assert_eq!(
+                    body.get("PricingPlanArns"),
+                    None,
+                    "case {case}: a refusal reports no associations, got {body:?}"
+                );
+            }
+        }
+
+        // The inverse listing references the PLAN it addresses, so it answers the same
+        // way for a period that held no such plan.
+        let case = format!("{how} ({period:?}), the inverse read");
+        let (status, body) = em
+            .post(
+                INVERSE_PATH,
+                &json!({"PricingPlanArn": plan, "BillingPeriod": period}),
+            )
+            .await;
+        assert_eq!(
+            status, 404,
+            "case {case}: the period held no such pricing plan, so the modelled 404 is \
+             expected, got {status} with {body:?}"
+        );
+        assert_eq!(
+            error_code(&body),
+            "ResourceNotFoundException",
+            "case {case}: expected ResourceNotFoundException, got {body:?}"
+        );
+        assert_eq!(
+            body["ResourceType"].as_str(),
+            Some("pricingplan"),
+            "case {case}: the refusal must name the resource type, got {body:?}"
+        );
+        assert_eq!(
+            body["ResourceId"].as_str(),
+            Some(plan.as_str()),
+            "case {case}: the refusal must name the plan asked for, got {body:?}"
+        );
+    }
+
+    // The other side of the same rule: a period the rule DID exist in is served, whether
+    // or not an association is in force in it. Rows differ along the period (the creation
+    // period, the next one, a year on) and along whether any plan associates the rule.
+    let lonely = em.create_rule("Lonely-Rule").await;
+    for months_on in [0i64, 1, 13] {
+        let period = shift_period(&created_in, months_on);
+        let case = format!("{months_on} periods after the create ({period:?})");
+        let (status, body) = em.list(&rule, None, None, Some(&period)).await;
+        assert_eq!(
+            status, 200,
+            "case {case}: the rule existed then, so the read is served, got {status} with \
+             {body:?}"
+        );
+        assert_eq!(
+            reported(&body),
+            vec![plan.clone()],
+            "case {case}: expected the associating plan, got {body:?}"
+        );
+
+        let case = format!("{case}, a rule no plan associates");
+        let (status, body) = em.list(&lonely, None, None, Some(&period)).await;
+        assert_eq!(
+            status, 200,
+            "case {case}: a rule that exists in the period is served even with no \
+             association, got {status} with {body:?}"
+        );
+        assert_eq!(
+            body.get("PricingPlanArns"),
+            None,
+            "case {case}: PricingPlanArns is modelled @length(min: 1), so no association \
+             reports no member, got {body:?}"
+        );
+        assert_eq!(
+            body["PricingRuleArn"].as_str(),
+            Some(lonely.as_str()),
+            "case {case}: the answer must echo the rule asked about, got {body:?}"
+        );
+    }
+
+    // The refusals wrote nothing: the current period still reports the association.
+    let (status, body) = em.list(&rule, None, None, None).await;
+    assert_eq!(
+        status, 200,
+        "case \"after the refusals\": expected 200, got {status} with {body:?}"
+    );
+    assert_eq!(
+        reported(&body),
+        vec![plan],
+        "case \"after the refusals\": a refused read must not change what a later caller \
+         sees, got {body:?}"
     );
 }
