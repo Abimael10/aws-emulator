@@ -3554,3 +3554,56 @@ fn parse_end_date(value: i64) -> Result<SystemTime, String> {
     );
     instant_from_rfc3339(&candidate).ok_or_else(malformed)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// How many serials the mint is driven for. A leading zero octet is one draw in 256, so
+    /// this many mints draw one with near certainty while the bound stays a COUNT — nothing
+    /// here depends on how fast the host runs.
+    const MINTS: usize = 4_000;
+
+    /// Every serial this service mints is the canonical spelling of a positive integer:
+    /// whole octets of lower-case hexadecimal with no leading zero octet — so the number a
+    /// certificate ARN names and an audit-report row states is the number the certificate's
+    /// own DER serial carries, whichever draw the mint made.
+    #[test]
+    fn a_minted_serial_spells_the_number_its_certificate_carries() {
+        for index in 0..MINTS {
+            let seed = format!("certificate-authority/{index}|{index}");
+            let minted = mint_serial(&seed);
+            assert!(
+                !minted.is_empty() && minted.len().is_multiple_of(2),
+                "case {seed:?}: expected whole octets of hex, got {minted:?}"
+            );
+            assert!(
+                minted
+                    .chars()
+                    .all(|digit| digit.is_ascii_hexdigit() && !digit.is_ascii_uppercase()),
+                "case {seed:?}: expected lower-case hexadecimal digits, got {minted:?}"
+            );
+            assert!(
+                !minted.starts_with("00"),
+                "case {seed:?}: a positive integer's canonical spelling carries no leading \
+                 zero octet, got {minted:?}"
+            );
+            // And the certificate's own serial IS that number: `SerialNumber` prepends the
+            // zero octet RFC 5280 calls for only where the leading bit is set, which changes
+            // no value, so the octets it carries past that are the ones minted.
+            let number = serial_number(&minted).expect("a minted serial is a serial number");
+            let carried: Vec<u8> = number
+                .as_bytes()
+                .iter()
+                .copied()
+                .skip_while(|octet| *octet == 0)
+                .collect();
+            let expected = ::hex::decode(&minted).expect("a minted serial is hex");
+            assert_eq!(
+                carried, expected,
+                "case {seed:?}: expected the certificate to carry the minted octets, got {:?}",
+                number.as_bytes()
+            );
+        }
+    }
+}
