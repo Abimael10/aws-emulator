@@ -199,9 +199,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 UpdateSignalingChannelErrorModeled::VersionMismatchException(
                     VersionMismatchException {
                         message: Some(
-                            "The version specified is not the latest version. To get the \
-                             latest version, use the DescribeSignalingChannel API."
-                                .to_string(),
+                            crate::state::CHANNEL_VERSION_MISMATCH_MESSAGE.to_string(),
                         ),
                     },
                 )

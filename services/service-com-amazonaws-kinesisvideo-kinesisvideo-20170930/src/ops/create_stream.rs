@@ -208,10 +208,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if store.streams.contains_key(&input.stream_name) {
             return Err(CreateStreamErrorModeled::ResourceInUseException(
                 ResourceInUseException {
-                    message: Some(format!(
-                        "The stream {} already exists in this account and region.",
-                        input.stream_name
-                    )),
+                    message: Some(format!("The stream {} already exists.", input.stream_name)),
                 },
             )
             .into());

@@ -2,7 +2,8 @@
 
 //! @op GetSignalingChannelEndpoint
 //! Reports one endpoint per `ChannelProtocol` the request asks for, for the stored
-//! signaling channel the `ChannelARN` names. Every endpoint is THIS emulator's own
+//! signaling channel the `ChannelARN` names, listed by `ChannelProtocol` value rather
+//! than in the order the request names them. Every endpoint is THIS emulator's own
 //! authority under the scheme that protocol names, because the endpoint has to be
 //! reachable: a client takes it and connects back here. `WEBRTC` is refused with the
 //! modeled `InvalidArgumentException` on a channel that is not configured for ingestion,
@@ -184,7 +185,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The store is read under one guard in this block and the guard is dropped with it:
         // an address below is resolved by opening a listener, which is awaited, and a
         // guard may not be held across an await.
-        let ingestion_enabled = {
+        let (ingestion_enabled, channel_type) = {
             let mut store = state.lock();
             store.settle_clock();
 
@@ -201,42 +202,74 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         ),
                     )
                 })?;
-            channel.media_storage_status == crate::state::MEDIA_STORAGE_ENABLED
+            (
+                channel.media_storage_status == crate::state::MEDIA_STORAGE_ENABLED,
+                channel.channel_type.clone(),
+            )
         };
 
         // "This API uses the SingleMasterChannelEndpointConfiguration input parameter,
         // which consists of the Protocols and Role properties. Protocols is used to
         // determine the communication mechanism … Role determines the messaging
-        // permissions." Neither can be inferred, so a request that leaves the
+        // permissions." None of the three can be inferred, so a request that leaves the
         // configuration, its protocols or its role unnamed names no endpoint to resolve
-        // and is a bad argument rather than an empty success.
-        let configuration = input
-            .single_master_channel_endpoint_configuration
-            .unwrap_or_default();
+        // and is a bad argument rather than an empty success. Each refusal names the
+        // member it is about and the type of the channel it addresses, read off the
+        // state.
+        let Some(configuration) = input.single_master_channel_endpoint_configuration else {
+            return Err(
+                GetSignalingChannelEndpointErrorModeled::InvalidArgumentException(
+                    InvalidArgumentException {
+                        message: Some(format!(
+                            "SingleMasterChannelEndpointConfiguration is required for \
+                             {channel_type} channels."
+                        )),
+                    },
+                )
+                .into(),
+            );
+        };
         let protocols = configuration.protocols.unwrap_or_default();
-        for (member, missing) in [
-            ("Protocols", protocols.is_empty()),
-            ("Role", configuration.role.is_none()),
-        ] {
-            if missing {
-                return Err(
-                    GetSignalingChannelEndpointErrorModeled::InvalidArgumentException(
-                        InvalidArgumentException {
-                            message: Some(format!(
-                                "SingleMasterChannelEndpointConfiguration.{member} must be \
-                                 specified to resolve a signaling channel endpoint."
-                            )),
-                        },
-                    )
-                    .into(),
-                );
-            }
+        if protocols.is_empty() {
+            // The same template as the two sentences a recording shows for this
+            // operation, for the member between them: a structure that names no
+            // protocols names no endpoint. No recording covers this one, so it is this
+            // family's form applied to `Protocols` rather than observed text.
+            return Err(
+                GetSignalingChannelEndpointErrorModeled::InvalidArgumentException(
+                    InvalidArgumentException {
+                        message: Some(format!(
+                            "Protocols is required for {channel_type} channels."
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+        if configuration.role.is_none() {
+            // "Role … is used to determine messaging permissions in this SINGLE_MASTER
+            // signaling channel": the endpoint a protocol resolves to is the one for the
+            // caller's role, so the role cannot be inferred from the protocol. The
+            // refusal names the addressed channel's own type and the protocol the request
+            // asked for, both read off the state and the request rather than fixed here.
+            let protocol = protocols.first().map(String::as_str).unwrap_or_default();
+            return Err(
+                GetSignalingChannelEndpointErrorModeled::InvalidArgumentException(
+                    InvalidArgumentException {
+                        message: Some(format!(
+                            "Role is required for {channel_type} channels requests for \
+                             {protocol} protocol."
+                        )),
+                    },
+                )
+                .into(),
+            );
         }
 
-        // The endpoint list is one entry per protocol the caller asked for, in the order
-        // asked. The protocols are checked first and the store's guard is dropped before
-        // any address is resolved, because the `WSS` one opens a listener.
-        let requested: Vec<String> = protocols;
+        // The endpoint list is one entry per protocol the caller asked for. The protocols
+        // are checked first and the store's guard is dropped before any address is
+        // resolved, because the `WSS` one opens a listener.
+        let mut requested: Vec<String> = protocols;
         for protocol in &requested {
             // `ChannelProtocol` is a modeled enum, so the boundary already refuses a
             // value outside its set; this re-states the same rule from the one list the
@@ -264,9 +297,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     GetSignalingChannelEndpointErrorModeled::InvalidArgumentException(
                         InvalidArgumentException {
                             message: Some(format!(
-                                "The {PROTOCOL_WEBRTC} protocol is available only for a \
-                                 signaling channel configured for ingestion. Use \
-                                 UpdateMediaStorageConfiguration to configure it."
+                                "{MEDIA_STORAGE_CONFIGURATION_MEMBER} is required for \
+                                 {PROTOCOL_WEBRTC} protocol"
                             )),
                         },
                     )
@@ -274,6 +306,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 );
             }
         }
+
+        // The ORDER of the answer is the service's own, not the request's: a
+        // multi-protocol answer is listed by `ChannelProtocol` value, so the same set of
+        // protocols is reported in the same order whichever order the request named them
+        // in (`HTTPS` before `WSS`, as a recorded multi-protocol answer shows; that pair
+        // is the only one a recording covers, so `WEBRTC`'s place in a mixed answer
+        // follows the same rule rather than an observed one).
+        requested.sort();
 
         let mut endpoints = Vec::with_capacity(requested.len());
         for protocol in requested {
@@ -323,6 +363,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// channel configured for ingestion. From
 /// [`crate::ops::types::CHANNEL_PROTOCOL_VALUES`].
 const PROTOCOL_WEBRTC: &str = "WEBRTC";
+
+/// The configuration a channel is configured for ingestion BY, named in the refusal a
+/// `WEBRTC` request on a channel without one carries: the member
+/// `UpdateMediaStorageConfiguration` and `DescribeMediaStorageConfiguration` carry
+/// (`MediaStorageConfiguration`), so the refusal names what is missing rather than
+/// describing it.
+const MEDIA_STORAGE_CONFIGURATION_MEMBER: &str = "MediaStorageConfiguration";
 
 /// The `ChannelProtocol` value whose endpoint is the channel's WebSocket data plane — the
 /// one a master and a viewer complete an opening handshake against. From

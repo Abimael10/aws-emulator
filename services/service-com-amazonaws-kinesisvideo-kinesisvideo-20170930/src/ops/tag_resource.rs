@@ -166,12 +166,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
         store.settle_clock();
 
+        // The ARN this operation is keyed on names the resource KIND it addresses, so
+        // the refusal for an ARN that resolves to nothing is worded for that kind.
         let stored = store
             .resource_tags_mut(input.resource_arn.as_str())
             .ok_or_else(|| {
                 TagResourceError::from(TagResourceErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {
-                        message: Some(crate::state::CHANNEL_NOT_FOUND_MESSAGE.to_string()),
+                        message: Some(
+                            crate::state::resource_not_found_message(input.resource_arn.as_str())
+                                .to_string(),
+                        ),
                     },
                 ))
             })?;

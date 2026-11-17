@@ -173,6 +173,32 @@ pub const CHANNEL_NOT_FOUND_MESSAGE: &str = "The requested channel is not found 
 /// its HTTP 404, and the message is an example.
 pub const STREAM_NOT_FOUND_MESSAGE: &str = "The requested stream is not found or not active.";
 
+/// The resource KIND a signaling channel's ARN names, as the first segment of the
+/// resource field the modeled `ResourceARN` pattern leaves open
+/// (`…:[a-z]+/[a-zA-Z0-9_.-]+/[0-9]+`) — see [`channel_arn`].
+pub const RESOURCE_KIND_CHANNEL: &str = "channel";
+
+/// The resource KIND a stream's ARN names; the companion of
+/// [`RESOURCE_KIND_CHANNEL`], and what [`stream_arn`] writes.
+pub const RESOURCE_KIND_STREAM: &str = "stream";
+
+/// How this service words a `ResourceNotFoundException` for an operation addressed by a
+/// bare `ResourceARN`.
+///
+/// Those operations (`ListTagsForResource`, `TagResource`, `UntagResource`) address
+/// whichever of this service's two resource kinds the ARN names, so the resource word in
+/// the refusal follows the ARN's own resource segment rather than being fixed per
+/// operation: a stream ARN that resolves to no stored stream is reported with
+/// [`STREAM_NOT_FOUND_MESSAGE`] and a channel ARN with [`CHANNEL_NOT_FOUND_MESSAGE`]. An
+/// ARN whose segment names a kind this service never mints resolves to no record at all
+/// and is reported over the channel surface those operations were introduced for.
+pub fn resource_not_found_message(resource_arn: &str) -> &'static str {
+    match arn_resource_kind(resource_arn) {
+        Some(RESOURCE_KIND_STREAM) => STREAM_NOT_FOUND_MESSAGE,
+        _ => CHANNEL_NOT_FOUND_MESSAGE,
+    }
+}
+
 /// How this service words a `ResourceInUseException` for a stream that EXISTS but is
 /// not in `ACTIVE` status — the case the shape is documented for ("if the provided
 /// input StreamARN or ChannelARN is not in Active status … The DescribeStream or
@@ -204,6 +230,14 @@ pub const STREAM_IDENTIFIER_MESSAGE: &str =
 /// one way.
 pub const STREAM_VERSION_MISMATCH_MESSAGE: &str =
     "The provided stream version does not match the existing stream version.";
+
+/// [`STREAM_VERSION_MISMATCH_MESSAGE`] for the signaling-channel surface: the same
+/// failure class, named for the resource whose version was compared, and stated once so
+/// the two channel mutations guarded by `CurrentVersion` word it one way. Wholly fixed
+/// text, for the same reason the stream sentence is: it names the two versions it
+/// compared without quoting either.
+pub const CHANNEL_VERSION_MISMATCH_MESSAGE: &str =
+    "The provided channel version does not match the existing channel version.";
 
 /// [`STREAM_IDENTIFIER_MESSAGE`] for the signaling-channel pair, whose operations model and
 /// document the same exclusive choice ("You must specify either the name or the Amazon
@@ -749,7 +783,7 @@ pub fn stream_arn(region: &str, stream_name: &str, creation_time_millis: i64) ->
     ::engine::emulator_arn(
         "kinesisvideo",
         region,
-        &format!("stream/{stream_name}/{creation_time_millis}"),
+        &format!("{RESOURCE_KIND_STREAM}/{stream_name}/{creation_time_millis}"),
     )
 }
 
@@ -761,9 +795,16 @@ pub fn stream_arn(region: &str, stream_name: &str, creation_time_millis: i64) ->
 /// the type reported for a mapped resource is READ OFF that resource's own ARN rather
 /// than chosen per operation. `None` for a string that carries no resource field.
 fn arn_resource_type(arn: &str) -> Option<String> {
+    arn_resource_kind(arn).map(str::to_ascii_uppercase)
+}
+
+/// The resource KIND an ARN names: the first segment of its resource field, as written
+/// — [`RESOURCE_KIND_CHANNEL`] for `channel/<name>/<millis>`, [`RESOURCE_KIND_STREAM`]
+/// for `stream/<name>/<millis>`. `None` for a string that carries no resource field.
+fn arn_resource_kind(arn: &str) -> Option<&str> {
     let resource = arn.splitn(6, ':').nth(5)?;
     let kind = resource.split('/').next()?;
-    (!kind.is_empty()).then(|| kind.to_ascii_uppercase())
+    (!kind.is_empty()).then_some(kind)
 }
 
 /// The `ChannelARN` of a signaling channel, in the one form the modeled `@pattern`
@@ -775,7 +816,7 @@ pub fn channel_arn(region: &str, channel_name: &str, creation_time_millis: i64) 
     ::engine::emulator_arn(
         "kinesisvideo",
         region,
-        &format!("channel/{channel_name}/{creation_time_millis}"),
+        &format!("{RESOURCE_KIND_CHANNEL}/{channel_name}/{creation_time_millis}"),
     )
 }
 

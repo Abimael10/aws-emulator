@@ -16,6 +16,15 @@
 //! BACK IN through an input member carrying that same pattern (`ChannelARN`,
 //! `CurrentVersion`, `NextToken`). The boundary validator is then the oracle for the
 //! pattern, instead of this file re-implementing one.
+//!
+//! The suites at the end of this file assert the SENTENCES this surface refuses with:
+//! the version-conflict sentence of the two channel mutations guarded by
+//! `CurrentVersion`, the not-found sentence of the three operations keyed on a bare
+//! `ResourceARN` (which name whichever resource kind that ARN's resource segment names,
+//! so a stream ARN is covered here too), the duplicate-name sentence of the two creates,
+//! the sentence a `WEBRTC` endpoint request on a channel with no media-storage
+//! configuration carries, and the sentence an endpoint request missing the configuration,
+//! its protocols or its role carries.
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -59,6 +68,20 @@ impl Answer {
             .rsplit('#')
             .next()
             .unwrap_or("")
+            .to_string()
+    }
+
+    /// The text of a failure, from the `Message` member every error shape of this model
+    /// declares. Each suite module of this target owns its own view of an answer (this
+    /// one carries the envelope headers the sibling suites do not assert), so this is
+    /// that accessor for THIS module's `Answer` rather than a second copy of a shared
+    /// helper.
+    fn message(&self) -> String {
+        self.body
+            .get("Message")
+            .or_else(|| self.body.get("message"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
             .to_string()
     }
 }
@@ -743,7 +766,10 @@ async fn a_create_stores_the_documented_defaults_and_every_value_it_is_sent() {
 
 /// RULE: `GetSignalingChannelEndpoint` answers with ONE endpoint per `ChannelProtocol`
 /// the request asks for, in the scheme that protocol names, addressed at the emulator
-/// the request arrived on — so a client can connect to what it is handed.
+/// the request arrived on — so a client can connect to what it is handed. The entries
+/// are listed by `ChannelProtocol` value, which is the service's own order rather than
+/// the request's, so the same set of protocols is answered the same way whichever order
+/// the request names them in.
 ///
 /// The protocol catalog is the modeled `ChannelProtocol` enum
 /// (`smithy_query(query="shape", shape="ChannelProtocol")`, exposed as
@@ -798,13 +824,13 @@ async fn an_endpoint_is_reported_for_every_protocol_the_request_names() {
             vec![("HTTPS", "https")],
         ),
         (
-            "both signaling protocols at once, in the order asked",
+            "both signaling protocols at once",
             vec!["WSS", "HTTPS"],
             Some("MASTER"),
-            vec![("WSS", "wss"), ("HTTPS", "https")],
+            vec![("HTTPS", "https"), ("WSS", "wss")],
         ),
         (
-            "the same two in the other order",
+            "the same two named in the other order",
             vec!["HTTPS", "WSS"],
             Some("MASTER"),
             vec![("HTTPS", "https"), ("WSS", "wss")],
@@ -1593,6 +1619,549 @@ async fn the_minted_arn_and_version_satisfy_their_modeled_patterns() {
             "case {name:?}: the minted ChannelARN {arn:?} and Version {version:?} must satisfy \
              the patterns their shapes carry, got {} with {:?}",
             answer.status, answer.body
+        );
+    }
+}
+
+/// The sentence this service refuses a channel mutation quoting a stale `CurrentVersion`
+/// with. Wholly fixed text: it names the two versions it compared without quoting
+/// either, which is why every row below expects the very same string.
+const CHANNEL_VERSION_MISMATCH: &str =
+    "The provided channel version does not match the existing channel version.";
+
+/// The same failure on the STREAM surface, which the channel sentence is the companion
+/// of: the resource whose versions were compared is what differs between the two.
+const STREAM_VERSION_MISMATCH: &str =
+    "The provided stream version does not match the existing stream version.";
+
+/// The sentence a `WEBRTC` endpoint request on a channel with no media-storage
+/// configuration is refused with: fixed text naming the configuration that is missing
+/// and the protocol that requires it.
+const WEBRTC_WITHOUT_MEDIA_STORAGE: &str =
+    "MediaStorageConfiguration is required for WEBRTC protocol";
+
+/// The `ResourceNotFoundException` sentence for an ARN naming a resource of `kind` that
+/// resolves to nothing. The resource word is the one the ARN's own resource segment
+/// names — the resource field the modeled `ResourceARN` pattern leaves open
+/// (`…:[a-z]+/[a-zA-Z0-9_.-]+/[0-9]+`, from
+/// `smithy_query(query="shape", shape="ResourceARN")`), which this service writes as
+/// `channel/<name>/<millis>` and `stream/<name>/<millis>`.
+fn not_found_sentence(kind: &str) -> String {
+    format!("The requested {kind} is not found or not active.")
+}
+
+/// Create a stream carrying `retention` hours of data retention, and return its
+/// `StreamARN` — the other resource kind a `ResourceARN` addresses.
+async fn create_stream(router: &MultiServiceRouter, name: &str, retention: i32) -> String {
+    let answer = call(
+        router,
+        "/createStream",
+        serde_json::json!({ "StreamName": name, "DataRetentionInHours": retention }),
+    )
+    .await;
+    assert_eq!(
+        answer.status, 200,
+        "case {name:?}: CreateStream failed with {:?}",
+        answer.body
+    );
+    answer
+        .body
+        .get("StreamARN")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_else(|| {
+            panic!(
+                "case {name:?}: CreateStream returned no StreamARN: {:?}",
+                answer.body
+            )
+        })
+        .to_string()
+}
+
+/// The ARN of a resource that is NOT stored, built from a stored one by moving its
+/// trailing creation-instant segment: same account, region, kind and name, different
+/// resource.
+fn arn_of_another_instant(arn: &str) -> String {
+    let (prefix, _) = arn
+        .rsplit_once('/')
+        .unwrap_or_else(|| panic!("a minted ARN ends in its creation instant, got {arn:?}"));
+    format!("{prefix}/1")
+}
+
+/// RULE: a mutation guarded by `CurrentVersion` refuses a version that is not the stored
+/// one with `VersionMismatchException` carrying the fixed version-conflict sentence of
+/// the resource kind it addresses — the same sentence for every such request, with no
+/// name, ARN or version string interpolated — and the stored record is left untouched.
+#[tokio::test]
+async fn a_guarded_channel_mutation_refuses_a_stale_version_with_the_channel_sentence() {
+    let router = harness();
+
+    // Rows differ along the rejected version's shape: one the channel never carried, the
+    // shortest and the longest the model's `Version` allows (`@length` 1..64, `@pattern`
+    // `^[a-zA-Z0-9]+$`), and a mixed-case one.
+    let rows: Vec<(&str, String)> = vec![
+        (
+            "a version the channel never carried",
+            "notthisversion1".to_string(),
+        ),
+        ("the shortest version the model allows", "7".to_string()),
+        ("the longest version the model allows", "v".repeat(64)),
+        ("a mixed-case alphanumeric version", "Zz0099Aa".to_string()),
+    ];
+
+    for (index, (case, stale)) in rows.into_iter().enumerate() {
+        let name = format!("channel-version-guard-{index}");
+        let arn = create_channel(&router, &name).await;
+        let stored = describe_channel(&router, &name).await["Version"]
+            .as_str()
+            .unwrap_or_else(|| panic!("case {case:?}: ChannelInfo carries a Version"))
+            .to_string();
+
+        // Both channel mutations that take a version word the refusal the same way: one
+        // sentence per failure class, not one per operation.
+        for (operation, path, body) in [
+            (
+                "UpdateSignalingChannel",
+                "/updateSignalingChannel",
+                serde_json::json!({
+                    "ChannelARN": arn.clone(),
+                    "CurrentVersion": stale.clone(),
+                    "SingleMasterConfiguration": { "MessageTtlSeconds": 30 }
+                }),
+            ),
+            (
+                "DeleteSignalingChannel",
+                "/deleteSignalingChannel",
+                serde_json::json!({ "ChannelARN": arn.clone(), "CurrentVersion": stale.clone() }),
+            ),
+        ] {
+            let answer = call(&router, path, body).await;
+            assert_eq!(
+                (answer.status, answer.error_code().as_str()),
+                (400, "VersionMismatchException"),
+                "case {case:?} on {operation}: expected HTTP 400 VersionMismatchException, \
+                 got {} {:?}",
+                answer.status,
+                answer.body
+            );
+            let actual = answer.message();
+            assert_eq!(
+                actual, CHANNEL_VERSION_MISMATCH,
+                "case {case:?} on {operation}: expected Message \
+                 {CHANNEL_VERSION_MISMATCH:?}, got {actual:?}"
+            );
+            // The sentence is fixed, so neither the rejected version, the stored one nor
+            // the addressed channel appears in it.
+            for (part, value) in [
+                ("the rejected version", stale.as_str()),
+                ("the stored version", stored.as_str()),
+                ("the channel name", name.as_str()),
+            ] {
+                assert!(
+                    !actual.contains(value),
+                    "case {case:?} on {operation}: the fixed sentence must not quote {part} \
+                     {value:?}, got {actual:?}"
+                );
+            }
+        }
+
+        // Both refusals left the record exactly as it was.
+        let info = describe_channel(&router, &name).await;
+        assert_eq!(
+            (
+                info["Version"].clone(),
+                info["SingleMasterConfiguration"]["MessageTtlSeconds"].clone()
+            ),
+            (
+                serde_json::json!(stored),
+                serde_json::json!(kvs::state::DEFAULT_MESSAGE_TTL_SECONDS)
+            ),
+            "case {case:?}: a refused mutation must change nothing, got {info:?}"
+        );
+    }
+
+    // The stream surface words the same failure for ITS resource, so the two sentences
+    // differ only in the resource whose versions were compared.
+    create_stream(&router, "version-sentence-stream", 24).await;
+    let answer = call(
+        &router,
+        "/updateDataRetention",
+        serde_json::json!({
+            "StreamName": "version-sentence-stream",
+            "CurrentVersion": "notthisversion1",
+            "Operation": "INCREASE_DATA_RETENTION",
+            "DataRetentionChangeInHours": 1
+        }),
+    )
+    .await;
+    assert_eq!(
+        (answer.status, answer.error_code().as_str()),
+        (400, "VersionMismatchException"),
+        "case \"a stale version on the stream surface\": expected HTTP 400 \
+         VersionMismatchException, got {} {:?}",
+        answer.status,
+        answer.body
+    );
+    let actual = answer.message();
+    assert_eq!(
+        actual, STREAM_VERSION_MISMATCH,
+        "case \"a stale version on the stream surface\": expected Message \
+         {STREAM_VERSION_MISMATCH:?}, got {actual:?}"
+    );
+}
+
+/// RULE: an endpoint request that leaves a member the resolution needs unnamed is refused
+/// with `InvalidArgumentException` naming that member and the TYPE of the channel it
+/// addresses, read off the stored record — and the `Role` refusal names the protocol the
+/// request asked for as well, since the endpoint a protocol resolves to is the one for
+/// the caller's role.
+#[tokio::test]
+async fn an_endpoint_request_missing_a_member_names_it_and_the_channel_type() {
+    let router = harness();
+
+    // Both modeled `ChannelType` values (`smithy_query(query="shape",
+    // shape="ChannelType")`), so the sentence's channel type is shown to come from the
+    // addressed record rather than being fixed.
+    for channel_type in ["SINGLE_MASTER", "FULL_MESH"] {
+        let name = format!("endpoint-members-{channel_type}");
+        let arn = create_channel_with(
+            &router,
+            &name,
+            serde_json::json!({ "ChannelType": channel_type }),
+        )
+        .await;
+
+        // (case, the endpoint configuration the request carries, the expected sentence)
+        let rows: Vec<(&str, Option<serde_json::Value>, String)> = vec![
+            (
+                "no endpoint configuration at all",
+                None,
+                format!(
+                    "SingleMasterChannelEndpointConfiguration is required for \
+                     {channel_type} channels."
+                ),
+            ),
+            (
+                "an empty endpoint configuration",
+                Some(serde_json::json!({})),
+                format!("Protocols is required for {channel_type} channels."),
+            ),
+            (
+                "a role but no protocols",
+                Some(serde_json::json!({ "Role": "MASTER" })),
+                format!("Protocols is required for {channel_type} channels."),
+            ),
+            (
+                "the websocket protocol but no role",
+                Some(serde_json::json!({ "Protocols": ["WSS"] })),
+                format!(
+                    "Role is required for {channel_type} channels requests for WSS protocol."
+                ),
+            ),
+            (
+                "the HTTPS protocol but no role",
+                Some(serde_json::json!({ "Protocols": ["HTTPS"] })),
+                format!(
+                    "Role is required for {channel_type} channels requests for HTTPS protocol."
+                ),
+            ),
+            (
+                "two protocols and no role",
+                Some(serde_json::json!({ "Protocols": ["WSS", "HTTPS"] })),
+                format!(
+                    "Role is required for {channel_type} channels requests for WSS protocol."
+                ),
+            ),
+            (
+                "the same two in the other order, and no role",
+                Some(serde_json::json!({ "Protocols": ["HTTPS", "WSS"] })),
+                format!(
+                    "Role is required for {channel_type} channels requests for HTTPS protocol."
+                ),
+            ),
+        ];
+
+        for (case, configuration, expected) in rows {
+            let mut request = serde_json::json!({ "ChannelARN": arn.clone() });
+            if let (Some(target), Some(configuration)) = (request.as_object_mut(), configuration) {
+                target.insert(
+                    "SingleMasterChannelEndpointConfiguration".to_string(),
+                    configuration,
+                );
+            }
+            let answer = call(&router, "/getSignalingChannelEndpoint", request).await;
+            assert_eq!(
+                (answer.status, answer.error_code().as_str()),
+                (400, "InvalidArgumentException"),
+                "case {case:?} on a {channel_type} channel: expected HTTP 400 \
+                 InvalidArgumentException, got {} {:?}",
+                answer.status,
+                answer.body
+            );
+            let actual = answer.message();
+            assert_eq!(
+                actual, expected,
+                "case {case:?} on a {channel_type} channel: expected Message {expected:?}, \
+                 got {actual:?}"
+            );
+        }
+    }
+}
+
+/// RULE: an operation keyed on a bare `ResourceARN` addresses whichever resource kind
+/// that ARN's resource segment names, so an ARN that resolves to no stored resource is
+/// refused with HTTP 404 `ResourceNotFoundException` whose sentence names THAT kind.
+#[tokio::test]
+async fn an_arn_keyed_refusal_names_the_resource_kind_the_arn_names() {
+    let router = harness();
+
+    // One stored resource of each kind, so the only reason an ARN below resolves to
+    // nothing is the ARN itself.
+    let channel_arn = create_channel(&router, "tagged-channel").await;
+    let stream_arn = create_stream(&router, "tagged-stream", 24).await;
+
+    // (case, the ARN, the resource kind its resource segment names)
+    let arns: Vec<(&str, String, &str)> = vec![
+        (
+            "a channel ARN naming no stored channel",
+            "arn:aws:kinesisvideo:us-east-1:000000000000:channel/absent-channel/1700000000000"
+                .to_string(),
+            "channel",
+        ),
+        (
+            "a stream ARN naming no stored stream",
+            "arn:aws:kinesisvideo:us-east-1:000000000000:stream/absent-stream/1700000000000"
+                .to_string(),
+            "stream",
+        ),
+        (
+            "a channel ARN whose name is stored but whose ARN is not",
+            arn_of_another_instant(&channel_arn),
+            "channel",
+        ),
+        (
+            "a stream ARN whose name is stored but whose ARN is not",
+            arn_of_another_instant(&stream_arn),
+            "stream",
+        ),
+        (
+            "a stream ARN of another region",
+            "arn:aws:kinesisvideo:eu-west-1:000000000000:stream/tagged-stream/1700000000000"
+                .to_string(),
+            "stream",
+        ),
+    ];
+
+    // The three operations the model keys on a bare `ResourceARN`.
+    let operations: Vec<(&str, &str, serde_json::Value)> = vec![
+        (
+            "ListTagsForResource",
+            "/ListTagsForResource",
+            serde_json::json!({}),
+        ),
+        (
+            "TagResource",
+            "/TagResource",
+            serde_json::json!({ "Tags": [{ "Key": "k", "Value": "v" }] }),
+        ),
+        (
+            "UntagResource",
+            "/UntagResource",
+            serde_json::json!({ "TagKeyList": ["k"] }),
+        ),
+    ];
+
+    for (case, arn, kind) in arns {
+        for (operation, path, extra) in &operations {
+            let mut request = serde_json::json!({ "ResourceARN": arn.clone() });
+            if let (Some(target), Some(source)) = (request.as_object_mut(), extra.as_object()) {
+                for (key, value) in source {
+                    target.insert(key.clone(), value.clone());
+                }
+            }
+            let answer = call(&router, path, request).await;
+            assert_eq!(
+                (answer.status, answer.error_code().as_str()),
+                (404, "ResourceNotFoundException"),
+                "case {case:?} on {operation}: expected HTTP 404 ResourceNotFoundException, \
+                 got {} {:?}",
+                answer.status,
+                answer.body
+            );
+            let expected = not_found_sentence(kind);
+            let actual = answer.message();
+            assert_eq!(
+                actual, expected,
+                "case {case:?} on {operation}: expected Message {expected:?}, got {actual:?}"
+            );
+        }
+    }
+
+    // The ARNs that DO resolve are still read: the kind is read off the ARN for the
+    // refusal only, and resolution is unchanged.
+    for (case, arn) in [
+        ("the stored channel's ARN", channel_arn),
+        ("the stored stream's ARN", stream_arn),
+    ] {
+        let answer = call(
+            &router,
+            "/ListTagsForResource",
+            serde_json::json!({ "ResourceARN": arn }),
+        )
+        .await;
+        assert_eq!(
+            answer.status, 200,
+            "case {case:?}: an ARN that names a stored resource must be read, got {} {:?}",
+            answer.status, answer.body
+        );
+        assert_eq!(
+            answer.body["Tags"],
+            serde_json::json!({}),
+            "case {case:?}: an untagged resource reports an empty map, got {:?}",
+            answer.body
+        );
+    }
+}
+
+/// RULE: a create under a name this account and region already holds is refused with
+/// `ResourceInUseException` whose sentence names the resource kind and the requested
+/// name, and nothing else.
+#[tokio::test]
+async fn a_duplicate_create_names_the_resource_kind_and_the_requested_name() {
+    let router = harness();
+
+    // Names differ along what the `ChannelName`/`StreamName` pattern
+    // `^[a-zA-Z0-9_.-]+$` admits: its one-character minimum, the separators, the digits
+    // and the case.
+    for name in ["a", "dup.name-0", "MiXeD_case", "0123456789"] {
+        // (case, the create's path, the name member, the sentence's resource word)
+        for (operation, path, member, kind) in [
+            (
+                "CreateSignalingChannel",
+                "/createSignalingChannel",
+                "ChannelName",
+                "channel",
+            ),
+            ("CreateStream", "/createStream", "StreamName", "stream"),
+        ] {
+            let request = serde_json::json!({ member: name });
+            let answer = call(&router, path, request.clone()).await;
+            assert_eq!(
+                answer.status, 200,
+                "case {name:?} on {operation}: the first create must be stored, got {} {:?}",
+                answer.status, answer.body
+            );
+
+            let answer = call(&router, path, request).await;
+            assert_eq!(
+                (answer.status, answer.error_code().as_str()),
+                (400, "ResourceInUseException"),
+                "case {name:?} on {operation}: expected HTTP 400 ResourceInUseException, \
+                 got {} {:?}",
+                answer.status,
+                answer.body
+            );
+            let expected = format!("The {kind} {name} already exists.");
+            let actual = answer.message();
+            assert_eq!(
+                actual, expected,
+                "case {name:?} on {operation}: expected Message {expected:?}, got {actual:?}"
+            );
+        }
+    }
+}
+
+/// RULE: a `WEBRTC` endpoint request on a channel that is not configured for ingestion is
+/// refused with `InvalidArgumentException` naming the media-storage configuration it
+/// requires, wherever `WEBRTC` sits in the requested protocols; the protocols that need
+/// no such configuration are served, one endpoint each, listed by protocol value.
+#[tokio::test]
+async fn a_webrtc_request_without_media_storage_names_the_configuration_it_requires() {
+    let router = harness();
+    let arn = create_channel(&router, "webrtc-precondition").await;
+
+    // Rows differ along where `WEBRTC` sits among the requested protocols, how many
+    // protocols are asked for, and the `Role` the request names — the refusal is the
+    // channel's missing configuration, so none of them changes it.
+    let rows: Vec<(&str, Vec<&str>, &str)> = vec![
+        ("WEBRTC alone, for the master", vec!["WEBRTC"], "MASTER"),
+        ("WEBRTC alone, for a viewer", vec!["WEBRTC"], "VIEWER"),
+        ("WEBRTC after another protocol", vec!["WSS", "WEBRTC"], "MASTER"),
+        ("WEBRTC before another protocol", vec!["WEBRTC", "HTTPS"], "VIEWER"),
+        (
+            "WEBRTC between both others",
+            vec!["HTTPS", "WEBRTC", "WSS"],
+            "MASTER",
+        ),
+    ];
+
+    for (case, protocols, role) in rows {
+        let answer = call(
+            &router,
+            "/getSignalingChannelEndpoint",
+            serde_json::json!({
+                "ChannelARN": arn.clone(),
+                "SingleMasterChannelEndpointConfiguration": {
+                    "Protocols": protocols, "Role": role
+                }
+            }),
+        )
+        .await;
+        assert_eq!(
+            (answer.status, answer.error_code().as_str()),
+            (400, "InvalidArgumentException"),
+            "case {case:?}: expected HTTP 400 InvalidArgumentException, got {} {:?}",
+            answer.status,
+            answer.body
+        );
+        let actual = answer.message();
+        assert_eq!(
+            actual, WEBRTC_WITHOUT_MEDIA_STORAGE,
+            "case {case:?}: expected Message {WEBRTC_WITHOUT_MEDIA_STORAGE:?}, got {actual:?}"
+        );
+    }
+
+    // The protocols that need no media-storage configuration are served, by protocol
+    // value: the same set comes back in the same order whichever order it was asked in.
+    for (case, protocols, expected) in [
+        (
+            "both signaling protocols, HTTPS named first",
+            vec!["HTTPS", "WSS"],
+            vec!["HTTPS", "WSS"],
+        ),
+        (
+            "both signaling protocols, the websocket named first",
+            vec!["WSS", "HTTPS"],
+            vec!["HTTPS", "WSS"],
+        ),
+        ("one protocol only", vec!["HTTPS"], vec!["HTTPS"]),
+    ] {
+        let answer = call(
+            &router,
+            "/getSignalingChannelEndpoint",
+            serde_json::json!({
+                "ChannelARN": arn.clone(),
+                "SingleMasterChannelEndpointConfiguration": {
+                    "Protocols": protocols.clone(), "Role": "MASTER"
+                }
+            }),
+        )
+        .await;
+        assert_eq!(
+            answer.status, 200,
+            "case {case:?}: expected HTTP 200, got {} {:?}",
+            answer.status, answer.body
+        );
+        let reported: Vec<String> = answer.body["ResourceEndpointList"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+            .iter()
+            .map(|item| item["Protocol"].as_str().unwrap_or_default().to_string())
+            .collect();
+        assert_eq!(
+            reported, expected,
+            "case {case:?}: expected the endpoints {expected:?}, got {:?}",
+            answer.body
         );
     }
 }
