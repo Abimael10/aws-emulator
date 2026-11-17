@@ -1,21 +1,25 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! Stopping an elastic cluster, end to end over HTTP.
+//! Stopping an elastic cluster, and starting it again, end to end over HTTP.
 //!
-//! The rule these suites assert: **a lifecycle call acts only from the cluster's settled
-//! available status, and the status it moves the cluster to is persisted on the cluster's
-//! own record**. So `StopCluster` against an `ACTIVE` cluster reports `STOPPING`, the
-//! clock owes that cluster `STOPPED` and every later reader sees it; a cluster in any
-//! other status is refused with `ValidationException` (HTTP 400 — the client refusal
-//! `StopCluster` models, `smithy_query(query="operation", operation="StopCluster")`)
-//! and nothing is written; an ARN no cluster carries is `ResourceNotFoundException`
-//! (HTTP 404); and a stopped cluster is not in a modifiable status, so a modification of
-//! it is refused with `ConflictException` (HTTP 409, the refusal `UpdateCluster` models).
+//! The rule these suites assert: **a lifecycle call acts only from the one stored status
+//! its own documented semantics name, and the status it moves the cluster to is persisted
+//! on the cluster's own record**. So `StopCluster` against an `ACTIVE` cluster reports
+//! `STOPPING`, the clock owes that cluster `STOPPED` and every later reader sees it;
+//! `StartCluster` — which "restarts the stopped elastic cluster that is specified by
+//! clusterARN" (`smithy_query(query="operation", operation="StartCluster")`) — acts from
+//! `STOPPED`, reports `STARTING` and is owed the available status from which the
+//! modification a stopped cluster refused is accepted again; a cluster in any other
+//! status is refused with `ValidationException` (HTTP 400 — the client refusal both
+//! operations model) and nothing is written; an ARN no cluster carries is
+//! `ResourceNotFoundException` (HTTP 404); and a cluster that is not in its settled
+//! available status is not modifiable, so a modification of it is refused with
+//! `ConflictException` (HTTP 409, the refusal `UpdateCluster` models).
 //!
 //! The tables differ along what the rule generalises over: the shape of the cluster being
 //! stopped (shard count, shard capacity, shard instance count, auth type), the status the
-//! cluster is in when the stop arrives, which member a modification of a stopped cluster
-//! carries, and which ARN the refusal is addressed to.
+//! cluster is in when the stop arrives, which member a modification of a stopped and then
+//! restarted cluster carries, and which ARN the refusal is addressed to.
 //!
 //! Each suite in this crate carries its own request harness (see
 //! `all/cluster_lifecycle.rs`): the helpers are private to their module, so the few lines
@@ -111,6 +115,12 @@ fn error_code(body: &Value) -> String {
 /// `POST /cluster/{clusterArn}/stop` — one `StopCluster` call.
 async fn stop(router: &MultiServiceRouter, cluster_arn: &str) -> (u16, Value) {
     let path = format!("/cluster/{}/stop", label(cluster_arn));
+    call(router, "POST", &path, None).await
+}
+
+/// `POST /cluster/{clusterArn}/start` — one `StartCluster` call.
+async fn start(router: &MultiServiceRouter, cluster_arn: &str) -> (u16, Value) {
+    let path = format!("/cluster/{}/start", label(cluster_arn));
     call(router, "POST", &path, None).await
 }
 
@@ -548,5 +558,194 @@ async fn a_stopped_cluster_is_not_modifiable() {
                 stopped.get(member)
             );
         }
+    }
+}
+
+#[tokio::test]
+async fn starting_a_stopped_cluster_resumes_it_and_makes_it_modifiable_again() {
+    // `StartCluster` is the documented way back out of the stopped status, so each row
+    // takes one modification the stopped cluster refuses, restarts the cluster, and asks
+    // for the same modification again. The rows differ in the kind of member the
+    // modification carries: a capacity, a shard count (which resizes the shard list),
+    // instances per shard, the auth type, a caller-sized list of ids, and a retention
+    // period.
+    let patches: Vec<(&str, Value)> = vec![
+        ("shardCapacity", json!({"shardCapacity": 16})),
+        ("shardCount", json!({"shardCount": 3})),
+        ("shardInstanceCount", json!({"shardInstanceCount": 2})),
+        ("authType", json!({"authType": "SECRET_ARN"})),
+        (
+            "subnetIds",
+            json!({"subnetIds": ["subnet-resumed-a", "subnet-resumed-b"]}),
+        ),
+        ("backupRetentionPeriod", json!({"backupRetentionPeriod": 21})),
+    ];
+
+    let router = emulator();
+    for (index, (case, patch)) in patches.iter().enumerate() {
+        let cluster_arn = create_active_cluster(&router, &format!("resumed{index}"), json!({})).await;
+        let (status, response) = stop(&router, &cluster_arn).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: the setup stop must be accepted, got {status} with {response}"
+        );
+        let stopped = wait_for_status(&router, &cluster_arn, "STOPPED").await;
+
+        // The stopped cluster is not modifiable, so the modification is refused before
+        // the start and nothing is written.
+        let (status, refused) = update(&router, &cluster_arn, patch.clone()).await;
+        assert_eq!(
+            status, 409,
+            "case {case:?}: a modification of a stopped cluster must answer HTTP 409, got \
+             {status} with {refused}"
+        );
+        assert_eq!(
+            error_code(&refused),
+            "ConflictException",
+            "case {case:?}: expected a ConflictException, got {refused}"
+        );
+
+        // The start acts from the stopped status: the restart is in flight when the call
+        // answers, so the cluster reports STARTING. That the start moves the status and
+        // nothing else — shards included — is what `all/cluster_delete_state_gate.rs`
+        // asserts over the cluster shapes, so this suite asks only what it is about.
+        let (status, response) = start(&router, &cluster_arn).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: starting a stopped cluster must answer 200, got {status} with \
+             {response}"
+        );
+        assert_eq!(
+            response["cluster"]["status"].as_str(),
+            Some("STARTING"),
+            "case {case:?}: the start is in flight when the call answers, so the cluster must \
+             report STARTING, got {response}"
+        );
+
+        // The restart is persisted, not just reported: the clock owes the cluster its
+        // available status, every later reader sees it, and the listing reports the same
+        // stored status.
+        let restarted = wait_for_status(&router, &cluster_arn, "ACTIVE").await;
+        let summary = cluster_in_list(&router, &cluster_arn).await;
+        assert_eq!(
+            summary["status"].as_str(),
+            Some("ACTIVE"),
+            "case {case:?}: the listing reports the same stored status, got {summary}"
+        );
+        // The restart brought the stopped cluster back, rather than minting another one:
+        // the identity the create persisted is still the one being reported.
+        for member in ["clusterName", "clusterArn", "createTime", "clusterEndpoint"] {
+            assert_eq!(
+                restarted.get(member),
+                stopped.get(member),
+                "case {case:?}: `{member}` must be the stopped cluster's, got {:?} where the \
+                 stopped cluster has {:?}",
+                restarted.get(member),
+                stopped.get(member)
+            );
+        }
+
+        // From the restarted cluster the modification the stopped one refused is accepted,
+        // and it round-trips through GetCluster.
+        let (status, response) = update(&router, &cluster_arn, patch.clone()).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: a modification of a restarted cluster must be accepted, got \
+             {status} with {response}"
+        );
+        assert_eq!(
+            response["cluster"]["status"].as_str(),
+            Some("UPDATING"),
+            "case {case:?}: an applied modification is in flight when the call answers, got \
+             {response}"
+        );
+        let settled = wait_for_status(&router, &cluster_arn, "ACTIVE").await;
+        for (member, value) in patch.as_object().expect("a patch object") {
+            assert_eq!(
+                settled.get(member),
+                Some(value),
+                "case {case:?}: `{member}` must be what the accepted modification carried, got \
+                 {settled}"
+            );
+            assert_ne!(
+                settled.get(member),
+                restarted.get(member),
+                "case {case:?}: the row must change `{member}`, but the restarted cluster \
+                 already had {:?}",
+                restarted.get(member)
+            );
+        }
+        let shards = settled["shards"]
+            .as_array()
+            .unwrap_or_else(|| panic!("case {case:?}: no shards in {settled}"));
+        assert_eq!(
+            Some(shards.len() as i64),
+            settled["shardCount"].as_i64(),
+            "case {case:?}: the cluster must hold one shard per reported shard, got {settled}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_start_judges_the_cluster_by_the_status_the_clock_owes_it() {
+    // Nothing reads the cluster between the stop and the start here, so the stop's
+    // transition is one the clock made due with no reader to materialise it: the start has
+    // to complete it itself rather than refuse a cluster that is owed STOPPED. The rows
+    // differ in the shape of the cluster, so the answer is not a property of one record.
+    let shapes: Vec<Value> = vec![json!({}), json!({"shardCount": 3, "shardCapacity": 8})];
+
+    let router = emulator();
+    for (index, extra) in shapes.iter().enumerate() {
+        let case = format!("owed{index}");
+        let cluster_arn = create_active_cluster(&router, &case, extra.clone()).await;
+        let (status, response) = stop(&router, &cluster_arn).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: the setup stop must be accepted, got {status} with {response}"
+        );
+
+        // The start itself is the poll: while the stop is still in flight the cluster is
+        // not stopped, so the call is refused with the service's fixed sentence, and the
+        // first start that arrives once the stop is due is accepted — without any read in
+        // between. The deadline is generous: it bounds a hung emulator, not the span the
+        // service takes.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+        let mut accepted = None;
+        while tokio::time::Instant::now() < deadline {
+            let (status, response) = start(&router, &cluster_arn).await;
+            if status == 200 {
+                accepted = Some(response);
+                break;
+            }
+            assert_eq!(
+                status, 400,
+                "case {case:?}: a start of a cluster that is not stopped must answer HTTP 400, \
+                 got {status} with {response}"
+            );
+            assert_eq!(
+                error_code(&response),
+                "ValidationException",
+                "case {case:?}: expected a ValidationException, got {response}"
+            );
+            assert_eq!(
+                response["message"].as_str(),
+                Some("Can't start the cluster as it's currently in state unavailable for starting."),
+                "case {case:?}: expected the service's refusal sentence, got {response}"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let accepted = accepted
+            .unwrap_or_else(|| panic!("case {case:?}: the start of the stopped cluster was never accepted"));
+        assert_eq!(
+            accepted["cluster"]["status"].as_str(),
+            Some("STARTING"),
+            "case {case:?}: the accepted start reports the restart in flight, got {accepted}"
+        );
+        let restarted = wait_for_status(&router, &cluster_arn, "ACTIVE").await;
+        assert_eq!(
+            restarted["clusterArn"].as_str(),
+            Some(cluster_arn.as_str()),
+            "case {case:?}: the restarted cluster is the one the start named, got {restarted}"
+        );
     }
 }
