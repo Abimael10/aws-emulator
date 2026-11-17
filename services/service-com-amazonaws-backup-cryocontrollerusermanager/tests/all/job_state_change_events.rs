@@ -401,17 +401,41 @@ pub(crate) async fn delivered_of_type(
     detail_type: &str,
     wanted: usize,
 ) -> Vec<Value> {
-    let deadline = Instant::now() + POLL_DEADLINE;
     let mut bodies = Vec::new();
+    delivered_until(router, case, url, &[(detail_type, wanted)], &mut bodies).await;
+    bodies
+}
+
+/// Drain the queue at `url` into `bodies` until it holds at least the counted number of
+/// envelopes of EACH named detail-type, or until [`POLL_DEADLINE`] passes.
+///
+/// The general form of [`delivered_of_type`], which waits for one kind: a case that starts
+/// several records at once waits for the envelopes of every kind they owe, so one published
+/// a moment after another is looked for again rather than missed. A drain takes the messages
+/// it reports off the queue, so what each attempt collected is kept in `bodies`.
+///
+/// `pub(crate)` for the sibling suite that waits on several kinds at once
+/// (`state_change_detail_member_names.rs`), so this crate has ONE drain-until-condition loop.
+pub(crate) async fn delivered_until(
+    router: &MultiServiceRouter,
+    case: &str,
+    url: &str,
+    wanted: &[(&str, usize)],
+    bodies: &mut Vec<Value>,
+) {
+    let deadline = Instant::now() + POLL_DEADLINE;
     loop {
         bodies.extend(delivered_in(router, REGION, case, url).await);
-        if of_type(&bodies, detail_type).len() >= wanted {
-            return bodies;
+        let held = wanted
+            .iter()
+            .all(|(detail_type, count)| of_type(bodies, detail_type).len() >= *count);
+        if held {
+            return;
         }
         assert!(
             Instant::now() < deadline,
-            "case {case:?}: expected at least {wanted} {detail_type:?} envelope(s) on \
-             {url:?} within {POLL_DEADLINE:?}, got {bodies:?}"
+            "case {case:?}: expected at least {wanted:?} envelope(s) on {url:?} within \
+             {POLL_DEADLINE:?}, got {bodies:?}"
         );
         // Hand the runtime back, so the in-process clock pump is polled between attempts
         // rather than only when this task happens to block.

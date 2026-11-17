@@ -13,7 +13,11 @@
 //! [`COPY_JOB_STATE_CHANGE`], [`RESTORE_JOB_STATE_CHANGE`],
 //! [`RECOVERY_POINT_STATE_CHANGE`]), carrying that record's own stored members — the state
 //! it moved into among them — as the event's `detail` and the recovery point the event is
-//! about in `resources`. The same holds for the RECOVERY POINT a backup or a copy writes:
+//! about in `resources`. Each `detail` member is named after the member the MOVED RECORD's
+//! own API reports it under, with a lower-case first letter, so the member carrying the
+//! state is `state` for a record the model gives a `State` (a backup job, a copy job) and
+//! `status` for one it gives a `Status` (a restore job, a recovery point).
+//! The same holds for the RECOVERY POINT a backup or a copy writes:
 //! it is a resource of its own with a status of its own, so each state it moves into is
 //! published too, which is what a client watching for a backup to become available reacts
 //! to. A rule on that bus whose `EventPattern` matches then delivers the envelope
@@ -698,10 +702,18 @@ fn restore_job_change(job: &RestoreJobRecord) -> JobStateChange {
 /// reacts to on the bus and the point it then reads back cannot disagree. A member the
 /// stored point does not carry is absent from the detail rather than reported as null,
 /// exactly as it is absent from that read.
+///
+/// That holds for the moved-into state as well, which is why this detail spells it
+/// `status` where a JOB's spells it `state`: what a recovery point moves through is its
+/// `Status`, of the enum `RecoveryPointStatus`
+/// (`smithy_query(query="operation", operation="DescribeRecoveryPoint")`), where a backup
+/// or a copy job moves through a `State`. The kind of record that moved decides the member
+/// name, so a client filtering on `detail.status` for a point and on `detail.state` for a
+/// job reads what each record's own API reports.
 fn recovery_point_change(point: &RecoveryPoint) -> JobStateChange {
     let mut detail = ::serde_json::Map::new();
     detail.insert("recoveryPointArn".to_string(), point.arn.clone().into());
-    detail.insert("state".to_string(), point.status.clone().into());
+    detail.insert("status".to_string(), point.status.clone().into());
     detail.insert(
         "backupVaultName".to_string(),
         point.backup_vault_name.clone().into(),

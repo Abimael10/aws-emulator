@@ -76,6 +76,8 @@ service-common = { path = "../common" }
 emulator-core-build-support = { workspace = true }
 
 [dev-dependencies]
+# Declares tests/all/main.rs's suite modules, one per tests/all/<name>.rs.
+automod = { workspace = true }
 sha2 = { workspace = true }
 # EventBridge and SQS are mounted beside Backup on one engine in the integration
 # tests, because a job transition publishes a state-change event onto the default

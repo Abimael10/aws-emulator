@@ -7,7 +7,8 @@
 //! own, so every status it MOVES INTO after the call that created it is published once onto
 //! the account's default event bus as `source` `aws.backup` with `detail-type`
 //! `Recovery Point State Change`, carrying that point's own stored members as the event
-//! `detail` — the state it moved into, its ARN, the vault holding it, the protected
+//! `detail` — the status it moved into, under the member name `DescribeRecoveryPoint`
+//! reports it by, its ARN, the vault holding it, the protected
 //! resource and that resource's Backup type — and the point itself in `resources`.
 //! EventBridge then routes it by CONTENT: a rule whose `EventPattern` matches hands the
 //! envelope UNCHANGED to every one of that rule's targets, and a rule whose pattern cannot
@@ -18,7 +19,7 @@
 //!
 //! The first table spans that rule along what it generalises over: WHICH dimension of the
 //! envelope the rule's pattern filters on (the source alone, the source plus this
-//! detail-type, a state inside `detail`, the vault's ARN inside `detail`, the point's own
+//! detail-type, a status inside `detail`, the vault's ARN inside `detail`, the point's own
 //! ARN in `resources`) and therefore whether that rule is owed the envelope at all — the
 //! rows that must receive NOTHING carry a positive control on the same bus, so what says
 //! the envelope was published is the control's own delivery rather than a look taken too
@@ -84,7 +85,11 @@ const SERVICE_PRINCIPAL: &str = "backup.amazonaws.com";
 
 /// Backup, EventBridge, SQS and IAM on ONE shared engine, each claiming only requests
 /// scoped to its own signing name.
-fn emulator() -> MultiServiceRouter {
+///
+/// `pub(crate)` for the sibling suite that pins which MEMBER of a published `detail`
+/// carries the state a record moved into (`state_change_detail_member_names.rs`), so the
+/// services mounted beside Backup are one list rather than two that can drift apart.
+pub(crate) fn emulator() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
@@ -113,7 +118,13 @@ fn emulator() -> MultiServiceRouter {
 /// One Amazon SNS call, made the way a client makes one: a form-encoded `awsQuery` POST
 /// signed for that service in [`REGION`]. Answers the XML body, asserted to have been a
 /// success.
-async fn sns(router: &MultiServiceRouter, action: &str, members: &[(&str, &str)]) -> String {
+///
+/// `pub(crate)` for the sibling suite named above, which stands a topic up the same way.
+pub(crate) async fn sns(
+    router: &MultiServiceRouter,
+    action: &str,
+    members: &[(&str, &str)],
+) -> String {
     let mut body = format!("Action={action}&Version=2010-03-31");
     for (name, value) in members {
         body.push('&');
@@ -143,7 +154,7 @@ async fn sns(router: &MultiServiceRouter, action: &str, members: &[(&str, &str)]
 }
 
 /// The text of the first `<tag>` of an `awsQuery` answer.
-fn element(xml: &str, tag: &str) -> String {
+pub(crate) fn element(xml: &str, tag: &str) -> String {
     let open = format!("<{tag}>");
     let close = format!("</{tag}>");
     let start = xml
@@ -248,11 +259,11 @@ fn rows() -> Vec<Row> {
             delivered: true,
         },
         Row {
-            case: "a pattern scoped to the state the point moves into",
+            case: "a pattern scoped to the status the point moves into",
             pattern: |_point| json!({
                 "source": [EVENT_SOURCE],
                 "detail-type": [RECOVERY_POINT_STATE_CHANGE],
-                "detail": { "state": [COMPLETED] },
+                "detail": { "status": [COMPLETED] },
             }),
             delivered: true,
         },
@@ -275,11 +286,11 @@ fn rows() -> Vec<Row> {
             delivered: true,
         },
         Row {
-            case: "a pattern scoped to a state this point never takes",
+            case: "a pattern scoped to a status this point never takes",
             pattern: |_point| json!({
                 "source": [EVENT_SOURCE],
                 "detail-type": [RECOVERY_POINT_STATE_CHANGE],
-                "detail": { "state": [EXPIRED] },
+                "detail": { "status": [EXPIRED] },
             }),
             delivered: false,
         },
@@ -394,7 +405,7 @@ async fn a_settled_recovery_point_reaches_the_targets_of_the_rules_that_match_it
         let detail = &envelope["detail"];
         for (member, read_member) in [
             ("recoveryPointArn", "RecoveryPointArn"),
-            ("state", "Status"),
+            ("status", "Status"),
             ("backupVaultName", "BackupVaultName"),
             ("backupVaultArn", "BackupVaultArn"),
             ("resourceArn", "ResourceArn"),
@@ -409,9 +420,9 @@ async fn a_settled_recovery_point_reaches_the_targets_of_the_rules_that_match_it
             );
         }
         assert_eq!(
-            detail["state"],
+            detail["status"],
             json!(COMPLETED),
-            "case {case:?}: expected the state the point moved into, got {detail}"
+            "case {case:?}: expected the status the point moved into, got {detail}"
         );
     }
 }
@@ -533,11 +544,8 @@ async fn a_recovery_point_envelope_reaches_a_queue_subscribed_to_a_topic_target(
     let point = started_point(&router, case, &table_arn("fanned-out"), &unresolved_role()).await;
     // What the subscriber receives is the NOTIFICATION the topic delivers, whose `Message`
     // is the envelope as it was published.
-    let notifications = notified_of_type(&router, case, &queue_url, RECOVERY_POINT_STATE_CHANGE)
-        .await;
-    let Some(envelope) = notifications.first() else {
-        panic!("case {case:?}: expected the envelope inside a notification, got nothing");
-    };
+    let (_notification, envelope) =
+        notified_of_type(&router, case, &queue_url, RECOVERY_POINT_STATE_CHANGE).await;
     assert_eq!(
         envelope["source"],
         json!(EVENT_SOURCE),
@@ -549,53 +557,45 @@ async fn a_recovery_point_envelope_reaches_a_queue_subscribed_to_a_topic_target(
         "case {case:?}: expected the point this job wrote, got {envelope}"
     );
     assert_eq!(
-        envelope["detail"]["state"],
+        envelope["detail"]["status"],
         json!(COMPLETED),
-        "case {case:?}: expected the state the point moved into, got {envelope}"
+        "case {case:?}: expected the status the point moved into, got {envelope}"
     );
 }
 
-/// Poll the queue at `url` until a notification carrying an envelope of `detail_type`
-/// arrives, and answer every envelope the notifications held.
+/// Poll the queue at `url` until a notification carrying an envelope of `detail_type` is
+/// there, and answer that notification together with the envelope inside it.
 ///
 /// The body of a message a topic delivers is the NOTIFICATION, whose `Message` member is
 /// the text that was published to the topic — the envelope — so it is parsed out of it.
-async fn notified_of_type(
+///
+/// `pub(crate)` for the sibling suite that reads a notification's own members beside the
+/// envelope (`state_change_detail_member_names.rs`), so this crate has ONE notification
+/// poll rather than two that can drift apart.
+pub(crate) async fn notified_of_type(
     router: &MultiServiceRouter,
     case: &str,
     url: &str,
     detail_type: &str,
-) -> Vec<Value> {
-    let notifications = delivered_of_type_inside_notifications(router, case, url, detail_type).await;
-    of_type(&notifications, detail_type)
-}
-
-/// The envelopes inside every notification the queue at `url` has handed over, polled until
-/// one of `detail_type` is among them.
-async fn delivered_of_type_inside_notifications(
-    router: &MultiServiceRouter,
-    case: &str,
-    url: &str,
-    detail_type: &str,
-) -> Vec<Value> {
+) -> (Value, Value) {
     let deadline = ::std::time::Instant::now() + POLL_DEADLINE;
-    let mut envelopes: Vec<Value> = Vec::new();
+    let mut seen: Vec<Value> = Vec::new();
     loop {
         for notification in delivered(router, case, url).await {
-            let Some(message) = notification["Message"].as_str() else {
-                continue;
-            };
-            if let Ok(envelope) = serde_json::from_str::<Value>(message) {
-                envelopes.push(envelope);
+            let envelope = notification["Message"]
+                .as_str()
+                .and_then(|message| serde_json::from_str::<Value>(message).ok());
+            match envelope {
+                Some(envelope) if envelope["detail-type"] == json!(detail_type) => {
+                    return (notification, envelope)
+                }
+                _ => seen.push(notification),
             }
-        }
-        if !of_type(&envelopes, detail_type).is_empty() {
-            return envelopes;
         }
         assert!(
             ::std::time::Instant::now() < deadline,
             "case {case:?}: expected a {detail_type:?} envelope inside a notification on \
-             {url:?} within {POLL_DEADLINE:?}, got {envelopes:?}"
+             {url:?} within {POLL_DEADLINE:?}, got {seen:?}"
         );
         // Hand the runtime back, so the in-process clock pump is polled between attempts.
         ::tokio::task::yield_now().await;
