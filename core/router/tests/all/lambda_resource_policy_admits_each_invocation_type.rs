@@ -38,14 +38,12 @@
 //! deployment package the run can read. Four crates therefore have to agree before any invocation
 //! type can be decided at all, and only the assembled router mounts them on one engine.
 
-use std::time::{Duration, Instant};
-
-use serde_json::{json, Value};
+use serde_json::Value;
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::lambda_invoke_grant_lifetime::{
-    assert_refused, build_router, given_execution_role, given_function, given_user, handler_answer,
-    lambda_as, refusal_message, Answer, ACCOUNT_KEY, FUNCTIONS_URI, INVOKE_ACTION,
+    add_permission, assert_refused, build_router, given_execution_role, given_function, given_user,
+    handler_answer, invoke_decided, refusal_message, remove_permission, Answer,
 };
 
 /// The function every row invokes, the stack that declares it and the role it runs as — names of
@@ -55,18 +53,10 @@ const FUNCTION: &str = "xsvc-invoke-type-grant";
 const STACK: &str = "xsvc-invoke-type-grant-stack";
 const EXECUTION_ROLE: &str = "xsvc-invoke-type-grant-exec";
 
-/// The statuses Lambda answers an invocation it has not DECIDED with, each of which says "not
-/// now" and carries no authorization verdict: no room in the account's concurrent executions
-/// (`TooManyRequestsException`, HTTP 429), or the function not being `Active` yet
-/// (`ResourceConflictException`, HTTP 409). Whether one arrives is decided by what the rest of
-/// this process is running at that instant and by nothing a row varies, so a call LOOKS AGAIN on
-/// one rather than reading a verdict out of an invocation that was never decided. Nothing is
-/// tolerated by looking again: one of these still standing at the deadline fails the row.
-const UNSERVED: &[u16] = &[409, 429];
-
-/// How long a call keeps looking for a decision, and how long between two looks.
-const DECISION_DEADLINE: Duration = Duration::from_secs(120);
-const LOOK: Duration = Duration::from_millis(50);
+// The statuses an invocation that was never DECIDED answers with, the deadline a call keeps
+// looking for a decision over, and the look-again span all live in the harness this suite drives
+// (`crate::lambda_invoke_grant_lifetime::invoke_decided`), so every suite over these routes reads
+// a verdict the one way.
 
 /// The header a caller asks for an invocation type with (`Invoke`'s `InvocationType` is bound to
 /// `X-Amz-Invocation-Type`).
@@ -109,88 +99,15 @@ fn rows() -> Vec<Row> {
 }
 
 /// Invoke the function as the credential `access_key_id` names, asking for the type `headers`
-/// states, and answer the DECISION: looks again, every [`LOOK`] until [`DECISION_DEADLINE`]
-/// passes, for as long as Lambda answers one of the statuses that carry no verdict
-/// ([`UNSERVED`]).
+/// states, and answer the DECISION — read through the harness's one reader of an invocation's
+/// verdict.
 async fn invoke_as(
     router: &MultiServiceRouter,
     case: &str,
     access_key_id: &str,
     headers: &[(&str, &str)],
 ) -> Answer {
-    let deadline = Instant::now() + DECISION_DEADLINE;
-    loop {
-        let answer = lambda_as(
-            router,
-            access_key_id,
-            "POST",
-            &format!("{FUNCTIONS_URI}/{FUNCTION}/invocations"),
-            Some(&json!({"probe": true})),
-            headers,
-        )
-        .await;
-        if !UNSERVED.contains(&answer.status) {
-            return answer;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "case {case:?}: Lambda never had room to decide the invocation, last answered {} \
-             with {}",
-            answer.status,
-            answer.text()
-        );
-        tokio::time::sleep(LOOK).await;
-    }
-}
-
-/// Write one statement into the function's resource-based policy through `AddPermission`, the
-/// call a client grants a principal the invocation with.
-async fn add_permission(
-    router: &MultiServiceRouter,
-    case: &str,
-    statement_id: &str,
-    principal: &str,
-) {
-    let answer = lambda_as(
-        router,
-        ACCOUNT_KEY,
-        "POST",
-        &format!("{FUNCTIONS_URI}/{FUNCTION}/policy"),
-        Some(&json!({
-            "StatementId": statement_id,
-            "Action": INVOKE_ACTION,
-            "Principal": principal,
-        })),
-        &[],
-    )
-    .await;
-    assert_eq!(
-        answer.status,
-        201,
-        "case {case:?}: AddPermission({statement_id}) must answer 201, got {} with {}",
-        answer.status,
-        answer.text()
-    );
-}
-
-/// Take that statement back out through `RemovePermission`.
-async fn remove_permission(router: &MultiServiceRouter, case: &str, statement_id: &str) {
-    let answer = lambda_as(
-        router,
-        ACCOUNT_KEY,
-        "DELETE",
-        &format!("{FUNCTIONS_URI}/{FUNCTION}/policy/{statement_id}"),
-        None,
-        &[],
-    )
-    .await;
-    assert_eq!(
-        answer.status,
-        204,
-        "case {case:?}: RemovePermission({statement_id}) must answer 204, got {} with {}",
-        answer.status,
-        answer.text()
-    );
+    invoke_decided(router, case, FUNCTION, access_key_id, headers).await
 }
 
 /// Assert that `answer` is the ADMITTED answer `row` states for its invocation type.
@@ -248,6 +165,7 @@ async fn a_resource_policy_statement_admits_each_invocation_type_while_it_stands
         add_permission(
             &router,
             case,
+            FUNCTION,
             &statement_id,
             &principal.statement_principal,
         )
@@ -255,7 +173,7 @@ async fn a_resource_policy_statement_admits_each_invocation_type_while_it_stands
         let admitted = invoke_as(&router, case, &principal.access_key_id, &headers).await;
         assert_admitted(case, row, &admitted);
 
-        remove_permission(&router, case, &statement_id).await;
+        remove_permission(&router, case, FUNCTION, &statement_id).await;
         let after = invoke_as(&router, case, &principal.access_key_id, &headers).await;
         assert_refused(case, "after the statement was removed", &after, &expected);
     }

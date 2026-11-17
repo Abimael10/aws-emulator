@@ -25,7 +25,7 @@
 //! withdrawal that leaves the function reachable, fails here.
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use serde_json::{json, Value};
@@ -612,17 +612,12 @@ async fn write_grant(
             }
         }
         Grant::ResourcePolicy => {
-            lambda(
+            add_permission(
                 router,
                 case,
-                "AddPermission",
-                "POST",
-                &format!("{FUNCTIONS_URI}/{FUNCTION}/policy"),
-                Some(&json!({
-                    "StatementId": STATEMENT_ID,
-                    "Action": INVOKE_ACTION,
-                    "Principal": principal.statement_principal,
-                })),
+                FUNCTION,
+                STATEMENT_ID,
+                &principal.statement_principal,
             )
             .await;
         }
@@ -658,30 +653,150 @@ async fn withdraw_grant(
             }
         },
         Grant::ResourcePolicy => {
-            lambda(
-                router,
-                case,
-                "RemovePermission",
-                "DELETE",
-                &format!("{FUNCTIONS_URI}/{FUNCTION}/policy/{STATEMENT_ID}"),
-                None,
-            )
-            .await;
+            remove_permission(router, case, FUNCTION, STATEMENT_ID).await;
         }
     }
 }
 
-/// `Invoke` the function synchronously as `access_key_id`.
-async fn invoke(router: &MultiServiceRouter, access_key_id: &str) -> Answer {
-    lambda_as(
+/// The statuses Lambda answers an invocation it has not DECIDED with, each of which says "not
+/// now" and carries no authorization verdict: no room in the account's concurrent executions
+/// (`TooManyRequestsException`, HTTP 429), or the function not being `Active` yet
+/// (`ResourceConflictException`, HTTP 409). Whether one arrives is decided by what the rest of
+/// this process is running at that instant and by nothing a row varies, so [`invoke_decided`]
+/// LOOKS AGAIN on one rather than reading a verdict out of an invocation that was never decided.
+/// Nothing is tolerated by looking again: one of these still standing at the deadline fails the
+/// row.
+///
+/// `pub(crate)` for the reason [`invoke_decided`] is.
+pub(crate) const UNSERVED: &[u16] = &[409, 429];
+
+/// How long [`invoke_decided`] keeps looking for a decision, call and look-again together, and
+/// how long between two looks. It is many times what a decision costs, so a loaded host cannot
+/// decide the outcome, and a call that does not answer at all fails the row with its own message
+/// rather than hanging the suite.
+pub(crate) const DECISION_DEADLINE: Duration = Duration::from_secs(120);
+
+/// Invoke `function` as the credential `access_key_id` names, asking for the type `headers`
+/// states, and answer the DECISION: looks again, every [`LOOK`] until [`DECISION_DEADLINE`]
+/// passes, for as long as Lambda answers one of the statuses that carry no verdict
+/// ([`UNSERVED`]), and fails the row naming the case when a call has not answered by that same
+/// deadline — which is the whole span this reader can take, call and look-again together.
+///
+/// `pub(crate)` because every suite over these routes reads an invocation's verdict this one
+/// way, so none of them can drift into tolerating a "not now" as an answer
+/// (`crate::lambda_resource_policy_admits_each_invocation_type`,
+/// `crate::lambda_invoke_grant_revocation_scope`).
+pub(crate) async fn invoke_decided(
+    router: &MultiServiceRouter,
+    case: &str,
+    function: &str,
+    access_key_id: &str,
+    headers: &[(&str, &str)],
+) -> Answer {
+    let deadline = Instant::now() + DECISION_DEADLINE;
+    let uri = format!("{FUNCTIONS_URI}/{function}/invocations");
+    let payload = json!({"probe": true});
+    // The last answer that carried no verdict, so the failure at the deadline reports what
+    // Lambda kept saying rather than only that the span ran out.
+    let mut unserved: Option<String> = None;
+    loop {
+        // What is left of the one deadline: the whole reading — the call and the looking
+        // again — is bounded by that deadline rather than by it once per call.
+        let left = deadline.saturating_duration_since(Instant::now());
+        assert!(
+            !left.is_zero(),
+            "case {case:?}: Lambda never had room to decide the invocation of {function:?} within \
+             {DECISION_DEADLINE:?}, last answered {}",
+            unserved.as_deref().unwrap_or("nothing at all")
+        );
+        let call = lambda_as(
+            router,
+            access_key_id,
+            "POST",
+            &uri,
+            Some(&payload),
+            headers,
+        );
+        let answer = tokio::time::timeout(left, call).await.unwrap_or_else(|_| {
+            panic!(
+                "case {case:?}: the invocation of {function:?} had no answer within \
+                 {DECISION_DEADLINE:?}"
+            )
+        });
+        if !UNSERVED.contains(&answer.status) {
+            return answer;
+        }
+        unserved = Some(format!("{} with {}", answer.status, answer.text()));
+        tokio::time::sleep(LOOK).await;
+    }
+}
+
+/// `Invoke` this suite's own function synchronously as `access_key_id`, through the one reader
+/// of an invocation's verdict above.
+async fn invoke(router: &MultiServiceRouter, case: &str, access_key_id: &str) -> Answer {
+    invoke_decided(router, case, FUNCTION, access_key_id, &[]).await
+}
+
+/// `AddPermission`: one statement under `statement_id` granting `principal` the invoking action
+/// on `function`, written as the account's own credential, which is who administers a function's
+/// policy.
+///
+/// `pub(crate)` for the reason [`invoke_decided`] is: the suites over these routes write a grant
+/// this one way.
+pub(crate) async fn add_permission(
+    router: &MultiServiceRouter,
+    case: &str,
+    function: &str,
+    statement_id: &str,
+    principal: &str,
+) {
+    let added = lambda_as(
         router,
-        access_key_id,
+        ACCOUNT_KEY,
         "POST",
-        &format!("{FUNCTIONS_URI}/{FUNCTION}/invocations"),
-        Some(&json!({"probe": true})),
+        &format!("{FUNCTIONS_URI}/{function}/policy"),
+        Some(&json!({
+            "StatementId": statement_id,
+            "Action": INVOKE_ACTION,
+            "Principal": principal,
+        })),
         &[],
     )
-    .await
+    .await;
+    assert_eq!(
+        added.status,
+        201,
+        "case {case:?}: AddPermission({statement_id}) must answer 201, got {} with {}",
+        added.status,
+        added.text()
+    );
+}
+
+/// `RemovePermission`: take the statement `statement_id` back out of `function`'s policy.
+///
+/// `pub(crate)` for the reason [`add_permission`] is.
+pub(crate) async fn remove_permission(
+    router: &MultiServiceRouter,
+    case: &str,
+    function: &str,
+    statement_id: &str,
+) {
+    let removed = lambda_as(
+        router,
+        ACCOUNT_KEY,
+        "DELETE",
+        &format!("{FUNCTIONS_URI}/{function}/policy/{statement_id}"),
+        None,
+        &[],
+    )
+    .await;
+    assert_eq!(
+        removed.status,
+        204,
+        "case {case:?}: RemovePermission({statement_id}) must answer 204, got {} with {}",
+        removed.status,
+        removed.text()
+    );
 }
 
 /// Assert that `answer` is the authorization refusal, and that no handler ran for it.
@@ -750,15 +865,15 @@ async fn an_invocation_is_served_only_while_a_document_in_force_grants_it() {
         };
         let expected = refusal_message(&principal.arn, &function_arn);
 
-        let before = invoke(&router, &principal.access_key_id).await;
+        let before = invoke(&router, case, &principal.access_key_id).await;
         assert_refused(case, "before any grant", &before, &expected);
 
         write_grant(&router, case, &principal, row.grant, &function_arn).await;
-        let granted = invoke(&router, &principal.access_key_id).await;
+        let granted = invoke(&router, case, &principal.access_key_id).await;
         assert_ran(case, "while the grant stands", &granted);
 
         withdraw_grant(&router, case, &principal, row.grant).await;
-        let after = invoke(&router, &principal.access_key_id).await;
+        let after = invoke(&router, case, &principal.access_key_id).await;
         assert_refused(case, "after the grant was withdrawn", &after, &expected);
     }
 }
