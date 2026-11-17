@@ -637,6 +637,41 @@ pub(crate) async fn cloud_map(
     parsed
 }
 
+/// The instances Cloud Map's own `DiscoverInstances` answers for one of its services, named
+/// by the namespace and the service name it was created under — the read a client
+/// discovering a service makes, so an instance that is not in Cloud Map's own store cannot
+/// pass.
+pub(crate) async fn cloud_map_discovered(
+    router: &MultiServiceRouter,
+    namespace_name: &str,
+    service_name: &str,
+    case: &str,
+) -> Vec<Value> {
+    let answer = cloud_map(
+        router,
+        "DiscoverInstances",
+        json!({ "NamespaceName": namespace_name, "ServiceName": service_name }),
+        case,
+    )
+    .await;
+    list(&answer, "Instances", case)
+}
+
+/// `GetService`'s own `InstanceCount` for one Cloud Map service, read by the id that names
+/// it — the last segment of its ARN when an ARN is what the caller holds.
+pub(crate) async fn cloud_map_instance_count(
+    router: &MultiServiceRouter,
+    service_id_or_arn: &str,
+    case: &str,
+) -> i64 {
+    let id = service_id_or_arn
+        .rsplit('/')
+        .next()
+        .unwrap_or(service_id_or_arn);
+    let read = cloud_map(router, "GetService", json!({ "Id": id }), case).await;
+    count(&read["Service"], "InstanceCount", case)
+}
+
 /// A router carrying this service AND the Amazon EC2 service over ONE shared engine — the
 /// two stores the image-fetch rule reads across, mounted the way the production router
 /// mounts them. Amazon EC2 Auto Scaling is mounted beside them, so a capacity provider

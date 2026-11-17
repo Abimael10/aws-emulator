@@ -28,7 +28,8 @@ use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::ecs_wire::{
-    awsvpc_network_configuration, cloud_map, cluster_with_capacity, count, list, ok, string,
+    awsvpc_network_configuration, cloud_map, cloud_map_discovered, cloud_map_instance_count,
+    cluster_with_capacity, list, ok, string,
 };
 
 /// The cluster every service below runs in.
@@ -178,20 +179,15 @@ async fn task_addresses(router: &MultiServiceRouter, service: &str, case: &str) 
 }
 
 /// The instances Cloud Map's own `DiscoverInstances` reports for `registry_name`, keyed by
-/// instance id, each with its attributes.
+/// instance id, each with its attributes — the shared read
+/// ([`crate::ecs_wire::cloud_map_discovered`]), indexed the way the rows below assert on it.
 async fn discovered(
     router: &MultiServiceRouter,
     registry_name: &str,
     case: &str,
 ) -> BTreeMap<String, BTreeMap<String, String>> {
-    let answer = cloud_map(
-        router,
-        "DiscoverInstances",
-        json!({ "NamespaceName": NAMESPACE, "ServiceName": registry_name }),
-        case,
-    )
-    .await;
-    list(&answer, "Instances", case)
+    cloud_map_discovered(router, NAMESPACE, registry_name, case)
+        .await
         .into_iter()
         .map(|instance| {
             let id = string(&instance, "InstanceId", case);
@@ -210,10 +206,10 @@ async fn discovered(
         .collect()
 }
 
-/// `GetService`'s `InstanceCount` for `service_id` — Cloud Map's own count of what it holds.
+/// `GetService`'s `InstanceCount` for `service_id` — Cloud Map's own count of what it holds
+/// ([`crate::ecs_wire::cloud_map_instance_count`]).
 async fn instance_count(router: &MultiServiceRouter, service_id: &str, case: &str) -> i64 {
-    let read = cloud_map(router, "GetService", json!({ "Id": service_id }), case).await;
-    count(&read["Service"], "InstanceCount", case)
+    cloud_map_instance_count(router, service_id, case).await
 }
 
 #[tokio::test]

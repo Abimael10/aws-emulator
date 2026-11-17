@@ -34,12 +34,15 @@
 //! MAP's own API on the one shared engine — so nothing reaches into a state struct and a
 //! refusal that is not computed from persisted state cannot pass.
 
+use std::time::Duration;
+
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::ecs_wire::{
-    answered, awsvpc_network_configuration, cloud_map, cluster_with_capacity,
-    emulator_with_cloud_map, list, ok, refusal, string,
+    answered, awsvpc_network_configuration, cloud_map, cloud_map_discovered,
+    cloud_map_instance_count, cluster_with_capacity, emulator_with_cloud_map, list, ok, refusal,
+    string,
 };
 
 /// The cluster every service below is created in.
@@ -63,6 +66,14 @@ const REGISTRY_PORT: i64 = 8080;
 /// A VPC id of the shape `CreatePrivateDnsNamespace$Vpc` takes. Never resolved: Cloud Map
 /// stores the id it is given.
 const VPC: &str = "vpc-0123456789abcdef0";
+
+/// The private DNS namespace every record-publishing registry below lives in, and the name
+/// each Cloud Map service in it was created under — together the `NamespaceName`/
+/// `ServiceName` pair `DiscoverInstances` answers a query by.
+const DNS_NAMESPACE: &str = "registryrules.example.com";
+const SRV_REGISTRY_NAME: &str = "srvreg";
+const A_REGISTRY_NAME: &str = "areg";
+const AAAA_REGISTRY_NAME: &str = "aaaareg";
 
 /// The modelled error every refusal in this suite carries, with HTTP 400.
 const INVALID_PARAMETER: &str = "InvalidParameterException";
@@ -205,7 +216,7 @@ impl Fixture {
         let dns_namespace = namespace_id(
             &router,
             "CreatePrivateDnsNamespace",
-            json!({ "Name": "registryrules.example.com", "Vpc": VPC }),
+            json!({ "Name": DNS_NAMESPACE, "Vpc": VPC }),
             case,
         )
         .await;
@@ -217,10 +228,13 @@ impl Fixture {
         )
         .await;
         let srv =
-            cloud_map_registry(&router, &dns_namespace, "srvreg", Some("SRV"), case).await;
-        let a = cloud_map_registry(&router, &dns_namespace, "areg", Some("A"), case).await;
+            cloud_map_registry(&router, &dns_namespace, SRV_REGISTRY_NAME, Some("SRV"), case)
+                .await;
+        let a =
+            cloud_map_registry(&router, &dns_namespace, A_REGISTRY_NAME, Some("A"), case).await;
         let aaaa =
-            cloud_map_registry(&router, &dns_namespace, "aaaareg", Some("AAAA"), case).await;
+            cloud_map_registry(&router, &dns_namespace, AAAA_REGISTRY_NAME, Some("AAAA"), case)
+                .await;
         let http = cloud_map_registry(&router, &http_namespace, "httpreg", None, case).await;
         Self {
             router,
@@ -827,5 +841,206 @@ async fn a_service_may_carry_at_most_the_published_number_of_registries() {
                 );
             }
         }
+    }
+}
+
+/// How long the poll below keeps looking for the registration a running task is owed before
+/// it gives up. Generous on purpose: it waits for the CONDITION, and the condition is
+/// reached long before this on any host.
+const REGISTRATION_DEADLINE: Duration = Duration::from_secs(60);
+
+/// How long the poll waits between looks.
+const POLL_INTERVAL: Duration = Duration::from_millis(50);
+
+#[tokio::test]
+async fn a_refused_registry_leaves_no_service_and_no_cloud_map_instance() {
+    let fixture = Fixture::build().await;
+    let router = &fixture.router;
+    let (srv, a, aaaa) = (
+        fixture.srv.as_str(),
+        fixture.a.as_str(),
+        fixture.aaaa.as_str(),
+    );
+
+    // One row per way the rule refuses an entry: the port an `SRV` record publishes named
+    // neither once nor twice, an address-only record paired with a revision that shares the
+    // instance's address, and a container the revision does not declare.
+    let rows = [
+        Row {
+            case: "an SRV registry naming no port source",
+            network_mode: "awsvpc",
+            registry: json!({ "registryArn": srv }),
+            refused_with: Some(srv_port_source_message(srv)),
+        },
+        Row {
+            case: "an SRV registry naming two port sources",
+            network_mode: "awsvpc",
+            registry: json!({
+                "registryArn": srv,
+                "containerName": CONTAINER,
+                "containerPort": CONTAINER_PORT,
+                "port": REGISTRY_PORT,
+            }),
+            refused_with: Some(srv_port_source_message(srv)),
+        },
+        Row {
+            case: "an A registry against a bridge revision",
+            network_mode: "bridge",
+            registry: json!({
+                "registryArn": a,
+                "containerName": CONTAINER,
+                "containerPort": CONTAINER_PORT,
+            }),
+            refused_with: Some(address_record_message("A", a)),
+        },
+        Row {
+            case: "an AAAA registry against a host revision",
+            network_mode: "host",
+            registry: json!({
+                "registryArn": aaaa,
+                "containerName": CONTAINER,
+                "containerPort": CONTAINER_PORT,
+            }),
+            refused_with: Some(address_record_message("AAAA", aaaa)),
+        },
+        Row {
+            case: "an SRV registry naming a container the revision does not declare",
+            network_mode: "awsvpc",
+            registry: json!({
+                "registryArn": srv,
+                "containerName": MISSING_CONTAINER,
+                "containerPort": CONTAINER_PORT,
+            }),
+            refused_with: Some(container_not_valid_message(MISSING_CONTAINER, srv)),
+        },
+    ];
+
+    for (index, row) in rows.iter().enumerate() {
+        let case = row.case;
+        let expected: &str = row
+            .refused_with
+            .as_deref()
+            .unwrap_or_else(|| panic!("case {case:?}: every row here is a refusal"));
+        let (code, message) = refusal(
+            router,
+            "CreateService",
+            create_request(row, &format!("refusedsvc{index}")),
+            case,
+        )
+        .await;
+        assert_eq!(
+            (code.as_str(), message.as_str()),
+            (INVALID_PARAMETER, expected),
+            "case {case:?}: expected the create to be refused with {INVALID_PARAMETER} \
+             {expected:?}, got ({code:?}, {message:?})"
+        );
+    }
+
+    // A refused create persisted NOTHING: no ECS service in the cluster ...
+    let listed = ok(
+        router,
+        "ListServices",
+        json!({ "cluster": CLUSTER }),
+        "listing",
+    )
+    .await;
+    let service_arns = list(&listed, "serviceArns", "listing");
+    assert!(
+        service_arns.is_empty(),
+        "a refused create leaves no ECS service behind, got {service_arns:?}"
+    );
+
+    // ... and no instance in any of the Cloud Map services those entries named.
+    for (registry_name, registry_arn) in [
+        (SRV_REGISTRY_NAME, srv),
+        (A_REGISTRY_NAME, a),
+        (AAAA_REGISTRY_NAME, aaaa),
+    ] {
+        let instances =
+            cloud_map_discovered(router, DNS_NAMESPACE, registry_name, registry_name).await;
+        assert!(
+            instances.is_empty(),
+            "case {registry_name:?}: a refused create registers no Cloud Map instance, got \
+             {instances:?}"
+        );
+        let held = cloud_map_instance_count(router, registry_arn, registry_name).await;
+        assert_eq!(
+            held, 0,
+            "case {registry_name:?}: expected Cloud Map to hold no instance, got {held}"
+        );
+    }
+
+    // The same reads are not vacuously empty: the one entry the rule ADMITS registers its
+    // task, so what the refusals left out is what a registration would have put there.
+    let accepted = json!({
+        "registryArn": srv,
+        "containerName": CONTAINER,
+        "containerPort": CONTAINER_PORT,
+    });
+    ok(
+        router,
+        "CreateService",
+        json!({
+            "cluster": CLUSTER,
+            "serviceName": "acceptedregsvc",
+            "taskDefinition": "registryrules-awsvpc",
+            "desiredCount": 1,
+            "launchType": "EC2",
+            "networkConfiguration": awsvpc_network_configuration(),
+            "serviceRegistries": [accepted.clone()],
+        }),
+        "accepted",
+    )
+    .await;
+
+    // The registration is owed once the task is RUNNING, so the CONDITION is polled for —
+    // never a span of time — until it holds or a generous deadline passes.
+    let deadline = tokio::time::Instant::now() + REGISTRATION_DEADLINE;
+    loop {
+        // An ECS read materialises the steps of the task's start the clock has made due.
+        let tasks = ok(
+            router,
+            "ListTasks",
+            json!({ "cluster": CLUSTER, "serviceName": "acceptedregsvc" }),
+            "accepted",
+        )
+        .await;
+        let task_arns = list(&tasks, "taskArns", "accepted");
+        if !task_arns.is_empty() {
+            ok(
+                router,
+                "DescribeTasks",
+                json!({ "cluster": CLUSTER, "tasks": task_arns }),
+                "accepted",
+            )
+            .await;
+        }
+        let instances =
+            cloud_map_discovered(router, DNS_NAMESPACE, SRV_REGISTRY_NAME, "accepted").await;
+        if !instances.is_empty() {
+            // One task, so ONE instance: an over-registration fails here on the count and
+            // not on the deadline.
+            assert_eq!(
+                instances.len(),
+                1,
+                "case \"accepted\": one running task is one Cloud Map instance, got \
+                 {instances:?}"
+            );
+            // And Cloud Map's own count agrees, so the zero counts the refused rows were
+            // read with are the count of an EMPTY service and not of an absent member.
+            let held = cloud_map_instance_count(router, srv, "accepted").await;
+            assert_eq!(
+                held, 1,
+                "case \"accepted\": expected Cloud Map to count the registered instance, \
+                 got {held}"
+            );
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "case \"accepted\": expected the admitted registry to register its running \
+             task's instance in Cloud Map, got {instances:?}"
+        );
+        tokio::time::sleep(POLL_INTERVAL).await;
     }
 }
