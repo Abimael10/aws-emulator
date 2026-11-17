@@ -21,6 +21,13 @@
 //! a rotation client actually hits — the id of a certificate authority this cluster
 //! HELD and a delete has taken out of its trust bundle.
 //!
+//! The three suites after it hold the rule fixed across the LIFECYCLE by which the
+//! cluster stopped holding the certificate authority: the refusal is a fact about
+//! the id no longer resolving, so a successor deleted before it ever signed, a
+//! signer an activation retired and then deleted, and a successor deleted on a
+//! cluster whose sole signer's delete was refused first are each refused with the
+//! same fixed text — one suite per lifecycle, so no one test drives three of them.
+//!
 //! `ActivateCertificateAuthority` and `DeleteCertificateAuthority` word the same
 //! absence as their own recordings show, so they are not asserted here: this is the
 //! READ's refusal.
@@ -31,63 +38,44 @@
 use std::collections::BTreeSet;
 
 use service_com_amazonaws_eks_awswesleyfrontend::state::{
-    CA_DISTRIBUTION_DELAY, CERTIFICATE_AUTHORITY_MANAGER, CERTIFICATE_AUTHORITY_NOT_FOUND_DETAIL,
-    CLUSTER_ACTIVATION_DELAY, UPDATE_COMPLETION_DELAY,
+    CA_DISTRIBUTION_DELAY, CLUSTER_ACTIVATION_DELAY, UPDATE_COMPLETION_DELAY,
 };
 
 use crate::certificate_authority::{
-    append_authority, create_cluster, describe_authority, is_uuid, settle, str_member, REGION,
+    append_authority, create_cluster, describe_authority, describe_update, is_uuid, settle,
+    str_member, REGION,
 };
-use crate::wire::{call, emulator, encode_label, error_code, Answer};
+use crate::certificate_authority_activation::activate_authority;
+use crate::certificate_authority_deletion::delete_authority;
+use crate::certificate_authority_listing::{list_authorities, listed_ids, signer_id};
+use crate::certificate_authority_rotation::{active_cluster, poll_until};
+use crate::wire::{emulator, error_code};
 
 /// The second region a row is signed for.
 const OTHER_REGION: &str = "eu-central-1";
 
-/// The head of the wrapped refusal: the plane's own sentence, and the tail's
-/// opening up to the request id.
-fn expected_head() -> String {
-    format!(
-        "{CERTIFICATE_AUTHORITY_NOT_FOUND_DETAIL} (Service: {CERTIFICATE_AUTHORITY_MANAGER}, \
-         Status Code: 404, Request ID: "
-    )
-}
+/// The head of the wrapped refusal — the plane's own sentence and the tail's
+/// opening up to the request id — as Amazon EKS words it. Written out here rather
+/// than composed from the service's own constants, so a change to that wording
+/// cannot keep this suite green.
+const EXPECTED_HEAD: &str = "certificate authority not found (Service: EksCertificateAuthority, \
+                             Status Code: 404, Request ID: ";
 
 /// The tail that closes it: how many attempts were made to reach that plane.
 const EXPECTED_TAIL: &str = ") (SDK Attempt Count: 1)";
 
-async fn delete_authority(
-    router: &smithy_server_runtime::MultiServiceRouter,
-    region: &str,
-    cluster: &str,
-    authority_id: &str,
-) -> Answer {
-    call(
-        router,
-        region,
-        "DELETE",
-        &format!(
-            "/clusters/{}/certificate-authorities/{}",
-            encode_label(cluster),
-            encode_label(authority_id)
-        ),
-        "",
-    )
-    .await
-}
-
 /// The request id the wrapped refusal carries, from a message that matches the
 /// fixed text around it.
 fn request_id(case: &str, message: &str) -> String {
-    let head = expected_head();
     assert!(
-        message.starts_with(&head),
-        "case {case:?}: the refusal must begin {head:?}, got {message:?}"
+        message.starts_with(EXPECTED_HEAD),
+        "case {case:?}: the refusal must begin {EXPECTED_HEAD:?}, got {message:?}"
     );
     assert!(
         message.ends_with(EXPECTED_TAIL),
         "case {case:?}: the refusal must end {EXPECTED_TAIL:?}, got {message:?}"
     );
-    let id = &message[head.len()..message.len() - EXPECTED_TAIL.len()];
+    let id = &message[EXPECTED_HEAD.len()..message.len() - EXPECTED_TAIL.len()];
     assert!(
         is_uuid(id),
         "case {case:?}: the tail must carry the id of the call that was made, got {id:?}"
@@ -147,7 +135,7 @@ async fn an_unresolvable_certificate_authority_read_carries_the_wrapped_refusal(
         &appended.body["certificateAuthority"]["id"],
     );
     settle(CA_DISTRIBUTION_DELAY).await;
-    let removed = delete_authority(&router, REGION, "ca-gone", &deleted_id).await;
+    let removed = delete_authority(&router, REGION, "ca-gone", &deleted_id, None).await;
     assert_eq!(
         removed.status, 200,
         "setup: expected 200 from DeleteCertificateAuthority, got {removed:?}"
@@ -225,4 +213,236 @@ async fn an_unresolvable_certificate_authority_read_carries_the_wrapped_refusal(
         !request_ids.contains(&repeated_id),
         "a repeated read draws its own request id, got {repeated_id:?} again"
     );
+}
+
+// ---------------------------------------------------------------------------
+// RULE, held fixed across the LIFECYCLE that removed the certificate authority:
+// the refusal reports that the id no longer resolves on the cluster, so HOW the
+// cluster stopped holding it — a successor deleted before it ever signed, a
+// signer an activation retired and then deleted, or a successor deleted on a
+// cluster whose sole signer's delete was refused first — changes nothing about
+// the message but the request id of the call behind it.
+// ---------------------------------------------------------------------------
+
+/// How a certificate authority left the cluster's trust bundle. The rows of the
+/// table below differ along this and along nothing else.
+#[derive(Debug, Clone, Copy)]
+enum Lifecycle {
+    /// Appended, fully distributed and deleted before it ever signed.
+    SuccessorNeverActivated,
+    /// The certificate authority Amazon EKS provisioned with the cluster, retired
+    /// by an activation and then deleted.
+    RetiredByAnActivation,
+    /// A successor deleted on a cluster whose sole signer's delete was refused
+    /// first, so a refusal preceded the delete that removed it.
+    SuccessorAfterARefusedSignerDelete,
+}
+
+/// A successor appended to `cluster` and polled until it is fully distributed —
+/// `COMPLETE` is the precondition an activation states — reporting its id.
+async fn distributed_successor(
+    router: &smithy_server_runtime::MultiServiceRouter,
+    case: &str,
+    cluster: &str,
+) -> String {
+    let appended = append_authority(router, REGION, cluster, None).await;
+    assert_eq!(
+        appended.status, 200,
+        "case {case:?}: expected 200 from CreateCertificateAuthority, got {appended:?}"
+    );
+    let id = str_member(
+        case,
+        "certificateAuthority.id",
+        &appended.body["certificateAuthority"]["id"],
+    );
+    poll_until(
+        case,
+        "the successor's distributionStatus reaching COMPLETE",
+        || describe_authority(router, REGION, cluster, &id),
+        |answer| {
+            answer.body["certificateAuthority"]["distributionStatus"]
+                == serde_json::json!("COMPLETE")
+        },
+    )
+    .await;
+    id
+}
+
+/// Delete `authority_id` from `cluster` and poll until the cluster no longer
+/// lists it: the state in which the read under test is made.
+async fn delete_until_gone(
+    router: &smithy_server_runtime::MultiServiceRouter,
+    case: &str,
+    cluster: &str,
+    authority_id: &str,
+) {
+    let deleted = delete_authority(router, REGION, cluster, authority_id, None).await;
+    assert_eq!(
+        deleted.status, 200,
+        "case {case:?}: expected 200 from DeleteCertificateAuthority, got {deleted:?}"
+    );
+    poll_until(
+        case,
+        "the deleted certificate authority dropping out of the listing",
+        || list_authorities(router, cluster, ""),
+        |answer| !listed_ids(answer).iter().any(|held| held == authority_id),
+    )
+    .await;
+}
+
+/// Drive `cluster` through `lifecycle` and report the id it left unresolvable.
+async fn authority_removed_by(
+    router: &smithy_server_runtime::MultiServiceRouter,
+    case: &str,
+    cluster: &str,
+    lifecycle: Lifecycle,
+) -> String {
+    active_cluster(router, case, cluster).await;
+    let signer = signer_id(router, case, cluster).await;
+
+    let gone = match lifecycle {
+        Lifecycle::SuccessorNeverActivated => distributed_successor(router, case, cluster).await,
+        Lifecycle::RetiredByAnActivation => {
+            let successor = distributed_successor(router, case, cluster).await;
+            let activated = activate_authority(router, REGION, cluster, &successor, None).await;
+            assert_eq!(
+                activated.status, 200,
+                "case {case:?}: expected 200 from ActivateCertificateAuthority, got {activated:?}"
+            );
+            let update = str_member(case, "update.id", &activated.body["update"]["id"]);
+            poll_until(
+                case,
+                "the activation update reaching Successful",
+                || describe_update(router, REGION, cluster, &update),
+                |answer| answer.body["update"]["status"] == serde_json::json!("Successful"),
+            )
+            .await;
+            poll_until(
+                case,
+                "the outgoing certificate authority being retired to NOT_USED",
+                || describe_authority(router, REGION, cluster, &signer),
+                |answer| {
+                    answer.body["certificateAuthority"]["signingStatus"]
+                        == serde_json::json!("NOT_USED")
+                },
+            )
+            .await;
+            signer
+        }
+        Lifecycle::SuccessorAfterARefusedSignerDelete => {
+            // The sole signer cannot be deleted, so this call removes nothing; it
+            // is the refusal the lifecycle begins with.
+            let refused = delete_authority(router, REGION, cluster, &signer, None).await;
+            assert_eq!(
+                refused.status, 409,
+                "case {case:?}: deleting the sole signer is refused 409, got {refused:?}"
+            );
+            assert_eq!(
+                error_code(&refused),
+                "ResourceInUseException",
+                "case {case:?}: expected ResourceInUseException, got {refused:?}"
+            );
+            distributed_successor(router, case, cluster).await
+        }
+    };
+
+    delete_until_gone(router, case, cluster, &gone).await;
+    gone
+}
+
+/// Drive `cluster` through `lifecycle`, then assert the read of the id it left
+/// unresolvable is refused exactly as Amazon EKS refuses it.
+///
+/// This is the whole rule for one lifecycle: 404, `ResourceNotFoundException`,
+/// the fixed text either side of a request id in the shape the service mints,
+/// neither of the request's labels echoed, a fresh request id per call, and the
+/// cluster still serving the certificate authorities it did not delete.
+async fn the_read_of_the_removed_authority_is_refused(
+    case: &str,
+    cluster: &str,
+    lifecycle: Lifecycle,
+) {
+    let router = emulator();
+    let gone = authority_removed_by(&router, case, cluster, lifecycle).await;
+
+    let answer = describe_authority(&router, REGION, cluster, &gone).await;
+    assert_eq!(
+        answer.status, 404,
+        "case {case:?}: expected 404 from DescribeCertificateAuthority, got {answer:?}"
+    );
+    assert_eq!(
+        error_code(&answer),
+        "ResourceNotFoundException",
+        "case {case:?}: expected ResourceNotFoundException, got {answer:?}"
+    );
+    let message = answer.message();
+    let id = request_id(case, &message);
+    assert_eq!(
+        message,
+        format!("{EXPECTED_HEAD}{id}{EXPECTED_TAIL}"),
+        "case {case:?}: the refusal is the fixed text around the request id of the call"
+    );
+    assert!(
+        !message.contains(gone.as_str()) && !message.contains(cluster),
+        "case {case:?}: the refusal echoes neither label of the request, got {message:?}"
+    );
+    // The payload names no resource of its own: see `child_resource_not_found`.
+    assert!(
+        answer.body.get("clusterName").is_none(),
+        "case {case:?}: the payload names no cluster, got {:?}",
+        answer.body
+    );
+
+    // A second read of the same removed id is refused with the same fixed text and
+    // its own request id: the id belongs to the call, not to what was asked for.
+    let again = describe_authority(&router, REGION, cluster, &gone).await;
+    let second = request_id(case, &again.message());
+    assert_ne!(
+        id, second,
+        "case {case:?}: each read draws its own request id"
+    );
+
+    // The cluster is still there and still serves the certificate authorities it
+    // did not delete: only the removed id is unresolvable.
+    let listed = list_authorities(&router, cluster, "").await;
+    assert_eq!(
+        listed.status, 200,
+        "case {case:?}: expected 200 from ListCertificateAuthorities, got {listed:?}"
+    );
+    let held = listed_ids(&listed);
+    assert!(
+        !held.is_empty() && !held.iter().any(|id| id == &gone),
+        "case {case:?}: the cluster holds its remaining certificate authorities and not the \
+         removed one, got {listed:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_successor_deleted_before_it_signed_reads_back_as_the_wrapped_refusal() {
+    the_read_of_the_removed_authority_is_refused(
+        "a successor deleted before it ever signed",
+        "ca-life-successor",
+        Lifecycle::SuccessorNeverActivated,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn a_signer_an_activation_retired_reads_back_as_the_wrapped_refusal() {
+    the_read_of_the_removed_authority_is_refused(
+        "a signer an activation retired, then deleted",
+        "ca-life-retired",
+        Lifecycle::RetiredByAnActivation,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn a_successor_deleted_after_a_refused_signer_delete_reads_back_as_the_wrapped_refusal() {
+    the_read_of_the_removed_authority_is_refused(
+        "a successor deleted after the sole signer's delete was refused",
+        "ca-life-refused",
+        Lifecycle::SuccessorAfterARefusedSignerDelete,
+    )
+    .await;
 }

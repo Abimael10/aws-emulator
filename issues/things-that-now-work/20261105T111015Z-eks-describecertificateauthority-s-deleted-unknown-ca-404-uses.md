@@ -10,6 +10,15 @@ Issue-Commit: 33a45829f0914d4e090018a6741160dbd250b745
 
 # eks: DescribeCertificateAuthority's deleted/unknown-CA 404 uses an emulator-authored sentence instead of EKS's wrapped not-found message (1 cause)
 
+> _Resolution: the read's refusal is the wrapped one now, and
+> `tests/all/certificate_authority_read_refusal.rs` pins it across the removal
+> lifecycles these three checks drive. Two of the three checks pass; the third,
+> `eks.certificate-authority-lifecycle-transitions`, now gets past this cause and
+> fails LATER on `DeleteCertificateAuthority`'s re-delete wording — a different
+> operation, carried by `20261110T203834Z-eks-6-net-new-root-causes-cluster-endpoint.md`
+> (cause 4) and `20261104T105252Z-eks-10-net-new-root-causes-in-not.md` (cause 3), so
+> this move does not claim that check passes end to end._
+
 > _Note: this issue was identified against the code base at commit `33a45829f0914d4e090018a6741160dbd250b745`. If you are an issue fixer working on this, the code base you are currently working in can have drifted, so you might need to trace the issue back to the current code base._
 
 ## Operation
