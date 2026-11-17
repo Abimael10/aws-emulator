@@ -28,7 +28,11 @@
 //! * RULE D — `StartUserImportJob` begins the import of a job "that you previously
 //!   created" (`StartUserImportJob.JobId`), so a job in any other state is refused
 //!   `PreconditionNotMetException` naming the job the REQUEST asked for, and the
-//!   stored job does not move.
+//!   stored job does not move. Asserted over how the job left the created state —
+//!   started, stopped, expired by the clock — and over how far the run its own
+//!   start made has got: importing, completed, or stopped by an error. The
+//!   sentence is the same one for every one of them, since the status the job is
+//!   in is no part of it.
 //!
 //! The pools, app clients, users, tokens and import jobs are real: they come from
 //! `CreateUserPool`, `CreateUserPoolClient`, `AdminCreateUser`,
@@ -1271,17 +1275,6 @@ fn not_in_created_state(job_id: &str) -> String {
 /// Create a job of `user_pool_id`, upload a file the pool's own import template
 /// can read, and return its `JobId`.
 async fn import_job(instance: &Emulator, user_pool_id: &str, job_name: &str) -> String {
-    let created = ok(
-        &instance.router,
-        "CreateUserImportJob",
-        &json!({
-            "UserPoolId": user_pool_id,
-            "JobName": job_name,
-            "CloudWatchLogsRoleArn": IMPORT_ROLE,
-        }),
-    )
-    .await;
-    let job = &created["UserImportJob"];
     let header = ok(
         &instance.router,
         "GetCSVHeader",
@@ -1300,6 +1293,28 @@ async fn import_job(instance: &Emulator, user_pool_id: &str, job_name: &str) -> 
         })
         .collect();
     let file = format!("{}\n{}\n", columns.join(","), row.join(","));
+    job_with_file(instance, user_pool_id, job_name, file).await
+}
+
+/// Create a job of `user_pool_id`, upload `file` to the target the created job
+/// names — whatever that file carries — and return its `JobId`.
+async fn job_with_file(
+    instance: &Emulator,
+    user_pool_id: &str,
+    job_name: &str,
+    file: String,
+) -> String {
+    let created = ok(
+        &instance.router,
+        "CreateUserImportJob",
+        &json!({
+            "UserPoolId": user_pool_id,
+            "JobName": job_name,
+            "CloudWatchLogsRoleArn": IMPORT_ROLE,
+        }),
+    )
+    .await;
+    let job = &created["UserImportJob"];
     let url = job["PreSignedUrl"]
         .as_str()
         .unwrap_or_else(|| panic!("a created job carries its locator, got {job}"));
@@ -1453,6 +1468,151 @@ async fn starting_a_job_that_is_not_in_the_created_state_names_the_job_the_reque
             state::JOB_STATUS_CREATED,
             "case {case:?}: a refused start must not put the job back in the created state, \
              got {after}"
+        );
+    }
+}
+
+/// How far a planted instant is moved past the moment a read compares it with, so
+/// the move it governs is unambiguously due.
+const PLANTED_STEP: Duration = Duration::from_secs(1);
+
+/// How far the NEXT move of a planted job is pushed out, so it stays undue for as
+/// long as any machine takes to run one row.
+const PLANTED_HORIZON: Duration = Duration::from_secs(60 * 60);
+
+/// Where a job's OWN run has got to when a second start arrives: the three
+/// statuses the clock drives a started job through, none of them the created
+/// state.
+#[derive(Clone, Copy, Debug)]
+enum StartedJob {
+    /// The clock has made the import due, so "users are being imported"
+    /// (`UserImportJobType.Status`).
+    InProgress,
+    /// The run read the file and the clock has made its completion due.
+    Succeeded,
+    /// The file's header is not one this pool's import can read, so the run
+    /// placed no row and "the job has stopped due to an error".
+    Failed,
+}
+
+impl StartedJob {
+    /// The status the stored job reports once this row's instants are planted.
+    fn status(self) -> &'static str {
+        match self {
+            Self::InProgress => state::JOB_STATUS_IN_PROGRESS,
+            Self::Succeeded => state::JOB_STATUS_SUCCEEDED,
+            Self::Failed => state::JOB_STATUS_FAILED,
+        }
+    }
+}
+
+/// RULE D, over the statuses a job's own RUN reaches: a job that was started has
+/// left the created state for good, so a second start is refused with the same
+/// sentence whether the import is still running or has reached either terminal
+/// status. The rows differ along the status the stored job is in when that second
+/// start arrives, and along the file the job was handed, which is what decides the
+/// terminal status its run earns.
+#[tokio::test]
+async fn starting_a_job_whose_run_has_begun_names_the_job_whatever_the_run_reached() {
+    for (index, way) in [
+        StartedJob::InProgress,
+        StartedJob::Succeeded,
+        StartedJob::Failed,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let case = format!("{way:?}");
+        let instance = emulator();
+        let user_pool_id = pool(
+            &instance.router,
+            &format!("start-after-start-{index}"),
+            &json!({}),
+        )
+        .await;
+        // The file the job is handed is what earns the run its terminal status: a
+        // header row of this pool's own import template completes the run, and one
+        // the template does not name stops it with an error.
+        let job_id = match way {
+            StartedJob::Failed => {
+                job_with_file(
+                    &instance,
+                    &user_pool_id,
+                    "start-after-start-job",
+                    "not,a,header,of,this,pool\nrecord\n".to_string(),
+                )
+                .await
+            }
+            StartedJob::InProgress | StartedJob::Succeeded => {
+                import_job(&instance, &user_pool_id, "start-after-start-job").await
+            }
+        };
+        let body = json!({ "UserPoolId": user_pool_id, "JobId": job_id });
+        ok(&instance.router, "StartUserImportJob", &body).await;
+
+        // The moves the clock owes a started job are PLANTED rather than waited
+        // out: the stored instants are moved so the move this row is about is
+        // already due and the next one is not, which is what puts the job in this
+        // row's status without the test depending on how fast the host runs.
+        {
+            let service_state =
+                state::service_state(&*instance.engine).expect("this service's state");
+            let mut guard = service_state.lock();
+            let pool = guard.pool_mut(&user_pool_id).expect("the created pool");
+            let job = pool
+                .user_import_jobs
+                .get_mut(&job_id)
+                .expect("the started job");
+            let in_progress_at = job
+                .in_progress_at
+                .expect("a started job owes its import move");
+            let completed_at = job.completed_at.expect("a started job owes its completion");
+            match way {
+                StartedJob::InProgress => {
+                    let import_due = in_progress_at - (state::JOB_START_SPAN + PLANTED_STEP);
+                    job.in_progress_at = Some(import_due);
+                    job.completed_at = Some(completed_at + PLANTED_HORIZON);
+                }
+                StartedJob::Succeeded | StartedJob::Failed => {
+                    let completion_due = completed_at - (state::JOB_IMPORT_SPAN + PLANTED_STEP);
+                    job.completed_at = Some(completion_due);
+                }
+            }
+        }
+
+        let before = job_status(&instance, &user_pool_id, &job_id).await;
+        let expected_status = way.status();
+        assert_eq!(
+            before, expected_status,
+            "case {case:?}: this row needs a job in {expected_status}, got {before}"
+        );
+        let (status, payload) = dispatch(&instance.router, "StartUserImportJob", &body, true).await;
+        assert_eq!(
+            (status, error_code(&payload)),
+            (REFUSED, "PreconditionNotMetException"),
+            "case {case:?}: expected a {REFUSED} PreconditionNotMetException, \
+             got {status} with {payload}"
+        );
+        let expected = not_in_created_state(&job_id);
+        let message = error_message(&payload);
+        assert_eq!(
+            message, expected,
+            "case {case:?}: expected {expected:?}, got {message:?}"
+        );
+        // The same sentence whatever the run reached: the status the job is in is
+        // not part of it, and neither is the pool.
+        assert!(
+            !message.contains(user_pool_id.as_str()) && !message.contains(before.as_str()),
+            "case {case:?}: the sentence must quote neither the pool nor the status, \
+             got {message:?}"
+        );
+
+        // The refused start begins no second import: the job reports the status it
+        // already had, and the run its first start made is the one it reports.
+        let after = job_status(&instance, &user_pool_id, &job_id).await;
+        assert_eq!(
+            after, expected_status,
+            "case {case:?}: a refused start must leave the job in {expected_status}, got {after}"
         );
     }
 }
