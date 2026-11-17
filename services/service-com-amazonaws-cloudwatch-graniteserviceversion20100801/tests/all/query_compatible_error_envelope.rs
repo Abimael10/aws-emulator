@@ -498,3 +498,120 @@ async fn a_value_supplied_empty_is_reported_as_a_parameter_with_no_value() {
         );
     }
 }
+
+/// The legacy query code of the request-validation class, which is what a query-compatible
+/// client of this service branches on for a value the service will not accept.
+const VALIDATION_REPORT: &str = "ValidationError;Sender";
+
+#[tokio::test]
+async fn a_value_outside_an_enumerated_type_reports_the_legacy_validation_code() {
+    // (case, operation, request). A value outside an enumerated type on a SCALAR member is
+    // refused under the request-validation class on every one of these reads, so each must
+    // report that class's legacy code — the rows span WHICH enumerated type the member targets,
+    // which operation it arrived on, and HOW the value misses the set (a word the type never
+    // offered, a declared value mis-cased, and no characters at all). A value inside a LIST is
+    // another class, which the table above holds.
+    let rows: Vec<(&str, &str, Value)> = vec![
+        (
+            "the scan direction of the metric-data read",
+            "GetMetricData",
+            metric_data_request(&json!({"ScanBy": "NotAnEnumValue"})),
+        ),
+        (
+            "the same member carrying a declared value mis-cased",
+            "GetMetricData",
+            metric_data_request(&json!({"ScanBy": "timestampascending"})),
+        ),
+        (
+            "the same member carrying no characters at all",
+            "GetMetricData",
+            metric_data_request(&json!({"ScanBy": ""})),
+        ),
+        (
+            "the scan direction of the alarm-history read",
+            "DescribeAlarmHistory",
+            json!({"ScanBy": "NotAnEnumValue"}),
+        ),
+        (
+            "the history item type of that read",
+            "DescribeAlarmHistory",
+            json!({"HistoryItemType": "NotAnEnumValue"}),
+        ),
+        (
+            "the state an alarm reader filters by",
+            "DescribeAlarms",
+            json!({"StateValue": "NotAnEnumValue"}),
+        ),
+    ];
+
+    let router = build_router();
+    for (case, operation, request) in rows {
+        let (status, headers, body) = call_in_query_mode(&router, operation, &request).await;
+        assert_eq!(
+            status, 400,
+            "case {case:?}: expected HTTP 400, got {status} with {body}"
+        );
+        assert_eq!(
+            error_type(&body),
+            VALIDATION_SHAPE_ID,
+            "case {case:?}: expected the body to name {VALIDATION_SHAPE_ID}, got {body}"
+        );
+        let reported = headers
+            .get(QUERY_ERROR_HEADER)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default();
+        assert_eq!(
+            reported, VALIDATION_REPORT,
+            "case {case:?}: expected {QUERY_ERROR_HEADER} to read {VALIDATION_REPORT:?}, got \
+             {reported:?}"
+        );
+    }
+
+    // Every value the types DO declare is served on the same reads, so the refusals above are
+    // about the value being outside the type rather than about the member being read at all.
+    for (case, operation, request) in [
+        (
+            "the scan direction's two declared values",
+            "GetMetricData",
+            metric_data_request(&json!({"ScanBy": "TimestampAscending"})),
+        ),
+        (
+            "the other one",
+            "GetMetricData",
+            metric_data_request(&json!({"ScanBy": "TimestampDescending"})),
+        ),
+        (
+            "a declared alarm state",
+            "DescribeAlarms",
+            json!({"StateValue": "INSUFFICIENT_DATA"}),
+        ),
+    ] {
+        let (status, _headers, body) = call_in_query_mode(&router, operation, &request).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected the call to be served, got {status} with {body}"
+        );
+    }
+}
+
+/// A one-query `GetMetricData` request over a one-minute window, with `patch` merged into it:
+/// the request is well-formed apart from whatever the row changes, so the refusal under test is
+/// the only thing wrong with it.
+fn metric_data_request(patch: &Value) -> Value {
+    merged(
+        json!({
+            "MetricDataQueries": [{
+                "Id": "q",
+                "MetricStat": {
+                    "Metric": {"Namespace": "MyApp/Envelope", "MetricName": "Latency"},
+                    "Period": 60,
+                    "Stat": "Sum",
+                },
+                "ReturnData": true,
+            }],
+            "StartTime": 1_700_000_000.0,
+            "EndTime": 1_700_000_060.0,
+        }),
+        patch,
+    )
+}

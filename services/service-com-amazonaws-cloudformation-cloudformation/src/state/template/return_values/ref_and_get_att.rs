@@ -1979,7 +1979,12 @@ pub(crate) fn return_values(
         // its resource with a COLON
         // (`arn:aws:cloudwatch:<region>:<account>:alarm:<alarm name>`), which is why the
         // type is catalogued rather than left to the uniform `<type>/<name>` convention.
-        "AWS::CloudWatch::Alarm" => {
+        // A COMPOSITE alarm publishes the same two values, and its ARN spells its resource
+        // the same way: "The ARN format of an alarm is
+        // arn:aws:cloudwatch:Region:account-id:alarm:alarm-name", whichever kind of alarm it
+        // is, so both types are catalogued in the one arm.
+        "AWS::CloudWatch::Alarm"
+        | crate::state::provisioner::cloudwatch_composite_alarms::CLOUDWATCH_COMPOSITE_ALARM => {
             attributes.insert(
                 "Arn".to_string(),
                 ::emulator_server::emulator_arn("cloudwatch", region, &format!("alarm:{name}")),

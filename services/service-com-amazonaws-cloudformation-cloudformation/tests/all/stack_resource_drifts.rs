@@ -300,10 +300,11 @@ fn report_cases() -> Vec<ReportCase> {
                 "    Properties:\n",
                 "      BucketName: drifts-mixed-kept\n",
                 "  Signal:\n",
-                "    Type: AWS::CloudWatch::CompositeAlarm\n",
+                "    Type: AWS::CloudWatch::AnomalyDetector\n",
                 "    Properties:\n",
-                "      AlarmName: drifts-mixed-signal\n",
-                "      AlarmRule: ALARM(drifts-mixed-other)\n",
+                "      Namespace: Sim/Drifts\n",
+                "      MetricName: drifts-mixed-signal\n",
+                "      Stat: Average\n",
             )
             .to_string(),
             tamper: Tamper::DeleteBucket("Gone"),
@@ -326,7 +327,7 @@ fn report_cases() -> Vec<ReportCase> {
                 },
             ],
             // "Resources that don't currently support drift detection aren't checked, and
-            // so not included": nothing here provisions a CloudWatch COMPOSITE alarm, so no
+            // so not included": nothing here provisions a CloudWatch anomaly detector, so no
             // service reports a configuration for one.
             omitted: vec!["Signal"],
         },
@@ -563,10 +564,11 @@ fn filter_template() -> String {
                 "Properties": {"BucketName": "drifts-filtered-kept"}
             },
             "Signal": {
-                "Type": "AWS::CloudWatch::CompositeAlarm",
+                "Type": "AWS::CloudWatch::AnomalyDetector",
                 "Properties": {
-                    "AlarmName": "drifts-filtered-signal",
-                    "AlarmRule": "ALARM(drifts-filtered-other)"
+                    "Namespace": "Sim/Drifts",
+                    "MetricName": "drifts-filtered-signal",
+                    "Stat": "Average"
                 }
             }
         }

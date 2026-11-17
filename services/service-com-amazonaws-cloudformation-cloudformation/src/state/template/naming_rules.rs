@@ -112,9 +112,12 @@ pub(super) fn naming_rules(resource_type: &str) -> Option<NameRules> {
         // model), which a generated name is already inside — letters, digits and the hyphen
         // are all admitted — but may be longer than.
         crate::state::provisioning::iot_authorizer::IOT_AUTHORIZER => rules(128, Characters::AsGenerated),
-        // Amazon CloudWatch `PutMetricAlarm.AlarmName`: `AlarmName`,
-        // `@length(min: 1, max: 255)` (CloudWatch's own Smithy model).
-        "AWS::CloudWatch::Alarm" => rules(255, Characters::AsGenerated),
+        // Amazon CloudWatch `PutMetricAlarm.AlarmName` / `PutCompositeAlarm.AlarmName`:
+        // `AlarmName`, `@length(min: 1, max: 255)` (CloudWatch's own Smithy model).
+        "AWS::CloudWatch::Alarm"
+        | crate::state::provisioner::cloudwatch_composite_alarms::CLOUDWATCH_COMPOSITE_ALARM => {
+            rules(255, Characters::AsGenerated)
+        }
         // Amazon CloudWatch `PutDashboard.DashboardName`: "The maximum length is 255, and
         // valid characters are A-Z, a-z, 0-9, \"-\", and \"_\""
         // (`PutDashboardInput$DashboardName`) — the CloudWatch model carries no `@length` for
@@ -801,6 +804,14 @@ pub(super) fn declared_name_property(resource_type: &str) -> Option<&'static str
         crate::state::provisioning::logs_resources::LOGS_METRIC_FILTER
         | crate::state::provisioning::logs_resources::LOGS_SUBSCRIPTION_FILTER => {
             Some("FilterName")
+        }
+        // Amazon CloudWatch's `PutCompositeAlarm` takes the `AlarmName` every call about an
+        // alarm takes — "Ref returns the alarm name" — so the type publishes `AlarmName`; the
+        // type's last segment is `CompositeAlarm`, so neither `CompositeAlarmName` nor `Name`
+        // finds it. (The METRIC alarm type's own `AlarmName` IS the convention, its last
+        // segment being `Alarm`.)
+        crate::state::provisioner::cloudwatch_composite_alarms::CLOUDWATCH_COMPOSITE_ALARM => {
+            Some(crate::state::provisioner::cloudwatch_composite_alarms::COMPOSITE_ALARM_NAME_MEMBER)
         }
         _ => None,
     }

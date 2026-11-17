@@ -650,6 +650,12 @@ pub(super) enum Provisioner {
     /// call is documented "Creates or updates an alarm", so it is this type's update as
     /// well as its create ([`cloudwatch_alarms`]).
     CloudWatchAlarm,
+    /// `AWS::CloudWatch::CompositeAlarm`: the composite alarm Amazon CloudWatch's own
+    /// `PutCompositeAlarm` creates under the name the stack decided — the name this type's
+    /// `Ref` returns — and `DeleteAlarms` removes. That one call is documented "Creates or
+    /// updates a composite alarm", so it is this type's update as well as its create
+    /// ([`cloudwatch_composite_alarms`]).
+    CloudWatchCompositeAlarm,
     EcrPublicRepository,
     /// `AWS::ECR::Repository`: a repository of the PRIVATE Amazon ECR registry — a
     /// different service from the public one above — which `CreateRepository` creates
@@ -1198,6 +1204,9 @@ pub(super) fn provisioner_for(resource_type: &str) -> Option<Provisioner> {
         KINESIS_STREAM => Some(Provisioner::KinesisStream),
         CLOUDWATCH_METRIC_STREAM => Some(Provisioner::CloudWatchMetricStream),
         cloudwatch_alarms::CLOUDWATCH_ALARM => Some(Provisioner::CloudWatchAlarm),
+        cloudwatch_composite_alarms::CLOUDWATCH_COMPOSITE_ALARM => {
+            Some(Provisioner::CloudWatchCompositeAlarm)
+        }
         CLOUDWATCH_DASHBOARD => Some(Provisioner::CloudWatchDashboard),
         ECR_PUBLIC_REPOSITORY => Some(Provisioner::EcrPublicRepository),
         ECR_REPOSITORY => Some(Provisioner::EcrRepository),
@@ -1429,6 +1438,11 @@ impl Provisioner {
             // an alarm's tags through its own tagging calls and `PutMetricAlarm` takes a
             // `Tags` member the type does not declare — so no tags are propagated to one.
             Self::CloudWatchAlarm => put_metric_alarm(ctx, region, resource, propagated).await,
+            // A composite alarm's own `Tags` member is one `PutCompositeAlarm` takes, so the
+            // tags CloudFormation propagates travel on the create like the declaration's own.
+            Self::CloudWatchCompositeAlarm => {
+                put_composite_alarm(ctx, region, resource, propagated).await
+            }
             Self::EmrCluster => run_job_flow(ctx, region, resource, propagated).await,
             Self::EcrPublicRepository => {
                 create_public_repository(ctx, region, resource, propagated).await
@@ -3136,6 +3150,14 @@ impl Provisioner {
             Self::CloudWatchAlarm => update_metric_alarm(ctx, region, resource, declared)
                 .await
                 .map(Some),
+            // `PutCompositeAlarm` is documented "Creates or updates a composite alarm" the
+            // same way, so a changed rule reaches that service under the name the alarm was
+            // created with.
+            Self::CloudWatchCompositeAlarm => {
+                update_composite_alarm(ctx, region, resource, declared)
+                    .await
+                    .map(Some)
+            }
             Self::BraketSpendingLimit => update_braket_spending_limit(ctx, region, resource, declared)
                 .await
                 .map(Some),
@@ -3945,6 +3967,11 @@ impl Provisioner {
             Self::CloudWatchAlarm => {
                 delete_metric_alarm(ctx, region, physical_resource_id).await
             }
+            // The same delete, addressing the composite alarm by the name it was created
+            // under, which is this resource's physical id.
+            Self::CloudWatchCompositeAlarm => {
+                delete_composite_alarm(ctx, region, physical_resource_id).await
+            }
             // The delete addresses the service by its own name inside the cluster it runs
             // on, which is what the ARN that is this resource's physical id carries.
             Self::EcsService => Box::pin(delete_ecs_service(ctx, region, resource)).await,
@@ -4056,6 +4083,11 @@ impl Provisioner {
             // created under.
             Self::CloudWatchAlarm => {
                 describe_metric_alarm(ctx, region, physical_resource_id).await
+            }
+            // CloudWatch's own read of the composite alarm the stack created, by the name it
+            // was created under.
+            Self::CloudWatchCompositeAlarm => {
+                describe_composite_alarm(ctx, region, physical_resource_id).await
             }
             // Amazon ECS's own read of the service the stack created, by its name inside the
             // cluster it runs on.
@@ -4636,6 +4668,7 @@ mod config_recording;
 /// The Amazon CloudWatch alarm arms: visible to the rest of this service's state because
 /// the type's own NAME lives here, beside the arms that provision it.
 pub(in crate::state) mod cloudwatch_alarms;
+pub(in crate::state) mod cloudwatch_composite_alarms;
 /// The Amazon ECS SERVICE arms, beside the cluster arms [`application_services`] holds for
 /// the same owning service.
 mod ecs_services;
@@ -4763,6 +4796,7 @@ use xray_groups::*;
 use route53_policies::*;
 pub(crate) use application_services::*;
 use cloudwatch_alarms::*;
+use cloudwatch_composite_alarms::*;
 use ecs_services::*;
 use ecs_capacity_providers::*;
 use config_recording::*;

@@ -9,7 +9,7 @@
 //! (which filter is used, the alarm type asked for, the history item type, the date window,
 //! the scan direction, the page size), so no assertion is keyed to one recorded request.
 
-use crate::harness::{build_router, call, error_code, ok};
+use crate::harness::{build_router, call, error_code, error_message, ok};
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -604,5 +604,73 @@ async fn bad_requests_carry_the_modelled_status_and_code() {
         timestamps(&second),
         timestamps(&first),
         "the second page must not repeat the first, got {second}"
+    );
+}
+
+/// The fixed text of this read's `InvalidNextToken`, whose one variable part is the token the
+/// request carried.
+const INVALID_NEXT_TOKEN_PREFIX: &str = "Invalid NextToken : ";
+
+/// RULE: a `NextToken` this service did not issue is refused with the `InvalidNextToken` this
+/// read models, worded as AWS words it for this operation — fixed text with the token the
+/// REQUEST carried as its one variable part, so a client that logged a token back reads which
+/// value was refused.
+///
+/// The rows differ along how the value misses being a token this service minted — the cursor is
+/// hex-encoded, so a word outside that alphabet, a padded base64 blob, an odd number of hex
+/// digits and hex bytes that are no text at all are each refused — and along the length of the
+/// value, since it travels into the message whatever it is.
+#[tokio::test]
+async fn a_forged_pagination_token_is_refused_with_the_token_it_carried() {
+    let router = build_router();
+    seed(&router).await;
+
+    // (case, the token the request carries)
+    for (case, token) in [
+        ("a word outside the token alphabet", "not-a-token"),
+        ("letters no hex digit admits", "zzzz"),
+        ("a padded base64 blob of another service", "QUJDREVGRw=="),
+        ("an odd number of hex digits", "abc"),
+        ("hex bytes that decode to no text", "ff"),
+        (
+            "a long value, refused the same way",
+            "0123456789abcdef0123456789abcdefzz",
+        ),
+    ] {
+        let (status, body) = call(
+            &router,
+            "DescribeAlarmHistory",
+            &json!({"NextToken": token}),
+        )
+        .await;
+        assert_eq!(
+            status, 400,
+            "case {case:?}: expected HTTP 400, got {status} with {body}"
+        );
+        assert_eq!(
+            error_code(&body),
+            "InvalidNextToken",
+            "case {case:?}: expected the modelled token error, got {body}"
+        );
+        let expected = format!("{INVALID_NEXT_TOKEN_PREFIX}{token}");
+        let message = error_message(&body);
+        assert_eq!(
+            message, expected,
+            "case {case:?}: expected the refusal to read {expected:?}, got {message:?}"
+        );
+    }
+
+    // An EMPTY `NextToken` is not a token at all — the only page it can name is the first — so
+    // it is served rather than refused, which is what keeps the rule about tokens the service
+    // did not issue.
+    let (status, body) = call(
+        &router,
+        "DescribeAlarmHistory",
+        &json!({"NextToken": "", "MaxRecords": 1}),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "case \"an empty NextToken\": expected the first page, got {status} with {body}"
     );
 }

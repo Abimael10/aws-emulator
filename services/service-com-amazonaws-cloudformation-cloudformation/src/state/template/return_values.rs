@@ -289,6 +289,9 @@ pub fn published_attribute_names(resource_type: &str) -> &'static [&'static str]
         "AWS::BedrockAgentCore::WorkloadIdentity" => &["Name", "WorkloadIdentityArn"],
         "AWS::RUM::AppMonitor" => &["Id"],
         "AWS::CloudWatch::Alarm" => &["Arn"],
+        crate::state::provisioner::cloudwatch_composite_alarms::CLOUDWATCH_COMPOSITE_ALARM => {
+            &["Arn"]
+        }
         CODEBUILD_REPORT_GROUP => &["Arn"],
         CODEBUILD_PROJECT => &["Arn"],
         CLOUDWATCH_METRIC_STREAM => &["Arn"],

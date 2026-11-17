@@ -36,6 +36,12 @@
 //! the item count (none, one, several), and the form of a number (fractional, whole, and
 //! negative, since a CBOR encoder is free to put a whole number on the wire as an integer
 //! item).
+//!
+//! The last two suites are about the protocol itself rather than about what a response puts in
+//! a collection: that the two RPC protocols are served over ONE metric store, so a datapoint
+//! written in either is readable in the other; and that a request is served in the protocol its
+//! own MARKER HEADER names, so a request carrying no marker of any protocol this service
+//! declares is answered `404`.
 
 use aws_smithy_schema::codec::{Codec, FinishSerializer};
 use aws_smithy_schema::serde::{SerializableStruct, ShapeSerializer};
@@ -640,5 +646,346 @@ async fn the_scalar_map_of_a_datapoint_carries_only_its_modelled_entries() {
         ),
     ] {
         names_its_container_once(case, &body, member, carriers);
+    }
+}
+
+/// The path a Smithy RPC v2 CBOR request of this service is POSTed to:
+/// `/service/{ServiceName}/operation/{OperationName}` (that protocol's specification), with the
+/// service shape's name as this model declares it.
+fn rpc_v2_path(operation: &str) -> String {
+    format!("/service/GraniteServiceVersion20100801/operation/{operation}")
+}
+
+/// The `Authorization` header every request below carries: the credential scope names the
+/// `monitoring` signing name, which is what routes a request to this service whichever protocol
+/// it is in. Neither the key id nor the signature is a credential — the harness turns request
+/// authentication off, so nothing here is verified.
+const AUTHORIZATION: &str = "AWS4-HMAC-SHA256 \
+                             Credential=AKIDTEST/20260101/us-east-1/monitoring/aws4_request, \
+                             SignedHeaders=host;x-amz-date, Signature=deadbeef";
+
+/// One request as written: the method is always POST, and the URI, the headers and the body are
+/// what a row varies. Answers the HTTP status and the body bytes.
+async fn posted(
+    router: &MultiServiceRouter,
+    uri: &str,
+    headers: &[(&str, &str)],
+    body: bytes::Bytes,
+) -> (u16, bytes::Bytes) {
+    let mut request = http::Request::builder()
+        .method("POST")
+        .uri(uri)
+        .header("authorization", AUTHORIZATION);
+    for (name, value) in headers {
+        request = request.header(*name, *value);
+    }
+    let response = router
+        .dispatch(request.body(body).expect("a well-formed request"))
+        .await;
+    (response.status().as_u16(), response.into_body())
+}
+
+/// A `PutMetricData` request publishing one datum into [`NAMESPACE`], as the input shape.
+fn one_datum(metric: &str, stamp: f64, value: f64) -> PutMetricDataInput {
+    PutMetricDataInput {
+        namespace: NAMESPACE.to_string(),
+        metric_data: Some(vec![MetricDatum {
+            metric_name: metric.to_string(),
+            dimensions: Some(dimensions()),
+            timestamp: Some(DateTime::from_secs_f64(stamp)),
+            value: Some(value),
+            unit: Some("Count".to_string()),
+            ..Default::default()
+        }]),
+        ..Default::default()
+    }
+}
+
+/// The same datum as the awsJson1_0 document a JSON client sends, where an instant travels as
+/// epoch seconds.
+fn one_datum_as_json(metric: &str, stamp: f64, value: f64) -> serde_json::Value {
+    serde_json::json!({
+        "Namespace": NAMESPACE,
+        "MetricData": [{
+            "MetricName": metric,
+            "Dimensions": dimensions()
+                .into_iter()
+                .map(|dimension| serde_json::json!({
+                    "Name": dimension.name,
+                    "Value": dimension.value,
+                }))
+                .collect::<Vec<_>>(),
+            "Timestamp": stamp,
+            "Value": value,
+            "Unit": "Count",
+        }],
+    })
+}
+
+/// The `(Sum, SampleCount)` of the one window `[base, base + MINUTE)` of `metric`, read over
+/// the awsJson1_0 wire.
+async fn folded_over_json(
+    router: &MultiServiceRouter,
+    case: &str,
+    metric: &str,
+    base: f64,
+) -> (Option<f64>, Option<f64>) {
+    let (status, body) = crate::harness::call(
+        router,
+        "GetMetricStatistics",
+        &serde_json::json!({
+            "Namespace": NAMESPACE,
+            "MetricName": metric,
+            "Dimensions": dimensions()
+                .into_iter()
+                .map(|dimension| serde_json::json!({
+                    "Name": dimension.name,
+                    "Value": dimension.value,
+                }))
+                .collect::<Vec<_>>(),
+            "StartTime": base,
+            "EndTime": base + MINUTE,
+            "Period": 60,
+            "Statistics": ["Sum", "SampleCount"],
+        }),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: GetMetricStatistics over awsJson1_0 must answer 200, got {status} with \
+         {body}"
+    );
+    let datapoints = body
+        .get("Datapoints")
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    assert_eq!(
+        datapoints.len(),
+        1,
+        "case {case:?}: one window answers one datapoint, got {datapoints:?}"
+    );
+    (
+        datapoints[0].get("Sum").and_then(serde_json::Value::as_f64),
+        datapoints[0]
+            .get("SampleCount")
+            .and_then(serde_json::Value::as_f64),
+    )
+}
+
+/// RULE: the two RPC protocols this service declares are served over ONE metric store, so a
+/// datapoint written in either is readable in the other.
+///
+/// The rows are the two directions, and each fold is taken after BOTH writes as well, so the
+/// window a read reports is one the two protocols contributed to together rather than one each
+/// wrote alone.
+#[tokio::test]
+async fn a_datapoint_written_in_either_protocol_is_read_in_the_other() {
+    let router = build_router();
+    let base = base_time();
+    let metric = "SharedStore";
+    let (first, second) = (2.5_f64, 4.0_f64);
+
+    // 1. The CBOR write, read over awsJson1_0.
+    let case = "a datapoint written over rpc-v2-cbor";
+    let (status, answered) = cbor_call(
+        &router,
+        "PutMetricData",
+        request_body(PUT_METRIC_DATA_INPUT_SCHEMA, &one_datum(metric, base, first)),
+    )
+    .await;
+    assert_eq!(
+        status,
+        200,
+        "case {case:?}: the CBOR publish must be accepted, got {status} with body {:?}",
+        String::from_utf8_lossy(&answered)
+    );
+    let folded = folded_over_json(&router, case, metric, base).await;
+    assert_eq!(
+        folded,
+        (Some(first), Some(1.0)),
+        "case {case:?}: expected the JSON read to report the CBOR datapoint as \
+         (Sum, SampleCount) ({first}, 1), got {folded:?}"
+    );
+
+    // 2. The awsJson1_0 write, read over rpc-v2-cbor — the same window, which now carries both.
+    let case = "a datapoint written over awsJson1_0 beside it";
+    let (status, body) = crate::harness::call(
+        &router,
+        "PutMetricData",
+        &one_datum_as_json(metric, base + 10.0, second),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: the JSON publish must be accepted, got {status} with {body}"
+    );
+    let (output, _): (GetMetricStatisticsOutput, _) = served(
+        case,
+        &router,
+        "GetMetricStatistics",
+        request_body(
+            GET_METRIC_STATISTICS_INPUT_SCHEMA,
+            &GetMetricStatisticsInput {
+                namespace: NAMESPACE.to_string(),
+                metric_name: metric.to_string(),
+                dimensions: Some(dimensions()),
+                start_time: DateTime::from_secs_f64(base),
+                end_time: DateTime::from_secs_f64(base + MINUTE),
+                period: 60,
+                statistics: Some(vec!["Sum".to_string(), "SampleCount".to_string()]),
+                extended_statistics: None,
+                unit: None,
+            },
+        ),
+    )
+    .await;
+    let datapoints = output.datapoints.clone().unwrap_or_default();
+    assert_eq!(
+        datapoints.len(),
+        1,
+        "case {case:?}: one window answers one datapoint, got {datapoints:?}"
+    );
+    assert_eq!(
+        (datapoints[0].sum, datapoints[0].sample_count),
+        (Some(first + second), Some(2.0)),
+        "case {case:?}: expected the CBOR read to report both datapoints as (Sum, SampleCount) \
+         ({}, 2), got {datapoints:?}",
+        first + second
+    );
+    // And the JSON read of the same window agrees, so neither protocol holds a store of its
+    // own.
+    let folded = folded_over_json(&router, case, metric, base).await;
+    assert_eq!(
+        folded,
+        (Some(first + second), Some(2.0)),
+        "case {case:?}: expected the JSON read to report the same window, got {folded:?}"
+    );
+}
+
+/// One row of the discriminator table: the case, the URI it is POSTed to, the headers it
+/// carries, the body, and the status this service owes it. Named so the row type stays simple
+/// enough to read.
+type DiscriminatorCase = (
+    &'static str,
+    String,
+    Vec<(&'static str, &'static str)>,
+    bytes::Bytes,
+    u16,
+);
+
+/// RULE: a request to this service is served in the protocol its own MARKER HEADER names, and a
+/// request carrying no marker of any protocol this service declares names no route at all and is
+/// answered `404` — never the malformed-body refusal of a protocol it never asked for.
+///
+/// The rows span every marker and every way of carrying none: the CBOR protocol's header, the
+/// same path without it, a marker naming a protocol this service does not serve, the JSON
+/// protocol's two markers, the query protocol's media type, and a body of a media type no
+/// protocol of this service declares.
+#[tokio::test]
+async fn a_request_naming_no_protocol_of_this_service_is_not_found() {
+    let router = build_router();
+    let base = base_time();
+    let cbor_body = request_body(
+        PUT_METRIC_DATA_INPUT_SCHEMA,
+        &one_datum("Discriminated", base, 1.0),
+    );
+    let json_body = bytes::Bytes::from(
+        serde_json::to_vec(&one_datum_as_json("Discriminated", base, 1.0))
+            .expect("the document serializes"),
+    );
+    let form_body = bytes::Bytes::from(format!(
+        "Action=PutMetricData&Version=2010-08-01&Namespace={}\
+         &MetricData.member.1.MetricName=Discriminated&MetricData.member.1.Value=1.0",
+        NAMESPACE.replace('/', "%2F")
+    ));
+
+    // (case, uri, headers, body, the status the service owes)
+    let rows: Vec<DiscriminatorCase> = vec![
+        (
+            "the CBOR protocol's marker on its own path",
+            rpc_v2_path("PutMetricData"),
+            vec![
+                ("content-type", "application/cbor"),
+                ("accept", "application/cbor"),
+                ("smithy-protocol", "rpc-v2-cbor"),
+            ],
+            cbor_body.clone(),
+            200,
+        ),
+        (
+            "the same request with the marker omitted",
+            rpc_v2_path("PutMetricData"),
+            vec![
+                ("content-type", "application/cbor"),
+                ("accept", "application/cbor"),
+            ],
+            cbor_body.clone(),
+            404,
+        ),
+        (
+            "that path with no header of any protocol",
+            rpc_v2_path("PutMetricData"),
+            vec![],
+            cbor_body.clone(),
+            404,
+        ),
+        (
+            "a marker naming a protocol this service does not serve",
+            rpc_v2_path("PutMetricData"),
+            vec![
+                ("content-type", "application/cbor"),
+                ("smithy-protocol", "rpc-v2-json"),
+            ],
+            cbor_body,
+            404,
+        ),
+        (
+            "the JSON protocol's target header",
+            "/".to_string(),
+            vec![
+                ("content-type", "application/x-amz-json-1.0"),
+                (
+                    "x-amz-target",
+                    "GraniteServiceVersion20100801.PutMetricData",
+                ),
+            ],
+            json_body.clone(),
+            200,
+        ),
+        (
+            "a JSON document under a media type no protocol of this service declares",
+            "/".to_string(),
+            vec![("content-type", "application/json")],
+            json_body,
+            404,
+        ),
+        (
+            "the query protocol's media type",
+            "/".to_string(),
+            vec![("content-type", "application/x-www-form-urlencoded")],
+            form_body,
+            200,
+        ),
+    ];
+
+    for (case, uri, headers, body, expected) in rows {
+        let (status, answered) = posted(&router, &uri, &headers, body).await;
+        assert_eq!(
+            status,
+            expected,
+            "case {case:?}: expected HTTP {expected}, got {status} with body {:?}",
+            String::from_utf8_lossy(&answered)
+        );
+        if expected == 404 {
+            // Stated separately, because the SHAPE of the refusal is the point: an unrouted
+            // request is not a request whose body could not be read.
+            let text = String::from_utf8_lossy(&answered);
+            assert!(
+                !text.contains("SerializationException"),
+                "case {case:?}: an unrouted request must not be reported as a malformed one, \
+                 got {text:?}"
+            );
+        }
     }
 }

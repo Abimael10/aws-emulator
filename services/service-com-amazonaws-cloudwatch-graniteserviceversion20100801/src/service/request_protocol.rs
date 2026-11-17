@@ -21,6 +21,19 @@
 //! `awsQuery` protocol, selected from the generated entry rather than built here, so the
 //! codec, its XML namespace and its error envelope are still the model's.
 //!
+//! The other half of that selection is what makes a request name a protocol AT ALL. Each of
+//! the three is named by a HEADER of the request — `smithy-protocol: rpc-v2-cbor` for the CBOR
+//! protocol, `x-amz-target` or the `application/x-amz-json-*` content type for the JSON one,
+//! the form content type for the query one — so a request carrying none of them names no
+//! protocol of this service and is routed nowhere ([`names_a_protocol`]): the answer is the
+//! not-found the framework already gives a request that names none of a service's declared
+//! protocols, rather than the malformed-body refusal of a protocol the request never asked
+//! for. The framework's own detection ALSO reads the CBOR protocol off a
+//! `/service/{Service}/operation/{Operation}` path, which that protocol's specification pairs
+//! with the header; this service is reached on one endpoint by clients of all three, so the
+//! header is what discriminates, and a request to that path without it is as unrouted as one
+//! to any other path.
+//!
 //! The second half is the request id: AWS answers a failed `awsQuery` call with
 //! `<ErrorResponse><Error>…</Error><RequestId>…</RequestId></ErrorResponse>`, the failure's
 //! counterpart of the `ResponseMetadata/RequestId` a success carries. The element belongs to
@@ -66,6 +79,39 @@ fn names_the_query_protocol() -> RtRequest {
     let mut marker = RtRequest::new(SdkBody::empty());
     marker.headers_mut().insert("content-type", FORM_CONTENT_TYPE);
     marker
+}
+
+/// The header that names the Smithy RPC v2 CBOR protocol, and the value it carries: "the
+/// `smithy-protocol` header… MUST be set to `rpc-v2-cbor`" (that protocol's specification).
+const SMITHY_PROTOCOL_HEADER: &str = "smithy-protocol";
+const RPC_V2_CBOR: &str = "rpc-v2-cbor";
+
+/// The header an `awsJson` client names the operation in, which is what names that protocol on
+/// a request to this service, and the media-type prefix its body carries.
+const RPC_TARGET_HEADER: &str = "x-amz-target";
+const AWS_JSON_CONTENT_TYPE: &str = "application/x-amz-json";
+
+/// Whether `req` names one of the protocols this service declares ([module docs](self)).
+///
+/// Keyed on the request's HEADERS alone, as each protocol's own marker is: nothing of the path
+/// or of the body is read, so a request that names no protocol is recognised as such before
+/// anything is decoded.
+fn names_a_protocol(req: &RtRequest) -> bool {
+    let headers = req.headers();
+    if headers
+        .get(SMITHY_PROTOCOL_HEADER)
+        .is_some_and(|value| value.trim().eq_ignore_ascii_case(RPC_V2_CBOR))
+    {
+        return true;
+    }
+    if headers.get(RPC_TARGET_HEADER).is_some() {
+        return true;
+    }
+    let content_type = headers
+        .get("content-type")
+        .map(|value| value.trim().to_ascii_lowercase())
+        .unwrap_or_default();
+    content_type.starts_with(AWS_JSON_CONTENT_TYPE) || content_type.starts_with(FORM_CONTENT_TYPE)
 }
 
 /// This service's model-derived half, serving each request in the protocol the request itself
@@ -130,6 +176,9 @@ impl<D: ErasedServiceDefinition> ErasedServiceDefinition for TheProtocolOfTheReq
                 return query;
             }
         }
+        if !names_a_protocol(req) {
+            return WireProtocol::unrecognised();
+        }
         self.inner.wire_protocol(req)
     }
 }
@@ -180,7 +229,7 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::{is_form_encoded, FORM_CONTENT_TYPE};
+    use super::{is_form_encoded, names_a_protocol, FORM_CONTENT_TYPE};
     use aws_smithy_runtime_api::http::Request as RtRequest;
     use aws_smithy_types::body::SdkBody;
 
@@ -244,6 +293,72 @@ mod tests {
             assert_eq!(
                 actual, expected,
                 "case {case:?}: expected a query call to be {expected}, got {actual}"
+            );
+        }
+    }
+
+    /// A request names one of this service's protocols when, and only when, it carries that
+    /// protocol's own marker header: the rows span every marker and every way of missing one.
+    #[test]
+    fn a_request_names_a_protocol_only_through_its_own_marker_header() {
+        // (case, headers, whether the request names one of this service's protocols)
+        let rows: [ContentTypeCase; 10] = [
+            (
+                "the CBOR protocol's own header",
+                &[
+                    ("smithy-protocol", "rpc-v2-cbor"),
+                    ("content-type", "application/cbor"),
+                ],
+                true,
+            ),
+            (
+                "that header spelled in upper case",
+                &[("smithy-protocol", "RPC-V2-CBOR")],
+                true,
+            ),
+            (
+                "a protocol header naming something else",
+                &[("smithy-protocol", "rpc-v2-json")],
+                false,
+            ),
+            (
+                "a CBOR body with no protocol header",
+                &[("content-type", "application/cbor")],
+                false,
+            ),
+            (
+                "the JSON protocol's target header",
+                &[("x-amz-target", "GraniteServiceVersion20100801.GetMetricStream")],
+                true,
+            ),
+            (
+                "the JSON protocol's media type alone",
+                &[("content-type", "application/x-amz-json-1.0")],
+                true,
+            ),
+            (
+                "the query protocol's media type",
+                &[("content-type", FORM_CONTENT_TYPE)],
+                true,
+            ),
+            (
+                "the query protocol's media type with a parameter",
+                &[("content-type", "application/x-www-form-urlencoded; charset=utf-8")],
+                true,
+            ),
+            ("no header at all", &[], false),
+            (
+                "a media type of no protocol this service declares",
+                &[("content-type", "application/json")],
+                false,
+            ),
+        ];
+        for (case, headers, expected) in rows {
+            let actual = names_a_protocol(&asked(headers));
+            assert_eq!(
+                actual, expected,
+                "case {case:?}: expected the request to name a protocol: {expected}, got \
+                 {actual}"
             );
         }
     }
