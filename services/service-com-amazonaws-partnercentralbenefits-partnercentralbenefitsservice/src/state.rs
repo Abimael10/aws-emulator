@@ -852,12 +852,16 @@ impl AllocatedCreditCode {
     /// [`BenefitAllocation::expire_due`] does for the allocation: a code past its own
     /// `ExpiresAt` can no longer be redeemed, so it is `INACTIVE` whether or not anybody
     /// has looked at it. A redeemed (`FULFILLED`) code is terminal.
-    fn expire_due(&mut self, now_millis: i64) -> bool {
+    ///
+    /// Answers WHEN the change fell due — this code's own `ExpiresAt` — so the allocation
+    /// that holds it can date the write by that instant rather than by the instant it was
+    /// read, and `None` where nothing was owed.
+    fn expire_due(&mut self, now_millis: i64) -> Option<i64> {
         if self.status != ALLOCATION_STATUS_ACTIVE || now_millis < self.expires_at_millis {
-            return false;
+            return None;
         }
         self.status = ALLOCATION_STATUS_INACTIVE.to_string();
-        true
+        Some(self.expires_at_millis)
     }
 }
 
@@ -1027,22 +1031,32 @@ impl BenefitAllocation {
     /// already `INACTIVE` has nowhere to move. Each credit code the allocation has issued
     /// expires on the same rule, against its own `ExpiresAt` (see
     /// [`AllocatedCreditCode::expire_due`]).
+    ///
+    /// `UpdatedAt` is dated by the instant the change FELL DUE — the `ExpiresAt` the record
+    /// already holds, the latest one where this call materialises several — and never by
+    /// `now_millis`: nothing happened to the allocation at the instant somebody looked at
+    /// it, so dating the write there would report a change at a moment no change was made
+    /// and would make the member a function of when the store was read rather than of what
+    /// it holds.
     pub fn expire_due(&mut self, now_millis: i64) -> bool {
-        let mut changed = false;
+        let mut due_millis: Option<i64> = None;
         if self.status == ALLOCATION_STATUS_ACTIVE && self.has_expired(now_millis) {
             self.status = ALLOCATION_STATUS_INACTIVE.to_string();
             self.status_reason = Some(ALLOCATION_EXPIRED_REASON.to_string());
-            changed = true;
+            due_millis = Some(self.expires_at_millis);
         }
         if let Some(AllocationFulfillment::Credits { codes, .. }) = self.fulfillment.as_mut() {
             for code in codes.iter_mut() {
-                changed |= code.expire_due(now_millis);
+                if let Some(code_due_millis) = code.expire_due(now_millis) {
+                    due_millis =
+                        Some(due_millis.map_or(code_due_millis, |due| due.max(code_due_millis)));
+                }
             }
         }
-        if !changed {
+        let Some(due_millis) = due_millis else {
             return false;
-        }
-        self.updated_at_millis = bump_millis(self.updated_at_millis, now_millis);
+        };
+        self.updated_at_millis = bump_millis(self.updated_at_millis, due_millis);
         true
     }
 }
@@ -3001,13 +3015,16 @@ pub fn now_millis() -> i64 {
     i64::try_from(since_epoch.as_millis()).unwrap_or(i64::MAX)
 }
 
-/// The new `UpdatedAt` for a record last written at `previous`.
+/// The new `UpdatedAt` for a record last written at `previous` by a change that happened
+/// at `applied_at`.
 ///
-/// `now` unless the clock has not advanced since `previous`, in which case one
-/// millisecond past `previous` — so an update is always observably later than the write
-/// before it, which is what a caller comparing two reads relies on.
-pub fn bump_millis(previous: i64, now: i64) -> i64 {
-    now.max(previous.saturating_add(1))
+/// `applied_at` is WHEN the change happened: the request's clock for a write a caller
+/// made, and the instant the change fell due for one the clock owed (see
+/// [`BenefitAllocation::expire_due`]). That instant unless it is not past `previous`, in
+/// which case one millisecond past `previous` — so an update is always observably later
+/// than the write before it, which is what a caller comparing two reads relies on.
+pub fn bump_millis(previous: i64, applied_at: i64) -> i64 {
+    applied_at.max(previous.saturating_add(1))
 }
 
 /// Render a stored epoch-millisecond instant as the modelled `date-time` timestamp.

@@ -37,6 +37,13 @@
 //!    clock already made due**: an allocation past its `ExpiresAt` is never reported
 //!    `ACTIVE` and a credit code past its own is never reported redeemable, while two reads
 //!    of any allocation are identical.
+//! 7. **A change the clock made due is dated by the instant it FELL DUE**, the `ExpiresAt`
+//!    the record holds and the latest one where a call materialises several, so `UpdatedAt`
+//!    follows the stored state and not the instant of the read. Rows: every
+//!    `FulfillmentType`, each status an allocation can be placed in, an expiry owed by the
+//!    allocation, one owed by an issued credit code, both owed in either order, a term that
+//!    closed one millisecond ago and terms still open; and the same over the sibling
+//!    `ListBenefitAllocations`, which materialises the same expiries.
 
 use std::collections::BTreeSet;
 
@@ -52,7 +59,7 @@ use service_com_amazonaws_partnercentralbenefits_partnercentralbenefitsservice::
     FULFILLMENT_TYPE_ACCESS, FULFILLMENT_TYPE_CASH, FULFILLMENT_TYPE_CREDITS, SEEDED_CATALOGS,
 };
 
-use crate::benefit_allocations::{granted, stored_allocations};
+use crate::benefit_allocations::{granted, list, stored_allocations};
 use crate::benefit_application_lifecycle::{error_code, instant, Harness, CATALOG};
 use crate::resource_tagging::{application_arn, benefit_id, error_message, expected_arn};
 
@@ -714,6 +721,349 @@ fn place_expiry(harness: &Harness, catalog: &str, id: &str, expires_at_millis: i
     if let Some(AllocationFulfillment::Credits { codes, .. }) = allocation.fulfillment.as_mut() {
         for code in codes.iter_mut() {
             code.expires_at_millis = expires_at_millis;
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Rule 7 — a materialised expiry is dated by the instant it fell due
+// ---------------------------------------------------------------------------
+
+/// Milliseconds in a day, so a row can place a term that closed a given number of days
+/// before it reads the record.
+const MILLIS_PER_DAY: i64 = 24 * 60 * 60 * 1000;
+
+/// Which stored allocation a row places its term on: a CLASS of stored record rather than
+/// one seeded id.
+#[derive(Debug, Clone, Copy)]
+enum Pick {
+    /// The allocation fulfilled with this `FulfillmentType` that has issued no credit code.
+    Type(&'static str),
+    /// The allocation that has issued a credit code, which expires against its own
+    /// `ExpiresAt`.
+    IssuedCode,
+}
+
+/// The instant a row expects the report's `UpdatedAt` to carry.
+#[derive(Debug, Clone, Copy)]
+enum Expect {
+    /// The allocation's own `ExpiresAt`: the instant its expiry fell due.
+    AllocationExpiry,
+    /// The credit code's `ExpiresAt`: the instant the latest expiry this read materialised
+    /// fell due.
+    CodeExpiry,
+    /// Nothing was owed, so `UpdatedAt` is still the instant of the last write the record
+    /// saw.
+    Unchanged,
+}
+
+/// One row of the table below: a stored allocation placed in `status`, with its own term
+/// ending `allocation_expiry` after the row's base instant and its issued credit codes'
+/// ending `code_expiry` after it (a negative offset is in the past, so that term has
+/// closed), and the `UpdatedAt` the report must then carry.
+struct Row {
+    case: &'static str,
+    pick: Pick,
+    status: &'static str,
+    allocation_expiry: i64,
+    /// The codes' term, for a row whose allocation has issued one; `None` leaves the codes
+    /// as the store holds them, which is what a row picking an allocation without any does.
+    code_expiry: Option<i64>,
+    expect: Expect,
+}
+
+/// The rows differ along everything the rule generalises over: which `FulfillmentType` the
+/// allocation was fulfilled with, the status it is in, WHICH of the two expiries is owed,
+/// which of two owed expiries fell due later, how long ago the term closed (down to one
+/// millisecond) and whether anything is owed at all.
+const EXPIRY_DATING_ROWS: &[Row] = &[
+    Row {
+        case: "CASH allocation, its term closed 35 days ago",
+        pick: Pick::Type(FULFILLMENT_TYPE_CASH),
+        status: ALLOCATION_STATUS_ACTIVE,
+        allocation_expiry: -35 * MILLIS_PER_DAY,
+        code_expiry: None,
+        expect: Expect::AllocationExpiry,
+    },
+    Row {
+        case: "ACCESS allocation, its term closed 400 days ago",
+        pick: Pick::Type(FULFILLMENT_TYPE_ACCESS),
+        status: ALLOCATION_STATUS_ACTIVE,
+        allocation_expiry: -400 * MILLIS_PER_DAY,
+        code_expiry: None,
+        expect: Expect::AllocationExpiry,
+    },
+    Row {
+        case: "CREDITS allocation with nothing issued, its term closed one millisecond ago",
+        pick: Pick::Type(FULFILLMENT_TYPE_CREDITS),
+        status: ALLOCATION_STATUS_ACTIVE,
+        allocation_expiry: -1,
+        code_expiry: None,
+        expect: Expect::AllocationExpiry,
+    },
+    Row {
+        case: "FULFILLED allocation, only its issued code's term closed",
+        pick: Pick::IssuedCode,
+        status: ALLOCATION_STATUS_FULFILLED,
+        allocation_expiry: -50 * MILLIS_PER_DAY,
+        code_expiry: Some(-5 * MILLIS_PER_DAY),
+        expect: Expect::CodeExpiry,
+    },
+    Row {
+        case: "both terms closed, the code's the later of the two",
+        pick: Pick::IssuedCode,
+        status: ALLOCATION_STATUS_ACTIVE,
+        allocation_expiry: -30 * MILLIS_PER_DAY,
+        code_expiry: Some(-3 * MILLIS_PER_DAY),
+        expect: Expect::CodeExpiry,
+    },
+    Row {
+        case: "both terms closed, the allocation's the later of the two",
+        pick: Pick::IssuedCode,
+        status: ALLOCATION_STATUS_ACTIVE,
+        allocation_expiry: -2 * MILLIS_PER_DAY,
+        code_expiry: Some(-40 * MILLIS_PER_DAY),
+        expect: Expect::AllocationExpiry,
+    },
+    Row {
+        case: "CASH allocation still inside its term",
+        pick: Pick::Type(FULFILLMENT_TYPE_CASH),
+        status: ALLOCATION_STATUS_ACTIVE,
+        allocation_expiry: 30 * MILLIS_PER_DAY,
+        code_expiry: None,
+        expect: Expect::Unchanged,
+    },
+    Row {
+        case: "allocation and issued code both inside their term",
+        pick: Pick::IssuedCode,
+        status: ALLOCATION_STATUS_ACTIVE,
+        allocation_expiry: 10 * MILLIS_PER_DAY,
+        code_expiry: Some(10 * MILLIS_PER_DAY),
+        expect: Expect::Unchanged,
+    },
+    Row {
+        case: "allocation already INACTIVE, so its closed term owes nothing",
+        pick: Pick::Type(FULFILLMENT_TYPE_ACCESS),
+        status: ALLOCATION_STATUS_INACTIVE,
+        allocation_expiry: -10 * MILLIS_PER_DAY,
+        code_expiry: None,
+        expect: Expect::Unchanged,
+    },
+    Row {
+        case: "FULFILLED allocation, both terms still open",
+        pick: Pick::IssuedCode,
+        status: ALLOCATION_STATUS_FULFILLED,
+        allocation_expiry: 5 * MILLIS_PER_DAY,
+        code_expiry: Some(5 * MILLIS_PER_DAY),
+        expect: Expect::Unchanged,
+    },
+];
+
+/// Rule 7: a report that materialises a change the clock already made due dates that change
+/// at the instant it FELL DUE — the `ExpiresAt` the record already holds, the latest one
+/// where the call materialises several — so `UpdatedAt` is a function of the stored state
+/// and never of when the record happened to be read.
+#[tokio::test]
+async fn a_materialised_expiry_is_dated_by_the_instant_it_fell_due() {
+    for row in EXPIRY_DATING_ROWS {
+        let case = row.case;
+        let harness = Harness::new();
+        // Every instant this row places is relative to one taken BEFORE the read, so the
+        // read's own instant is strictly later than any of them.
+        let base = now_millis();
+        let created_at = base - 500 * MILLIS_PER_DAY;
+        let allocation = pick_allocation(&harness, case, CATALOG, row.pick);
+        let allocation_expires_at = base + row.allocation_expiry;
+        let code_expires_at = row.code_expiry.map(|offset| base + offset);
+        place_term(
+            &harness,
+            case,
+            CATALOG,
+            &allocation.id,
+            row.status,
+            created_at,
+            allocation_expires_at,
+            code_expires_at,
+        );
+
+        let expected = match row.expect {
+            Expect::AllocationExpiry => allocation_expires_at,
+            Expect::CodeExpiry => code_expires_at
+                .unwrap_or_else(|| panic!("case {case:?}: a code-dated row places a code term")),
+            Expect::Unchanged => created_at,
+        };
+
+        let body = get(&harness, case, CATALOG, &allocation.id).await;
+        let reported = instant(case, &body, "UpdatedAt");
+        assert_eq!(
+            reported, expected,
+            "case {case:?}: expected UpdatedAt {expected}, got {reported} in {body:?}"
+        );
+        assert!(
+            reported < base,
+            "case {case:?}: UpdatedAt must be the instant the change happened, not the \
+             instant of the read; expected a value below {base}, got {reported}"
+        );
+        // The status follows the same rule: an `ACTIVE` allocation whose term has closed is
+        // `INACTIVE`, and everything else keeps the status it was placed in.
+        let expected_status = if row.status == ALLOCATION_STATUS_ACTIVE && row.allocation_expiry < 0
+        {
+            ALLOCATION_STATUS_INACTIVE
+        } else {
+            row.status
+        };
+        assert_eq!(
+            member(&body, "Status").as_deref(),
+            Some(expected_status),
+            "case {case:?}: expected Status {expected_status:?}, got {body:?}"
+        );
+        // The store holds exactly what the report carried, so a reader that never calls
+        // this operation sees the same instant...
+        let stored = stored_allocations(&harness, CATALOG)
+            .into_iter()
+            .find(|stored| stored.id == allocation.id)
+            .unwrap_or_else(|| panic!("case {case:?}: the allocation is still stored"));
+        assert_eq!(
+            stored.updated_at_millis, expected,
+            "case {case:?}: expected the store to hold UpdatedAt {expected}, got {stored:?}"
+        );
+        // ... and reading again answers it unchanged: the value does not move with the clock.
+        let again = get(&harness, case, CATALOG, &allocation.id).await;
+        assert_eq!(
+            again, body,
+            "case {case:?}: a second read must report exactly what the first did, got \
+             {again:?} and {body:?}"
+        );
+    }
+}
+
+/// The sibling report materialises the same expiries, so it dates them the same way: after
+/// a `ListBenefitAllocations` the record carries the due instant, not the instant that list
+/// was taken.
+#[tokio::test]
+async fn the_sibling_report_dates_a_materialised_expiry_by_the_due_instant_too() {
+    // (case, which allocation, its term, its codes' term, the due instant expected)
+    let rows: &[(&str, Pick, i64, Option<i64>, i64)] = &[
+        (
+            "the allocation's own term closed 12 days ago",
+            Pick::Type(FULFILLMENT_TYPE_CASH),
+            -12 * MILLIS_PER_DAY,
+            None,
+            -12 * MILLIS_PER_DAY,
+        ),
+        (
+            "only an issued code's term closed, 4 days ago",
+            Pick::IssuedCode,
+            7 * MILLIS_PER_DAY,
+            Some(-4 * MILLIS_PER_DAY),
+            -4 * MILLIS_PER_DAY,
+        ),
+    ];
+
+    for (case, pick, allocation_expiry, code_expiry, due) in rows {
+        let harness = Harness::new();
+        let base = now_millis();
+        let created_at = base - 500 * MILLIS_PER_DAY;
+        let allocation = pick_allocation(&harness, case, CATALOG, *pick);
+        place_term(
+            &harness,
+            case,
+            CATALOG,
+            &allocation.id,
+            ALLOCATION_STATUS_ACTIVE,
+            created_at,
+            base + allocation_expiry,
+            code_expiry.map(|offset| base + offset),
+        );
+
+        // The listing is what materialises the expiry here; it reports no `UpdatedAt` of its
+        // own, so the write it leaves behind is read back from the store and over the wire.
+        list(&harness, case, &json!({ "Catalog": CATALOG })).await;
+        let expected = base + due;
+        let stored = stored_allocations(&harness, CATALOG)
+            .into_iter()
+            .find(|stored| stored.id == allocation.id)
+            .unwrap_or_else(|| panic!("case {case:?}: the allocation is still stored"));
+        assert_eq!(
+            stored.updated_at_millis, expected,
+            "case {case:?}: expected the listing to date the expiry at {expected}, got {stored:?}"
+        );
+        let body = get(&harness, case, CATALOG, &allocation.id).await;
+        let reported = instant(case, &body, "UpdatedAt");
+        assert_eq!(
+            reported, expected,
+            "case {case:?}: expected UpdatedAt {expected}, got {reported} in {body:?}"
+        );
+        assert!(
+            reported < base,
+            "case {case:?}: UpdatedAt must be the instant the change happened, not the \
+             instant of the listing; expected a value below {base}, got {reported}"
+        );
+    }
+}
+
+/// The stored allocation of `catalog` that `pick` names.
+fn pick_allocation(
+    harness: &Harness,
+    case: &str,
+    catalog: &str,
+    pick: Pick,
+) -> BenefitAllocation {
+    let has_code = |allocation: &BenefitAllocation| {
+        matches!(&allocation.fulfillment, Some(AllocationFulfillment::Credits { codes, .. }) if !codes.is_empty())
+    };
+    stored_allocations(harness, catalog)
+        .into_iter()
+        .find(|allocation| match pick {
+            Pick::IssuedCode => has_code(allocation),
+            Pick::Type(fulfillment_type) => {
+                allocation.fulfillment_type == fulfillment_type && !has_code(allocation)
+            }
+        })
+        .unwrap_or_else(|| panic!("case {case:?}: {catalog:?} holds no allocation matching {pick:?}"))
+}
+
+/// Place one stored allocation's status, its own term end and its issued codes' term end
+/// directly in the store, with every other instant on the record at `created_at_millis`.
+///
+/// AWS's own fulfillment workflow is what grants an allocation and issues its codes, and no
+/// operation this emulator serves moves either, so a rule stated over a term that has closed
+/// can only be exercised by placing the instants here; the behaviour under test is still
+/// read and asserted over the wire. Dating the record's last write at its creation is what
+/// makes a materialised expiry the latest write the record has seen.
+#[allow(clippy::too_many_arguments)]
+fn place_term(
+    harness: &Harness,
+    case: &str,
+    catalog: &str,
+    id: &str,
+    status: &str,
+    created_at_millis: i64,
+    expires_at_millis: i64,
+    code_expires_at_millis: Option<i64>,
+) {
+    let state = service_state(&**harness.engine())
+        .expect("the in-memory engine carries this service's state");
+    let mut store = state.lock();
+    let allocation = store
+        .catalogs
+        .get_mut(catalog)
+        .and_then(|catalog| catalog.allocations.get_mut(id))
+        .unwrap_or_else(|| {
+            panic!("case {case:?}: {id:?} names no stored allocation of {catalog:?}")
+        });
+    allocation.status = status.to_string();
+    allocation.status_reason = None;
+    allocation.created_at_millis = created_at_millis;
+    allocation.starts_at_millis = created_at_millis;
+    allocation.updated_at_millis = created_at_millis;
+    allocation.expires_at_millis = expires_at_millis;
+    if let Some(AllocationFulfillment::Credits { codes, .. }) = allocation.fulfillment.as_mut() {
+        for code in codes.iter_mut() {
+            code.issued_at_millis = created_at_millis;
+            if let Some(code_expires_at_millis) = code_expires_at_millis {
+                code.expires_at_millis = code_expires_at_millis;
+            }
         }
     }
 }
