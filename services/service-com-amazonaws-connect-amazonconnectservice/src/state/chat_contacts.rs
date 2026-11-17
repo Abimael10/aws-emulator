@@ -274,16 +274,13 @@ pub fn chat_duration(minutes: Option<i32>) -> Duration {
 /// another request.
 pub fn chat_session_for(record: &ChatContactRecord) -> participant::state::ChatSession {
     participant::state::ChatSession {
-        contact_id: record.id.clone(),
         initial_contact_id: record.initial_contact_id.clone(),
-        participant_id: record.participant_id.clone(),
-        participant_role: participant::state::PARTICIPANT_ROLE_CUSTOMER.to_string(),
-        display_name: Some(record.display_name.clone()),
-        connected: true,
-        connect_participant: false,
-        transcript: Vec::new(),
-        idempotency: HashMap::new(),
-        retain_until: record.ends_at,
+        ..participant::state::ChatSession::started(
+            record.id.clone(),
+            record.participant_id.clone(),
+            Some(record.display_name.clone()),
+            record.ends_at,
+        )
     }
 }
 

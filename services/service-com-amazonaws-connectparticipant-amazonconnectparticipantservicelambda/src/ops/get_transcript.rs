@@ -544,9 +544,25 @@ fn transcript_item(
                 })
                 .collect()
         }),
-        // Message receipts belong to the receipt operations, which are still their own gap
-        // issues.
-        message_metadata: None,
+        // Message receipts: the metadata is reported only for an item some recipient has
+        // acknowledged, which is the only information `MessageMetadata` carries here.
+        message_metadata: (!stored.receipts.is_empty()).then(|| MessageMetadata {
+            message_id: Some(stored.id.clone()),
+            receipts: Some(
+                stored
+                    .receipts
+                    .iter()
+                    .map(|receipt| Receipt {
+                        delivered_timestamp: receipt.delivered_timestamp.clone(),
+                        read_timestamp: receipt.read_timestamp.clone(),
+                        recipient_participant_id: Some(receipt.recipient_participant_id.clone()),
+                    })
+                    .collect(),
+            ),
+            // `MessageProcessingStatus` models only FAILED, PROCESSING and REJECTED, so an
+            // item that is in the transcript carries no processing status.
+            message_processing_status: None,
+        }),
         // Only populated for a persistent chat whose item came from an earlier session.
         related_contact_id: None,
         contact_id: Some(stored.contact_id.clone()),

@@ -471,10 +471,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 now,
             );
         }
-        sessions.sessions.insert(contact_id.clone(), session);
-        sessions
-            .participant_tokens
-            .insert(participant_token, contact_id);
+        sessions.register_session(participant_token, session);
 
         answer(&record, &mut sessions, wanted, &region, ctx, now)
     }

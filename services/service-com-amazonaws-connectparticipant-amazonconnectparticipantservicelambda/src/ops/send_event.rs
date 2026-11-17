@@ -1,9 +1,21 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op SendEvent
-//! IMPLEMENTED. Appends an `EVENT` item to the transcript of the session the
-//! `ConnectionToken` header authenticates, and returns the `Id` and `AbsoluteTime` it
-//! was stored with. Repeating a `ClientToken` returns that same stored item.
+//! IMPLEMENTED. Acknowledges an event sent on the session the `ConnectionToken` header
+//! authenticates, with an `Id` and the `AbsoluteTime` it was sent at.
+//!
+//! What an event DOES is decided by its `ContentType`:
+//!
+//! * a message receipt (`…message.delivered`, `…message.read`) is recorded against the
+//!   chat item its `Content` names — `{"messageId":"<chat item id>"}` — and answers THAT
+//!   item's `Id`, which is what a client correlates the receipt back to. `GetTranscript`
+//!   reports it as that item's `MessageMetadata`. The answer follows from the message the
+//!   receipt names, so one acknowledged twice answers the same `Id` and holds the same
+//!   acknowledgement whatever `ClientToken` each call carried;
+//! * every other event is transient. `GetTranscript` documents the event content types a
+//!   transcript contains, and no content type `SendEvent` sends is one of them, so an
+//!   event is acknowledged, appends nothing to the conversation, and is answered from what
+//!   the first call reported when a `ClientToken` and `Content` are repeated.
 //!
 //! An unknown, expired or disconnected connection token is refused with
 //! `AccessDeniedException` (HTTP 403).
@@ -191,39 +203,93 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
-        // A repeated `ClientToken` must answer with the item the first call stored, and
-        // must not append a second one.
+        // A receipt names an existing chat item and is recorded against it, and answers
+        // THAT item's `Id`: the answer follows from the message the receipt names, so
+        // acknowledging one message again records the same acknowledgement and answers the
+        // same `Id` without any token to replay from.
+        if let Some(kind) = receipt_kind(&input.content_type) {
+            let Some(message_id) = receipt_message_id(input.content.as_deref()) else {
+                return Err(crate::scaffolded::Scaffolded::validation(
+                    "The input fails to satisfy the constraints specified by Amazon Connect: \
+                     Content must name the acknowledged message as a JSON string of the form \
+                     {\"messageId\":\"<chat item id>\"} for a message-receipt ContentType",
+                ));
+            };
+            let Some((id, absolute_time)) = session.record_receipt(&message_id, kind, now) else {
+                return Err(crate::scaffolded::Scaffolded::validation(
+                    "The input fails to satisfy the constraints specified by Amazon Connect: \
+                     Content must name a messageId of this chat's transcript",
+                ));
+            };
+            return Ok(SendEventOutput {
+                id: Some(id),
+                absolute_time: Some(absolute_time),
+            });
+        }
+
+        // Every other event is transient: it is acknowledged with an `Id` of its own and
+        // recorded nowhere, so a repeated `ClientToken` carrying the same `Content` is
+        // answered from what the first call reported.
         let key = crate::state::idempotency_key(
             crate::state::CHAT_ITEM_TYPE_EVENT,
             input.client_token.as_deref(),
+            input.content.as_deref(),
         );
-        if let Some(stored) = session.replayed(key.as_deref()) {
+        if let Some(stored) = session.replayed_event(key.as_deref()) {
             return Ok(SendEventOutput {
                 id: Some(stored.id.clone()),
                 absolute_time: Some(stored.absolute_time.clone()),
             });
         }
 
-        if !session.has_room() {
+        if !session.has_event_room() {
             return Err(SendEventErrorModeled::ThrottlingException(ThrottlingException {
                 message: format!(
-                    "this chat's transcript holds its {} item limit",
-                    crate::state::MAX_TRANSCRIPT_ITEMS
+                    "this chat holds its {} event limit",
+                    crate::state::MAX_EVENTS_PER_SESSION
                 ),
             })
             .into());
         }
 
-        let (id, absolute_time) = session.append(
-            crate::state::CHAT_ITEM_TYPE_EVENT,
-            input.content.clone(),
-            input.content_type.clone(),
+        let (id, absolute_time) = (crate::state::new_id(), crate::state::format_instant(now));
+        session.record_event(
             key,
-            now,
+            crate::state::SentEvent {
+                id: id.clone(),
+                absolute_time: absolute_time.clone(),
+            },
         );
         Ok(SendEventOutput {
             id: Some(id),
             absolute_time: Some(absolute_time),
         })
     }
+}
+
+/// Which message-receipt timestamp `content_type` records, or `None` when it is not a
+/// receipt at all.
+///
+/// The two receipt content types are the ones this operation documents as supported;
+/// `Content` carries the message they acknowledge.
+fn receipt_kind(content_type: &str) -> Option<crate::state::ReceiptKind> {
+    match content_type {
+        crate::state::EVENT_CONTENT_TYPE_MESSAGE_DELIVERED => {
+            Some(crate::state::ReceiptKind::Delivered)
+        }
+        crate::state::EVENT_CONTENT_TYPE_MESSAGE_READ => Some(crate::state::ReceiptKind::Read),
+        _ => None,
+    }
+}
+
+/// The chat item a receipt's `Content` acknowledges.
+///
+/// `SendEventRequest$Content`: "For content related to message receipts, this is supported
+/// in the form of a JSON string. Sample Content:
+/// "{\"messageId\":\"11111111-aaaa-bbbb-cccc-EXAMPLE01234\"}"". `None` for content that is
+/// not that form, which names no message to record the receipt against.
+fn receipt_message_id(content: Option<&str>) -> Option<String> {
+    let parsed: serde_json::Value = serde_json::from_str(content?).ok()?;
+    let message_id = parsed.get("messageId")?.as_str()?;
+    (!message_id.is_empty()).then(|| message_id.to_string())
 }

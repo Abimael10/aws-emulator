@@ -2,9 +2,11 @@
 
 //! Engine state for the com-amazonaws-connectparticipant-amazonconnectparticipantservicelambda service.
 //!
-//! One chat session per contact. `CreateParticipantConnection` mints a session for a
-//! participant token and binds a freshly generated connection token to it; every other
-//! operation authenticates by looking that connection token up here.
+//! One chat session per contact, registered where the chat is STARTED
+//! ([`ComAmazonawsConnectparticipantAmazonconnectparticipantservicelambdaState::register_session`]).
+//! `CreateParticipantConnection` resolves the session a participant token names and binds
+//! a freshly generated connection token to it; every other operation authenticates by
+//! looking that connection token up here.
 //!
 //! Every store is bounded. Connection bindings and sessions are reclaimed once the clock
 //! has passed their expiry ([`State::prune_expired`], called by the operations that write
@@ -18,6 +20,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use aws_smithy_types::date_time::Format;
 use aws_smithy_types::DateTime;
+use sha2::{Digest, Sha256};
 
 mod attachments;
 pub use attachments::*;
@@ -35,16 +38,9 @@ pub const CONNECTION_TOKEN_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 /// response URL for has a connect expiry timeout of 100s."
 pub const WEBSOCKET_CONNECT_TTL: Duration = Duration::from_secs(100);
 
-/// How long a session is retained: exactly as long as the newest connection token that
-/// can reach it, so a session never outlives every token for it. Pushed out whenever
-/// another connection is created; past it, [`State::prune_expired`] reclaims the session.
-///
-/// Equal to [`CONNECTION_TOKEN_TTL`] because a token minted now expires that far ahead.
-pub const SESSION_RETENTION: Duration = CONNECTION_TOKEN_TTL;
-
 /// The most chat sessions this emulator holds at once. State is in memory, so the count a
-/// caller can drive is capped; `CreateParticipantConnection` refuses a new session past it
-/// rather than growing without limit.
+/// caller can drive is capped; the operation that STARTS a chat refuses a new session past
+/// it rather than growing without limit.
 pub const MAX_SESSIONS: usize = 10_000;
 
 /// The most live connection tokens one session may hold. `CreateParticipantConnection`'s
@@ -53,10 +49,16 @@ pub const MAX_SESSIONS: usize = 10_000;
 /// own bound on that count.
 pub const MAX_CONNECTIONS_PER_SESSION: usize = 100;
 
-/// The most items one session's transcript holds. `SendMessage` / `SendEvent` refuse a
-/// further item past it. It also bounds the per-request work `GetTranscript` does, and
-/// the idempotency map, which only ever gains an entry alongside an item.
+/// The most items one session's transcript holds. `SendMessage` refuses a further item
+/// past it. It also bounds the per-request work `GetTranscript` does, and the idempotency
+/// map, which only ever gains an entry alongside an item.
 pub const MAX_TRANSCRIPT_ITEMS: usize = 10_000;
+
+/// The most events one session remembers for idempotency. An event is not a transcript
+/// item (see [`ChatSession::record_event`]), so the record a `ClientToken` replays from is
+/// bounded on its own; `SendEvent` refuses a further event past it rather than growing
+/// without limit.
+pub const MAX_EVENTS_PER_SESSION: usize = MAX_TRANSCRIPT_ITEMS;
 
 /// `ConnectionType` values this emulator serves, from `CONNECTION_TYPE_VALUES`.
 pub const CONNECTION_TYPE_WEBSOCKET: &str = "WEBSOCKET";
@@ -69,6 +71,21 @@ pub const CONNECTION_TYPE_WEBRTC: &str = "WEBRTC_CONNECTION";
 pub const CHAT_ITEM_TYPE_MESSAGE: &str = "MESSAGE";
 /// `ChatItemType$EVENT`, the transcript item `SendEvent` appends.
 pub const CHAT_ITEM_TYPE_EVENT: &str = "EVENT";
+
+/// `application/vnd.amazonaws.connect.event.message.delivered`: the receipt that records
+/// when a message reached its recipient.
+///
+/// One of the four `ContentType` values `SendEvent` documents. The two receipt types are
+/// named here because what the service DOES with an event is decided by its content type:
+/// a receipt is recorded against the message its `Content` names, and every other event is
+/// transient (see `crate::ops::send_event`).
+pub const EVENT_CONTENT_TYPE_MESSAGE_DELIVERED: &str =
+    "application/vnd.amazonaws.connect.event.message.delivered";
+
+/// `application/vnd.amazonaws.connect.event.message.read`: the receipt that records when a
+/// message was read by its recipient. See [`EVENT_CONTENT_TYPE_MESSAGE_DELIVERED`].
+pub const EVENT_CONTENT_TYPE_MESSAGE_READ: &str =
+    "application/vnd.amazonaws.connect.event.message.read";
 
 /// `ParticipantRole$CUSTOMER`: the role of a participant that connects with a
 /// participant token obtained from `StartChatContact`.
@@ -85,6 +102,54 @@ pub const PARTICIPANT_ROLE_CUSTOM_BOT: &str = "CUSTOM_BOT";
 /// named exists. Every operation that refuses with this error words it the same way, so
 /// the wording lives here rather than at each call site.
 pub const ACCESS_DENIED_MESSAGE: &str = "Access denied";
+
+/// The `AccessDeniedException$Message` a PARTICIPANT token this service never issued is
+/// refused with.
+///
+/// A participant token is minted where a chat is STARTED, so a token no started chat
+/// registered names no participant of any contact and authenticates nobody; the refusal is
+/// the identity-policy denial, worded the same for every such token and carrying nothing
+/// of the request.
+pub const PARTICIPANT_TOKEN_DENIED_MESSAGE: &str =
+    "User is not authorized to access this resource with an explicit deny in an \
+     identity-based policy";
+
+/// Which of a message's receipt timestamps one receipt event records.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReceiptKind {
+    /// `…connect.event.message.delivered`: the message reached the recipient.
+    Delivered,
+    /// `…connect.event.message.read`: the recipient read the message.
+    Read,
+}
+
+/// What one recipient has acknowledged of one message: the `Receipt` a transcript `Item`'s
+/// `MessageMetadata` reports.
+///
+/// One entry per recipient participant, so acknowledging a message twice updates the entry
+/// the first acknowledgement created rather than adding a second one for the same
+/// recipient.
+#[derive(Debug, Clone)]
+pub struct MessageReceipt {
+    /// `Receipt$RecipientParticipantId`: the participant that acknowledged the message.
+    pub recipient_participant_id: String,
+    /// `Receipt$DeliveredTimestamp`, absent until a delivered receipt is sent.
+    pub delivered_timestamp: Option<String>,
+    /// `Receipt$ReadTimestamp`, absent until a read receipt is sent.
+    pub read_timestamp: Option<String>,
+}
+
+/// What one `SendEvent` answered, remembered so a repeat of that request answers the same.
+///
+/// An event is not a transcript item, so the answer is kept here rather than looked up from
+/// one.
+#[derive(Debug, Clone)]
+pub struct SentEvent {
+    /// The `Id` that call reported.
+    pub id: String,
+    /// The `AbsoluteTime` that call reported.
+    pub absolute_time: String,
+}
 
 /// One message or event stored in a session's transcript, in the order it was sent.
 #[derive(Debug, Clone)]
@@ -112,6 +177,9 @@ pub struct TranscriptItem {
     /// [`ComAmazonawsConnectparticipantAmazonconnectparticipantservicelambdaState::attachments`],
     /// so an item reports the status the attachment currently has rather than a copy of it.
     pub attachments: Vec<String>,
+    /// What this item's recipients have acknowledged, which `Item$MessageMetadata` reports.
+    /// Empty until a message receipt names this item.
+    pub receipts: Vec<MessageReceipt>,
 }
 
 /// What one connection token authenticates, and when it stops doing so.
@@ -176,9 +244,8 @@ pub struct ChatSession {
     /// That participant's chat display name, when one is known.
     ///
     /// Its one source is the `ParticipantDetails` the chat was started with on the
-    /// connect service (`StartChatContact`), which writes the session here: no input
-    /// THIS service models carries a display name, so a session created by
-    /// `CreateParticipantConnection` for a token no started chat registered has none.
+    /// connect service (`StartChatContact`), which registers the session here: no input
+    /// THIS service models carries a display name.
     pub display_name: Option<String>,
     /// False once `DisconnectParticipant` ran: every later call is refused.
     pub connected: bool,
@@ -190,9 +257,13 @@ pub struct ChatSession {
     pub connect_participant: bool,
     /// The transcript, oldest item first.
     pub transcript: Vec<TranscriptItem>,
-    /// Idempotency: `<item type>:<ClientToken>` -> the id of the item it created. Gains
-    /// an entry only alongside a transcript item, so [`MAX_TRANSCRIPT_ITEMS`] bounds it.
+    /// Idempotency: [`idempotency_key`] -> the id of the item it created. Gains an entry
+    /// only alongside a transcript item, so [`MAX_TRANSCRIPT_ITEMS`] bounds it.
     pub idempotency: HashMap<String, String>,
+    /// Idempotency for `SendEvent`: [`idempotency_key`] -> what that call answered. An
+    /// event is not a transcript item, so its answer is remembered here; bounded by
+    /// [`MAX_EVENTS_PER_SESSION`].
+    pub events: HashMap<String, SentEvent>,
     /// When this session, and the participant token that reaches it, is reclaimed: the
     /// expiry of the newest connection token minted for it. Pushed out whenever another
     /// connection is created.
@@ -200,6 +271,35 @@ pub struct ChatSession {
 }
 
 impl ChatSession {
+    /// The session a started chat registers for the participant its token names:
+    /// connected, attributed to `participant_id`, with an empty transcript.
+    ///
+    /// `contact_id` is both the contact and the initial contact of a chat that continues
+    /// nothing; a continued chat overwrites `initial_contact_id` with the one it carries
+    /// on. Every store a later call fills starts empty, so nothing about a session is
+    /// derived from the request that opens a connection to it.
+    #[must_use]
+    pub fn started(
+        contact_id: String,
+        participant_id: String,
+        display_name: Option<String>,
+        retain_until: SystemTime,
+    ) -> Self {
+        Self {
+            initial_contact_id: contact_id.clone(),
+            contact_id,
+            participant_id,
+            participant_role: PARTICIPANT_ROLE_CUSTOMER.to_string(),
+            display_name,
+            connected: true,
+            connect_participant: false,
+            transcript: Vec::new(),
+            idempotency: HashMap::new(),
+            events: HashMap::new(),
+            retain_until,
+        }
+    }
+
     /// The item `id` names, if this session's transcript holds it.
     pub fn item(&self, id: &str) -> Option<&TranscriptItem> {
         self.transcript.iter().find(|item| item.id == id)
@@ -215,6 +315,69 @@ impl ChatSession {
     /// [`MAX_TRANSCRIPT_ITEMS`] limit.
     pub fn has_room(&self) -> bool {
         self.transcript.len() < MAX_TRANSCRIPT_ITEMS
+    }
+
+    /// What a `SendEvent` idempotency `key` already answered: the caller is repeating a
+    /// request, so it must be answered with what the first call reported.
+    pub fn replayed_event(&self, key: Option<&str>) -> Option<&SentEvent> {
+        self.events.get(key?)
+    }
+
+    /// Whether another event may be remembered, or this session holds its
+    /// [`MAX_EVENTS_PER_SESSION`] limit.
+    pub fn has_event_room(&self) -> bool {
+        self.events.len() < MAX_EVENTS_PER_SESSION
+    }
+
+    /// Remember what one `SendEvent` answered under `key`, so a repeat of that request
+    /// replays it. An event is not part of the conversation, so nothing is appended to the
+    /// transcript for it.
+    pub fn record_event(&mut self, key: Option<String>, answer: SentEvent) {
+        if let Some(key) = key {
+            self.events.insert(key, answer);
+        }
+    }
+
+    /// Record that this session's participant acknowledged the item `message_id` names, at
+    /// `now`, and answer that item's own `Id` and the time the receipt was sent.
+    ///
+    /// `None` when this transcript holds no such item: a receipt names a message of the
+    /// chat it is sent in.
+    pub fn record_receipt(
+        &mut self,
+        message_id: &str,
+        kind: ReceiptKind,
+        now: SystemTime,
+    ) -> Option<(String, String)> {
+        let at = format_instant(now);
+        let recipient = self.participant_id.clone();
+        let item = self
+            .transcript
+            .iter_mut()
+            .find(|item| item.id == message_id)?;
+        // One entry per recipient: this acknowledgement updates the entry this recipient
+        // already has, or starts the one it does not.
+        let index = match item
+            .receipts
+            .iter()
+            .position(|receipt| receipt.recipient_participant_id == recipient)
+        {
+            Some(index) => index,
+            None => {
+                item.receipts.push(MessageReceipt {
+                    recipient_participant_id: recipient,
+                    delivered_timestamp: None,
+                    read_timestamp: None,
+                });
+                item.receipts.len() - 1
+            }
+        };
+        let receipt = item.receipts.get_mut(index)?;
+        match kind {
+            ReceiptKind::Delivered => receipt.delivered_timestamp = Some(at.clone()),
+            ReceiptKind::Read => receipt.read_timestamp = Some(at.clone()),
+        }
+        Some((item.id.clone(), at))
     }
 
     /// Append an item sent at `now`, attributed to this session's participant, recording
@@ -239,6 +402,7 @@ impl ChatSession {
             participant_role: self.participant_role.clone(),
             contact_id: self.contact_id.clone(),
             attachments: Vec::new(),
+            receipts: Vec::new(),
         };
         let stored = (item.id.clone(), item.absolute_time.clone());
         if let Some(key) = key {
@@ -272,6 +436,7 @@ impl ChatSession {
             participant_role: self.participant_role.clone(),
             contact_id: self.contact_id.clone(),
             attachments: vec![attachment_id],
+            receipts: Vec::new(),
         };
         let id = item.id.clone();
         self.transcript.push(item);
@@ -393,6 +558,17 @@ impl ComAmazonawsConnectparticipantAmazonconnectparticipantservicelambdaState {
         self.connections
             .retain(|_, binding| binding.contact_id != contact_id);
     }
+
+    /// Register `session` as the session `participant_token` reaches.
+    ///
+    /// The one way a participant token becomes one this service serves: a chat is STARTED
+    /// elsewhere (`StartChatContact` on the connect service writes this store), and no
+    /// call this service's API carries creates a session or a token for one.
+    pub fn register_session(&mut self, participant_token: String, session: ChatSession) {
+        self.participant_tokens
+            .insert(participant_token, session.contact_id.clone());
+        self.sessions.insert(session.contact_id.clone(), session);
+    }
 }
 
 /// A fresh opaque identifier: a contact id, a participant id, a chat item id or a
@@ -426,9 +602,33 @@ pub fn new_id() -> String {
 ///
 /// Scoped by item type because a `ClientToken` makes ONE operation idempotent: the same
 /// token on `SendMessage` and on `SendEvent` is two distinct requests.
-pub fn idempotency_key(item_type: &str, client_token: Option<&str>) -> Option<String> {
+///
+/// It also carries the request's `Content`, because a `ClientToken` makes one REQUEST
+/// idempotent rather than reserving the token: the same token with another `Content` is
+/// another request and gets an answer of its own. The content is reduced to a digest, so
+/// one caller's payload is not held twice and the key stays bounded whatever the content's
+/// length. `ContentType` is NOT part of the key: one content under two content types is
+/// one request repeated.
+pub fn idempotency_key(
+    item_type: &str,
+    client_token: Option<&str>,
+    content: Option<&str>,
+) -> Option<String> {
     let token = client_token?;
-    (!token.is_empty()).then(|| format!("{item_type}:{token}"))
+    (!token.is_empty()).then(|| format!("{item_type}:{token}:{}", content_digest(content)))
+}
+
+/// `content` as the fixed-width digest an idempotency key carries, distinguishing content
+/// that was sent from content that was not (an event may carry none).
+fn content_digest(content: Option<&str>) -> String {
+    match content {
+        None => "-".to_string(),
+        Some(content) => {
+            let mut hasher = Sha256::new();
+            hasher.update(content.as_bytes());
+            hex::encode(hasher.finalize())
+        }
+    }
 }
 
 /// `at` as an `ISO8601Datetime` / `Instant`, in the documented

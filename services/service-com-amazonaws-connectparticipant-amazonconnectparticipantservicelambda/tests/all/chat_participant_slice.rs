@@ -23,12 +23,68 @@ const HOST: &str = "participant.connect.us-east-1.amazonaws.com";
 const AUTHORIZATION: &str = "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20260101/us-east-1/\
                              execute-api/aws4_request, SignedHeaders=host, Signature=00";
 
-/// A router with just this service mounted on one shared engine.
-fn router() -> MultiServiceRouter {
+/// The chat display name a started chat registers its participant with; the one source of
+/// a session's display name is the chat that started it.
+const DISPLAY_NAME: &str = "sim-customer";
+
+/// A router with just this service mounted on one shared engine, plus that engine: the
+/// store a STARTED chat is registered in.
+///
+/// A participant token is issued where a chat is started, so a test that connects one
+/// registers the chat first ([`Harness::start_chat`]) exactly as `StartChatContact` does.
+/// The harness derefs to the router, so a request is dispatched through it directly.
+struct Harness {
+    router: MultiServiceRouter,
+    engine: Arc<engine::InMemoryEngine>,
+}
+
+impl std::ops::Deref for Harness {
+    type Target = MultiServiceRouter;
+
+    fn deref(&self) -> &MultiServiceRouter {
+        &self.router
+    }
+}
+
+impl Harness {
+    /// This service's store in the shared engine.
+    fn store(
+        &self,
+    ) -> ::engine::ServiceState<
+        participant::state::ComAmazonawsConnectparticipantAmazonconnectparticipantservicelambdaState,
+    > {
+        participant::state::service_state(&*self.engine).expect("the connectparticipant store")
+    }
+
+    /// Register the chat a `StartChatContact` would have started for `participant_token`,
+    /// and answer its contact id.
+    ///
+    /// Registering one token twice keeps the session the first call registered, because a
+    /// participant token names one participant of one contact.
+    fn start_chat(&self, participant_token: &str) -> String {
+        let store = self.store();
+        let mut state = store.lock();
+        if let Some(contact_id) = state.participant_tokens.get(participant_token) {
+            return contact_id.clone();
+        }
+        let session = participant::state::ChatSession::started(
+            participant::state::new_id(),
+            participant::state::new_id(),
+            Some(DISPLAY_NAME.to_string()),
+            SystemTime::now() + participant::state::CONNECTION_TOKEN_TTL,
+        );
+        let contact_id = session.contact_id.clone();
+        state.register_session(participant_token.to_string(), session);
+        contact_id
+    }
+}
+
+/// A harness with just this service mounted on one shared engine.
+fn router() -> Harness {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
-    router.register_service(participant::EmulatedService::new(engine));
-    router
+    router.register_service(participant::EmulatedService::new(engine.clone()));
+    Harness { router, engine }
 }
 
 /// POST `path` with an optional `X-Amz-Bearer` token, returning the status and the
@@ -72,6 +128,15 @@ fn error_type(body: &Value) -> String {
         .to_string()
 }
 
+/// The `Message` of a restJson1 error body.
+fn error_message(body: &Value) -> String {
+    body.get("Message")
+        .or_else(|| body.get("message"))
+        .and_then(Value::as_str)
+        .unwrap_or("<no Message>")
+        .to_string()
+}
+
 /// Assert `value` is an `ISO8601Datetime` / `Instant`: `yyyy-MM-ddThh:mm:ss.SSSZ`,
 /// the form every timestamp in this model documents (e.g. `2019-11-08T02:41:28.172Z`).
 ///
@@ -100,10 +165,12 @@ fn assert_iso8601_millis(case: &str, value: &str) {
     }
 }
 
-/// Open a connection for `participant_token` and return its `ConnectionToken`.
-async fn connect(router: &MultiServiceRouter, participant_token: &str) -> String {
+/// Start the chat `participant_token` belongs to, open a connection for it and return its
+/// `ConnectionToken`.
+async fn connect(harness: &Harness, participant_token: &str) -> String {
+    harness.start_chat(participant_token);
     let (status, body) = post(
-        router,
+        harness,
         "/participant/connection",
         Some(participant_token),
         &json!({"Type": ["CONNECTION_CREDENTIALS"]}),
@@ -132,6 +199,12 @@ async fn send_message(router: &MultiServiceRouter, connection_token: &str, conte
         .to_string()
 }
 
+/// The `Content` a message receipt carries: `SendEventRequest$Content` documents receipt
+/// content as the JSON string `{"messageId":"<chat item id>"}`.
+fn receipt_content(message_id: &str) -> String {
+    json!({"messageId": message_id}).to_string()
+}
+
 /// One `GetTranscript` page: the items and the continuation token.
 async fn get_transcript(
     router: &MultiServiceRouter,
@@ -154,6 +227,7 @@ async fn get_transcript(
 #[tokio::test]
 async fn a_sent_message_comes_back_from_the_transcript_that_stored_it() {
     let router = router();
+    router.start_chat("participant-token-1");
     let (status, body) = post(
         &router,
         "/participant/connection",
@@ -225,7 +299,8 @@ async fn a_sent_message_comes_back_from_the_transcript_that_stored_it() {
         event["AbsoluteTime"].as_str().expect("SendEvent AbsoluteTime"),
     );
 
-    // Read it back: the transcript is what was sent, not a canned body.
+    // Read it back: the transcript is what was sent, not a canned body. A typing event is
+    // transient, so the message is the only item in it.
     let (status, transcript) = post(
         &router,
         "/participant/transcript",
@@ -237,13 +312,19 @@ async fn a_sent_message_comes_back_from_the_transcript_that_stored_it() {
     let items = transcript["Transcript"].as_array().expect("Transcript");
     assert_eq!(
         items.len(),
-        2,
-        "case round trip: expected the two sent items, got {items:?}"
+        1,
+        "case round trip: expected the one sent message, got {items:?}"
+    );
+    assert!(
+        items
+            .iter()
+            .all(|item| item["Id"].as_str() != Some(event_id.as_str())),
+        "case round trip: the typing event must not be a transcript item, got {items:?}"
     );
     assert_eq!(
         items[0]["Id"].as_str(),
         Some(message_id.as_str()),
-        "case round trip: expected the message first, got {items:?}"
+        "case round trip: expected the message, got {items:?}"
     );
     assert_eq!(
         items[0]["Content"].as_str(),
@@ -266,24 +347,18 @@ async fn a_sent_message_comes_back_from_the_transcript_that_stored_it() {
         "case round trip: expected a MESSAGE item, got {items:?}"
     );
     assert_eq!(
-        items[1]["Id"].as_str(),
-        Some(event_id.as_str()),
-        "case round trip: expected the event second, got {items:?}"
-    );
-    assert_eq!(
-        items[1]["Type"].as_str(),
-        Some("EVENT"),
-        "case round trip: expected an EVENT item, got {items:?}"
-    );
-    assert_eq!(
-        items[1]["ParticipantRole"].as_str(),
+        items[0]["ParticipantRole"].as_str(),
         Some("CUSTOMER"),
         "case round trip: expected the session's ParticipantRole, got {items:?}"
     );
     let participant_id = items[0]["ParticipantId"].as_str().unwrap_or_default();
     assert!(
-        !participant_id.is_empty() && items[1]["ParticipantId"].as_str() == Some(participant_id),
-        "case round trip: expected both items attributed to one participant, got {items:?}"
+        !participant_id.is_empty(),
+        "case round trip: expected the item attributed to a participant, got {items:?}"
+    );
+    assert!(
+        items[0].get("MessageMetadata").is_none(),
+        "case round trip: a message nobody acknowledged carries no MessageMetadata, got {items:?}"
     );
     let initial_contact_id = transcript["InitialContactId"].as_str().unwrap_or_default();
     assert!(
@@ -310,10 +385,12 @@ async fn only_the_requested_connection_types_are_returned() {
     ];
     for (index, (types, credentials, websocket)) in cases.iter().enumerate() {
         let case = format!("{types:?}");
+        let participant_token = format!("participant-token-types-{index}");
+        router.start_chat(&participant_token);
         let (status, body) = post(
             &router,
             "/participant/connection",
-            Some(&format!("participant-token-types-{index}")),
+            Some(&participant_token),
             &json!({"Type": types}),
         )
         .await;
@@ -335,7 +412,9 @@ async fn only_the_requested_connection_types_are_returned() {
     }
 
     // An absent `Type` asks for no connection information at all, so neither member is
-    // returned. (An EMPTY list is refused by the model's own `length: min 1`.)
+    // returned. (An EMPTY list asks for connection information of no kind, which the
+    // service refuses with its own sentence — see below.)
+    router.start_chat("participant-token-no-type");
     let (status, body) = post(
         &router,
         "/participant/connection",
@@ -348,22 +427,10 @@ async fn only_the_requested_connection_types_are_returned() {
         body.get("ConnectionCredentials").is_none() && body.get("Websocket").is_none(),
         "case absent Type: expected no connection information, got {body:?}"
     );
-    let (status, body) = post(
-        &router,
-        "/participant/connection",
-        Some("participant-token-empty-type"),
-        &json!({"Type": []}),
-    )
-    .await;
-    assert_eq!(status, 400, "case empty Type: got {body:?}");
-    assert_eq!(
-        error_type(&body),
-        "ValidationException",
-        "case empty Type: got {body:?}"
-    );
 
     // WEBRTC_CONNECTION's response is Chime SDK media-session data this emulator cannot
     // produce, so it is answered with the scaffold's 501 rather than invented values.
+    router.start_chat("participant-token-webrtc");
     let (status, body) = post(
         &router,
         "/participant/connection",
@@ -379,6 +446,7 @@ async fn only_the_requested_connection_types_are_returned() {
     );
 
     // A value outside the ConnectionType set is a client error, not a silent no-op.
+    router.start_chat("participant-token-bogus-type");
     let (status, body) = post(
         &router,
         "/participant/connection",
@@ -391,6 +459,149 @@ async fn only_the_requested_connection_types_are_returned() {
         error_type(&body),
         "ValidationException",
         "case TELEPATHY: got {body:?}"
+    );
+}
+
+/// A request that asks for connection information of no kind at all is refused with the
+/// service's own sentence about the missing connection type, whatever else the request
+/// carries — fixed text, with nothing of the request in it.
+#[tokio::test]
+async fn an_empty_connection_type_list_is_refused_with_the_services_own_sentence() {
+    let router = router();
+    router.start_chat("participant-token-empty-type");
+
+    // Rows differ in what the request carries BESIDE the empty list: the member is the
+    // same, so the refusal is.
+    let cases: &[(&str, Value)] = &[
+        ("an empty Type alone", json!({"Type": []})),
+        (
+            "an empty Type with ConnectParticipant",
+            json!({"Type": [], "ConnectParticipant": true}),
+        ),
+        (
+            "an empty Type with ConnectParticipant false",
+            json!({"Type": [], "ConnectParticipant": false}),
+        ),
+    ];
+    for (case, body) in cases {
+        let (status, response) = post(
+            &router,
+            "/participant/connection",
+            Some("participant-token-empty-type"),
+            body,
+        )
+        .await;
+        assert_eq!(status, 400, "case {case:?}: got {response:?}");
+        assert_eq!(
+            (
+                error_type(&response).as_str(),
+                error_message(&response).as_str()
+            ),
+            (
+                "ValidationException",
+                "Failed to create participant connection due to missing connection type"
+            ),
+            "case {case:?}: got {response:?}"
+        );
+    }
+
+    // The constraint report the framework would otherwise render — the member path, the
+    // submitted size and the bound — is what this refusal replaces.
+    let (_, response) = post(
+        &router,
+        "/participant/connection",
+        Some("participant-token-empty-type"),
+        &json!({"Type": []}),
+    )
+    .await;
+    let message = error_message(&response);
+    for fragment in ["'type'", "0 items", "validation error"] {
+        assert!(
+            !message.contains(fragment),
+            "case {fragment:?}: the refusal must not carry it, got {message:?}"
+        );
+    }
+
+    // Another member's own constraint keeps the framework's report: only the missing
+    // connection type is worded by this service.
+    let (status, response) = post(
+        &router,
+        "/participant/transcript",
+        Some("participant-token-empty-type"),
+        &json!({"MaxResults": 101}),
+    )
+    .await;
+    assert_eq!(
+        (status, error_type(&response).as_str()),
+        (400, "ValidationException"),
+        "case \"another member's constraint\": got {response:?}"
+    );
+    assert_ne!(
+        error_message(&response).as_str(),
+        "Failed to create participant connection due to missing connection type",
+        "case \"another member's constraint\": got {response:?}"
+    );
+}
+
+/// A participant token no started chat registered authenticates nobody: it is refused
+/// rather than served a chat session of its own.
+#[tokio::test]
+async fn a_participant_token_no_started_chat_registered_is_refused() {
+    let router = router();
+
+    // Rows differ in the shape of the token and in the connection information asked for;
+    // none of them was ever issued.
+    let cases: &[(&str, &str, Value)] = &[
+        (
+            "an unissued token",
+            "bogus-participant-token",
+            json!({"Type": ["CONNECTION_CREDENTIALS"]}),
+        ),
+        (
+            "a token shaped like one the service mints",
+            "00000000-0000-4000-8000-000000000000",
+            json!({"Type": ["WEBSOCKET"]}),
+        ),
+        ("a single character", "x", json!({"ConnectParticipant": true})),
+        (
+            "a token at the modelled maximum length",
+            &"t".repeat(1000),
+            json!({"Type": ["CONNECTION_CREDENTIALS", "WEBSOCKET"]}),
+        ),
+    ];
+    for (case, participant_token, body) in cases {
+        let (status, response) =
+            post(&router, "/participant/connection", Some(participant_token), body).await;
+        assert_eq!(
+            (status, error_type(&response).as_str(), error_message(&response).as_str()),
+            (
+                403,
+                "AccessDeniedException",
+                "User is not authorized to access this resource with an explicit deny in an \
+                 identity-based policy"
+            ),
+            "case {case:?}: got {response:?}"
+        );
+        // Nothing was minted for it: no session, no connection token, no participant token.
+        let store = router.store();
+        let state = store.lock();
+        assert!(
+            state.sessions.is_empty()
+                && state.connections.is_empty()
+                && state.participant_tokens.is_empty(),
+            "case {case:?}: the refused call must mint nothing, store holds {} session(s), \
+             {} connection(s), {} participant token(s)",
+            state.sessions.len(),
+            state.connections.len(),
+            state.participant_tokens.len()
+        );
+    }
+
+    // And the token a started chat DID register is served.
+    let connection_token = connect(&router, "participant-token-issued").await;
+    assert!(
+        !connection_token.is_empty(),
+        "case \"an issued token\": expected a ConnectionToken"
     );
 }
 
@@ -432,33 +643,41 @@ async fn re_using_a_participant_token_resolves_to_the_same_session() {
 async fn repeating_a_client_token_returns_the_stored_item_and_appends_nothing() {
     let router = router();
     let token = connect(&router, "participant-token-idempotent").await;
+    let acknowledged = send_message(&router, &token, "a message to acknowledge").await;
 
-    // Rows differ in the operation, the client token and the content.
-    let cases: &[(&str, &str, &str, &str)] = &[
-        ("/participant/message", "ct-1", "text/plain", "hello"),
-        ("/participant/message", "ct-2", "text/plain", "a second message"),
+    // Rows differ in the operation, the client token, the content type and the content.
+    let cases: Vec<(&str, &str, &str, String)> = vec![
+        ("/participant/message", "ct-1", "text/plain", "hello".to_string()),
+        (
+            "/participant/message",
+            "ct-2",
+            "text/plain",
+            "a second message".to_string(),
+        ),
         (
             "/participant/message",
             "a-much-longer-client-token-0123456789",
             "text/markdown",
-            "# heading",
+            "# heading".to_string(),
         ),
         (
             "/participant/event",
             "ct-1",
             "application/vnd.amazonaws.connect.event.typing",
-            "",
+            String::new(),
         ),
         (
             "/participant/event",
             "ct-3",
             "application/vnd.amazonaws.connect.event.message.delivered",
-            "",
+            receipt_content(&acknowledged),
         ),
     ];
 
-    let mut expected_items = 0usize;
-    for (path, client_token, content_type, content) in cases {
+    // Only a message is an item of the conversation: a typing event is transient and a
+    // receipt is recorded on the message it names, so neither grows the transcript.
+    let mut expected_items = 1usize;
+    for (path, client_token, content_type, content) in &cases {
         let case = format!("{path} {client_token}");
         let mut body = json!({"ContentType": content_type, "ClientToken": client_token});
         if !content.is_empty() {
@@ -466,7 +685,9 @@ async fn repeating_a_client_token_returns_the_stored_item_and_appends_nothing() 
         }
         let (status, first) = post(&router, path, Some(&token), &body).await;
         assert_eq!(status, 200, "case {case}: got {first:?}");
-        expected_items += 1;
+        if *path == "/participant/message" {
+            expected_items += 1;
+        }
 
         let (status, again) = post(&router, path, Some(&token), &body).await;
         assert_eq!(status, 200, "case {case} repeated: got {again:?}");
@@ -998,4 +1219,385 @@ async fn a_contact_id_from_another_connection_is_refused() {
         items.is_empty(),
         "case own contact id: expected an empty transcript, got {items:?}"
     );
+}
+
+/// An event this service has no conversation item for is acknowledged with an `Id` and an
+/// `AbsoluteTime` and recorded nowhere: the transcript holds only what the chat retains.
+///
+/// `GetTranscript` documents the event content types a transcript contains
+/// (`…participant.invited`, `…participant.joined`, `…participant.left`, `…chat.ended`,
+/// `…transfer.succeeded`, `…transfer.failed`), and no content type `SendEvent` sends is
+/// one of them.
+#[tokio::test]
+async fn a_transient_event_is_acknowledged_and_never_becomes_a_transcript_item() {
+    let router = router();
+    let token = connect(&router, "participant-token-transient").await;
+
+    // Rows are the content types `SendEvent` documents that name no message of their own
+    // (smithy_query operation=SendEvent, member ContentType), with and without content.
+    let cases: Vec<(&str, &str, Option<&str>)> = vec![
+        (
+            "typing",
+            "application/vnd.amazonaws.connect.event.typing",
+            None,
+        ),
+        (
+            "typing with content",
+            "application/vnd.amazonaws.connect.event.typing",
+            Some("{}"),
+        ),
+        (
+            "connection acknowledged",
+            "application/vnd.amazonaws.connect.event.connection.acknowledged",
+            None,
+        ),
+    ];
+
+    let mut acknowledged: Vec<(String, String)> = Vec::new();
+    for (case, content_type, content) in &cases {
+        let mut body = json!({"ContentType": content_type});
+        if let Some(content) = content {
+            body["Content"] = json!(content);
+        }
+        let (status, response) = post(&router, "/participant/event", Some(&token), &body).await;
+        assert_eq!(status, 200, "case {case:?}: got {response:?}");
+        let id = response["Id"]
+            .as_str()
+            .unwrap_or_else(|| panic!("case {case:?}: expected an Id, got {response:?}"))
+            .to_string();
+        assert_iso8601_millis(
+            case,
+            response["AbsoluteTime"]
+                .as_str()
+                .unwrap_or_else(|| panic!("case {case:?}: expected an AbsoluteTime")),
+        );
+        assert!(
+            acknowledged.iter().all(|(_, other)| other != &id),
+            "case {case:?}: expected an Id of its own, got {id:?} again"
+        );
+        acknowledged.push(((*content_type).to_string(), id));
+    }
+
+    // A message sent after them fences the transcript: whatever the scan, the events are
+    // not in it.
+    let fence = send_message(&router, &token, "after the events").await;
+    let (items, _) = get_transcript(
+        &router,
+        &token,
+        &json!({"MaxResults": 100, "SortOrder": "ASCENDING", "ScanDirection": "FORWARD"}),
+    )
+    .await;
+    assert_eq!(
+        items.len(),
+        1,
+        "case \"the fenced transcript\": expected only the message, got {items:?}"
+    );
+    assert_eq!(
+        items[0]["Id"].as_str(),
+        Some(fence.as_str()),
+        "case \"the fenced transcript\": expected the message, got {items:?}"
+    );
+    for (content_type, id) in &acknowledged {
+        assert!(
+            items.iter().all(|item| {
+                item["Id"].as_str() != Some(id.as_str())
+                    && item["ContentType"].as_str() != Some(content_type.as_str())
+                    && item["Type"].as_str() != Some("TYPING")
+            }),
+            "case {content_type:?}: no transcript item may name it, got {items:?}"
+        );
+    }
+}
+
+/// One row of the message-receipt table: which receipts one message is sent, and the
+/// timestamps its one receipt entry must carry afterwards.
+struct ReceiptCase {
+    /// What the assertions name this row.
+    case: &'static str,
+    /// Each receipt as its `ContentType` and the `ClientToken` it is sent under; an empty
+    /// token means the call carries none.
+    receipts: &'static [(&'static str, &'static str)],
+    /// Whether the entry must carry a `DeliveredTimestamp` at the end.
+    delivered: bool,
+    /// Whether the entry must carry a `ReadTimestamp` at the end.
+    read: bool,
+}
+
+/// A message receipt answers the `Id` of the message its `Content` names, and that
+/// message's own transcript item reports it as `MessageMetadata`.
+#[tokio::test]
+async fn a_message_receipt_answers_its_message_and_shows_up_on_that_items_metadata() {
+    let router = router();
+    let token = connect(&router, "participant-token-receipts").await;
+
+    const DELIVERED: &str = "application/vnd.amazonaws.connect.event.message.delivered";
+    const READ: &str = "application/vnd.amazonaws.connect.event.message.read";
+
+    // Rows differ in which receipts one message gets, in which order, and under which
+    // `ClientToken` — which is what decides the timestamps its one receipt entry carries.
+    // A receipt's answer follows from the message it names, so repeating a token cannot
+    // swallow the acknowledgement.
+    let cases: &[ReceiptCase] = &[
+        ReceiptCase {
+            case: "delivered only",
+            receipts: &[(DELIVERED, "")],
+            delivered: true,
+            read: false,
+        },
+        ReceiptCase {
+            case: "delivered then read",
+            receipts: &[(DELIVERED, ""), (READ, "")],
+            delivered: true,
+            read: true,
+        },
+        ReceiptCase {
+            case: "read only",
+            receipts: &[(READ, "")],
+            delivered: false,
+            read: true,
+        },
+        ReceiptCase {
+            case: "delivered twice",
+            receipts: &[(DELIVERED, ""), (DELIVERED, "")],
+            delivered: true,
+            read: false,
+        },
+        ReceiptCase {
+            case: "delivered then read under one ClientToken",
+            receipts: &[(DELIVERED, "one-token"), (READ, "one-token")],
+            delivered: true,
+            read: true,
+        },
+    ];
+    for ReceiptCase {
+        case,
+        receipts,
+        delivered: expect_delivered,
+        read: expect_read,
+    } in cases
+    {
+        let message_id = send_message(&router, &token, &format!("message for {case}")).await;
+        for (content_type, client_token) in *receipts {
+            let mut body = json!({"ContentType": content_type,
+                                  "Content": receipt_content(&message_id)});
+            if !client_token.is_empty() {
+                body["ClientToken"] = json!(client_token);
+            }
+            let (status, answered) = post(&router, "/participant/event", Some(&token), &body).await;
+            assert_eq!(status, 200, "case {case:?}: got {answered:?}");
+            assert_eq!(
+                answered["Id"].as_str(),
+                Some(message_id.as_str()),
+                "case {case:?}: a receipt must answer the Id of the message it names, \
+                 got {answered:?}"
+            );
+            assert_iso8601_millis(
+                case,
+                answered["AbsoluteTime"]
+                    .as_str()
+                    .unwrap_or_else(|| panic!("case {case:?}: expected an AbsoluteTime")),
+            );
+        }
+
+        let (items, _) = get_transcript(
+            &router,
+            &token,
+            &json!({"MaxResults": 100, "SortOrder": "ASCENDING", "ScanDirection": "FORWARD"}),
+        )
+        .await;
+        let item = items
+            .iter()
+            .find(|item| item["Id"].as_str() == Some(message_id.as_str()))
+            .unwrap_or_else(|| panic!("case {case:?}: the message is not in {items:?}"));
+        let metadata = item
+            .get("MessageMetadata")
+            .unwrap_or_else(|| panic!("case {case:?}: expected MessageMetadata on {item:?}"));
+        assert_eq!(
+            metadata["MessageId"].as_str(),
+            Some(message_id.as_str()),
+            "case {case:?}: MessageMetadata must name its own message, got {metadata:?}"
+        );
+        let entries = metadata["Receipts"]
+            .as_array()
+            .unwrap_or_else(|| panic!("case {case:?}: expected Receipts on {metadata:?}"));
+        assert_eq!(
+            entries.len(),
+            1,
+            "case {case:?}: one recipient acknowledged it, so it carries one receipt, \
+             got {entries:?}"
+        );
+        let receipt = &entries[0];
+        assert_eq!(
+            receipt["RecipientParticipantId"].as_str(),
+            item["ParticipantId"].as_str(),
+            "case {case:?}: the receipt names the participant that acknowledged it, \
+             got {receipt:?}"
+        );
+        assert_eq!(
+            receipt.get("DeliveredTimestamp").is_some(),
+            *expect_delivered,
+            "case {case:?}: DeliveredTimestamp presence wrong, got {receipt:?}"
+        );
+        assert_eq!(
+            receipt.get("ReadTimestamp").is_some(),
+            *expect_read,
+            "case {case:?}: ReadTimestamp presence wrong, got {receipt:?}"
+        );
+        if let (Some(delivered), Some(read)) = (
+            receipt["DeliveredTimestamp"].as_str(),
+            receipt["ReadTimestamp"].as_str(),
+        ) {
+            assert_iso8601_millis(case, delivered);
+            assert_iso8601_millis(case, read);
+            assert!(
+                delivered <= read,
+                "case {case:?}: expected DeliveredTimestamp not after ReadTimestamp, \
+                 got {receipt:?}"
+            );
+        }
+    }
+
+    // A receipt adds no item of its own: the transcript holds exactly the messages sent.
+    let (items, _) = get_transcript(
+        &router,
+        &token,
+        &json!({"MaxResults": 100, "SortOrder": "ASCENDING", "ScanDirection": "FORWARD"}),
+    )
+    .await;
+    assert_eq!(
+        items.len(),
+        cases.len(),
+        "case \"the whole transcript\": expected one item per message sent, got {items:?}"
+    );
+
+    // Content that names no message of this chat is a client error, not a new item.
+    let foreign = connect(&router, "participant-token-receipts-other").await;
+    let theirs = send_message(&router, &foreign, "another chat's message").await;
+    let refused: Vec<(&str, Value)> = vec![
+        (
+            "no Content at all",
+            json!({"ContentType": DELIVERED}),
+        ),
+        (
+            "Content that is not the receipt form",
+            json!({"ContentType": DELIVERED, "Content": "just text"}),
+        ),
+        (
+            "Content with no messageId member",
+            json!({"ContentType": READ, "Content": "{\"message\":\"x\"}"}),
+        ),
+        (
+            "a messageId of no item",
+            json!({"ContentType": DELIVERED,
+                   "Content": receipt_content("00000000-0000-4000-8000-000000000000")}),
+        ),
+        (
+            "a messageId from another chat",
+            json!({"ContentType": DELIVERED, "Content": receipt_content(&theirs)}),
+        ),
+    ];
+    for (case, body) in &refused {
+        let (status, response) = post(&router, "/participant/event", Some(&token), body).await;
+        assert_eq!(
+            (status, error_type(&response).as_str()),
+            (400, "ValidationException"),
+            "case {case:?}: got {response:?}"
+        );
+    }
+    let (items_again, _) = get_transcript(
+        &router,
+        &token,
+        &json!({"MaxResults": 100, "SortOrder": "ASCENDING", "ScanDirection": "FORWARD"}),
+    )
+    .await;
+    assert_eq!(
+        items_again.len(),
+        items.len(),
+        "case \"after the refusals\": a refused receipt must store nothing, got {items_again:?}"
+    );
+}
+
+/// A `ClientToken` makes one REQUEST idempotent: the replay key is the token together with
+/// the `Content` the request carries, and never its `ContentType`. A receipt is not
+/// replayed from a token at all — its answer follows from the message it names.
+#[tokio::test]
+async fn a_reused_client_token_is_judged_on_the_content_it_carries() {
+    let router = router();
+    let token = connect(&router, "participant-token-content-key").await;
+    let first_message = send_message(&router, &token, "the first acknowledged message").await;
+    let second_message = send_message(&router, &token, "the second acknowledged message").await;
+
+    const DELIVERED: &str = "application/vnd.amazonaws.connect.event.message.delivered";
+    const READ: &str = "application/vnd.amazonaws.connect.event.message.read";
+    const TYPING: &str = "application/vnd.amazonaws.connect.event.typing";
+
+    // Rows are (path, the first call, the second call, whether the two answer one Id).
+    // They differ in the operation and in what the second call changes: the content type
+    // alone (one request repeated), or the content (a request of its own).
+    let cases: Vec<(&str, &str, Value, Value, bool)> = vec![
+        (
+            "a receipt under one token with another content type",
+            "/participant/event",
+            json!({"ContentType": DELIVERED, "Content": receipt_content(&first_message),
+                   "ClientToken": "ck-1"}),
+            json!({"ContentType": READ, "Content": receipt_content(&first_message),
+                   "ClientToken": "ck-1"}),
+            true,
+        ),
+        (
+            "a receipt under one token for another message",
+            "/participant/event",
+            json!({"ContentType": DELIVERED, "Content": receipt_content(&first_message),
+                   "ClientToken": "ck-2"}),
+            json!({"ContentType": DELIVERED, "Content": receipt_content(&second_message),
+                   "ClientToken": "ck-2"}),
+            false,
+        ),
+        (
+            "a typing event under one token with no content either time",
+            "/participant/event",
+            json!({"ContentType": TYPING, "ClientToken": "ck-3"}),
+            json!({"ContentType": TYPING, "ClientToken": "ck-3"}),
+            true,
+        ),
+        (
+            "a typing event under one token that gains content",
+            "/participant/event",
+            json!({"ContentType": TYPING, "ClientToken": "ck-4"}),
+            json!({"ContentType": TYPING, "Content": "{}", "ClientToken": "ck-4"}),
+            false,
+        ),
+        (
+            "a message under one token with another content type",
+            "/participant/message",
+            json!({"ContentType": "text/plain", "Content": "# heading", "ClientToken": "ck-5"}),
+            json!({"ContentType": "text/markdown", "Content": "# heading", "ClientToken": "ck-5"}),
+            true,
+        ),
+        (
+            "a message under one token with other content",
+            "/participant/message",
+            json!({"ContentType": "text/plain", "Content": "one", "ClientToken": "ck-6"}),
+            json!({"ContentType": "text/plain", "Content": "two", "ClientToken": "ck-6"}),
+            false,
+        ),
+    ];
+    for (case, path, first_body, second_body, same) in &cases {
+        let (status, first) = post(&router, path, Some(&token), first_body).await;
+        assert_eq!(status, 200, "case {case:?}: got {first:?}");
+        let (status, second) = post(&router, path, Some(&token), second_body).await;
+        assert_eq!(status, 200, "case {case:?} second call: got {second:?}");
+        let (first_id, second_id) = (first["Id"].as_str(), second["Id"].as_str());
+        if *same {
+            assert_eq!(
+                first_id, second_id,
+                "case {case:?}: expected the first answer replayed, got {second:?}"
+            );
+        } else {
+            assert_ne!(
+                first_id, second_id,
+                "case {case:?}: expected an answer of its own, got {second:?}"
+            );
+        }
+    }
 }

@@ -26,18 +26,64 @@ const HOST: &str = "participant.connect.us-east-1.amazonaws.com";
 const AUTHORIZATION: &str = "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20260101/us-east-1/\
                              execute-api/aws4_request, SignedHeaders=host, Signature=00";
 
-/// A router with just this service mounted on one shared engine.
-fn router() -> MultiServiceRouter {
+/// A harness with just this service mounted on one shared engine.
+fn router() -> Harness {
     router_and_engine().0
 }
 
 /// [`router`], plus the shared engine behind it — the store the component that starts a chat
 /// writes its session into, and the one every handler reads.
-fn router_and_engine() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
+fn router_and_engine() -> (Harness, Arc<engine::InMemoryEngine>) {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     router.register_service(participant::EmulatedService::new(engine.clone()));
-    (router, engine)
+    (
+        Harness {
+            router,
+            engine: engine.clone(),
+        },
+        engine,
+    )
+}
+
+/// The router plus the shared engine: a participant token is issued where a chat is
+/// STARTED, so a test that connects one registers the chat in that store first
+/// ([`Harness::start_chat`]), exactly as `StartChatContact` does.
+///
+/// Derefs to the router, so a request is dispatched through the harness itself.
+struct Harness {
+    router: MultiServiceRouter,
+    engine: Arc<engine::InMemoryEngine>,
+}
+
+impl std::ops::Deref for Harness {
+    type Target = MultiServiceRouter;
+
+    fn deref(&self) -> &MultiServiceRouter {
+        &self.router
+    }
+}
+
+impl Harness {
+    /// Register the chat a `StartChatContact` would have started for `participant_token`,
+    /// and answer its contact id. Registering one token twice keeps the session the first
+    /// call registered, because a participant token names one participant of one contact.
+    fn start_chat(&self, participant_token: &str) -> String {
+        let store = store(&self.engine);
+        let mut state = store.lock();
+        if let Some(contact_id) = state.participant_tokens.get(participant_token) {
+            return contact_id.clone();
+        }
+        let session = participant::state::ChatSession::started(
+            participant::state::new_id(),
+            participant::state::new_id(),
+            Some("sim-customer".to_string()),
+            std::time::SystemTime::now() + participant::state::CONNECTION_TOKEN_TTL,
+        );
+        let contact_id = session.contact_id.clone();
+        state.register_session(participant_token.to_string(), session);
+        contact_id
+    }
 }
 
 /// This service's store in the shared engine.
@@ -177,10 +223,12 @@ fn query_param(url: &str, name: &str) -> Option<String> {
     })
 }
 
-/// Open a connection for `participant_token` and return its `ConnectionToken`.
-async fn connect(router: &MultiServiceRouter, participant_token: &str) -> String {
+/// Start the chat `participant_token` belongs to, open a connection for it and return its
+/// `ConnectionToken`.
+async fn connect(harness: &Harness, participant_token: &str) -> String {
+    harness.start_chat(participant_token);
     let (status, body) = post(
-        router,
+        harness,
         "/participant/connection",
         Some(participant_token),
         &json!({"Type": ["CONNECTION_CREDENTIALS"]}),

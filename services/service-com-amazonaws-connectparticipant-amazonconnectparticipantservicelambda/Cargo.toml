@@ -24,8 +24,11 @@ bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
-# Opaque hex encoding for the GetTranscript `NextToken`, which carries its cursor.
+# Opaque hex encoding for the GetTranscript `NextToken`, which carries its cursor, and for
+# the content digest an idempotency key carries.
 hex = { workspace = true }
+# The digest a `ClientToken` idempotency key reduces a request's `Content` to.
+sha2 = { workspace = true }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

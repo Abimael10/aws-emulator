@@ -51,6 +51,7 @@ use smithy_server_runtime::{
 use std::sync::Arc;
 
 mod attachment_plane;
+mod connection_type_refusal;
 
 /// Whether this service serves the request these `parts` came from.
 ///
@@ -159,8 +160,17 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // for the rest. Replace BOTH the code and the message: a client branches
         // on the code, so a message without its matching code is worse than
         // leaving both alone.
-        let _ = refusal;
-        None
+        //
+        // The one refusal this service states itself is a request for no connection type:
+        // it answers that with one sentence of its own rather than a report of the
+        // modelled bound. See [`connection_type_refusal`].
+        let Refusal::Invalid(violations) = refusal else {
+            return None;
+        };
+        connection_type_refusal::missing_connection_type(violations).then(|| Refused {
+            code: connection_type_refusal::VALIDATION_EXCEPTION.to_string(),
+            message: connection_type_refusal::MISSING_CONNECTION_TYPE.to_string(),
+        })
     }
 
     fn override_routing_error(

@@ -1,9 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateParticipantConnection
-//! IMPLEMENTED. Mints (or re-resolves) the chat session a participant token names,
-//! mints a fresh connection token for this call, and returns the connection
-//! information the request asked for in `Type`.
+//! IMPLEMENTED. Resolves the chat session a participant token names, mints a fresh
+//! connection token for this call, and returns the connection information the request
+//! asked for in `Type`.
+//!
+//! A participant token is issued where a chat is STARTED (`StartChatContact` registers
+//! the session and the token in this service's store), so a token no started chat
+//! registered names no participant of any contact and is refused `AccessDeniedException`
+//! (HTTP 403) rather than served a session of its own.
 //!
 //! The connection token this returns is STORED and is the key every later operation
 //! authenticates with; `CONNECTION_CREDENTIALS` and `WEBSOCKET` are served, and
@@ -25,7 +30,9 @@
 //!   participant as connected is reachable WITHOUT asking for any connection type. Such
 //!   a call records `ConnectParticipant` on the session and answers 200 with no output
 //!   member — and mints no connection token, since none is reported. (An EMPTY `Type`
-//!   list is refused by the model's own `length: min 1`.)
+//!   list asks for connection information of no kind at all, which the model's own
+//!   `length: min 1` refuses; the service words that refusal itself, see
+//!   `crate::service`.)
 //!
 //! ## Shape of an operation
 //!
@@ -267,63 +274,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // A participant token identifies one participant of one contact for the lifetime
         // of that participant, so calling again with the same token connects to the
-        // session it already created rather than starting a second one.
-        let contact_id = match state
+        // session the started chat registered for it rather than starting a second one. A
+        // token that names no live participant authenticates nobody: it is not a token
+        // this service issued, or the participant it named has left the contact, which is
+        // when a participant token stops being valid.
+        let contact_id = state
             .participant_tokens
             .get(&input.participant_token)
             .cloned()
-        {
-            Some(contact_id) => {
-                let still_live = state
-                    .sessions
-                    .get(&contact_id)
-                    .is_some_and(|session| session.connected);
-                if !still_live {
-                    // The participant left the contact, which is when the participant
-                    // token stops being valid.
-                    return Err(CreateParticipantConnectionErrorModeled::AccessDeniedException(
-                        AccessDeniedException {
-                            message: crate::state::ACCESS_DENIED_MESSAGE.to_string(),
-                        },
-                    )
-                    .into());
-                }
-                contact_id
-            }
-            None => {
-                if state.sessions.len() >= crate::state::MAX_SESSIONS {
-                    return Err(CreateParticipantConnectionErrorModeled::ThrottlingException(
-                        ThrottlingException {
-                            message: format!(
-                                "this emulator holds its {} chat-session limit; \
-                                 disconnect a participant or wait for a session to expire",
-                                crate::state::MAX_SESSIONS
-                            ),
-                        },
-                    )
-                    .into());
-                }
-                let contact_id = crate::state::new_id();
-                state.sessions.insert(
-                    contact_id.clone(),
-                    crate::state::ChatSession {
-                        contact_id: contact_id.clone(),
-                        initial_contact_id: contact_id.clone(),
-                        participant_id: crate::state::new_id(),
-                        participant_role: crate::state::PARTICIPANT_ROLE_CUSTOMER.to_string(),
-                        display_name: None,
-                        connected: true,
-                        connect_participant: false,
-                        transcript: Vec::new(),
-                        idempotency: std::collections::HashMap::new(),
-                        retain_until: now + crate::state::SESSION_RETENTION,
-                    },
-                );
+            .filter(|contact_id| {
                 state
-                    .participant_tokens
-                    .insert(input.participant_token.clone(), contact_id.clone());
-                contact_id
-            }
+                    .sessions
+                    .get(contact_id)
+                    .is_some_and(|session| session.connected)
+            });
+        let Some(contact_id) = contact_id else {
+            return Err(CreateParticipantConnectionErrorModeled::AccessDeniedException(
+                AccessDeniedException {
+                    message: crate::state::PARTICIPANT_TOKEN_DENIED_MESSAGE.to_string(),
+                },
+            )
+            .into());
         };
 
         // A connection token is minted only when this call actually reports one, so a

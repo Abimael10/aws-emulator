@@ -187,11 +187,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
-        // A repeated `ClientToken` must answer with the item the first call stored, and
-        // must not append a second one.
+        // A repeated `ClientToken` with the same `Content` must answer with the item the
+        // first call stored, and must not append a second one.
         let key = crate::state::idempotency_key(
             crate::state::CHAT_ITEM_TYPE_MESSAGE,
             input.client_token.as_deref(),
+            Some(input.content.as_str()),
         );
         if let Some(stored) = session.replayed(key.as_deref()) {
             return Ok(SendMessageOutput {

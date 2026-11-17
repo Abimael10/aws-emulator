@@ -55,9 +55,31 @@ impl Harness {
         participant::state::service_state(&*self.engine).expect("the connectparticipant store")
     }
 
+    /// Register the chat a `StartChatContact` would have started for `participant_token`,
+    /// and answer its contact id. A participant token is issued where a chat is STARTED,
+    /// so a test that connects one registers the chat first; registering one token twice
+    /// keeps the session the first call registered.
+    fn start_chat(&self, participant_token: &str) -> String {
+        let store = self.store();
+        let mut state = store.lock();
+        if let Some(contact_id) = state.participant_tokens.get(participant_token) {
+            return contact_id.clone();
+        }
+        let session = participant::state::ChatSession::started(
+            participant::state::new_id(),
+            participant::state::new_id(),
+            Some("sim-customer".to_string()),
+            std::time::SystemTime::now() + participant::state::CONNECTION_TOKEN_TTL,
+        );
+        let contact_id = session.contact_id.clone();
+        state.register_session(participant_token.to_string(), session);
+        contact_id
+    }
+
     /// Open a connection for `participant_token`, returning its `ConnectionToken` and the
     /// contact of the session that token authenticates.
     async fn connect(&self, participant_token: &str) -> (String, String) {
+        self.start_chat(participant_token);
         let request = http::Request::builder()
             .method("POST")
             .uri(format!("https://{HOST}/participant/connection"))
