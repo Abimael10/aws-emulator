@@ -13,6 +13,16 @@
 //! nothing was stored under is reported missing, and a stored configuration is what a
 //! pipeline's reference to one resolves to.
 //!
+//! `DeleteDistributionConfiguration` is the other end of the same store: it removes exactly
+//! the record its ARN names in the Region the request reached, names the ARN of the record
+//! it removed, and leaves every other record alone — so an ARN this Region holds nothing
+//! under (one nothing created, one a delete already removed, one of another Region) takes
+//! nothing out and is reported missing, and a configuration an image pipeline still
+//! references is not removed at all. The same dependency rule across every kind of resource
+//! a pipeline reaches is the subject of the `resource_delete_lifecycle` suite; what the
+//! cases here add is this resource's own store: several configurations in one store, two
+//! standing references to one of them, and the name a delete freed.
+//!
 //! None of the EC2, ECR, License Manager or S3 values a distribution names is resolved at
 //! create time, so the rows below name values no other service in this emulator holds and
 //! still expect a 200.
@@ -908,69 +918,7 @@ async fn a_pipeline_resolves_a_reference_to_a_stored_configuration() {
     let router = emulator();
 
     // The resources a pipeline needs beside the distribution configuration.
-    let component = {
-        let body = json!({
-            "name": "pipeline-component",
-            "semanticVersion": "1.0.0",
-            "platform": "Linux",
-            "clientToken": "token-component",
-            "data": BUILD_DOCUMENT,
-        });
-        let (status, answer) = call_in(&router, REGION, "PUT", "/CreateComponent", Some(&body)).await;
-        assert_eq!(
-            status, 200,
-            "case \"create the component\": got {status} with {answer}"
-        );
-        answer
-            .get("componentBuildVersionArn")
-            .and_then(Value::as_str)
-            .expect("the component's build version ARN")
-            .to_string()
-    };
-    let recipe = {
-        let body = json!({
-            "name": "pipeline-recipe",
-            "semanticVersion": "1.0.0",
-            "parentImage": "ami-0123456789abcdef0",
-            "clientToken": "token-recipe",
-            "components": [{ "componentArn": component }],
-        });
-        let (status, answer) =
-            call_in(&router, REGION, "PUT", "/CreateImageRecipe", Some(&body)).await;
-        assert_eq!(
-            status, 200,
-            "case \"create the image recipe\": got {status} with {answer}"
-        );
-        answer
-            .get("imageRecipeArn")
-            .and_then(Value::as_str)
-            .expect("the recipe's ARN")
-            .to_string()
-    };
-    let infrastructure = {
-        let body = json!({
-            "name": "pipeline-infra",
-            "clientToken": "token-infra",
-            "instanceProfileName": "EC2InstanceProfileForImageBuilder",
-        });
-        let (status, answer) = call_in(
-            &router,
-            REGION,
-            "PUT",
-            "/CreateInfrastructureConfiguration",
-            Some(&body),
-        )
-        .await;
-        assert_eq!(
-            status, 200,
-            "case \"create the infrastructure configuration\": got {status} with {answer}"
-        );
-        answer
-            .get("infrastructureConfigurationArn")
-            .and_then(Value::as_str)
-            .expect("the configuration's ARN")
-            .to_string()
-    };
+    let (recipe, infrastructure) = pipeline_prerequisites(&router).await;
     let body = create_body(
         "pipeline-distribution",
         "token-pipeline-distribution",
@@ -1049,4 +997,400 @@ async fn a_pipeline_resolves_a_reference_to_a_stored_configuration() {
             "case {case:?}: expected the pipeline to report {reference:?}, got {reported:?}"
         );
     }
+}
+
+/// A second Region, so a case can ask one Region's endpoint about the other's resources.
+const OTHER_REGION: &str = "us-east-1";
+
+/// `DeleteDistributionConfiguration` for `arn`, in `region`.
+async fn delete_in(router: &MultiServiceRouter, region: &str, arn: &str) -> (u16, Value) {
+    call_in(
+        router,
+        region,
+        "DELETE",
+        &format!("/DeleteDistributionConfiguration?distributionConfigurationArn={arn}"),
+        None,
+    )
+    .await
+}
+
+/// `DeleteDistributionConfiguration` for `arn`, in [`REGION`].
+async fn delete(router: &MultiServiceRouter, arn: &str) -> (u16, Value) {
+    delete_in(router, REGION, arn).await
+}
+
+/// Assert a delete succeeded, named the ARN of the record it removed, and named the
+/// request it answers.
+fn assert_deleted(case: &str, status: u16, body: &Value, arn: &str) {
+    assert_eq!(
+        status, 200,
+        "case {case:?}: expected HTTP 200 from the delete, got {status} with {body}"
+    );
+    let echoed = body
+        .get("distributionConfigurationArn")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    assert_eq!(
+        echoed, arn,
+        "case {case:?}: expected the delete to name the removed {arn:?}, got {echoed:?}"
+    );
+    let request_id = body
+        .get("requestId")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    assert!(
+        !request_id.is_empty(),
+        "case {case:?}: expected the delete to name the request it answers, got \
+         {request_id:?}"
+    );
+}
+
+/// Assert a call reported the configuration `arn` names as missing: this service's modelled
+/// not-found error, naming the ARN the request acted on. The sentence it carries is pinned
+/// by [`an_arn_nothing_was_stored_under_is_reported_missing`] here and, across every kind of
+/// resource this service reports missing, by the `resource_not_found` suite.
+fn assert_missing(case: &str, status: u16, body: &Value, arn: &str) {
+    assert_refused(case, status, body, 404, "ResourceNotFoundException");
+    let message = error_message(case, body);
+    assert!(
+        message.contains(arn),
+        "case {case:?}: expected the report to name {arn:?}, got {message:?}"
+    );
+}
+
+/// Assert a read reports the configuration stored under `arn`, and answer it.
+async fn assert_stored(router: &MultiServiceRouter, case: &str, region: &str, arn: &str) -> Value {
+    let (status, read) = get_in(router, region, arn).await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: expected HTTP 200 from the read, got {status} with {read}"
+    );
+    let stored = configuration(case, &read);
+    let reported = stored.get("arn").and_then(Value::as_str).unwrap_or_default();
+    assert_eq!(
+        reported, arn,
+        "case {case:?}: expected the read to report {arn:?}, got {reported:?}"
+    );
+    stored
+}
+
+/// The resources beside a distribution configuration that an image pipeline needs: an image
+/// recipe (over a component of its own) and an infrastructure configuration, as their ARNs.
+async fn pipeline_prerequisites(router: &MultiServiceRouter) -> (String, String) {
+    let component = {
+        let body = json!({
+            "name": "referencing-component",
+            "semanticVersion": "1.0.0",
+            "platform": "Linux",
+            "clientToken": "token-referencing-component",
+            "data": BUILD_DOCUMENT,
+        });
+        let (status, answer) = call_in(router, REGION, "PUT", "/CreateComponent", Some(&body)).await;
+        assert_eq!(
+            status, 200,
+            "case \"create the component\": got {status} with {answer}"
+        );
+        answer
+            .get("componentBuildVersionArn")
+            .and_then(Value::as_str)
+            .expect("the component's build version ARN")
+            .to_string()
+    };
+    let recipe = {
+        let body = json!({
+            "name": "referencing-recipe",
+            "semanticVersion": "1.0.0",
+            "parentImage": "ami-0123456789abcdef0",
+            "clientToken": "token-referencing-recipe",
+            "components": [{ "componentArn": component }],
+        });
+        let (status, answer) =
+            call_in(router, REGION, "PUT", "/CreateImageRecipe", Some(&body)).await;
+        assert_eq!(
+            status, 200,
+            "case \"create the image recipe\": got {status} with {answer}"
+        );
+        answer
+            .get("imageRecipeArn")
+            .and_then(Value::as_str)
+            .expect("the recipe's ARN")
+            .to_string()
+    };
+    let infrastructure = {
+        let body = json!({
+            "name": "referencing-infra",
+            "clientToken": "token-referencing-infra",
+            "instanceProfileName": "EC2InstanceProfileForImageBuilder",
+        });
+        let (status, answer) = call_in(
+            router,
+            REGION,
+            "PUT",
+            "/CreateInfrastructureConfiguration",
+            Some(&body),
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case \"create the infrastructure configuration\": got {status} with {answer}"
+        );
+        answer
+            .get("infrastructureConfigurationArn")
+            .and_then(Value::as_str)
+            .expect("the configuration's ARN")
+            .to_string()
+    };
+    (recipe, infrastructure)
+}
+
+#[tokio::test]
+async fn a_delete_removes_only_the_configuration_its_arn_names() {
+    let router = emulator();
+    // The rows of the round-trip table: the delete acts on configurations that differ in
+    // the form of their name, in how many target Regions they name and in which per-Region
+    // settings their entries carry, because the rule is about the RECORD an ARN names and
+    // not about what the record holds.
+    let table = rows();
+
+    for (n, row) in table.iter().enumerate() {
+        let body = create_body(
+            row.name,
+            &format!("token-delete-{n:04}"),
+            (row.distributions)(),
+            (row.extra)(),
+        );
+        let (status, created) = create(&router, &body).await;
+        assert_eq!(
+            status, 200,
+            "case {:?}: expected HTTP 200 from the create, got {status} with {created}",
+            row.case
+        );
+    }
+
+    for (i, row) in table.iter().enumerate() {
+        let arn = arn_of(REGION, row.normalized);
+        let (status, deleted) = delete(&router, &arn).await;
+        assert_deleted(row.case, status, &deleted, &arn);
+
+        // A repeat of a delete that already succeeded removes nothing and is reported the
+        // same way as an ARN nothing was ever stored under.
+        let (status, repeated) = delete(&router, &arn).await;
+        assert_missing(
+            &format!("{}, deleted a second time", row.case),
+            status,
+            &repeated,
+            &arn,
+        );
+
+        // Nothing else moved: the configurations this loop has deleted are reported
+        // missing, and every one it has not is still read back under its own ARN.
+        for (j, other) in table.iter().enumerate() {
+            let other_arn = arn_of(REGION, other.normalized);
+            let case = format!("{} after the delete of {}", other.case, row.case);
+            if j <= i {
+                let (status, read) = get(&router, &other_arn).await;
+                assert_missing(&case, status, &read, &other_arn);
+            } else {
+                assert_stored(&router, &case, REGION, &other_arn).await;
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_delete_leaves_the_configuration_a_later_create_stores_under_the_same_name() {
+    let router = emulator();
+    let arn = arn_of(REGION, "recreated-distribution");
+
+    // The name a deleted configuration carried is free again, and what the next create
+    // stores under it is that create's own configuration — not a trace of the deleted one.
+    let first = create_body(
+        "Recreated Distribution",
+        "token-recreated-first",
+        json!([ami_entry(REGION)]),
+        json!({ "description": "the first configuration", "tags": {"owner": "platform"} }),
+    );
+    let (status, created) = create(&router, &first).await;
+    assert_eq!(
+        status, 200,
+        "case \"the first create\": got {status} with {created}"
+    );
+    let (status, deleted) = delete(&router, &arn).await;
+    assert_deleted("the first configuration", status, &deleted, &arn);
+
+    let second = create_body(
+        "recreated_distribution",
+        "token-recreated-second",
+        json!([ami_entry(OTHER_REGION), ami_entry("eu-west-1")]),
+        json!({ "description": "the second configuration" }),
+    );
+    let (status, created) = create(&router, &second).await;
+    assert_eq!(
+        status, 200,
+        "case \"the create after the delete\": got {status} with {created}"
+    );
+    let stored = assert_stored(&router, "the recreated configuration", REGION, &arn).await;
+    for (member, expected) in round_tripped_members(&second) {
+        let reported = stored.get(&member).cloned().unwrap_or(Value::Null);
+        assert_eq!(
+            reported, expected,
+            "case \"the recreated configuration\": expected {member} to be {expected}, got \
+             {reported}"
+        );
+    }
+    // What this pins is that none of the DELETED configuration's tags survived under the
+    // name it carried, so the member is asserted as empty-or-absent rather than as one of
+    // the two forms that says the same thing.
+    let tags = stored.get("tags").cloned().unwrap_or(Value::Null);
+    let carried = tags
+        .as_object()
+        .map_or_else(|| tags.is_null(), |tags| tags.is_empty());
+    assert!(
+        carried,
+        "case \"the recreated configuration\": expected none of the deleted configuration's \
+         tags, got {tags}"
+    );
+}
+
+#[tokio::test]
+async fn an_arn_this_region_holds_nothing_under_is_not_deleted() {
+    let router = emulator();
+
+    // One configuration of the same name in each of two Regions, so a delete can be asked
+    // of a Region that does not hold the configuration its ARN names.
+    for (region, token) in [(REGION, "token-here"), (OTHER_REGION, "token-there")] {
+        let body = create_body(
+            "regional-distribution",
+            token,
+            json!([ami_entry(region)]),
+            json!({}),
+        );
+        let (status, created) = create_in(&router, region, &body).await;
+        assert_eq!(
+            status, 200,
+            "case \"the create in {region}\": got {status} with {created}"
+        );
+    }
+    let here = arn_of(REGION, "regional-distribution");
+    let there = arn_of(OTHER_REGION, "regional-distribution");
+
+    // (case, the Region the delete is signed for, the ARN it names)
+    let absent: Vec<(&str, &str, String)> = vec![
+        (
+            "an ARN nothing was created under",
+            REGION,
+            arn_of(REGION, "absent-distribution"),
+        ),
+        (
+            "a name that differs from a stored one",
+            REGION,
+            arn_of(REGION, "regional-distribution-2"),
+        ),
+        (
+            "another Region's stored configuration",
+            REGION,
+            there.clone(),
+        ),
+        (
+            "this Region's stored configuration, from another Region's endpoint",
+            OTHER_REGION,
+            here.clone(),
+        ),
+    ];
+
+    for (case, region, arn) in absent {
+        let (status, refused) = delete_in(&router, region, &arn).await;
+        assert_missing(case, status, &refused, &arn);
+    }
+
+    // None of those took anything out of the store: each configuration still reads back in
+    // the Region that stored it.
+    assert_stored(&router, "the configuration of this Region", REGION, &here).await;
+    assert_stored(
+        &router,
+        "the configuration of the other Region",
+        OTHER_REGION,
+        &there,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn a_configuration_a_pipeline_distributes_with_is_deleted_once_no_pipeline_reaches_it() {
+    let router = emulator();
+    let (recipe, infrastructure) = pipeline_prerequisites(&router).await;
+
+    let body = create_body(
+        "referenced-distribution",
+        "token-referenced",
+        json!([ami_entry(REGION)]),
+        json!({}),
+    );
+    let (status, created) = create(&router, &body).await;
+    assert_eq!(
+        status, 200,
+        "case \"create the referenced configuration\": got {status} with {created}"
+    );
+    let arn = arn_of(REGION, "referenced-distribution");
+
+    // TWO pipelines distribute with it, so the refusal stands while ANY reference does:
+    // what blocks the delete is that one still stands, not how many there are.
+    let mut pipelines: Vec<String> = Vec::new();
+    for n in 0..2 {
+        let body = json!({
+            "name": format!("referencing-pipeline-{n}"),
+            "clientToken": format!("token-referencing-pipeline-{n}"),
+            "imageRecipeArn": recipe,
+            "infrastructureConfigurationArn": infrastructure,
+            "distributionConfigurationArn": arn,
+        });
+        let (status, answer) =
+            call_in(&router, REGION, "PUT", "/CreateImagePipeline", Some(&body)).await;
+        assert_eq!(
+            status, 200,
+            "case \"create the pipeline {n}\": got {status} with {answer}"
+        );
+        pipelines.push(
+            answer
+                .get("imagePipelineArn")
+                .and_then(Value::as_str)
+                .expect("the pipeline's ARN")
+                .to_string(),
+        );
+    }
+
+    let standing = pipelines.len();
+    for (n, pipeline) in pipelines.iter().enumerate() {
+        let case = format!("{} pipelines still distribute with it", standing - n);
+        let (status, refused) = delete(&router, &arn).await;
+        assert_refused(&case, status, &refused, 400, "ResourceDependencyException");
+        let message = error_message(&case, &refused);
+        assert!(
+            message.contains(&arn),
+            "case {case:?}: expected the refusal to name {arn:?}, got {message:?}"
+        );
+        // The refused delete left the configuration in the store.
+        assert_stored(&router, &case, REGION, &arn).await;
+
+        let (status, deleted) = call_in(
+            &router,
+            REGION,
+            "DELETE",
+            &format!("/DeleteImagePipeline?imagePipelineArn={pipeline}"),
+            None,
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected HTTP 200 deleting the pipeline, got {status} with \
+             {deleted}"
+        );
+    }
+
+    // With no reference left, the delete removes the configuration and names what it
+    // removed, and every later read of that ARN reports it missing.
+    let (status, deleted) = delete(&router, &arn).await;
+    assert_deleted("no pipeline reaches it", status, &deleted, &arn);
+    let (status, read) = get(&router, &arn).await;
+    assert_missing("a read after the delete", status, &read, &arn);
 }
