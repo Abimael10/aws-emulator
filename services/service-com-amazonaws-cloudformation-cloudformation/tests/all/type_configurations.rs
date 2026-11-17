@@ -19,10 +19,23 @@
 //! identifies the configuration (by the type's ARN, by the configuration's own ARN, by kind
 //! and name).
 //!
-//! The recorded traces this suite was written for are one row of it: a Guard Hook activated
-//! with an execution role, configured under the alias `default`, and read back.
+//! The second rule, about WHICH publisher a request may name: **CloudFormation does not hold
+//! a request's `PublisherId` to the modelled third-party form — Amazon Web Services publishes
+//! its own Hooks under a publisher id that form does not admit, so an activation naming that
+//! publisher is served and the Hook is activated, configured and read back like any other —
+//! while every value outside the form is still refused, in the words and under the code the
+//! request boundary refuses a constrained member with.** Its rows differ along what that rule
+//! generalises over: the operation whose request names a publisher (`ActivateType`,
+//! `DescribeType`, `ListTypeVersions`, `DescribePublisher`, and the publisher `ListTypes`
+//! filters by, which is the member nested inside `Filters`), and the FORM of the value — the
+//! first-party id, ids at and inside both ends of the modelled form, one character short of
+//! it, one past its length, a character the form does not admit, and a non-ASCII one.
+//!
+//! The recorded traces this suite was written for are one row of each: a Guard Hook activated
+//! with an execution role, configured under the alias `default`, and read back; and that
+//! activation naming Amazon Web Services' own Hook publisher.
 
-use crate::harness::xml_blocks;
+use crate::harness::{xml_blocks, xml_unescape};
 use crate::stack_lifecycle::{call, member, router, xml_text};
 use service_com_amazonaws_cloudformation_cloudformation::state::registry;
 use smithy_server_runtime::MultiServiceRouter;
@@ -459,4 +472,343 @@ async fn a_type_arn_no_extension_answers_to_is_refused_as_not_found() {
         Some("TypeNotFoundException"),
         "expected the modelled not-found error, got {body}"
     );
+}
+
+/// Every Hook Amazon Web Services publishes to the public registry, read from the catalogue
+/// rather than listed here, so one published later is covered without editing this suite.
+fn amazon_published_hooks() -> Vec<&'static registry::PublishedExtension> {
+    registry::PUBLIC_EXTENSION_CATALOG
+        .iter()
+        .filter(|published| {
+            published.publisher_name == registry::AWS_PUBLISHER_NAME
+                && published.type_kind == registry::registry_type::HOOK
+        })
+        .collect()
+}
+
+/// The execution role an activation names, inside the modelled `RoleARN2` pattern
+/// `^arn:.+:iam::[0-9]{12}:role/.+$`.
+fn execution_role_arn() -> String {
+    format!("arn:aws:iam::{ACCOUNT_ID}:role/hook-execution")
+}
+
+#[tokio::test]
+async fn an_amazon_published_hook_activates_under_its_first_party_publisher_id() {
+    let published = amazon_published_hooks();
+    assert!(
+        !published.is_empty(),
+        "the public registry must publish at least one Hook of Amazon Web Services' own for a \
+         client to activate, got {:?}",
+        registry::PUBLIC_EXTENSION_CATALOG
+            .iter()
+            .map(|entry| entry.type_name)
+            .collect::<Vec<_>>()
+    );
+
+    // The rows: every such Hook, activated under its own name and under an alias — the two
+    // local names an activation can be addressed by.
+    for entry in published {
+        for alias in [None, Some("Local::Guard::Hook")] {
+            let case = format!(
+                "{} activated as {}",
+                entry.type_name,
+                alias.unwrap_or(entry.type_name)
+            );
+            // A fresh account per row, so each activation is the first one its registry saw.
+            let router = router();
+            let mut members = vec![
+                member("Type", entry.type_kind),
+                member("TypeName", entry.type_name),
+                member("PublisherId", registry::AWS_HOOKS_PUBLISHER_ID),
+                member("ExecutionRoleArn", &execution_role_arn()),
+            ];
+            if let Some(alias) = alias {
+                members.push(member("TypeNameAlias", alias));
+            }
+            let (code, body) = call(&router, "ActivateType", &members).await;
+            assert_eq!(
+                code, 200,
+                "case {case:?}: expected the activation to be served, got {code} {body}"
+            );
+            let activated_arn = xml_text(&body, "Arn").unwrap_or_default();
+            let local_name = alias.unwrap_or(entry.type_name);
+            let expected_arn = format!(
+                "arn:aws:cloudformation:{REGION}:{ACCOUNT_ID}:type/{}/{}",
+                entry.type_kind.to_ascii_lowercase(),
+                local_name.replace("::", "-")
+            );
+            assert_eq!(
+                activated_arn, expected_arn,
+                "case {case:?}: expected the ARN this account addresses the activation by, got \
+                 {activated_arn:?}"
+            );
+
+            // The activation is in this account and Region's registry, under the local name,
+            // naming the public extension it was made from.
+            let (code, described) =
+                call(&router, "DescribeType", &[member("Arn", &activated_arn)]).await;
+            assert_eq!(
+                code, 200,
+                "case {case:?}: expected DescribeType to answer for the activation, got {code} \
+                 {described}"
+            );
+            for (tag, expected) in [
+                ("TypeName", local_name),
+                ("IsActivated", "true"),
+                ("PublisherId", registry::AWS_HOOKS_PUBLISHER_ID),
+                ("OriginalTypeName", entry.type_name),
+            ] {
+                let actual = xml_text(&described, tag);
+                assert_eq!(
+                    actual.as_deref(),
+                    Some(expected),
+                    "case {case:?}: expected <{tag}> to be {expected:?}, got {actual:?} from \
+                     {described}"
+                );
+            }
+
+            // ...and it takes an account-level configuration and reads it back, which is what
+            // activating a Hook is for.
+            let (code, body) = call(
+                &router,
+                "SetTypeConfiguration",
+                &[
+                    member("TypeArn", &activated_arn),
+                    member("Configuration", HOOK_CONFIGURATION),
+                ],
+            )
+            .await;
+            assert_eq!(
+                code, 200,
+                "case {case:?}: expected the configuration of the activated Hook to be \
+                 persisted, got {code} {body}"
+            );
+            let configuration_arn = xml_text(&body, "ConfigurationArn").unwrap_or_default();
+            let (code, body) = call(
+                &router,
+                "BatchDescribeTypeConfigurations",
+                &[member(
+                    "TypeConfigurationIdentifiers.member.1.TypeConfigurationArn",
+                    &configuration_arn,
+                )],
+            )
+            .await;
+            assert_eq!(
+                code, 200,
+                "case {case:?}: expected the configuration read to answer, got {code} {body}"
+            );
+            let read = details(&body);
+            assert_eq!(
+                reported(&read, "Configuration"),
+                HOOK_CONFIGURATION,
+                "case {case:?}: expected the configuration that was set, got {read:?}"
+            );
+            assert_eq!(
+                reported(&read, "TypeArn"),
+                activated_arn,
+                "case {case:?}: expected the activated Hook's own ARN, got {read:?}"
+            );
+        }
+    }
+}
+
+/// The clause the request boundary states for a value outside a member's `@pattern`, and the
+/// one it states for a value past its `@length` maximum — the two requirements a publisher id
+/// can break, each naming the member path the walk spells.
+fn pattern_clause(path: &str, value: &str) -> String {
+    format!(
+        "Value '{value}' at '{path}' failed to satisfy constraint: Member must satisfy regular \
+         expression pattern: {}",
+        registry::PUBLISHER_ID_PATTERN
+    )
+}
+
+fn max_length_clause(path: &str, value: &str) -> String {
+    format!(
+        "Value '{value}' at '{path}' failed to satisfy constraint: Member must have length less \
+         than or equal to {}",
+        registry::PUBLISHER_ID_MAX_LEN
+    )
+}
+
+/// The envelope those clauses are stated in, as the boundary's own renderer builds it.
+fn validation_envelope(clauses: &[String]) -> String {
+    match clauses {
+        [one] => format!("1 validation error detected: {one}"),
+        many => format!(
+            "{} validation errors detected: {}",
+            many.len(),
+            many.join("; ")
+        ),
+    }
+}
+
+/// The members one operation's request carries to name `publisher_id`, with whatever else it
+/// needs to identify an extension at all.
+fn naming_the_publisher(
+    action: &str,
+    type_kind: &str,
+    type_name: &str,
+    publisher_id: &str,
+) -> Vec<(String, String)> {
+    match action {
+        "DescribePublisher" => vec![member("PublisherId", publisher_id)],
+        "ListTypes" => vec![
+            member("Visibility", registry::visibility::PUBLIC),
+            member("Filters.PublisherId", publisher_id),
+        ],
+        "ActivateType" => vec![
+            member("Type", type_kind),
+            member("TypeName", type_name),
+            member("PublisherId", publisher_id),
+            member("ExecutionRoleArn", &execution_role_arn()),
+        ],
+        _ => vec![
+            member("Type", type_kind),
+            member("TypeName", type_name),
+            member("PublisherId", publisher_id),
+        ],
+    }
+}
+
+#[tokio::test]
+async fn a_publisher_id_is_held_to_the_modelled_form_except_amazons_own() {
+    let hook = amazon_published_hooks()
+        .first()
+        .copied()
+        .expect("the public registry publishes a Hook of Amazon Web Services' own");
+
+    // The forms a publisher id can take: Amazon's own, ids at and inside both ends of the
+    // modelled form, one character short of it, one past its length, a character the form does
+    // not admit, and a non-ASCII one. `served` is a value CloudFormation answers for; the
+    // others carry the requirements their value breaks, in the order the boundary's walk
+    // reports them (length, then pattern).
+    struct Row {
+        case: &'static str,
+        publisher_id: String,
+        /// Which requirements the value breaks: `max_length` before `pattern`, as the
+        /// boundary states them; empty for a value the service serves.
+        max_length: bool,
+        pattern: bool,
+    }
+    let rows = vec![
+        Row {
+            case: "the publisher id Amazon Web Services' own Hooks are named by",
+            publisher_id: registry::AWS_HOOKS_PUBLISHER_ID.to_string(),
+            max_length: false,
+            pattern: false,
+        },
+        Row {
+            case: "an id inside the modelled form",
+            publisher_id: PUBLISHER_ID.to_string(),
+            max_length: false,
+            pattern: false,
+        },
+        Row {
+            case: "the shortest id the modelled form admits",
+            publisher_id: "a1b2c3d4e5f6".to_string(),
+            max_length: false,
+            pattern: false,
+        },
+        Row {
+            case: "the longest id the modelled form admits",
+            publisher_id: "a".repeat(registry::PUBLISHER_ID_MAX_LEN),
+            max_length: false,
+            pattern: false,
+        },
+        Row {
+            case: "one character short of the shortest the form admits",
+            publisher_id: "a1b2c3d4e5f".to_string(),
+            max_length: false,
+            pattern: true,
+        },
+        Row {
+            case: "one character past the longest the form admits",
+            publisher_id: "a".repeat(registry::PUBLISHER_ID_MAX_LEN + 1),
+            max_length: true,
+            pattern: true,
+        },
+        Row {
+            case: "a hyphen inside an id of the admitted length, which is not Amazon's own",
+            publisher_id: "a1b2c3-d4e5f6".to_string(),
+            max_length: false,
+            pattern: true,
+        },
+        Row {
+            case: "a non-ASCII letter inside an id of the admitted length",
+            publisher_id: "a1b2c3d4e5fé".to_string(),
+            max_length: false,
+            pattern: true,
+        },
+    ];
+
+    for action in [
+        "ActivateType",
+        "DescribeType",
+        "ListTypeVersions",
+        "DescribePublisher",
+        "ListTypes",
+    ] {
+        // The member path the clause names: the operation's own member, and the one nested
+        // inside the filters `ListTypes` narrows by.
+        let path = if action == "ListTypes" {
+            registry::FILTERS_PUBLISHER_ID_PATH
+        } else {
+            registry::PUBLISHER_ID_PATH
+        };
+        for row in &rows {
+            let case = format!("{action} with {}", row.case);
+            // A fresh account per row: an activation is a WRITE, and two rows activating the
+            // same Hook under two publishers would be the alias clash rather than this rule.
+            let router = router();
+            let members =
+                naming_the_publisher(action, hook.type_kind, hook.type_name, &row.publisher_id);
+            let (code, body) = call(&router, action, &members).await;
+            let mut clauses = Vec::new();
+            if row.max_length {
+                clauses.push(max_length_clause(path, &row.publisher_id));
+            }
+            if row.pattern {
+                clauses.push(pattern_clause(path, &row.publisher_id));
+            }
+            if clauses.is_empty() {
+                // A value the service serves is never answered with the boundary's refusal —
+                // an error class none of these operations even models. What it IS answered
+                // with is each operation's own business: the activation is performed, while a
+                // read of a publisher that published nothing here is the registry's own
+                // not-found.
+                assert_ne!(
+                    xml_text(&body, "Code").as_deref(),
+                    Some("ValidationError"),
+                    "case {case:?}: expected the value to be served rather than refused as \
+                     invalid, got {code} {body}"
+                );
+                if action == "ActivateType" {
+                    assert_eq!(
+                        code, 200,
+                        "case {case:?}: expected the activation to be performed, got {code} \
+                         {body}"
+                    );
+                }
+                continue;
+            }
+            assert_eq!(
+                code, 400,
+                "case {case:?}: expected the refusal of a value outside the modelled form, got \
+                 {code} {body}"
+            );
+            assert_eq!(
+                xml_text(&body, "Code").as_deref(),
+                Some("ValidationError"),
+                "case {case:?}: expected the code this service refuses a request with, got \
+                 {body}"
+            );
+            let message = xml_text(&body, "Message").map(|message| xml_unescape(&message));
+            assert_eq!(
+                message.as_deref(),
+                Some(validation_envelope(&clauses).as_str()),
+                "case {case:?}: expected the boundary's own sentence, got {message:?}"
+            );
+        }
+    }
 }

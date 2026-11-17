@@ -11,7 +11,16 @@ use super::*;
 
 smithy_macros::smithy_model!("smithy-model/com-amazonaws-cloudformation-cloudformation.json");
 
-#[smithy_macros::smithy(shape = "com.amazonaws.cloudformation#ListTypeVersionsInput")]
+// `skip_validation = ["PublisherId"]`: the same rule `ActivateTypeInput` records — the
+// modelled `PublisherId` form is the form of an id CloudFormation mints for a publisher that
+// registers, and the publisher id Amazon Web Services' own published extensions are named by
+// is outside it, so no member of this surface holds one to that form at the boundary. The
+// member is held to it in the handler instead
+// (`crate::state::registry::publisher_id_refusal`).
+#[smithy_macros::smithy(
+    shape = "com.amazonaws.cloudformation#ListTypeVersionsInput",
+    skip_validation = ["PublisherId"]
+)]
 #[derive(Debug, Clone, Default)]
 pub struct ListTypeVersionsInput {
     pub r#type: Option<String>,

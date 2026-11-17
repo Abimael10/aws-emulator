@@ -299,6 +299,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
+        // The publisher id the request names, held to the modelled `PublisherId` form — the
+        // one check of this request the BOUNDARY does not make (see this input's declaration
+        // in `crate::ops::types`), because the publisher of Amazon Web Services' own
+        // published extensions is named by an id outside that form. Stated first, exactly as
+        // the boundary's refusal of any other member of this request comes first.
+        if let Some(publisher_id) = input.publisher_id.as_deref() {
+            if let Some(message) = crate::state::registry::publisher_id_refusal(
+                crate::state::registry::PUBLISHER_ID_PATH,
+                publisher_id,
+            ) {
+                return Err(crate::scaffolded::Scaffolded::validation_error(message));
+            }
+        }
         // Which extension the request identifies. A combination of members that identifies
         // none is refused with the registry's own modelled 400 before any state is touched.
         let identifier = read_request(&input).map_err(registry_exception)?;

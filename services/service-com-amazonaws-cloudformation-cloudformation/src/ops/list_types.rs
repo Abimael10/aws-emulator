@@ -433,6 +433,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
+        // The publisher id this listing is narrowed by, held to the modelled `PublisherId`
+        // form — the one check of this request the BOUNDARY does not make (see
+        // `TypeFilters`' declaration in `crate::ops::types`), because the publisher of
+        // Amazon Web Services' own published extensions is named by an id outside that form.
+        // Stated first, exactly as the boundary's refusal of any other member of this
+        // request comes first.
+        if let Some(publisher_id) = input
+            .filters
+            .as_ref()
+            .and_then(|filters| filters.publisher_id.as_deref())
+        {
+            if let Some(message) = registry::publisher_id_refusal(
+                registry::FILTERS_PUBLISHER_ID_PATH,
+                publisher_id,
+            ) {
+                return Err(crate::scaffolded::Scaffolded::validation_error(message));
+            }
+        }
         let Some(state) = crate::state::service_state(&*self.engine) else {
             // Not the shared in-memory engine: there is no registry to list, so this
             // answers 501 rather than an empty, truthful-looking list.

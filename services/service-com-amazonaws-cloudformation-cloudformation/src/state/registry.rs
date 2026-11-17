@@ -1632,7 +1632,7 @@ pub const PUBLIC_EXTENSION_CATALOG: &[PublishedExtension] = &[
 ];
 
 /// The public name of the publisher Amazon Web Services publishes its own extensions under.
-const AWS_PUBLISHER_NAME: &str = "Amazon Web Services";
+pub const AWS_PUBLISHER_NAME: &str = "Amazon Web Services";
 
 /// What this registry knows about the publisher an extension of
 /// [`PUBLIC_EXTENSION_CATALOG`] was published by, beyond the id the record carries.
@@ -1680,6 +1680,117 @@ pub fn published_publisher(publisher_id: &str) -> Option<CatalogPublisher> {
 /// same form [`crate::state::new_publisher_id`] mints for a registration.
 pub fn published_publisher_id(publisher_name: &str) -> String {
     crate::state::stable_identifier_digits(publisher_name, 32)
+}
+
+/// The publisher id Amazon Web Services' own published Hook extensions are named by, which is
+/// what a client activating one of them puts in `PublisherId`.
+///
+/// It is not an id CloudFormation MINTED for a publisher that registered
+/// ([`crate::state::new_publisher_id`]): no registration assigned it — "extensions published
+/// by Amazon aren't assigned a publisher ID" (`ListTypeVersionsInput$PublisherId`) — so it is
+/// outside the form the modelled `PublisherId` states for a registered publisher's id: it is
+/// shorter than twelve characters and carries a character that form does not admit.
+/// CloudFormation SERVES a request naming it, which is why no member of this service's surface
+/// holds a publisher id to that form at the request boundary (see [`publisher_id_refusal`]).
+pub const AWS_HOOKS_PUBLISHER_ID: &str = "aws-hooks";
+
+/// Every publisher id Amazon Web Services' OWN public extensions are named by, which this
+/// service serves whatever the modelled form says — one entry per such id.
+pub const FIRST_PARTY_PUBLISHER_IDS: &[&str] = &[AWS_HOOKS_PUBLISHER_ID];
+
+/// Whether `publisher_id` names Amazon Web Services as the publisher of its own public
+/// extensions, rather than a publisher that registered with CloudFormation.
+pub fn is_first_party_publisher_id(publisher_id: &str) -> bool {
+    FIRST_PARTY_PUBLISHER_IDS.contains(&publisher_id)
+}
+
+/// The form the modelled `PublisherId` states for the id of a publisher that REGISTERED with
+/// CloudFormation: `@pattern("^[0-9a-zA-Z]{12,40}$")` within `@length(1..40)`
+/// (`smithy_query(query="shape", shape="PublisherId")`), which is also the form
+/// [`crate::state::new_publisher_id`] mints one in.
+pub const PUBLISHER_ID_PATTERN: &str = "^[0-9a-zA-Z]{12,40}$";
+/// `PublisherId`'s modelled `@length` minimum.
+pub const PUBLISHER_ID_MIN_LEN: usize = 1;
+/// `PublisherId`'s modelled `@length` maximum.
+pub const PUBLISHER_ID_MAX_LEN: usize = 40;
+/// The shortest id [`PUBLISHER_ID_PATTERN`] admits.
+const PUBLISHER_ID_PATTERN_MIN_LEN: usize = 12;
+/// The longest id [`PUBLISHER_ID_PATTERN`] admits.
+const PUBLISHER_ID_PATTERN_MAX_LEN: usize = 40;
+
+/// How much of a refused value one clause echoes back.
+///
+/// A publisher id is a value the CALLER sizes, and the clause interpolates it, so a value
+/// echoed whole would turn a short request into an arbitrarily long response. The request
+/// boundary bounds the echo for exactly that reason, and a clause stated here is bounded the
+/// same way.
+const ECHOED_VALUE_MAX_LEN: usize = 256;
+
+/// The lowerCamel member path a clause about an operation's own `PublisherId` names, which is
+/// how the boundary's walk spells that member.
+pub const PUBLISHER_ID_PATH: &str = "publisherId";
+
+/// The same path for the `PublisherId` of `ListTypes`' filters, which the walk spells with the
+/// member it is nested under.
+pub const FILTERS_PUBLISHER_ID_PATH: &str = "filters.publisherId";
+
+/// `Some(message)` for a `PublisherId` this service refuses, `None` for one it serves.
+///
+/// The publisher id of an extension Amazon Web Services published is served whatever its form
+/// ([`is_first_party_publisher_id`]); every other value is held to the modelled form
+/// ([`PUBLISHER_ID_PATTERN`] within the member's `@length`), which is the check the request
+/// boundary makes for every member the model constrains. The message is the SENTENCE that
+/// boundary states — built through the framework's own envelope over the same structural
+/// violations, in the same order the validating walk reports them (its length clause, then its
+/// pattern clause) — so a value this service refuses is refused in exactly the words, and
+/// under exactly the code, every other refused value of the request is.
+pub fn publisher_id_refusal(member_path: &str, publisher_id: &str) -> Option<String> {
+    use ::aws_smithy_schema_server::constraints::{Violation, ViolationKind};
+
+    if is_first_party_publisher_id(publisher_id) {
+        return None;
+    }
+    let length = publisher_id.chars().count();
+    let echoed = echoed_value(publisher_id);
+    let clause = |kind: ViolationKind| Violation {
+        path: member_path.to_string(),
+        kind,
+        value: Some(echoed.clone()),
+        sensitive: false,
+    };
+    let mut violations = Vec::new();
+    if length < PUBLISHER_ID_MIN_LEN {
+        violations.push(clause(ViolationKind::MinLength(PUBLISHER_ID_MIN_LEN as i64)));
+    } else if length > PUBLISHER_ID_MAX_LEN {
+        violations.push(clause(ViolationKind::MaxLength(PUBLISHER_ID_MAX_LEN as i64)));
+    }
+    if !is_modelled_publisher_id(publisher_id) {
+        violations.push(clause(ViolationKind::Pattern(
+            PUBLISHER_ID_PATTERN.to_string(),
+        )));
+    }
+    ::aws_smithy_schema_server::constraints::envelope(&violations)
+}
+
+/// Whether `publisher_id` is in the form [`PUBLISHER_ID_PATTERN`] states: twelve to forty
+/// characters, each a digit or an ASCII letter.
+fn is_modelled_publisher_id(publisher_id: &str) -> bool {
+    let length = publisher_id.chars().count();
+    (PUBLISHER_ID_PATTERN_MIN_LEN..=PUBLISHER_ID_PATTERN_MAX_LEN).contains(&length)
+        && publisher_id.chars().all(|c| c.is_ascii_alphanumeric())
+}
+
+/// A caller's value as a clause echoes it: itself when short, and a prefix with the length it
+/// was when not — cut on a character boundary, so the echo is never half a codepoint.
+fn echoed_value(value: &str) -> String {
+    if value.len() <= ECHOED_VALUE_MAX_LEN {
+        return value.to_string();
+    }
+    let mut end = ECHOED_VALUE_MAX_LEN;
+    while end > 0 && !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}... [{} bytes]", &value[..end], value.len())
 }
 
 /// The record a catalogued public extension ([`PUBLIC_EXTENSION_CATALOG`]) is reported as.

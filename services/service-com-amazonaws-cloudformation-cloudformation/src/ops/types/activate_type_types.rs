@@ -11,7 +11,21 @@ use super::*;
 
 smithy_macros::smithy_model!("smithy-model/com-amazonaws-cloudformation-cloudformation.json");
 
-#[smithy_macros::smithy(shape = "com.amazonaws.cloudformation#ActivateTypeInput")]
+// `skip_validation = ["PublisherId"]`: CloudFormation does not hold a request's publisher id
+// to the modelled `PublisherId` form at the boundary. That form
+// (`@pattern("^[0-9a-zA-Z]{12,40}$")` within `@length(1..40)`) is the form of an id
+// CloudFormation MINTS for a publisher that registers, while the publisher id Amazon Web
+// Services' own published extensions are named by is outside it
+// (`crate::state::registry::AWS_HOOKS_PUBLISHER_ID`) — and an activation naming that publisher
+// is served, so refusing it here would make the whole Amazon-published Hook surface
+// unreachable, under an error class this operation does not even model. The member is held to
+// the modelled form in the handler instead, in the boundary's own words
+// (`crate::state::registry::publisher_id_refusal`), which is the only place that can tell the
+// one publisher from the other.
+#[smithy_macros::smithy(
+    shape = "com.amazonaws.cloudformation#ActivateTypeInput",
+    skip_validation = ["PublisherId"]
+)]
 #[derive(Debug, Clone, Default)]
 pub struct ActivateTypeInput {
     pub r#type: Option<String>,

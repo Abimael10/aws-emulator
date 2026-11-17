@@ -208,6 +208,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
+        // The publisher id the request names, held to the modelled `PublisherId` form — the
+        // one check of this request the BOUNDARY does not make (see this input's declaration
+        // in `crate::ops::types`), because the publisher of Amazon Web Services' own
+        // published extensions is named by an id outside that form and an activation naming
+        // it is served. Stated in the boundary's own words, and first, exactly as the
+        // boundary's refusal of any other member of this request comes first.
+        if let Some(publisher_id) = input.publisher_id.as_deref() {
+            if let Some(message) =
+                registry::publisher_id_refusal(registry::PUBLISHER_ID_PATH, publisher_id)
+            {
+                return Err(crate::scaffolded::Scaffolded::validation_error(message));
+            }
+        }
         // What the request names, and the rules the model states in prose rather than in a
         // constraint. Refused before any state is touched.
         let named = PublicExtension::read(&input).map_err(registry_exception)?;
