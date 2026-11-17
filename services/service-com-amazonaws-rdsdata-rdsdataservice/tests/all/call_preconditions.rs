@@ -21,7 +21,11 @@
 //! * every operation is authorized against `rds-data:<OperationName>` on the cluster and
 //!   against `secretsmanager:GetSecretValue` on the secret it authenticates with, before it
 //!   resolves anything, so an identity no policy grants either is refused 403
-//!   ([`every_operation_is_authorized_against_the_cluster_first`]).
+//!   ([`every_operation_is_authorized_against_the_cluster_first`]);
+//! * the cluster the call addresses is decided BEFORE the transaction the call names, so a
+//!   call on a cluster that serves no Data API is the endpoint refusal whatever its
+//!   `transactionId` is — and the transaction it named is still running afterwards
+//!   ([`the_cluster_is_decided_before_the_transaction_the_call_names`]).
 //!
 //! Every resource a case needs is created through its OWNER's own operations — the
 //! cluster with `rds:CreateDBCluster`, the secret with `secretsmanager:CreateSecret` (or
@@ -31,9 +35,12 @@
 //! store.
 
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
+
+use crate::sql_data_api::a_sibling_id;
 
 /// The Region every call below is signed for, and the Region every resource lives in.
 const REGION: &str = "us-east-1";
@@ -1007,5 +1014,399 @@ async fn every_operation_is_authorized_against_the_cluster_first() {
         served["records"],
         json!([[{"longValue": 1}]]),
         "case the account's own credential: expected the call served, got {served}"
+    );
+}
+
+/// The modelled maximum length of `transactionId`: the member targets `Id`, which carries
+/// `@length(max: 192)` (`smithy_query(query="shape",shape="Id")`).
+const MAX_TRANSACTION_ID_LENGTH: usize = 192;
+
+/// The `transactionStatus` a commit reports.
+const COMMITTED_STATUS: &str = "Transaction Committed";
+
+/// The status an Amazon RDS DB cluster is in when a change to its configuration may be
+/// applied to it.
+const CLUSTER_AVAILABLE: &str = "available";
+
+/// How long [`when_available`] waits for the RDS control plane's own clock to settle a
+/// cluster, and how long it waits between reads. Generous, because what the loop waits for
+/// is the CONDITION the control plane settles into and not a duration.
+const SETTLE_DEADLINE: Duration = Duration::from_secs(60);
+const SETTLE_POLL: Duration = Duration::from_millis(25);
+
+/// Read the cluster through `rds:DescribeDBClusters` until the control plane has settled it
+/// to `available`, which is the state a change to its configuration may be applied in.
+async fn when_available(cloud: &Cloud, identifier: &str) {
+    let deadline = Instant::now() + SETTLE_DEADLINE;
+    loop {
+        let described = cloud
+            .rds()
+            .describe_db_clusters()
+            .db_cluster_identifier(identifier)
+            .send()
+            .await
+            .unwrap_or_else(|error| {
+                panic!(
+                    "DescribeDBClusters {identifier} must be served: {}",
+                    aws_smithy_types::error::display::DisplayErrorContext(&error)
+                )
+            });
+        let status = described
+            .db_clusters()
+            .first()
+            .and_then(aws_sdk_rds::types::DbCluster::status)
+            .unwrap_or_default()
+            .to_string();
+        if status == CLUSTER_AVAILABLE {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "case {identifier}: expected the cluster to settle to {CLUSTER_AVAILABLE}, \
+             got {status:?}"
+        );
+        tokio::time::sleep(SETTLE_POLL).await;
+    }
+}
+
+/// Turn the cluster's Data API HTTP endpoint on or off through the Amazon RDS operations
+/// that OWN that setting, waiting first for the control plane to settle the cluster into
+/// the state a change to its configuration may be applied in.
+async fn set_http_endpoint(cloud: &Cloud, identifier: &str, resource_arn: &str, enabled: bool) {
+    when_available(cloud, identifier).await;
+    let answered = if enabled {
+        cloud
+            .rds()
+            .enable_http_endpoint()
+            .resource_arn(resource_arn)
+            .send()
+            .await
+            .map(|answer| answer.http_endpoint_enabled())
+            .map_err(|error| {
+                aws_smithy_types::error::display::DisplayErrorContext(&error).to_string()
+            })
+    } else {
+        cloud
+            .rds()
+            .disable_http_endpoint()
+            .resource_arn(resource_arn)
+            .send()
+            .await
+            .map(|answer| answer.http_endpoint_enabled())
+            .map_err(|error| {
+                aws_smithy_types::error::display::DisplayErrorContext(&error).to_string()
+            })
+    };
+    let reported = answered.unwrap_or_else(|rendered| {
+        panic!("the endpoint toggle of {identifier} must be served: {rendered}")
+    });
+    assert_eq!(
+        reported,
+        Some(enabled),
+        "case setting the endpoint of {identifier} to {enabled}: expected the toggle to \
+         report the setting it wrote, got {reported:?}"
+    );
+}
+
+/// Open a transaction on `resource_arn` and answer the id it was issued.
+async fn begin_transaction(cloud: &Cloud, resource_arn: &str, secret_arn: &str) -> String {
+    let (status, body) = cloud
+        .call_as(
+            ACCOUNT_KEY_ID,
+            "/BeginTransaction",
+            json!({
+                "resourceArn": resource_arn,
+                "secretArn": secret_arn,
+                "database": DATABASE,
+            }),
+        )
+        .await;
+    assert_eq!(
+        status, 200,
+        "case opening a transaction on {resource_arn}: expected the call served, got {body}"
+    );
+    body["transactionId"]
+        .as_str()
+        .unwrap_or_else(|| panic!("an opened transaction carries its id: {body}"))
+        .to_string()
+}
+
+/// The members of one call that names a transaction, for every operation that takes one.
+fn calls_naming_a_transaction(
+    resource_arn: &str,
+    secret_arn: &str,
+    transaction_id: &str,
+) -> Vec<(&'static str, &'static str, Value)> {
+    vec![
+        (
+            "ExecuteStatement",
+            "/Execute",
+            json!({
+                "resourceArn": resource_arn,
+                "secretArn": secret_arn,
+                "transactionId": transaction_id,
+                "sql": "INSERT INTO notes (id) VALUES (91)",
+            }),
+        ),
+        (
+            "BatchExecuteStatement",
+            "/BatchExecute",
+            json!({
+                "resourceArn": resource_arn,
+                "secretArn": secret_arn,
+                "transactionId": transaction_id,
+                "sql": "INSERT INTO notes (id) VALUES (92)",
+            }),
+        ),
+        (
+            "CommitTransaction",
+            "/CommitTransaction",
+            json!({
+                "resourceArn": resource_arn,
+                "secretArn": secret_arn,
+                "transactionId": transaction_id,
+            }),
+        ),
+        (
+            "RollbackTransaction",
+            "/RollbackTransaction",
+            json!({
+                "resourceArn": resource_arn,
+                "secretArn": secret_arn,
+                "transactionId": transaction_id,
+            }),
+        ),
+    ]
+}
+
+/// One row of [`the_cluster_is_decided_before_the_transaction_the_call_names`]: the case,
+/// the `transactionId` the call carries, and the status and class the TRANSACTION leg
+/// answers that id with once the envelope admits the call — `None` for the id a
+/// transaction is running under, which commits instead.
+type TransactionIdRow = (&'static str, String, Option<(u16, &'static str)>);
+
+/// RULE: the resource envelope of a Data API call — the `resourceArn` it addresses and
+/// whether that cluster's Data API HTTP endpoint is turned on — is resolved BEFORE the
+/// `transactionId` the call carries is looked up, so a call on a cluster that serves no
+/// Data API is answered HTTP 400 `HttpEndpointNotEnabledException` naming that ARN whatever
+/// its transaction id is, on every operation that takes one; and because the refusal is
+/// decided ahead of the transaction store, it resolves nothing and changes nothing, so the
+/// transaction the refused calls named is still running once the endpoint is back on.
+///
+/// The rows differ along the CLASS of `transactionId` the call carries — which is what the
+/// transaction leg would otherwise answer differently: an id a transaction of that very
+/// cluster is running under (which would be SERVED), an id a previous call ended and an id
+/// of the same class nothing was ever opened under (the lookup's own 404), and the ids no
+/// cluster could have issued or that another cluster issued (the request's own validation
+/// fault). With the endpoint back on, each class draws that other answer, which is what
+/// says the 400s above came from the envelope and not from the id.
+#[tokio::test]
+async fn the_cluster_is_decided_before_the_transaction_the_call_names() {
+    let cloud = Cloud::new();
+    let (cluster, secret) = cloud.create_cluster("transaction-envelope", true).await;
+    let (elsewhere, elsewhere_secret) = cloud.create_cluster("another-serving-cluster", true).await;
+
+    // The table the calls below write into, so a refusal that reached the store would be
+    // visible afterwards as a row.
+    cloud
+        .run(json!({
+            "resourceArn": cluster,
+            "secretArn": secret,
+            "database": DATABASE,
+            "sql": "CREATE TABLE notes (id INT PRIMARY KEY)",
+        }))
+        .await;
+
+    // A transaction of this cluster that is RUNNING, with a write of its own in it.
+    let running = begin_transaction(&cloud, &cluster, &secret).await;
+    let (status, body) = cloud
+        .call_as(
+            ACCOUNT_KEY_ID,
+            "/Execute",
+            json!({
+                "resourceArn": cluster,
+                "secretArn": secret,
+                "transactionId": running,
+                "sql": "INSERT INTO notes (id) VALUES (1)",
+            }),
+        )
+        .await;
+    assert_eq!(
+        status, 200,
+        "case the transaction's own write: expected the call served, got {status} {body}"
+    );
+    // A transaction of this cluster a previous call ENDED, an id of the same class nothing
+    // was ever opened under, and one another cluster issued.
+    let ended = begin_transaction(&cloud, &cluster, &secret).await;
+    let (status, body) = cloud
+        .call_as(
+            ACCOUNT_KEY_ID,
+            "/RollbackTransaction",
+            json!({
+                "resourceArn": cluster,
+                "secretArn": secret,
+                "transactionId": ended,
+            }),
+        )
+        .await;
+    assert_eq!(
+        status, 200,
+        "case ending a transaction: expected the rollback served, got {status} {body}"
+    );
+    let never_opened = a_sibling_id(&running);
+    let another_clusters = begin_transaction(&cloud, &elsewhere, &elsewhere_secret).await;
+
+    // (case, the id the call carries, what the TRANSACTION leg answers that id with once
+    // the envelope admits the call: `None` for the running transaction, which commits)
+    let ids: Vec<TransactionIdRow> = vec![
+        (
+            "an id a transaction of this cluster is running under",
+            running.clone(),
+            None,
+        ),
+        (
+            "an id a previous call ended",
+            ended,
+            Some((404, "TransactionNotFoundException")),
+        ),
+        (
+            "an id of the same class nothing was opened under",
+            never_opened,
+            Some((404, "TransactionNotFoundException")),
+        ),
+        (
+            "an id that is empty",
+            String::new(),
+            Some((400, "ValidationException")),
+        ),
+        (
+            "a string that is no transaction id",
+            "no-such-transaction-id".to_string(),
+            Some((400, "ValidationException")),
+        ),
+        (
+            "the longest id the model allows",
+            "a".repeat(MAX_TRANSACTION_ID_LENGTH),
+            Some((400, "ValidationException")),
+        ),
+        (
+            "an id another cluster issued",
+            another_clusters,
+            Some((400, "ValidationException")),
+        ),
+    ];
+
+    // The endpoint goes off UNDER the running transaction, through the Amazon RDS operation
+    // that owns the setting.
+    set_http_endpoint(&cloud, "transaction-envelope", &cluster, false).await;
+
+    for (case, transaction_id, _) in &ids {
+        for (operation, path, members) in calls_naming_a_transaction(&cluster, &secret, transaction_id)
+        {
+            let (status, body) = cloud.call_as(ACCOUNT_KEY_ID, path, members).await;
+            assert_eq!(
+                status, 400,
+                "case {case} on {operation}: expected HTTP 400, got {status} {body}"
+            );
+            assert_eq!(
+                error_code(&body),
+                "HttpEndpointNotEnabledException",
+                "case {case} on {operation}: expected HttpEndpointNotEnabledException, got {body}"
+            );
+            assert_eq!(
+                message(&body),
+                endpoint_refusal(&cluster),
+                "case {case} on {operation}: expected the refusal to name the ARN the request \
+                 carried, got {body}"
+            );
+        }
+    }
+
+    // The answer is a fact about the cluster's configuration, so the identical call
+    // repeated is answered identically rather than drifting onto the transaction's class.
+    let commit = json!({
+        "resourceArn": cluster,
+        "secretArn": secret,
+        "transactionId": running,
+    });
+    let first = cloud
+        .call_as(ACCOUNT_KEY_ID, "/CommitTransaction", commit.clone())
+        .await;
+    let again = cloud
+        .call_as(ACCOUNT_KEY_ID, "/CommitTransaction", commit)
+        .await;
+    assert_eq!(
+        first, again,
+        "case the same commit repeated: expected the same answer twice, got {first:?} then \
+         {again:?}"
+    );
+
+    // With the endpoint back on, every id class draws the answer its OWN leg gives it, so
+    // the refusals above were the envelope's and not the id's.
+    set_http_endpoint(&cloud, "transaction-envelope", &cluster, true).await;
+    for (case, transaction_id, expected) in &ids {
+        let Some((expected_status, expected_code)) = expected else {
+            continue;
+        };
+        let (status, body) = cloud
+            .call_as(
+                ACCOUNT_KEY_ID,
+                "/CommitTransaction",
+                json!({
+                    "resourceArn": cluster,
+                    "secretArn": secret,
+                    "transactionId": transaction_id,
+                }),
+            )
+            .await;
+        assert_eq!(
+            status, *expected_status,
+            "case {case} with the endpoint back on: expected HTTP {expected_status}, got \
+             {status} {body}"
+        );
+        assert_eq!(
+            error_code(&body),
+            *expected_code,
+            "case {case} with the endpoint back on: expected {expected_code}, got {body}"
+        );
+    }
+
+    // Not one of the refused calls reached the transaction store: the transaction they all
+    // named is still running, so its commit is served and its own row — the only one — is
+    // the committed database's.
+    let (status, body) = cloud
+        .call_as(
+            ACCOUNT_KEY_ID,
+            "/CommitTransaction",
+            json!({
+                "resourceArn": cluster,
+                "secretArn": secret,
+                "transactionId": running,
+            }),
+        )
+        .await;
+    assert_eq!(
+        status, 200,
+        "case the running transaction after every refusal: expected the commit served, got \
+         {status} {body}"
+    );
+    assert_eq!(
+        body["transactionStatus"],
+        json!(COMMITTED_STATUS),
+        "case the running transaction after every refusal: expected the commit's status, got \
+         {body}"
+    );
+    let counted = cloud
+        .run(json!({
+            "resourceArn": cluster,
+            "secretArn": secret,
+            "database": DATABASE,
+            "sql": "SELECT count(*) AS rows FROM notes",
+        }))
+        .await;
+    assert_eq!(
+        counted["records"],
+        json!([[{"longValue": 1}]]),
+        "case after the commit: expected only the transaction's own row, got {counted}"
     );
 }
