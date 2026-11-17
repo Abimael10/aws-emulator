@@ -92,7 +92,6 @@ impl Seeded {
             status_reason: None,
             provenance: Vec::new(),
             custom_metadata: None,
-            custom_metadata_schema_compliance_status: None,
             created_by: None,
             created_by_auto_detection: None,
             created_at,

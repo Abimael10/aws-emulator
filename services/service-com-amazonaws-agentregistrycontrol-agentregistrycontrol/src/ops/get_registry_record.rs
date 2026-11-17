@@ -199,56 +199,82 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
-        let mut state = state.lock();
-        state.materialise_due_transitions();
+        // Everything that reads the store happens inside this block, so the guard is
+        // released at its end: the compliance verdict below is caller-driven work (a schema
+        // the caller stored, applied to metadata the caller stored) and runs neither under
+        // this service's lock nor on the worker serving this request.
+        let (schema_configuration, answer) = {
+            let mut state = state.lock();
+            state.materialise_due_transitions();
 
-        let registry_id = crate::state::identifier_to_id(&input.registry_id);
-        let record_id = crate::state::identifier_to_id(&input.record_id);
-        let Some(registry) = state.registries.get(registry_id) else {
-            // The identifier is stated back exactly as the request supplied it: the label
-            // admits the bare id or the full ARN, and the one that resolved to nothing is
-            // the one the caller sent.
-            return Err(GetRegistryRecordErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: Some(crate::state::registry_not_found_message(
-                        &input.registry_id,
-                    )),
+            let registry_id = crate::state::identifier_to_id(&input.registry_id);
+            let record_id = crate::state::identifier_to_id(&input.record_id);
+            let Some(registry) = state.registries.get(registry_id) else {
+                // The identifier is stated back exactly as the request supplied it: the
+                // label admits the bare id or the full ARN, and the one that resolved to
+                // nothing is the one the caller sent.
+                return Err(GetRegistryRecordErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(crate::state::registry_not_found_message(
+                            &input.registry_id,
+                        )),
+                    },
+                )
+                .into());
+            };
+            let Some(record) = registry.records.get(record_id) else {
+                return Err(GetRegistryRecordErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(crate::state::record_not_found_message(record_id)),
+                    },
+                )
+                .into());
+            };
+
+            (
+                registry.custom_metadata_schema_configuration.clone(),
+                GetRegistryRecordOutput {
+                    registry_arn: record.registry_arn.clone(),
+                    record_arn: record.record_arn.clone(),
+                    record_id: record.record_id.clone(),
+                    name: record.name.clone(),
+                    display_name: record.display_name.clone(),
+                    description: record.description.clone(),
+                    record_type: record.record_type.clone(),
+                    descriptors: record.descriptors.clone(),
+                    record_version: Some(record.record_version.clone()),
+                    status: record.status.clone(),
+                    created_at: record.created_at,
+                    updated_at: record.updated_at,
+                    status_reason: record.status_reason.clone(),
+                    // An empty provenance list is reported as absent rather than as an empty
+                    // list: the member is only populated for records with a lineage.
+                    provenance: (!record.provenance.is_empty())
+                        .then(|| record.provenance.clone()),
+                    created_by_auto_detection: record.created_by_auto_detection,
+                    created_by: record.created_by.clone(),
+                    custom_metadata: record.custom_metadata.clone(),
+                    // Filled in below, from the registry's schema as it stands now.
+                    custom_metadata_schema_compliance_status: None,
                 },
             )
-            .into());
-        };
-        let Some(record) = registry.records.get(record_id) else {
-            return Err(GetRegistryRecordErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: Some(crate::state::record_not_found_message(record_id)),
-                },
-            )
-            .into());
         };
 
+        // The verdict the registry's schema gives the stored metadata AS THE SCHEMA STANDS
+        // NOW, so a record whose metadata an updated schema no longer admits reads back
+        // `NON_COMPLIANT` without anything having been written to it. Derived, so reporting
+        // it changes nothing a later caller sees.
+        let verdict = crate::state::custom_metadata_verdict_of(
+            schema_configuration,
+            &answer.record_type,
+            answer.custom_metadata.as_ref(),
+        )
+        .await;
         Ok(GetRegistryRecordOutput {
-            registry_arn: record.registry_arn.clone(),
-            record_arn: record.record_arn.clone(),
-            record_id: record.record_id.clone(),
-            name: record.name.clone(),
-            display_name: record.display_name.clone(),
-            description: record.description.clone(),
-            record_type: record.record_type.clone(),
-            descriptors: record.descriptors.clone(),
-            record_version: Some(record.record_version.clone()),
-            status: record.status.clone(),
-            created_at: record.created_at,
-            updated_at: record.updated_at,
-            status_reason: record.status_reason.clone(),
-            // An empty provenance list is reported as absent rather than as an empty
-            // list: the member is only populated for records with a lineage.
-            provenance: (!record.provenance.is_empty()).then(|| record.provenance.clone()),
-            created_by_auto_detection: record.created_by_auto_detection,
-            created_by: record.created_by.clone(),
-            custom_metadata: record.custom_metadata.clone(),
-            custom_metadata_schema_compliance_status: record
-                .custom_metadata_schema_compliance_status
-                .clone(),
+            custom_metadata_schema_compliance_status: crate::state::custom_metadata_status_of(
+                &verdict,
+            ),
+            ..answer
         })
     }
 }

@@ -18,12 +18,27 @@ use crate::ops::types::{
     Descriptors, DiscoveryConfiguration, EncryptionConfiguration, Provenance,
 };
 
+mod custom_metadata;
 mod descriptor_payload;
 
 /// The refusal message for a descriptor payload that is not the JSON a descriptor's content
 /// is serialized as, or `None` when every payload of the set parses. The ONE check a record
 /// write runs its descriptors through, so a create and an edit admit the same payloads.
 pub use descriptor_payload::refusal as descriptor_payload_refusal;
+
+/// Whether a record's custom metadata satisfies the schema its registry carries, the
+/// compliance verdict a read reports for it, and how a write of metadata that does not
+/// satisfy it is refused. A handler reads the registry's configuration out of the store,
+/// releases it, and then asks for the verdict: the evaluation is caller-driven work, so it
+/// runs neither under this service's lock nor on the worker serving the request. See
+/// [`custom_metadata`].
+pub use custom_metadata::{
+    page_compliance_statuses as page_custom_metadata_compliance_statuses,
+    refusal_of as custom_metadata_refusal_of, status_of as custom_metadata_status_of,
+    validation_failure_message as custom_metadata_validation_failure_message,
+    verdict_of as custom_metadata_verdict_of, SchemaEvaluation, SchemaVerdict, COMPLIANT,
+    NON_COMPLIANT,
+};
 
 /// The region used for an ARN when the request carries no usable SigV4 credential
 /// scope (an unsigned request). Every emulator defaults to `us-east-1`.
@@ -319,6 +334,53 @@ pub fn terminal_record_status_message(status: &str) -> String {
     format!("Cannot update registry record in {status} status (terminal state)")
 }
 
+/// The `RegistryAuthorizerType` a registry whose creation named none is authorized under —
+/// the type that controls "how consumers access the registry's search and MCP invoke
+/// operations".
+///
+/// The catalogue is `crate::ops::types::REGISTRY_AUTHORIZER_TYPE_VALUES`, and of its two
+/// values this is the one a registry needs nothing else for: `CUSTOM_JWT` is the one whose
+/// `authorizerConfiguration` is "required when authorizerType is CUSTOM_JWT", which a
+/// request that named no discovery configuration at all did not supply. So a registry
+/// created without one is reached under the account's own IAM authorization, which is how
+/// every request to this service is authorized to begin with.
+pub const DEFAULT_REGISTRY_AUTHORIZER_TYPE: &str = "AWS_IAM";
+
+/// The discovery configuration a registry is created with: the one the request named, with
+/// the service's own default filled in for what it left out.
+///
+/// A registry HAS a discovery configuration whether or not the create named one — a consumer
+/// of the registry is authorized one way or another — so this is what a read reports rather
+/// than nothing at all. Only an absent `authorizerType` is filled
+/// ([`DEFAULT_REGISTRY_AUTHORIZER_TYPE`]); a value the request carried is kept as it came.
+pub fn effective_discovery_configuration(
+    requested: Option<DiscoveryConfiguration>,
+) -> DiscoveryConfiguration {
+    let mut configuration = requested.unwrap_or_default();
+    if configuration.authorizer_type.is_none() {
+        configuration.authorizer_type = Some(DEFAULT_REGISTRY_AUTHORIZER_TYPE.to_string());
+    }
+    configuration
+}
+
+/// The approval configuration a registry is created with: the one the request named, with an
+/// EMPTY rule list filled in for what it left out.
+///
+/// `autoApprovalRules` are "the rules that determine which registry records are automatically
+/// approved on submission. When omitted or empty, submitted records require manual review" —
+/// so a registry created without them has an approval workflow all the same, the one with no
+/// rule in it, and that is what a read reports. A list the request carried is kept as it
+/// came, empty or not.
+pub fn effective_approval_configuration(
+    requested: Option<ApprovalConfiguration>,
+) -> ApprovalConfiguration {
+    let mut configuration = requested.unwrap_or_default();
+    if configuration.auto_approval_rules.is_none() {
+        configuration.auto_approval_rules = Some(Vec::new());
+    }
+    configuration
+}
+
 /// The one `AutoApprovalRule` the model declares — the catalogue it comes from is
 /// `crate::ops::types::AUTO_APPROVAL_RULE_VALUES`. It selects every submitted record,
 /// so a registry configured with it approves a submission without manual review.
@@ -430,7 +492,6 @@ pub struct RegistryRecord {
     pub status_reason: Option<String>,
     pub provenance: Vec<Provenance>,
     pub custom_metadata: Option<::aws_smithy_types::Document>,
-    pub custom_metadata_schema_compliance_status: Option<String>,
     pub created_by: Option<String>,
     pub created_by_auto_detection: Option<bool>,
     pub created_at: DateTime,

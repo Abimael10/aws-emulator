@@ -276,8 +276,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             name: input.name.clone(),
             description: input.description,
             encryption_configuration: input.encryption_configuration,
-            discovery_configuration: input.discovery_configuration,
-            approval_configuration: input.approval_configuration,
+            // A registry carries a discovery and an approval configuration whether or not
+            // the create named one: consumers are authorized one way or another, and an
+            // approval workflow with no auto-approval rule in it is the one that sends every
+            // submission to manual review. So what is stored — and what every later read
+            // reports — is the EFFECTIVE configuration: the request's values, with the
+            // service's own defaults filled in for what it left out.
+            discovery_configuration: Some(crate::state::effective_discovery_configuration(
+                input.discovery_configuration,
+            )),
+            approval_configuration: Some(crate::state::effective_approval_configuration(
+                input.approval_configuration,
+            )),
             custom_metadata_schema_configuration: input.custom_metadata_schema_configuration,
             auto_detection,
             status: crate::state::REGISTRY_CREATING.to_string(),

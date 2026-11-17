@@ -9460,6 +9460,7 @@ dependencies = [
  "aws-smithy-runtime-api",
  "aws-smithy-schema 0.2.1",
  "aws-smithy-types",
+ "boon",
  "bytes",
  "hex",
  "http",

@@ -222,9 +222,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
-        let mut state = state.lock();
-        state.materialise_due_transitions();
-
         // Both labels accept the resource's ARN or its bare id.
         let registry_id = crate::state::identifier_to_id(&input.registry_id).to_string();
         let record_id = crate::state::identifier_to_id(&input.record_id).to_string();
@@ -248,7 +245,95 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // The metadata and the record type this edit would leave on the record — the stored
+        // values with the patch applied — and the registry's schema they are checked
+        // against. All three are read under the lock and the lock is released with them: the
+        // evaluation below is caller-driven work (the caller's schema applied to the
+        // caller's metadata), so it runs neither under this service's lock nor on the worker
+        // serving this request.
+        #[allow(clippy::type_complexity)]
+        let (patched_record_type, patched_metadata, schema_configuration): (
+            String,
+            Option<::aws_smithy_types::Document>,
+            Option<CustomMetadataSchemaConfiguration>,
+        ) = {
+            let mut state = state.lock();
+            state.materialise_due_transitions();
+
+            let Some(registry) = state.registries.get(&registry_id) else {
+                return Err(UpdateRegistryRecordErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(crate::state::registry_not_found_message(
+                            &input.registry_id,
+                        )),
+                    },
+                )
+                .into());
+            };
+            let Some(record) = registry.records.get(&record_id) else {
+                return Err(UpdateRegistryRecordErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(crate::state::record_not_found_message(&record_id)),
+                    },
+                )
+                .into());
+            };
+
+            let patched_record_type = input
+                .record_type
+                .clone()
+                .unwrap_or_else(|| record.record_type.clone());
+            let patched_metadata = {
+                let mut metadata = record.custom_metadata.clone();
+                patch_optional(
+                    &mut metadata,
+                    input
+                        .custom_metadata
+                        .take()
+                        .map(|wrapper| wrapper.optional_value),
+                );
+                metadata
+            };
+            (
+                patched_record_type,
+                patched_metadata,
+                registry.custom_metadata_schema_configuration.clone(),
+            )
+        };
+
+        // The registry's `customMetadataSchemaConfiguration` states the fields a record of
+        // its type may carry, so a patch that would leave metadata the applicable schema
+        // does not admit is refused — the same check a create runs, applied to the result of
+        // the patch, so the invariant holds whichever operation wrote the metadata. Nothing
+        // of the record has been written yet, and this runs before every precondition on
+        // the stored state, because what does not hold is the request itself.
+        let verdict = crate::state::custom_metadata_verdict_of(
+            schema_configuration,
+            &patched_record_type,
+            patched_metadata.as_ref(),
+        )
+        .await;
+        if let Some(message) =
+            crate::state::custom_metadata_refusal_of(&verdict, &patched_record_type)
+        {
+            return Err(UpdateRegistryRecordErrorModeled::ValidationException(
+                ValidationException {
+                    message,
+                    reason: crate::state::FIELD_VALIDATION_FAILED.to_string(),
+                    field_list: None,
+                },
+            )
+            .into());
+        }
+
+        // The request holds; what is left is the preconditions on the stored state and the
+        // write itself, which take the store again.
+        let mut state = state.lock();
+        state.materialise_due_transitions();
+
         let Some(registry) = state.registries.get(&registry_id) else {
+            // Resolved once already, above: a registry that has gone since resolves to
+            // nothing now, the same answer as if it never had.
             return Err(UpdateRegistryRecordErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
                     message: Some(crate::state::registry_not_found_message(
@@ -361,6 +446,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // The metadata and the record type this edit leaves on the record were computed and
+        // checked above, before the store was taken again.
+
         // Where the record lands once the asynchronous update has been processed: an edit
         // to a record under review takes it back out of the approval workflow, so it
         // settles at DRAFT and can be submitted again; any other record settles back at
@@ -424,11 +512,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         );
         // The metadata wrapper replaces the whole set or, supplied with no value, clears
         // it: "supply the wrapper with a full replacement set to update, or with a null
-        // value to clear all metadata".
-        patch_optional(
-            &mut record.custom_metadata,
-            input.custom_metadata.map(|wrapper| wrapper.optional_value),
-        );
+        // value to clear all metadata". Both were applied above, so that the write could be
+        // checked against the registry's schema before it was made.
+        record.custom_metadata = patched_metadata;
         record.descriptors = patched_descriptors;
         // `triggerSynchronization` asks the service to re-read the record's descriptor
         // content from the source the descriptors name. Nothing in this emulator reaches
@@ -465,9 +551,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             created_by_auto_detection: record.created_by_auto_detection,
             created_by: record.created_by.clone(),
             custom_metadata: record.custom_metadata.clone(),
-            custom_metadata_schema_compliance_status: record
-                .custom_metadata_schema_compliance_status
-                .clone(),
+            // The verdict the registry's schema gave the metadata this call wrote, computed
+            // before the write: a record whose metadata satisfies the schema it was written
+            // under reads back `COMPLIANT`, and nothing is claimed where no verdict was
+            // reached. A later read recomputes it against the schema as it stands then.
+            custom_metadata_schema_compliance_status: crate::state::custom_metadata_status_of(
+                &verdict,
+            ),
         })
     }
 }

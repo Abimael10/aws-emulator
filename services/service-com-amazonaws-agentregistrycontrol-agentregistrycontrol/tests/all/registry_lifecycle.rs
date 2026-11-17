@@ -337,13 +337,14 @@ async fn create_registry_persists_every_member_and_get_registry_reports_it() {
         );
 
         // Every member the request carried is reported back from state, and one it did
-        // not carry is absent rather than defaulted.
+        // not carry is absent rather than defaulted. `discoveryConfiguration` and
+        // `approvalConfiguration` are not in this set: a registry carries one of each
+        // whether or not the create named it, so they are asserted below as the EFFECTIVE
+        // configuration the registry ends up with.
         for member in [
             "name",
             "description",
             "encryptionConfiguration",
-            "discoveryConfiguration",
-            "approvalConfiguration",
             "customMetadataSchemaConfiguration",
         ] {
             match body.get(member) {
@@ -360,6 +361,29 @@ async fn create_registry_persists_every_member_and_get_registry_reports_it() {
                 ),
             }
         }
+
+        // The registry's effective configuration: what the request asked for where it
+        // asked, and the service's own default where it did not — an IAM-authorized
+        // discovery configuration, and an approval workflow with no auto-approval rule in
+        // it, which is the one that sends every submission to manual review.
+        assert_eq!(
+            got.field("discoveryConfiguration"),
+            &body
+                .get("discoveryConfiguration")
+                .cloned()
+                .unwrap_or_else(|| json!({ "authorizerType": "AWS_IAM" })),
+            "case {case:?}: GetRegistry reports the effective discoveryConfiguration, got {:?}",
+            got.field("discoveryConfiguration")
+        );
+        assert_eq!(
+            got.field("approvalConfiguration"),
+            &body
+                .get("approvalConfiguration")
+                .cloned()
+                .unwrap_or_else(|| json!({ "autoApprovalRules": [] })),
+            "case {case:?}: GetRegistry reports the effective approvalConfiguration, got {:?}",
+            got.field("approvalConfiguration")
+        );
 
         match body.get("autoDetectionConfiguration") {
             Some(sent) => {
@@ -1426,3 +1450,699 @@ async fn delete_registry_moves_an_emptied_registry_to_deleting_and_then_removes_
         reused.body
     );
 }
+
+// ---------------------------------------------------------------------------------------
+// A registry's custom-metadata schema, and the configuration blocks a read reports.
+//
+// The rule under test: a registry's `customMetadataSchemaConfiguration` constrains every
+// write of a record's `customMetadata` — the `defaultSchema` for every record type plus the
+// override declared for the record's own type — so metadata that does not satisfy it is
+// refused with a 400 `ValidationException` naming the offending node, before any state
+// precondition of the write; and a read reports the verdict the registry's CURRENT schema
+// gives the stored metadata, together with the registry's effective discovery and approval
+// configuration.
+// ---------------------------------------------------------------------------------------
+
+/// The registry's `defaultSchema`: the common attributes every record type may carry.
+const COMMON_ATTRIBUTE_SCHEMA: &str =
+    r#"{"type":"object","properties":{"owner":{"type":"string"}}}"#;
+
+/// The `recordTypeSchemaOverrides` schema for `CUSTOM` records: a required property whose
+/// value has to come from an enumeration.
+const CUSTOM_RECORD_SCHEMA: &str = r#"{"type":"object","properties":{"environment":{"enum":["dev","prod"]}},"required":["environment"]}"#;
+
+/// The `recordTypeSchemaOverrides` schema for `MCP` records, so a second record type is
+/// constrained differently from the first.
+const MCP_RECORD_SCHEMA: &str =
+    r#"{"type":"object","properties":{"tier":{"type":"integer"}},"required":["tier"]}"#;
+
+/// The configuration a registry under test carries: the common attributes plus one
+/// override per constrained record type. Record types with no override carry the common
+/// attributes alone.
+fn schema_configuration() -> Value {
+    json!({
+        "defaultSchema": COMMON_ATTRIBUTE_SCHEMA,
+        "recordTypeSchemaOverrides": [
+            { "recordType": "CUSTOM", "schema": CUSTOM_RECORD_SCHEMA },
+            { "recordType": "MCP", "schema": MCP_RECORD_SCHEMA }
+        ]
+    })
+}
+
+/// How this service words a refusal of custom metadata the registry's schema does not
+/// admit: the fixed text with the request's record type, then the failure — the JSON
+/// pointer of the offending node and the constraint it does not satisfy.
+fn schema_refusal(record_type: &str, failure: &str) -> String {
+    format!("Custom metadata validation failed for record type {record_type}: {failure}")
+}
+
+/// Create a registry from a whole request body and wait for the creation the clock owes to
+/// be reported, so it is `READY`; returns its registry id. [`ready_registry`] for a registry
+/// whose request carries nothing but a name.
+async fn ready_registry_with(router: &MultiServiceRouter, body: Value) -> String {
+    let created = create_registry(router, body.clone()).await;
+    assert_eq!(
+        created.status, 202,
+        "case {body:?}: CreateRegistry must answer 202, got {} {:?}",
+        created.status, created.body
+    );
+    let registry_id = id_of(created.str_field("registryArn")).to_string();
+    registry_at_status(router, &registry_id, "READY", &format!("{body:?}")).await;
+    registry_id
+}
+
+/// How long a test looks for a status the clock owes before giving up. GENEROUS: what is
+/// waited for is a CONDITION the next call reports, not a span of time, so a loaded host only
+/// makes the loop go round more often.
+const STATUS_DEADLINE: Duration = Duration::from_secs(30);
+
+/// How often the loop looks again.
+const POLL_INTERVAL: Duration = Duration::from_millis(20);
+
+/// Poll `GetRegistry` until the registry reports `status`, and answer the reply that did.
+/// Panics, naming the case and the last status seen, if the deadline passes first.
+async fn registry_at_status(
+    router: &MultiServiceRouter,
+    registry_id: &str,
+    status: &str,
+    case: &str,
+) -> Reply {
+    let deadline = tokio::time::Instant::now() + STATUS_DEADLINE;
+    loop {
+        let got = get_registry(router, registry_id).await;
+        if got.str_field("status") == status {
+            return got;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "case {case:?}: the registry never reported {status}, last answer {} {:?}",
+            got.status,
+            got.body
+        );
+        tokio::time::sleep(POLL_INTERVAL).await;
+    }
+}
+
+/// Poll `GetRegistryRecord` until the record reports `status`, and answer the reply that did.
+/// Panics, naming the case and the last status seen, if the deadline passes first.
+async fn record_at_status(
+    router: &MultiServiceRouter,
+    registry_id: &str,
+    record_id: &str,
+    status: &str,
+    case: &str,
+) -> Reply {
+    let deadline = tokio::time::Instant::now() + STATUS_DEADLINE;
+    loop {
+        let got = get_record(router, registry_id, record_id).await;
+        if got.str_field("status") == status {
+            return got;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "case {case:?}: the record never reported {status}, last answer {} {:?}",
+            got.status,
+            got.body
+        );
+        tokio::time::sleep(POLL_INTERVAL).await;
+    }
+}
+
+/// A router over this service together with the engine its state lives in, so a test can
+/// also act on the stored registry the way an update of its schema would.
+fn router_and_engine() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
+    let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
+    let mut router = MultiServiceRouter::new();
+    router.set_request_authentication(false);
+    router.register_service(
+        service_com_amazonaws_agentregistrycontrol_agentregistrycontrol::EmulatedService::new(
+            Arc::clone(&engine),
+        ),
+    );
+    (router, engine)
+}
+
+/// Replace the schema a stored registry declares for `record_type`, which is the state an
+/// update of the registry's `customMetadataSchemaConfiguration` leaves behind: what a
+/// record's compliance verdict is computed against from then on.
+fn declare_record_type_schema(
+    engine: &Arc<engine::InMemoryEngine>,
+    registry_id: &str,
+    record_type: &str,
+    schema: &str,
+) {
+    use service_com_amazonaws_agentregistrycontrol_agentregistrycontrol::ops::types::{
+        CustomMetadataSchemaConfiguration, RecordTypeSchemaOverride,
+    };
+    use service_com_amazonaws_agentregistrycontrol_agentregistrycontrol::state as owner;
+
+    let state = engine.state::<owner::ComAmazonawsAgentregistrycontrolAgentregistrycontrolState>();
+    let mut state = state.lock();
+    let registry = state
+        .registries
+        .get_mut(registry_id)
+        .expect("the registry under test is stored");
+    registry.custom_metadata_schema_configuration = Some(CustomMetadataSchemaConfiguration {
+        default_schema: None,
+        record_type_schema_overrides: Some(vec![RecordTypeSchemaOverride {
+            record_type: record_type.to_string(),
+            schema: schema.to_string(),
+        }]),
+    });
+}
+
+#[tokio::test]
+async fn custom_metadata_must_satisfy_the_schema_the_registry_declares_for_the_record_type() {
+    let router = router();
+    let registry_id = ready_registry_with(
+        &router,
+        json!({
+            "name": "schema-enforcing-registry",
+            "customMetadataSchemaConfiguration": schema_configuration()
+        }),
+    )
+    .await;
+
+    // Rows differ along the record type whose schema applies, the keyword that fails
+    // (enumeration, required property, declared type), whether the metadata is present at
+    // all, and which of the two schemas is the one that is not satisfied — the override's
+    // or the common attributes', which apply to a record type that has no override of its
+    // own. The last column is the failure the refusal must state, or `None` for metadata
+    // the schema admits.
+    let cases: Vec<(&str, &str, Option<Value>, Option<&str>)> = vec![
+        (
+            "a value outside the enumeration the override declares",
+            "CUSTOM",
+            Some(json!({ "environment": "staging" })),
+            Some("/environment: does not have a value in the enumeration [\"dev\", \"prod\"]"),
+        ),
+        (
+            "metadata omitting a property the override requires",
+            "CUSTOM",
+            Some(json!({ "owner": "platform" })),
+            Some(": required property 'environment' not found"),
+        ),
+        (
+            "no metadata at all where the override requires a property",
+            "CUSTOM",
+            None,
+            Some(": required property 'environment' not found"),
+        ),
+        (
+            "metadata the override and the common attributes both admit",
+            "CUSTOM",
+            Some(json!({ "environment": "prod", "owner": "platform" })),
+            None,
+        ),
+        (
+            "a value whose type is not the one the override declares",
+            "MCP",
+            Some(json!({ "tier": "gold" })),
+            Some("/tier: string found, integer expected"),
+        ),
+        (
+            "a second record type's own override, satisfied",
+            "MCP",
+            Some(json!({ "tier": 3 })),
+            None,
+        ),
+        (
+            "a record type with no override, satisfying the common attributes",
+            "AGENT",
+            Some(json!({ "owner": "agents" })),
+            None,
+        ),
+        (
+            "a record type with no override, violating the common attributes",
+            "AGENT",
+            Some(json!({ "owner": 7 })),
+            Some("/owner: integer found, string expected"),
+        ),
+    ];
+
+    for (at, (case, record_type, metadata, failure)) in cases.into_iter().enumerate() {
+        let name = format!("probe-{at}");
+        let mut body = json!({
+            "name": name,
+            "recordType": record_type,
+            "descriptors": descriptors_for(record_type)
+        });
+        if let Some(metadata) = &metadata {
+            body["customMetadata"] = metadata.clone();
+        }
+        let created = create_record(&router, &registry_id, body).await;
+
+        let Some(failure) = failure else {
+            assert_eq!(
+                created.status, 202,
+                "case {case:?}: metadata the schema admits is accepted, got {} {:?}",
+                created.status, created.body
+            );
+            // And the record reads back compliant with the schema it was written under.
+            let record_id = id_of(created.str_field("recordArn")).to_string();
+            let got = record_at_status(&router, &registry_id, &record_id, "DRAFT", case).await;
+            assert_eq!(
+                got.field("customMetadataSchemaComplianceStatus"),
+                &json!("COMPLIANT"),
+                "case {case:?}: metadata that satisfies the registry's schema reads back COMPLIANT, got {:?}",
+                got.body
+            );
+            continue;
+        };
+
+        assert_eq!(
+            created.status, 400,
+            "case {case:?}: metadata the schema does not admit is refused with 400, got {} {:?}",
+            created.status, created.body
+        );
+        assert_eq!(
+            created.error_code.as_deref(),
+            Some("ValidationException"),
+            "case {case:?}: the modelled error code is ValidationException, got {:?}",
+            created.error_code
+        );
+        assert_eq!(
+            created.str_field("message"),
+            schema_refusal(record_type, failure),
+            "case {case:?}: the refusal states the record type and the failure, got {:?}",
+            created.body
+        );
+        assert_eq!(
+            created.str_field("reason"),
+            "FieldValidationFailed",
+            "case {case:?}: the refusal is a field validation failure, got {:?}",
+            created.body
+        );
+    }
+}
+
+#[tokio::test]
+async fn metadata_the_schema_refuses_leaves_the_record_name_free() {
+    let router = router();
+    let registry_id = ready_registry_with(
+        &router,
+        json!({
+            "name": "nothing-written-registry",
+            "customMetadataSchemaConfiguration": schema_configuration()
+        }),
+    )
+    .await;
+
+    // A create the schema refuses writes nothing, so the name it asked for is still free
+    // and the registry still holds no record — a later call must not be answered about a
+    // name conflict with a record that was never created.
+    let name = "arc-probe.one";
+    for (case, metadata, failure) in [
+        (
+            "a value outside the enumeration",
+            json!({ "environment": "staging" }),
+            "/environment: does not have a value in the enumeration [\"dev\", \"prod\"]",
+        ),
+        (
+            "a missing required property",
+            json!({ "owner": "platform" }),
+            ": required property 'environment' not found",
+        ),
+    ] {
+        let refused = create_record(
+            &router,
+            &registry_id,
+            json!({
+                "name": name,
+                "recordType": "CUSTOM",
+                "descriptors": descriptors_for("CUSTOM"),
+                "customMetadata": metadata
+            }),
+        )
+        .await;
+        assert_eq!(
+            refused.status, 400,
+            "case {case:?}: the refusal is a 400 validation failure and not a name conflict, got {} {:?}",
+            refused.status, refused.body
+        );
+        assert_eq!(
+            refused.str_field("message"),
+            schema_refusal("CUSTOM", failure),
+            "case {case:?}: the refusal names the metadata failure, got {:?}",
+            refused.body
+        );
+        let listed = list_records(&router, &registry_id, json!({})).await;
+        assert_eq!(
+            listed.field("registryRecords"),
+            &json!([]),
+            "case {case:?}: a refused create writes no record, got {:?}",
+            listed.body
+        );
+    }
+
+    // So the same name, with metadata the schema admits, creates the record.
+    let accepted = create_record(
+        &router,
+        &registry_id,
+        json!({
+            "name": name,
+            "recordType": "CUSTOM",
+            "descriptors": descriptors_for("CUSTOM"),
+            "customMetadata": { "environment": "dev" }
+        }),
+    )
+    .await;
+    assert_eq!(
+        accepted.status, 202,
+        "case \"the name a refused create asked for\": it is still free, got {} {:?}",
+        accepted.status, accepted.body
+    );
+}
+
+#[tokio::test]
+async fn a_records_compliance_is_computed_against_the_registrys_current_schema() {
+    let (router, engine) = router_and_engine();
+    let registry_id = ready_registry_with(
+        &router,
+        json!({
+            "name": "compliance-registry",
+            "customMetadataSchemaConfiguration": schema_configuration()
+        }),
+    )
+    .await;
+    let created = create_record(
+        &router,
+        &registry_id,
+        json!({
+            "name": "compliance-probe",
+            "recordType": "CUSTOM",
+            "descriptors": descriptors_for("CUSTOM"),
+            "customMetadata": { "environment": "dev", "owner": "platform" }
+        }),
+    )
+    .await;
+    assert_eq!(
+        created.status, 202,
+        "case \"a record the schema admits\": it is created, got {} {:?}",
+        created.status, created.body
+    );
+    let record_id = id_of(created.str_field("recordArn")).to_string();
+    record_at_status(
+        &router,
+        &registry_id,
+        &record_id,
+        "DRAFT",
+        "a record the schema admits",
+    )
+    .await;
+
+    // Each row is a schema the registry declares for this record type, and the verdict the
+    // record's unchanged metadata earns under it: the record is never written again, so
+    // what changes the verdict is the schema alone.
+    let cases: Vec<(&str, &str, Value)> = vec![
+        (
+            "the schema the record was written under",
+            CUSTOM_RECORD_SCHEMA,
+            json!("COMPLIANT"),
+        ),
+        (
+            "a schema whose enumeration no longer admits the stored value",
+            r#"{"type":"object","properties":{"environment":{"enum":["prod"]}},"required":["environment"]}"#,
+            json!("NON_COMPLIANT"),
+        ),
+        (
+            "a schema requiring a property the stored metadata does not carry",
+            r#"{"type":"object","required":["costCentre"]}"#,
+            json!("NON_COMPLIANT"),
+        ),
+        (
+            "a schema that admits the stored metadata again",
+            r#"{"type":"object","properties":{"environment":{"type":"string"}}}"#,
+            json!("COMPLIANT"),
+        ),
+        (
+            // No verdict can be reached about metadata whose schema cannot be read, so
+            // nothing is claimed about it rather than claiming either verdict.
+            "a schema document that is not a JSON Schema at all",
+            "not a schema",
+            Value::Null,
+        ),
+    ];
+
+    for (case, schema, expected) in cases {
+        declare_record_type_schema(&engine, &registry_id, "CUSTOM", schema);
+        let got = get_record(&router, &registry_id, &record_id).await;
+        assert_eq!(
+            got.field("customMetadataSchemaComplianceStatus"),
+            &expected,
+            "case {case:?}: GetRegistryRecord reports the verdict of the current schema, got {:?}",
+            got.body
+        );
+        // The stored record itself is untouched by the verdict a read reports.
+        assert_eq!(
+            got.field("customMetadata"),
+            &json!({ "environment": "dev", "owner": "platform" }),
+            "case {case:?}: reporting a verdict changes no stored metadata, got {:?}",
+            got.body
+        );
+        // And a list reports the same verdict for the same record, since both compute it
+        // from the registry's schema and the record's metadata.
+        let listed = list_records(&router, &registry_id, json!({})).await;
+        assert_eq!(
+            &listed.field("registryRecords")[0]["customMetadataSchemaComplianceStatus"],
+            &expected,
+            "case {case:?}: the list summary carries the same verdict, got {:?}",
+            listed.body
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_record_of_a_registry_with_no_schema_carries_no_metadata_to_violate() {
+    let router = router();
+    let registry_id = ready_registry(&router, "unconstrained-registry").await;
+    for (case, body) in [
+        (
+            "metadata of any shape",
+            json!({
+                "name": "free-form",
+                "recordType": "CUSTOM",
+                "descriptors": descriptors_for("CUSTOM"),
+                "customMetadata": { "anything": "goes", "nested": true }
+            }),
+        ),
+        (
+            "no metadata at all",
+            json!({
+                "name": "no-metadata",
+                "recordType": "MCP",
+                "descriptors": descriptors_for("MCP")
+            }),
+        ),
+    ] {
+        let created = create_record(&router, &registry_id, body).await;
+        assert_eq!(
+            created.status, 202,
+            "case {case:?}: a registry that declares no schema constrains nothing, got {} {:?}",
+            created.status, created.body
+        );
+        let record_id = id_of(created.str_field("recordArn")).to_string();
+        let got = record_at_status(&router, &registry_id, &record_id, "DRAFT", case).await;
+        assert_eq!(
+            got.field("customMetadataSchemaComplianceStatus"),
+            &json!("COMPLIANT"),
+            "case {case:?}: there is no schema the metadata fails to satisfy, got {:?}",
+            got.body
+        );    }
+}
+
+#[tokio::test]
+async fn an_edit_must_leave_custom_metadata_the_registrys_schema_admits() {
+    let router = router();
+    let registry_id = ready_registry_with(
+        &router,
+        json!({
+            "name": "edit-schema-registry",
+            "customMetadataSchemaConfiguration": schema_configuration()
+        }),
+    )
+    .await;
+    let created = create_record(
+        &router,
+        &registry_id,
+        json!({
+            "name": "edit-probe",
+            "recordType": "CUSTOM",
+            "descriptors": descriptors_for("CUSTOM"),
+            "customMetadata": { "environment": "dev" }
+        }),
+    )
+    .await;
+    let record_id = id_of(created.str_field("recordArn")).to_string();
+    record_at_status(&router, &registry_id, &record_id, "DRAFT", "edit-probe").await;
+
+    // Rows differ along what the patch would leave on the record: a replacement set the
+    // schema does not admit, a cleared set where the schema requires a property, and a
+    // replacement set it does admit.
+    let cases: Vec<(&str, Value, Option<&str>)> = vec![
+        (
+            "a replacement value outside the enumeration",
+            json!({ "customMetadata": { "optionalValue": { "environment": "staging" } } }),
+            Some("/environment: does not have a value in the enumeration [\"dev\", \"prod\"]"),
+        ),
+        (
+            "clearing metadata the schema requires",
+            json!({ "customMetadata": {} }),
+            Some(": required property 'environment' not found"),
+        ),
+        (
+            "a replacement set the schema admits",
+            json!({ "customMetadata": { "optionalValue": { "environment": "prod", "owner": "platform" } } }),
+            None,
+        ),
+    ];
+
+    for (case, patch, failure) in cases {
+        let patched = call(
+            &router,
+            "PATCH",
+            &format!(
+                "/registries/{}/records/{}",
+                encode_label(&registry_id),
+                encode_label(&record_id)
+            ),
+            Some(patch),
+        )
+        .await;
+        match failure {
+            Some(failure) => {
+                assert_eq!(
+                    patched.status, 400,
+                    "case {case:?}: an edit the schema does not admit is refused, got {} {:?}",
+                    patched.status, patched.body
+                );
+                assert_eq!(
+                    patched.str_field("message"),
+                    schema_refusal("CUSTOM", failure),
+                    "case {case:?}: the refusal states the record type and the failure, got {:?}",
+                    patched.body
+                );
+                // The refused edit wrote nothing: the record still carries what it had.
+                let got = get_record(&router, &registry_id, &record_id).await;
+                assert_eq!(
+                    got.field("customMetadata"),
+                    &json!({ "environment": "dev" }),
+                    "case {case:?}: a refused edit leaves the stored metadata alone, got {:?}",
+                    got.body
+                );
+            }
+            None => {
+                assert_eq!(
+                    patched.status, 202,
+                    "case {case:?}: an edit the schema admits is accepted, got {} {:?}",
+                    patched.status, patched.body
+                );
+                assert_eq!(
+                    patched.field("customMetadataSchemaComplianceStatus"),
+                    &json!("COMPLIANT"),
+                    "case {case:?}: the edited record satisfies the schema, got {:?}",
+                    patched.body
+                );
+                let got =
+                    record_at_status(&router, &registry_id, &record_id, "DRAFT", case).await;
+                assert_eq!(
+                    got.field("customMetadata"),
+                    &json!({ "environment": "prod", "owner": "platform" }),
+                    "case {case:?}: the replacement set is what a later read reports, got {:?}",
+                    got.body
+                );
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn get_registry_reports_the_effective_discovery_and_approval_configuration() {
+    let router = router();
+
+    // Rows differ along which configuration block the request carries and how fully: a
+    // request that names neither, one that names an empty block of each, and ones that
+    // name a value for each. The authorizer types are the model's own catalogue
+    // (`smithy_query(query="shape", shape="RegistryAuthorizerType")`: AWS_IAM |
+    // CUSTOM_JWT) and the rule is the model's one `AutoApprovalRule`, APPROVE_ALL.
+    let cases: Vec<(&str, Value, Value, Value)> = vec![
+        (
+            "neither block named",
+            json!({ "name": "effective-none" }),
+            json!({ "authorizerType": "AWS_IAM" }),
+            json!({ "autoApprovalRules": [] }),
+        ),
+        (
+            "an empty block of each",
+            json!({
+                "name": "effective-empty",
+                "discoveryConfiguration": {},
+                "approvalConfiguration": {}
+            }),
+            json!({ "authorizerType": "AWS_IAM" }),
+            json!({ "autoApprovalRules": [] }),
+        ),
+        (
+            "an explicitly empty rule list",
+            json!({
+                "name": "effective-manual-review",
+                "approvalConfiguration": { "autoApprovalRules": [] }
+            }),
+            json!({ "authorizerType": "AWS_IAM" }),
+            json!({ "autoApprovalRules": [] }),
+        ),
+        (
+            "the IAM authorizer and an auto-approval rule",
+            json!({
+                "name": "effective-auto-approval",
+                "discoveryConfiguration": { "authorizerType": "AWS_IAM" },
+                "approvalConfiguration": { "autoApprovalRules": ["APPROVE_ALL"] }
+            }),
+            json!({ "authorizerType": "AWS_IAM" }),
+            json!({ "autoApprovalRules": ["APPROVE_ALL"] }),
+        ),
+        (
+            "a custom JWT authorizer",
+            json!({
+                "name": "effective-custom-jwt",
+                "discoveryConfiguration": {
+                    "authorizerType": "CUSTOM_JWT",
+                    "authorizerConfiguration": {
+                        "customJWTAuthorizer": {
+                            "discoveryUrl": "https://idp.example.test/.well-known/openid-configuration",
+                            "allowedAudience": ["registry-consumers"]
+                        }
+                    }
+                }
+            }),
+            json!({
+                "authorizerType": "CUSTOM_JWT",
+                "authorizerConfiguration": {
+                    "customJWTAuthorizer": {
+                        "discoveryUrl": "https://idp.example.test/.well-known/openid-configuration",
+                        "allowedAudience": ["registry-consumers"]
+                    }
+                }
+            }),
+            json!({ "autoApprovalRules": [] }),
+        ),
+    ];
+
+    for (case, body, discovery, approval) in cases {
+        let registry_id = ready_registry_with(&router, body).await;
+        let got = get_registry(&router, &registry_id).await;
+        assert_eq!(
+            got.field("discoveryConfiguration"),
+            &discovery,
+            "case {case:?}: GetRegistry reports the effective discoveryConfiguration, got {:?}",
+            got.field("discoveryConfiguration")
+        );
+        assert_eq!(
+            got.field("approvalConfiguration"),
+            &approval,
+            "case {case:?}: GetRegistry reports the effective approvalConfiguration, got {:?}",
+            got.field("approvalConfiguration")
+        );
+    }
+}
+

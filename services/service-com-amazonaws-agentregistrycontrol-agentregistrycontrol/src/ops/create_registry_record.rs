@@ -2,8 +2,11 @@
 
 //! @op CreateRegistryRecord
 //! IMPLEMENTED: mints a record id under the parent registry, persists the whole
-//! request in [`crate::state`] and answers the record ARN and status. Creation is
-//! asynchronous, so the record is stored `CREATING` with the clock owing it `DRAFT`.
+//! request in [`crate::state`] and answers the record ARN and status. The record's
+//! `customMetadata` has to satisfy the registry's `customMetadataSchemaConfiguration`
+//! first, so metadata the schema does not admit is refused before anything is written.
+//! Creation is asynchronous, so the record is stored `CREATING` with the clock owing it
+//! `DRAFT`.
 //!
 //! ## Shape of an operation
 //!
@@ -184,9 +187,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
-        let mut state = state.lock();
-        state.materialise_due_transitions();
-
         // A descriptor's content is "serialized as descriptor payload data" and validated
         // against the protocol schema of the descriptor's type, so a payload that is not
         // even JSON is refused here — before the request is remembered for its token and
@@ -214,7 +214,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             Self::INPUT_SCHEMA,
         );
 
-        let registry_arn = {
+        // What the metadata is evaluated against: the registry's own schema, read under the
+        // lock and released with it. The store is NOT held while the evaluation runs — both
+        // documents are the caller's, so that work belongs neither under this service's lock
+        // nor on the worker serving this request.
+        let schema_configuration: Option<CustomMetadataSchemaConfiguration> = {
+            let mut state = state.lock();
+            state.materialise_due_transitions();
+
             let Some(registry) = state.registries.get(&registry_id) else {
                 return Err(CreateRegistryRecordErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {
@@ -288,6 +295,55 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     crate::state::TokenReplay::Unused => {}
                 }
             }
+
+            registry.custom_metadata_schema_configuration.clone()
+        };
+
+        // The registry's `customMetadataSchemaConfiguration` states the fields a record of
+        // this registry may carry — the common attributes plus this record type's own — so
+        // metadata that does not satisfy the schema that applies to the request's
+        // `recordType` is refused before anything is written. This runs BEFORE every
+        // precondition on the stored state (the registry's status, its record quota and the
+        // uniqueness of the record's name), because what does not hold is the request
+        // itself: a schema-invalid create is a 400 `ValidationException` naming the
+        // offending field, never a report about another record.
+        let verdict = crate::state::custom_metadata_verdict_of(
+            schema_configuration,
+            &input.record_type,
+            input.custom_metadata.as_ref(),
+        )
+        .await;
+        if let Some(message) = crate::state::custom_metadata_refusal_of(&verdict, &input.record_type)
+        {
+            return Err(CreateRegistryRecordErrorModeled::ValidationException(
+                ValidationException {
+                    message,
+                    reason: crate::state::FIELD_VALIDATION_FAILED.to_string(),
+                    field_list: None,
+                },
+            )
+            .into());
+        }
+
+        // The request holds; what is left is the preconditions on the stored state and the
+        // write itself, which take the store again.
+        let mut state = state.lock();
+        state.materialise_due_transitions();
+
+        let registry_arn = {
+            let Some(registry) = state.registries.get(&registry_id) else {
+                // The registry was there when its schema was read and is not there now, so
+                // the identifier the request named resolves to nothing — the same answer as
+                // if it never had, stated with the identifier the caller sent.
+                return Err(CreateRegistryRecordErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(crate::state::registry_not_found_message(
+                            &input.registry_id,
+                        )),
+                    },
+                )
+                .into());
+            };
 
             // A registry "becomes usable once it reaches READY", so a record cannot be
             // created in one that is still being created or is being deleted.
@@ -367,9 +423,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             status_reason: None,
             provenance: input.provenance.unwrap_or_default(),
             custom_metadata: input.custom_metadata,
-            // Schema-compliance evaluation is not implemented, so nothing is claimed
-            // about it rather than claiming compliance.
-            custom_metadata_schema_compliance_status: None,
             created_by: Some(::engine::emulator_account_id().to_string()),
             // false: the record was created through a control-plane API call.
             created_by_auto_detection: Some(false),
