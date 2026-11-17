@@ -2,12 +2,14 @@
 
 //! @op EnableLDAPS
 //!
-//! Activates LDAP secure calls for a stored directory, by recording the `LDAPSStatus`
-//! transition the enable starts: the directory's LDAP security for the requested
-//! `LDAPSType` enters the transient [`crate::state::LDAPS_STATUS_ENABLING`], and the
-//! clock — not a later call — settles it on [`crate::state::LDAPS_STATUS_ENABLED`] once
-//! [`crate::state::TRANSITION_SPAN`] has elapsed. `DescribeLDAPSSettings` is what
-//! reports that status.
+//! Activates LDAP secure calls for a stored directory, by recording
+//! [`crate::state::LDAPS_STATUS_ENABLED`] for the requested `LDAPSType`. The switch is a
+//! setting of the directory this service already holds rather than infrastructure to
+//! build — this operation's result is modelled with no members at all, so it reports no
+//! status a caller could be told to wait out — so the call itself applies it and
+//! `DescribeLDAPSSettings` reports the settled status from here on, the same way
+//! `DisableLDAPS` deactivates it and the same way this directory's data-access toggle
+//! switches its own setting.
 //!
 //! LDAPS secures the traffic between a directory server and its clients with a
 //! certificate the directory holds, so the switch can only be activated where there is
@@ -22,8 +24,8 @@
 //! is refused with `DirectoryDoesNotExistException`, a directory that is not in service
 //! (still being built by the transition its create owes, or otherwise outside `Active`)
 //! with `DirectoryUnavailableException`, a directory type that serves no LDAPS endpoint
-//! with `UnsupportedOperationException`, and LDAP security that is already active — or
-//! already on its way there — with `InvalidLDAPSStatusException`.
+//! with `UnsupportedOperationException`, and LDAP security that is already active with
+//! `InvalidLDAPSStatusException`.
 //!
 //! ## Shape of an operation
 //!
@@ -216,16 +218,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        // LDAP security that is already active — or already on its way there under the
-        // transition an earlier enable started — is in the state this request asks for,
-        // so the enable is refused rather than silently restarting that transition. The
-        // LDAP activities this request asks for are limited by the status the setting
-        // already carries, which is the modelled refusal for exactly that, stated by this
-        // service's shared sentence for it.
+        // LDAP security that is already active is in the state this request asks for, so
+        // the enable is refused rather than written again. The LDAP activities this
+        // request asks for are limited by the status the setting already carries, which is
+        // the modelled refusal for exactly that, stated by this service's shared sentence
+        // for it.
         if let Some(existing) = directory.ldaps_settings.get(&input.r#type) {
-            if existing.status == crate::state::LDAPS_STATUS_ENABLING
-                || existing.status == crate::state::LDAPS_STATUS_ENABLED
-            {
+            if existing.status == crate::state::LDAPS_STATUS_ENABLED {
                 return Err(EnableLDAPSErrorModeled::InvalidLDAPSStatusException(
                     crate::state::refusal(crate::state::invalid_ldaps_status(
                         crate::state::LDAPS_ACTION_ENABLE,
@@ -247,17 +246,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        // The request is accepted. LDAP secure calls are not in service the instant this
-        // call answers: the move to `Enabled` is owed by the clock, like a create's stage
-        // transition. Nothing but the clock has changed this status, so there is no state
+        // The request is accepted. The switch this toggle moves is the directory's own
+        // setting — nothing is built for it, which is why the operation reports nothing
+        // back — so the call applies it instead of leaving a transition for the clock: the
+        // next read reports `Enabled`. Nothing failed on the way, so there is no state
         // change to describe in `LDAPSStatusReason`.
         directory.ldaps_settings.insert(
             input.r#type.clone(),
             crate::state::LdapsSetting {
-                status: crate::state::LDAPS_STATUS_ENABLING.to_string(),
+                status: crate::state::LDAPS_STATUS_ENABLED.to_string(),
                 status_reason: None,
                 last_updated: now,
-                status_due_at: Some(now + crate::state::TRANSITION_SPAN),
             },
         );
 

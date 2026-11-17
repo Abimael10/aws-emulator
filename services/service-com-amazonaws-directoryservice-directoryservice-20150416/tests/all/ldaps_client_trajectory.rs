@@ -5,15 +5,15 @@
 //! RULE: every status this service records on the way to LDAP security being in force is
 //! reached by ASKING AGAIN — a client that registers a certificate securing LDAP calls and
 //! polls `DescribeCertificate` until the registration leaves its transient state reads
-//! `Registered`; one that then calls `EnableLDAPS` and polls `DescribeLDAPSSettings` until the
-//! status leaves its transient one reads `Enabled` (never `EnableFailed`: a self-signed
-//! certificate the service accepted is one it secures LDAP calls with); and one that then
-//! calls `DisableLDAPS` reads `Disabled` on its very next read, because the modelled
-//! `LDAPSStatus` enum carries no transient value on the way down
-//! (`smithy_query(query="shape",shape="LDAPSStatus")` answers `["Enabling", "Enabled",
-//! "EnableFailed", "Disabled"]`). No step of that trajectory is refused, and none of those
-//! readings needs a wait of any particular length: each one is owed by the clock and
-//! materialised for whoever reads next.
+//! `Registered`; one that then calls `EnableLDAPS` reads `Enabled` on its very next read
+//! (never `EnableFailed`: a self-signed certificate the service accepted is one it secures
+//! LDAP calls with); and one that then calls `DisableLDAPS` reads `Disabled` on its very
+//! next read. Both of those readings are immediate because the switch is a setting of the
+//! directory this service already holds, applied by the call that asks for it, and the
+//! modelled `LDAPSStatus` enum carries no value a caller is left waiting on in either
+//! direction (`smithy_query(query="shape",shape="LDAPSStatus")` answers `["Enabling",
+//! "Enabled", "EnableFailed", "Disabled"]`). No step of that trajectory is refused, and
+//! none of those readings needs a wait of any particular length.
 //!
 //! The rows differ along what the rule generalises over: the directory type that serves an
 //! LDAPS endpoint (Managed Microsoft AD and AD Connector), every value of the modelled
@@ -53,10 +53,8 @@ const POLL_INTERVAL: Duration = Duration::from_millis(25);
 /// operations' required `Type` member admits.
 const LDAPS_TYPE_CATALOG: [&str; 1] = ["Client"];
 
-/// The values of the modelled `LDAPSStatus` enum a client's waiter watches for: the transient
-/// status an activation answers in, the two terminal ones it can settle on, and the one a
-/// deactivation records.
-const STATUS_ENABLING: &str = "Enabling";
+/// The values of the modelled `LDAPSStatus` enum a client's waiter watches for: the two
+/// terminal ones an activation can settle on, and the one a deactivation records.
 const STATUS_ENABLED: &str = "Enabled";
 const STATUS_ENABLE_FAILED: &str = "EnableFailed";
 const STATUS_DISABLED: &str = "Disabled";
@@ -204,7 +202,7 @@ async fn status_settling_on(
 }
 
 /// RULE: the documented LDAPS trajectory — register and wait for the certificate, activate
-/// and wait for the switch, deactivate and read it back — reaches every one of its readings
+/// and read the switch back, deactivate and read it back — reaches every one of its readings
 /// for a client that polls, for every directory type that serves an LDAPS endpoint and every
 /// `LDAPSType`, and runs the same way the second time round.
 #[tokio::test]
@@ -241,8 +239,9 @@ async fn the_documented_ldaps_trajectory_converges_for_a_client_that_polls() {
             // The certificate the switch is served by, waited for the way a client waits.
             certificate_registered(&router, &directory_id, "ldaps.example.com", case).await;
 
-            // Two cycles: a switch that has been turned off is turned on again the same
-            // way, so neither reading is a one-shot.
+            // The activation is in force for the read that follows it, which is what a
+            // client's waiter stops on at once; the waiter is kept because a status that
+            // regressed to a transient value, or settled on `EnableFailed`, would fail it.
             for cycle in 1..=2 {
                 let case = &format!("{case}, cycle {cycle}");
                 ok(
@@ -252,6 +251,14 @@ async fn the_documented_ldaps_trajectory_converges_for_a_client_that_polls() {
                     case,
                 )
                 .await;
+                let straight_after =
+                    reported_status(&router, &directory_id, ldaps_type, case).await;
+                assert_eq!(
+                    straight_after.as_deref(),
+                    Some(STATUS_ENABLED),
+                    "case {case:?}: expected the activation to be in force on the next \
+                     read, got {straight_after:?}"
+                );
                 let settled = status_settling_on(
                     &router,
                     &directory_id,
@@ -300,27 +307,6 @@ async fn the_documented_ldaps_trajectory_converges_for_a_client_that_polls() {
                      {still:?}"
                 );
             }
-
-            // The transient status the activation answers in is still observable to a
-            // caller that reads straight after it — the trajectory converges without that
-            // state having been taken away. Read immediately, which is inside the span the
-            // activation owes its transition over (`crate::state::TRANSITION_SPAN`, the one
-            // constant this assertion depends on): a shorter span would have to move this
-            // assertion rather than loosen it.
-            ok(
-                &router,
-                "EnableLDAPS",
-                json!({ "DirectoryId": &directory_id, "Type": ldaps_type }),
-                case,
-            )
-            .await;
-            let straight_after = reported_status(&router, &directory_id, ldaps_type, case).await;
-            assert_eq!(
-                straight_after.as_deref(),
-                Some(STATUS_ENABLING),
-                "case {case:?}: expected the transient status right after the activation, \
-                 got {straight_after:?}"
-            );
         }
     }
 }

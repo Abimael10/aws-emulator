@@ -5,8 +5,9 @@
 //! Deactivates LDAP secure calls for a stored directory, by recording the
 //! [`crate::state::LDAPS_STATUS_DISABLED`] status for the requested `LDAPSType`. The
 //! modelled `LDAPSStatus` enum carries no transient value on the way down — there is no
-//! `Disabling` — so the deactivation settles the instant it is recorded and owes the
-//! clock nothing. `DescribeLDAPSSettings` is what reports that status.
+//! `Disabling` — so the deactivation settles the instant it is recorded, exactly as
+//! `EnableLDAPS` applies the activation in the call that asks for it, and owes the clock
+//! nothing. `DescribeLDAPSSettings` is what reports that status.
 //!
 //! The modelled constraints (the `DirectoryId` pattern, the `LDAPSType` enum values) are
 //! refused by the framework's boundary validator BEFORE this handler runs, so a
@@ -15,7 +16,7 @@
 //! (still being built by the transition its create owes, or otherwise outside `Active`)
 //! with `DirectoryUnavailableException`, a directory type that serves no LDAPS endpoint
 //! with `UnsupportedOperationException`, and LDAP security that is not active — never
-//! enabled, still being enabled, or already deactivated — with
+//! enabled, or already deactivated — with
 //! `InvalidLDAPSStatusException`, the error whose own documentation reads "The LDAP
 //! activities could not be performed because they are limited by the LDAPS status".
 //!
@@ -203,8 +204,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // There is a switch to turn off only where LDAP secure calls are active: a
-        // directory nothing enabled LDAPS for carries no setting at all, one still being
-        // enabled has not finished the transition its enable started, and one already
+        // directory nothing enabled LDAPS for carries no setting at all, and one already
         // deactivated is in the state this request asks for. In each case the activity
         // asked for is limited by the status the setting carries, which is the modelled
         // refusal for exactly that, stated by this service's shared sentence for it: the
@@ -223,15 +223,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // The request is accepted. The deactivation is in force the instant this call
-        // answers, and nothing but this call has changed the status, so there is no state
-        // change to describe in `LDAPSStatusReason`.
+        // answers, and nothing failed on the way, so there is no state change to describe
+        // in `LDAPSStatusReason`.
         directory.ldaps_settings.insert(
             input.r#type.clone(),
             crate::state::LdapsSetting {
                 status: crate::state::LDAPS_STATUS_DISABLED.to_string(),
                 status_reason: None,
                 last_updated: now,
-                status_due_at: None,
             },
         );
 

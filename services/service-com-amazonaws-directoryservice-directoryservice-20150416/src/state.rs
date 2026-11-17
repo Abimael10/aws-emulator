@@ -21,7 +21,6 @@
 //!   trust leaving `Creating` or `Verifying` (and a torn-down one settling on `Deleted`
 //!   and then leaving the store), an
 //!   assessment leaving `IN_PROGRESS`, a
-//!   directory's LDAP security leaving `Enabling`, a
 //!   registered certificate leaving `Registering`, an organization directory share
 //!   leaving `Sharing` (and an unshared one leaving the store), a schema extension
 //!   leaving `Initializing` or `CancelInProgress`, a domain controller leaving
@@ -769,27 +768,25 @@ pub const CERTIFICATE_TYPE_CLIENT_LDAPS: &str = "ClientLDAPS";
 /// `ClientCertAuth`. The default value is `ClientLDAPS`."
 pub const DEFAULT_CERTIFICATE_TYPE: &str = CERTIFICATE_TYPE_CLIENT_LDAPS;
 
-/// The `LDAPSStatus` a directory's LDAP security carries between `EnableLDAPS` and
-/// [`TRANSITION_SPAN`]: the first value of the modelled `LDAPSStatus` enum
+/// The `LDAPSStatus` a directory's LDAP security carries once `EnableLDAPS` has
+/// activated it: the `Enabled` value of the modelled `LDAPSStatus` enum
 /// (`smithy_query(query="shape", shape="LDAPSStatus")` answers `["Enabling", "Enabled",
 /// "EnableFailed", "Disabled"]`).
 ///
-/// `EnableLDAPS` "activates the switch for the specific directory to always use LDAP
-/// secure calls" and answers before that switch is in service — the enum carries both
-/// the transient `Enabling` and the settled `Enabled` — so the move to
-/// [`LDAPS_STATUS_ENABLED`] is owed by the clock, on the same span a create's stage
-/// transition uses.
-pub const LDAPS_STATUS_ENABLING: &str = "Enabling";
-
-/// The `LDAPSStatus` a directory's LDAP security reaches once the enable's
-/// [`TRANSITION_SPAN`] has elapsed: the modelled enum's `Enabled` value.
+/// `EnableLDAPS` switches a setting of a directory this service already holds — nothing
+/// is built for it, which is why the operation is modelled with no output members at all
+/// and hands the caller no status to wait out — so the call itself applies the switch and
+/// `DescribeLDAPSSettings` reports this settled status from the next read on, exactly as
+/// the data-access toggle of the same directory does. Nothing is left for the clock in
+/// either direction, which is why no record of this service rests on the enum's
+/// `Enabling` value.
 pub const LDAPS_STATUS_ENABLED: &str = "Enabled";
 
 /// The `LDAPSStatus` LDAP security carries once `DisableLDAPS` has deactivated it: the
 /// modelled enum's `Disabled` value.
 ///
 /// The enum carries no transient value on the way down — there is no `Disabling` — so a
-/// deactivation settles the instant it is recorded and owes the clock nothing.
+/// deactivation settles the instant it is recorded, the same instant an activation does.
 pub const LDAPS_STATUS_DISABLED: &str = "Disabled";
 
 /// The `DirectoryType` values LDAP secure calls can be activated for.
@@ -1242,6 +1239,10 @@ impl IpRouteRecord {
 /// `EnableLDAPS` and `DisableLDAPS` are what record and change one, so a directory
 /// nothing has enabled LDAPS for carries no entry at all — which is what
 /// `DescribeLDAPSSettings` then reports: an empty list.
+///
+/// Both of those operations apply the switch they ask for in the call that asks for it
+/// (see [`LDAPS_STATUS_ENABLED`]), so a setting carries no due instant: there is no
+/// transition for `advance_clock` to settle on it.
 #[derive(Debug, Clone)]
 pub struct LdapsSetting {
     /// One of the modelled `LDAPSStatus` values.
@@ -1250,9 +1251,6 @@ pub struct LdapsSetting {
     pub status_reason: Option<String>,
     /// When this setting last changed, as `LastUpdatedDateTime` reports it.
     pub last_updated: SystemTime,
-    /// When the status transition the enable owes falls due; `None` once there is none
-    /// left to make. See [`TRANSITION_SPAN`].
-    pub status_due_at: Option<SystemTime>,
 }
 
 impl LdapsSetting {
@@ -2528,17 +2526,16 @@ impl Directory {
     }
 
     /// Whether this directory's LDAP security rests on the certificates it holds:
-    /// whether LDAP secure calls are active for any `LDAPSType` of it, or on their way
-    /// there under the transition an activation owes.
+    /// whether LDAP secure calls are active for any `LDAPSType` of it.
     ///
     /// While they are, the registrations that perform
     /// [`CERTIFICATE_TYPE_CLIENT_LDAPS`] are what secures them, which is what
     /// `DeregisterCertificate` refuses to take out from under a live LDAP security
     /// connection.
     pub fn ldaps_security_in_force(&self) -> bool {
-        self.ldaps_settings.values().any(|setting| {
-            setting.status == LDAPS_STATUS_ENABLING || setting.status == LDAPS_STATUS_ENABLED
-        })
+        self.ldaps_settings
+            .values()
+            .any(|setting| setting.status == LDAPS_STATUS_ENABLED)
     }
 
     /// Whether a change to this directory's IP routing is still being applied: whether any
@@ -3691,8 +3688,8 @@ impl ComAmazonawsDirectoryserviceDirectoryservice20150416State {
     /// `EnableDirectoryDataAccess` ran, a directory's CA enrollment policy status when
     /// `EnableCAEnrollmentPolicy` or `DisableCAEnrollmentPolicy` ran, a directory
     /// setting's status when
-    /// `UpdateSettings` ran, a directory's LDAPS status when `EnableLDAPS`
-    /// ran, a domain controller's status when the placement or the retirement of it ran,
+    /// `UpdateSettings` ran, a domain controller's status when the placement or the
+    /// retirement of it ran,
     /// a directory's teardown when `DeleteDirectory` ran.
     pub fn advance_clock(&mut self, now: SystemTime) {
         for directory in self.directories.values_mut() {
@@ -3797,20 +3794,10 @@ impl ComAmazonawsDirectoryserviceDirectoryservice20150416State {
                 certificate.state != CERTIFICATE_STATE_DEREGISTERING
                     || certificate.state_due_at.is_some_and(|due| now < due)
             });
-            // The status transition `EnableLDAPS` owes: the transient `Enabling`
-            // settles on `Enabled`. A deactivation has no transient status to settle
-            // out of — the modelled enum carries no `Disabling` — so `DisableLDAPS`
-            // records the settled status itself and leaves nothing here to do.
-            for setting in directory.ldaps_settings.values_mut() {
-                let Some(due) = setting.status_due_at else {
-                    continue;
-                };
-                if now >= due && setting.status == LDAPS_STATUS_ENABLING {
-                    setting.status = LDAPS_STATUS_ENABLED.to_string();
-                    setting.last_updated = due;
-                    setting.status_due_at = None;
-                }
-            }
+            // A directory's LDAP security leaves nothing here to do: `EnableLDAPS` and
+            // `DisableLDAPS` switch a setting of a directory this service already holds,
+            // so each of them records the settled status itself (see
+            // [`LDAPS_STATUS_ENABLED`]).
             // The status transitions the schema-extension writes owe: the transient
             // `Initializing` a start answers in settles on `Completed`, and the transient
             // `CancelInProgress` a cancel answers in settles on `Cancelled`. Either way

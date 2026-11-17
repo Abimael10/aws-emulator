@@ -10,23 +10,36 @@
 //! The rule under test is that LDAP security is a switch a directory carries per
 //! `LDAPSType`: it can be activated only for a directory that is in service, of a type
 //! that serves an LDAPS endpoint, that holds a certificate in service securing LDAP
-//! calls, and whose LDAP security is not already active — and activating it records the
-//! transient status the clock settles on the active one, while deactivating it records
-//! the inactive status at once. Every suite below reads the recorded status back through
-//! `DescribeLDAPSSettings`, the operation a client discovers it by.
+//! calls, and whose LDAP security is not already active — and both operations APPLY the
+//! switch they ask for in the call that asks for it, so the first read after either one
+//! reports the position it put the switch in and nothing moves it afterwards. Every suite
+//! below reads the recorded status back through `DescribeLDAPSSettings`, the operation a
+//! client discovers it by.
+//!
+//! Every wait below waits for the CONDITION — the build of a directory, the registration
+//! of a certificate — by looking again until it holds, so no case's outcome depends on how
+//! fast the host runs.
 
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
+use crate::ad_connector::{connect_directory, minimal_connect};
 use crate::certificates::{
-    certificate_pem, connector_in_service, register, TYPE_CLIENT_CERT_AUTH, TYPE_CLIENT_LDAPS,
+    certificate_pem, describe, register, STATE_REGISTERED,
+    TYPE_CLIENT_CERT_AUTH, TYPE_CLIENT_LDAPS,
 };
 use crate::directory_lifecycle::{
-    call, create_directory, minimal_create, ok, refused, service, PAST_ONE_SPAN,
+    await_in_service, call, create_directory, minimal_create, ok, refused, service, string,
 };
 use crate::microsoft_ad::{create_microsoft_ad, minimal_microsoft_ad};
+
+/// How many times a case looks again for a registration to be made, and how long it leaves
+/// between looks: a generous bound on a state that never settles rather than a wait for a
+/// known duration.
+const LOOK_ATTEMPTS: usize = 1200;
+const LOOK_AGAIN: Duration = Duration::from_millis(50);
 
 /// Every value of the modelled `LDAPSType` enum
 /// (`smithy_query(query="shape",shape="LDAPSType")` answers `["Client"]`), which is what
@@ -36,9 +49,8 @@ const LDAPS_TYPE_CATALOG: [&str; 1] = ["Client"];
 
 /// The values of the modelled `LDAPSStatus` enum
 /// (`smithy_query(query="shape",shape="LDAPSStatus")` answers `["Enabling", "Enabled",
-/// "EnableFailed", "Disabled"]`) this emulator's own writes produce: the transient status
-/// an activation answers in, the one it settles on, and the one a deactivation records.
-const STATUS_ENABLING: &str = "Enabling";
+/// "EnableFailed", "Disabled"]`) this emulator's own writes produce: the one an activation
+/// records and the one a deactivation records.
 const STATUS_ENABLED: &str = "Enabled";
 const STATUS_DISABLED: &str = "Disabled";
 
@@ -49,16 +61,53 @@ fn epoch_seconds(at: SystemTime) -> f64 {
         .as_secs_f64()
 }
 
-/// A Managed Microsoft AD directory past the stage transition its create owes, so it is
-/// in service for the activations the cases make.
+/// A Managed Microsoft AD directory the case has looked for until its build finished, so
+/// it is in service for the activations the cases make.
 async fn directory_in_service(router: &MultiServiceRouter, name: &str, case: &str) -> String {
     let id = create_microsoft_ad(router, minimal_microsoft_ad(name), case).await;
-    tokio::time::sleep(PAST_ONE_SPAN).await;
+    await_in_service(router, &id, case).await;
     id
 }
 
-/// A certificate of `certificate_type` registered with `directory_id` and waited past the
-/// transition its register owes, so it is the certificate in service an activation needs.
+/// An AD CONNECTOR directory the case has looked for the same way.
+///
+/// Client authentication — what a `ClientCertAuth` certificate performs — is offered for
+/// this directory type and no other, so every row whose inventory holds such a certificate
+/// is made against one of these.
+async fn connector_in_service(router: &MultiServiceRouter, name: &str, case: &str) -> String {
+    let id = connect_directory(router, minimal_connect(name), case).await;
+    await_in_service(router, &id, case).await;
+    id
+}
+
+/// Look again until `DescribeCertificate` reports `certificate_id` registered.
+///
+/// A registration IS a clock-owed transition — `RegisterCertificate` answers while the
+/// registration is still being made — so a case that needs the certificate in service
+/// polls for THAT CONDITION instead of waiting a fixed time for it.
+async fn await_registered(
+    router: &MultiServiceRouter,
+    directory_id: &str,
+    certificate_id: &str,
+    case: &str,
+) {
+    for _ in 0..LOOK_ATTEMPTS {
+        let certificate = describe(router, directory_id, certificate_id, case).await;
+        if string(&certificate, "State", case) == STATE_REGISTERED {
+            return;
+        }
+        tokio::time::sleep(LOOK_AGAIN).await;
+    }
+    let certificate = describe(router, directory_id, certificate_id, case).await;
+    panic!(
+        "case {case:?}: expected {certificate_id} to reach State {STATE_REGISTERED}, it stayed \
+         at {:?}",
+        certificate["State"]
+    );
+}
+
+/// A certificate of `certificate_type` registered with `directory_id` and looked for until
+/// the registration was made, so it is the certificate in service an activation needs.
 async fn certificate_in_service(
     router: &MultiServiceRouter,
     directory_id: &str,
@@ -77,7 +126,7 @@ async fn certificate_in_service(
         case,
     )
     .await;
-    tokio::time::sleep(PAST_ONE_SPAN).await;
+    await_registered(router, directory_id, &id, case).await;
     id
 }
 
@@ -157,7 +206,7 @@ struct ActivationCase {
 }
 
 #[tokio::test]
-async fn an_activation_records_the_transient_status_the_clock_settles() {
+async fn an_activation_is_in_force_from_the_call_that_makes_it() {
     let router = service();
 
     // The rows differ along the certificate inventory the directory holds — one
@@ -225,20 +274,19 @@ async fn an_activation_records_the_transient_status_the_clock_settles() {
         enable(&router, &directory_id, ldaps_type, case).await;
         let enabled_until = epoch_seconds(SystemTime::now());
 
-        // The activation answers before LDAP secure calls are in service, so the
-        // transient status is what a caller acting straight after it observes.
+        // The activation applies the switch it asks for, so the status a caller reads
+        // straight after it is the one the activation put the switch in.
         let recorded = required_setting(&router, &directory_id, ldaps_type, case).await;
         assert_eq!(
             recorded["LDAPSStatus"],
-            json!(STATUS_ENABLING),
-            "case {case:?}: expected the transient status right after the activation, got {recorded}"
+            json!(STATUS_ENABLED),
+            "case {case:?}: expected the active status right after the activation, got {recorded}"
         );
-        // Nothing but the clock has changed this status, so there is no state change to
-        // describe.
+        // Nothing failed on the way, so there is no state change to describe.
         assert!(
             recorded["LDAPSStatusReason"].is_null(),
-            "case {case:?}: expected no LDAPSStatusReason on a status only the clock \
-             moves, got {recorded}"
+            "case {case:?}: expected no LDAPSStatusReason on a switch nothing failed for, \
+             got {recorded}"
         );
         let updated = recorded["LastUpdatedDateTime"].as_f64().unwrap_or_else(|| {
             panic!("case {case:?}: expected a LastUpdatedDateTime, got {recorded}")
@@ -256,23 +304,8 @@ async fn an_activation_records_the_transient_status_the_clock_settles() {
             "case {case:?}: expected a repeated read to report the same setting, got {again}"
         );
 
-        // The transition the activation owed has fallen due: the status settles on the
-        // active one, and the clock — not a later call — is what moved it.
-        tokio::time::sleep(PAST_ONE_SPAN).await;
-        let settled = required_setting(&router, &directory_id, ldaps_type, case).await;
-        assert_eq!(
-            settled["LDAPSStatus"],
-            json!(STATUS_ENABLED),
-            "case {case:?}: expected the settled status once the transition fell due, got {settled}"
-        );
-        assert!(
-            settled["LastUpdatedDateTime"].as_f64().unwrap_or_default() >= updated,
-            "case {case:?}: expected the settled instant not to precede the activation, \
-             got {settled}"
-        );
-
         // An activation of LDAP security that is already active is refused rather than
-        // restarting the transition, and the recorded setting is left alone.
+        // written again, and the recorded setting is left alone.
         refused(
             &router,
             "EnableLDAPS",
@@ -283,7 +316,7 @@ async fn an_activation_records_the_transient_status_the_clock_settles() {
         .await;
         let untouched = required_setting(&router, &directory_id, ldaps_type, case).await;
         assert_eq!(
-            untouched, settled,
+            untouched, recorded,
             "case {case:?}: expected the refused activation to change nothing, got {untouched}"
         );
     }
@@ -338,7 +371,7 @@ async fn an_activation_needs_a_certificate_in_service_securing_ldap_calls() {
         let registering =
             directory_in_service(&router, "registering.example.com", "still registering").await;
         let (pem, _) = certificate_pem(Some("pending.example.com"), (2031, 2, 3));
-        register(
+        let pending = register(
             &router,
             json!({
                 "DirectoryId": &registering,
@@ -373,10 +406,10 @@ async fn an_activation_needs_a_certificate_in_service_securing_ldap_calls() {
         }
 
         // The refusal was about the certificate, so the very same call is admitted once
-        // the registration the last row made has settled.
-        tokio::time::sleep(PAST_ONE_SPAN).await;
+        // the registration the last row made has been looked for and found: the
+        // activation then applies the switch, and the next read reports it active.
+        await_registered(&router, &registering, &pending, "the registration settled").await;
         enable(&router, &registering, ldaps_type, "the registration settled").await;
-        tokio::time::sleep(PAST_ONE_SPAN).await;
         assert_eq!(
             ldaps_status(
                 &router,
@@ -480,7 +513,7 @@ async fn both_operations_need_a_directory_in_service_of_a_type_that_serves_ldaps
             "a type that serves no LDAPS endpoint",
         )
         .await;
-        tokio::time::sleep(PAST_ONE_SPAN).await;
+        await_in_service(&router, &simple, "a type that serves no LDAPS endpoint").await;
         for operation in ["EnableLDAPS", "DisableLDAPS"] {
             refused(
                 &router,
@@ -537,29 +570,10 @@ async fn a_deactivation_needs_ldap_security_that_is_active() {
             "never activated"
         );
 
-        // LDAP security that is still being activated has not finished the transition
-        // its activation started, so the deactivation is refused there too...
-        enable(&router, &directory_id, ldaps_type, "mid-transition").await;
-        refused(
-            &router,
-            "DisableLDAPS",
-            json!({ "DirectoryId": &directory_id, "Type": ldaps_type }),
-            "InvalidLDAPSStatusException",
-            "mid-transition",
-        )
-        .await;
-        assert_eq!(
-            ldaps_status(&router, &directory_id, ldaps_type, "mid-transition")
-                .await
-                .as_deref(),
-            Some(STATUS_ENABLING),
-            "case {:?}: expected the refused deactivation to leave the transient status",
-            "mid-transition"
-        );
-
-        // ...and admitted once that transition has fallen due, where it takes effect at
-        // once: the modelled status enum carries no transient value on the way down.
-        tokio::time::sleep(PAST_ONE_SPAN).await;
+        // LDAP security the activation just put in force is what there is a switch to
+        // turn off, so the deactivation is admitted on the very next call and takes
+        // effect at once: the modelled status enum carries no transient value either way.
+        enable(&router, &directory_id, ldaps_type, "activated").await;
         let disabled_from = epoch_seconds(SystemTime::now());
         disable(&router, &directory_id, ldaps_type, "deactivated").await;
         let disabled_until = epoch_seconds(SystemTime::now());
@@ -579,9 +593,8 @@ async fn a_deactivation_needs_ldap_security_that_is_active() {
             "deactivated"
         );
 
-        // The clock owes a deactivated setting nothing: it is still inactive a span
-        // later.
-        tokio::time::sleep(PAST_ONE_SPAN).await;
+        // The clock owes a deactivated setting nothing: it reads the same however many
+        // reads come after it.
         assert_eq!(
             ldaps_status(&router, &directory_id, ldaps_type, "deactivated")
                 .await
@@ -601,15 +614,15 @@ async fn a_deactivation_needs_ldap_security_that_is_active() {
         )
         .await;
 
-        // A deactivated switch can be activated again, and the cycle runs through the
-        // same transient status as the first time.
+        // A deactivated switch can be activated again, and the cycle puts it back in
+        // force the same way the first activation did.
         enable(&router, &directory_id, ldaps_type, "reactivated").await;
         assert_eq!(
             ldaps_status(&router, &directory_id, ldaps_type, "reactivated")
                 .await
                 .as_deref(),
-            Some(STATUS_ENABLING),
-            "case {:?}: expected the transient status on a reactivation",
+            Some(STATUS_ENABLED),
+            "case {:?}: expected the reactivation to be in force at once",
             "reactivated"
         );
         refused(
@@ -620,13 +633,12 @@ async fn a_deactivation_needs_ldap_security_that_is_active() {
             "reactivated twice",
         )
         .await;
-        tokio::time::sleep(PAST_ONE_SPAN).await;
         assert_eq!(
             ldaps_status(&router, &directory_id, ldaps_type, "reactivated")
                 .await
                 .as_deref(),
             Some(STATUS_ENABLED),
-            "case {:?}: expected the reactivation to settle on the active status",
+            "case {:?}: expected the refused second activation to leave it active",
             "reactivated"
         );
     }
@@ -651,7 +663,6 @@ async fn ldap_security_is_recorded_per_directory() {
     }
 
     enable(&router, &first, ldaps_type, "per directory").await;
-    tokio::time::sleep(PAST_ONE_SPAN).await;
 
     // The activation reached the directory it named and no other.
     assert_eq!(
@@ -685,8 +696,285 @@ async fn ldap_security_is_recorded_per_directory() {
         ldaps_status(&router, &second, ldaps_type, "per directory")
             .await
             .as_deref(),
-        Some(STATUS_ENABLING),
-        "case {:?}: expected the other directory's own transient status",
+        Some(STATUS_ENABLED),
+        "case {:?}: expected the other directory's own switch to be in force",
         "per directory"
     );
+}
+
+/// Which directory type a row of the switch table drives, both of which serve an LDAPS
+/// endpoint (`state::LDAPS_SUPPORTED_DIRECTORY_TYPES`).
+#[derive(Debug, Clone, Copy)]
+enum Kind {
+    /// `CreateMicrosoftAD`: AWS Managed Microsoft AD.
+    MicrosoftAd,
+    /// `ConnectDirectory`: an AD Connector.
+    Connector,
+}
+
+/// One row of the switch table: the directory the switch is carried by, how many
+/// certificates securing LDAP calls it holds, and how many activate/deactivate cycles it
+/// is driven through.
+struct SwitchCase {
+    case: &'static str,
+    kind: Kind,
+    certificates: usize,
+    cycles: usize,
+}
+
+/// The row's directory, created but not yet looked for: the rows are all created before
+/// any of them is waited on, so their build windows overlap instead of adding up.
+async fn switch_directory(
+    router: &MultiServiceRouter,
+    kind: Kind,
+    name: &str,
+    case: &str,
+) -> String {
+    match kind {
+        Kind::MicrosoftAd => create_microsoft_ad(router, minimal_microsoft_ad(name), case).await,
+        Kind::Connector => connect_directory(router, minimal_connect(name), case).await,
+    }
+}
+
+/// The status reported for one directory's switch, which the case requires to be recorded.
+async fn recorded_status(
+    router: &MultiServiceRouter,
+    directory_id: &str,
+    ldaps_type: &str,
+    case: &str,
+) -> String {
+    ldaps_status(router, directory_id, ldaps_type, case)
+        .await
+        .unwrap_or_else(|| panic!("case {case:?}: expected a recorded LDAPS setting"))
+}
+
+/// RULE: both toggles switch a setting of a directory this service already holds — neither
+/// is modelled with a single output member (`smithy_query(query="operation",
+/// operation="EnableLDAPS")` — input `{DirectoryId, Type}`, output `{}`), so neither hands
+/// the caller a status to wait out — so each is applied by the call that makes it: the
+/// FIRST `DescribeLDAPSSettings` after a toggle reports the position it put the switch in,
+/// and nothing, no later call and no clock, moves it afterwards.
+///
+/// The rows span the class rather than one recorded call: both directory types that serve
+/// an LDAPS endpoint, differing in how many certificates securing LDAP calls the directory
+/// holds, each driven through a different NUMBER of cycles, with a directory in the same
+/// store that is never toggled as the control — so a switch that is not per-directory, or
+/// that needs a wait anywhere in the cycle, cannot pass.
+#[tokio::test]
+async fn every_ldaps_switch_takes_effect_in_the_call_that_makes_it() {
+    for ldaps_type in LDAPS_TYPE_CATALOG {
+        let router = service();
+
+        let rows = [
+            SwitchCase {
+                case: "a Managed Microsoft AD with one certificate, one cycle",
+                kind: Kind::MicrosoftAd,
+                certificates: 1,
+                cycles: 1,
+            },
+            SwitchCase {
+                case: "a Managed Microsoft AD with three certificates, two cycles",
+                kind: Kind::MicrosoftAd,
+                certificates: 3,
+                cycles: 2,
+            },
+            SwitchCase {
+                case: "an AD Connector with one certificate, three cycles",
+                kind: Kind::Connector,
+                certificates: 1,
+                cycles: 3,
+            },
+            SwitchCase {
+                case: "the control directory, never toggled",
+                kind: Kind::MicrosoftAd,
+                certificates: 1,
+                cycles: 0,
+            },
+        ];
+
+        // Every row's directory lives in ONE store, so a switch that is not per-directory
+        // cannot pass. All of them are created first and looked for afterwards, so the one
+        // transition the clock owes here runs for every row at once.
+        let mut created: Vec<(&SwitchCase, String)> = Vec::new();
+        for (index, row) in rows.iter().enumerate() {
+            let id = switch_directory(
+                &router,
+                row.kind,
+                &format!("switch{index}.example.com"),
+                row.case,
+            )
+            .await;
+            created.push((row, id));
+        }
+        for (row, id) in &created {
+            await_in_service(&router, id, row.case).await;
+            for certificate in 0..row.certificates {
+                certificate_in_service(
+                    &router,
+                    id,
+                    &format!("ldaps-{certificate}.example.com"),
+                    TYPE_CLIENT_LDAPS,
+                    row.case,
+                )
+                .await;
+            }
+
+            // Nothing has activated LDAP security yet, so the store holds no setting for
+            // the directory at all.
+            let before = ldaps_status(&router, id, ldaps_type, row.case).await;
+            assert_eq!(
+                before, None,
+                "case {:?}: expected no LDAPS setting before any activation, got {before:?}",
+                row.case
+            );
+        }
+
+        for (row, id) in &created {
+            for cycle in 1..=row.cycles {
+                let case = format!("{} (cycle {cycle} activation)", row.case);
+                enable(&router, id, ldaps_type, &case).await;
+                let reported = recorded_status(&router, id, ldaps_type, &case).await;
+                assert_eq!(
+                    reported, STATUS_ENABLED,
+                    "case {case:?}: expected the activation to be in force on the next \
+                     read, got {reported:?}"
+                );
+
+                // A second activation asks for the position the first one already put the
+                // switch in, and leaves it there.
+                refused(
+                    &router,
+                    "EnableLDAPS",
+                    json!({ "DirectoryId": id, "Type": ldaps_type }),
+                    "InvalidLDAPSStatusException",
+                    &case,
+                )
+                .await;
+                let after_refusal = recorded_status(&router, id, ldaps_type, &case).await;
+                assert_eq!(
+                    after_refusal, STATUS_ENABLED,
+                    "case {case:?}: expected the refused second activation to leave the \
+                     switch in force, got {after_refusal:?}"
+                );
+
+                let case = format!("{} (cycle {cycle} deactivation)", row.case);
+                disable(&router, id, ldaps_type, &case).await;
+                let reported = recorded_status(&router, id, ldaps_type, &case).await;
+                assert_eq!(
+                    reported, STATUS_DISABLED,
+                    "case {case:?}: expected the deactivation to be in force on the next \
+                     read, got {reported:?}"
+                );
+                refused(
+                    &router,
+                    "DisableLDAPS",
+                    json!({ "DirectoryId": id, "Type": ldaps_type }),
+                    "InvalidLDAPSStatusException",
+                    &case,
+                )
+                .await;
+            }
+        }
+
+        // One closing activation per toggled row, then every row is read again with the
+        // other rows' calls in between: each switch is exactly where its own last call
+        // left it — the toggled ones in force, the control holding no setting — because a
+        // toggle leaves nothing for a later call or the clock to settle.
+        for (row, id) in &created {
+            if row.cycles > 0 {
+                let case = format!("{} (the closing activation)", row.case);
+                enable(&router, id, ldaps_type, &case).await;
+            }
+        }
+        for (row, id) in &created {
+            let case = format!("{} (read again after every row's calls)", row.case);
+            let reported = ldaps_status(&router, id, ldaps_type, &case).await;
+            let expected = if row.cycles > 0 {
+                Some(STATUS_ENABLED)
+            } else {
+                None
+            };
+            assert_eq!(
+                reported.as_deref(),
+                expected,
+                "case {case:?}: expected {expected:?}, got {reported:?}"
+            );
+        }
+    }
+}
+
+/// RULE: the switch waits for the transitions the clock DOES owe — the directory's build
+/// and the registration of the certificate it is served by — and for nothing else: refused
+/// from both until they have finished, in force on the read after the call that is
+/// admitted.
+#[tokio::test]
+async fn the_switch_waits_for_the_build_and_the_certificate_and_for_nothing_else() {
+    for ldaps_type in LDAPS_TYPE_CATALOG {
+        let router = service();
+        let case = "a directory still being built";
+        let directory_id = create_microsoft_ad(
+            &router,
+            minimal_microsoft_ad("waits.example.com"),
+            case,
+        )
+        .await;
+
+        // The create answers while the directory's servers are still coming up, so the
+        // activation is refused for the directory being out of service.
+        refused(
+            &router,
+            "EnableLDAPS",
+            json!({ "DirectoryId": &directory_id, "Type": ldaps_type }),
+            "DirectoryUnavailableException",
+            case,
+        )
+        .await;
+
+        // Once the build has finished the refusal moves on to what the switch is served
+        // by: a directory holding no certificate in service securing LDAP calls.
+        await_in_service(&router, &directory_id, "a directory whose build has finished").await;
+        let case = "a directory holding no certificate";
+        refused(
+            &router,
+            "EnableLDAPS",
+            json!({ "DirectoryId": &directory_id, "Type": ldaps_type }),
+            "NoAvailableCertificateException",
+            case,
+        )
+        .await;
+        let refused_status = ldaps_status(&router, &directory_id, ldaps_type, case).await;
+        assert_eq!(
+            refused_status, None,
+            "case {case:?}: expected the refused activations to record no setting, got \
+             {refused_status:?}"
+        );
+
+        // With both of those transitions behind it, the very same call is admitted and the
+        // switch is in force for the request that follows it...
+        let case = "a directory with its certificate registered";
+        certificate_in_service(
+            &router,
+            &directory_id,
+            "waits.example.com",
+            TYPE_CLIENT_LDAPS,
+            case,
+        )
+        .await;
+        enable(&router, &directory_id, ldaps_type, case).await;
+        let reported = recorded_status(&router, &directory_id, ldaps_type, case).await;
+        assert_eq!(
+            reported, STATUS_ENABLED,
+            "case {case:?}: expected the admitted activation to be in force at once, got \
+             {reported:?}"
+        );
+
+        // ...and the deactivation that follows it the same way.
+        disable(&router, &directory_id, ldaps_type, case).await;
+        let reported = recorded_status(&router, &directory_id, ldaps_type, case).await;
+        assert_eq!(
+            reported, STATUS_DISABLED,
+            "case {case:?}: expected the deactivation to be in force at once, got \
+             {reported:?}"
+        );
+    }
 }
