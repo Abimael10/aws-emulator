@@ -7,9 +7,13 @@
 //! `DeletionId` it minted.
 //!
 //! A request naming a `DeletionId` is asking about that one deletion — "this ID was returned
-//! by the `DeleteInventory` operation" — so an id this Region has recorded no deletion under
-//! is the modelled `InvalidDeletionIdException`; a request naming none is served every
-//! deletion the Region has recorded, in ascending deletion-id order and one page at a time.
+//! by the `DeleteInventory` operation" — and a request naming none is asking about every
+//! deletion the Region has recorded; either way the answer is the LISTING the operation is
+//! `@paginated` over, in ascending deletion-id order and one page at a time. So an id this
+//! Region recorded no deletion under is reported as the empty list it matches, the same answer
+//! an account with no deletion history gets: the deletion history a read projects is what has
+//! been recorded, and nothing has been recorded under an id no delete of this endpoint
+//! handed out.
 //!
 //! ## Shape of an operation
 //!
@@ -169,25 +173,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let region = crate::state::request_region(ctx.parts());
         let store = state.lock();
         let wanted = crate::state::non_empty(input.deletion_id.as_deref());
+        // "Specify the delete inventory ID for which you want information. This ID was
+        // returned by the `DeleteInventory` operation": a request naming one reports the
+        // deletion it names, and a request naming none reports every deletion this Region
+        // recorded. Either way this is a LISTING — the operation is `@paginated` over
+        // `InventoryDeletions` — so a well-formed id this Region recorded no deletion under
+        // reports the empty list it matches rather than a refusal, exactly as an account with
+        // no deletion history at all does.
         let recorded: Vec<&InventoryDeletionRecord> = store
             .inventory_deletions_in_region(&region)
             .filter(|record| wanted.is_none_or(|wanted| wanted == record.deletion_id))
             .collect();
-        // "Specify the delete inventory ID for which you want information. This ID was
-        // returned by the `DeleteInventory` operation": an id this Region recorded no deletion
-        // under was returned by no delete of this endpoint.
-        if wanted.is_some() && recorded.is_empty() {
-            return Err(
-                DescribeInventoryDeletionsErrorModeled::InvalidDeletionIdException(
-                    InvalidDeletionIdException {
-                        message: Some(
-                            crate::state::custom_inventory::UNKNOWN_DELETION_ID.to_string(),
-                        ),
-                    },
-                )
-                .into(),
-            );
-        }
 
         // The token a page hands out is the id of the deletion the next page starts at, so a
         // value that names no deletion this read holds names no page of it to resume.

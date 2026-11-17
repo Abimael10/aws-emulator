@@ -20,8 +20,9 @@
 //! node holds no inventory, and an attribute the node record holds no value for is
 //! reported by nothing and selected by no filter — the same rule
 //! [`super::ManagedNodeRecord::filter_values`] follows for the node describes. The other
-//! types are types this service knows and holds no item of, because the only item derived
-//! here is the node's own and the only items a caller writes are the `Custom:` ones
+//! types Systems Manager publishes ([`super::inventory_catalog`]) are types this service
+//! knows the schema of and holds no item of, because the only item derived here is the node's
+//! own and the only items a caller writes are the `Custom:` ones
 //! ([`super::custom_inventory`], written by `PutInventory` and removed by `DeleteInventory`):
 //! a query for one of those types is answered with the nothing that has been collected for
 //! it, never refused.
@@ -36,7 +37,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
-use crate::ops::types::{InventoryItemAttribute, InventoryItemSchema};
+use crate::ops::types::InventoryItemSchema;
 
 use super::ManagedNodeRecord;
 
@@ -46,49 +47,34 @@ use super::ManagedNodeRecord;
 /// `ResultAttribute$TypeName`).
 pub const INVENTORY_TYPE_INSTANCE_INFORMATION: &str = "AWS:InstanceInformation";
 
-/// The schema version the items of that type carry (`InventoryResultItem$SchemaVersion`,
-/// pattern `^([0-9]{1,6})(\.[0-9]{1,6})$`): the first version of a schema this service
-/// publishes and has never revised, since the attributes below are the ones a node has
-/// reported since the type existed.
-pub const INSTANCE_INFORMATION_SCHEMA_VERSION: &str = "1.0";
-
-/// The default inventory types this service knows the names of: "Default inventory item
-/// type names start with Amazon Web Services. … Default inventory item types include the
-/// following: `AWS:AWSComponent`, `AWS:Application`, `AWS:InstanceInformation`,
-/// `AWS:Network`, and `AWS:WindowsUpdate`" (`InventoryItemSchema$TypeName`).
+/// The schema version the ITEMS of that type carry here (`InventoryResultItem$SchemaVersion`,
+/// pattern `^([0-9]{1,6})(\.[0-9]{1,6})$`): the first version of that schema, which is the
+/// version the content projected from the node record belongs to — the attributes
+/// [`instance_information_attribute`] answers are the ones that version carries, and nothing
+/// here collects the ones the published revision added.
 ///
-/// A type this service knows is a type a query may name; only
-/// [`INVENTORY_TYPE_INSTANCE_INFORMATION`] has items here, so a query naming one of the
-/// others reads the nothing that has been collected for it.
-pub const DEFAULT_INVENTORY_TYPES: &[&str] = &[
-    "AWS:AWSComponent",
-    "AWS:Application",
-    INVENTORY_TYPE_INSTANCE_INFORMATION,
-    "AWS:Network",
-    "AWS:WindowsUpdate",
-];
+/// It is NOT the version the CATALOG publishes for the type: that is the current schema
+/// version, which [`super::inventory_catalog`] holds beside the type's full attribute list.
+pub const INSTANCE_INFORMATION_SCHEMA_VERSION: &str = "1.0";
 
 /// The prefix of a type name a caller's own schema carries, as against the Amazon ones:
 /// "Custom inventory type names will start with Custom" (`InventoryItemSchema$TypeName`).
 pub const CUSTOM_TYPE_PREFIX: &str = "Custom:";
 
-/// The attributes an `AWS:InstanceInformation` item is made of, in the order an item
-/// reports them. Each is one property of the registered node
-/// ([`instance_information_attribute`]): the node's identity and kind, the agent it runs,
+/// The attributes an `AWS:InstanceInformation` item is made of, which are the ones the
+/// published schema of that type carries
+/// ([`super::inventory_catalog::INSTANCE_INFORMATION_ATTRIBUTES`]) — the catalog is the one
+/// statement of what a type's attributes are, so a filter key, an aggregator expression and a
+/// reported schema all name the same set.
+///
+/// Each is one property of the registered node ([`instance_information_attribute`]), for the
+/// ones this endpoint holds a property for: the node's identity and kind, the agent it runs,
 /// the platform it runs on, its address and name, and the node status `GetInventory`
-/// documents this type as carrying.
-pub const INSTANCE_INFORMATION_ATTRIBUTES: &[&str] = &[
-    ATTRIBUTE_AGENT_TYPE,
-    "AgentVersion",
-    "ComputerName",
-    "InstanceId",
-    "InstanceStatus",
-    "IpAddress",
-    "PlatformName",
-    "PlatformType",
-    "PlatformVersion",
-    "ResourceType",
-];
+/// documents this type as carrying. An attribute no node record holds is reported by nothing
+/// and selected by no filter, the same answer the node describes give for a property nothing
+/// has recorded.
+pub const INSTANCE_INFORMATION_ATTRIBUTES: &[&str] =
+    super::inventory_catalog::INSTANCE_INFORMATION_ATTRIBUTES;
 
 /// The attribute naming WHICH agent reported the item. The node store records the agent's
 /// version but not its implementation ([`super::ManagedNodeRecord`] holds the modelled
@@ -303,10 +289,17 @@ pub fn split_qualified_attribute(name: &str) -> Option<(&str, &str)> {
         .then(|| (&name[..prefix.len() + 1 + type_tail.len()], attribute))
 }
 
-/// Whether `type_name` names an inventory type this service knows: one of the default
-/// types it publishes, or a caller's own `Custom:` type.
+/// Whether `type_name` names an inventory type this service knows: one of the types Systems
+/// Manager publishes, spelled exactly ([`super::inventory_catalog::is_published_type`]), or a
+/// name of the caller's own namespace satisfying the custom-name pattern
+/// ([`super::inventory_catalog::is_valid_custom_type_name`]).
+///
+/// The modelled `^(AWS|Custom):.*$` pattern admits the FORM of a name; this is the service's
+/// own rule about what such a name may be, and a value outside it names no inventory type at
+/// all ([`super::inventory_catalog::invalid_type_name_message`]).
 pub fn is_known_inventory_type(type_name: &str) -> bool {
-    DEFAULT_INVENTORY_TYPES.contains(&type_name) || type_name.starts_with(CUSTOM_TYPE_PREFIX)
+    super::inventory_catalog::is_published_type(type_name)
+        || super::inventory_catalog::is_valid_custom_type_name(type_name)
 }
 
 /// Why an inventory filter key cannot be served, or `None` when it can.
@@ -371,18 +364,15 @@ pub fn schema_page_size(max_results: Option<i32>) -> Result<usize, String> {
 /// a schema read walks them in, which is what lets a page resume from the type name it
 /// stopped at rather than from an offset.
 ///
-/// A schema is reported for a type whose ATTRIBUTES this endpoint knows:
+/// Two sets make it up:
 ///
-/// * [`INVENTORY_TYPE_INSTANCE_INFORMATION`], whose schema this service publishes
-///   ([`INSTANCE_INFORMATION_ATTRIBUTES`]) because the item is the projection of the node
-///   record;
+/// * every type Systems Manager PUBLISHES ([`super::inventory_catalog`]), with that type's
+///   published attribute list and schema version. A published schema says what an account may
+///   query, filter and aggregate on, which is why it is reported whether or not anything here
+///   has collected an item of the type — the discovery call is what a client reads BEFORE it
+///   has any data;
 /// * every custom type the Region holds items of, whose schema is what those items say
 ///   ([`super::custom_inventory::custom_type_schema`]).
-///
-/// The other default type NAMES this service knows ([`DEFAULT_INVENTORY_TYPES`]) are types it
-/// holds no schema of — nothing here describes what an `AWS:Network` item carries — and
-/// `InventoryItemSchema$Attributes` is `@required` with at least one attribute, so there is no
-/// schema to report for them rather than one with no attributes.
 ///
 /// `aggregatable_only` reports the schemas that "support aggregation", with only the
 /// attributes an aggregator may count over (`GetInventorySchemaRequest$Aggregator`): for the
@@ -395,31 +385,25 @@ pub fn reported_schemas(
     aggregatable_only: bool,
 ) -> BTreeMap<String, InventoryItemSchema> {
     let mut schemas = BTreeMap::new();
-    let attributes: &[&str] = if aggregatable_only {
-        INSTANCE_INFORMATION_AGGREGATABLE_ATTRIBUTES
-    } else {
-        INSTANCE_INFORMATION_ATTRIBUTES
-    };
-    schemas.insert(
-        INVENTORY_TYPE_INSTANCE_INFORMATION.to_string(),
-        InventoryItemSchema {
-            type_name: INVENTORY_TYPE_INSTANCE_INFORMATION.to_string(),
-            version: Some(INSTANCE_INFORMATION_SCHEMA_VERSION.to_string()),
-            attributes: attributes
-                .iter()
-                .map(|name| InventoryItemAttribute {
-                    name: (*name).to_string(),
-                    // Every property of a node record is text, including the ones whose
-                    // values look like numbers (an agent version, a platform version).
-                    data_type: super::custom_inventory::ATTRIBUTE_DATA_TYPE_STRING.to_string(),
-                })
-                .collect(),
-            // "The alias name of the inventory type … used for display purposes": Systems
-            // Manager publishes this type under its own name and this service holds no alias
-            // beside it, so none is invented.
-            display_name: None,
-        },
-    );
+    for published in super::inventory_catalog::PUBLISHED_INVENTORY_TYPES {
+        // The attributes an aggregator may count over, for the one type whose aggregatable
+        // attributes this service knows; a type it knows none of supports no aggregation it
+        // could report, so an aggregation read leaves that type out.
+        let aggregatable = (published.type_name == INVENTORY_TYPE_INSTANCE_INFORMATION)
+            .then_some(INSTANCE_INFORMATION_AGGREGATABLE_ATTRIBUTES);
+        let attributes = if aggregatable_only {
+            match aggregatable {
+                None => continue,
+                Some(attributes) => attributes,
+            }
+        } else {
+            published.attributes
+        };
+        schemas.insert(
+            published.type_name.to_string(),
+            published.to_schema(attributes),
+        );
+    }
     if aggregatable_only {
         return schemas;
     }

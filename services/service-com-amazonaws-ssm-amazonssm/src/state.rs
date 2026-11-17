@@ -314,6 +314,10 @@ pub mod patch_properties;
 /// each of them.
 pub mod patch_catalog;
 
+/// The inventory TYPES Systems Manager publishes — the catalog a schema read reports — and
+/// the naming rule a type name has to satisfy to name an inventory type at all.
+pub mod inventory_catalog;
+
 /// The inventory this service holds about the managed nodes of a Region — the
 /// `AWS:InstanceInformation` item every registered node has — and how a query filters and
 /// aggregates it.
@@ -2100,6 +2104,14 @@ pub struct ComAmazonawsSsmAmazonssmState {
     pub custom_inventory:
         BTreeMap<(String, String, String), custom_inventory::CustomInventoryItemRecord>,
 
+    /// Every custom inventory TYPE a write has defined, keyed by `(region, type name)`: the
+    /// type an item is written under is DEFINED for the Region by that write, and stays
+    /// defined until a `DeleteInventory` of its SCHEMA removes it — a different question from
+    /// whether any item of it is still held, since "the system only deletes existing
+    /// inventory data associated with the custom inventory type" when no schema option is
+    /// chosen. See [`custom_inventory`].
+    pub custom_inventory_types: BTreeSet<(String, String)>,
+
     /// Every inventory deletion a `DeleteInventory` recorded, keyed by `(region, deletion
     /// id)`: the id a delete hands back resolves to the deletion it names, and the client
     /// token a delete carried is what makes a repeat of it the same deletion.
@@ -2248,6 +2260,7 @@ impl Default for ComAmazonawsSsmAmazonssmState {
             ops_item_related_item_sequence: 0,
             ops_metadata: BTreeMap::new(),
             custom_inventory: BTreeMap::new(),
+            custom_inventory_types: BTreeSet::new(),
             inventory_deletions: BTreeMap::new(),
             service_settings: BTreeMap::new(),
             created_at: SystemTime::now(),

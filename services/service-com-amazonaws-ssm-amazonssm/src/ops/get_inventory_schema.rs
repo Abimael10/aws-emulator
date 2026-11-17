@@ -6,11 +6,13 @@
 //! names for a specific Inventory item type"
 //! ([`crate::state::inventory::reported_schemas`]).
 //!
-//! A schema is reported for a type whose ATTRIBUTES this endpoint knows: the
-//! `AWS:InstanceInformation` type Systems Manager publishes, whose item is the projection of
-//! the node record, and every custom type the Region holds items of, whose schema is what
-//! those items say ([`crate::state::custom_inventory`]) — so a schema a caller reads back is
-//! the one its own `PutInventory` wrote.
+//! Two sets make up what it reports: every inventory type Systems Manager PUBLISHES, with
+//! that type's published attributes and schema version
+//! ([`crate::state::inventory_catalog`]) — this is the discovery call, so the catalog is
+//! reported whether or not anything here has collected an item of a type — and every custom
+//! type the Region holds items of, whose schema is what those items say
+//! ([`crate::state::custom_inventory`]), so a schema a caller reads back is the one its own
+//! `PutInventory` wrote.
 //!
 //! What the request may narrow it by:
 //!
@@ -181,15 +183,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // A `TypeName` that names no inventory type at all cannot be served: the member
-        // carries no pattern, so a value that is not `AWS:` or `Custom:` followed by a type
-        // reaches here and names nothing this endpoint could hold a schema of.
+        // carries no pattern, so a value that is neither a published type name nor a
+        // well-formed custom one reaches here and names nothing this endpoint could hold a
+        // schema of.
         let wanted = crate::state::non_empty(input.type_name.as_deref());
         if let Some(type_name) = wanted {
             if !inventory::is_known_inventory_type(type_name) {
                 return Err(GetInventorySchemaErrorModeled::InvalidTypeNameException(
                     InvalidTypeNameException {
                         message: Some(
-                            crate::state::custom_inventory::unknown_type_name_message(type_name),
+                            crate::state::inventory_catalog::invalid_type_name_message(type_name),
                         ),
                     },
                 )

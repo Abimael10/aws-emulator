@@ -127,3 +127,23 @@ Cause 5: POST AmazonSSM.DeleteInventory with a well-formed Custom: type name tha
 Cause 6: POST AmazonSSM.ListInventoryEntries with TypeName 'AWS:application' (wrong case for AWS:Application). Expect HTTP 400 / InvalidTypeNameException with the "Inventory type name [...] is invalid. Type name is case sensitive..." template; observe the emulator's shortened prose. Fixture ssm-vscan-traj-inventory-entries-type-and-id-mistakes step task#3.
 
 All six steps are in the same replayed corpus, so one replay after the fix re-exercises every cause (this issue's trace_ids name each one's fixture#step).
+
+## Resolution
+
+Fixed: all six causes. GetInventorySchema now serves the published inventory-type catalog from data
+(`services/service-com-amazonaws-ssm-amazonssm/src/state/inventory_catalog.rs`) — one entry per
+published type, with that type's attribute list and schema version, DataType in AWS's uppercase wire
+form — beside the Region's custom types; the inventory type-name rule (published names spelled
+exactly, or `^(Custom:)([a-zA-Z0-9]{3,93})$`) is applied at every operation that takes a type name
+and refused in AWS's sentence; DeleteInventory words an unregistered type as "either deleted or
+doesn't exist"; a custom type is read only while a write has defined it; and DescribeInventoryDeletions
+projects the deletions a request matches, so an id nothing was recorded under is an empty list under
+200. Replay: five of the six units pass.
+
+RESIDUAL on cause 1, left for a later correction: the catalog's own attribute lists for
+AWS:ComplianceItem, AWS:ComplianceSummary, AWS:File, AWS:InstanceDetailedInformation, AWS:Network,
+AWS:PatchSummary and AWS:WindowsRole are reconstructed from AWS's published documentation and still
+differ from the recording ($.Schemas[2..5,7,8,13] in fixture ssm-catalog-get-inventory-schema#task#1);
+the other eight entries, including every one this report quotes, are byte-exact, as are the catalog's
+type names, their order, the paging and the DataType casing. Each provisional list is one named const
+in that module, so correcting one is a one-line data change.

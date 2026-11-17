@@ -14,13 +14,18 @@
 //!
 //! The decisions, in order:
 //!
-//! 1. the type name has to name an inventory type this service knows
-//!    ([`crate::state::inventory::is_known_inventory_type`]), which is the modelled
+//! 1. the type name has to name an inventory type this service knows — a name Systems Manager
+//!    publishes, spelled exactly, or a well-formed name of the caller's own namespace
+//!    ([`crate::state::inventory::is_known_inventory_type`]) — which is the modelled
 //!    `InvalidTypeNameException`;
 //! 2. every filter has to name an attribute of that type, which for the one type whose
 //!    schema this service publishes is one of that schema's attributes — the modelled
 //!    `InvalidFilter` ([`crate::state::inventory::entry_filter_key_rejection`]);
-//! 3. the entries: the ones the item this endpoint holds carries, narrowed to those meeting
+//! 3. a well-formed `Custom:` name has to stand for a type this account has DEFINED
+//!    ([`crate::state::ComAmazonawsSsmAmazonssmState::holds_custom_inventory_type`]): a write
+//!    defines the type and a delete of its schema removes it, and a name nothing stands under
+//!    is the same modelled refusal as 1, worded for that condition;
+//! 4. the entries: the ones the item this endpoint holds carries, narrowed to those meeting
 //!    EVERY filter and bounded by the page the request asked for. A node and type this
 //!    endpoint holds no item of reports no entry — what it holds — rather than a refusal:
 //!    the read reports what has been collected for a node, and nothing has been collected
@@ -203,7 +208,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(ListInventoryEntriesErrorModeled::InvalidTypeNameException(
                 InvalidTypeNameException {
                     message: Some(
-                        crate::state::custom_inventory::unknown_type_name_message(
+                        crate::state::inventory_catalog::invalid_type_name_message(
                             &input.type_name,
                         ),
                     ),
@@ -236,6 +241,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // own item is projected — with no guard of it held.
         crate::state::node_registration::settle_registrations(&*self.engine, &region);
         let store = state.lock();
+        // Whether a `Custom:` name stands for a type at all is a question about what the
+        // account holds, so it is decided once the store is open: a custom type is DEFINED by
+        // the write that first put an item under it and stops being defined when a delete
+        // removes its schema ([`crate::state::custom_inventory`]), and a read of a name
+        // nothing stands under is refused rather than answered with the nothing it holds. A
+        // type Systems Manager publishes is defined for every account, so it is read whether
+        // or not anything has collected an item of it.
+        if crate::state::custom_inventory::is_custom_type(&input.type_name)
+            && !store.holds_custom_inventory_type(&region, &input.type_name)
+        {
+            return Err(ListInventoryEntriesErrorModeled::InvalidTypeNameException(
+                InvalidTypeNameException {
+                    message: Some(
+                        crate::state::custom_inventory::undefined_type_name_message(
+                            &input.type_name,
+                        ),
+                    ),
+                },
+            )
+            .into());
+        }
         let held = inventory::held_item(&store, &region, &input.instance_id, &input.type_name);
         let matching: Vec<&::std::collections::HashMap<String, String>> = held
             .as_ref()

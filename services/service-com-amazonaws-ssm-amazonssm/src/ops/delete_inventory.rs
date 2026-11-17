@@ -7,9 +7,11 @@
 //!
 //! "Delete a custom inventory type or the data associated with a custom Inventory type" — so
 //! the type has to be a custom one ([`crate::state::custom_inventory::is_custom_type`]): a
-//! name in the `AWS:` namespace is a type Systems Manager publishes and gathers itself, and
-//! a custom name this Region holds no inventory of names no schema to delete. Both are the
-//! modelled `InvalidTypeNameException`.
+//! name that names no inventory type at all
+//! ([`crate::state::inventory::is_known_inventory_type`]), a name in the `AWS:` namespace,
+//! which is a type Systems Manager publishes and gathers itself, and a well-formed custom
+//! name this Region holds no inventory of are each the modelled `InvalidTypeNameException`,
+//! and each is worded for the condition it names rather than for the error class.
 //!
 //! What each form of the request does to the store:
 //!
@@ -124,6 +126,12 @@ use super::types::*;
 // `DeleteInventoryError` enum is never produced.
 smithy_macros::smithy_model!("smithy-model/com-amazonaws-ssm-amazonssm.json");
 
+/// The `SchemaDeleteOption` that removes the TYPE and not only its data: "DeleteSchema: this
+/// option deletes the specified custom type from the Inventory service" — the first value of
+/// the modelled `InventorySchemaDeleteOption`
+/// ([`super::types::INVENTORY_SCHEMA_DELETE_OPTION_VALUES`]).
+const SCHEMA_DELETE_OPTION_DELETE: &str = "DeleteSchema";
+
 // The operation's MODELED errors. `#[operation_error]` accepts only variants the
 // model declares for this operation, so the scaffold's `NotImplemented` cannot live
 // here — hence the `DeleteInventoryError` alias below. An operation that models no errors
@@ -211,6 +219,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ))
         };
 
+        // A name that names no inventory type at all is refused before anything is addressed:
+        // the modelled pattern admits the FORM of a name, and the service's own rule is that
+        // a name is a published type spelled exactly or a well-formed custom one.
+        if !crate::state::inventory::is_known_inventory_type(&input.type_name) {
+            return Err(invalid_type_name(
+                crate::state::inventory_catalog::invalid_type_name_message(&input.type_name),
+            ));
+        }
+
         // Only a custom type can be deleted: a name in the `AWS:` namespace names a type
         // Systems Manager publishes, which is not the account's to delete.
         if !custom::is_custom_type(&input.type_name) {
@@ -236,19 +253,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             });
         }
 
-        // The schema exists exactly while some node holds an item under it, so a type nothing
-        // was ever put under names no schema to delete.
+        // A type the Region has not DEFINED is a name nothing stands under: either a delete
+        // already removed its schema or nothing ever wrote one. What it currently holds items
+        // of is a different question — deleting the data of a defined type leaves it defined
+        // and holding nothing — so the delete of such a type is served and counts the nothing
+        // it finds.
+        if !store.holds_custom_inventory_type(&region, &input.type_name) {
+            return Err(invalid_type_name(custom::deleted_or_missing_type_message(
+                &input.type_name,
+            )));
+        }
         let mut counts_by_version: ::std::collections::BTreeMap<String, i32> =
             ::std::collections::BTreeMap::new();
         for item in store.custom_inventory_of_type(&region, &input.type_name) {
             *counts_by_version
                 .entry(item.schema_version.clone())
                 .or_default() += 1;
-        }
-        if counts_by_version.is_empty() {
-            return Err(invalid_type_name(custom::unknown_custom_type_message(
-                &input.type_name,
-            )));
         }
 
         // The record of this deletion is what the id it hands back resolves to, so a store
@@ -280,6 +300,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         if !record.dry_run {
             store.remove_custom_inventory_of_type(&region, &input.type_name);
+            // "DeleteSchema: this option deletes the specified custom type from the Inventory
+            // service. You can recreate the schema later, if you want" — so the TYPE stops
+            // being defined, while a delete of the data alone (and a `DisableSchema`, which
+            // "ignores all inventory data for the specified version") leaves it defined and
+            // holding nothing.
+            if record.schema_delete_option.as_deref() == Some(SCHEMA_DELETE_OPTION_DELETE) {
+                store.forget_custom_inventory_type(&region, &input.type_name);
+            }
         }
         let summary = record.to_summary();
         let deletion_id = record.deletion_id.clone();

@@ -158,6 +158,16 @@ fn schema_types(reported: &Value) -> Vec<String> {
         .collect()
 }
 
+/// The CUSTOM type names a schema read reports, in the order it reports them: the ones of the
+/// caller's own namespace, as against the catalog Systems Manager publishes for every account
+/// (covered by `all/inventory_type_catalog.rs`).
+fn custom_schema_types(reported: &Value) -> Vec<String> {
+    schema_types(reported)
+        .into_iter()
+        .filter(|type_name| type_name.starts_with("Custom:"))
+        .collect()
+}
+
 /// RULE: what a put persisted is what a later read reports — one item per `(node, type)`,
 /// its entries, schema version and capture time read back exactly as the put supplied them,
 /// and a second put of the same type on the same node UPDATES that item rather than adding
@@ -280,7 +290,7 @@ async fn an_item_belongs_to_the_node_and_region_its_put_named() {
 
     // (case, the Region the read is signed for, the node it asks about, the entries it must
     // report)
-    let rows: [(&str, &str, &str, Value); 3] = [
+    let rows: [(&str, &str, &str, Value); 2] = [
         (
             "the node and Region the put named",
             crate::parameter_store::REGION,
@@ -291,12 +301,6 @@ async fn an_item_belongs_to_the_node_and_region_its_put_named() {
             "another node of the same Region",
             crate::parameter_store::REGION,
             OTHER_NODE,
-            json!([]),
-        ),
-        (
-            "the same node through another Region",
-            OTHER_REGION,
-            NODE,
             json!([]),
         ),
     ];
@@ -317,6 +321,23 @@ async fn an_item_belongs_to_the_node_and_region_its_put_named() {
             "case {case:?}: expected {expected}, got {read}"
         );
     }
+
+    // The type a put DEFINED belongs to that put's Region too, so the same name through
+    // another Region's endpoint stands for nothing there.
+    let case = "the same node through another Region";
+    let (status, read) = call_in_region(
+        &router,
+        OTHER_REGION,
+        "ListInventoryEntries",
+        &json!({ "InstanceId": NODE, "TypeName": CUSTOM_TYPE }),
+    )
+    .await;
+    assert_eq!(
+        (status, error_code(&read).as_str()),
+        (400, "InvalidTypeNameException"),
+        "case {case:?}: the type is defined in the Region its put named, got {status} with \
+         {read}"
+    );
 }
 
 /// RULE: a put is refused where the request names a node this account holds none of
@@ -393,18 +414,20 @@ async fn a_put_is_refused_for_an_unknown_node_or_a_type_that_is_not_the_callers(
                 "case {case:?}: this refusal carries no message, got {body}"
             );
         }
-        // Nothing was written: a type the read can address and the refused put named holds
-        // no item. A type name the read cannot address either is left to its own case above.
+        // Nothing was written: the refused put defined no type, so the name it carried stands
+        // for nothing and the read of it says so. A type name the read cannot address either
+        // is left to its own case above.
         if type_name == CUSTOM_TYPE {
             let (status, read) = entries(&router, NODE, type_name).await;
             assert_eq!(
-                status, 200,
-                "case {case:?}: the read must be served, got {status} with {read}"
+                (status, error_code(&read).as_str()),
+                (400, "InvalidTypeNameException"),
+                "case {case:?}: a refused put defines nothing, got {status} with {read}"
             );
             assert_eq!(
-                read["Entries"],
-                json!([]),
-                "case {case:?}: a refused put writes nothing, got {read}"
+                error_message(&read),
+                format!("Inventory type name {type_name} is not defined."),
+                "case {case:?}: expected the undefined-type sentence, got {read}"
             );
         }
     }
@@ -435,28 +458,40 @@ async fn a_put_carrying_one_bad_item_writes_none_of_them() {
         "InvalidTypeNameException",
         "expected the type refusal, got {body}"
     );
-    let (_, read) = entries(&router, NODE, CUSTOM_TYPE).await;
+    // The good item was not written either, so its type was never defined and the read of it
+    // says so.
+    let (status, read) = entries(&router, NODE, CUSTOM_TYPE).await;
     assert_eq!(
-        read["Entries"],
-        json!([]),
-        "the good item of a refused put is not written either, got {read}"
+        (status, error_code(&read).as_str()),
+        (400, "InvalidTypeNameException"),
+        "the good item of a refused put is not written either, got {status} with {read}"
+    );
+    assert_eq!(
+        error_message(&read),
+        format!("Inventory type name {CUSTOM_TYPE} is not defined."),
+        "expected the undefined-type sentence, got {read}"
     );
 }
 
-/// RULE: a schema read reports the types whose attributes this endpoint knows — the
-/// `AWS:InstanceInformation` type it publishes, and every custom type the Region holds items
-/// of, whose attributes and data types are what those items say.
+/// RULE: a schema read reports the CUSTOM types the Region holds items of, whose attributes
+/// and data types are what those items say, beside the catalog Systems Manager publishes for
+/// every account.
 #[tokio::test]
 async fn a_schema_read_reports_the_types_the_items_make() {
     let (router, engine) = service();
     register(&engine, crate::parameter_store::REGION, NODE);
 
-    // Before any put: only the type this service publishes.
+    // Before any put: the published catalog, and no custom type at all.
     let reported = schemas(&router, &json!({})).await;
+    assert!(
+        schema_types(&reported).contains(&INSTANCE_INFORMATION.to_string()),
+        "the published catalog carries the type whose item is the node's own projection, got \
+         {reported}"
+    );
     assert_eq!(
-        schema_types(&reported),
-        vec![INSTANCE_INFORMATION.to_string()],
-        "with no custom item written, only the published type has a schema, got {reported}"
+        custom_schema_types(&reported),
+        Vec::<String>::new(),
+        "with no custom item written, no custom type has a schema, got {reported}"
     );
 
     let (status, body) = put(
@@ -479,17 +514,14 @@ async fn a_schema_read_reports_the_types_the_items_make() {
 
     let reported = schemas(&router, &json!({})).await;
     assert_eq!(
-        schema_types(&reported),
-        vec![
-            INSTANCE_INFORMATION.to_string(),
-            SECOND_CUSTOM_TYPE.to_string(),
-            CUSTOM_TYPE.to_string(),
-        ],
+        custom_schema_types(&reported),
+        vec![SECOND_CUSTOM_TYPE.to_string(), CUSTOM_TYPE.to_string()],
         "every type an item was written under has a schema, in type-name order, got {reported}"
     );
 
     // The custom type's own schema: its attributes in name order, each with the data type
-    // its values carry, and the schema version the put wrote.
+    // its values carry in the case the service puts on the wire, and the schema version the
+    // put wrote.
     let narrowed = schemas(&router, &json!({ "TypeName": CUSTOM_TYPE })).await;
     assert_eq!(
         narrowed["Schemas"],
@@ -497,8 +529,8 @@ async fn a_schema_read_reports_the_types_the_items_make() {
             "TypeName": CUSTOM_TYPE,
             "Version": VERSION,
             "Attributes": [
-                { "Name": "RackLocation", "DataType": "string" },
-                { "Name": "Units", "DataType": "number" },
+                { "Name": "RackLocation", "DataType": "STRING" },
+                { "Name": "Units", "DataType": "NUMBER" },
             ],
         }]),
         "a custom type's schema is what its items say, got {narrowed}"
@@ -657,9 +689,21 @@ async fn a_delete_removes_the_items_of_a_custom_type_and_records_what_it_did() {
             .unwrap_or_else(|| panic!("case {case:?}: a delete mints a DeletionId, got {deleted}"))
             .to_string();
 
-        // What the type holds afterwards, and what the other type still holds.
+        // What the type holds afterwards, and what the other type still holds. A delete of
+        // the SCHEMA takes the type away, so a read of it is refused rather than served the
+        // nothing it holds; every other form leaves the type defined.
+        let schema_deleted = !row.dry_run && row.schema_delete_option == Some("DeleteSchema");
         for node_id in [NODE, OTHER_NODE] {
-            let (_, read) = entries(&router, node_id, CUSTOM_TYPE).await;
+            let (status, read) = entries(&router, node_id, CUSTOM_TYPE).await;
+            if schema_deleted {
+                assert_eq!(
+                    (status, error_code(&read).as_str()),
+                    (400, "InvalidTypeNameException"),
+                    "case {case:?}: node {node_id}: a read of the type the delete took away is \
+                     refused, got {status} with {read}"
+                );
+                continue;
+            }
             let expected = if row.dry_run {
                 json!([{ "RackLocation": "Bay B/Row 4" }])
             } else {
@@ -730,14 +774,12 @@ async fn a_delete_is_refused_for_a_type_it_cannot_address() {
         (
             "a custom type nothing was written under",
             "Custom:NobodyWroteThis",
-            "The parameter type name isn't valid: Custom:NobodyWroteThis. No inventory of that \
-             type exists.",
+            "The given TypeName Custom:NobodyWroteThis is either deleted or doesn't exist",
         ),
         (
             "a custom type written under another Region",
             SECOND_CUSTOM_TYPE,
-            "The parameter type name isn't valid: Custom:Compliance. No inventory of that type \
-             exists.",
+            "The given TypeName Custom:Compliance is either deleted or doesn't exist",
         ),
     ];
 
@@ -781,7 +823,8 @@ async fn a_delete_is_refused_for_a_type_it_cannot_address() {
         );
     }
 
-    // An id this endpoint recorded no deletion under names no deletion to report.
+    // An id this endpoint recorded no deletion under matches no deletion, which a LISTING
+    // reports as the empty list rather than refusing.
     let (status, body) = call(
         &router,
         "DescribeInventoryDeletions",
@@ -789,13 +832,14 @@ async fn a_delete_is_refused_for_a_type_it_cannot_address() {
     )
     .await;
     assert_eq!(
-        status, 400,
-        "an unknown DeletionId must be refused, got {status} with {body}"
+        status, 200,
+        "a listing naming an unrecorded DeletionId is a successful read, got {status} with \
+         {body}"
     );
     assert_eq!(
-        error_code(&body),
-        "InvalidDeletionIdException",
-        "expected InvalidDeletionIdException, got {body}"
+        body["InventoryDeletions"],
+        json!([]),
+        "it matches no deletion, so it reports none, got {body}"
     );
 }
 

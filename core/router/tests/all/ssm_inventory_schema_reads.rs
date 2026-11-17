@@ -6,16 +6,17 @@
 //! The RULE under test: **`GetInventorySchema` "return[s] a list of inventory type names for
 //! the account, or … a list of attribute names for a specific Inventory item type"
 //! (`smithy_query(query="operation", operation="GetInventorySchema")`), so the schemas it
-//! reports are the ones this endpoint holds for the Region the call was signed for — the
-//! `AWS:InstanceInformation` type Systems Manager publishes, plus every custom type that
-//! Region holds items of, whose attributes, data types and version are what those items say.
-//! The request narrows that set and nothing else: `TypeName` selects the one type it names (a
-//! name of no inventory namespace is `InvalidTypeNameException`, and a name the endpoint holds
-//! no schema of reports nothing), `Aggregator` reports only the attributes aggregation counts
-//! over, `SubType` reports the nothing this endpoint holds of sub-type schemas, `MaxResults`
-//! bounds the page inside its modelled range and is refused outside it, and `NextToken`
-//! resumes at the type the page it came from stopped at — a token naming no schema of this
-//! read being `InvalidNextToken`.**
+//! reports are the inventory types Systems Manager publishes for every account — reported
+//! whether or not anything has been collected for them, because this is the discovery call —
+//! plus every custom type the Region the call was signed for holds items of, whose attributes,
+//! data types and version are what those items say. The request narrows that set and nothing
+//! else: `TypeName` selects the one type it names (a name of no inventory namespace is
+//! `InvalidTypeNameException`, and a well-formed custom name this endpoint holds no schema of
+//! reports nothing), `Aggregator` reports only the attributes aggregation counts over,
+//! `SubType` reports the nothing this endpoint holds of sub-type schemas, `MaxResults` bounds
+//! the page inside its modelled range and is refused outside it, and `NextToken` resumes at
+//! the type the page it came from stopped at — a token naming no schema of this read being
+//! `InvalidNextToken`.**
 //!
 //! Every case goes through the front door a client uses: `PutInventory` writes the custom
 //! items and `GetInventorySchema` reads the schemas back, so a schema reported here is one the
@@ -64,8 +65,8 @@ const LAST_PING: Duration = Duration::from_secs(1_700_000_000);
 /// A capture time in the form the modelled `InventoryItemCaptureTime` spells.
 const CAPTURED: &str = "2024-03-04T05:06:07Z";
 
-/// The one type Systems Manager publishes a schema of here, which is the projection of the
-/// node record.
+/// The one type Systems Manager publishes whose item this endpoint derives from the node
+/// record.
 const PUBLISHED_TYPE: &str = "AWS:InstanceInformation";
 
 /// The attributes `GetInventorySchemaRequest$Aggregator` documents that type as supporting
@@ -74,23 +75,46 @@ const PUBLISHED_TYPE: &str = "AWS:InstanceInformation";
 /// (`smithy_query(query="doc", shape="GetInventorySchemaRequest", member="Aggregator")`).
 const AGGREGATABLE_ATTRIBUTES: [&str; 3] = ["PlatformName", "PlatformType", "PlatformVersion"];
 
-/// Default inventory type names this service knows and gathers no item of here: "Default
+/// The inventory types Systems Manager PUBLISHES, in the order a schema read reports them
+/// (ascending type name). Written out here independently of the service, from AWS's published
+/// inventory catalog: the five the model's own doc names
+/// (`smithy_query(query="doc", shape="InventoryItemSchema", member="TypeName")`: "Default
 /// inventory item types include the following: AWS:AWSComponent, AWS:Application,
-/// AWS:InstanceInformation, AWS:Network, and AWS:WindowsUpdate"
-/// (`smithy_query(query="doc", shape="InventoryItemSchema", member="TypeName")`), less the one
-/// whose item this endpoint derives from the node record.
+/// AWS:InstanceInformation, AWS:Network, and AWS:WindowsUpdate") and the rest of the catalog
+/// the AWS Systems Manager User Guide tabulates under "Metadata collected by Systems Manager
+/// Inventory".
 ///
-/// A name on this list is one a read may NAME — it is refused by nothing — and a read of it
-/// reports no schema: a reported schema is "a list of attribute names for a specific Inventory
-/// item type", and `InventoryItemSchema$Attributes` is `@required` with length 1..50
-/// (`smithy_query(query="shape", shape="InventoryItemSchema")`), so a type whose attributes
-/// nothing here has collected has no schema to report rather than one carrying no attribute.
-const KNOWN_BUT_UNGATHERED_TYPES: [&str; 4] = [
+/// A published schema says what an account MAY query, filter and aggregate on, so a read
+/// reports it whether or not anything has collected an item of that type; the attribute lists
+/// themselves are under test in the owning crate's own suite.
+const PUBLISHED_TYPES: [&str; 15] = [
     "AWS:AWSComponent",
     "AWS:Application",
+    "AWS:ComplianceItem",
+    "AWS:ComplianceSummary",
+    "AWS:File",
+    "AWS:InstanceDetailedInformation",
+    PUBLISHED_TYPE,
     "AWS:Network",
+    "AWS:PatchSummary",
+    "AWS:ResourceGroup",
+    "AWS:Service",
+    "AWS:Tag",
+    "AWS:WindowsRegistry",
+    "AWS:WindowsRole",
     "AWS:WindowsUpdate",
 ];
+
+/// The type names a read reports for a Region holding items of `custom` — the published
+/// catalog, then the custom types in type-name order (every `AWS:` name sorts before every
+/// `Custom:` one).
+fn published_and(custom: &[&str]) -> Vec<String> {
+    let mut names: Vec<String> = PUBLISHED_TYPES.iter().map(|name| name.to_string()).collect();
+    let mut custom: Vec<String> = custom.iter().map(|name| name.to_string()).collect();
+    custom.sort();
+    names.extend(custom);
+    names
+}
 
 /// The custom types the main Region's put writes.
 const RACK_INFO: &str = "Custom:RackInfo";
@@ -327,18 +351,14 @@ async fn three_custom_types() -> (Emulator, Vec<String>) {
             ]),
         )
         .await;
-    let held = vec![
-        PUBLISHED_TYPE.to_string(),
-        COMPLIANCE.to_string(),
-        POWER_DRAW.to_string(),
-        RACK_INFO.to_string(),
-    ];
+    let held = published_and(&[COMPLIANCE, POWER_DRAW, RACK_INFO]);
     (emulator, held)
 }
 
-/// RULE: `TypeName` narrows the read to the one type it names — the published type, a custom
-/// type the Region holds items of, or a known name this endpoint holds no schema of, which
-/// reports nothing — and naming none reports every schema the Region holds.
+/// RULE: `TypeName` narrows the read to the one type it names — a type Systems Manager
+/// publishes, or a custom type the Region holds items of, a well-formed custom name this
+/// endpoint holds no schema of reporting nothing — and naming none reports every schema the
+/// Region holds.
 #[tokio::test]
 async fn a_schema_read_narrows_to_the_type_the_request_names() {
     let (emulator, held) = three_custom_types().await;
@@ -384,14 +404,18 @@ async fn a_schema_read_narrows_to_the_type_the_request_names() {
             expected: Vec::new(),
         },
     ];
-    // Every default type name this endpoint gathers no item of (see
-    // `KNOWN_BUT_UNGATHERED_TYPES`), the ones the issue's own reproduction never named among
-    // them.
-    rows.extend(KNOWN_BUT_UNGATHERED_TYPES.iter().map(|type_name| Row {
-        case: "a default type name this endpoint holds no item of",
-        type_name: Some(type_name),
-        expected: Vec::new(),
-    }));
+    // Every other published type name, each of which reports its own published schema — the
+    // ones the issue's own reproduction never named among them.
+    rows.extend(
+        PUBLISHED_TYPES
+            .iter()
+            .filter(|type_name| **type_name != PUBLISHED_TYPE)
+            .map(|type_name| Row {
+                case: "another published type name",
+                type_name: Some(type_name),
+                expected: vec![(*type_name).to_string()],
+            }),
+    );
 
     for row in rows {
         let case = row.case;
@@ -409,15 +433,17 @@ async fn a_schema_read_narrows_to_the_type_the_request_names() {
 }
 
 /// RULE: a `TypeName` that names no inventory type at all — neither one Systems Manager
-/// publishes nor one of the caller's own `Custom:` namespace — is refused
-/// `InvalidTypeNameException`, in a message naming the value the request carried.
+/// publishes, spelled exactly, nor a well-formed name of the caller's own `Custom:` namespace
+/// — is refused `InvalidTypeNameException`, in the sentence stating those naming rules with
+/// the value the request carried in it.
 #[tokio::test]
 async fn a_type_name_of_no_inventory_namespace_is_refused() {
     let (emulator, _) = three_custom_types().await;
 
     // One row per shape a name outside both namespaces can take: no namespace at all, a
-    // namespace spelled in the wrong case, a namespace with no type after it, and a name that
-    // only looks like one of the published ones.
+    // namespace spelled in the wrong case, a namespace with no type after it, a name that
+    // only looks like one of the published ones, and a custom name the custom-name pattern
+    // does not admit.
     let cases = [
         "NotAType",
         "InstanceInformation",
@@ -426,6 +452,7 @@ async fn a_type_name_of_no_inventory_namespace_is_refused() {
         "AWS:",
         "Custom",
         "AWS:InstanceInformation.PlatformType",
+        "Custom:Rack-Info",
     ];
 
     for case in cases {
@@ -438,9 +465,17 @@ async fn a_type_name_of_no_inventory_namespace_is_refused() {
             "case {case:?}: expected 400 InvalidTypeNameException, got {status} {code} with \
              {message:?}"
         );
-        assert!(
-            message.starts_with("The parameter type name isn't valid:") && message.contains(case),
-            "case {case:?}: the refusal must name the value the request carried, got {message:?}"
+        // The sentence, written out here independently of the service: fixed text apart from
+        // the bracketed name, with two spaces before "Custom inventory type name".
+        let expected = format!(
+            "Inventory type name [{case}] is invalid. Type name is case sensitive, such as \
+             AWS:APpLICation is invalid; Type name must start with either AWS: or Custom:;  \
+             Custom inventory type name must satisfy regular expression pattern: \
+             ^(Custom:)([a-zA-Z0-9]{{3,93}})$"
+        );
+        assert_eq!(
+            message, expected,
+            "case {case:?}: expected {expected:?}, got {message:?}"
         );
     }
 }
@@ -526,10 +561,8 @@ async fn a_page_that_leaves_schemas_behind_hands_back_the_token_the_next_one_res
         .map(|index| format!("Custom:Type{index:03}"))
         .collect();
     emulator.hold_custom_items(REGION, NODE, &types);
-    // What the Region holds: the type Systems Manager publishes, then the custom ones in
-    // type-name order.
-    let mut held = vec![PUBLISHED_TYPE.to_string()];
-    held.extend(types.iter().cloned());
+    // What the Region holds: the published catalog, then the custom ones in type-name order.
+    let held = published_and(&types.iter().map(String::as_str).collect::<Vec<&str>>());
 
     // One row per page the held set divides into: the smallest page the operation admits, one
     // just under the held set, and one exactly as large as it.
@@ -617,8 +650,18 @@ async fn a_schema_read_resumes_at_the_token_it_is_handed() {
         Row {
             case: "a token at the first schema",
             type_name: None,
-            next_token: Some(PUBLISHED_TYPE),
+            next_token: Some(PUBLISHED_TYPES[0]),
             expected: held.clone(),
+        },
+        Row {
+            case: "a token in the middle of the published catalog",
+            type_name: None,
+            next_token: Some(PUBLISHED_TYPE),
+            expected: held
+                .iter()
+                .skip_while(|name| name.as_str() != PUBLISHED_TYPE)
+                .cloned()
+                .collect(),
         },
         Row {
             case: "a token in the middle of the set",
@@ -667,8 +710,8 @@ async fn a_schema_read_resumes_at_the_token_it_is_handed() {
             "Custom:NothingWritten",
         ),
         (
-            "a token naming a default type this endpoint holds no schema of",
-            None,
+            "a token naming a type no narrowed read of another type reports",
+            Some(RACK_INFO),
             "AWS:Network",
         ),
         (
@@ -841,17 +884,17 @@ async fn the_schemas_are_the_ones_the_signed_region_holds_items_of() {
         Row {
             case: "the Region the first put wrote in",
             region: REGION,
-            expected: vec![PUBLISHED_TYPE.to_string(), RACK_INFO.to_string()],
+            expected: published_and(&[RACK_INFO]),
         },
         Row {
             case: "the Region the second put wrote in",
             region: OTHER_REGION,
-            expected: vec![PUBLISHED_TYPE.to_string(), FLEET.to_string()],
+            expected: published_and(&[FLEET]),
         },
         Row {
             case: "a Region holding no node and no item",
             region: EMPTY_REGION,
-            expected: vec![PUBLISHED_TYPE.to_string()],
+            expected: published_and(&[]),
         },
     ];
     for row in rows {
@@ -864,9 +907,10 @@ async fn the_schemas_are_the_ones_the_signed_region_holds_items_of() {
         );
     }
 
-    // The custom schema itself: the attribute names its items carry in name order, `number`
-    // for the one whose every value is a number, and the version the put that wrote it
-    // carried — which differs from every other put's here.
+    // The custom schema itself: the attribute names its items carry in name order, the
+    // uppercase wire data type the service serializes — `NUMBER` for the one whose every value
+    // is a number — and the version the put that wrote it carried, which differs from every
+    // other put's here.
     let narrowed = emulator
         .schemas(
             "the custom type of the first Region",
@@ -880,8 +924,8 @@ async fn the_schemas_are_the_ones_the_signed_region_holds_items_of() {
             "TypeName": RACK_INFO,
             "Version": RACK_INFO_VERSION,
             "Attributes": [
-                { "Name": "RackLocation", "DataType": "string" },
-                { "Name": "Units", "DataType": "number" },
+                { "Name": "RackLocation", "DataType": "STRING" },
+                { "Name": "Units", "DataType": "NUMBER" },
             ],
         }]),
         "case the custom type of the first Region: a custom schema is what its items say, got \

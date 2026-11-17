@@ -266,12 +266,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
-        // What the put would leave this Region holding: the types it already holds items of,
-        // plus the ones these items would admit. The ceilings are the EMULATOR's own — the
-        // store is in memory for as long as the process runs — and a put past either of them
-        // writes nothing.
+        // What the put would leave this Region holding: the types it has DEFINED already, plus
+        // the ones these items would define. The ceilings are the EMULATOR's own — the store
+        // is in memory for as long as the process runs — and a put past either of them writes
+        // nothing. A type stays defined until a delete of its schema removes it, so what the
+        // ceiling counts is the definitions rather than the items still held under them.
         let mut types: ::std::collections::BTreeSet<&str> =
-            store.custom_inventory_types_in_region(&region).collect();
+            store.defined_custom_inventory_types(&region).collect();
         types.extend(input.items.iter().map(|item| item.type_name.as_str()));
         if types.len() > custom::MAX_CUSTOM_INVENTORY_TYPES {
             return Err(
@@ -292,6 +293,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     .all(|held| held.type_name != item.type_name)
             })
             .count();
+        // The DEFINITIONS this store holds are bounded across every Region as well: one
+        // outlives the items written under it, and the Region a call is signed for is the
+        // caller's to choose, so neither the item ceiling nor the per-Region one bounds the
+        // set a put grows.
+        let defining: ::std::collections::BTreeSet<&str> = input
+            .items
+            .iter()
+            .map(|item| item.type_name.as_str())
+            .filter(|type_name| !store.holds_custom_inventory_type(&region, type_name))
+            .collect();
+        if !store.can_define_custom_inventory_types(defining.len()) {
+            return Err(
+                PutInventoryErrorModeled::CustomSchemaCountLimitExceededException(
+                    CustomSchemaCountLimitExceededException {
+                        message: Some(custom::custom_schema_total_ceiling_message()),
+                    },
+                )
+                .into(),
+            );
+        }
         if store.custom_inventory.len() + admitted > custom::MAX_CUSTOM_INVENTORY_ITEMS {
             return Err(PutInventoryErrorModeled::TotalSizeLimitExceededException(
                 TotalSizeLimitExceededException {

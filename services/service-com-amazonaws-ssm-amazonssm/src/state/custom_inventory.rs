@@ -13,14 +13,17 @@
 //! node, which is what makes a second put of the same type an UPDATE of the item rather than
 //! a second one.
 //!
-//! A custom inventory TYPE exists in a Region for as long as some node there holds an item
-//! of it — a schema is not registered separately, it is what the items of that type are
-//! reported under — so [`custom_types_in_region`] reads the types off the items rather than
-//! from a second store. That is what `DeleteInventory` addresses: "Delete a custom inventory
-//! type or the data associated with a custom Inventory type. Deleting a custom inventory
-//! type is also referred to as deleting a custom inventory schema", so a type name outside
-//! the `Custom:` namespace, and one no node holds an item of, name nothing a delete can
-//! remove ([`InvalidTypeNameException`](crate::ops::types::InvalidTypeNameException)).
+//! A custom inventory TYPE is DEFINED in a Region by the first write of an item under it —
+//! no call registers a schema of its own, so a write is what defines the type
+//! ([`super::ComAmazonawsSsmAmazonssmState::holds_custom_inventory_type`]) and the SHAPE of
+//! that schema is read off the items ([`custom_type_schema`]) rather than from a second
+//! store. That is what `DeleteInventory` addresses: "Delete a custom inventory type or the
+//! data associated with a custom Inventory type. Deleting a custom inventory type is also
+//! referred to as deleting a custom inventory schema", so deleting the DATA leaves the type
+//! defined and holding nothing, while deleting the SCHEMA leaves the name standing for
+//! nothing at all — and a type name outside the `Custom:` namespace, or one nothing stands
+//! under, names nothing a delete can remove
+//! ([`InvalidTypeNameException`](crate::ops::types::InvalidTypeNameException)).
 //!
 //! A delete is RECORDED ([`InventoryDeletionRecord`]), keyed by the `DeletionId` it minted,
 //! for two reasons: the id a delete hands back has to resolve to the deletion it names, and
@@ -44,13 +47,26 @@ use super::inventory::CUSTOM_TYPE_PREFIX;
 /// only thing that admits a type, callers may write as many as they like, and the store is
 /// held in memory for as long as the process runs. A put that would admit one past it is
 /// refused through the modelled `CustomSchemaCountLimitExceededException` and writes
-/// nothing.
+/// nothing. What it counts is the types a Region has DEFINED
+/// ([`super::ComAmazonawsSsmAmazonssmState::defined_custom_inventory_types`]), since a
+/// definition outlives the items written under it.
 pub const MAX_CUSTOM_INVENTORY_TYPES: usize = 20;
 
 /// How many inventory items this store holds at once, across every Region and node — the
 /// emulator's own bound on the one map a put grows, for the same reason
 /// [`MAX_CUSTOM_INVENTORY_TYPES`] exists.
 pub const MAX_CUSTOM_INVENTORY_ITEMS: usize = 1_000;
+
+/// How many custom inventory TYPE DEFINITIONS this store holds at once, across every Region.
+///
+/// The emulator's own bound, like the two above, and a bound of its own because a definition
+/// OUTLIVES the items written under it
+/// ([`super::ComAmazonawsSsmAmazonssmState::holds_custom_inventory_type`]): the item ceiling
+/// does not bound the definitions a put leaves behind, and the Region a call is signed for is
+/// the caller's to choose, so neither does the per-Region one. A put that would define one
+/// past it is refused through the modelled `CustomSchemaCountLimitExceededException` and
+/// writes nothing.
+pub const MAX_CUSTOM_INVENTORY_TYPE_DEFINITIONS: usize = MAX_CUSTOM_INVENTORY_ITEMS;
 
 /// What a put refused by [`MAX_CUSTOM_INVENTORY_TYPES`] reports: the emulator's own ceiling,
 /// named as the emulator's, with the figure it stands at.
@@ -71,6 +87,15 @@ pub fn custom_item_ceiling_message() -> String {
     )
 }
 
+/// What a put refused by [`MAX_CUSTOM_INVENTORY_TYPE_DEFINITIONS`] reports.
+#[must_use]
+pub fn custom_schema_total_ceiling_message() -> String {
+    format!(
+        "This emulator holds at most {MAX_CUSTOM_INVENTORY_TYPE_DEFINITIONS} custom inventory \
+         type definitions across every Region"
+    )
+}
+
 /// How this service refuses a type name a WRITE of custom inventory may not carry: the name
 /// the caller submitted and the namespace a custom type is written under.
 ///
@@ -88,8 +113,8 @@ pub fn uncustomizable_type_name_message(type_name: &str) -> String {
 /// How this service refuses a type name a DELETE cannot address because it is not a custom
 /// type: "Delete a custom inventory type or the data associated with a custom Inventory
 /// type" (`DeleteInventory`), so a name outside the `Custom:` namespace names one of the
-/// types Systems Manager itself predefines ([`super::inventory::DEFAULT_INVENTORY_TYPES`]),
-/// which is not the account's to delete.
+/// types Systems Manager itself predefines ([`super::inventory_catalog`]), which is not the
+/// account's to delete.
 ///
 /// RECORDED BEHAVIOUR (corpus `simparity-behavioral-aws-v1`, unit
 /// `ssm.delete-inventory-schema-delete-builtin-type-rejected`): a `DeleteInventory` naming a
@@ -98,22 +123,27 @@ pub fn uncustomizable_type_name_message(type_name: &str) -> String {
 /// request in it, so the name the caller submitted does not appear.
 pub const PREDEFINED_TYPE_NOT_DELETABLE: &str = "Deleting predefined type names is not allowed.";
 
-/// How this service refuses a custom type name the Region holds no inventory of: the name
-/// names no schema here, so there is nothing to delete or disable under it.
+/// How this service refuses a type name no schema of this account stands under: a `Custom:`
+/// type is DEFINED by the write that first put an item under it and stops being defined when
+/// a delete removes its schema, so a read of such a name is refused rather than answered with
+/// the nothing it holds.
+///
+/// Fixed text apart from the type name, which is echoed from the request.
 #[must_use]
-pub fn unknown_custom_type_message(type_name: &str) -> String {
-    format!("The parameter type name isn't valid: {type_name}. No inventory of that type exists.")
+pub fn undefined_type_name_message(type_name: &str) -> String {
+    format!("Inventory type name {type_name} is not defined.")
 }
 
-/// How this service refuses a type name that names no inventory type at all: it is neither
-/// one of the types Systems Manager publishes ([`super::inventory::DEFAULT_INVENTORY_TYPES`])
-/// nor a name of the caller's own namespace, so no schema could be held under it.
+/// How this service refuses a custom type name the Region holds no inventory of: the name is
+/// well formed, so what is wrong is not the NAME but that no schema stands under it — either
+/// a delete already removed it or nothing ever wrote one.
+///
+/// Fixed text apart from the type name, which is echoed from the request. It names both
+/// possibilities, because the two are indistinguishable once the items are gone: a type
+/// exists for as long as some node holds an item of it (see the module docs).
 #[must_use]
-pub fn unknown_type_name_message(type_name: &str) -> String {
-    format!(
-        "The parameter type name isn't valid: {type_name}. An inventory type name is \
-         {CUSTOM_TYPE_PREFIX}<name> or one of the type names Systems Manager publishes."
-    )
+pub fn deleted_or_missing_type_message(type_name: &str) -> String {
+    format!("The given TypeName {type_name} is either deleted or doesn't exist")
 }
 
 /// Whether `type_name` is a name of the caller's own inventory namespace: "Custom inventory
@@ -149,13 +179,6 @@ pub struct CustomInventoryItemRecord {
     /// When the put that persisted this item ran.
     pub written_at: SystemTime,
 }
-
-/// How this service reports a `DeletionId` this endpoint recorded no deletion under, through
-/// `InvalidDeletionIdException`: the id was returned by no `DeleteInventory` of this
-/// endpoint. Fixed text for this error class, with nothing of the request in it.
-pub const UNKNOWN_DELETION_ID: &str =
-    "The ID specified for the delete operation doesn't exist or isn't valid. Verify the ID and \
-     try again.";
 
 /// The status a recorded deletion reports, from the modelled `InventoryDeletionStatus`
 /// (`InProgress | Complete`): a deletion this store performs is done when the call that
@@ -237,14 +260,19 @@ impl InventoryDeletionRecord {
     }
 }
 
-/// The data type an inventory attribute's values carry, as the modelled
-/// `InventoryAttributeDataType` spells it: the type of everything a node reported under that
-/// attribute.
-pub const ATTRIBUTE_DATA_TYPE_STRING: &str = "string";
+/// The data type an inventory attribute's values carry, as AWS puts it on the wire: the type
+/// of everything a node reported under that attribute.
+///
+/// The modelled `InventoryAttributeDataType` enum spells its two values in lower case
+/// (`string`, `number`), and the value Systems Manager SERIALIZES is the uppercase token
+/// (RECORDED BEHAVIOUR: every attribute of every schema a `GetInventorySchema` reads back
+/// carries `"DataType": "STRING"`), so that is what a reported attribute carries here — a
+/// client comparing the value it reads is comparing against this token.
+pub const ATTRIBUTE_DATA_TYPE_STRING: &str = "STRING";
 
-/// See [`ATTRIBUTE_DATA_TYPE_STRING`]: the other value of that enum, which an attribute
-/// carries when every value reported under it is a number.
-pub const ATTRIBUTE_DATA_TYPE_NUMBER: &str = "number";
+/// See [`ATTRIBUTE_DATA_TYPE_STRING`]: the other value of that enum, in the same uppercase
+/// wire form, which an attribute carries when every value reported under it is a number.
+pub const ATTRIBUTE_DATA_TYPE_NUMBER: &str = "NUMBER";
 
 /// The schema of the custom type `type_name`, read off the items `items` holds of it.
 ///
@@ -335,8 +363,8 @@ impl super::ComAmazonawsSsmAmazonssmState {
             .map(|(_, record)| record)
     }
 
-    /// Every custom inventory type `region` holds an item of: a schema exists for as long as
-    /// some node holds an item under it (see the module docs).
+    /// Every custom inventory type `region` holds an item of: the types a schema read reports
+    /// the SHAPE of, which is what the items of that type say (see the module docs).
     pub fn custom_inventory_types_in_region<'a>(
         &'a self,
         region: &'a str,
@@ -347,16 +375,61 @@ impl super::ComAmazonawsSsmAmazonssmState {
             .map(|(_, _, type_name)| type_name.as_str())
     }
 
+    /// Every custom inventory type `region` has DEFINED: the types that stand for something
+    /// there, whether or not any item of them is still held
+    /// ([`Self::holds_custom_inventory_type`]) — which is what a ceiling on how many custom
+    /// types a Region may hold counts, since a definition is what a type costs.
+    pub fn defined_custom_inventory_types<'a>(
+        &'a self,
+        region: &'a str,
+    ) -> impl Iterator<Item = &'a str> + 'a {
+        self.custom_inventory_types
+            .iter()
+            .filter(move |(held_region, _)| held_region == region)
+            .map(|(_, type_name)| type_name.as_str())
+    }
+
     /// Store `record` as the one item of its type for its node, replacing the item that node
     /// held of that type — "adds an inventory item, if it doesn't already exist, or updates
     /// an inventory item, if it does exist" (`PutInventory`).
+    ///
+    /// The write also DEFINES the type for its Region ([`Self::holds_custom_inventory_type`]):
+    /// a custom type is registered by the first write under it rather than by a call of its
+    /// own, which is why the registration outlives the items a later delete removes.
     pub fn insert_custom_inventory(&mut self, record: CustomInventoryItemRecord) {
+        self.custom_inventory_types
+            .insert((record.region.clone(), record.type_name.clone()));
         let key = (
             record.region.clone(),
             record.node_id.clone(),
             record.type_name.clone(),
         );
         self.custom_inventory.insert(key, record);
+    }
+
+    /// Whether `region` has a custom inventory type DEFINED under `type_name`: some write
+    /// defined it and no delete of its schema has removed it. A read of a name nothing stands
+    /// under is refused ([`undefined_type_name_message`]), which is what makes a schema
+    /// deletion observable.
+    pub fn holds_custom_inventory_type(&self, region: &str, type_name: &str) -> bool {
+        self.custom_inventory_types
+            .contains(&(region.to_string(), type_name.to_string()))
+    }
+
+    /// Whether this store can hold the definitions of `additional` more custom inventory
+    /// types ([`MAX_CUSTOM_INVENTORY_TYPE_DEFINITIONS`]): a definition outlives the items
+    /// written under it, so this is what bounds the set a put grows.
+    pub fn can_define_custom_inventory_types(&self, additional: usize) -> bool {
+        self.custom_inventory_types.len() + additional <= MAX_CUSTOM_INVENTORY_TYPE_DEFINITIONS
+    }
+
+    /// Drop the definition of `type_name` in `region`, the way a delete of the SCHEMA does:
+    /// "this option deletes the specified custom type from the Inventory service"
+    /// (`InventorySchemaDeleteOption` value `DeleteSchema`), after which the name stands for
+    /// nothing until a later put defines it again.
+    pub fn forget_custom_inventory_type(&mut self, region: &str, type_name: &str) {
+        self.custom_inventory_types
+            .remove(&(region.to_string(), type_name.to_string()));
     }
 
     /// Drop every item of `type_name` that `region` holds, answering how many went.
