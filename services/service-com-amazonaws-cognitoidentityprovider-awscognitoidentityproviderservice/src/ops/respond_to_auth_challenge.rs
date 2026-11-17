@@ -900,6 +900,7 @@ fn challenge_refused(
         crate::state::NewPasswordChallengeRefusal::NewPasswordMissing
         | crate::state::NewPasswordChallengeRefusal::UsernameMissing
         | crate::state::NewPasswordChallengeRefusal::UnknownAttribute(_)
+        | crate::state::NewPasswordChallengeRefusal::AttributeOutsideDeclaredBound(_)
         | crate::state::NewPasswordChallengeRefusal::RequiredAttributeUnset(_) => {
             invalid_parameter(message)
         }

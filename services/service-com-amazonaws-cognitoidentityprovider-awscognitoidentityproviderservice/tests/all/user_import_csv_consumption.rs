@@ -393,7 +393,8 @@ struct ImportCase {
 /// records the file carries, which of the template's columns it names and in which
 /// order, the form of a field (quoted, carrying the separator, padded, CRLF line
 /// endings), a custom attribute column, a name the pool already holds, a row with
-/// no username, a value no attribute of the pool can hold, and the MFA column.
+/// no username, a value no attribute of the pool can hold, a value outside the
+/// bound the pool's schema declares for its attribute, and the MFA column.
 fn import_cases() -> Vec<ImportCase> {
     vec![
         ImportCase {
@@ -513,6 +514,23 @@ fn import_cases() -> Vec<ImportCase> {
             status: "Succeeded",
             counters: (1, 0, 1),
             imported: vec![("mary", vec![("phone_number", "+15550111")])],
+        },
+        ImportCase {
+            case: "a row whose value is outside the bound the pool's schema declares",
+            schema: vec![json!({
+                "Name": "rank",
+                "AttributeDataType": "Number",
+                "Mutable": true,
+                "Required": false,
+                "NumberAttributeConstraints": { "MinValue": "1", "MaxValue": "10" },
+            })],
+            existing: None,
+            file: "cognito:username,custom:rank\n\
+                   oscar,99\n\
+                   petra,7\n",
+            status: "Succeeded",
+            counters: (1, 0, 1),
+            imported: vec![("petra", vec![("custom:rank", "7")])],
         },
         ImportCase {
             case: "a row whose MFA column is no boolean",

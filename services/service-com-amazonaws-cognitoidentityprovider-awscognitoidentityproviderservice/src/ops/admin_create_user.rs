@@ -469,6 +469,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> AdminCreateUser<E
         }) {
             return Err(invalid_parameter(defect.to_string()));
         }
+        // A submitted value also has to be within the bounds the pool's schema
+        // declares for its attribute, the same rule every other writer of a user
+        // attribute applies ([`crate::state::declared_bound_report`]).
+        if let Some(report) = crate::state::declared_bound_report(
+            pool,
+            requested_attributes.iter().map(|attribute| {
+                (
+                    attribute.name.as_str(),
+                    attribute.value.as_deref().unwrap_or_default(),
+                )
+            }),
+        ) {
+            return Err(invalid_parameter(report));
+        }
         // In a pool that signs its users in WITH an attribute value, the
         // submitted `Username` is that value rather than a name of its own, so
         // it has to be a value one of those attributes can hold

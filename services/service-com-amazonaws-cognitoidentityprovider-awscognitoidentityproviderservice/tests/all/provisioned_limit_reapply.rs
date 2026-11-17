@@ -4,22 +4,23 @@
 //! driven through the router exactly as an SDK drives it (`POST /` with
 //! `X-Amz-Target: AWSCognitoIdentityProviderService.UpdateProvisionedLimit`).
 //!
-//! The rule under test: `UpdateProvisionedLimit` stores and reports EVERY
-//! `RequestedLimitValue` inside the account's range for the identified limit —
-//! "the value must be between the default limit and your account-level maximum
-//! limit in Service Quotas" (`UpdateProvisionedLimit` in this service's model),
-//! so from the limit's `FreeLimitValue` up to the account's Service Quotas
-//! ceiling, both included — and refuses only a value outside it. A value equal
-//! to the rate the limit already reports as in force is inside the range, so
-//! the write is accepted and answers 200 with the limit it stored: setting a
-//! limit to the rate it already holds is the same write made twice, not an
-//! error, and a caller that re-applies the value a read just reported
-//! converges.
+//! The rule under test: `UpdateProvisionedLimit` "sets the provisioned limit for
+//! a specific API category" (this service's model), so the `RequestedLimitValue`
+//! has to CHANGE the limit. A request naming the rate the limit already reports
+//! as its `ProvisionedLimitValue` sets nothing and is refused with
+//! `InvalidParameterException` (HTTP 400) whose one sentence states that the
+//! requested value is the same as the current provisioned limit, and the limit a
+//! later read reports is the one that was already in force. The comparison is
+//! against the CURRENT provisioned value and is taken ahead of the account's
+//! Service Quotas ceiling, so a request that is both the rate in force and the
+//! account's ceiling is refused as the former. Every other rate in the account's
+//! range — "the value must be between the default limit and your account-level
+//! maximum limit in Service Quotas" (the same doc) — is still stored.
 //!
 //! The suite varies the rate's position in the range (its floor, one step in,
 //! the midpoint, the account's ceiling), the width of the range (none, so the
 //! floor and the ceiling are the same rate, and one a granted quota increase
-//! opened), how many times the same value is applied, and the limit itself —
+//! opened), how many times the same value is re-applied, and the limit itself —
 //! every API category this account holds, whose included rates differ. The
 //! wire harness is the one `log_delivery_configuration.rs` already builds for
 //! this service, reached through the test crate root rather than copied; this
@@ -31,10 +32,11 @@ use service_com_amazonaws_cognitoidentityprovider_awscognitoidentityproviderserv
 use smithy_server_runtime::MultiServiceRouter;
 use std::sync::Arc;
 
-use super::log_delivery_configuration::{call, ok};
+use super::log_delivery_configuration::{call, error_code, error_message, ok};
 
-/// How many times a rate is applied where the rule is idempotence: more than
-/// twice, so the answer is asserted to be the same beyond the first repeat.
+/// How many times a rate in force is re-applied where the rule is that every
+/// such request is refused: more than twice, so the answer is asserted beyond
+/// the first repeat.
 const REPEATS: usize = 3;
 
 /// How far above a limit's included rate a granted Service Quotas increase
@@ -83,6 +85,12 @@ async fn provision(router: &MultiServiceRouter, category: &str, requested: i32) 
     .await
 }
 
+/// What a refusal says for a rate the limit already holds: one sentence with no
+/// variable part, the rate it is about being the one the request carried.
+fn same_as_provisioned_message() -> String {
+    "Requested value is the same as the current provisioned limit".to_string()
+}
+
 /// Record a granted Service Quotas increase raising this account's ceiling for
 /// `category` to `ceiling`, and return the ceiling now in force.
 ///
@@ -101,13 +109,14 @@ fn granted_increase(
 }
 
 #[tokio::test]
-async fn the_rate_a_read_reports_is_accepted_again_and_answers_the_same_limit() {
+async fn the_rate_a_read_reports_is_refused_when_it_is_sent_back() {
     // The flow a client converging on a configuration runs: read the limit,
-    // send back the rate it reported, and expect the limit it asked for. The
-    // rows vary the width of the account's range — none, so the rate in force
-    // is both bounds at once, and one a granted increase opened — and run every
-    // API category this account holds through both, so the rule is asserted
-    // over limits with different included rates rather than over one.
+    // send back the rate it reported, and be told it is the rate already
+    // provisioned. The rows vary the width of the account's range — none, so
+    // the rate in force is both bounds at once, and one a granted increase
+    // opened — and run every API category this account holds through both, so
+    // the rule is asserted over limits with different included rates rather
+    // than over one.
     for increase in [0, GRANTED_INCREASE] {
         for category in cognito_idp::state::API_CATEGORIES {
             let (router, engine) = router_and_engine();
@@ -128,33 +137,30 @@ async fn the_rate_a_read_reports_is_accepted_again_and_answers_the_same_limit() 
             let requested = i32::try_from(in_force)
                 .unwrap_or_else(|_| panic!("case {case:?}: {in_force} is a modelled rate"));
 
-            // Applying it more than once: every repeat answers the same limit,
-            // so the write is idempotent rather than accepted only the first
-            // time.
+            // Sending it back more than once: every repeat is refused the same
+            // way, so the refusal is the rule rather than a one-off.
             for repeat in 1..=REPEATS {
                 let case = format!("{case} (apply {repeat} of {REPEATS})");
-                let (status, answered) = provision(&router, category.name, requested).await;
+                let (status, payload) = provision(&router, category.name, requested).await;
                 assert_eq!(
-                    status, 200,
-                    "case {case:?}: re-applying the rate in force is accepted, got {status} \
-                     with {answered}"
-                );
-                assert_eq!(
-                    answered.get("Limit"),
-                    Some(&baseline),
-                    "case {case:?}: the answer must be the limit the read reported, got {answered}"
-                );
-                assert_eq!(
-                    answered["Limit"]["ProvisionedLimitValue"].as_i64(),
-                    Some(in_force),
-                    "case {case:?}: the answered rate must be the one asked for, got {answered}"
+                    (
+                        status,
+                        error_code(&payload),
+                        error_message(&payload).to_string()
+                    ),
+                    (
+                        400,
+                        "InvalidParameterException",
+                        same_as_provisioned_message()
+                    ),
+                    "case {case:?}: re-applying the rate in force is refused, got {status} \
+                     with {payload}"
                 );
 
                 let reported = read_back(&router, &case, category.name).await;
                 assert_eq!(
                     reported, baseline,
-                    "case {case:?}: the limit a later read reports is the rate that was \
-                     applied, got {reported}"
+                    "case {case:?}: a refused update leaves the limit as it was, got {reported}"
                 );
             }
         }
@@ -162,15 +168,15 @@ async fn the_rate_a_read_reports_is_accepted_again_and_answers_the_same_limit() 
 }
 
 #[tokio::test]
-async fn every_rate_inside_the_range_is_stored_whether_or_not_it_is_in_force() {
+async fn every_rate_inside_the_range_is_stored_once_and_refused_when_it_is_in_force() {
     let (router, engine) = router_and_engine();
 
     // The rows differ along where in the account's range the rate sits: its
     // floor (the rate the limit includes, which is the bottom of the accepted
     // range), one step in, the midpoint, and the account's ceiling. Each one is
-    // applied twice in a row, so the second application asks for the rate the
-    // first put in force — the case this suite is about — and both are expected
-    // to answer the same limit.
+    // sent twice in a row: the first application is an adjustment and is
+    // stored, the second asks for the rate the first put in force — the case
+    // this suite is about — and is refused, leaving that rate in place.
     for category in cognito_idp::state::API_CATEGORIES {
         let ceiling = granted_increase(&engine, category, category.free_rate + GRANTED_INCREASE);
         assert_eq!(
@@ -182,39 +188,57 @@ async fn every_rate_inside_the_range_is_stored_whether_or_not_it_is_in_force() {
         let midpoint = (category.free_rate + ceiling) / 2;
 
         for (position, requested) in [
-            ("the floor of the range", category.free_rate),
             ("one step above the floor", category.free_rate + 1),
             ("the midpoint of the range", midpoint),
             ("the account's ceiling", ceiling),
+            ("the floor of the range", category.free_rate),
         ] {
-            for application in ["first", "repeated"] {
-                let case = format!(
-                    "{} asked for {requested} ({position}, {application} application)",
-                    category.name
-                );
-                let expected = json!({
-                    "LimitDefinition": definition(category.name),
-                    "ProvisionedLimitValue": requested,
-                    "FreeLimitValue": category.free_rate,
-                });
-                let (status, answered) = provision(&router, category.name, requested).await;
-                assert_eq!(
-                    status, 200,
-                    "case {case:?}: a rate inside the account's range is stored, got {status} \
-                     with {answered}"
-                );
-                assert_eq!(
-                    answered.get("Limit"),
-                    Some(&expected),
-                    "case {case:?}: the update must answer the limit it stored, got {answered}"
-                );
+            let expected = json!({
+                "LimitDefinition": definition(category.name),
+                "ProvisionedLimitValue": requested,
+                "FreeLimitValue": category.free_rate,
+            });
 
-                let reported = read_back(&router, &case, category.name).await;
-                assert_eq!(
-                    reported, expected,
-                    "case {case:?}: the read must render the stored limit, got {reported}"
-                );
-            }
+            let case = format!(
+                "{} asked for {requested} ({position}, first application)",
+                category.name
+            );
+            let (status, answered) = provision(&router, category.name, requested).await;
+            assert_eq!(
+                status, 200,
+                "case {case:?}: a rate inside the account's range that changes the limit is \
+                 stored, got {status} with {answered}"
+            );
+            assert_eq!(
+                answered.get("Limit"),
+                Some(&expected),
+                "case {case:?}: the update must answer the limit it stored, got {answered}"
+            );
+
+            let case = format!(
+                "{} asked for {requested} ({position}, repeated application)",
+                category.name
+            );
+            let (status, payload) = provision(&router, category.name, requested).await;
+            assert_eq!(
+                (
+                    status,
+                    error_code(&payload),
+                    error_message(&payload).to_string()
+                ),
+                (
+                    400,
+                    "InvalidParameterException",
+                    same_as_provisioned_message()
+                ),
+                "case {case:?}: the rate now in force is refused, got {status} with {payload}"
+            );
+
+            let reported = read_back(&router, &case, category.name).await;
+            assert_eq!(
+                reported, expected,
+                "case {case:?}: the read must render the stored limit, got {reported}"
+            );
         }
     }
 }

@@ -27,6 +27,10 @@ use super::*;
 /// * A value whose attribute has a FORM of its own has to have that form
 ///   ([`attribute_value_defect`]), so a `phone_number` that is not a phone
 ///   number in E.164 form is refused rather than stored.
+/// * A value has to be within the bounds the pool's schema declares for its
+///   attribute ([`declared_bound_report`]), so a number outside the declared
+///   `MinValue`/`MaxValue` and a string outside the declared
+///   `MinLength`/`MaxLength` are refused rather than stored.
 /// * A new `email` or `phone_number` is no longer the value its verified flag
 ///   vouched for ([`verified_flag`]), so the flag goes unconfirmed unless the
 ///   request sets it itself, and a deleted one takes its flag with it.
@@ -116,6 +120,16 @@ pub fn plan_attribute_update(
                 .into_iter()
                 .map(|name| (name, SchemaValidationFinding::NotUpdatable)),
         )));
+    }
+    // Every value written has to be within the bounds the pool's schema declares
+    // for its attribute ([`declared_bound_report`]), and EVERY value outside one
+    // is reported, a line each, exactly as the findings above are. Decided before
+    // any attribute is planned, so a request carrying one writes nothing.
+    if let Some(report) = declared_bound_report(
+        pool,
+        submitted.iter().map(|(name, value)| (*name, *value)),
+    ) {
+        return Err(AttributeUpdateRefusal::Invalid(report));
     }
     for (name, value) in &submitted {
         let name = (*name).to_string();
@@ -372,6 +386,173 @@ fn is_e164(value: &str) -> bool {
     !digits.is_empty()
         && digits.len() <= E164_MAX_DIGITS
         && digits.bytes().all(|digit| digit.is_ascii_digit())
+}
+
+/// The bound a submitted value missed, as the pool's schema declares it.
+///
+/// A schema attribute carries the constraints of its OWN data type —
+/// "specifies the constraints for an attribute of the number type"
+/// (`SchemaAttributeType.NumberAttributeConstraints`, whose `MinValue` is "the
+/// minimum length of a number attribute value" and `MaxValue` the maximum) and
+/// "... of the string type" (`StringAttributeConstraints`, with `MinLength` and
+/// `MaxLength`), this service's model — so a value stored for that attribute has
+/// to be within them, and the sentence a violation is reported with states which
+/// bound was missed and that bound as the SCHEMA declares it, never the submitted
+/// value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DeclaredBound<'schema> {
+    /// The value is a number above the declared `MaxValue`.
+    NumberAbove(&'schema str),
+    /// The value is a number below the declared `MinValue`.
+    NumberBelow(&'schema str),
+    /// The value is longer than the declared `MaxLength`.
+    StringLonger(&'schema str),
+    /// The value is shorter than the declared `MinLength`.
+    StringShorter(&'schema str),
+}
+
+impl DeclaredBound<'_> {
+    /// The sentence this violation is reported with: the bound that was missed,
+    /// stated in the units its data type is bounded in — a number against the
+    /// value it may not pass, a string against the number of characters it may
+    /// not pass.
+    fn sentence(self) -> String {
+        match self {
+            Self::NumberAbove(max_value) => format!("Number must be less than {max_value}"),
+            Self::NumberBelow(min_value) => format!("Number must be greater than {min_value}"),
+            Self::StringLonger(max_length) => {
+                format!("String must be no longer than {max_length} characters")
+            }
+            Self::StringShorter(min_length) => {
+                format!("String must be no shorter than {min_length} characters")
+            }
+        }
+    }
+}
+
+/// The schema-validation report refusing every `submitted` `(attribute, value)`
+/// whose value is outside a bound `pool`'s schema declares for that attribute, or
+/// `None` when every submitted value is within the bounds declared for it.
+///
+/// The pool's schema is the boundary every write of a user attribute is judged
+/// against, whichever operation submitted it: the entry for an attribute declares
+/// the constraints its values take ([`DeclaredBound`]), so a value outside one is
+/// a value no user of the pool can hold and the write is refused with the report
+/// those findings make up ([`schema_validation_report`]) — a line per attribute,
+/// exactly as the other schema findings are reported.
+///
+/// A BLANK value is no value at all — "to delete an attribute from your user,
+/// submit the attribute in your API request with a blank value" (this service's
+/// model) — so no bound applies to it.
+///
+/// Bounded by the submitted list, with one lookup of the pool's schema per entry
+/// and nothing allocated for a value that is within its bounds.
+pub fn declared_bound_report<'submitted>(
+    pool: &UserPool,
+    submitted: impl IntoIterator<Item = (&'submitted str, &'submitted str)>,
+) -> Option<String> {
+    let mut findings: Vec<(&'submitted str, SchemaValidationFinding)> = Vec::new();
+    for (name, value) in submitted {
+        if value.is_empty() {
+            continue;
+        }
+        if let Some(missed) = declared_bound_missed(pool, name, value) {
+            findings.push((
+                name,
+                SchemaValidationFinding::OutsideDeclaredBound(missed.sentence()),
+            ));
+        }
+    }
+    if findings.is_empty() {
+        return None;
+    }
+    Some(schema_validation_report(findings))
+}
+
+/// Whether `value` is within every bound `pool`'s schema declares for the
+/// attribute `name`. [`declared_bound_report`] states the refusal a caller
+/// answers with; this answers the question alone, for a caller that reports no
+/// message and so needs no report built.
+pub fn within_declared_bounds(pool: &UserPool, name: &str, value: &str) -> bool {
+    value.is_empty() || declared_bound_missed(pool, name, value).is_none()
+}
+
+/// The bound `pool`'s schema declares for the attribute `name` that `value` is
+/// outside, or `None` when the value is within every bound declared for it.
+///
+/// Which constraints apply is the attribute's `AttributeDataType` — a `Number`
+/// attribute's values are bounded by value and a `String` attribute's by length,
+/// and an attribute of any other type (a boolean) carries neither structure, so
+/// nothing bounds its values. An entry naming no data type is a `String` one, the
+/// type an attribute defaults to ([`DEFAULT_ATTRIBUTE_DATA_TYPE`]). An attribute
+/// the schema does not declare has no entry to read, and a value of a `Number`
+/// attribute that is not a number at all is outside no declared bound: neither is
+/// judged here, the first being refused as undeclared
+/// ([`plan_attribute_update`]) and the second having nothing to compare against.
+fn declared_bound_missed<'pool>(
+    pool: &'pool UserPool,
+    name: &str,
+    value: &str,
+) -> Option<DeclaredBound<'pool>> {
+    let entry = pool.schema_attribute(name)?;
+    match entry
+        .attribute_data_type
+        .as_deref()
+        .unwrap_or(DEFAULT_ATTRIBUTE_DATA_TYPE)
+    {
+        NUMBER_ATTRIBUTE_DATA_TYPE => {
+            let constraints = entry.number_attribute_constraints.as_ref()?;
+            let submitted: f64 = value.trim().parse().ok()?;
+            if let Some((declared, max_value)) = declared_number(constraints.max_value.as_deref()) {
+                if submitted > max_value {
+                    return Some(DeclaredBound::NumberAbove(declared));
+                }
+            }
+            if let Some((declared, min_value)) = declared_number(constraints.min_value.as_deref()) {
+                if submitted < min_value {
+                    return Some(DeclaredBound::NumberBelow(declared));
+                }
+            }
+            None
+        }
+        STRING_ATTRIBUTE_DATA_TYPE => {
+            let constraints = entry.string_attribute_constraints.as_ref()?;
+            // A length is counted in CHARACTERS, which is what the constraint
+            // bounds: a value the caller wrote in a non-ASCII script is as long
+            // as the characters it has.
+            let submitted = value.chars().count();
+            if let Some((declared, max_length)) = declared_length(constraints.max_length.as_deref())
+            {
+                if submitted > max_length {
+                    return Some(DeclaredBound::StringLonger(declared));
+                }
+            }
+            if let Some((declared, min_length)) = declared_length(constraints.min_length.as_deref())
+            {
+                if submitted < min_length {
+                    return Some(DeclaredBound::StringShorter(declared));
+                }
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+/// A declared numeric bound as `(the text the schema declares it with, the number
+/// that text names)`, or `None` where the schema declares no such bound or
+/// declares one that names no number — a bound nothing can be compared against
+/// bounds nothing.
+fn declared_number(bound: Option<&str>) -> Option<(&str, f64)> {
+    let declared = bound.map(str::trim).filter(|text| !text.is_empty())?;
+    Some((declared, declared.parse().ok()?))
+}
+
+/// A declared length bound as `(the text the schema declares it with, the length
+/// that text names)`, by the same rule as [`declared_number`].
+fn declared_length(bound: Option<&str>) -> Option<(&str, usize)> {
+    let declared = bound.map(str::trim).filter(|text| !text.is_empty())?;
+    Some((declared, declared.parse().ok()?))
 }
 
 /// The attribute whose confirmation `flag` records, or `None` when `flag` is

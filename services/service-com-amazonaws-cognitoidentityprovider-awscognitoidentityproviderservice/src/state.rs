@@ -3949,21 +3949,28 @@ pub fn non_mutable_attribute_message(attribute_name: &str) -> String {
 /// attribute, under the `user.` prefix the schema gives a user's own attributes,
 /// then what is wrong with it, then the newline every line of that report ends
 /// with. [`schema_validation_report`] is the report those lines make up.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SchemaValidationFinding {
     /// The pool's schema declares no such attribute, so there is nothing to write.
     NotInSchema,
     /// The pool's schema declares the attribute immutable
     /// (`SchemaAttributeType.Mutable`), so its stored value cannot change.
     NotUpdatable,
+    /// The submitted value is outside a bound the pool's schema declares for the
+    /// attribute (`SchemaAttributeType.StringAttributeConstraints` /
+    /// `NumberAttributeConstraints`), carrying the sentence that states which
+    /// bound it missed and the bound as the schema declares it
+    /// ([`declared_bound_report`]).
+    OutsideDeclaredBound(String),
 }
 
 impl SchemaValidationFinding {
     /// The sentence this finding is reported with.
-    fn sentence(self) -> &'static str {
+    fn sentence(&self) -> &str {
         match self {
             Self::NotInSchema => "Attribute does not exist in the schema.",
             Self::NotUpdatable => "Attribute cannot be updated.",
+            Self::OutsideDeclaredBound(sentence) => sentence.as_str(),
         }
     }
 }
@@ -4582,9 +4589,19 @@ impl LimitLookupFailure {
     }
 }
 
+/// The one sentence a request asking for the rate a limit already holds is
+/// refused with. Fixed text: the rate it is about is the rate the request
+/// carried, which the caller already has, so no value of the request or of the
+/// account is quoted back.
+pub const SAME_AS_PROVISIONED_LIMIT_MESSAGE: &str =
+    "Requested value is the same as the current provisioned limit";
+
 /// Why a requested rate is not one this account can provision for a limit.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RateRefusal {
+    /// The requested rate is the one the limit already holds, so the request
+    /// asks for no change to make.
+    SameAsProvisioned,
     /// The requested rate is below the rate the limit includes, which is the
     /// lowest rate it can hold.
     BelowFreeRate { requested: i32, free_rate: i32 },
@@ -4604,6 +4621,14 @@ impl RateRefusal {
     #[must_use]
     pub fn message(&self) -> String {
         match self {
+            // A rate the limit already holds is reported in ONE sentence with
+            // no variable part: the rate it names is the rate the request
+            // carried and the rate the limit already reports, so the sentence
+            // states the fact alone and the caller reads the value off its own
+            // request.
+            Self::SameAsProvisioned => {
+                SAME_AS_PROVISIONED_LIMIT_MESSAGE.to_string()
+            }
             // The rate missing the floor states the rate that was asked for and
             // the floor it missed: the floor is the rate the limit includes at
             // no additional cost, which the limit reports as its
@@ -4748,22 +4773,28 @@ impl ComAmazonawsCognitoidentityproviderAwscognitoidentityproviderserviceState {
     /// Provision `requested` requests per second for `category` and return the
     /// limit as it now stands.
     ///
-    /// EVERY rate in the account's range is stored, including one the limit
-    /// already reports as in force: the range runs from the rate the category
-    /// includes up to the account's Service Quotas ceiling for that limit
-    /// ([`Self::api_category_quota_ceiling`]) — "the value must be between the
-    /// default limit and your account-level maximum limit in Service Quotas"
-    /// (`UpdateProvisionedLimit` in this service's model) — and only a rate
-    /// OUTSIDE that range is refused. Setting a limit to the rate it already
-    /// holds is the same write made twice, so it stores the same rate again and
-    /// reports it; a caller that re-applies the rate a read just reported
-    /// converges rather than failing. A refused call stores nothing, so the
-    /// limit a later read reports is the one that was already in force.
+    /// The requested rate has to CHANGE the limit: this operation "sets the
+    /// provisioned limit for a specific API category" (`UpdateProvisionedLimit`
+    /// in this service's model), so a request naming the rate the limit already
+    /// holds — the rate a read of that limit just reported — sets nothing, and
+    /// is refused ahead of every other test, the account's Service Quotas
+    /// ceiling included.
+    ///
+    /// Every OTHER rate in the account's range is stored: the range runs from
+    /// the rate the category includes up to the account's Service Quotas ceiling
+    /// for that limit ([`Self::api_category_quota_ceiling`]) — "the value must be
+    /// between the default limit and your account-level maximum limit in Service
+    /// Quotas" (the same doc) — and a rate OUTSIDE that range is refused. A
+    /// refused call stores nothing, so the limit a later read reports is the one
+    /// that was already in force.
     pub fn set_api_category_limit(
         &mut self,
         category: &ApiCategory,
         requested: i32,
     ) -> Result<LimitType, RateRefusal> {
+        if requested == self.api_category_limit(category).provisioned_limit_value {
+            return Err(RateRefusal::SameAsProvisioned);
+        }
         if requested < category.free_rate {
             return Err(RateRefusal::BelowFreeRate {
                 requested,
