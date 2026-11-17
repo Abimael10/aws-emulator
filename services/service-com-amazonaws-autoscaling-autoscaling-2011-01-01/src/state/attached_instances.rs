@@ -34,6 +34,7 @@
 //! HOLDING them — the registrations a group's attachments owe are recomputed from its
 //! instances ([`super::elbv2_targets`]) — rather than being written again here.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::SystemTime;
 
 use super::{
@@ -169,10 +170,12 @@ impl AutoScalingState {
             return Ok(Vec::new());
         };
         // An id the request repeats names one instance, so it is attached once and counts
-        // once towards the capacity the group is left with.
+        // once towards the capacity the group is left with. Each id is admitted through a
+        // SET, so one pass over the request costs the same per id however many it carries.
+        let mut admitted: BTreeSet<&str> = BTreeSet::new();
         let mut wanted: Vec<String> = Vec::new();
         for instance_id in instance_ids {
-            if !wanted.contains(instance_id) {
+            if admitted.insert(instance_id.as_str()) {
                 wanted.push(instance_id.clone());
             }
         }
@@ -192,18 +195,28 @@ impl AutoScalingState {
         // instances of a group's WARM POOL are instances of that group too ("in the warm
         // pool or in any state except Terminated for the Auto Scaling group"), so one of
         // those is not free either.
-        for instance_id in &wanted {
-            let holder = self.groups.values().find(|group| {
-                group
+        //
+        // WHICH group holds each instance of the account is read in ONE pass, as the index
+        // the requested ids are then looked up in: the cost of a call is the account's
+        // inventory once, never that inventory once per id the request carries.
+        let holders: BTreeMap<&str, &str> = self
+            .groups
+            .values()
+            .flat_map(|holder| {
+                holder
                     .instances
                     .iter()
-                    .chain(group.warm_pool_instances().iter())
-                    .any(|instance| instance.instance_id == *instance_id)
-            });
-            if let Some(holder) = holder {
+                    .chain(holder.warm_pool_instances().iter())
+                    .map(move |instance| {
+                        (instance.instance_id.as_str(), holder.name.as_str())
+                    })
+            })
+            .collect();
+        for instance_id in &wanted {
+            if let Some(holder) = holders.get(instance_id.as_str()) {
                 return Err(AttachRefusal::AlreadyInGroup {
                     instance_id: instance_id.clone(),
-                    group_name: holder.name.clone(),
+                    group_name: (*holder).to_string(),
                 });
             }
         }
@@ -228,8 +241,14 @@ impl AutoScalingState {
             }
         }
 
-        let count = i32::try_from(wanted.len()).unwrap_or(i32::MAX);
-        let after = desired_capacity.saturating_add(count);
+        // What the attached instances will contribute to the group's capacity, in the units
+        // its size is stated in: an instance of a type the group weights brings its own
+        // weight's worth of capacity with it, which is what the group's size rises by.
+        let units = wanted.iter().fold(0i32, |units, instance_id| {
+            let instance_type = held.get(instance_id).map(|held| held.instance_type.as_str());
+            units.saturating_add(group.capacity_units_for_type(instance_type))
+        });
+        let after = desired_capacity.saturating_add(units);
         if after > max_size {
             return Err(AttachRefusal::PastMaxSize {
                 after,

@@ -334,7 +334,7 @@ fn group_view(group: &crate::state::StoredGroup, include_instances: bool) -> Aut
         group
             .instances
             .iter()
-            .map(crate::state::StoredInstance::to_instance)
+            .map(|instance| group.instance_view(instance))
             .collect()
     });
     AutoScalingGroup {

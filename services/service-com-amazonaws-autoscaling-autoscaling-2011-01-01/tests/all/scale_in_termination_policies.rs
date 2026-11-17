@@ -24,6 +24,12 @@
 //! Every wait here looks again until the group has settled, never for a span: the
 //! lifecycle transitions are owed on a clock, so a fixed sleep would be a guess about
 //! how fast the host runs.
+//!
+//! The suite's second subject is the other half of that same seam — HOW MANY instances a
+//! capacity change moves. A group whose mixed instances policy weights its instance types
+//! states its three size parameters in those weights' units, so the capacity asked for is
+//! fulfilled by the instances whose weights add up to it and each member reports the units
+//! it contributes; the tables at the end of this file span that rule.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -34,7 +40,7 @@ use service_com_amazonaws_autoscaling_autoscaling_2011_01_01 as autoscaling;
 use service_com_amazonaws_ec2_amazonec2 as ec2_service;
 use service_com_amazonaws_ec2_amazonec2::state as ec2;
 
-use crate::support::{borrowed, ec2_query, p, query, tag_value, tag_values, REGION};
+use crate::support::{borrowed, ec2_query, p, query, tag_value, tag_values, xml_unescape, REGION};
 
 /// The launch source every group here names. The template need not exist in Amazon EC2:
 /// what these cases are about is WHICH of the group's instances a scale-in picks, not
@@ -598,4 +604,595 @@ async fn wait_for_ec2_state(router: &MultiServiceRouter, instance_id: &str, expe
         );
         tokio::time::sleep(LOOK_AGAIN).await;
     }
+}
+
+// ---------------------------------------------------------------------------------------
+// A WEIGHTED group's size is stated in CAPACITY UNITS.
+//
+// "If you provide a list of instance types to use, you can specify the number of capacity
+// units provided by each instance type … the capacity units count toward the desired
+// capacity. Amazon EC2 Auto Scaling launches instances until the desired capacity is
+// totally fulfilled, even if this results in an overage … Every Auto Scaling group has
+// three size parameters (DesiredCapacity, MaxSize, and MinSize) … if you configure a mixed
+// instances policy that defines weights for the instance types, you must specify these
+// sizes with the same units that you use for weighting instances"
+// (`smithy_query(query="shape",shape="LaunchTemplateOverrides")`, member
+// `WeightedCapacity`). The weight each member contributes is reported on both read paths:
+// `Instance$WeightedCapacity` and `AutoScalingInstanceDetails$WeightedCapacity`, "the
+// number of capacity units contributed by the instance based on its instance type".
+// ---------------------------------------------------------------------------------------
+
+/// The instance type the weighted groups below override, so one override carries one
+/// weight.
+const WEIGHTED_INSTANCE_TYPE: &str = "t3.micro";
+
+/// Where the capacity a weighted group is driven to is asked for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CapacityFrom {
+    /// `CreateAutoScalingGroup$DesiredCapacity`.
+    Create,
+    /// A later `SetDesiredCapacity`.
+    SetDesiredCapacity,
+    /// A later `UpdateAutoScalingGroup`.
+    Update,
+}
+
+/// One row of the weighted-capacity table.
+struct WeightRow {
+    case: &'static str,
+    /// The `WeightedCapacity` the group's single override carries, or `None` for an
+    /// override that states none.
+    weight: Option<&'static str>,
+    /// The group's `MaxSize`, in the same units as the capacity asked for.
+    max_size: i32,
+    /// The capacity asked for, in capacity units.
+    units: i32,
+    asked_by: CapacityFrom,
+    /// How many instances fulfil that capacity: the fewest whose weights reach it.
+    expected_instances: usize,
+}
+
+/// One member of a group, as `DescribeAutoScalingGroups` reports it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ReportedMember {
+    instance_id: String,
+    instance_type: String,
+    lifecycle_state: String,
+    /// `Instance$WeightedCapacity`, absent when the group states no weight for the type.
+    weighted_capacity: Option<String>,
+}
+
+/// Create one group whose mixed instances policy overrides [`WEIGHTED_INSTANCE_TYPE`],
+/// carrying `row`'s weight, and ask for the row's capacity the way the row says.
+async fn create_weighted_group(router: &MultiServiceRouter, name: &str, row: &WeightRow) {
+    let mut params = vec![
+        p("AutoScalingGroupName", name),
+        p(
+            "MixedInstancesPolicy.LaunchTemplate.LaunchTemplateSpecification.LaunchTemplateName",
+            LAUNCH_TEMPLATE_NAME,
+        ),
+        p(
+            "MixedInstancesPolicy.LaunchTemplate.Overrides.member.1.InstanceType",
+            WEIGHTED_INSTANCE_TYPE,
+        ),
+        p("MinSize", "0"),
+        p("MaxSize", row.max_size.to_string()),
+        p("AvailabilityZones.member.1", only_zone()),
+    ];
+    if let Some(weight) = row.weight {
+        params.push(p(
+            "MixedInstancesPolicy.LaunchTemplate.Overrides.member.1.WeightedCapacity",
+            weight,
+        ));
+    }
+    if row.asked_by == CapacityFrom::Create {
+        params.push(p("DesiredCapacity", row.units.to_string()));
+    }
+    let (status, body) = query(router, "CreateAutoScalingGroup", &borrowed(&params)).await;
+    assert_eq!(
+        status, 200,
+        "case {:?}: CreateAutoScalingGroup expected 200, got {status}: {body}",
+        row.case
+    );
+    let action = match row.asked_by {
+        CapacityFrom::Create => return,
+        CapacityFrom::SetDesiredCapacity => "SetDesiredCapacity",
+        CapacityFrom::Update => "UpdateAutoScalingGroup",
+    };
+    let params = vec![
+        p("AutoScalingGroupName", name),
+        p("DesiredCapacity", row.units.to_string()),
+    ];
+    let (status, body) = query(router, action, &borrowed(&params)).await;
+    assert_eq!(
+        status, 200,
+        "case {:?}: {action} to {} units expected 200, got {status}: {body}",
+        row.case, row.units
+    );
+}
+
+/// The members one group reports, read out of the `Instances` member of a
+/// `DescribeAutoScalingGroups` answer — scoped to that element, so the weights the group's
+/// own `MixedInstancesPolicy` echoes back are not read as a member's.
+fn reported_members(body: &str) -> Vec<ReportedMember> {
+    let instances = tag_value(body, "Instances");
+    instances
+        .split("</member>")
+        .filter(|member| member.contains("<InstanceId"))
+        .map(|member| ReportedMember {
+            instance_id: tag_value(member, "InstanceId"),
+            instance_type: tag_value(member, "InstanceType"),
+            lifecycle_state: tag_value(member, "LifecycleState"),
+            weighted_capacity: {
+                let weight = tag_value(member, "WeightedCapacity");
+                (!weight.is_empty()).then_some(weight)
+            },
+        })
+        .collect()
+}
+
+/// Read one group, and answer its `DesiredCapacity` beside the members it reports.
+async fn described_group(
+    router: &MultiServiceRouter,
+    name: &str,
+) -> (String, Vec<ReportedMember>) {
+    let (status, body) = query(
+        router,
+        "DescribeAutoScalingGroups",
+        &[("AutoScalingGroupNames.member.1", name)],
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "DescribeAutoScalingGroups for {name} got {status}: {body}"
+    );
+    (tag_value(&body, "DesiredCapacity"), reported_members(&body))
+}
+
+/// Look again until the group reports `expected` members and every one of them is in
+/// service, and answer what it last reported.
+///
+/// The CONDITION, never a fixed wait: the launches and terminations a capacity change
+/// starts are owed on a clock.
+async fn settled_members(
+    router: &MultiServiceRouter,
+    name: &str,
+    expected: usize,
+    case: &str,
+) -> Vec<ReportedMember> {
+    let deadline = Instant::now() + SETTLE_DEADLINE;
+    loop {
+        let (_, members) = described_group(router, name).await;
+        if members.len() == expected
+            && members
+                .iter()
+                .all(|member| member.lifecycle_state == IN_SERVICE)
+        {
+            return members;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "case {case:?}: expected the group to settle at {expected} members in service, \
+             got {members:?}"
+        );
+        tokio::time::sleep(LOOK_AGAIN).await;
+    }
+}
+
+/// What `DescribeAutoScalingInstances` reports for one instance: the group it belongs to
+/// and the capacity units it contributes.
+async fn described_instances(
+    router: &MultiServiceRouter,
+    instance_ids: &[String],
+) -> Vec<(String, String, Option<String>)> {
+    let params: Vec<(String, String)> = instance_ids
+        .iter()
+        .enumerate()
+        .map(|(index, instance_id)| {
+            p(
+                &format!("InstanceIds.member.{}", index + 1),
+                instance_id.as_str(),
+            )
+        })
+        .collect();
+    let (status, body) =
+        query(router, "DescribeAutoScalingInstances", &borrowed(&params)).await;
+    assert_eq!(
+        status, 200,
+        "DescribeAutoScalingInstances for {instance_ids:?} got {status}: {body}"
+    );
+    tag_value(&body, "AutoScalingInstances")
+        .split("</member>")
+        .filter(|member| member.contains("<InstanceId"))
+        .map(|member| {
+            let weight = tag_value(member, "WeightedCapacity");
+            (
+                tag_value(member, "InstanceId"),
+                tag_value(member, "AutoScalingGroupName"),
+                (!weight.is_empty()).then_some(weight),
+            )
+        })
+        .collect()
+}
+
+/// A weighted group's `DesiredCapacity` is a number of CAPACITY UNITS: the group launches
+/// the fewest instances whose weights fulfil it, and every read of a member reports the
+/// units that member contributes.
+#[tokio::test]
+async fn a_weighted_group_is_sized_in_capacity_units() {
+    let rows = [
+        WeightRow {
+            case: "two units at a weight of two: ONE instance",
+            weight: Some("2"),
+            max_size: 4,
+            units: 2,
+            asked_by: CapacityFrom::SetDesiredCapacity,
+            expected_instances: 1,
+        },
+        WeightRow {
+            case: "three units at a weight of two: the launch overshoots to four units",
+            weight: Some("2"),
+            max_size: 4,
+            units: 3,
+            asked_by: CapacityFrom::SetDesiredCapacity,
+            expected_instances: 2,
+        },
+        WeightRow {
+            case: "six units at a weight of three: two instances, asked for by the create",
+            weight: Some("3"),
+            max_size: 6,
+            units: 6,
+            asked_by: CapacityFrom::Create,
+            expected_instances: 2,
+        },
+        WeightRow {
+            case: "the smallest published weight: a unit per instance",
+            weight: Some("1"),
+            max_size: 3,
+            units: 3,
+            asked_by: CapacityFrom::Update,
+            expected_instances: 3,
+        },
+        WeightRow {
+            case: "an override that states no weight: the size is an instance count",
+            weight: None,
+            max_size: 2,
+            units: 2,
+            asked_by: CapacityFrom::SetDesiredCapacity,
+            expected_instances: 2,
+        },
+        WeightRow {
+            case: "the largest published weight: one instance fulfils 999 units",
+            weight: Some("999"),
+            max_size: 999,
+            units: 999,
+            asked_by: CapacityFrom::SetDesiredCapacity,
+            expected_instances: 1,
+        },
+        WeightRow {
+            case: "one past the published maximum: counted as the override states it, and \
+                   reported as it states it",
+            weight: Some("1000"),
+            max_size: 1000,
+            units: 1000,
+            asked_by: CapacityFrom::Create,
+            expected_instances: 1,
+        },
+    ];
+
+    for (index, row) in rows.iter().enumerate() {
+        // One emulator per row: each row is its own account, so one row's instances never
+        // explain another's.
+        let (router, _engine) = emulator();
+        let name = format!("asg-weighted-{index}");
+        create_weighted_group(&router, &name, row).await;
+
+        let members = settled_members(&router, &name, row.expected_instances, row.case).await;
+        assert_eq!(
+            members.len(),
+            row.expected_instances,
+            "case {:?}: expected {} instances for {} units, got {members:?}",
+            row.case,
+            row.expected_instances,
+            row.units
+        );
+        let (desired_capacity, _) = described_group(&router, &name).await;
+        assert_eq!(
+            desired_capacity,
+            row.units.to_string(),
+            "case {:?}: the group holds the capacity asked for, in units, got \
+             {desired_capacity:?}",
+            row.case
+        );
+        let expected_weight = row.weight.map(::std::string::ToString::to_string);
+        for member in &members {
+            assert_eq!(
+                member.instance_type, WEIGHTED_INSTANCE_TYPE,
+                "case {:?}: the override's instance type, got {member:?}",
+                row.case
+            );
+            assert_eq!(
+                member.weighted_capacity, expected_weight,
+                "case {:?}: expected the member to report WeightedCapacity \
+                 {expected_weight:?}, got {member:?}",
+                row.case
+            );
+        }
+
+        // The other read path reports the same instances, the group they belong to and the
+        // same weight: a client reconciling units against members has both sides.
+        let ids: Vec<String> = members
+            .iter()
+            .map(|member| member.instance_id.clone())
+            .collect();
+        let detailed = described_instances(&router, &ids).await;
+        let expected: Vec<(String, String, Option<String>)> = ids
+            .iter()
+            .map(|instance_id| {
+                (
+                    instance_id.clone(),
+                    name.clone(),
+                    expected_weight.clone(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            detailed, expected,
+            "case {:?}: expected DescribeAutoScalingInstances to report {expected:?}, got \
+             {detailed:?}",
+            row.case
+        );
+    }
+}
+
+/// One row of the weighted scale-in table: the capacity the group is driven down to, and
+/// the instances that still fulfil it afterwards.
+struct ScaleInRow {
+    case: &'static str,
+    /// The capacity, in units, the group is scaled in to.
+    units: i32,
+    expected_instances: usize,
+}
+
+/// A scale-in of a weighted group is a scale-in of CAPACITY UNITS: it takes instances out
+/// only while what is left still fulfils the capacity asked for, so a group of members
+/// worth several units each loses fewer instances than the surplus names.
+#[tokio::test]
+async fn a_weighted_scale_in_keeps_the_capacity_fulfilled() {
+    let rows = [
+        ScaleInRow {
+            case: "down to three units: two instances of two units still fulfil it",
+            units: 3,
+            expected_instances: 2,
+        },
+        ScaleInRow {
+            case: "down to two units: one instance of two units fulfils it exactly",
+            units: 2,
+            expected_instances: 1,
+        },
+        ScaleInRow {
+            case: "down to nothing: the group holds no instance",
+            units: 0,
+            expected_instances: 0,
+        },
+    ];
+
+    for (index, row) in rows.iter().enumerate() {
+        let (router, _engine) = emulator();
+        let name = format!("asg-weighted-in-{index}");
+        // Six units at a weight of two: three instances, which is what each row scales in
+        // from.
+        let grown = WeightRow {
+            case: row.case,
+            weight: Some("2"),
+            max_size: 8,
+            units: 6,
+            asked_by: CapacityFrom::SetDesiredCapacity,
+            expected_instances: 3,
+        };
+        create_weighted_group(&router, &name, &grown).await;
+        let launched = settled_members(&router, &name, 3, row.case).await;
+
+        let params = vec![
+            p("AutoScalingGroupName", name.as_str()),
+            p("DesiredCapacity", row.units.to_string()),
+        ];
+        let (status, body) = query(&router, "SetDesiredCapacity", &borrowed(&params)).await;
+        assert_eq!(
+            status, 200,
+            "case {:?}: SetDesiredCapacity to {} units got {status}: {body}",
+            row.case, row.units
+        );
+
+        let left = settled_members(&router, &name, row.expected_instances, row.case).await;
+        assert_eq!(
+            left.len(),
+            row.expected_instances,
+            "case {:?}: expected {} instances left for {} units, got {left:?} of \
+             {launched:?}",
+            row.case,
+            row.expected_instances,
+            row.units
+        );
+        // What stays is a subset of what the group launched, still carrying its weight.
+        for member in &left {
+            assert!(
+                launched
+                    .iter()
+                    .any(|launched| launched.instance_id == member.instance_id),
+                "case {:?}: every instance left is one the group launched {launched:?}, \
+                 got {member:?}",
+                row.case
+            );
+            assert_eq!(
+                member.weighted_capacity.as_deref(),
+                Some("2"),
+                "case {:?}: a member of the weighted group reports its weight, got \
+                 {member:?}",
+                row.case
+            );
+        }
+        let (desired_capacity, _) = described_group(&router, &name).await;
+        assert_eq!(
+            desired_capacity,
+            row.units.to_string(),
+            "case {:?}: the group holds the capacity the scale-in asked for, got \
+             {desired_capacity:?}",
+            row.case
+        );
+    }
+}
+
+/// One row of the account-wide read's own table: the request it makes, and what the read
+/// must answer.
+struct ReadRow {
+    case: &'static str,
+    /// How many of the group's instances the request names, or `None` to name none at all.
+    named_ids: Option<usize>,
+    /// `MaxRecords`, when the request carries one.
+    max_records: Option<&'static str>,
+    /// How many entries the answer carries.
+    expected_entries: usize,
+    /// Whether the answer carries a `NextToken` for a further page.
+    expects_next_token: bool,
+}
+
+/// `DescribeAutoScalingInstances` reports the account's Auto Scaling instances, filtered by
+/// the ids the request names and paged by `MaxRecords` — and refuses a request naming more
+/// ids than one call may carry, rather than scanning the account's inventory once per id.
+#[tokio::test]
+async fn the_account_wide_instance_read_is_filtered_and_paged() {
+    let (router, _engine) = emulator();
+    let name = "asg-instance-read";
+    // Three instances at a weight of two, so the read has several members to page over.
+    let group = WeightRow {
+        case: "three members of a weighted group",
+        weight: Some("2"),
+        max_size: 6,
+        units: 6,
+        asked_by: CapacityFrom::Create,
+        expected_instances: 3,
+    };
+    create_weighted_group(&router, name, &group).await;
+    let members = settled_members(&router, name, 3, group.case).await;
+    let ids: Vec<String> = members
+        .iter()
+        .map(|member| member.instance_id.clone())
+        .collect();
+
+    let rows = [
+        ReadRow {
+            case: "no ids and no page size: every instance of the account",
+            named_ids: None,
+            max_records: None,
+            expected_entries: 3,
+            expects_next_token: false,
+        },
+        ReadRow {
+            case: "one id: only that instance",
+            named_ids: Some(1),
+            max_records: None,
+            expected_entries: 1,
+            expects_next_token: false,
+        },
+        ReadRow {
+            case: "a page size below the count: one entry and a token for the rest",
+            named_ids: None,
+            max_records: Some("1"),
+            expected_entries: 1,
+            expects_next_token: true,
+        },
+        ReadRow {
+            case: "a page size at the count: every entry and no token",
+            named_ids: None,
+            max_records: Some("3"),
+            expected_entries: 3,
+            expects_next_token: false,
+        },
+    ];
+
+    for row in &rows {
+        let mut params: Vec<(String, String)> = Vec::new();
+        for (index, instance_id) in ids.iter().take(row.named_ids.unwrap_or(0)).enumerate() {
+            params.push(p(
+                &format!("InstanceIds.member.{}", index + 1),
+                instance_id.as_str(),
+            ));
+        }
+        if let Some(max_records) = row.max_records {
+            params.push(p("MaxRecords", max_records));
+        }
+        let (status, body) =
+            query(&router, "DescribeAutoScalingInstances", &borrowed(&params)).await;
+        assert_eq!(
+            status, 200,
+            "case {:?}: expected 200, got {status}: {body}",
+            row.case
+        );
+        let reported = tag_value(&body, "AutoScalingInstances");
+        let entries = reported
+            .split("</member>")
+            .filter(|member| member.contains("<InstanceId"))
+            .count();
+        assert_eq!(
+            entries, row.expected_entries,
+            "case {:?}: expected {} entries, got {body}",
+            row.case, row.expected_entries
+        );
+        assert_eq!(
+            !tag_value(&body, "NextToken").is_empty(),
+            row.expects_next_token,
+            "case {:?}: expected a NextToken: {}, got {body}",
+            row.case,
+            row.expects_next_token
+        );
+        if let Some(named) = row.named_ids {
+            for instance_id in ids.iter().take(named) {
+                assert!(
+                    reported.contains(instance_id.as_str()),
+                    "case {:?}: expected the answer to report {instance_id}, got {body}",
+                    row.case
+                );
+            }
+        }
+    }
+
+    // A page the read never issued a token for is refused, and so is an id list longer
+    // than one call may carry ("Array Members: Maximum number of 50 items").
+    let params = vec![p("NextToken", "not-a-token-this-service-issued")];
+    let (status, body) =
+        query(&router, "DescribeAutoScalingInstances", &borrowed(&params)).await;
+    assert_eq!(status, 400, "an unusable NextToken: got {status}: {body}");
+    assert!(
+        body.contains("<Code>InvalidNextToken</Code>"),
+        "an unusable NextToken is the modelled InvalidNextToken, got {body}"
+    );
+
+    let over_the_limit = autoscaling::state::MAX_INSTANCE_IDS_PER_CALL + 1;
+    let params: Vec<(String, String)> = (0..over_the_limit)
+        .map(|index| {
+            p(
+                &format!("InstanceIds.member.{}", index + 1),
+                format!("i-{index:017x}"),
+            )
+        })
+        .collect();
+    let (status, body) =
+        query(&router, "DescribeAutoScalingInstances", &borrowed(&params)).await;
+    assert_eq!(
+        status, 400,
+        "{over_the_limit} ids in one call: got {status}: {body}"
+    );
+    assert!(
+        body.contains("<Code>ValidationError</Code>"),
+        "too many ids is a ValidationError, got {body}"
+    );
+    assert!(
+        xml_unescape(&tag_value(&body, "Message")).contains(&format!(
+            "at 'instanceIds' failed to satisfy constraint: Member must have length less \
+             than or equal to {}",
+            autoscaling::state::MAX_INSTANCE_IDS_PER_CALL
+        )),
+        "the refusal names the member and the bound it missed, got {body}"
+    );
 }

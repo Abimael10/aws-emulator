@@ -102,12 +102,20 @@ const ORDERING_POLICIES: &[&str] = &[
 /// [`CLOSEST_TO_NEXT_INSTANCE_HOUR`] orders by how much is left of.
 const BILLING_HOUR: Duration = Duration::from_secs(60 * 60);
 
-/// The instances a scale-in of `count` takes out of `group`, in the order it takes
-/// them.
+/// The instances a scale-in of `surplus_units` capacity units takes out of `group`, in the
+/// order it takes them.
 ///
-/// Answers fewer than `count` ids when the group holds fewer candidates — an instance
-/// already `Terminating` is already leaving, and one protected from scale-in is not
-/// chosen at all — and never names one instance twice.
+/// `surplus_units` is a capacity in the group's own units
+/// ([`StoredGroup::surplus_capacity_units`]), so each candidate covers the units ITS
+/// instance type is weighted at and a scale-in of a weighted group takes fewer instances
+/// than the surplus names: for an unweighted group every candidate covers one unit, which is
+/// the instance count this answered before any group had weights. An instance worth more
+/// units than the surplus left is passed over — the group has to go on fulfilling the
+/// capacity asked for, so a scale-in never takes its capacity below it.
+///
+/// Answers fewer instances than the surplus would pay for when the group holds fewer
+/// candidates — an instance already `Terminating` is already leaving, and one protected from
+/// scale-in is not chosen at all — and never names one instance twice.
 ///
 /// `launch_configurations` is the account's own collection, which
 /// [`OLDEST_LAUNCH_CONFIGURATION`] resolves an instance's configuration age against;
@@ -116,11 +124,10 @@ const BILLING_HOUR: Duration = Duration::from_secs(60 * 60);
 pub fn scale_in_selection(
     group: &StoredGroup,
     launch_configurations: &BTreeMap<String, StoredLaunchConfiguration>,
-    count: i32,
+    surplus_units: i32,
     now: SystemTime,
 ) -> Vec<String> {
-    let wanted = usize::try_from(count).unwrap_or(0);
-    if wanted == 0 {
+    if surplus_units <= 0 {
         return Vec::new();
     }
     let mut ordered = candidates(group);
@@ -135,11 +142,21 @@ pub fn scale_in_selection(
     {
         order_by(&mut ordered, policy, launch_configurations, now);
     }
-    ordered
-        .into_iter()
-        .take(wanted)
-        .map(|instance| instance.instance_id.clone())
-        .collect()
+    // Each instance pays for the units its own type is weighted at, so the surplus is
+    // spent down the selection order rather than counted in instances.
+    let mut remaining = surplus_units;
+    let mut taken: Vec<String> = Vec::new();
+    for instance in ordered {
+        if remaining <= 0 {
+            break;
+        }
+        let units = group.instance_capacity_units(instance);
+        if units <= remaining {
+            remaining -= units;
+            taken.push(instance.instance_id.clone());
+        }
+    }
+    taken
 }
 
 /// The policies of `policies` a selection has to apply, in the order they are listed.

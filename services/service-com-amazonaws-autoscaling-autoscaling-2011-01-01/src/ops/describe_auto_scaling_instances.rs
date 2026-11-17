@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeAutoScalingInstances
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeAutoScalingInstances`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeAutoScalingInstances::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the Auto Scaling instances of the account and Region: every instance each of
+//! the account's Auto Scaling groups holds, as that group's own view of it, filtered by
+//! the ids the request names and paged with the operation's own `NextToken`.
 //!
 //! ## Shape of an operation
 //!
@@ -151,18 +146,171 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeAutoScalingInstances` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeAutoScalingInstancesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeAutoScalingInstances"))
+        // This read reports the account's own instances rather than one group's, so it
+        // takes nothing from the request's metadata; whether the caller may make it at all
+        // is decided ahead of the handler ([`crate::service::authorization`]).
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                DescribeAutoScalingInstancesErrorModeled::ResourceContentionFault(
+                    ResourceContentionFault {
+                        message: Some(
+                            "the Auto Scaling store is not mounted on this engine".to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // The page this read resumes at, from the token a previous one issued: a token
+        // this service never issued names no page, which is this operation's own modelled
+        // `InvalidNextToken`.
+        let (offset, token) = match input.next_token.clone() {
+            None => (0, String::new()),
+            Some(token) => match crate::state::decode_next_token(&token) {
+                Some(offset) => (offset, token),
+                None => {
+                    return Err(DescribeAutoScalingInstancesErrorModeled::InvalidNextToken(
+                        InvalidNextToken {
+                            message: Some(crate::state::invalid_next_token_message(&token)),
+                        },
+                    )
+                    .into())
+                }
+            },
+        };
+        // "The maximum number of items to return with this call. The default value is 50
+        // and the maximum value is 50" (`DescribeAutoScalingInstancesType$MaxRecords`):
+        // this operation's own ceiling, checked here because the member carries no
+        // modelled range, and stated as the bound the value missed.
+        if let Some(max_records) = crate::state::max_records_out_of_range_within(
+            input.max_records,
+            MAX_AUTO_SCALING_INSTANCE_RECORDS,
+        ) {
+            return Err(crate::scaffolded::Scaffolded::validation_error(
+                crate::state::max_records_violation_message_within(
+                    max_records,
+                    MAX_AUTO_SCALING_INSTANCE_RECORDS,
+                ),
+            ));
+        }
+
+        // "If you omit this property, all Auto Scaling instances are described. If you
+        // specify an ID that does not exist, it is ignored with no error" (this
+        // operation's own documentation), so the ids are a filter and nothing else — and
+        // "Array Members: Maximum number of 50 items"
+        // (`DescribeAutoScalingInstancesType$InstanceIds`) is how many one call may name,
+        // so a longer list is refused before anything is read rather than scanned.
+        let requested = input.instance_ids.unwrap_or_default();
+        if requested.len() > crate::state::MAX_INSTANCE_IDS_PER_CALL {
+            return Err(crate::scaffolded::Scaffolded::validation_error(
+                crate::state::constraint_violation_message(
+                    crate::state::stated_value_set(requested.iter().map(String::as_str)),
+                    "instanceIds",
+                    &format!(
+                        "Member must have length less than or equal to {}",
+                        crate::state::MAX_INSTANCE_IDS_PER_CALL
+                    ),
+                ),
+            ));
+        }
+        // The ids as a SET, built once: a membership test that scanned the list would cost
+        // the request's length for every instance the account holds.
+        let wanted: ::std::collections::BTreeSet<&str> =
+            requested.iter().map(String::as_str).collect();
+        // How many entries this page holds, which is also how many instances this call
+        // projects: the work one request makes is the page it is served, not the account's
+        // whole inventory.
+        let limit = crate::state::page_limit(input.max_records);
+
+        let mut state = state.lock();
+        state.materialize_due(&*self.engine, ::std::time::SystemTime::now());
+
+        // Every instance of every group of the account, in group-name order and inside a
+        // group in the order the group reports its own members, so one page of this read
+        // follows the previous one. Iterated LAZILY from the page's own first entry: only
+        // what is served is projected, and one entry past it is looked at to decide
+        // whether a further page exists.
+        let mut matching = state
+            .groups
+            .values()
+            .flat_map(|group| {
+                group
+                    .instances
+                    .iter()
+                    .map(move |instance| (group, instance))
+            })
+            .filter(|(_, instance)| {
+                wanted.is_empty() || wanted.contains(instance.instance_id.as_str())
+            })
+            .skip(offset);
+        let mut page: Vec<AutoScalingInstanceDetails> = Vec::new();
+        let mut further_page = false;
+        for (group, instance) in matching.by_ref() {
+            if page.len() == limit {
+                further_page = true;
+                break;
+            }
+            page.push(instance_details(group, instance));
+        }
+        // A token the service issued always points inside the list it was issued for; one
+        // that points past the end was not issued for this list. Only a decoded token
+        // reaches a non-zero offset, so `token` is the one submitted.
+        if page.is_empty() && offset > 0 {
+            return Err(DescribeAutoScalingInstancesErrorModeled::InvalidNextToken(
+                InvalidNextToken {
+                    message: Some(crate::state::invalid_next_token_message(&token)),
+                },
+            )
+            .into());
+        }
+        let next_token =
+            further_page.then(|| crate::state::encode_next_token(offset + page.len()));
+
+        Ok(DescribeAutoScalingInstancesOutput {
+            auto_scaling_instances: Some(page),
+            next_token,
+        })
+    }
+}
+
+/// The largest `MaxRecords` this read honours.
+///
+/// From the model's own documentation for `DescribeAutoScalingInstancesType$MaxRecords`:
+/// "The maximum number of items to return with this call. The default value is 50 and the
+/// maximum value is 50." A request that names none is served the service's own default page
+/// ([`crate::state::page_limit`]), which is that same 50.
+const MAX_AUTO_SCALING_INSTANCE_RECORDS: i32 = 50;
+
+/// One instance of a group as THIS operation reports it — the `AutoScalingInstanceDetails`
+/// shape.
+///
+/// The same facts the group reports for the instance under
+/// `AutoScalingGroups[].Instances[]` ([`crate::state::StoredGroup::instance_view`]), plus
+/// the group it belongs to: one stored instance, so a client reconciling the two reads sees
+/// one instance — its placement, its lifecycle state, its health, the launch source it was
+/// launched from and the capacity units it contributes.
+fn instance_details(
+    group: &crate::state::StoredGroup,
+    instance: &crate::state::StoredInstance,
+) -> AutoScalingInstanceDetails {
+    let view = group.instance_view(instance);
+    AutoScalingInstanceDetails {
+        instance_id: view.instance_id,
+        instance_type: view.instance_type,
+        auto_scaling_group_name: group.name.clone(),
+        availability_zone: view.availability_zone,
+        availability_zone_id: view.availability_zone_id,
+        lifecycle_state: view.lifecycle_state,
+        health_status: view.health_status,
+        launch_configuration_name: view.launch_configuration_name,
+        launch_template: view.launch_template,
+        image_id: view.image_id,
+        protected_from_scale_in: view.protected_from_scale_in,
+        // "The number of capacity units contributed by the instance based on its instance
+        // type" (`AutoScalingInstanceDetails$WeightedCapacity`), which is the same weight
+        // the group's own read of the instance carries.
+        weighted_capacity: view.weighted_capacity,
     }
 }

@@ -210,7 +210,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let instances: Vec<Instance> = group
             .warm_pool_instances()
             .iter()
-            .map(crate::state::StoredInstance::to_instance)
+            .map(|instance| group.instance_view(instance))
             .collect();
         let warm_pool_configuration = group
             .warm_pool()

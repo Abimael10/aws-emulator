@@ -33,6 +33,7 @@
 //! Both operations are answered with the scaling activities the move produced, which is
 //! what their `Activities` output reports.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::SystemTime;
 
 use super::{
@@ -181,13 +182,19 @@ impl AutoScalingState {
         // Every named instance is checked BEFORE one is moved: an id the group does not
         // hold, or one not on the side this move starts from, refuses the whole call and
         // leaves every instance of the group exactly where it was.
+        //
+        // The group's own members are indexed in ONE pass, and each id is admitted through a
+        // SET: the cost of a call is the group's membership once plus one lookup per id,
+        // never the membership once per id.
+        let members: BTreeMap<&str, &StoredInstance> = group
+            .instances
+            .iter()
+            .map(|instance| (instance.instance_id.as_str(), instance))
+            .collect();
+        let mut admitted: BTreeSet<&str> = BTreeSet::new();
         let mut moving: Vec<String> = Vec::new();
         for instance_id in instance_ids {
-            let held: Option<&StoredInstance> = group
-                .instances
-                .iter()
-                .find(|instance| instance.instance_id == *instance_id);
-            let Some(instance) = held else {
+            let Some(instance) = members.get(instance_id.as_str()) else {
                 return Err(StandbyRefusal::NotInGroup(instance_id.clone()));
             };
             if instance.lifecycle_state != move_kind.from_state() {
@@ -196,7 +203,7 @@ impl AutoScalingState {
                     lifecycle_state: instance.lifecycle_state.clone(),
                 });
             }
-            if !moving.contains(instance_id) {
+            if admitted.insert(instance_id.as_str()) {
                 moving.push(instance_id.clone());
             }
         }
@@ -204,13 +211,16 @@ impl AutoScalingState {
             return Ok(Vec::new());
         }
 
-        let count = i32::try_from(moving.len()).unwrap_or(i32::MAX);
+        // What the instances being moved contribute to the group's capacity, in the units
+        // its size is stated in: a parked member of a weighted group stops its own weight's
+        // worth of capacity counting, and a returning one starts it counting again.
+        let units = group.capacity_units_of(&moving);
         let new_desired_capacity = match move_kind {
             // Parking without the decrement leaves the capacity where it is, so the group
             // launches a replacement for each parked instance.
             StandbyMove::Enter if !should_decrement => desired_capacity,
             StandbyMove::Enter => {
-                let after = desired_capacity.saturating_sub(count);
+                let after = desired_capacity.saturating_sub(units);
                 if after < min_size {
                     return Err(StandbyRefusal::BelowMinSize { after, min_size });
                 }
@@ -219,7 +229,7 @@ impl AutoScalingState {
             // A returning instance counts towards the capacity again, and the capacity
             // rises with it — never above the group's own `MaxSize`, which it is never
             // left over.
-            StandbyMove::Exit => desired_capacity.saturating_add(count).min(max_size),
+            StandbyMove::Exit => desired_capacity.saturating_add(units).min(max_size),
         };
         let cause = if new_desired_capacity == desired_capacity {
             format!("{}.", move_kind.reason())

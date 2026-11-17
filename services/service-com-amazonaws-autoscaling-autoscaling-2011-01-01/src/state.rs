@@ -446,6 +446,51 @@ pub const TERMINATE_INSTANCE_REASON: &str =
 /// this ceiling plays that role, at a size an in-memory emulator can hold.
 pub const MAX_GROUP_CAPACITY: i32 = 1_000;
 
+/// The capacity units one instance contributes to a group whose launch source states no
+/// weight for its instance type.
+///
+/// "Usually, you set these sizes based on a specific number of instances. However, if you
+/// configure a mixed instances policy that defines weights for the instance types, you must
+/// specify these sizes with the same units that you use for weighting instances"
+/// (`LaunchTemplateOverrides$WeightedCapacity`): an unweighted group's size IS its instance
+/// count, which is that same accounting with every instance worth one unit.
+pub const UNWEIGHTED_CAPACITY_UNITS: i32 = 1;
+
+/// The least capacity units an override may say an instance type provides, from the member's
+/// own documentation: "Value must be in the range of 1–999"
+/// (`LaunchTemplateOverrides$WeightedCapacity`).
+pub const MIN_WEIGHTED_CAPACITY: i32 = 1;
+
+/// The most capacity units an override may say an instance type provides, from the same
+/// sentence.
+pub const MAX_WEIGHTED_CAPACITY: i32 = 999;
+
+/// The capacity units a `WeightedCapacity` names, as a number.
+///
+/// The member is a STRING carrying a count — "the number of capacity units provided by each
+/// instance type", whose "value must be in the range of 1–999"
+/// (`LaunchTemplateOverrides$WeightedCapacity`, so between [`MIN_WEIGHTED_CAPACITY`] and
+/// [`MAX_WEIGHTED_CAPACITY`]) — and what it names is what both the counting and the
+/// reporting use: the number is taken EXACTLY as the override states it, never reshaped,
+/// because a group reports that same string back on every read of a member and of its own
+/// policy, so a capacity counted at some other number would contradict what the group says
+/// it is counting in.
+///
+/// Text that names no number, and a number below the one unit an instance can least
+/// contribute, name no weight: an instance of such an override contributes the
+/// [`UNWEIGHTED_CAPACITY_UNITS`] every unweighted instance does, which is the one reading
+/// under which a group's capacity can still be fulfilled at all.
+///
+/// THE ONE reading of that member in this crate, so the units a capacity change counts and
+/// the units a read reports cannot drift apart.
+pub fn weighted_capacity_units(weighted_capacity: &str) -> Option<i32> {
+    weighted_capacity
+        .trim()
+        .parse::<i32>()
+        .ok()
+        .filter(|units| *units >= MIN_WEIGHTED_CAPACITY)
+}
+
 /// The most Auto Scaling groups this emulator will hold, for the same reason as
 /// [`MAX_GROUP_CAPACITY`]: a bound on this process, chosen at the order of the
 /// service's own adjustable per-Region quota, past which `CreateAutoScalingGroup`
@@ -648,14 +693,20 @@ impl StoredInstance {
     ///
     /// THE ONE projection of a stored instance onto the wire shape, so the instances a
     /// group reports and the instances of its warm pool are reported identically.
-    /// `WeightedCapacity` is left unfilled: it is not part of what this service stores
-    /// for an instance.
+    ///
+    /// `weighted_capacity` is "the number of capacity units contributed by the instance
+    /// based on its instance type" (`Instance$WeightedCapacity`), which is a fact about the
+    /// GROUP's launch source rather than about the instance: the group reads it off its own
+    /// weights for the instance's type ([`StoredGroup::instance_view`]), so a weight an
+    /// update changes is reported changed on the instances already in service. Unfilled for
+    /// an instance whose group states no weight for its type, which is how an unweighted
+    /// group's members are reported.
     ///
     /// `AvailabilityZoneId` is "the Availability Zone ID where the instance was launched"
     /// (`Instance$AvailabilityZoneId`), which is the ID of the zone this instance is in:
     /// the two members are two spellings of ONE placement, so the id is read off the zone
     /// rather than stored beside it ([`availability_zone_ids`]).
-    pub fn to_instance(&self) -> Instance {
+    pub fn to_instance(&self, weighted_capacity: Option<String>) -> Instance {
         Instance {
             instance_id: self.instance_id.clone(),
             instance_type: self.instance_type.clone(),
@@ -667,7 +718,7 @@ impl StoredInstance {
             launch_template: self.launch_template.clone(),
             image_id: self.image_id.clone(),
             protected_from_scale_in: self.protected_from_scale_in,
-            weighted_capacity: None,
+            weighted_capacity,
         }
     }
 
@@ -808,8 +859,112 @@ impl StoredGroup {
     }
 
     /// How many instances count towards the group's capacity.
+    ///
+    /// NOT what the group's size parameters are stated in once its launch source weights
+    /// its instance types: [`Self::active_capacity_units`] is the capacity those parameters
+    /// are met in.
     pub fn active_instance_count(&self) -> i32 {
         i32::try_from(self.active_instances().count()).unwrap_or(i32::MAX)
+    }
+
+    /// The capacity units one instance of `instance_type` contributes to this group.
+    ///
+    /// "If you provide a list of instance types to use, you can specify the number of
+    /// capacity units provided by each instance type … the capacity units count toward the
+    /// desired capacity" (`LaunchTemplateOverrides$WeightedCapacity`): the weight belongs to
+    /// the override that names the type, so an instance's weight is read off the group's own
+    /// mixed instances policy rather than frozen on the instance when it was launched — a
+    /// group whose weights an update rewrites counts and reports its members by the weights
+    /// in force. `None` for a type no override of this group names a weight for, and for a
+    /// group with no mixed instances policy at all: such an instance contributes the single
+    /// [`UNWEIGHTED_CAPACITY_UNITS`] every unweighted instance does, and the member is left
+    /// unfilled on every read of it.
+    pub fn weighted_capacity_of(&self, instance_type: Option<&str>) -> Option<String> {
+        let instance_type = instance_type?;
+        self.mixed_instances_policy
+            .as_ref()?
+            .launch_template
+            .as_ref()?
+            .overrides
+            .as_ref()?
+            .iter()
+            .find(|entry| entry.instance_type.as_deref() == Some(instance_type))?
+            .weighted_capacity
+            .clone()
+    }
+
+    /// The capacity units one instance of `instance_type` contributes to this group, as a
+    /// number: the weight the group states for that type, or the single unit an unweighted
+    /// instance contributes.
+    pub fn capacity_units_for_type(&self, instance_type: Option<&str>) -> i32 {
+        self.weighted_capacity_of(instance_type)
+            .as_deref()
+            .and_then(weighted_capacity_units)
+            .unwrap_or(UNWEIGHTED_CAPACITY_UNITS)
+    }
+
+    /// The capacity units `instance` contributes to this group, as a number: the weight the
+    /// group states for its instance type, or the single unit an unweighted instance
+    /// contributes.
+    pub fn instance_capacity_units(&self, instance: &StoredInstance) -> i32 {
+        self.capacity_units_for_type(instance.instance_type.as_deref())
+    }
+
+    /// This group's view of one of its instances — one of its own or one of its warm pool's
+    /// — as the API reports it, carrying the capacity units that instance contributes.
+    ///
+    /// THE ONE place a read of this service fills `WeightedCapacity` in, so the weight the
+    /// group's members report and the weight its capacity is counted in are the same weight.
+    pub fn instance_view(&self, instance: &StoredInstance) -> Instance {
+        instance.to_instance(self.weighted_capacity_of(instance.instance_type.as_deref()))
+    }
+
+    /// The capacity the group's own members currently provide, in the units its
+    /// `DesiredCapacity`, `MinSize` and `MaxSize` are stated in.
+    ///
+    /// "Every Auto Scaling group has three size parameters … if you configure a mixed
+    /// instances policy that defines weights for the instance types, you must specify these
+    /// sizes with the same units that you use for weighting instances"
+    /// (`LaunchTemplateOverrides$WeightedCapacity`): the capacity a group holds is therefore
+    /// the SUM of its members' weights, which for an unweighted group is their count.
+    pub fn active_capacity_units(&self) -> i32 {
+        self.active_instances().fold(0i32, |units, instance| {
+            units.saturating_add(self.instance_capacity_units(instance))
+        })
+    }
+
+    /// The capacity units the instances `instance_ids` names contribute, counting each id
+    /// once: what the group's capacity falls by when they stop counting towards it, and
+    /// rises by when they start.
+    ///
+    /// The ids are read into a SET first, so one pass over the group's members answers the
+    /// whole call however many ids it names.
+    pub fn capacity_units_of(&self, instance_ids: &[String]) -> i32 {
+        let named: BTreeSet<&str> = instance_ids.iter().map(String::as_str).collect();
+        self.instances
+            .iter()
+            .filter(|instance| named.contains(instance.instance_id.as_str()))
+            .fold(0i32, |units, instance| {
+                units.saturating_add(self.instance_capacity_units(instance))
+            })
+    }
+
+    /// The capacity units one instance a launch of this group makes will contribute.
+    ///
+    /// A launch from a mixed instances policy is made from the FIRST of the policy's
+    /// overrides ([`ec2_instances`] resolves the instance type from it, the way an
+    /// allocation strategy prefers the first type it is given), so the weight that override
+    /// carries is what the instance it produces counts for. One unit for a group whose
+    /// launch source states no weight.
+    pub fn launch_capacity_units(&self) -> i32 {
+        self.mixed_instances_policy
+            .as_ref()
+            .and_then(|policy| policy.launch_template.as_ref())
+            .and_then(|template| template.overrides.as_ref())
+            .and_then(|overrides| overrides.first())
+            .and_then(|entry| entry.weighted_capacity.as_deref())
+            .and_then(weighted_capacity_units)
+            .unwrap_or(UNWEIGHTED_CAPACITY_UNITS)
     }
 
     /// Whether the group is inside the cooldown that followed its last capacity
@@ -838,8 +993,35 @@ impl StoredGroup {
     }
 
     /// How many instances this group must launch to reach `desired_capacity`.
+    ///
+    /// `desired_capacity` is a capacity in the group's own units, so the launches it needs
+    /// are what it takes to FULFIL it rather than its difference from the instance count:
+    /// "Amazon EC2 Auto Scaling launches instances until the desired capacity is totally
+    /// fulfilled, even if this results in an overage … if there are two units remaining to
+    /// fulfill capacity, and Amazon EC2 Auto Scaling can only launch an instance with a
+    /// WeightedCapacity of five units, the instance is launched, and the desired capacity is
+    /// exceeded by three units" (`LaunchTemplateOverrides$WeightedCapacity`) — so the
+    /// shortfall is divided by the weight of the instance a launch produces and ROUNDED UP.
+    /// For an unweighted group every instance is worth one unit, which is the difference
+    /// this answered before any group had weights.
     pub fn launches_needed(&self, desired_capacity: i32) -> i32 {
-        (desired_capacity - self.active_instance_count()).max(0)
+        let shortfall = desired_capacity.saturating_sub(self.active_capacity_units());
+        if shortfall <= 0 {
+            return 0;
+        }
+        let units = self.launch_capacity_units().max(UNWEIGHTED_CAPACITY_UNITS);
+        shortfall.saturating_add(units - 1) / units
+    }
+
+    /// The capacity units this group holds ABOVE `desired_capacity`, which is what a
+    /// scale-in has to take out of service.
+    ///
+    /// Zero for a group whose members do not fulfil the capacity asked for: there is
+    /// nothing surplus to take out of one that is still short.
+    pub fn surplus_capacity_units(&self, desired_capacity: i32) -> i32 {
+        self.active_capacity_units()
+            .saturating_sub(desired_capacity)
+            .max(0)
     }
 
     /// The target groups attached to this group, as the group itself holds them:
@@ -1618,7 +1800,6 @@ impl AutoScalingState {
         let arn = group.arn.clone();
         let zoneless = group.availability_zones.is_empty();
         let cooldown = group.default_cooldown.max(0);
-        let previous = group.active_instance_count();
         let headroom = group.launch_headroom();
         // A scale-out is the `Launch` process and a scale-in is the `Terminate` process, so
         // a group that has either suspended does not do that half of the change: the
@@ -1632,18 +1813,23 @@ impl AutoScalingState {
             // handlers refuse such a request before reaching here.
             0
         } else {
-            // Bounded by the ceiling AND by what the group can still hold, so
-            // neither one request nor a run of them can grow the stored instances
-            // past MAX_GROUP_CAPACITY. The handlers refuse a change that does not
-            // fit; this is the floor under them.
-            (desired_capacity - previous)
+            // What it takes to FULFIL the capacity asked for, counted in the group's own
+            // units ([`StoredGroup::launches_needed`]), and bounded by the ceiling AND by
+            // what the group can still hold, so neither one request nor a run of them can
+            // grow the stored instances past MAX_GROUP_CAPACITY. The handlers refuse a
+            // change that does not fit; this is the floor under them.
+            group
+                .launches_needed(desired_capacity)
                 .clamp(0, MAX_GROUP_CAPACITY)
                 .min(headroom)
         };
-        let to_terminate = if terminate_suspended {
+        // And what the group holds above that capacity, in those same units: a scale-in
+        // takes the surplus out of service rather than a number of instances, so a member
+        // worth several units covers several units of the surplus.
+        let surplus_units = if terminate_suspended {
             0
         } else {
-            (previous - desired_capacity).max(0)
+            group.surplus_capacity_units(desired_capacity)
         };
         let due = now + LIFECYCLE_TRANSITION;
 
@@ -1674,7 +1860,7 @@ impl AutoScalingState {
         group.pending_capacity = None;
         group.cooldown_until = Some(now + Duration::from_secs(u64::from(cooldown.unsigned_abs())));
 
-        let terminated_ids = self.scale_in_selection(group_name, to_terminate, now);
+        let terminated_ids = self.scale_in_selection(group_name, surplus_units, now);
         self.terminate_group_instances(engine, group_name, &terminated_ids, due);
 
         for instance_id in launched_ids {
@@ -1749,11 +1935,12 @@ impl AutoScalingState {
     /// records its own activity.
     ///
     /// `should_decrement` is what the request says about the group's size: with it the
-    /// desired capacity goes down by the number of instances this call took out of
-    /// service, so nothing replaces them; without it the capacity stands and the group
-    /// launches a replacement for each, which is the convergence
-    /// [`Self::apply_capacity`] performs for every change. The decrement is held at the
-    /// group's own `MinSize`, because a group never holds a desired capacity below the
+    /// desired capacity goes down by the capacity this call took out of service — the
+    /// instances' own weights, in the units the group's size is stated in
+    /// ([`StoredGroup::capacity_units_of`]) — so nothing replaces them; without it the
+    /// capacity stands and the group launches a replacement for each, which is the
+    /// convergence [`Self::apply_capacity`] performs for every change. The decrement is held
+    /// at the group's own `MinSize`, because a group never holds a desired capacity below the
     /// minimum it is configured with — the floor under the caller, which refuses a
     /// request that would take the capacity under it
     /// ([`min_size_breach_message`]) rather than quietly applying less than it asked
@@ -1785,10 +1972,13 @@ impl AutoScalingState {
             return Vec::new();
         }
 
-        let count = i32::try_from(taken.len()).unwrap_or(i32::MAX);
+        // What those instances contribute to the group's capacity, in the units its size is
+        // stated in: a member of a weighted group takes its own weight's worth of capacity
+        // with it, which is what the decrement below takes off.
+        let units = group.capacity_units_of(&taken);
         let new_desired_capacity = if should_decrement {
             desired_capacity
-                .saturating_sub(count)
+                .saturating_sub(units)
                 .clamp(min_size, max_size)
         } else {
             desired_capacity
@@ -2021,7 +2211,7 @@ impl AutoScalingState {
         }
     }
 
-    /// The instances a scale-in of `count` takes out of the group.
+    /// The instances a scale-in of `surplus_units` capacity units takes out of the group.
     ///
     /// The group's own `TerminationPolicies` select them, applied in the order the
     /// group lists them ([`termination_policies`]), against the account's launch
@@ -2029,11 +2219,21 @@ impl AutoScalingState {
     /// configuration age against — at the instant `now` the scale-in happens. An
     /// instance protected from scale-in is never chosen: that is what the protection
     /// means.
-    fn scale_in_selection(&self, group_name: &str, count: i32, now: SystemTime) -> Vec<String> {
+    fn scale_in_selection(
+        &self,
+        group_name: &str,
+        surplus_units: i32,
+        now: SystemTime,
+    ) -> Vec<String> {
         let Some(group) = self.groups.get(group_name) else {
             return Vec::new();
         };
-        termination_policies::scale_in_selection(group, &self.launch_configurations, count, now)
+        termination_policies::scale_in_selection(
+            group,
+            &self.launch_configurations,
+            surplus_units,
+            now,
+        )
     }
 
     /// Take the instances `instance_ids` names out of the group: each is reported
