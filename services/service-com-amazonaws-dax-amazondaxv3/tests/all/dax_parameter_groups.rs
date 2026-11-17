@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! End-to-end tests for the DAX parameter-group slice: `CreateParameterGroup`,
-//! `DescribeParameterGroups` and `DeleteParameterGroup` over the wire.
+//! `DescribeParameterGroups`, `UpdateParameterGroup` and `DeleteParameterGroup` over the
+//! wire.
 //!
 //! Every case drives `POST /` with `X-Amz-Target: AmazonDAXV3.<Operation>` through the
 //! same `MultiServiceRouter` the production router builds, so what is asserted is the
@@ -12,6 +13,7 @@
 //! different lengths, shapes and orderings, over present/absent/empty descriptions, and
 //! over every published `MaxResults` bound plus one past each.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -880,5 +882,692 @@ async fn a_create_past_the_parameter_group_bound_is_refused() {
         (status, error_code(&read).as_str()),
         (400, "ParameterGroupNotFoundFault"),
         "case one past the bound: the refused name must name no group, got {status} {read:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Update: the values a group holds for the parameters the caching software defines.
+//
+// Rule: `UpdateParameterGroup` stores, for the group it names, the value each
+// name-value pair in the request carries for a parameter the caching software defines,
+// and nothing else about that group or any other changes; the whole request is applied
+// or none of it is.
+// Source: `UpdateParameterGroup` ("Modifies the parameters of a parameter group. You can
+// modify up to 20 parameters in a single request by submitting a list parameter name and
+// value pairs") and `ParameterNameValues` ("record-ttl-millis and query-ttl-millis are
+// the only supported parameter names"), with each parameter's own `DataType` and
+// `AllowedValues` from the catalog this service publishes
+// (`smithy_query(query="operation",operation="UpdateParameterGroup")`,
+// `smithy_query(query="shape",shape="Parameter")`).
+// ---------------------------------------------------------------------------
+
+/// The value a group reports for each of its parameters, read back through
+/// `DescribeParameters` — the operation a client reads a group's parameters with.
+async fn reported_values(router: &MultiServiceRouter, group: &str) -> BTreeMap<String, String> {
+    let (status, body) = call(
+        router,
+        "DescribeParameters",
+        json!({ "ParameterGroupName": group }),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "case {group:?}: DescribeParameters got {status} {body:?}"
+    );
+    body["Parameters"]
+        .as_array()
+        .map(|parameters| {
+            parameters
+                .iter()
+                .map(|parameter| {
+                    (
+                        parameter["ParameterName"]
+                            .as_str()
+                            .unwrap_or_default()
+                            .to_string(),
+                        parameter["ParameterValue"]
+                            .as_str()
+                            .unwrap_or_default()
+                            .to_string(),
+                    )
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The values a group that has never been updated holds: the system-defined value of
+/// every parameter the catalog publishes.
+fn catalog_defaults() -> BTreeMap<String, String> {
+    state::DEFAULT_PARAMETERS
+        .iter()
+        .map(|definition| {
+            (
+                definition.name.to_string(),
+                definition.default_value.to_string(),
+            )
+        })
+        .collect()
+}
+
+/// The `ParameterNameValues` list for `pairs`.
+fn name_values(pairs: &[(String, String)]) -> Value {
+    Value::Array(
+        pairs
+            .iter()
+            .map(|(name, value)| json!({ "ParameterName": name, "ParameterValue": value }))
+            .collect(),
+    )
+}
+
+/// The inclusive bounds the catalog publishes for one parameter's values.
+fn published_range(definition: &state::ParameterDefinition) -> (i64, Option<i64>) {
+    definition.allowed_range().unwrap_or_else(|| {
+        panic!(
+            "case {}: the catalog must publish a range, got {:?}",
+            definition.name, definition.allowed_values
+        )
+    })
+}
+
+/// Create one group to update, and return its name.
+async fn group_to_update(router: &MultiServiceRouter, name: &str) -> String {
+    let (status, body) = call(
+        router,
+        "CreateParameterGroup",
+        json!({ "ParameterGroupName": name, "Description": "a group to update" }),
+    )
+    .await;
+    assert_eq!(status, 200, "create {name}: got {status} {body:?}");
+    name.to_string()
+}
+
+/// Every accepted update is read back out of the store: the update's own response reports
+/// the stored group, `DescribeParameters` reports the values it persisted, every
+/// parameter the request did not name keeps the value it had, and repeating the same
+/// update reports the same thing.
+///
+/// The rows are built from the catalog rather than from one cited pair: each published
+/// parameter on its own at the bottom of its published range, one step inside it, well
+/// inside it and back at its own default, then every parameter in one request, and the
+/// same request with the pairs in the other order.
+#[tokio::test]
+async fn an_accepted_update_round_trips_through_describe_parameters() {
+    let router = emulator();
+
+    let mut cases: Vec<(String, Vec<(String, String)>)> = Vec::new();
+    for definition in state::DEFAULT_PARAMETERS {
+        let (min, max) = published_range(definition);
+        let mut values = vec![min, min + 1, min + 60_000];
+        if let Some(max) = max {
+            values.push(max);
+        }
+        for value in values {
+            cases.push((
+                format!("{} = {value}", definition.name),
+                vec![(definition.name.to_string(), value.to_string())],
+            ));
+        }
+        cases.push((
+            format!("{} back to its own default", definition.name),
+            vec![(
+                definition.name.to_string(),
+                definition.default_value.to_string(),
+            )],
+        ));
+    }
+    cases.push((
+        "every published parameter in one request".to_string(),
+        state::DEFAULT_PARAMETERS
+            .iter()
+            .map(|definition| (definition.name.to_string(), "1234".to_string()))
+            .collect(),
+    ));
+    cases.push((
+        "every published parameter, pairs reversed".to_string(),
+        state::DEFAULT_PARAMETERS
+            .iter()
+            .rev()
+            .map(|definition| (definition.name.to_string(), "4321".to_string()))
+            .collect(),
+    ));
+
+    for (index, (label, pairs)) in cases.iter().enumerate() {
+        // A fresh group per row, so each row starts from the values a group that has
+        // never been updated holds.
+        let group = group_to_update(&router, &format!("updated-{index:03}")).await;
+
+        let (status, updated) = call(
+            &router,
+            "UpdateParameterGroup",
+            json!({
+                "ParameterGroupName": group,
+                "ParameterNameValues": name_values(pairs),
+            }),
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {label:?}: expected 200, got {status} {updated:?}"
+        );
+        assert_eq!(
+            updated["ParameterGroup"]["ParameterGroupName"].as_str(),
+            Some(group.as_str()),
+            "case {label:?}: the update reports the group it modified, got {updated:?}"
+        );
+        assert_eq!(
+            updated["ParameterGroup"]["Description"].as_str(),
+            Some("a group to update"),
+            "case {label:?}: an update leaves the stored description alone, got {updated:?}"
+        );
+
+        // Exactly the named parameters carry their new value; every other one still
+        // carries the value it had.
+        let mut expected = catalog_defaults();
+        for (name, value) in pairs {
+            expected.insert(name.clone(), value.clone());
+        }
+        let stored = reported_values(&router, &group).await;
+        assert_eq!(
+            stored, expected,
+            "case {label:?}: expected {expected:?}, got {stored:?}"
+        );
+
+        // The same update again is accepted and reports the same values.
+        let (status, again) = call(
+            &router,
+            "UpdateParameterGroup",
+            json!({
+                "ParameterGroupName": group,
+                "ParameterNameValues": name_values(pairs),
+            }),
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {label:?}: a repeated update got {status} {again:?}"
+        );
+        let stored_again = reported_values(&router, &group).await;
+        assert_eq!(
+            stored_again, expected,
+            "case {label:?}: a repeated update must report the same values, got {stored_again:?}"
+        );
+
+        // The group is still the one group of that name, and still carries its
+        // description, when read through the describe a client lists groups with.
+        let (status, read) = call(
+            &router,
+            "DescribeParameterGroups",
+            json!({ "ParameterGroupNames": [&group] }),
+        )
+        .await;
+        assert_eq!(status, 200, "case {label:?}: describe got {status} {read:?}");
+        assert_eq!(
+            reported_names(&read),
+            vec![group.clone()],
+            "case {label:?}: the updated group is reported once, got {read:?}"
+        );
+
+        // The modification is recorded against the group, beside its creation.
+        let (status, events) = call(
+            &router,
+            "DescribeEvents",
+            json!({ "SourceName": &group, "SourceType": state::SOURCE_TYPE_PARAMETER_GROUP }),
+        )
+        .await;
+        assert_eq!(status, 200, "case {label:?}: DescribeEvents got {events:?}");
+        let messages: Vec<String> = events["Events"]
+            .as_array()
+            .expect("Events is a list")
+            .iter()
+            .map(|event| event["Message"].as_str().unwrap_or_default().to_string())
+            .collect();
+        assert_eq!(
+            messages,
+            vec![
+                state::EVENT_PARAMETER_GROUP_CREATED.to_string(),
+                state::EVENT_PARAMETER_GROUP_MODIFIED.to_string(),
+                state::EVENT_PARAMETER_GROUP_MODIFIED.to_string(),
+            ],
+            "case {label:?}: each accepted update is recorded against the group, \
+             got {events:?}"
+        );
+    }
+}
+
+/// An update changes the group it names and no other: the groups beside it, and the
+/// parameter group AWS provides, still report the values they held.
+#[tokio::test]
+async fn an_update_changes_only_the_group_it_names() {
+    let router = emulator();
+    for name in ["left", "right"] {
+        group_to_update(&router, name).await;
+    }
+
+    let changed: Vec<(String, String)> = state::DEFAULT_PARAMETERS
+        .iter()
+        .map(|definition| (definition.name.to_string(), "7777".to_string()))
+        .collect();
+    let (status, body) = call(
+        &router,
+        "UpdateParameterGroup",
+        json!({
+            "ParameterGroupName": "left",
+            "ParameterNameValues": name_values(&changed),
+        }),
+    )
+    .await;
+    assert_eq!(status, 200, "update left: got {status} {body:?}");
+
+    let mut expected = catalog_defaults();
+    for (name, value) in &changed {
+        expected.insert(name.clone(), value.clone());
+    }
+    let stored = reported_values(&router, "left").await;
+    assert_eq!(
+        stored, expected,
+        "case left: expected {expected:?}, got {stored:?}"
+    );
+
+    for untouched in ["right", state::DEFAULT_PARAMETER_GROUP] {
+        let stored = reported_values(&router, untouched).await;
+        assert_eq!(
+            stored,
+            catalog_defaults(),
+            "case {untouched:?}: a group nothing updated still reports the published \
+             defaults, got {stored:?}"
+        );
+    }
+}
+
+/// A name that names no stored group is answered with `ParameterGroupNotFoundFault`
+/// naming it — the template DAX answers on a path that modifies THROUGH a group name —
+/// and nothing is created in its place.
+#[tokio::test]
+async fn updating_a_parameter_group_that_does_not_exist_is_refused() {
+    let router = emulator();
+    group_to_update(&router, "stored-group").await;
+    group_to_update(&router, "deleted-group").await;
+    let (status, body) = call(
+        &router,
+        "DeleteParameterGroup",
+        json!({ "ParameterGroupName": "deleted-group" }),
+    )
+    .await;
+    assert_eq!(status, 200, "delete deleted-group: got {status} {body:?}");
+
+    let pairs = vec![(
+        state::DEFAULT_PARAMETERS[0].name.to_string(),
+        "1000".to_string(),
+    )];
+    // Absent names spanning the class: never created, one that differs only in case from
+    // a stored one, the empty name, one a single character off, and one whose group was
+    // just deleted.
+    for absent in [
+        "never-created",
+        "STORED-GROUP",
+        "",
+        "stored-grou",
+        "deleted-group",
+    ] {
+        let (status, body) = call(
+            &router,
+            "UpdateParameterGroup",
+            json!({
+                "ParameterGroupName": absent,
+                "ParameterNameValues": name_values(&pairs),
+            }),
+        )
+        .await;
+        assert_eq!(
+            (status, error_code(&body).as_str()),
+            (400, "ParameterGroupNotFoundFault"),
+            "case {absent:?}: expected 400 ParameterGroupNotFoundFault, got {status} {body:?}"
+        );
+        assert_eq!(
+            body["message"].as_str().unwrap_or_default(),
+            state::parameter_group_not_found_named_message(absent),
+            "case {absent:?}: an update names the group it could not resolve, got {body:?}"
+        );
+
+        let (status, read) = call(
+            &router,
+            "DescribeParameterGroups",
+            json!({ "ParameterGroupNames": [absent] }),
+        )
+        .await;
+        assert_eq!(
+            (status, error_code(&read).as_str()),
+            (400, "ParameterGroupNotFoundFault"),
+            "case {absent:?}: a refused update must create nothing, got {status} {read:?}"
+        );
+    }
+
+    // The group that does exist was not touched by any of those refusals.
+    let stored = reported_values(&router, "stored-group").await;
+    assert_eq!(
+        stored,
+        catalog_defaults(),
+        "case stored-group: a refusal elsewhere changes nothing, got {stored:?}"
+    );
+}
+
+/// The parameter group AWS provides carries the family's own defaults, so it is not the
+/// caller's to change: the update is refused and the group still reports those defaults.
+#[tokio::test]
+async fn updating_the_default_parameter_group_is_refused() {
+    let router = emulator();
+
+    for definition in state::DEFAULT_PARAMETERS {
+        let pairs = vec![(definition.name.to_string(), "9999".to_string())];
+        let (status, body) = call(
+            &router,
+            "UpdateParameterGroup",
+            json!({
+                "ParameterGroupName": state::DEFAULT_PARAMETER_GROUP,
+                "ParameterNameValues": name_values(&pairs),
+            }),
+        )
+        .await;
+        assert_eq!(
+            (status, error_code(&body).as_str()),
+            (400, "InvalidParameterValueException"),
+            "case {}: expected 400 InvalidParameterValueException, got {status} {body:?}",
+            definition.name
+        );
+
+        let stored = reported_values(&router, state::DEFAULT_PARAMETER_GROUP).await;
+        assert_eq!(
+            stored,
+            catalog_defaults(),
+            "case {}: a refused update leaves the default group's values alone, got {stored:?}",
+            definition.name
+        );
+    }
+}
+
+/// A group holds a value only for a parameter the caching software defines, so a name
+/// outside the published catalog is refused with `InvalidParameterValueException` and the
+/// whole request — including the pairs that were acceptable — changes nothing.
+#[tokio::test]
+async fn updating_a_parameter_the_catalog_does_not_publish_is_refused() {
+    let router = emulator();
+    let group = group_to_update(&router, "unknown-names").await;
+    let published = state::DEFAULT_PARAMETERS[0].name;
+
+    // Rows: a name unrelated to any published one, a published name in another case,
+    // one with a trailing character, a truncated one, and one carrying whitespace.
+    for unknown in [
+        "ttl".to_string(),
+        published.to_uppercase(),
+        format!("{published}x"),
+        published[..published.len() - 1].to_string(),
+        format!(" {published}"),
+    ] {
+        for pairs in [
+            vec![(unknown.clone(), "1000".to_string())],
+            // Mixed with a pair that WOULD be accepted on its own: the request is
+            // applied whole or not at all.
+            vec![
+                (published.to_string(), "1000".to_string()),
+                (unknown.clone(), "1000".to_string()),
+            ],
+        ] {
+            let (status, body) = call(
+                &router,
+                "UpdateParameterGroup",
+                json!({
+                    "ParameterGroupName": &group,
+                    "ParameterNameValues": name_values(&pairs),
+                }),
+            )
+            .await;
+            assert_eq!(
+                (status, error_code(&body).as_str()),
+                (400, "InvalidParameterValueException"),
+                "case {unknown:?} ({} pairs): expected 400 InvalidParameterValueException, \
+                 got {status} {body:?}",
+                pairs.len()
+            );
+
+            let stored = reported_values(&router, &group).await;
+            assert_eq!(
+                stored,
+                catalog_defaults(),
+                "case {unknown:?} ({} pairs): a refused update must write nothing, \
+                 got {stored:?}",
+                pairs.len()
+            );
+        }
+    }
+}
+
+/// A value is accepted only when it is one the catalog publishes for that parameter: a
+/// whole number inside its `AllowedValues` range. Each published bound is accepted and
+/// one step past it is refused, as is anything that is not a whole number; a refused
+/// value changes nothing.
+#[tokio::test]
+async fn updating_a_parameter_outside_its_published_values_is_refused() {
+    let router = emulator();
+    let group = group_to_update(&router, "bad-values").await;
+
+    for definition in state::DEFAULT_PARAMETERS {
+        let (min, max) = published_range(definition);
+
+        let mut accepted = vec![min.to_string(), (min + 1).to_string()];
+        if let Some(max) = max {
+            accepted.push(max.to_string());
+        }
+        for value in accepted {
+            let pairs = vec![(definition.name.to_string(), value.clone())];
+            let (status, body) = call(
+                &router,
+                "UpdateParameterGroup",
+                json!({
+                    "ParameterGroupName": &group,
+                    "ParameterNameValues": name_values(&pairs),
+                }),
+            )
+            .await;
+            assert_eq!(
+                status, 200,
+                "case {} = {value:?}: a published value is accepted, got {status} {body:?}",
+                definition.name
+            );
+            let stored = reported_values(&router, &group).await;
+            assert_eq!(
+                stored.get(definition.name).map(String::as_str),
+                Some(value.as_str()),
+                "case {} = {value:?}: expected the stored value to be it, got {stored:?}",
+                definition.name
+            );
+        }
+
+        // Back to the published default, so each refusal below is measured against it.
+        let reset = vec![(
+            definition.name.to_string(),
+            definition.default_value.to_string(),
+        )];
+        let (status, body) = call(
+            &router,
+            "UpdateParameterGroup",
+            json!({
+                "ParameterGroupName": &group,
+                "ParameterNameValues": name_values(&reset),
+            }),
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {} reset: got {status} {body:?}",
+            definition.name
+        );
+
+        let mut refused = vec![
+            (min - 1).to_string(),
+            "not-a-number".to_string(),
+            String::new(),
+            "1.5".to_string(),
+            format!(" {min}"),
+            "0x10".to_string(),
+        ];
+        if let Some(max) = max {
+            refused.push((max + 1).to_string());
+        }
+        for value in refused {
+            let pairs = vec![(definition.name.to_string(), value.clone())];
+            let (status, body) = call(
+                &router,
+                "UpdateParameterGroup",
+                json!({
+                    "ParameterGroupName": &group,
+                    "ParameterNameValues": name_values(&pairs),
+                }),
+            )
+            .await;
+            assert_eq!(
+                (status, error_code(&body).as_str()),
+                (400, "InvalidParameterValueException"),
+                "case {} = {value:?}: expected 400 InvalidParameterValueException, \
+                 got {status} {body:?}",
+                definition.name
+            );
+            let stored = reported_values(&router, &group).await;
+            assert_eq!(
+                stored.get(definition.name).map(String::as_str),
+                Some(definition.default_value),
+                "case {} = {value:?}: a refused value must not be stored, got {stored:?}",
+                definition.name
+            );
+        }
+    }
+}
+
+/// A request that names no parameter to change, or names one with nothing to set it to,
+/// is refused: `ParameterNameValues` is `@required` and both members of a pair are
+/// optional, so the empty list and a half-filled pair are what a client can still send.
+#[tokio::test]
+async fn an_update_that_names_nothing_to_change_is_refused() {
+    let router = emulator();
+    let group = group_to_update(&router, "names-nothing").await;
+    let published = state::DEFAULT_PARAMETERS[0].name;
+
+    // Rows: no pair at all, a pair with no name, a pair with an empty name, and a pair
+    // with a name but no value.
+    let cases: [(&str, Value); 4] = [
+        ("no pair at all", json!([])),
+        ("a pair with no name", json!([{ "ParameterValue": "1000" }])),
+        (
+            "a pair with an empty name",
+            json!([{ "ParameterName": "", "ParameterValue": "1000" }]),
+        ),
+        (
+            "a pair with no value",
+            json!([{ "ParameterName": published }]),
+        ),
+    ];
+
+    for (label, pairs) in cases {
+        let (status, body) = call(
+            &router,
+            "UpdateParameterGroup",
+            json!({
+                "ParameterGroupName": &group,
+                "ParameterNameValues": pairs,
+            }),
+        )
+        .await;
+        assert_eq!(
+            (status, error_code(&body).as_str()),
+            (400, "InvalidParameterValueException"),
+            "case {label:?}: expected 400 InvalidParameterValueException, got {status} {body:?}"
+        );
+        let stored = reported_values(&router, &group).await;
+        assert_eq!(
+            stored,
+            catalog_defaults(),
+            "case {label:?}: a refused update must write nothing, got {stored:?}"
+        );
+    }
+}
+
+/// One request carries at most one value per parameter, and at most
+/// [`state::MAX_PARAMETERS_PER_UPDATE`] pairs ("You can modify up to 20 parameters in a
+/// single request"): either is refused with `InvalidParameterCombinationException` and
+/// writes nothing.
+#[tokio::test]
+async fn an_update_that_names_a_parameter_twice_or_too_many_is_refused() {
+    let router = emulator();
+    let group = group_to_update(&router, "combinations").await;
+    let published = state::DEFAULT_PARAMETERS[0].name;
+
+    // Rows: the same name twice with different values, the same name twice with the same
+    // value, and a pair repeated past the bound on how many one request may carry.
+    let duplicated = [
+        vec![
+            (published.to_string(), "1000".to_string()),
+            (published.to_string(), "2000".to_string()),
+        ],
+        vec![
+            (published.to_string(), "1000".to_string()),
+            (published.to_string(), "1000".to_string()),
+        ],
+    ];
+    for pairs in &duplicated {
+        let (status, body) = call(
+            &router,
+            "UpdateParameterGroup",
+            json!({
+                "ParameterGroupName": &group,
+                "ParameterNameValues": name_values(pairs),
+            }),
+        )
+        .await;
+        assert_eq!(
+            (status, error_code(&body).as_str()),
+            (400, "InvalidParameterCombinationException"),
+            "case {pairs:?}: expected 400 InvalidParameterCombinationException, \
+             got {status} {body:?}"
+        );
+        let stored = reported_values(&router, &group).await;
+        assert_eq!(
+            stored,
+            catalog_defaults(),
+            "case {pairs:?}: a refused update must write nothing, got {stored:?}"
+        );
+    }
+
+    // One pair past the documented bound: refused on the bound itself, which the
+    // refusal names.
+    let too_many: Vec<(String, String)> = (0..=state::MAX_PARAMETERS_PER_UPDATE)
+        .map(|index| (published.to_string(), index.to_string()))
+        .collect();
+    let (status, body) = call(
+        &router,
+        "UpdateParameterGroup",
+        json!({
+            "ParameterGroupName": &group,
+            "ParameterNameValues": name_values(&too_many),
+        }),
+    )
+    .await;
+    assert_eq!(
+        (status, error_code(&body).as_str()),
+        (400, "InvalidParameterCombinationException"),
+        "case one pair past the bound: expected 400 InvalidParameterCombinationException, \
+         got {status} {body:?}"
+    );
+    assert!(
+        body["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains(&state::MAX_PARAMETERS_PER_UPDATE.to_string()),
+        "case one pair past the bound: the refusal names the bound, got {body:?}"
+    );
+    let stored = reported_values(&router, &group).await;
+    assert_eq!(
+        stored,
+        catalog_defaults(),
+        "case one pair past the bound: a refused update must write nothing, got {stored:?}"
     );
 }

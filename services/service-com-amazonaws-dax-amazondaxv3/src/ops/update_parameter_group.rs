@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateParameterGroup
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateParameterGroup`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateParameterGroup::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Changes the value this account's named parameter group holds for each parameter the
+//! request names, and returns the stored group — so a later `DescribeParameters` on that
+//! group reports exactly the values this call persisted, and every other group keeps its
+//! own. A request is applied WHOLE or not at all: a name the caching software does not
+//! define, a value outside what the catalog publishes for that parameter, a parameter
+//! named twice, or more names than one request may carry leaves every stored value as it
+//! was.
 //!
 //! ## Shape of an operation
 //!
@@ -150,18 +149,159 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateParameterGroup` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateParameterGroupErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateParameterGroup"))
+        let _ = ctx;
+        let state = crate::state::store(&*self.engine, Self::NAME)?;
+        let now = ::std::time::SystemTime::now();
+
+        // "You can modify up to 20 parameters in a single request": a longer list asks
+        // for more than this operation accepts, so it is refused before anything is read.
+        if input.parameter_name_values.len() > crate::state::MAX_PARAMETERS_PER_UPDATE {
+            return Err(
+                UpdateParameterGroupErrorModeled::InvalidParameterCombinationException(
+                    InvalidParameterCombinationException {
+                        message: Some(format!(
+                            "You can modify up to {} parameters in a single request",
+                            crate::state::MAX_PARAMETERS_PER_UPDATE
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+        // `ParameterNameValues` is `@required`, which the empty list satisfies; it names
+        // no parameter to modify, so there is nothing for this call to change.
+        if input.parameter_name_values.is_empty() {
+            return Err(
+                UpdateParameterGroupErrorModeled::InvalidParameterValueException(
+                    InvalidParameterValueException {
+                        message: Some(
+                            "At least one parameter name and value must be specified"
+                                .to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let mut store = state.lock();
+
+        // The group modified is the NAMED one, so a name this account holds no parameter
+        // group for resolves to nothing and is refused — telling the caller which name
+        // could not be resolved, as every path that MODIFIES through a group name does.
+        let Some(group) = store.parameter_groups.get_mut(&input.parameter_group_name) else {
+            return Err(
+                UpdateParameterGroupErrorModeled::ParameterGroupNotFoundFault(
+                    crate::state::parameter_group_not_found_named(&input.parameter_group_name),
+                )
+                .into(),
+            );
+        };
+        // A parameter group AWS provides carries the family's own defaults, so it is not
+        // the caller's to change — as it is not the caller's to delete.
+        if group.default_group {
+            return Err(
+                UpdateParameterGroupErrorModeled::InvalidParameterValueException(
+                    InvalidParameterValueException {
+                        message: Some("Default parameter group cannot be modified.".to_string()),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // Resolve the WHOLE request against the catalog first and only then write, so a
+        // request carrying one unacceptable pair changes nothing at all.
+        let mut changes: Vec<(String, String)> = Vec::new();
+        for pair in &input.parameter_name_values {
+            // Both members of `ParameterNameValue` are optional in the model; a pair
+            // naming no parameter, or naming one with no value, asks for no change that
+            // could be stored.
+            let Some(name) = pair
+                .parameter_name
+                .as_deref()
+                .filter(|name| !name.is_empty())
+            else {
+                return Err(
+                    UpdateParameterGroupErrorModeled::InvalidParameterValueException(
+                        InvalidParameterValueException {
+                            message: Some(
+                                "ParameterName must be specified for each entry in \
+                                 ParameterNameValues"
+                                    .to_string(),
+                            ),
+                        },
+                    )
+                    .into(),
+                );
+            };
+            // One request carries at most one value per parameter: two values for the
+            // same name do not say which one the group should end up holding.
+            if changes.iter().any(|(named, _)| named == name) {
+                return Err(
+                    UpdateParameterGroupErrorModeled::InvalidParameterCombinationException(
+                        InvalidParameterCombinationException {
+                            message: Some(format!(
+                                "Parameter {name} was specified more than once"
+                            )),
+                        },
+                    )
+                    .into(),
+                );
+            }
+            // A group holds a value only for a parameter the caching software defines,
+            // so a name outside the catalog names nothing this group could store.
+            let Some(definition) = crate::state::default_parameter(name) else {
+                return Err(
+                    UpdateParameterGroupErrorModeled::InvalidParameterValueException(
+                        crate::state::unknown_parameter_name(name),
+                    )
+                    .into(),
+                );
+            };
+            let Some(value) = pair.parameter_value.as_deref() else {
+                return Err(
+                    UpdateParameterGroupErrorModeled::InvalidParameterValueException(
+                        InvalidParameterValueException {
+                            message: Some(format!(
+                                "ParameterValue must be specified for parameter {name}"
+                            )),
+                        },
+                    )
+                    .into(),
+                );
+            };
+            // The value must be one the catalog publishes for that parameter: its data
+            // type, and the range its `AllowedValues` names.
+            if let Some(reason) = definition.value_violation(value) {
+                return Err(
+                    UpdateParameterGroupErrorModeled::InvalidParameterValueException(
+                        InvalidParameterValueException {
+                            message: Some(reason),
+                        },
+                    )
+                    .into(),
+                );
+            }
+            changes.push((name.to_string(), value.to_string()));
+        }
+
+        // ONLY the parameters the request named are changed; every other value this
+        // group holds is kept. `group` is the record resolved above, under the one lock
+        // taken for this call, so nothing can have removed it in between.
+        for (name, value) in changes {
+            group.parameter_values.insert(name, value);
+        }
+        let view = group.view();
+        store.record_event(
+            &input.parameter_group_name,
+            crate::state::SOURCE_TYPE_PARAMETER_GROUP,
+            crate::state::EVENT_PARAMETER_GROUP_MODIFIED,
+            now,
+        );
+
+        Ok(UpdateParameterGroupOutput {
+            parameter_group: Some(view),
+        })
     }
 }

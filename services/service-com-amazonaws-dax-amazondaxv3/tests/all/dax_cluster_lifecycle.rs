@@ -1442,11 +1442,7 @@ async fn an_update_applies_only_the_members_it_was_given() {
 async fn the_operations_outside_this_slice_still_answer_not_implemented() {
     let router = emulator();
     // Rows: one operation from each family left to its own gap issue.
-    let cases: [(&str, Value); 5] = [
-        (
-            "UpdateParameterGroup",
-            json!({ "ParameterGroupName": "pg", "ParameterNameValues": [] }),
-        ),
+    let cases: [(&str, Value); 4] = [
         (
             "DecreaseReplicationFactor",
             json!({ "ClusterName": "demo", "NewReplicationFactor": 1 }),

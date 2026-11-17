@@ -123,6 +123,12 @@ pub const MAX_SUBNET_GROUPS: usize = 50;
 /// emulator picks the bound, as it does for [`MAX_CLUSTERS`] and [`MAX_SUBNET_GROUPS`].
 pub const MAX_PARAMETER_GROUPS: usize = 50;
 
+/// The number of parameters one `UpdateParameterGroup` request may change: "You can
+/// modify up to 20 parameters in a single request by submitting a list parameter name
+/// and value pairs" (`UpdateParameterGroup`). A longer list is refused with the modelled
+/// `InvalidParameterCombinationException`.
+pub const MAX_PARAMETERS_PER_UPDATE: usize = 20;
+
 /// The parameter group family a service-provided parameter group belongs to: the caching
 /// software and the version of it whose defaults the group carries. AWS names a group it
 /// provides itself after the family rather than after the service alone, so the name a
@@ -203,6 +209,9 @@ pub const EVENT_CLUSTER_DELETED: &str = "Cluster deleted.";
 pub const EVENT_SUBNET_GROUP_CREATED: &str = "Subnet group created.";
 /// The event a `CreateParameterGroup` records against the group it minted.
 pub const EVENT_PARAMETER_GROUP_CREATED: &str = "Parameter group created.";
+/// The event an `UpdateParameterGroup` records against the group whose parameters it
+/// changed.
+pub const EVENT_PARAMETER_GROUP_MODIFIED: &str = "Parameter group modified.";
 /// The event a `DeleteParameterGroup` records.
 pub const EVENT_PARAMETER_GROUP_DELETED: &str = "Parameter group deleted.";
 
@@ -662,6 +671,61 @@ impl ParameterDefinition {
     pub fn default_view(&self) -> Parameter {
         self.view(self.default_value, self.source)
     }
+
+    /// The values this parameter accepts, as `AllowedValues` publishes them in the AWS
+    /// range notation: the inclusive minimum, and the inclusive maximum when the entry
+    /// names one (`<min>-` is "`min` and above"). `None` for an entry whose
+    /// `AllowedValues` is not a range, which bounds nothing.
+    pub fn allowed_range(&self) -> Option<(i64, Option<i64>)> {
+        // A bound may be negative, so the separator is the one AFTER the minimum's own
+        // sign rather than the first hyphen in the notation.
+        let (sign, rest) = match self.allowed_values.strip_prefix('-') {
+            Some(rest) => ("-", rest),
+            None => ("", self.allowed_values),
+        };
+        let (min, max) = rest.split_once('-')?;
+        let min = format!("{sign}{min}").parse::<i64>().ok()?;
+        let max = if max.is_empty() {
+            None
+        } else {
+            Some(max.parse::<i64>().ok()?)
+        };
+        Some((min, max))
+    }
+
+    /// Why `value` is not one this parameter may be set to, worded for the caller, or
+    /// `None` when it is acceptable.
+    ///
+    /// The check is driven by what the CATALOG publishes for the entry rather than by
+    /// its name: a parameter whose `DataType` is a whole number takes one, and
+    /// `AllowedValues` ([`allowed_range`](Self::allowed_range)) bounds it. An entry the
+    /// customer may not modify accepts no value at all.
+    pub fn value_violation(&self, value: &str) -> Option<String> {
+        if self.is_modifiable != IS_MODIFIABLE_TRUE {
+            return Some(format!("Parameter {} cannot be modified", self.name));
+        }
+        if self.data_type != DATA_TYPE_INTEGER {
+            return None;
+        }
+        let Ok(parsed) = value.parse::<i64>() else {
+            return Some(format!(
+                "Invalid value for parameter {}: {value} is not an {}",
+                self.name, self.data_type
+            ));
+        };
+        // An entry whose `AllowedValues` is not a range bounds nothing, so the value is
+        // checked against its data type alone rather than reported as acceptable
+        // untested.
+        if let Some((min, max)) = self.allowed_range() {
+            if parsed < min || max.is_some_and(|max| parsed > max) {
+                return Some(format!(
+                    "Invalid value for parameter {}: {value} is outside the allowed values {}",
+                    self.name, self.allowed_values
+                ));
+            }
+        }
+        None
+    }
 }
 
 /// The parameters the DAX caching software defines, sorted by name (so [`page`] can
@@ -974,10 +1038,11 @@ pub fn parameter_group_not_found_message() -> String {
 }
 
 /// The message `ParameterGroupNotFoundFault` carries when a request names a parameter
-/// group as a REFERENCE from another resource — a cluster's `ParameterGroupName`: the
-/// fixed text `ParameterGroup not found: ` followed by that name, so the caller is told
-/// which group the cluster could not be given. DAX words the two paths differently, and
-/// each is taken from its own recorded answer.
+/// group it MODIFIES THROUGH — a cluster's `ParameterGroupName`, or the group an
+/// `UpdateParameterGroup` changes the parameters of: the fixed text
+/// `ParameterGroup not found: ` followed by that name, so the caller is told which group
+/// could not be resolved. DAX words the two paths differently, and each is taken from
+/// its own recorded answer.
 pub fn parameter_group_not_found_named_message(name: &str) -> String {
     format!("ParameterGroup not found: {name}")
 }
@@ -1162,5 +1227,15 @@ pub fn parameter_group_not_found_named(name: &str) -> ParameterGroupNotFoundFaul
 pub fn parameter_group_already_exists() -> ParameterGroupAlreadyExistsFault {
     ParameterGroupAlreadyExistsFault {
         message: Some("Parameter Group already exists.".to_string()),
+    }
+}
+
+/// `InvalidParameterValueException` for a request naming a parameter the caching
+/// software does not define. The names it MAY name are exactly the ones
+/// [`DEFAULT_PARAMETERS`] publishes, so the refusal is driven by the catalog rather than
+/// by a list written out beside it.
+pub fn unknown_parameter_name(name: &str) -> InvalidParameterValueException {
+    InvalidParameterValueException {
+        message: Some(format!("Unknown parameter name: {name}")),
     }
 }
