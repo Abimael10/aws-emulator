@@ -1135,17 +1135,41 @@ fn is_defined_function(name: &str) -> bool {
 /// name — "you must use `"double quotes"` around a reserved word" is how a name that
 /// collides with one is spelled. Compared without regard to case, the way every other
 /// keyword of this dialect is ([`StatementParser::peek_word`]).
-const STATEMENT_KEYWORDS: [&str; 104] = [
+///
+/// The set is the LANGUAGE's, not a subset of it this parser happens to read: a word is
+/// reserved because the grammar spells it SOMEWHERE, whether or not this dialect's own
+/// clauses use it. So the table holds, beside the clause words and the verbs,
+///
+/// * every spelling of a type a value can be cast to (`integer8` as well as `int8`,
+///   `double precision`, `character varying`, `time with time zone`, the collection
+///   types `list`, `bag`, `sexp`, `struct`, `tuple`),
+/// * the DATE PARTS `EXTRACT` names (`year` … `timezone_minute`),
+/// * the three trim specifications (`both`, `leading`, `trailing`), and
+/// * the names the grammar spells a FUNCTION SPECIAL FORM with — `size` beside the
+///   `cast` and `extract` the table already held — as against an ordinary function
+///   name, which is a name like any other ([`is_defined_function`]: a call to one
+///   standing where a path belongs is reported as the path it is not),
+///
+/// because a statement that writes one of those plainly where a name belongs has written
+/// that keyword just as surely as one that writes `SELECT` there. The verbs of the schema
+/// operations this surface refuses ([`NON_DML_STATEMENT_OPERATIONS`]) are NOT among them:
+/// `DROP "t"` is a name followed by a token nothing can follow an expression with
+/// ([`ParseDefect::TrailingToken`]), where `TABLE "t"` — a keyword — states no data
+/// manipulation at all.
+const STATEMENT_KEYWORDS: [&str; 122] = [
     "all", "and", "any", "as", "asc", "at", "bag", "between", "bigint", "blob", "bool", "boolean",
-    "both", "by", "case", "cast", "char", "character", "clob", "cross", "date", "decimal",
+    "both", "by", "case", "cast", "char", "character", "clob", "cross", "date", "day", "decimal",
     "delete", "desc", "distinct", "double", "else", "end", "escape", "except", "exclude", "exists",
-    "extract", "false", "first", "float", "for", "from", "full", "group", "having", "in", "inner",
-    "insert", "int", "int2", "int4", "int8", "integer", "intersect", "into", "is", "join", "last",
-    "lateral", "left", "like", "limit", "list", "missing", "modified", "natural", "new", "not",
-    "null", "nulls", "numeric", "offset", "old", "on", "or", "order", "outer", "pivot", "real",
-    "remove", "replace", "returning", "right", "select", "set", "sexp", "smallint", "string",
-    "struct", "symbol", "table", "then", "time", "timestamp", "tinyint", "to", "true", "union",
-    "unpivot", "update", "upsert", "using", "value", "values", "varchar", "when", "where", "with",
+    "extract", "false", "first", "float", "for", "from", "full", "group", "having", "hour", "in",
+    "inner", "insert", "int", "int2", "int4", "int8", "integer", "integer2", "integer4",
+    "integer8", "intersect", "into", "is", "join", "last", "lateral", "leading", "left", "like",
+    "limit", "list", "minute", "missing", "modified", "month", "natural", "new", "not", "null",
+    "nulls", "numeric", "offset", "old", "on", "or", "order", "outer", "pivot", "precision",
+    "real", "remove", "replace", "returning", "right", "second", "select", "set", "sexp", "size",
+    "smallint", "string", "struct", "symbol", "table", "then", "time", "timestamp",
+    "timezone_hour", "timezone_minute", "tinyint", "to", "trailing", "true", "tuple", "union",
+    "unpivot", "update", "upsert", "using", "value", "values", "varchar", "varying", "when",
+    "where", "with", "year", "zone",
 ];
 
 /// Whether a bare word spells one of the dialect's keywords.

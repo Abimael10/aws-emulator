@@ -629,6 +629,143 @@ async fn every_clause_of_one_update_resolves_against_the_pre_image() {
     }
 }
 
+/// Rule 4, continued: the clauses of ONE update are applied in the order of the paths
+/// they name, not in the order the expression writes them.
+///
+/// Which shows exactly where two clauses write past the end of one list: each such write
+/// appends, so the one naming the SMALLER index lands first and the appended run reads in
+/// index order however the clauses were ordered. Everywhere else the two orders agree,
+/// because a write to a location the item already holds moves no other location.
+#[tokio::test]
+async fn writes_past_the_end_of_one_list_append_in_the_order_of_their_indices() {
+    let router = emulator();
+    create_active_table(&router, "AppendOrder", &[("pk", "HASH", "S")]).await;
+
+    /// The five-element list every row starts from, so every index from 5 up is past its
+    /// end and appends.
+    fn stored() -> Value {
+        json!({"L": [{"S": "a"}, {"S": "b"}, {"S": "c"}, {"S": "d"}, {"S": "e"}]})
+    }
+
+    /// A list of one-character strings, as the stored value reads.
+    fn letters(members: &[&str]) -> Value {
+        json!({
+            "L": members
+                .iter()
+                .map(|member| json!({"S": member}))
+                .collect::<Vec<Value>>(),
+        })
+    }
+
+    /// The one-character value for each `:marker` an expression names, and no other:
+    /// "Value provided in ExpressionAttributeValues unused in expressions" refuses a
+    /// substitution the expression does not read.
+    fn values_for(expression: &str) -> Value {
+        let mut values = serde_json::Map::new();
+        for marker in [":x", ":y", ":z"] {
+            if expression.contains(marker) {
+                let letter = marker.trim_start_matches(':').to_uppercase();
+                values.insert(marker.to_string(), json!({"S": letter}));
+            }
+        }
+        Value::Object(values)
+    }
+
+    // Each row: the case, the expression, and what the list READS afterwards. The rows
+    // differ in the order the clauses are written in against the order of the indices
+    // they name, in how many clauses append, in how far past the end they reach, and in
+    // whether a clause that writes inside the list or removes from it stands beside them.
+    let rows: Vec<(&str, &str, Value)> = vec![
+        (
+            "two appends written greatest index first",
+            "SET l[99] = :x, l[98] = :y",
+            letters(&["a", "b", "c", "d", "e", "Y", "X"]),
+        ),
+        (
+            "the same two appends written smallest index first",
+            "SET l[98] = :x, l[99] = :y",
+            letters(&["a", "b", "c", "d", "e", "X", "Y"]),
+        ),
+        (
+            "three appends written in neither order",
+            "SET l[30] = :x, l[10] = :y, l[20] = :z",
+            letters(&["a", "b", "c", "d", "e", "Y", "Z", "X"]),
+        ),
+        (
+            "an append at the first index past the end, written after a farther one",
+            "SET l[7] = :x, l[5] = :y",
+            letters(&["a", "b", "c", "d", "e", "Y", "X"]),
+        ),
+        (
+            "an append beside a write inside the list",
+            "SET l[9] = :x, l[0] = :y",
+            letters(&["Y", "b", "c", "d", "e", "X"]),
+        ),
+        (
+            "two appends beside a removal from the front",
+            "SET l[99] = :x, l[98] = :y REMOVE l[0]",
+            letters(&["b", "c", "d", "e", "Y", "X"]),
+        ),
+    ];
+    for (case, expression, after) in rows {
+        ok(
+            &router,
+            "PutItem",
+            json!({"TableName": "AppendOrder", "Item": {"pk": {"S": case}, "l": stored()}}),
+        )
+        .await;
+        ok(
+            &router,
+            "UpdateItem",
+            json!({"TableName": "AppendOrder", "Key": {"pk": {"S": case}},
+                   "UpdateExpression": expression,
+                   "ExpressionAttributeValues": values_for(expression)}),
+        )
+        .await;
+        let read = ok(
+            &router,
+            "GetItem",
+            json!({"TableName": "AppendOrder", "Key": {"pk": {"S": case}}}),
+        )
+        .await;
+        assert_eq!(
+            read["Item"]["l"], after,
+            "case {case:?} ({expression}): expected the list to read {after}, got {}",
+            read["Item"]["l"]
+        );
+    }
+
+    // The same rule one level down: the paths are ordered step by step, so two appends
+    // into a list held inside a map land in index order as well.
+    ok(
+        &router,
+        "PutItem",
+        json!({"TableName": "AppendOrder",
+               "Item": {"pk": {"S": "nested"}, "m": {"M": {"l": stored()}}}}),
+    )
+    .await;
+    ok(
+        &router,
+        "UpdateItem",
+        json!({"TableName": "AppendOrder", "Key": {"pk": {"S": "nested"}},
+               "UpdateExpression": "SET m.l[9] = :x, m.l[8] = :y",
+               "ExpressionAttributeValues": {":x": {"S": "X"}, ":y": {"S": "Y"}}}),
+    )
+    .await;
+    let read = ok(
+        &router,
+        "GetItem",
+        json!({"TableName": "AppendOrder", "Key": {"pk": {"S": "nested"}}}),
+    )
+    .await;
+    let expected = letters(&["a", "b", "c", "d", "e", "Y", "X"]);
+    assert_eq!(
+        read["Item"]["m"]["M"]["l"], expected,
+        "case a list inside a map: expected it to read {expected}, got {}",
+        read["Item"]["m"]
+    );
+}
+
 #[tokio::test]
 async fn size_of_a_string_counts_utf8_bytes() {
     let router = emulator();

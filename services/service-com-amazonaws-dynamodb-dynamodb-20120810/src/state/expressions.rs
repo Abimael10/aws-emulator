@@ -2777,20 +2777,40 @@ impl ParsedUpdate {
     /// index where the pre-image had it), then the removals greatest path first (so
     /// removing one location never shifts a smaller one that is still to be removed).
     ///
+    /// Within each phase the order is the PATH's, not the order the expression spells
+    /// its clauses in: the writes smallest path first, the removals greatest path
+    /// first. Which only shows where two clauses write past the end of ONE list — each
+    /// such write appends ("if the index is greater than the list's size, the new
+    /// element is appended"), so the element of the SMALLER index lands first and the
+    /// appended run reads in index order, whichever order the clauses were written in.
+    /// Everywhere else the two orders agree, because one update's paths are disjoint
+    /// ([`check_paths_disjoint`]) and a write to a location the pre-image already holds
+    /// moves no other location.
+    ///
     /// A value an action COMPUTES goes through [`check_attribute_value`] before it is
     /// written, exactly as one a request sent does, and the item is clamped AS IT
     /// GROWS — the room check and the running member count both precede each write —
     /// so a many-action update cannot multiply a per-value bound into an unbounded item
-    /// while it is being built, however many actions the expression states. A value past
-    /// the documented item ceiling is worded as the UPDATE path words that quota
-    /// ([`stated_for_an_update`]): the item that crossed it is the one this change would
-    /// leave behind.
+    /// while it is being built, however many actions the expression states. Those checks
+    /// run in the write phase's own order, so an update whose clauses break more than one
+    /// of them is refused for the SMALLEST path that breaks one rather than for the
+    /// first clause written. A value past the documented item ceiling is worded as the
+    /// UPDATE path words that quota ([`stated_for_an_update`]): the item that crossed it
+    /// is the one this change would leave behind.
     pub fn apply(&self, item: &mut Item) -> Result<UpdateOutcome, RequestError> {
         let before = item.clone();
         let mut changed: Vec<DocumentPath> = Vec::new();
         let mut members_written = 0usize;
         let mut removals: Vec<&DocumentPath> = Vec::new();
+        let mut writes: Vec<&UpdateAction> = Vec::new();
         for action in &self.actions {
+            match action {
+                UpdateAction::Remove(path) => removals.push(path),
+                _ => writes.push(action),
+            }
+        }
+        writes.sort_by(|one, two| one.path().0.cmp(&two.path().0));
+        for action in writes {
             let path = action.path();
             match action {
                 UpdateAction::Set(path, value) => {
@@ -2803,7 +2823,8 @@ impl ParsedUpdate {
                     path.set(item, value)?;
                     changed.push(path.clone());
                 }
-                UpdateAction::Remove(path) => removals.push(path),
+                // Collected above: a removal is applied in the second phase.
+                UpdateAction::Remove(_) => {}
                 UpdateAction::Add(_, value) => {
                     let added = apply_add(self.member, path, value, &before)?;
                     check_attribute_value(path.attribute(), &added)
