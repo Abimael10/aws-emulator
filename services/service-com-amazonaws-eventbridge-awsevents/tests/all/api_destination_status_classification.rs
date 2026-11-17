@@ -47,7 +47,7 @@ use service_com_amazonaws_eventbridge_awsevents::state::ComAmazonawsEventbridgeA
 use smithy_server_runtime::MultiServiceRouter;
 
 /// The Region every request below is signed for.
-const REGION: &str = "us-west-2";
+pub const REGION: &str = "us-west-2";
 
 /// The `detail-type` every event this suite publishes carries.
 pub const DETAIL_TYPE: &str = "Hook Fired";
@@ -59,6 +59,16 @@ const HANDLER: &str = "lambda_function.lambda_handler";
 /// so the pair the `Authorization` header carries the base64 of (RFC 7617).
 const BASIC_USER: &str = "hook-user";
 const BASIC_PASSWORD: &str = "hook-password";
+
+/// The `Authorization` a destination invoking through that connection has to carry, composed
+/// the way RFC 7617 defines it rather than asserted as one encoded literal.
+pub fn basic_authorization() -> String {
+    format!(
+        "Basic {}",
+        base64::engine::general_purpose::STANDARD
+            .encode(format!("{BASIC_USER}:{BASIC_PASSWORD}"))
+    )
+}
 
 /// The method every destination here is invoked with — not the default, so a request made
 /// with some other method fails the row.
@@ -198,8 +208,9 @@ pub fn member(case: &str, body: &Value, name: &str) -> String {
 }
 
 /// The endpoint every destination of this suite points at: the handler answers the status
-/// the LAST path segment names and echoes what the request carried, so one function serves
-/// every row and the row's own status is in the address.
+/// the LAST path segment names and echoes what the request carried — its method, its
+/// `Authorization`, the path and query string it arrived on and its body — so one function
+/// serves every row and the row's own status is in the address.
 ///
 /// Nothing here is derived from the request's content: the status comes from the path the
 /// destination was created with, and the echo is what the invocation handed the handler.
@@ -214,6 +225,7 @@ def lambda_handler(event, context):
     echoed = {
         "method": context_http.get("method") or "",
         "authorization": headers.get("authorization") or "",
+        "path": path,
         "query": event.get("rawQueryString") or "",
         "body": event.get("body") or "",
     }
@@ -526,13 +538,8 @@ async fn an_endpoints_answer_decides_the_api_destination_delivery_and_its_dead_l
     let emulator = emulator();
     let endpoint = given_echo_endpoint(&emulator).await;
     let connection_arn = given_basic_connection(&emulator).await;
-    // What the connection's own authorization header has to be, computed here the way
-    // RFC 7617 defines it rather than asserting one encoded literal.
-    let expected_authorization = format!(
-        "Basic {}",
-        base64::engine::general_purpose::STANDARD
-            .encode(format!("{BASIC_USER}:{BASIC_PASSWORD}"))
-    );
+    // What the connection's own authorization header has to be ([`basic_authorization`]).
+    let expected_authorization = basic_authorization();
 
     for (index, row) in rows().iter().enumerate() {
         let case = row.case;
