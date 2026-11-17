@@ -16,6 +16,13 @@
 //! opens at undefined. `StartDate` and `EndDate` are modelled as plain strings and are
 //! held exactly as the request stated them.
 //!
+//! `Cutoff` is "the number of hours before the end of the maintenance window that […]
+//! Systems Manager stops scheduling new tasks", counted back from an end `Duration` hours
+//! after the window opens — so a cutoff that is not SMALLER than that duration leaves no
+//! span in which a task could start and is refused before anything is written
+//! ([`crate::state::maintenance_windows::cutoff_violation`]), each figure's own range
+//! being modelled and already refused by the walk.
+//!
 //! A create carrying an idempotency token a create already ran under reports the window
 //! that one minted rather than minting a second, and is refused with
 //! `IdempotentParameterMismatch` when it supplies different members under that token.
@@ -222,6 +229,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if let Some(why) = crate::state::maintenance_windows::schedule_timezone_violation(
             input.schedule_timezone.as_deref(),
         ) {
+            return Err(crate::scaffolded::Scaffolded::validation(why));
+        }
+        // `Cutoff` and `Duration` each satisfy their own modelled range by the time this
+        // runs, and the service enforces one rule ON TOP of them: the cutoff is counted
+        // back from the end of a window that lasts `Duration` hours, so it has to be
+        // smaller than that duration or no task could ever start. The model declares no
+        // error for the pair, so it is a 400 `ValidationException`, raised before anything
+        // is written.
+        if let Some(why) =
+            crate::state::maintenance_windows::cutoff_violation(input.cutoff, input.duration)
+        {
             return Err(crate::scaffolded::Scaffolded::validation(why));
         }
 

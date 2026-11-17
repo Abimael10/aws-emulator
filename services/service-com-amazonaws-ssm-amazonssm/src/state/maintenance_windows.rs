@@ -134,16 +134,36 @@ const NEUTRAL_CRON_FIELDS: [&str; CRON_FIELDS + 1] = ["0", "0", "0", "*", "*", "
 /// date and time with no zone offset, since the zone is `ScheduleTimezone`'s to state.
 const AT_EXPRESSION_FORMAT: &str = "%Y-%m-%dT%H:%M:%S";
 
-/// The form a window's `NextExecutionTime` is reported in: ISO-8601 Extended to the
-/// MINUTE, which is the resolution Systems Manager states the instants a window opens at
-/// — a window's schedule names a minute of the hour at its finest (the cron grammar's
-/// first field, and the smallest unit a `rate(...)` may state), so there is no finer
-/// instant for one to report.
-const NEXT_EXECUTION_UTC_FORMAT: &str = "%Y-%m-%dT%H:%MZ";
+/// The date and the time of day an instant a window reports is written with, down to the
+/// MINUTE — the shortest ISO-8601 Extended rendering, which a whole minute is written as.
+///
+/// `MaintenanceWindowStringDateTime` is a plain string shape with no `timestampFormat`
+/// trait, so the text is the service's to write and a client parses what it finds:
+/// Systems Manager writes an ISO-8601 Extended instant whose components BELOW the minute
+/// are stated only when they carry something — the seconds when they are not zero, and the
+/// milliseconds beside them when they are not either
+/// ([`INSTANT_SECONDS_FORMAT`], [`INSTANT_MILLISECONDS_FORMAT`]) — so the instants a
+/// schedule names on whole minutes are written to the minute, and one a series anchored
+/// off the minute lands on carries every component it has.
+const INSTANT_MINUTE_FORMAT: &str = "%Y-%m-%dT%H:%M";
 
-/// The same form for an instant read in a zone that is not at UTC, whose offset it carries
-/// in place of the `Z` designator.
-const NEXT_EXECUTION_OFFSET_FORMAT: &str = "%Y-%m-%dT%H:%M%:z";
+/// What the seconds of such an instant are appended as, when they are not zero.
+const INSTANT_SECONDS_FORMAT: &str = ":%S";
+
+/// What its milliseconds are appended as, when they are not zero: the resolution every
+/// instant this service writes is held at.
+const INSTANT_MILLISECONDS_FORMAT: &str = "%.3f";
+
+/// The designator an instant read at UTC ends with, rather than a zero offset.
+const INSTANT_UTC_DESIGNATOR: &str = "Z";
+
+/// The offset an instant read in a zone that is not at UTC ends with instead.
+const INSTANT_OFFSET_FORMAT: &str = "%:z";
+
+/// How many nanoseconds a millisecond is, which is the resolution an instant is written
+/// at: a finer reading of the clock than the service's own states a precision it does not
+/// hold, so it is dropped rather than written.
+const NANOS_PER_MILLISECOND: u32 = 1_000_000;
 
 /// The civil date-and-time form a window's `StartDate`/`EndDate` may state without a zone,
 /// the zone then being the window's own: both are documented "in ISO-8601 Extended format"
@@ -265,6 +285,34 @@ pub fn schedule_timezone_violation(timezone: Option<&str>) -> Option<String> {
         .parse::<::chrono_tz::Tz>()
         .err()
         .map(|_| invalid_schedule_timezone_message(timezone))
+}
+
+/// How this service words a `Cutoff` that is not smaller than the `Duration` it is taken
+/// against: the figure the request carried, and the figure the service names the bound
+/// with — the duration's last hour, one short of the duration itself, which is the largest
+/// cutoff a window of that duration could carry.
+#[must_use]
+pub fn cutoff_not_smaller_than_duration_message(cutoff: i32, duration: i32) -> String {
+    let bound = duration.saturating_sub(1);
+    format!("Cutoff was {cutoff} but must be smaller than {bound} (Duration  - 1 )")
+}
+
+/// Refuse a `Cutoff` that is not smaller than the `Duration` it is stated beside; `None`
+/// when the two hold together.
+///
+/// "The value you specify for Duration determines the specific end time for the maintenance
+/// window based on the time it begins. No maintenance window tasks are permitted to start
+/// after the resulting endtime minus the number of hours you specify for Cutoff"
+/// (`smithy_query(query="doc",shape="CreateMaintenanceWindow")`): the cutoff is counted
+/// back from the end of a window that lasts `Duration` hours, so a cutoff of the whole
+/// duration or more leaves no span in which a task could ever start — the largest cutoff a
+/// window can carry is one hour short of its duration. Each figure's own range (`Cutoff`
+/// 0..23, `Duration` 1..24) is MODELLED, so the boundary walk has already refused anything
+/// outside it; this is the rule the PAIR holds together under, and every operation that
+/// writes the pair is held to it.
+#[must_use]
+pub fn cutoff_violation(cutoff: i32, duration: i32) -> Option<String> {
+    (cutoff >= duration).then(|| cutoff_not_smaller_than_duration_message(cutoff, duration))
 }
 
 /// `at` instant, `rate` period or `cron` fields: the forms a maintenance window's schedule
@@ -580,21 +628,37 @@ fn window_instant(value: &str, zone: ::chrono_tz::Tz) -> Option<SystemTime> {
     Some(SystemTime::from(local.with_timezone(&::chrono::Utc)))
 }
 
-/// One instant as a `MaintenanceWindowStringDateTime`: ISO-8601 Extended to the minute
-/// ([`NEXT_EXECUTION_UTC_FORMAT`]), in `zone` — so a window whose schedule is read in a
-/// zone reports the instants it opens at in that same zone, and one read at UTC reports
-/// them with the `Z` designator rather than with a zero offset.
+/// One instant as a `MaintenanceWindowStringDateTime`: ISO-8601 Extended, written in
+/// `zone` — so a window whose schedule is read in a zone reports the instants it opens at
+/// in that same zone, and one read at UTC reports them with the `Z` designator rather than
+/// with a zero offset.
+///
+/// The components below the minute are stated only when they carry something
+/// ([`INSTANT_MINUTE_FORMAT`]), and the finest the service holds is the millisecond, so a
+/// closer reading of the clock is dropped rather than written.
 ///
 /// `None` for an instant outside the calendar ([`calendar_instant`]): such an instant has no
 /// ISO-8601 rendering, so nothing is reported for it.
 fn rendered_instant(at: SystemTime, zone: ::chrono_tz::Tz) -> Option<String> {
+    use ::chrono::Timelike as _;
+
     let local = calendar_instant(at)?.with_timezone(&zone);
-    let format = if local.offset().fix().local_minus_utc() == 0 {
-        NEXT_EXECUTION_UTC_FORMAT
+    let milliseconds = local.nanosecond() / NANOS_PER_MILLISECOND;
+    let local = local.with_nanosecond(milliseconds * NANOS_PER_MILLISECOND)?;
+
+    let mut format = String::from(INSTANT_MINUTE_FORMAT);
+    if local.second() != 0 || milliseconds != 0 {
+        format.push_str(INSTANT_SECONDS_FORMAT);
+        if milliseconds != 0 {
+            format.push_str(INSTANT_MILLISECONDS_FORMAT);
+        }
+    }
+    if local.offset().fix().local_minus_utc() == 0 {
+        format.push_str(INSTANT_UTC_DESIGNATOR);
     } else {
-        NEXT_EXECUTION_OFFSET_FORMAT
-    };
-    Some(local.format(format).to_string())
+        format.push_str(INSTANT_OFFSET_FORMAT);
+    }
+    Some(local.format(&format).to_string())
 }
 
 /// One maintenance window the account created, as the store holds it.
@@ -1194,6 +1258,123 @@ mod tests {
             Some("2130-01-01T00:01Z"),
             "expected the first period boundary after the activation, got {next:?}"
         );
+    }
+
+    /// An instant reported as a window's next execution is written in ISO-8601 Extended
+    /// form, stating the components BELOW the minute only when they carry something: the
+    /// seconds when they are not zero, the milliseconds beside them when they are not
+    /// either, and a closer reading of the clock not at all. The rows differ along the
+    /// components the instant carries, the form of the schedule that named it and the zone
+    /// it is read in.
+    #[test]
+    fn a_next_execution_states_the_components_it_carries() {
+        // 2030-01-01T00:00:13.040Z: an anchor that is no whole minute, so a series measured
+        // from it lands on instants with seconds and milliseconds of their own.
+        let odd_anchor = epoch(1_893_456_013) + Duration::from_millis(40);
+        // The same anchor read closer than the service holds an instant.
+        let finer_than_a_millisecond = odd_anchor + Duration::from_nanos(123_456);
+        // (case, schedule, the instant the create recorded, the zone, the instant reported)
+        let rows: [(&str, &str, SystemTime, Option<&str>, &str); 6] = [
+            (
+                "a cron naming a whole minute",
+                "cron(0 8 * * ? *)",
+                epoch(1_893_456_000),
+                None,
+                "2030-01-01T08:00Z",
+            ),
+            (
+                "a rate anchored off the minute",
+                "rate(1 hour)",
+                odd_anchor,
+                None,
+                "2030-01-01T01:00:13.040Z",
+            ),
+            (
+                "the same rate read in a western zone",
+                "rate(1 hour)",
+                odd_anchor,
+                Some("America/Los_Angeles"),
+                "2029-12-31T17:00:13.040-08:00",
+            ),
+            // Whole seconds carry no milliseconds to state.
+            (
+                "a rate anchored on a whole second",
+                "rate(1 hour)",
+                epoch(1_893_456_013),
+                None,
+                "2030-01-01T01:00:13Z",
+            ),
+            // A reading finer than the millisecond the service holds states nothing
+            // further.
+            (
+                "a rate anchored finer than a millisecond",
+                "rate(1 hour)",
+                finer_than_a_millisecond,
+                None,
+                "2030-01-01T01:00:13.040Z",
+            ),
+            (
+                "a one-time instant naming a whole minute",
+                "at(2030-06-01T12:00:00)",
+                epoch(1_893_456_000),
+                None,
+                "2030-06-01T12:00Z",
+            ),
+        ];
+
+        for (case, schedule, created_date, timezone, expected) in rows {
+            let mut held = window(schedule);
+            held.created_date = created_date;
+            held.modified_date = created_date;
+            held.schedule_timezone = timezone.map(str::to_string);
+            // 2030-01-01T00:00:20Z: past every anchor above, so each row reports an
+            // instant still ahead of the clock.
+            let next = held.next_execution_time(epoch(1_893_456_020));
+            assert_eq!(
+                next.as_deref(),
+                Some(expected),
+                "case {case:?}: expected the next execution at {expected:?}, got {next:?}"
+            );
+        }
+    }
+
+    /// A window's cutoff has to be SMALLER than its duration, each figure's own modelled
+    /// range notwithstanding: the rows differ along the figures and cover each published
+    /// bound of both ranges (`Cutoff` 0..23, `Duration` 1..24) and the pairs on either side
+    /// of the rule.
+    #[test]
+    fn a_cutoff_stays_under_the_duration() {
+        // (case, cutoff, duration, is refused)
+        let rows: [(&str, i32, i32, bool); 9] = [
+            ("no cutoff under the smallest duration", 0, 1, false),
+            ("a cutoff one hour short of the duration", 1, 2, false),
+            ("the largest cutoff under the largest duration", 23, 24, false),
+            ("no cutoff under the largest duration", 0, 24, false),
+            ("a cutoff equal to the duration", 2, 2, true),
+            ("a cutoff one hour past the duration", 2, 1, true),
+            ("the largest cutoff with the smallest duration", 23, 1, true),
+            ("the largest cutoff equal to the duration", 23, 23, true),
+            ("no cutoff is never refused", 0, 2, false),
+        ];
+
+        for (case, cutoff, duration, refused) in rows {
+            let violation = cutoff_violation(cutoff, duration);
+            assert_eq!(
+                violation.is_some(),
+                refused,
+                "case {case:?}: expected refused={refused} for cutoff {cutoff} and duration \
+                 {duration}, got {violation:?}"
+            );
+            if let Some(message) = violation {
+                let bound = duration - 1;
+                assert_eq!(
+                    message,
+                    format!("Cutoff was {cutoff} but must be smaller than {bound} (Duration  - 1 )"),
+                    "case {case:?}: the refusal is worded as this error class is, got \
+                     {message:?}"
+                );
+            }
+        }
     }
 
     /// Two creates carrying one idempotency token are the same call exactly when the

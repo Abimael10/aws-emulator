@@ -12,13 +12,14 @@
 //! The rules under test are that a read of a window reports, for the `WindowId` the
 //! request names, exactly the members the create of that window persisted — with the
 //! documented default of every member the create left out — that a `Schedule` stating none
-//! of the forms this service documents is refused before any window exists, that
-//! `NextExecutionTime` is the first instant the stored schedule names, and that an
-//! idempotency token makes a retried create the SAME window. The suites are tables whose
-//! rows differ along what each rule generalises over: which optional members a create
-//! supplies, the duration and cutoff figures, the form of the schedule, the zone it is
-//! read in, the days it waits, the Region the endpoint is, and the way an id or an
-//! expression misses.
+//! of the forms this service documents is refused before any window exists, that a `Cutoff`
+//! that is not smaller than the `Duration` it is counted back from is refused the same way,
+//! that `NextExecutionTime` is the first instant the stored schedule names and is written
+//! in ISO-8601 Extended form, and that an idempotency token makes a retried create the
+//! SAME window. The suites are tables whose rows differ along what each rule generalises
+//! over: which optional members a create supplies, the duration and cutoff figures, the
+//! form of the schedule, the zone it is read in, the days it waits, the Region the endpoint
+//! is, and the way an id or an expression misses.
 
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
@@ -80,6 +81,51 @@ fn minimal(name: &str, schedule: &str) -> Value {
         "Cutoff": 1,
         "AllowUnassociatedTargets": false,
     })
+}
+
+/// The ISO-8601 Extended forms this service writes an instant in, as SHAPES — every digit
+/// replaced by `0`, so a form is asserted rather than a value: a whole minute, one carrying
+/// seconds, and one carrying milliseconds beside them.
+const INSTANT_SHAPES: [&str; 3] = [
+    "0000-00-00T00:00",
+    "0000-00-00T00:00:00",
+    "0000-00-00T00:00:00.000",
+];
+
+/// `text` with every digit replaced by `0`.
+fn shape_of(text: &str) -> String {
+    text.chars()
+        .map(|character| if character.is_ascii_digit() { '0' } else { character })
+        .collect()
+}
+
+/// Assert `instant` is written in one of the forms this service writes an instant in
+/// ([`INSTANT_SHAPES`]), ending in the `Z` designator or in a zone offset.
+///
+/// `MaintenanceWindowStringDateTime` is a plain string, so an SDK hands the text to
+/// application code verbatim and an ISO-8601 reader is what parses it: the components below
+/// the minute are stated when they carry something and omitted when they do not, and
+/// nothing finer than the millisecond is ever written.
+fn assert_window_instant(case: &str, instant: &str) {
+    let civil = match instant.strip_suffix('Z') {
+        Some(civil) => civil,
+        None => {
+            // A zone offset, which is the only other designator an instant ends with.
+            let (civil, offset) = instant.split_at(instant.len().saturating_sub(6));
+            let offset_shape = shape_of(offset);
+            assert!(
+                matches!(offset_shape.as_str(), "+00:00" | "-00:00"),
+                "case {case:?}: expected a zone designator, got {instant:?}"
+            );
+            civil
+        }
+    };
+    let shape = shape_of(civil);
+    assert!(
+        INSTANT_SHAPES.contains(&shape.as_str()),
+        "case {case:?}: expected an instant of one of the forms {INSTANT_SHAPES:?}, got \
+         {instant:?}"
+    );
 }
 
 /// A read of a window reports the members its create persisted, and the documented default
@@ -224,8 +270,9 @@ async fn a_read_reports_what_the_create_persisted() {
     }
 }
 
-/// `NextExecutionTime` is the first instant the stored schedule names: the rows differ
-/// along the form of the schedule, the zone it is read in and the days it waits.
+/// `NextExecutionTime` is the first instant the stored schedule names, written in ISO-8601
+/// Extended form: the rows differ along the form of the schedule, the zone it is read in
+/// and the days it waits.
 #[tokio::test]
 async fn the_next_execution_time_is_read_from_the_schedule() {
     let router = router();
@@ -282,6 +329,7 @@ async fn the_next_execution_time_is_read_from_the_schedule() {
             next.ends_with(ends_with),
             "case {case:?}: expected a next execution ending {ends_with:?}, got {next:?}"
         );
+        assert_window_instant(case, next);
     }
 
     // A window whose activation interval has already closed will not run again, so it
@@ -327,6 +375,161 @@ async fn the_next_execution_time_is_read_from_the_schedule() {
         "case {case:?}: a window whose stated bound names no instant reports no next \
          execution, got {read}"
     );
+}
+
+/// A window's `NextExecutionTime` is written in ISO-8601 Extended form wherever this
+/// service reports one, and the single read of a window and the listing of the account's
+/// windows report the SAME text: one formatter feeds both. The rows differ along the form of
+/// the schedule, which is what decides the components the instant carries — a schedule
+/// naming whole minutes states none below the minute, while a rate series measured from the
+/// instant the create recorded states the seconds and milliseconds it lands on.
+#[tokio::test]
+async fn a_next_execution_time_is_an_iso_8601_instant() {
+    let router = router();
+    // (case, the schedule, the components the reported instant states)
+    let rows: [(&str, &str, &str); 5] = [
+        ("a cron at an hour of the day", "cron(0 8 * * ? *)", "0000-00-00T00:00"),
+        ("a cron on the half hour", "cron(30 23 * * ? *)", "0000-00-00T00:00"),
+        ("a cron over a step of minutes", "cron(0/15 * * * ? *)", "0000-00-00T00:00"),
+        ("a one-time instant", "at(2030-06-01T12:00:00)", "0000-00-00T00:00"),
+        // A rate series is measured from the instant the create recorded rather than from a
+        // whole minute, so what it states below the minute is whatever that instant
+        // carried — any of the forms, decided by the clock rather than by the schedule.
+        ("a rate of minutes", "rate(30 minutes)", ""),
+    ];
+
+    for (index, (case, schedule, shape)) in rows.into_iter().enumerate() {
+        let body = minimal(&format!("instant-form-{index}"), schedule);
+        let window_id = create_ok(&router, case, REGION, &body).await;
+        let read = get_ok(&router, case, REGION, &window_id).await;
+        let next = read["NextExecutionTime"].as_str().unwrap_or_else(|| {
+            panic!("case {case:?}: a window that will run reports a next execution, got {read}")
+        });
+        assert_window_instant(case, next);
+        if !shape.is_empty() {
+            assert_eq!(
+                shape_of(next.trim_end_matches('Z')),
+                shape,
+                "case {case:?}: expected an instant of the form {shape:?}, got {next:?}"
+            );
+        }
+
+        // The listing of the account's windows reports the same instant in the same form:
+        // one formatter feeds both reads.
+        let (status, listed) = call_in_region(
+            &router,
+            REGION,
+            "DescribeMaintenanceWindows",
+            &json!({ "Filters": [{ "Key": "Name", "Values": [body["Name"].clone()] }] }),
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: the window the create minted is listed, got {status} {listed}"
+        );
+        let identity = &listed["WindowIdentities"][0];
+        assert_eq!(
+            identity["WindowId"].as_str(),
+            Some(window_id.as_str()),
+            "case {case:?}: the listing reports the window that was created, got {listed}"
+        );
+        let listed_next = identity["NextExecutionTime"].as_str().unwrap_or_else(|| {
+            panic!("case {case:?}: the listing reports a next execution, got {listed}")
+        });
+        assert_window_instant(case, listed_next);
+        assert_eq!(
+            listed_next, next,
+            "case {case:?}: the listing and the read report one instant, got \
+             {listed_next:?} for {next:?}"
+        );
+    }
+}
+
+/// `Cutoff` is counted back from the end of a window that lasts `Duration` hours, so a
+/// cutoff that is not SMALLER than that duration is refused and no window is minted for it.
+/// The rows differ along the two figures and cover each published bound of their modelled
+/// ranges (`Cutoff` 0..23, `Duration` 1..24).
+#[tokio::test]
+async fn a_cutoff_stays_under_the_duration() {
+    let router = router();
+    // (case, cutoff, duration, the window is minted)
+    let rows: [(&str, i64, i64, bool); 9] = [
+        ("no cutoff under the smallest duration", 0, 1, true),
+        ("a cutoff one hour short of the duration", 1, 2, true),
+        ("the largest cutoff under the largest duration", 23, 24, true),
+        ("no cutoff under the largest duration", 0, 24, true),
+        ("a cutoff equal to the duration", 2, 2, false),
+        ("a cutoff one hour past the duration", 2, 1, false),
+        ("the largest cutoff with the smallest duration", 23, 1, false),
+        ("the largest cutoff equal to the duration", 23, 23, false),
+        ("a cutoff well past the duration", 12, 3, false),
+    ];
+
+    for (index, (case, cutoff, duration, minted)) in rows.into_iter().enumerate() {
+        let mut body = minimal(&format!("cutoff-row-{index}"), "cron(0 8 ? * MON *)");
+        body["Cutoff"] = json!(cutoff);
+        body["Duration"] = json!(duration);
+        let (status, response) = create(&router, REGION, &body).await;
+        if minted {
+            assert_eq!(
+                status, 200,
+                "case {case:?}: cutoff {cutoff} under duration {duration} is a window, got \
+                 {status} {response}"
+            );
+            // The figures the create stated are the window's own.
+            let window_id = response["WindowId"]
+                .as_str()
+                .unwrap_or_else(|| panic!("case {case:?}: a create reports a WindowId, got {response}"));
+            let read = get_ok(&router, case, REGION, window_id).await;
+            assert_eq!(
+                (read["Cutoff"].as_i64(), read["Duration"].as_i64()),
+                (Some(cutoff), Some(duration)),
+                "case {case:?}: the read reports the figures the create persisted, got {read}"
+            );
+            continue;
+        }
+        assert_eq!(
+            status, 400,
+            "case {case:?}: cutoff {cutoff} is not under duration {duration}, got {status} \
+             {response}"
+        );
+        assert_eq!(
+            error_code(&response),
+            "ValidationException",
+            "case {case:?}: expected a validation refusal, got {response}"
+        );
+        let message = error_message(&response);
+        let bound = duration - 1;
+        assert_eq!(
+            message,
+            format!("Cutoff was {cutoff} but must be smaller than {bound} (Duration  - 1 )"),
+            "case {case:?}: the refusal states the figures the request carried, got \
+             {message:?}"
+        );
+    }
+
+    // Nothing was written for a refused pair: the windows the listing reports are the ones
+    // whose figures hold together.
+    let (status, listed) = call_in_region(
+        &router,
+        REGION,
+        "DescribeMaintenanceWindows",
+        &json!({}),
+    )
+    .await;
+    assert_eq!(status, 200, "the account's windows are listed, got {status} {listed}");
+    let names: Vec<&str> = listed["WindowIdentities"]
+        .as_array()
+        .expect("a listing reports WindowIdentities")
+        .iter()
+        .filter_map(|identity| identity["Name"].as_str())
+        .collect();
+    for refused in ["cutoff-row-4", "cutoff-row-5", "cutoff-row-6", "cutoff-row-7", "cutoff-row-8"] {
+        assert!(
+            !names.contains(&refused),
+            "a refused create leaves no window behind, got {names:?} carrying {refused:?}"
+        );
+    }
 }
 
 /// A `Schedule` that states none of the documented forms is refused, and nothing is
