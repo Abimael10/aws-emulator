@@ -1857,16 +1857,44 @@ pub const MIN_NODE_PAGE_SIZE: i32 = 5;
 /// See [`MIN_NODE_PAGE_SIZE`].
 pub const MAX_NODE_PAGE_SIZE: i32 = 50;
 
+/// The member path a page-size refusal names, as the validating walk spells it.
+pub const NODE_PAGE_SIZE_MEMBER: &str = "maxResults";
+
 /// The page size a node report serves, or the refusal message for a `MaxResults` outside
 /// the modelled range — which the protocol's boundary validator already refuses, so this
 /// is a backstop rather than the first line of defence.
+///
+/// The refusal states the MEMBER and the BOUND the model declares, and nothing of the
+/// request: a broken range is the violated constraint, reported in the framework's own
+/// envelope and clause (`service_common::validation_message`), so this backstop cannot word
+/// the same refusal differently from the walk that normally catches it — and the operations
+/// whose boundary clauses state no value ([`crate::service`]) state none here either.
 pub fn node_page_size(max_results: Option<i32>) -> Result<usize, String> {
     let requested = max_results.unwrap_or(DEFAULT_NODE_PAGE_SIZE);
-    if !(MIN_NODE_PAGE_SIZE..=MAX_NODE_PAGE_SIZE).contains(&requested) {
-        return Err(format!(
-            "Value '{requested}' at 'maxResults' failed to satisfy constraint: Member must be \
-             between {MIN_NODE_PAGE_SIZE} and {MAX_NODE_PAGE_SIZE}"
-        ));
+    let broken = if requested < MIN_NODE_PAGE_SIZE {
+        Some(::aws_smithy_schema_server::constraints::ViolationKind::MinValue(
+            MIN_NODE_PAGE_SIZE.to_string(),
+        ))
+    } else if requested > MAX_NODE_PAGE_SIZE {
+        Some(::aws_smithy_schema_server::constraints::ViolationKind::MaxValue(
+            MAX_NODE_PAGE_SIZE.to_string(),
+        ))
+    } else {
+        None
+    };
+    if let Some(kind) = broken {
+        let clause = ::aws_smithy_schema_server::constraints::Violation {
+            path: NODE_PAGE_SIZE_MEMBER.to_string(),
+            kind,
+            // No value: this operation's clauses state the member and the requirement alone.
+            value: None,
+            sensitive: true,
+        }
+        .message();
+        return Err(
+            ::service_common::validation_message::envelope_over(std::slice::from_ref(&clause))
+                .unwrap_or(clause),
+        );
     }
     Ok(requested as usize)
 }
