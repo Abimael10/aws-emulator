@@ -7,7 +7,9 @@
 //!
 //! A WRITE: it stores one version and moves the template's `LatestVersionNumber`. The
 //! template's DEFAULT version is left where it is — a new version is not the default one
-//! until something makes it so.
+//! until something makes it so. The version keeps the launch parameters as given, an
+//! `ImageId` naming a Systems Manager parameter included: that "will resolve to an AMI ID on
+//! launch", so it is stored unresolved and read by the launch alone.
 //!
 //! ## Shape of an operation
 //!
@@ -286,11 +288,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Every remaining check is READ-ONLY, and a replay clears them all by storing
         // nothing.
         if replayed.is_none() {
-            // "The Systems Manager parameter will resolve to an AMI ID on launch"
-            // (`RequestLaunchTemplateData$ImageId`) — and EC2 resolves it HERE, when the
-            // version is created, so a version that could never launch is refused where the
-            // caller can still correct the value. The one reader both template writers share.
-            store.require_resolvable_image_alias(spec.data.image_id.as_deref())?;
+            // An `ImageId` naming a Systems Manager parameter is stored AS GIVEN and read by
+            // nothing here: "the Systems Manager parameter will resolve to an AMI ID on
+            // launch" (`RequestLaunchTemplateData$ImageId`), so which AMI it names — or
+            // whether it names one at all — is the launch's question, and a version is
+            // refused for no alias.
             if versions_held >= MAX_LAUNCH_TEMPLATE_VERSIONS {
                 return Err(launch_template_limit_exceeded(format!(
                     "Launch template '{launch_template_id}' holds \

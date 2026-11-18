@@ -8,7 +8,9 @@
 //!
 //! The id, the create time, the creating principal and the default and latest version
 //! numbers are derived by the store, never taken from the request; the first version keeps
-//! the request's `LaunchTemplateData` verbatim, so nothing a caller set is dropped.
+//! the request's `LaunchTemplateData` verbatim, so nothing a caller set is dropped — an
+//! `ImageId` naming a Systems Manager parameter included, which "will resolve to an AMI ID
+//! on launch" and so is stored unresolved here and read by the launch alone.
 //!
 //! A name is refused unless the modelled `LaunchTemplateName` can carry it, and a name the
 //! account already holds a template under is refused with
@@ -310,13 +312,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Every remaining check is READ-ONLY, and a replay clears them all by storing
         // nothing.
         if replayed.is_none() {
-            // "The Systems Manager parameter will resolve to an AMI ID on launch"
-            // (`RequestLaunchTemplateData$ImageId`) — and EC2 resolves it HERE, when the
-            // version is created, so a template that could never launch is refused where the
-            // caller can still correct the value. The one reader both template writers share.
-            store.require_resolvable_image_alias(
-                input.launch_template_data.image_id.as_deref(),
-            )?;
+            // An `ImageId` naming a Systems Manager parameter is stored AS GIVEN and read by
+            // nothing here: "the Systems Manager parameter will resolve to an AMI ID on
+            // launch" (`RequestLaunchTemplateData$ImageId`), so which AMI it names — or
+            // whether it names one at all — is the launch's question, and a create is
+            // refused for no alias.
             if store.launch_template_id_for_name(&spec.name).is_some() {
                 return Err(launch_template_name_already_exists());
             }

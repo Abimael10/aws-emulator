@@ -509,14 +509,6 @@ async fn a_create_that_cannot_be_served_is_refused_and_stores_nothing() {
             vec![p("LaunchTemplateId", &launch_template_id)],
             "MissingParameter",
         ),
-        (
-            "an ImageId naming a Systems Manager parameter no image publishes",
-            vec![
-                p("LaunchTemplateId", &launch_template_id),
-                data("ImageId", "resolve:ssm:/aws/service/no/such/parameter"),
-            ],
-            "SsmInvalidParameter",
-        ),
     ];
 
     for (case, params, expected_code) in rows {

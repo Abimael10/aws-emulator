@@ -2017,62 +2017,6 @@ pub fn ssm_image_alias_parameter(image_id: &str) -> Option<&str> {
         .filter(|parameter| !parameter.is_empty())
 }
 
-/// The code EC2 answers a request whose `ImageId` names Systems Manager parameters that
-/// resolve to no AMI (EC2 error codes, `SsmInvalidParameter`).
-pub const SSM_INVALID_PARAMETER: &str = "SsmInvalidParameter";
-
-/// Refuse a launch template whose `ImageId` alias resolves to no AMI: HTTP 400
-/// [`SSM_INVALID_PARAMETER`].
-///
-/// "The Systems Manager parameter will resolve to an AMI ID on launch"
-/// (`RequestLaunchTemplateData$ImageId`), and EC2 resolves it when the template VERSION is
-/// created, not only when an instance is launched: a template whose alias names no parameter
-/// is refused there and then, so the client learns of it where it can still fix the value.
-///
-/// The sentence is EC2's: the fixed text `The following aliases are invalid: ` followed by
-/// the parameter names it could not resolve, which are the request's own values with the
-/// `resolve:ssm:` prefix stripped — the names the alias NAMES, not the aliases as written.
-/// The plural is EC2's too: the service reports the set it could not resolve, which for a
-/// launch template's one `ImageId` is one name. Each is bounded the way every echoed id of
-/// this crate is ([`echoed_resource_id`]), the member carrying no modelled length of its own.
-pub fn ssm_aliases_are_invalid<E>(parameters: &[&str]) -> Scaffolded<E> {
-    let named = parameters
-        .iter()
-        .map(|parameter| echoed_resource_id(parameter))
-        .collect::<Vec<String>>()
-        .join(", ");
-    Scaffolded::service_error(
-        SSM_INVALID_PARAMETER,
-        400,
-        format!("The following aliases are invalid: {named}"),
-    )
-}
-
-impl ComAmazonawsEc2Amazonec2State {
-    /// Refuse a launch template `ImageId` whose `resolve:ssm:` alias this account resolves to
-    /// no AMI, leaving every other value — a literal `ami-` id, or no `ImageId` at all — to
-    /// the launch that will read it.
-    ///
-    /// The ONE reading both template writers share, so `CreateLaunchTemplate` and
-    /// `CreateLaunchTemplateVersion` cannot disagree about which alias a stored version may
-    /// carry. The parameter is resolved against the image catalogue
-    /// ([`Self::public_ssm_parameter_image_ids`]), the one place this emulator records which
-    /// AMI a parameter names, so a template is refused exactly when a launch from it could
-    /// not have resolved its AMI.
-    pub fn require_resolvable_image_alias<E>(&self, image_id: Option<&str>) -> Result<(), Scaffolded<E>> {
-        let Some(parameter) = image_id.and_then(ssm_image_alias_parameter) else {
-            return Ok(());
-        };
-        if self
-            .public_ssm_parameter_image_ids(::engine::emulator_account_id())
-            .contains_key(parameter)
-        {
-            return Ok(());
-        }
-        Err(ssm_aliases_are_invalid(&[parameter]))
-    }
-}
-
 /// A public AMI Amazon publishes: owned by Amazon's publishing account
 /// ([`AMAZON_IMAGE_OWNER_ID`]) under the `amazon` alias, with public launch permissions, and
 /// carrying no product code of its own — so it is eligible for the Free Tier

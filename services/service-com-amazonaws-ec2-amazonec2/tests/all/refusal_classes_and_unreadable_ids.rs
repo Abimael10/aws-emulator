@@ -5,7 +5,7 @@
 //! shapes at all, so the wire CODE is the whole contract a client can branch on and a wrong
 //! class is a wrong response.
 //!
-//! Four rules, one per test:
+//! Three rules, one per test:
 //!
 //! 1. an EC2 long-form resource id is an IDENTIFIER the service decodes before it looks
 //!    anything up, so a value whose identifier this service issued to a resource of another
@@ -16,19 +16,20 @@
 //! 2. two members that are each acceptable alone but cannot hold together are a parameter
 //!    COMBINATION, not a parameter value — Multi-Attach against a volume type that does not
 //!    support it, wherever a request can ask for the pair;
-//! 3. a launch template's `ImageId` of the `resolve:ssm:` form must resolve to an AMI when
-//!    the VERSION is created, so a template that could never launch is never stored;
-//! 4. a value of a MEMBER this service reads without regard to ASCII case is SERVED, so the
+//! 3. a value of a MEMBER this service reads without regard to ASCII case is SERVED, so the
 //!    request goes on to be validated for everything else — while a member held to its
 //!    declared spelling keeps refusing another case, even one whose value set is the very same
 //!    one, and a value outside the set is refused whatever its case.
 //!
 //! Each table spans what its rule generalises over — the resource kind and the operation that
-//! reads it, the volume type and the operation that sets it, the alias and the member it
-//! sits in, the spelling and the member — so no row is the specification. Every identifier a
-//! row probes is derived from the STORE's own id counter rather than written here, so the
-//! rows cannot drift from the mint; every code and sentence asserted is written out as the
-//! recorded response gives it.
+//! reads it, the volume type and the operation that sets it, the spelling and the member — so
+//! no row is the specification. Every identifier a row probes is derived from the STORE's own
+//! id counter rather than written here, so the rows cannot drift from the mint; every code and
+//! sentence asserted is written out as the recorded response gives it.
+//!
+//! A launch template's `ImageId` of the `resolve:ssm:` form belongs to NO refusal class: such
+//! a value is stored as given and resolved on the launch path, which is held to its own rule
+//! in [`super::launch_template_ssm_alias_forms`].
 
 use ec2::state::{
     ComAmazonawsEc2Amazonec2State as Ec2State, LONG_RESOURCE_ID_DIGITS,
@@ -498,104 +499,7 @@ async fn a_volume_id_outside_the_issued_form_is_a_parameter_level_refusal() {
     );
 }
 
-/// RULE 4: a launch template's `ImageId` of the `resolve:ssm:` form must resolve to an AMI
-/// when the version is created, and a create that names a parameter the account resolves
-/// nothing for stores nothing at all.
-#[tokio::test]
-async fn a_launch_template_image_alias_must_resolve_when_the_version_is_created() {
-    let (router, engine) = emulator();
-    let catalog: Vec<String> = engine
-        .state::<Ec2State>()
-        .lock()
-        .public_ssm_parameter_image_ids(engine::emulator_account_id())
-        .into_keys()
-        .collect();
-    let published = catalog
-        .first()
-        .cloned()
-        .unwrap_or_else(|| panic!("the image catalog must publish a parameter to resolve"));
-    let (published_image, _snapshot) = published_image_and_its_snapshot(&router).await;
-
-    // (what the row names, the ImageId, the code due or an empty string for a create served)
-    let rows: Vec<(&str, String, &str)> = vec![
-        (
-            "a parameter the catalog publishes",
-            format!("resolve:ssm:{published}"),
-            "",
-        ),
-        (
-            "a literal AMI id of the account",
-            published_image.clone(),
-            "",
-        ),
-        (
-            "a parameter under the public namespace that names nothing",
-            "resolve:ssm:/aws/service/ami-amazon-linux-latest/no-such-build".to_string(),
-            "SsmInvalidParameter",
-        ),
-        (
-            "a parameter of the caller's own namespace that names nothing",
-            "resolve:ssm:/team/golden/image-id".to_string(),
-            "SsmInvalidParameter",
-        ),
-        (
-            "a published parameter name with a version suffix, which names no parameter here",
-            format!("resolve:ssm:{published}:1"),
-            "SsmInvalidParameter",
-        ),
-    ];
-    for (index, (case, image_id, code)) in rows.iter().enumerate() {
-        let name = format!("alias.rule.{index}");
-        let (status, body) = api(
-            &router,
-            "CreateLaunchTemplate",
-            &[
-                p("LaunchTemplateName", name.as_str()),
-                p("LaunchTemplateData.ImageId", image_id.as_str()),
-                p("LaunchTemplateData.InstanceType", "t3.micro"),
-            ],
-        )
-        .await;
-        if code.is_empty() {
-            assert_eq!(
-                status, 200,
-                "case {case:?} ({image_id}): an ImageId that resolves must be stored, got \
-                 {status} with body {body}"
-            );
-            continue;
-        }
-        assert_eq!(
-            (status, error_code(&body).as_str()),
-            (REFUSAL, *code),
-            "case {case:?} ({image_id}): expected {REFUSAL} {code}, got {status} with body {body}"
-        );
-        let parameter = image_id
-            .strip_prefix("resolve:ssm:")
-            .unwrap_or(image_id.as_str());
-        assert_eq!(
-            error_message(&body),
-            format!("The following aliases are invalid: {parameter}"),
-            "case {case:?}: expected EC2's own sentence naming the alias it could not \
-             resolve, got body {body}"
-        );
-
-        // A refused create stores nothing: the name it asked for still names no template.
-        let (status, body) = api(
-            &router,
-            "DescribeLaunchTemplates",
-            &indexed("LaunchTemplateName", &[name.as_str()]),
-        )
-        .await;
-        assert_eq!(
-            (status, error_code(&body).as_str()),
-            (REFUSAL, "InvalidLaunchTemplateName.NotFoundException"),
-            "case {case:?}: a refused create must store no template, got {status} with body \
-             {body}"
-        );
-    }
-}
-
-/// RULE 5: a value of a MEMBER this service reads without regard to ASCII case is SERVED —
+/// RULE 4: a value of a MEMBER this service reads without regard to ASCII case is SERVED —
 /// the request goes on to be validated for everything else — while a member held to its
 /// declared spelling still refuses another case, even one whose value set is the very same
 /// one, and a value outside the set is refused whatever case it is sent in.

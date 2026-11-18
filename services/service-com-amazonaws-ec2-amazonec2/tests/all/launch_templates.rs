@@ -2136,55 +2136,20 @@ mod describe_launch_template_versions {
             );
         }
 
-        // A parameter no image publishes resolves to nothing. Such an alias is refused at
-        // CREATE — "the Systems Manager parameter will resolve to an AMI ID on launch", so a
-        // template that could never launch is not stored at all — while a version ALREADY
-        // stored under one (the parameter having gone since) reports the parameter the caller
-        // stored, whether or not the request asks for the alias to be resolved.
+        // A parameter no image publishes resolves to nothing, and a create is refused for no
+        // alias — "the Systems Manager parameter will resolve to an AMI ID on launch", so the
+        // value is stored as given whatever it names — while a version stored under one
+        // reports the parameter the caller stored, whether or not the request asks for the
+        // alias to be resolved.
         let unresolvable = format!("{SSM_IMAGE_ALIAS_PREFIX}/aws/service/no/such/parameter");
-        let (status, body) = api(
+        let unresolvable_template = create_template(
             &router,
-            "CreateLaunchTemplate",
-            &[
-                p("LaunchTemplateName", "alias.unresolvable"),
-                data("ImageId", &unresolvable),
-            ],
+            "alias.unresolvable",
+            &[data("ImageId", &unresolvable)],
         )
         .await;
-        assert_eq!(
-            (status, error_code(&body).as_str()),
-            (400, "SsmInvalidParameter"),
-            "a create whose alias resolves to no AMI must be refused, got {status} with body \
-             {body}"
-        );
-
-        let (resolvable_parameter, resolvable_image) = published
-            .first()
-            .cloned()
-            .expect("the image catalog publishes at least one parameter");
-        let alias = format!("{SSM_IMAGE_ALIAS_PREFIX}{resolvable_parameter}");
-        let resolvable_template =
-            create_template(&router, "alias.beside.unresolvable", &[data("ImageId", &alias)]).await;
-        // Written into the store the way a version whose parameter has since gone reads, which
-        // is the only way one can be there now that the create resolves the alias.
-        seed_versions(
-            &engine,
-            &resolvable_template,
-            &[(
-                2,
-                0,
-                RequestLaunchTemplateData {
-                    image_id: Some(unresolvable.clone()),
-                    ..RequestLaunchTemplateData::default()
-                },
-            )],
-            1,
-        );
         for asked in [None, Some("false"), Some("true")] {
-            let mut params = vec![
-                p("LaunchTemplateId", resolvable_template.clone()),
-                ("LaunchTemplateVersion.1".to_string(), "2".to_string()),
-            ];
+            let mut params = vec![p("LaunchTemplateId", unresolvable_template.clone())];
             if let Some(value) = asked {
                 params.push(p("ResolveAlias", value));
             }
@@ -2201,6 +2166,30 @@ mod describe_launch_template_versions {
                  parameter {unresolvable}, got body {body}"
             );
         }
+
+        let (resolvable_parameter, resolvable_image) = published
+            .first()
+            .cloned()
+            .expect("the image catalog publishes at least one parameter");
+        let alias = format!("{SSM_IMAGE_ALIAS_PREFIX}{resolvable_parameter}");
+        let resolvable_template =
+            create_template(&router, "alias.beside.unresolvable", &[data("ImageId", &alias)]).await;
+        // A second version of that template carrying the unresolvable parameter, created the
+        // way a caller creates one.
+        let (status, body) = api(
+            &router,
+            "CreateLaunchTemplateVersion",
+            &[
+                p("LaunchTemplateId", resolvable_template.clone()),
+                data("ImageId", &unresolvable),
+            ],
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "a version carrying an unresolvable parameter must be stored, got {status} with \
+             body {body}"
+        );
 
         // One unresolvable alias does not hide the versions that do resolve: both versions are
         // described in one call, each reporting its own image id.
