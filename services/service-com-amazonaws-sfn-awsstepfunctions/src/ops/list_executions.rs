@@ -230,6 +230,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             input.map_run_arn.as_deref(),
         );
         let endpoint_region = crate::state::request_region(ctx.parts());
+        // The token is one THIS store minted, so it is resolved under the store's own
+        // page-token key ([`crate::state::pagination`]); the key is taken off the store
+        // before the listing is read, because it is a fact of the store rather than of
+        // the records this call reports.
+        let page_token_key = state.lock().page_token_key;
         let state_machine_arn = match (state_machine_arn, map_run_arn) {
             (Some(arn), None) => arn,
             (None, Some(map_run)) => {
@@ -244,7 +249,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 }
                 // The page token is judged on this branch too, so one request is
                 // refused for the same defect whichever selector it names.
-                let Some(offset) = crate::state::page_offset(input.next_token.as_deref()) else {
+                let Some(offset) =
+                    crate::state::page_offset(&page_token_key, input.next_token.as_deref())
+                else {
                     return Err(ListExecutionsErrorModeled::InvalidToken(InvalidToken {
                         message: Some(crate::state::invalid_token_message()),
                     })
@@ -291,8 +298,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     .take(crate::state::page_size(input.max_results))
                     .map(|child| list_item(child, Some(map_run)))
                     .collect();
-                let next_token =
-                    crate::state::next_page_token(offset, executions.len(), matching.len());
+                let next_token = crate::state::next_page_token(
+                    &page_token_key,
+                    offset,
+                    executions.len(),
+                    matching.len(),
+                );
                 return Ok(ListExecutionsOutput {
                     executions,
                     next_token,
@@ -352,7 +363,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        let Some(offset) = crate::state::page_offset(input.next_token.as_deref()) else {
+        let Some(offset) = crate::state::page_offset(&page_token_key, input.next_token.as_deref())
+        else {
             return Err(ListExecutionsErrorModeled::InvalidToken(InvalidToken {
                 message: Some(crate::state::invalid_token_message()),
             })
@@ -446,8 +458,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .map(|execution| list_item(execution, None))
             .collect();
 
-        let next_token =
-            crate::state::next_page_token(offset, executions.len(), matching.len());
+        let next_token = crate::state::next_page_token(
+            &page_token_key,
+            offset,
+            executions.len(),
+            matching.len(),
+        );
         Ok(ListExecutionsOutput {
             executions,
             next_token,

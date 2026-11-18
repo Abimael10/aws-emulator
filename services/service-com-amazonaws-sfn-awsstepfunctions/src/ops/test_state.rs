@@ -237,15 +237,63 @@ fn mock_unsupported_state_type(state_type: &str) -> String {
     format!("State type '{state_type}' is not supported when a mock is specified")
 }
 
+/// The validation mode a `mock` that names none is judged at: "If no value is
+/// specified, the default value is `STRICT`."
+const DEFAULT_FIELD_VALIDATION_MODE: &str = "STRICT";
+
+/// The modes under which a mocked result's members are judged against the mocked
+/// integration's result schema: "`STRICT`: All required fields must be present, and
+/// all present fields must conform to the API's schema" and "`PRESENT`: All present
+/// fields must conform to the API's schema" — `NONE`, where "no validation is
+/// performed", is the mode that judges nothing.
+const SCHEMA_VALIDATING_MODES: &[&str] = &["STRICT", "PRESENT"];
+
+/// What this operation answers a mocked result whose member is of another JSON type
+/// than the mocked integration's result schema declares for it.
+///
+/// RECORDED text: the fixed sentence with the offending FIELD taken from the submitted
+/// mock and the TYPE from the schema that field is judged against
+/// ([`crate::state::integration::mock_result`]).
+fn mock_result_schema_error(field: &str, must_be: &str) -> String {
+    format!("Mock result schema validation error: Field '{field}' must be a {must_be}")
+}
+
+/// The refusal the mocked result in `mock` earns for the state under test, or `None`
+/// when it conforms to that state's integration result schema.
+///
+/// "Determines the level of strictness when validating mocked results against their
+/// respective API models": the model a result is validated against is the OUTPUT of
+/// the operation the state's `Resource` names, so what is judged is each present
+/// member's JSON type against the type that output declares for it. A state whose
+/// result is not an operation's output document, and an operation whose schema this
+/// emulator does not carry, are judged by nothing — see
+/// [`crate::state::integration::mock_result::schema_of`].
+fn mock_result_refusal(
+    state: &serde_json::Map<String, Value>,
+    mock: &MockInput,
+    result: &Value,
+) -> Option<String> {
+    let mode = mock
+        .field_validation_mode
+        .as_deref()
+        .unwrap_or(DEFAULT_FIELD_VALIDATION_MODE);
+    if !SCHEMA_VALIDATING_MODES.contains(&mode) {
+        return None;
+    }
+    let resource = state.get("Resource").and_then(Value::as_str)?;
+    let call = crate::state::integration::read(resource).ok()?;
+    let (field, declared) = crate::state::integration::mock_result::schema_violation(&call, result)?;
+    Some(mock_result_schema_error(field, declared.stated()))
+}
+
 /// The mocked outcome `mock` names: "A JSON object that contains a mocked `result` or
 /// `errorOutput`" — exactly one of the two, since the state's invocation either
 /// produced a result or failed.
 ///
-/// `fieldValidationMode` "determines the level of strictness when validating mocked
-/// results against their respective API models". No integration is invoked here and
-/// this emulator carries no API model for one, so there is nothing to validate a
-/// mocked result against: the member is read only to refuse a value the enum does not
-/// declare, and a mocked result is taken as the state's result at every mode.
+/// `fieldValidationMode` is read here only to refuse a value the enum does not declare;
+/// what it decides about the mocked RESULT is applied by [`mock_result_refusal`], which
+/// needs the state under test to know which integration's schema that result stands in
+/// for.
 fn read_mock(mock: &MockInput) -> Result<asl::Mock, TestStateError> {
     if let Some(mode) = mock.field_validation_mode.as_deref() {
         if !MOCK_RESPONSE_VALIDATION_MODE_VALUES.contains(&mode) {
@@ -546,7 +594,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 if !asl::INVOKING_STATE_TYPES.contains(&state_type) {
                     return Err(refuse(mock_unsupported_state_type(state_type)));
                 }
-                Some(read_mock(mock)?)
+                let read = read_mock(mock)?;
+                // A mocked RESULT stands in for the answer of the integration the
+                // state under test calls, so it is validated against that operation's
+                // own result schema before the state is tested against it: a result
+                // AWS refuses is no result to compute an answer from.
+                if let asl::Mock::Result(result) = &read {
+                    if let Some(refusal) = mock_result_refusal(state, mock, result) {
+                        return Err(refuse(refusal));
+                    }
+                }
+                Some(read)
             }
         };
         // "TestState only supports the following when a mock is specified: Activity

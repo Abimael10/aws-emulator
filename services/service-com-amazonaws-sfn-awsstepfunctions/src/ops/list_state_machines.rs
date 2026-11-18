@@ -156,7 +156,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         };
 
-        let Some(offset) = crate::state::page_offset(input.next_token.as_deref()) else {
+        // The token is one THIS store minted, so it is resolved under the store's own
+        // page-token key ([`crate::state::pagination`]); the key is taken off the store
+        // before the listing is read, because it is a fact of the store rather than of
+        // the records this call reports.
+        let page_token_key = state.lock().page_token_key;
+        let Some(offset) = crate::state::page_offset(&page_token_key, input.next_token.as_deref())
+        else {
             return Err(ListStateMachinesErrorModeled::InvalidToken(InvalidToken {
                 message: Some(crate::state::invalid_token_message()),
             })
@@ -186,7 +192,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
             .collect();
 
-        let next_token = crate::state::next_page_token(offset, state_machines.len(), total);
+        let next_token =
+            crate::state::next_page_token(&page_token_key, offset, state_machines.len(), total);
         Ok(ListStateMachinesOutput {
             state_machines,
             next_token,

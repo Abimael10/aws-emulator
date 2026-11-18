@@ -2237,3 +2237,168 @@ async fn state_machine_names_are_scoped_per_region() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// A `nextToken` is opaque, and only the store that minted it resolves one
+// ---------------------------------------------------------------------------
+
+/// How one paged listing is reached: the operation, the request members that scope it,
+/// and the output member its page arrives in.
+struct PagedListing {
+    case: &'static str,
+    operation: &'static str,
+    request: Value,
+    items: &'static str,
+}
+
+/// Store two of every record the listings below page, and answer the state machine the
+/// executions were started on.
+///
+/// Every record is NAMED, so two stores filled by this hold the same ARNs in the same
+/// order: a token one store minted names a position that exists in the other just as
+/// well, which is what makes the refusal below about the token's authenticity and not
+/// about the position it carries.
+pub(crate) async fn two_of_every_listed_record(emulator: &Emulator) -> String {
+    let machine = create_machine(emulator, "token-machine", HELLO_DEFINITION).await;
+    create_machine(emulator, "token-other-machine", HELLO_DEFINITION).await;
+    for name in ["token-activity-one", "token-activity-two"] {
+        emulator
+            .ok("CreateActivity", &json!({ "name": name }))
+            .await;
+    }
+    for name in ["token-run-one", "token-run-two"] {
+        start_execution(emulator, &machine, name, "{}").await;
+    }
+    machine
+}
+
+/// Whether `token` reads as a POSITION in the order it pages — the spelling a caller
+/// could have written itself, and the one an opaque token never has.
+fn names_a_position(token: &str) -> bool {
+    token.trim().parse::<u64>().is_ok()
+}
+
+/// One page of `operation`, one record long, continuing from `token` when there is one.
+async fn one_record_page(
+    emulator: &Emulator,
+    operation: &str,
+    request: &Value,
+    token: Option<&str>,
+) -> Value {
+    let mut body = request.clone();
+    body["maxResults"] = json!(1);
+    if let Some(token) = token {
+        body["nextToken"] = json!(token);
+    }
+    emulator.ok(operation, &body).await
+}
+
+/// `token` with its FIRST character changed: a base64 character at that position
+/// carries six bits of the authenticator, so the value is a different one of exactly
+/// the token's own shape.
+fn tampered(token: &str) -> String {
+    let mut characters = token.chars();
+    let first = characters.next().unwrap_or('A');
+    let replacement = if first == 'A' { 'B' } else { 'A' };
+    format!("{replacement}{}", characters.as_str())
+}
+
+/// Every listing hands back an OPAQUE `nextToken`: it carries no legible position, it
+/// continues the one order when handed back, and a value this store did not mint —
+/// a position a caller wrote, or a token another store minted for the same order — is
+/// the modelled `InvalidToken` rather than a page.
+///
+/// Rows span the listings of this service that page a stored order, which is what the
+/// rule generalises over: the state machines, the activities and one state machine's
+/// executions.
+#[tokio::test]
+async fn a_listings_next_token_is_opaque_and_only_its_own_stores() {
+    let emulator = Emulator::new();
+    let machine = two_of_every_listed_record(&emulator).await;
+    // A second store, filled identically, so its tokens name positions that exist here.
+    let elsewhere = Emulator::new();
+    two_of_every_listed_record(&elsewhere).await;
+
+    let listings = [
+        PagedListing {
+            case: "ListStateMachines",
+            operation: "ListStateMachines",
+            request: json!({}),
+            items: "stateMachines",
+        },
+        PagedListing {
+            case: "ListActivities",
+            operation: "ListActivities",
+            request: json!({}),
+            items: "activities",
+        },
+        PagedListing {
+            case: "ListExecutions",
+            operation: "ListExecutions",
+            request: json!({ "stateMachineArn": machine.clone() }),
+            items: "executions",
+        },
+    ];
+
+    for PagedListing {
+        case,
+        operation,
+        request,
+        items,
+    } in listings
+    {
+        let first = one_record_page(&emulator, operation, &request, None).await;
+        let token = first
+            .get("nextToken")
+            .and_then(Value::as_str)
+            .unwrap_or_else(|| {
+                panic!("case {case:?}: expected a nextToken while items remain, got {first:?}")
+            })
+            .to_string();
+        assert!(
+            !names_a_position(&token),
+            "case {case:?}: expected an opaque token, got the position {token:?}"
+        );
+
+        // Handed back, it continues the ONE order: the second page holds the other
+        // record and owes no further token.
+        let second = one_record_page(&emulator, operation, &request, Some(&token)).await;
+        assert_ne!(
+            first[items], second[items],
+            "case {case:?}: expected the token to continue the order, got {second:?}"
+        );
+        assert!(
+            second.get("nextToken").is_none_or(Value::is_null),
+            "case {case:?}: expected no token once every record is reported, got {second:?}"
+        );
+
+        // A value this store did not mint names no page at all. The rows are the
+        // spellings a caller could produce: each position of this order, the token with
+        // one character changed, and the token the OTHER store minted for the same
+        // position of the same order.
+        let elsewhere_token = one_record_page(&elsewhere, operation, &request, None)
+            .await
+            .get("nextToken")
+            .and_then(Value::as_str)
+            .unwrap_or_else(|| panic!("case {case:?}: expected the other store to page too"))
+            .to_string();
+        for (what, candidate) in [
+            ("the first position", "0".to_string()),
+            ("the position the page stopped at", "1".to_string()),
+            ("a position past the end", "2".to_string()),
+            ("text that is no token", "not-a-token".to_string()),
+            ("the token with one character changed", tampered(&token)),
+            ("a token another store minted", elsewhere_token),
+        ] {
+            let mut body = request.clone();
+            body["nextToken"] = json!(candidate);
+            let (status, code) = emulator.err(operation, &body).await;
+            assert_eq!(
+                (status, code.as_str()),
+                (400, "InvalidToken"),
+                "case {case:?}/{what:?}: expected 400 InvalidToken for {candidate:?}, got \
+                 {status} {code}"
+            );
+        }
+    }
+}

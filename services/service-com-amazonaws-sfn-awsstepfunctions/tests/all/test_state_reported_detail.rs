@@ -37,7 +37,7 @@
 
 use serde_json::{json, Value};
 
-use crate::state_machine_lifecycle::{error_code, Emulator, ROLE_ARN};
+use crate::state_machine_lifecycle::{error_code, Emulator, ACCOUNT, REGION, ROLE_ARN};
 
 /// A mocked outcome every row of a table can share: the invocation the state under
 /// test would otherwise make failed with an error of the caller's own naming.
@@ -685,23 +685,33 @@ async fn the_state_types_test_state_does_not_test_are_refused_in_its_own_words()
 /// value set is listed in the order THIS SERVICE states that enum's values in — not
 /// the order the model declares its members in.
 ///
-/// Rows vary along the rejected value (a name of its own, and one differing from a
-/// permitted value only in case) and along the ENUM: `InspectionLevel`, whose stated
-/// order this service's refusals fix, and `StateMachineType`, which it states no order
-/// for and which is therefore listed as the model declares it.
+/// Rows vary along the rejected value (a name of its own, one differing from a
+/// permitted value only in case, and the empty string) and along the ENUM:
+/// `InspectionLevel` and `ExecutionStatus`, whose stated orders this service's refusals
+/// fix, and `StateMachineType` and `ExecutionRedriveFilter`, which it states no order
+/// for and which are therefore listed as the model declares them.
 #[tokio::test]
 async fn an_advertised_enum_value_set_is_listed_in_the_order_the_service_states_it() {
     // RECORDED for `InspectionLevel`; the model declares it `INFO | DEBUG | TRACE`
     // (`smithy_query(query="shape",shape="InspectionLevel")`).
     const INSPECTION_LEVELS: &str = "[TRACE, INFO, DEBUG]";
+    // RECORDED for `ExecutionStatus`; the model declares it `RUNNING | SUCCEEDED |
+    // FAILED | TIMED_OUT | ABORTED | PENDING_REDRIVE`
+    // (`smithy_query(query="shape",shape="ExecutionStatus")`).
+    const EXECUTION_STATUSES: &str = "[SUCCEEDED, TIMED_OUT, PENDING_REDRIVE, ABORTED, FAILED, RUNNING]";
     // `StateMachineType`, as the model declares it
     // (`smithy_query(query="shape",shape="StateMachineType")` -> `STANDARD | EXPRESS`):
     // this service states no order of its own for it.
     const MACHINE_TYPES: &str = "[STANDARD, EXPRESS]";
+    // `ExecutionRedriveFilter`, likewise as the model declares it
+    // (`smithy_query(query="shape",shape="ExecutionRedriveFilter")` -> `REDRIVEN |
+    // NOT_REDRIVEN`).
+    const REDRIVE_FILTERS: &str = "[REDRIVEN, NOT_REDRIVEN]";
     const DEFINITION: &str = r#"{"Type":"Pass","End":true}"#;
+    let machine = format!("arn:aws:states:{REGION}:{ACCOUNT}:stateMachine:listed-enum-order");
 
     // (case, the operation, the request, the member, the value, the set it lists)
-    let cases: [(&str, &str, Value, &str, &str, &str); 4] = [
+    let cases: [(&str, &str, Value, &str, &str, &str); 7] = [
         (
             "an inspectionLevel of its own naming",
             "TestState",
@@ -725,6 +735,30 @@ async fn an_advertised_enum_value_set_is_listed_in_the_order_the_service_states_
             "inspectionLevel",
             "",
             INSPECTION_LEVELS,
+        ),
+        (
+            "a statusFilter of its own naming",
+            "ListExecutions",
+            json!({ "stateMachineArn": machine.clone(), "statusFilter": "NOT_A_STATUS" }),
+            "statusFilter",
+            "NOT_A_STATUS",
+            EXECUTION_STATUSES,
+        ),
+        (
+            "a statusFilter differing from a permitted value only in case",
+            "ListExecutions",
+            json!({ "stateMachineArn": machine.clone(), "statusFilter": "succeeded" }),
+            "statusFilter",
+            "succeeded",
+            EXECUTION_STATUSES,
+        ),
+        (
+            "another enum of the same operation, which this service states no order for",
+            "ListExecutions",
+            json!({ "stateMachineArn": machine.clone(), "redriveFilter": "NOT_A_FILTER" }),
+            "redriveFilter",
+            "NOT_A_FILTER",
+            REDRIVE_FILTERS,
         ),
         (
             "an enum this service states no order for",

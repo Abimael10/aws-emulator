@@ -4955,3 +4955,7 @@ pub use jobs::*;
 /// What a `Task` state's event publication carries, and what a rejected entry makes of it.
 mod published_events;
 pub use published_events::*;
+
+/// The result schema of the operation an integration calls, which a MOCKED result is
+/// judged against.
+pub mod mock_result;

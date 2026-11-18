@@ -2620,6 +2620,15 @@ impl MapRun {
 /// through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsSfnAwsstepfunctionsState {
+    /// The secret this store's pagination tokens are authenticated under, drawn from
+    /// the system's randomness when the store is created and never reported
+    /// ([`pagination`]).
+    ///
+    /// It is a fact of the STORE rather than of one listing, because every paginated
+    /// read of this service mints its `nextToken` under it: a token one read issued is
+    /// resolved by the read that is handed it back, and a value this store never
+    /// minted — a caller's own, or one from another process — names no position at all.
+    pub page_token_key: ::service_common::page_tokens::PageTokenKey,
     /// Every state machine, keyed by its ARN. A `BTreeMap` so `ListStateMachines`
     /// walks one stable, total order and a page token can name an offset into it.
     ///
@@ -4519,111 +4528,6 @@ pub fn reported_variable_references(
 // Pagination
 // ---------------------------------------------------------------------------
 
-/// How many items one page of a list operation carries.
-///
-/// `maxResults` is modelled `0..1000`, so the walk has already refused anything
-/// outside that; `0` means the default, per the member's own documentation.
-pub fn page_size(max_results: i32) -> usize {
-    if max_results <= 0 {
-        DEFAULT_PAGE_SIZE
-    } else {
-        usize::try_from(max_results).unwrap_or(DEFAULT_PAGE_SIZE)
-    }
-}
-
-/// The offset a page token names, or `None` when the token is not one this service
-/// issued — which the modelled `InvalidToken` reports.
-///
-/// A token is the decimal offset of the next item in the operation's own total
-/// order, which is what makes it a token "for each page" that keeps meaning across
-/// calls.
-pub fn page_offset(next_token: Option<&str>) -> Option<usize> {
-    match next_token {
-        None => Some(0),
-        Some(token) => token.parse::<usize>().ok(),
-    }
-}
-
-/// The token that names the next page, or `None` when `items` were not truncated.
-pub fn next_page_token(offset: usize, page: usize, total: usize) -> Option<String> {
-    let next = offset.saturating_add(page);
-    (next < total).then(|| next.to_string())
-}
-
-/// What a HISTORY page token names: the position in this execution's OWN event order
-/// — ascending, zero-based — at which the next page begins.
-///
-/// "The value of nextToken is a unique pagination token for each page. Make the call
-/// again using the returned token to retrieve the next page. Keep all other
-/// arguments unchanged": the token is a cursor into the HISTORY rather than a count
-/// of pages, so the position a read continues from is the event it stopped at,
-/// whichever end of the history that read walks from. That is also what binds a
-/// token to the read that issued it: a backwards read continues from a position no
-/// page of a forwards read ever begins at, so each order's tokens are the other's
-/// `InvalidToken`.
-///
-/// The mapping is its own inverse, so one function turns a position in the READ's
-/// order into the cursor the token carries and back.
-fn history_cursor(position: usize, total: usize, reverse_order: bool) -> usize {
-    if reverse_order {
-        total.saturating_sub(1).saturating_sub(position)
-    } else {
-        position
-    }
-}
-
-/// The offset into this read's own order that the page token `next_token` names, or
-/// `None` when it is not a token this read handed out — which the modelled
-/// `InvalidToken` reports.
-///
-/// A token this read issued names one of ITS page boundaries, inside this
-/// execution's history, never the first page (which is asked for by sending no
-/// token at all), and no further than this read has got — `handed_out` is how far
-/// each read of this history has handed cursors out
-/// ([`Execution::issued_page_cursors`]). So text that is no position, a position no
-/// page of this read begins at, and a cursor minted for another execution, the other
-/// sort order or another page size all resolve to nothing.
-pub fn history_page_offset(
-    next_token: Option<&str>,
-    read: HistoryRead,
-    total: usize,
-    handed_out: &[HistoryPageCursor],
-) -> Option<usize> {
-    let Some(token) = next_token else {
-        return Some(0);
-    };
-    let cursor = token.parse::<usize>().ok()?;
-    if cursor >= total {
-        return None;
-    }
-    let offset = history_cursor(cursor, total, read.reverse_order);
-    let boundary = read.page > 0 && offset.is_multiple_of(read.page);
-    if offset == 0 || offset >= total || !boundary {
-        return None;
-    }
-    let reached = handed_out.iter().find(|remembered| remembered.of(read))?;
-    (offset <= reached.offset).then_some(offset)
-}
-
-/// The cursor that names the next page of a history read, or `None` when the page
-/// was not truncated — the one [`history_page_offset`] resolves back, and the one
-/// the execution remembers handing out.
-pub fn next_history_page_cursor(
-    offset: usize,
-    page: usize,
-    total: usize,
-    read: HistoryRead,
-) -> Option<HistoryPageCursor> {
-    let next = offset.saturating_add(page);
-    (next < total).then(|| read.at(next))
-}
-
-/// The `nextToken` text a cursor into a history of `total` events is carried as: the
-/// position in the EXECUTION's own event order ([`history_cursor`]).
-pub fn history_page_token(cursor: HistoryPageCursor, total: usize) -> String {
-    history_cursor(cursor.offset, total, cursor.reverse_order).to_string()
-}
-
 // ---------------------------------------------------------------------------
 // Time
 // ---------------------------------------------------------------------------
@@ -4779,6 +4683,8 @@ pub mod task_authorization;
 pub mod target_resource_policy;
 pub mod xml_answer;
 pub mod xray_tracing;
+mod pagination;
+pub use pagination::*;
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.
 ///

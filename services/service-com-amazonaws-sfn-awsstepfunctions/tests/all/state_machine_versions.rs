@@ -331,13 +331,20 @@ async fn paging_reassembles_the_one_descending_order() {
         );
     }
 
-    // A token naming an offset past the end is a token this service issued: it names
-    // the empty tail, not an error.
-    let past_the_end = list(&emulator, &arn, json!({ "nextToken": "9" })).await;
+    // A bare decimal index is no token this service hands out: a `nextToken` is opaque
+    // and authenticated, so a position a caller assembled itself names no page at all
+    // (the table below spans the other forms).
+    let (status, code) = emulator
+        .err(
+            "ListStateMachineVersions",
+            &json!({ "stateMachineArn": &arn, "nextToken": "9" }),
+        )
+        .await;
     assert_eq!(
-        listed_arns(&past_the_end),
-        Vec::<String>::new(),
-        "a token at the end of the order lists nothing, got {past_the_end:?}"
+        (status, code.as_str()),
+        (400, "InvalidToken"),
+        "a position a caller wrote itself is no token: expected 400 InvalidToken, got \
+         {status} {code}"
     );
 }
 
@@ -349,8 +356,9 @@ async fn a_token_this_service_never_issued_is_invalid_token() {
     let arn = machine_with_versions(&emulator, "tokens", 3).await;
 
     // Rows vary along the form of the text: not a number at all, a negative offset,
-    // a float, a number padded on either side, a non-decimal radix, and a number
-    // that overflows the offset.
+    // a float, a number padded on either side, a non-decimal radix, a number
+    // that overflows the offset, and a bare position of the order itself — none of
+    // them a token this service minted.
     for token in [
         "not-a-token",
         "-1",
@@ -359,6 +367,7 @@ async fn a_token_this_service_never_issued_is_invalid_token() {
         "1 ",
         "0x1",
         "99999999999999999999999999",
+        "1",
     ] {
         let (status, code) = emulator
             .err(

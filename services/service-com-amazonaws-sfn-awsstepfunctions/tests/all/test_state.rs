@@ -37,7 +37,7 @@
 
 use serde_json::{json, Value};
 
-use crate::state_machine_lifecycle::{string, Emulator, ROLE_ARN};
+use crate::state_machine_lifecycle::{error_code, string, Emulator, ROLE_ARN};
 use crate::sync_execution::document;
 
 /// A fully-formed definition whose states differ in what each one does, so a
@@ -536,6 +536,9 @@ struct MockedResultCase {
     definition: &'static str,
     /// The `mock.result` the request carries.
     result: &'static str,
+    /// The `mock.fieldValidationMode` the request carries, or `None` to send none and
+    /// be judged at the default (`STRICT`).
+    validation: Option<&'static str>,
     input: &'static str,
     /// The output the state's result-side filters place the mocked result into.
     output: Value,
@@ -553,6 +556,11 @@ async fn a_mocked_result_runs_through_the_state_s_own_filters() {
             case: "a Task's ResultSelector and ResultPath place the mocked result",
             definition: MOCKED_TASK,
             result: r#"{"Payload":{"sum":7}}"#,
+            // The optimized `lambda:invoke` integration reports the function's payload
+            // as the DOCUMENT it holds, while `Invoke`'s own output models `Payload` as
+            // a blob — a string. So a mock of this shape is one "no validation is
+            // performed" is asked for, which is what `NONE` means.
+            validation: Some("NONE"),
             input: r#"{"a":3,"b":4}"#,
             output: json!({ "a": 3, "b": 4, "result": { "total": 7 } }),
         },
@@ -560,6 +568,9 @@ async fn a_mocked_result_runs_through_the_state_s_own_filters() {
             case: "a Map state's iterations are the mocked result",
             definition: r#"{"Type":"Map","ItemProcessor":{"StartAt":"P","States":{"P":{"Type":"Pass","End":true}}},"ResultPath":"$.seen","Next":"After"}"#,
             result: r#"["one","two"]"#,
+            // A `Map` state calls no API, so there is no result schema its mocked
+            // iterations are judged against at any mode.
+            validation: None,
             input: r#"{"items":[1,2]}"#,
             output: json!({ "items": [1, 2], "seen": ["one", "two"] }),
         },
@@ -567,6 +578,7 @@ async fn a_mocked_result_runs_through_the_state_s_own_filters() {
             case: "a Parallel state's branches are the mocked result",
             definition: r#"{"Type":"Parallel","Branches":[{"StartAt":"P","States":{"P":{"Type":"Pass","End":true}}}],"OutputPath":"$[0]","Next":"After"}"#,
             result: r#"[{"branch":"first"}]"#,
+            validation: None,
             input: "{}",
             output: json!({ "branch": "first" }),
         },
@@ -577,10 +589,15 @@ async fn a_mocked_result_runs_through_the_state_s_own_filters() {
         case,
         definition,
         result,
+        validation,
         input,
         output,
     } in cases
     {
+        let mut mock = json!({ "result": result });
+        if let Some(mode) = validation {
+            mock["fieldValidationMode"] = json!(mode);
+        }
         let answered = emulator
             .ok(
                 "TestState",
@@ -589,7 +606,7 @@ async fn a_mocked_result_runs_through_the_state_s_own_filters() {
                     "input": input,
                     "roleArn": ROLE_ARN,
                     "inspectionLevel": "DEBUG",
-                    "mock": { "result": result },
+                    "mock": mock,
                 }),
             )
             .await;
@@ -925,6 +942,164 @@ async fn test_state_refuses_a_request_it_cannot_serve() {
             (400, expected),
             "case {case:?}: expected a 400 {expected}, got {status} {code}"
         );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// A mocked result conforms to the mocked integration's result schema
+// ---------------------------------------------------------------------------
+
+/// A `Task` state whose `Resource` names the AWS SDK family's spelling of the same
+/// Lambda operation `MOCKED_TASK` names through the optimized one.
+const SDK_MOCKED_TASK: &str = r#"{
+    "Type": "Task",
+    "Resource": "arn:aws:states:::aws-sdk:lambda:invoke",
+    "Parameters": { "FunctionName": "summer" },
+    "End": true
+}"#;
+
+/// A `Task` state whose work is an operation of ANOTHER service, to show the rule is
+/// the schema's and not one integration's.
+const QUEUE_MOCKED_TASK: &str = r#"{
+    "Type": "Task",
+    "Resource": "arn:aws:states:::sqs:sendMessage",
+    "Parameters": { "QueueUrl": "http://localhost/q", "MessageBody": "hi" },
+    "End": true
+}"#;
+
+/// One row of the mock-schema table: the case, the state under test, the mocked
+/// result, the `fieldValidationMode` the mock names, and the refusal message — or
+/// `None` where the mock is served.
+type MockSchemaRow = (
+    &'static str,
+    &'static str,
+    &'static str,
+    Option<&'static str>,
+    Option<&'static str>,
+);
+
+/// A mocked RESULT is validated against the result schema of the operation the state's
+/// integration calls: a member whose JSON type is not the one that operation's output
+/// declares is refused, and nothing is computed from it.
+///
+/// Rows span what the rule generalises over — the member's declared type (a blob,
+/// reported as a string; an integral member), the operation and the service it belongs
+/// to, both families' spellings of one `Resource`, and the validation MODE, where
+/// `NONE` performs no validation at all.
+#[tokio::test]
+async fn a_mocked_result_must_conform_to_the_mocked_apis_schema() {
+    // (case, the state under test, the mocked result, the mode the mock names, the
+    // refusal message — or `None` where the mock is served)
+    let cases: [MockSchemaRow; 9] = [
+        (
+            "a blob member sent as an object",
+            MOCKED_TASK,
+            r#"{"Payload":{"sum":7}}"#,
+            None,
+            Some("Mock result schema validation error: Field 'Payload' must be a string"),
+        ),
+        (
+            "a blob member sent as a number",
+            MOCKED_TASK,
+            r#"{"Payload":42}"#,
+            None,
+            Some("Mock result schema validation error: Field 'Payload' must be a string"),
+        ),
+        (
+            "an integral member sent as a string",
+            MOCKED_TASK,
+            r#"{"StatusCode":"200"}"#,
+            None,
+            Some("Mock result schema validation error: Field 'StatusCode' must be a integer"),
+        ),
+        (
+            "the AWS SDK family's spelling of the same operation",
+            SDK_MOCKED_TASK,
+            r#"{"Payload":[1]}"#,
+            None,
+            Some("Mock result schema validation error: Field 'Payload' must be a string"),
+        ),
+        (
+            "another service's operation, judged by its own schema",
+            QUEUE_MOCKED_TASK,
+            r#"{"MessageId":7}"#,
+            None,
+            Some("Mock result schema validation error: Field 'MessageId' must be a string"),
+        ),
+        (
+            "the same mock where all present fields must conform",
+            MOCKED_TASK,
+            r#"{"Payload":{"sum":7}}"#,
+            Some("PRESENT"),
+            Some("Mock result schema validation error: Field 'Payload' must be a string"),
+        ),
+        (
+            // "NONE: No validation is performed."
+            "the same mock where no validation is performed",
+            MOCKED_TASK,
+            r#"{"Payload":{"sum":7}}"#,
+            Some("NONE"),
+            None,
+        ),
+        (
+            "a mock whose members are each of the declared type",
+            MOCKED_TASK,
+            r#"{"StatusCode":200,"Payload":"{}","ExecutedVersion":"$LATEST"}"#,
+            None,
+            None,
+        ),
+        (
+            // A `Map` state calls no operation, so its mocked iterations conform to no
+            // result schema at any mode.
+            "a state whose work is no integration call",
+            r#"{"Type":"Map","ItemProcessor":{"StartAt":"P","States":{"P":{"Type":"Pass","End":true}}},"End":true}"#,
+            r#"["one"]"#,
+            None,
+            None,
+        ),
+    ];
+
+    let emulator = Emulator::new();
+    for (case, definition, result, mode, refusal) in cases {
+        let mut mock = json!({ "result": result });
+        if let Some(mode) = mode {
+            mock["fieldValidationMode"] = json!(mode);
+        }
+        let (status, body) = emulator
+            .call(
+                "TestState",
+                &json!({
+                    "definition": definition,
+                    "input": "{}",
+                    "roleArn": ROLE_ARN,
+                    "mock": mock,
+                }),
+            )
+            .await;
+        match refusal {
+            Some(expected) => {
+                assert_eq!(
+                    (status, error_code(&body).as_str()),
+                    (400, "ValidationException"),
+                    "case {case:?}: expected a 400 ValidationException, got {status} {body:?}"
+                );
+                assert_eq!(
+                    body.get("message").and_then(Value::as_str),
+                    Some(expected),
+                    "case {case:?}: expected the message {expected:?}, got {body:?}"
+                );
+            }
+            None => {
+                assert_eq!(
+                    status, 200,
+                    "case {case:?}: expected the mock to be served, got {status} {body:?}"
+                );
+                assert!(
+                    body.get("status").and_then(Value::as_str).is_some(),
+                    "case {case:?}: expected the state's status, got {body:?}"
+                );
+            }
+        }
     }
 }
 

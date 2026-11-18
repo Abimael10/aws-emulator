@@ -146,6 +146,33 @@ fn in_modelled_type(violation: &Violation) -> Violation {
 const INSPECTION_LEVELS: (&[&str], &[&str]) =
     (&["INFO", "DEBUG", "TRACE"], &["TRACE", "INFO", "DEBUG"]);
 
+/// The order this service states the `ExecutionStatus` value set in, paired with the
+/// values the model declares.
+///
+/// RECORDED text: the model declares the enum's members in another order
+/// (`smithy_query(query="shape",shape="ExecutionStatus")` -> `RUNNING | SUCCEEDED |
+/// FAILED | TIMED_OUT | ABORTED | PENDING_REDRIVE`), and the order a refusal
+/// ADVERTISES is the service's own rather than the model's declaration order — which
+/// is the order the value set reaches this seam in.
+const EXECUTION_STATUSES: (&[&str], &[&str]) = (
+    &[
+        "RUNNING",
+        "SUCCEEDED",
+        "FAILED",
+        "TIMED_OUT",
+        "ABORTED",
+        "PENDING_REDRIVE",
+    ],
+    &[
+        "SUCCEEDED",
+        "TIMED_OUT",
+        "PENDING_REDRIVE",
+        "ABORTED",
+        "FAILED",
+        "RUNNING",
+    ],
+);
+
 /// Every enum value set this service states in an order of its own, as the shared
 /// wording reads such a table
 /// ([`::service_common::validation_message::StatedEnumValueSets`]).
@@ -156,7 +183,7 @@ const INSPECTION_LEVELS: (&[&str], &[&str]) =
 /// by its declared value SET, so every member targeting one enum — of any operation, at
 /// any depth — advertises that enum's set in the one order.
 const STATED_ENUM_VALUE_SETS: &::service_common::validation_message::StatedEnumValueSets<'_> =
-    &[INSPECTION_LEVELS];
+    &[INSPECTION_LEVELS, EXECUTION_STATUSES];
 
 /// `violation` as THIS SERVICE states it: its value in the member's modelled type
 /// ([`in_modelled_type`]) and its enum value set in the order the service advertises

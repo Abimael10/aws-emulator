@@ -354,8 +354,159 @@ async fn a_timed_out_task_writes_the_failure_it_closed_with() {
 }
 
 // ---------------------------------------------------------------------------
-// Rule 3: paging
+// Rule 3: paging — the token is opaque, and only this store resolves one
 // ---------------------------------------------------------------------------
+
+/// The whole history of `execution`, read again until the outcome the clock owed it has
+/// been written — the CONDITION this waits for, on a deadline generous enough that
+/// nothing here depends on how fast the host runs.
+async fn settled_history(emulator: &Emulator, case: &str, execution: &str) -> Vec<Value> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(90);
+    loop {
+        let events = history(emulator, execution, json!({})).await;
+        if types(&events)
+            .iter()
+            .any(|event| event == "ExecutionSucceeded")
+        {
+            return events;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "case {case:?}: expected the outcome to be written, got {:?}",
+            types(&events)
+        );
+        ::tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+}
+
+/// One page of this history, `maxResults` long, continuing from `token` when there is
+/// one.
+async fn page(
+    emulator: &Emulator,
+    execution: &str,
+    max_results: i64,
+    token: Option<&str>,
+) -> Value {
+    let mut request = json!({ "executionArn": execution, "maxResults": max_results });
+    if let Some(token) = token {
+        request["nextToken"] = json!(token);
+    }
+    emulator.ok("GetExecutionHistory", &request).await
+}
+
+/// The history's `nextToken` is OPAQUE: it carries no legible position in the event
+/// order, it continues that order when handed back, and a value this store did not mint
+/// — a position a caller wrote, or a token another store minted for the same history —
+/// is the modelled `InvalidToken` rather than a page.
+///
+/// Rows span the positions of one history (every page boundary a one-event page hands
+/// out) and both sort orders, which is what a history token is bound to.
+#[tokio::test]
+async fn a_history_page_token_is_opaque_and_only_this_stores_own() {
+    let emulator = Emulator::new();
+    let machine = create_machine(&emulator, "history-tokens", PASS_DEFINITION).await;
+    let execution =
+        crate::state_machine_lifecycle::start_execution(&emulator, &machine, "only", "{}").await;
+    let whole = types(&settled_history(&emulator, "the walked execution", &execution).await);
+
+    // A second store holding the same history under the same ARN: the state machine and
+    // the execution are both NAMED, so a token it mints names a position that exists
+    // here just as well — which is what makes the refusal below about the token's
+    // authenticity rather than about its position.
+    let elsewhere = Emulator::new();
+    let elsewhere_machine = create_machine(&elsewhere, "history-tokens", PASS_DEFINITION).await;
+    let elsewhere_execution = crate::state_machine_lifecycle::start_execution(
+        &elsewhere,
+        &elsewhere_machine,
+        "only",
+        "{}",
+    )
+    .await;
+    assert_eq!(
+        elsewhere_execution, execution,
+        "the two stores must hold the same execution ARN, got {elsewhere_execution:?}"
+    );
+    settled_history(&elsewhere, "the other store's execution", &execution).await;
+
+    for reverse_order in [false, true] {
+        let case = format!("reverseOrder {reverse_order}");
+        let mut request = json!({});
+        if reverse_order {
+            request["reverseOrder"] = json!(true);
+        }
+        let mut token: Option<String> = None;
+        // Every page boundary of this history: one event at a time, so each of the
+        // tokens the read hands out is checked.
+        for boundary in 1..whole.len() {
+            let mut body = json!({ "executionArn": execution.clone(), "maxResults": 1 });
+            if reverse_order {
+                body["reverseOrder"] = json!(true);
+            }
+            if let Some(token) = token.as_deref() {
+                body["nextToken"] = json!(token);
+            }
+            let answered = emulator.ok("GetExecutionHistory", &body).await;
+            let handed = answered
+                .get("nextToken")
+                .and_then(Value::as_str)
+                .unwrap_or_else(|| {
+                    panic!("case {case:?}: expected a token at boundary {boundary}, got {answered:?}")
+                })
+                .to_string();
+            assert!(
+                handed.trim().parse::<u64>().is_err(),
+                "case {case:?}: expected an opaque token at boundary {boundary}, got the \
+                 position {handed:?}"
+            );
+            token = Some(handed);
+        }
+
+        // The tokens a caller could write instead: each position of this history, and
+        // the token the other store minted for the same first boundary.
+        let elsewhere_token = {
+            let mut body = json!({ "executionArn": execution.clone(), "maxResults": 1 });
+            if reverse_order {
+                body["reverseOrder"] = json!(true);
+            }
+            string(
+                &elsewhere.ok("GetExecutionHistory", &body).await,
+                "nextToken",
+            )
+        };
+        let mut candidates: Vec<(String, String)> = (0..=whole.len())
+            .map(|position| ("a position of the history".to_string(), position.to_string()))
+            .collect();
+        candidates.push(("text that is no token".to_string(), "not-a-token".to_string()));
+        candidates.push(("a token another store minted".to_string(), elsewhere_token));
+        for (what, candidate) in candidates {
+            let mut body = json!({
+                "executionArn": execution.clone(),
+                "maxResults": 1,
+                "nextToken": candidate.clone(),
+            });
+            if reverse_order {
+                body["reverseOrder"] = json!(true);
+            }
+            let (status, code, message) =
+                failure(&emulator, &case, "GetExecutionHistory", &body).await;
+            assert_eq!(
+                (status, code.as_str()),
+                (400, "InvalidToken"),
+                "case {case:?}/{what:?}: expected 400 InvalidToken for {candidate:?}, got \
+                 {status} {code} with message {message:?}"
+            );
+        }
+    }
+
+    // And a token this read DID hand out still continues the one order.
+    let first = page(&emulator, &execution, 1, None).await;
+    let token = string(&first, "nextToken");
+    let second = page(&emulator, &execution, 1, Some(&token)).await;
+    assert_ne!(
+        first["events"], second["events"],
+        "expected the token to continue the history, got {second:?}"
+    );
+}
 
 /// `maxResults` pages the history and `nextToken` walks the rest, with the pages of
 /// one history concatenating to exactly that history.

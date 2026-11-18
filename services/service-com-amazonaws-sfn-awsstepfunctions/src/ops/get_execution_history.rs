@@ -249,6 +249,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         crate::state::events::publish(&self.engine, ctx.callback()).await;
 
         let mut store = state.lock();
+        // The token is one THIS store minted, so it is resolved and minted under the
+        // store's own page-token key ([`crate::state::pagination`]). It is a `Copy`
+        // value, so it is taken off the store before the history it borrows is read.
+        let page_token_key = store.page_token_key;
         // The one write a report may make: the events an outcome the clock already
         // made due writes were owed at that instant, whether or not anybody read the
         // history.
@@ -310,6 +314,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `InvalidToken`, worded as the history API words it: the condition alone,
         // see `crate::state::invalid_history_token_message`.
         let Some(offset) = crate::state::history_page_offset(
+            &page_token_key,
             input.next_token.as_deref(),
             read,
             total,
@@ -339,7 +344,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let reported = GetExecutionHistoryOutput {
             events,
-            next_token: next.map(|cursor| crate::state::history_page_token(cursor, total)),
+            next_token: next
+                .map(|cursor| crate::state::history_page_token(&page_token_key, cursor, total)),
         };
 
         Ok(reported)
