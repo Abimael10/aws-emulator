@@ -193,6 +193,11 @@ mod knowledge_base_names;
 /// a policy at all.
 mod resource_policies;
 
+/// WHICH values this service's front door states that an enumerated type admits, and
+/// in which order — the one listing both the request boundary's refusals and a
+/// handler-stated discriminator clause are built from.
+mod published_enum_value_sets;
+
 pub use bound_vector_index::*;
 pub use data_source_listing::*;
 pub use flow_aliases::*;
@@ -201,6 +206,7 @@ pub use ingestion_job_listing::*;
 pub use ingestion_record::*;
 pub use knowledge_base_names::*;
 pub use opensearch_serverless_store::*;
+pub use published_enum_value_sets::*;
 pub use pushed_documents::*;
 pub use resource_policies::*;
 pub use service_role::*;
@@ -1032,21 +1038,6 @@ pub const KNOWLEDGE_BASE_CONFIGURATION_MEMBERS: [(&str, &str); 4] = [
     ("SQL", "sqlKnowledgeBaseConfiguration"),
     ("MANAGED", "managedKnowledgeBaseConfiguration"),
 ];
-
-/// The values of an enumerated type as this service LISTS them in a
-/// `Member must satisfy enum value set: [ … ]` clause: the order the front door
-/// walks its own table of the admissible values, which is that table's buckets in
-/// ascending order rather than the order the model declares the type in
-/// (`service_common::validation_message::hashed_enum_order`).
-///
-/// A handler that judges a discriminator the request boundary cannot — a `type` that
-/// names which sibling member carries its details — states the same clause the
-/// boundary states, so it lists the set the same way; the order is derived from the
-/// values themselves, so it belongs to the enumerated TYPE and nothing here pins one
-/// type's listing.
-fn stated_value_set(admitted: &[&str]) -> String {
-    ::service_common::validation_message::hashed_enum_order(admitted).join(", ")
-}
 
 /// Why a `knowledgeBaseConfiguration` (with its `storageConfiguration`) cannot
 /// back a knowledge base. Each variant is a bad request, answered with the

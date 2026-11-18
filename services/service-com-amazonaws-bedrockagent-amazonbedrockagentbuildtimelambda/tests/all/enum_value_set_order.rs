@@ -5,26 +5,34 @@
 //! `dispatch`, so the clause is read exactly as a client reads it.
 //!
 //! The rule: a value outside an enumerated type is refused HTTP 400 `ValidationException`
-//! whose clause names the values that type admits, and those values are listed in the order
-//! this front door walks its own table of them — a table keyed on each value's own text,
-//! walked bucket by bucket (`service_common::validation_message::hashed_enum_order`) —
-//! rather than in the order the model declares them.
+//! whose clause names the values this front door PUBLISHES for that type — which for one
+//! type of this model are fewer than the model declares — listed in the order the front
+//! door walks its own table of them: a table keyed on each value's own text, walked bucket
+//! by bucket (`service_common::validation_message::hashed_enum_order`), rather than the
+//! order the model declares them in. Both halves live in one place
+//! (`crate::state::front_door_enum_value_set`), which is what every expectation below
+//! derives its listing from.
 //!
-//! The order is derived from the values themselves, so it belongs to the enumerated TYPE:
-//! one type is listed alike whichever member carries it, in whatever operation, and whatever
-//! the request's shape. That is what the rows below walk — the enum, the member, the
-//! operation, the depth the value sits at (top level, a structure, a structure inside a
-//! list), the binding it arrived in (body or query string), how many values the type admits
-//! (one, two, four, five, eight and sixteen) and the form of the rejected value — while the
-//! guards at the end state the derivation independently of any request, and the one clause a
-//! HANDLER states for a discriminator is checked to list its set the same way.
+//! Membership and order are both derived from the values themselves, so the listing belongs
+//! to the enumerated TYPE: one type is listed alike whichever member carries it, in whatever
+//! operation, and whatever the request's shape. That is what the rows below walk — the enum,
+//! the member, the operation, the depth the value sits at (top level, a structure, a
+//! structure inside a list), the binding it arrived in (body or query string), how many
+//! values the type admits (one, two, four, five, eight and sixteen) and the form of the
+//! rejected value — while the guards at the end state the derivation independently of any
+//! request, and the one clause a HANDLER states for a discriminator is checked to list its
+//! set the same way.
+//!
+//! What the front door publishes decides what a refusal ADVERTISES and nothing else: a value
+//! the model declares but the published set leaves out is still accepted, which the last
+//! test below states for the type whose published set lags the model.
 
 use std::collections::BTreeSet;
 
 use serde_json::{json, Value};
 
 use service_com_amazonaws_bedrockagent_amazonbedrockagentbuildtimelambda::state::{
-    DataSourceConfigurationProblem, KnowledgeBaseConfigurationProblem,
+    front_door_enum_value_set, DataSourceConfigurationProblem, KnowledgeBaseConfigurationProblem,
 };
 use service_common::validation_message::{enum_value_bucket, hashed_enum_order};
 
@@ -99,6 +107,23 @@ fn declared(name: &str) -> &'static [&'static str] {
         .unwrap_or_else(|| panic!("case {name:?}: this model declares no such enum"))
 }
 
+/// The values the front door PUBLISHES for `KnowledgeBaseType`: the self-managed vector kind
+/// alone, fewer than the four the model declares, which is the set a recorded refusal of a
+/// `knowledgeBaseConfiguration.type` outside it lists.
+const PUBLISHED_KNOWLEDGE_BASE_TYPES: &[&str] = &["VECTOR"];
+
+/// The values a clause ADVERTISES for `name`: the published set for the one type of this
+/// model whose published set lags its declaration, and the declared set for every other.
+///
+/// Written out here rather than read back from the crate's own derivation, so a published set
+/// that moved is observed instead of followed.
+fn published(name: &str) -> &'static [&'static str] {
+    if name == "KnowledgeBaseType" {
+        return PUBLISHED_KNOWLEDGE_BASE_TYPES;
+    }
+    declared(name)
+}
+
 /// A role ARN matching the modelled `FlowExecutionRoleArn` pattern, so a `CreateFlow`
 /// row's only fault is the enum member under test.
 const EXECUTION_ROLE: &str =
@@ -130,7 +155,7 @@ fn expected_message(quoted: Option<&str>, member: &str, enumerated: &str) -> Str
     format!(
         "1 validation error detected: {subject} at '{member}' failed to satisfy constraint: \
          Member must satisfy enum value set: [{}]",
-        hashed_enum_order(declared(enumerated)).join(", ")
+        front_door_enum_value_set(declared(enumerated)).join(", ")
     )
 }
 
@@ -427,17 +452,18 @@ async fn an_enum_refusal_lists_the_values_in_the_order_the_front_door_states_the
                 "case {case:?} attempt {attempt}: expected the refusal {expected:?}, \
                  got {message:?}"
             );
-            // Whatever the order, the membership is the model's: the clause neither adds a
-            // value the model does not declare nor drops one it does.
+            // Whatever the order, the membership is the set the front door publishes for the
+            // type: the clause neither adds a value that set does not hold nor drops one it
+            // does.
             let stated: BTreeSet<String> = bracketed(case, &message).into_iter().collect();
-            let modelled: BTreeSet<String> = declared(row.enumerated)
+            let advertised: BTreeSet<String> = published(row.enumerated)
                 .iter()
                 .map(|value| (*value).to_string())
                 .collect();
             assert_eq!(
-                stated, modelled,
+                stated, advertised,
                 "case {case:?} attempt {attempt}: the set stated must hold exactly the values \
-                 the model declares, got {message:?}"
+                 the front door publishes, got {message:?}"
             );
         }
     }
@@ -555,7 +581,7 @@ fn the_flow_node_type_value_set_is_listed_as_the_recorded_refusal_lists_it() {
     // listing is derived from the model's declaration and not from any other presentation
     // of the same set.
     let model = declared("FlowNodeType");
-    let listed = hashed_enum_order(model);
+    let listed = front_door_enum_value_set(model);
     assert_eq!(
         listed, RECORDED,
         "case the model's declaration order: expected {RECORDED:?}, got {listed:?}"
@@ -600,7 +626,7 @@ fn a_handler_stated_discriminator_clause_lists_the_set_the_same_way() {
         let expected = format!(
             "Value '{rejected}' at '{member}' failed to satisfy constraint: \
              Member must satisfy enum value set: [{}]",
-            hashed_enum_order(declared(enumerated)).join(", ")
+            front_door_enum_value_set(declared(enumerated)).join(", ")
         );
         assert_eq!(
             message, expected,
@@ -640,5 +666,131 @@ fn every_modelled_value_set_is_listed_whole_and_independently_of_its_presentatio
             "case {name:?}: the listing must not depend on the presentation, got \
              {from_reversed:?} from the reversed set and {listed:?} from the declared one"
         );
+    }
+}
+
+/// Every member of this model carrying `KnowledgeBaseType`, as the operation that carries it
+/// and the path a clause about it is reported at: the two knowledge-base operations whose
+/// input holds a `KnowledgeBaseConfiguration`.
+fn knowledge_base_type_members() -> Vec<(&'static str, &'static str, String)> {
+    vec![
+        (
+            "UpdateKnowledgeBase",
+            "PUT",
+            format!("/knowledgebases/{IDENTIFIER}"),
+        ),
+        ("CreateKnowledgeBase", "PUT", "/knowledgebases/".to_string()),
+    ]
+}
+
+/// A knowledge-base request whose only fault is `knowledgeBaseConfiguration.type`.
+fn knowledge_base_request(knowledge_base_type: &str) -> Value {
+    json!({
+        "name": "EnumValueSetOrder",
+        "roleArn": KNOWLEDGE_BASE_ROLE,
+        "knowledgeBaseConfiguration": { "type": knowledge_base_type },
+    })
+}
+
+/// Each declared `KnowledgeBaseType` paired with the `KnowledgeBaseConfiguration` member
+/// carrying that kind's details.
+///
+/// Source: the `KnowledgeBaseConfiguration` structure of this model
+/// (`smithy_query(query="shape", shape="KnowledgeBaseConfiguration")`).
+const CONFIGURATION_MEMBERS: [(&str, &str); 4] = [
+    ("VECTOR", "vectorKnowledgeBaseConfiguration"),
+    ("KENDRA", "kendraKnowledgeBaseConfiguration"),
+    ("SQL", "sqlKnowledgeBaseConfiguration"),
+    ("MANAGED", "managedKnowledgeBaseConfiguration"),
+];
+
+/// RULE: a refusal of a value outside `KnowledgeBaseType` advertises the values the front
+/// door PUBLISHES for that type and no others — not the four the model declares.
+///
+/// The rows span what the rule generalises over: both operations carrying the member, and the
+/// forms a rejected value takes (a declared value recased, an unknown name, the empty string,
+/// a declared value with a leading space, a prefix of a declared value, and a value belonging
+/// to another enum of this model).
+#[tokio::test]
+async fn a_knowledge_base_type_refusal_advertises_only_the_published_values() {
+    let emulator = Emulator::new();
+
+    for (operation, method, uri) in knowledge_base_type_members() {
+        for rejected in [
+            "managed", "VECTORS", "", " VECTOR", "VECT", "CUSTOM", "vector",
+        ] {
+            let case = format!("{operation} with knowledgeBaseConfiguration.type {rejected:?}");
+            let refused = emulator
+                .call(method, &uri, Some(knowledge_base_request(rejected)))
+                .await;
+            assert_eq!(
+                (refused.status, refused.error_type.as_deref()),
+                (400, Some("ValidationException")),
+                "case {case:?}: expected 400 ValidationException, got {refused:?}"
+            );
+            let message = refused.message(&case);
+            let expected = expected_message(
+                Some(rejected),
+                "knowledgeBaseConfiguration.type",
+                "KnowledgeBaseType",
+            );
+            assert_eq!(
+                message, expected,
+                "case {case:?}: expected the refusal {expected:?}, got {message:?}"
+            );
+            let stated = bracketed(&case, &message);
+            assert_eq!(
+                stated, PUBLISHED_KNOWLEDGE_BASE_TYPES,
+                "case {case:?}: expected the published set \
+                 {PUBLISHED_KNOWLEDGE_BASE_TYPES:?}, got {stated:?}"
+            );
+        }
+    }
+}
+
+/// The counterpart of the rule above: what the front door PUBLISHES decides what a refusal
+/// advertises and nothing else, so a value the model declares but the published set leaves
+/// out is NOT judged against that set.
+///
+/// The rows are every declared `KnowledgeBaseType` — the published one and the three it
+/// leaves out — through both operations carrying the member. Each reaches the handler, which
+/// judges the kind's own details: the refusal names the `KnowledgeBaseConfiguration` member
+/// that kind needs ([`CONFIGURATION_MEMBERS`]) and states no enum value set at all.
+#[tokio::test]
+async fn a_declared_value_the_published_set_leaves_out_is_still_accepted_as_a_value() {
+    let emulator = Emulator::new();
+
+    // Every kind the model declares is a row, so a kind this model gains is not skipped.
+    let covered: BTreeSet<&str> = CONFIGURATION_MEMBERS
+        .iter()
+        .map(|(knowledge_base_type, _)| *knowledge_base_type)
+        .collect();
+    let modelled: BTreeSet<&str> = declared("KnowledgeBaseType").iter().copied().collect();
+    assert_eq!(
+        covered, modelled,
+        "case the rows: they must cover every declared KnowledgeBaseType, got {covered:?}"
+    );
+
+    for (operation, method, uri) in knowledge_base_type_members() {
+        for (knowledge_base_type, member) in CONFIGURATION_MEMBERS {
+            let case =
+                format!("{operation} with knowledgeBaseConfiguration.type {knowledge_base_type:?}");
+            let answer = emulator
+                .call(method, &uri, Some(knowledge_base_request(knowledge_base_type)))
+                .await;
+            let message = answer.message(&case);
+            assert!(
+                !message.contains("enum value set"),
+                "case {case:?}: a declared value must not be refused as one outside the set, \
+                 got {message:?}"
+            );
+            // The value reached the handler, which asked for that kind's own details: the
+            // request above carries none of them.
+            assert!(
+                message.contains(member) && message.contains(knowledge_base_type),
+                "case {case:?}: expected the refusal to name {member:?} for a \
+                 {knowledge_base_type:?} knowledge base, got {message:?}"
+            );
+        }
     }
 }

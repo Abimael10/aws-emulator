@@ -27,9 +27,9 @@
 //! - `override_refusal` — how this service words a request the framework refused
 //!   before any handler ran. This service states them AWS's way: the framework's
 //!   envelope and clauses, with the value dropped from a clause about a `@sensitive`
-//!   member and an enumerated type's value set listed in the order the table of those
-//!   values is walked rather than in the order the model declares them
-//!   (`service_common::validation_message::in_hashed_enum_order`). See the inline note
+//!   member and an enumerated type's value set stated as this front door states it —
+//!   the values it publishes for that type, in the order its table of them is walked
+//!   (`crate::state::in_front_door_enum_value_set`). See the inline note
 //!   on that method.
 //! - `override_routing_error` — how this service words a request that reached it
 //!   but named no modeled operation. The default returns `None`, so the entry
@@ -276,23 +276,25 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // `@pattern` expression and every other requirement — stays exactly as the
         // framework worded it.
         //
-        // One ORDER is this service's too: an enumerated type's admissible values are
-        // listed in the order this front door walks its OWN table of them — a table
-        // keyed on each value's text, so the listing is that table's buckets in
-        // ascending order (`in_hashed_enum_order`) — and not in the order the model
-        // declares them. Each violation goes through that re-ordering BEFORE the
+        // One LISTING is this service's too: an enumerated type's admissible values are
+        // stated as this front door states them — the values it PUBLISHES for that type,
+        // which for one type of this model are fewer than the model declares, in the
+        // order it walks its own table of them, a table keyed on each value's text
+        // (`crate::state::in_front_door_enum_value_set`) — and not as the model declares
+        // the type. Each violation goes through that restatement BEFORE the
         // envelope words it, so only the values move: the member path, the echoed
         // value and every requirement's wording keep coming from the one place that
-        // writes them, and every other violation class comes back untouched. The order
-        // is derived from the values themselves, so it belongs to the enumerated TYPE:
-        // every member of every operation targeting one enum is listed alike, at
-        // whatever depth and in whatever binding the value arrived, and an enum the
-        // model gains needs nothing added here.
+        // writes them, and every other violation class comes back untouched. Both the
+        // membership and the order are derived from the values themselves, so they belong
+        // to the enumerated TYPE: every member of every operation targeting one enum is
+        // listed alike, at whatever depth and in whatever binding the value arrived, and
+        // an enum the model gains needs nothing added here. The listing says what the
+        // front door ADVERTISES; which values a member admits stays the enum it targets.
         let restated = match refusal {
             Refusal::Invalid(violations) => std::borrow::Cow::Owned(Refusal::Invalid(
                 violations
                     .iter()
-                    .map(service_common::validation_message::in_hashed_enum_order)
+                    .map(crate::state::in_front_door_enum_value_set)
                     .collect(),
             )),
             // Not a constraint refusal, so it carries no value set to re-order.
