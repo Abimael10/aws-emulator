@@ -8,7 +8,10 @@
 //!
 //! * RULE T — every projected member whose Smithy target carries
 //!   `@timestampFormat("date-time")` serializes as an ISO-8601 date-time STRING, on every
-//!   operation that projects it. (`smithy_query(query="shape",shape="ReportSummary")` and
+//!   operation that projects it, carrying the MILLISECOND fraction this service renders a
+//!   date-time with — three digits wide whatever the value of the milliseconds, as the
+//!   recorded catalog entries show (`2024-11-01T00:00:00.000Z`).
+//!   (`smithy_query(query="shape",shape="ReportSummary")` and
 //!   `…shape="ReportDetail"` report `"timestampFormat": "date-time"` on `periodStart`,
 //!   `periodEnd`, `createdAt`, `lastModifiedAt` and `deletedAt`, all of which target
 //!   `TimestampAttribute`.)
@@ -21,6 +24,13 @@
 //! * RULE K — a `nextToken` is an OPAQUE continuation value: it is none of the resource
 //!   identifiers of the collection it pages, handing it back resumes exactly where the
 //!   page ended, and it is refused by the operation that did not issue it.
+//! * RULE I — every member of a projected entry is the published metadata of the report
+//!   that entry's id/arn/version IDENTIFIES: its own published title, its own published
+//!   description, its series, category, company and product names, its acceptance type and
+//!   the window of the period that version covers. So the values follow the entry's
+//!   identity and never its position in the list, the page size that cut the page, or the
+//!   product the report happens to be about; the per-report metadata read of the same
+//!   version answers with the very same values, because both read one stored record.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -30,8 +40,9 @@ use serde_json::Value;
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::harness::{
-    emulator, get_report_metadata, get_signed, list_report_versions, list_reports, signed_for,
-    Answer, CATALOG, HOME_REGION, REGION, SIGNED_FOR_A_MALFORMED_REGION,
+    assert_rendered_date_time, emulator, get_report_metadata, get_signed, list_report_versions,
+    list_reports, page_size_case, signed_for, walk_reports, Answer, CATALOG, HOME_REGION, REGION,
+    SIGNED_FOR_A_MALFORMED_REGION,
 };
 
 /// The members `ReportSummary` projects for a published catalog report, exactly.
@@ -78,30 +89,69 @@ const DETAIL_DATE_TIME_MEMBERS: &[&str] = &[
 /// The visibility a report AWS publishes in the Artifact catalog carries.
 const PUBLIC: &str = "PUBLIC";
 
-/// Assert `value` is an ISO-8601 date-time STRING: a string the `date-time` format parses,
-/// and one that is reproduced by re-formatting the instant it denotes (so a number, an
-/// epoch-seconds string, or a truncated rendering all fail).
-fn assert_date_time(case: &str, member: &str, value: &Value) {
-    let Some(text) = value.as_str() else {
-        panic!(
-            "case {case:?}: {member} is @timestampFormat date-time, so it must serialize as \
-             an ISO-8601 string, got {value:?}"
-        );
-    };
-    let parsed = DateTime::from_str(text, Format::DateTime).unwrap_or_else(|error| {
-        panic!("case {case:?}: {member} must parse as an ISO-8601 date-time ({error}), got {text:?}")
+/// The series of the accessibility-conformance class, which AWS publishes one report of
+/// per product it has evaluated.
+const ACR_SERIES: &str = "ACR";
+
+/// How AWS titles every report of that class: the kind of document, the template it is
+/// reported on, and then the product evaluated. Source: the title the recorded
+/// `ListReports` body carries for an entry of this class, as the issue in this suite's
+/// commit quotes it.
+const ACR_TITLE_FORM: &str = "Accessibility Conformance Report (VPAT) - ";
+
+/// The members of an entry that are a property of the REPORT and so take the same value at
+/// every published version of it. Source:
+/// `smithy_query(query="shape",shape="ReportSummary")`.
+const REPORT_WIDE_MEMBERS: &[&str] = &[
+    "name",
+    "series",
+    "category",
+    "companyName",
+    "productName",
+    "acceptanceType",
+];
+
+/// One published member value the corpus records for one report of the catalog, as the
+/// issue that reported this divergence quotes the recorded `ListReports` body:
+/// `(report id, member, published value)`. A timestamp is named as the INSTANT it denotes
+/// and compared as one, so the row says nothing about the width of its fraction.
+const RECORDED_PUBLISHED: &[(&str, &str, &str)] = &[
+    (
+        "report-7g5j2DTVeNXWx7St",
+        "name",
+        "Accessibility Conformance Report (VPAT) - AWS Transfer Family",
+    ),
+    (
+        "report-7g5j2DTVeNXWx7St",
+        "periodStart",
+        "2024-11-01T00:00:00Z",
+    ),
+    (
+        "report-5eevElBv6MyRmQsD",
+        "acceptanceType",
+        "PASSTHROUGH",
+    ),
+];
+
+/// The members compared as instants rather than as text in [`RECORDED_PUBLISHED`].
+const INSTANT_MEMBERS: &[&str] = &["periodStart", "periodEnd"];
+
+/// The instant `value` denotes, in seconds since the Unix epoch.
+fn instant(case: &str, member: &str, value: &Value) -> i64 {
+    let text = value.as_str().unwrap_or_else(|| {
+        panic!("case {case:?}: {member} must be an ISO-8601 date-time string, got {value:?}")
     });
-    let reformatted = parsed
-        .fmt(Format::DateTime)
-        .expect("a parsed instant re-formats");
-    assert_eq!(
-        reformatted, text,
-        "case {case:?}: {member} must round-trip through the date-time format, got {text:?}"
-    );
-    assert!(
-        text.ends_with('Z') && text.contains('T'),
-        "case {case:?}: {member} must be a UTC ISO-8601 date-time, got {text:?}"
-    );
+    DateTime::from_str(text, Format::DateTime)
+        .unwrap_or_else(|error| {
+            panic!("case {case:?}: {member} must parse as a date-time ({error}), got {text:?}")
+        })
+        .secs()
+}
+
+/// Assert `value` is the date-time form this service renders: the harness's one wire-form
+/// rule (an ISO-8601 UTC string carrying a three-digit millisecond fraction).
+fn assert_date_time(case: &str, member: &str, value: &Value) {
+    assert_rendered_date_time(case, member, value);
 }
 
 /// The member names an object carries, as a set.
@@ -521,5 +571,239 @@ async fn a_token_issued_by_one_paginated_operation_is_refused_by_the_other() {
             "case {case:?}: expected ValidationException, got {:?}",
             answer.body
         );
+    }
+}
+
+/// Every catalog entry of one whole walk, keyed by the report id it names.
+///
+/// The walk is the harness's ([`walk_reports`]); what this adds is the rule this suite
+/// needs of it — a report is enumerated exactly once, and the walk enumerates the whole
+/// published catalog.
+async fn walked_catalog(
+    router: &MultiServiceRouter,
+    case: &str,
+    max_results: Option<i32>,
+) -> BTreeMap<String, Value> {
+    let mut entries: BTreeMap<String, Value> = BTreeMap::new();
+    for (_, summary) in walk_reports(router, case, max_results).await {
+        let id = summary["id"].as_str().unwrap_or_default().to_string();
+        assert!(
+            entries.insert(id.clone(), summary).is_none(),
+            "case {case:?}: {id} is enumerated twice"
+        );
+    }
+    assert_eq!(
+        entries.len(),
+        CATALOG.len(),
+        "case {case:?}: the walk must enumerate the whole catalog, got {:?}",
+        entries.keys().collect::<Vec<_>>()
+    );
+    entries
+}
+
+#[tokio::test]
+async fn an_entry_carries_the_metadata_of_the_report_its_identity_names() {
+    let router = emulator();
+
+    // Rows: the page sizes that put the catalog's entries at different positions and on
+    // different pages — the floor and the ceiling of `MaxResultsAttribute`'s
+    // `@range(min: 1, max: 300)`, a size that cuts the catalog mid-page, and the unpaged
+    // call — crossed with every report the catalog publishes.
+    let page_sizes = [None, Some(1), Some(4), Some(300)];
+    let mut walks: Vec<(String, BTreeMap<String, Value>)> = Vec::new();
+    for max_results in page_sizes {
+        let case = page_size_case(max_results);
+        let entries = walked_catalog(&router, &case, max_results).await;
+        walks.push((case, entries));
+    }
+    let (reference_case, reference) = walks
+        .first()
+        .cloned()
+        .expect("the walk table names at least one page size");
+
+    for (case, entries) in &walks {
+        for expected in CATALOG {
+            let row = format!("{case} {}", expected.id);
+            let entry = entries
+                .get(expected.id)
+                .unwrap_or_else(|| panic!("case {row:?}: the catalog must publish this report"));
+
+            // The published metadata of the report this entry's id names.
+            for (member, published) in [
+                ("name", expected.name),
+                ("series", expected.series),
+                ("category", expected.category),
+                ("acceptanceType", expected.acceptance_type),
+            ] {
+                assert_eq!(
+                    entry[member].as_str(),
+                    Some(published),
+                    "case {row:?}: expected the published {member} {published:?}, got {:?}",
+                    entry[member]
+                );
+            }
+            assert_eq!(
+                entry["version"].as_i64(),
+                Some(expected.latest()),
+                "case {row:?}: an entry names the report's latest published version, got \
+                 {entry:?}"
+            );
+            assert_eq!(
+                entry["arn"].as_str(),
+                Some(
+                    format!(
+                        "arn:aws:artifact:{HOME_REGION}::report/{}:{}",
+                        expected.id,
+                        expected.latest()
+                    )
+                    .as_str()
+                ),
+                "case {row:?}: an entry is keyed by its own ARN, got {entry:?}"
+            );
+
+            // A published title belongs to ONE report: an entry carrying another row's
+            // title is an entry reporting another report's metadata.
+            let titled: Vec<&str> = CATALOG
+                .iter()
+                .filter(|other| Some(other.name) == entry["name"].as_str())
+                .map(|other| other.id)
+                .collect();
+            assert_eq!(
+                titled,
+                vec![expected.id],
+                "case {row:?}: a published title names one report, got {titled:?} for {:?}",
+                entry["name"]
+            );
+
+            // And the entry is the SAME one every other page size reported: the values
+            // follow the report's identity, never its position in the list.
+            assert_eq!(
+                Some(entry),
+                reference.get(expected.id),
+                "case {row:?}: an entry must carry the same members it does under \
+                 {reference_case:?}, got {entry:?}"
+            );
+
+            // The per-report metadata read of that same version answers with the same
+            // values, because both projections read one stored record.
+            let detail = get_report_metadata(
+                &router,
+                &format!(
+                    "?reportId={}&reportVersion={}",
+                    expected.id,
+                    expected.latest()
+                ),
+            )
+            .await;
+            assert_eq!(
+                detail.status, 200,
+                "case {row:?}: expected HTTP 200 from GetReportMetadata, got {} with {:?}",
+                detail.status, detail.body
+            );
+            let detail = &detail.body["reportDetails"];
+            for member in REPORT_WIDE_MEMBERS.iter().chain(["description"].iter()) {
+                assert_eq!(
+                    detail[*member], entry[*member],
+                    "case {row:?}: the two projections report one record's {member}, got \
+                     {:?} against {:?}",
+                    detail[*member], entry[*member]
+                );
+            }
+            for member in INSTANT_MEMBERS {
+                assert_eq!(
+                    instant(&row, member, &detail[*member]),
+                    instant(&row, member, &entry[*member]),
+                    "case {row:?}: the two projections report one version's {member}"
+                );
+            }
+            assert!(
+                instant(&row, "periodStart", &entry["periodStart"])
+                    < instant(&row, "periodEnd", &entry["periodEnd"]),
+                "case {row:?}: a reporting period opens before it closes, got {entry:?}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn the_accessibility_conformance_class_reports_its_published_title_and_description() {
+    let router = emulator();
+    let entries = walked_catalog(&router, "the accessibility class", None).await;
+
+    // One report of this class per product AWS evaluated, so the class is a SET of
+    // entries; what they share is the class's published metadata.
+    let class: Vec<(&String, &Value)> = entries
+        .iter()
+        .filter(|(_, entry)| entry["series"].as_str() == Some(ACR_SERIES))
+        .collect();
+    assert!(
+        class.len() > 1,
+        "the accessibility-conformance class is published per product, got {} entries",
+        class.len()
+    );
+
+    let mut descriptions: BTreeSet<&str> = BTreeSet::new();
+    for (id, entry) in &class {
+        let title = entry["name"].as_str().unwrap_or_default();
+        let product = title.strip_prefix(ACR_TITLE_FORM).unwrap_or_else(|| {
+            panic!(
+                "case {id:?}: a report of this class is titled {ACR_TITLE_FORM:?} followed by \
+                 the product evaluated, got {title:?}"
+            )
+        });
+        assert!(
+            !product.trim().is_empty(),
+            "case {id:?}: the title must name the product evaluated, got {title:?}"
+        );
+        descriptions.insert(entry["description"].as_str().unwrap_or_default());
+    }
+    assert_eq!(
+        descriptions.len(),
+        1,
+        "the class publishes ONE description, about the template rather than about a \
+         product, got {descriptions:?}"
+    );
+    let description = descriptions
+        .iter()
+        .next()
+        .copied()
+        .expect("the class publishes a description");
+    for (id, entry) in &class {
+        assert_eq!(
+            entry["description"].as_str(),
+            Some(description),
+            "case {id:?}: expected the class's published description, got {entry:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn the_recorded_published_metadata_is_what_the_catalog_reports() {
+    let router = emulator();
+    let entries = walked_catalog(&router, "recorded published metadata", None).await;
+
+    for (id, member, published) in RECORDED_PUBLISHED {
+        let case = format!("{id} {member}");
+        let entry = entries
+            .get(*id)
+            .unwrap_or_else(|| panic!("case {case:?}: the catalog must publish this report"));
+        if INSTANT_MEMBERS.contains(member) {
+            let expected_instant = DateTime::from_str(published, Format::DateTime)
+                .expect("the table names a date-time")
+                .secs();
+            assert_eq!(
+                instant(&case, member, &entry[*member]),
+                expected_instant,
+                "case {case:?}: expected the published instant {published:?}, got {:?}",
+                entry[*member]
+            );
+        } else {
+            assert_eq!(
+                entry[*member].as_str(),
+                Some(*published),
+                "case {case:?}: expected the published value {published:?}, got {:?}",
+                entry[*member]
+            );
+        }
     }
 }

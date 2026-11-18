@@ -33,14 +33,17 @@
 //! reports (`ResponseVersion`) has. `PutComplianceInquiryFeedbackResponse$submittedAt` is
 //! reported over HTTP by `PutComplianceInquiryFeedback`, and its end-to-end row lives in
 //! `implemented_inquiry_operations.rs`, beside that operation's other rows.
+//!
+//! The date-time is rendered with a MILLISECOND fraction, three digits wide whatever the
+//! value of the milliseconds — the resolution AWS Artifact reports these members at, as a
+//! recorded catalog entry shows (`2024-11-01T00:00:00.000Z`). That is a property of the
+//! service's rendering, not of any one member, so every row below asserts it.
 
 use std::sync::Arc;
 use std::time::Duration;
 
 use aws_smithy_schema::traits::TimestampFormat;
 use aws_smithy_schema::Schema;
-use aws_smithy_types::date_time::Format;
-use aws_smithy_types::DateTime;
 use bytes::Bytes;
 use serde_json::{json, Value};
 use service_com_amazonaws_artifact_artifact::ops::types::{
@@ -49,6 +52,12 @@ use service_com_amazonaws_artifact_artifact::ops::types::{
 };
 use service_com_amazonaws_artifact_artifact::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
+
+use crate::harness::assert_rendered_date_time;
+
+/// Nanoseconds in one millisecond, for checking the reported instant carries no finer
+/// digits than the rendering shows.
+const NANOS_PER_MILLI: u32 = 1_000_000;
 
 /// A SigV4 credential scope naming this service: it is what routes a request here.
 const SIGNED: &str = "AWS4-HMAC-SHA256 \
@@ -147,35 +156,23 @@ fn at(body: &Value, pointer: &str) -> Value {
     body.pointer(pointer).cloned().unwrap_or(Value::Null)
 }
 
-/// Assert one `TimestampAttribute` member's wire form: a JSON STRING that parses as an
-/// RFC 3339 date-time and renders back to the very same text, naming a real instant.
+/// Assert one `TimestampAttribute` member's wire form — the harness's one rule, an RFC
+/// 3339 UTC string carrying the three-digit millisecond fraction this service renders with
+/// — and, beyond it, that the member names a real instant at that resolution.
 ///
-/// Parsed and re-rendered rather than matched against a literal: the instant itself is
+/// Parsed rather than matched against a literal: the instant itself is
 /// environment-specific (a created inquiry's `createdAt` is the clock's), so what is under
-/// test is the JSON type and the lexical form, not the value.
+/// test is the JSON type, the lexical form and the resolution, not the value.
 fn assert_date_time(case: &str, member: &str, value: &Value) {
-    assert!(
-        !value.is_number(),
-        "case {case:?}: {member} targets TimestampAttribute (@timestampFormat date-time), so it \
-         must be an RFC 3339 string and never an epoch-seconds number, got {value:?}"
-    );
-    let text = value.as_str().unwrap_or_else(|| {
-        panic!("case {case:?}: {member} must be an RFC 3339 date-time string, got {value:?}")
-    });
-    let parsed = DateTime::from_str(text, Format::DateTime).unwrap_or_else(|error| {
-        panic!("case {case:?}: {member} must parse as a date-time ({error}), got {text:?}")
-    });
-    let rendered = parsed
-        .fmt(Format::DateTime)
-        .unwrap_or_else(|error| panic!("case {case:?}: {member} does not re-render ({error})"));
+    let parsed = assert_rendered_date_time(case, member, value);
     assert_eq!(
-        rendered, text,
-        "case {case:?}: {member} must already be in the canonical date-time form, got {text:?} \
-         against {rendered:?}"
+        parsed.subsec_nanos() % NANOS_PER_MILLI,
+        0,
+        "case {case:?}: {member} is reported at millisecond resolution, got {value:?}"
     );
     assert!(
         parsed.secs() > 0,
-        "case {case:?}: {member} must name a real instant, got {text:?}"
+        "case {case:?}: {member} must name a real instant, got {value:?}"
     );
 }
 

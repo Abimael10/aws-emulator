@@ -8,8 +8,9 @@
 //! ([`super::SEED`]) is one row per compliance programme — one certificate, one
 //! attestation, one questionnaire — while an accessibility-conformance report is published
 //! PER PRODUCT, so the class is a set of rows that grows with the products AWS evaluates
-//! and shares one series, one category and one acceptance type between all of them. Those
-//! three are therefore stated once here rather than repeated on every row.
+//! and shares one series, one category, one acceptance type and one published description
+//! between all of them. Those are therefore stated once here rather than repeated on every
+//! row.
 //!
 //! Catalog membership is not something the model bounds: AWS Artifact has no
 //! `CreateReport`, so what the catalog holds is the published inventory, and this class is
@@ -20,11 +21,17 @@
 //! `ReportId`'s `^report-[a-zA-Z0-9]{16}$` and are not a claim that AWS issued them), as
 //! [`super::SEED`]'s own doc comment explains for the rows there.
 //!
-//! Every value satisfies its member's modelled constraints: `name`, `series`, `category`
-//! and `productName` match `ShortStringAttribute`'s `^[a-zA-Z0-9_\-\s]*$` within 1..=256
-//! characters — which is why a report's name spells the template out rather than
-//! parenthesising it — and each `description` matches `LongStringAttribute`'s `^[^<>]*$`
-//! within 1..=2048.
+//! What each member CARRIES is the published metadata of the document the row's id names,
+//! never prose re-authored about the product: every row is TITLED the way AWS titles this
+//! class — the kind of document, the template it is reported on, then the product evaluated
+//! ("Accessibility Conformance Report (VPAT) - <product>", as the recorded catalog entry of
+//! this class is titled) — and carries the published description of the template
+//! ([`ACCESSIBILITY_DESCRIPTION`]) and the cycle the class is published on (the window
+//! constants each version names). A published title carries punctuation that
+//! `ShortStringAttribute`'s `@pattern` — a constraint on what a REQUEST may send — does not
+//! admit; a response reports the title as it is published, which is what the recorded
+//! catalog entry of this class shows. Each `description` satisfies `LongStringAttribute`'s
+//! `^[^<>]*$` within 1..=2048 characters.
 
 use super::*;
 
@@ -42,13 +49,27 @@ const ACCESSIBILITY_CATEGORY: &str = "Certifications and Attestations";
 /// recorded entries of this class carry this value.
 const ACCESSIBILITY_ACCEPTANCE: &str = "PASSTHROUGH";
 
+/// The published description every report of this class carries.
+///
+/// ONE text for the whole class rather than one per product: the publisher's description is
+/// written about the template, not about a product — it states what an ACR is, which
+/// standards the VPAT references, and that it informs about "the relevant AWS product or
+/// service" — so which product a row reports on is carried by its title, never by this
+/// text. This is the description the corpus records for an entry of this class.
+const ACCESSIBILITY_DESCRIPTION: &str =
+    "This document is an Accessibility Conformance Report (ACR) based on the ITI VPAT® \
+     and is intended to provide information on the accessibility of the relevant AWS \
+     product or service. The VPAT references accessibility standards for information and \
+     communications technology including: Section 508 (U.S.), EN 301 549 (EU), and \
+     W3C/WAI WCAG.";
+
 /// The accessibility-conformance reports the catalog publishes, one per evaluated product.
 ///
 /// The rows differ along what the report surface generalises over: the product evaluated,
-/// the number of published versions (one, two and three) and the reporting windows those
-/// versions cover. Each `description` is the published description of that document — the
-/// prose a publisher writes about it — and names the product's own surfaces, so no two
-/// documents share one description.
+/// the number of published versions (one, two and three) and the windows those versions
+/// cover. A window is the one the evaluation it reports covers — a property of that
+/// document rather than of the class — and the only one the corpus discloses is the AWS
+/// Transfer Family report's, which opens on 1 November.
 ///
 /// A version's `published_at` opens the window it covers rather than closing it: an
 /// accessibility conformance report states the conformance of a product AS EVALUATED, and
@@ -59,18 +80,8 @@ const ACCESSIBILITY_ACCEPTANCE: &str = "PASSTHROUGH";
 pub(super) const ACCESSIBILITY_SEED: &[SeedReport] = &[
     SeedReport {
         id: "report-0QjvdIs6Bsw4uPxb",
-        name: "Accessibility Conformance Report VPAT - Amazon Connect",
-        description: "The Accessibility Conformance Report for Amazon Connect records how \
-                      the product's user interfaces meet the accessibility criteria of \
-                      Section 508 of the US Rehabilitation Act, EN 301 549 and the Web \
-                      Content Accessibility Guidelines, reported in the Voluntary Product \
-                      Accessibility Template that the Information Technology Industry \
-                      Council publishes. The evaluation covers the agent workspace, the \
-                      contact control panel and the administration website. Each criterion \
-                      is reported as supported, partially supported or not applicable, with \
-                      the remarks the evaluator recorded for it. Customer teams use it to \
-                      assess the product against their own accessibility obligations before \
-                      they roll it out to their users.",
+        name: "Accessibility Conformance Report (VPAT) - Amazon Connect",
+        description: ACCESSIBILITY_DESCRIPTION,
         series: ACCESSIBILITY_SERIES,
         category: ACCESSIBILITY_CATEGORY,
         acceptance_type: ACCESSIBILITY_ACCEPTANCE,
@@ -95,46 +106,27 @@ pub(super) const ACCESSIBILITY_SEED: &[SeedReport] = &[
     },
     SeedReport {
         id: "report-7g5j2DTVeNXWx7St",
-        name: "Accessibility Conformance Report VPAT - AWS Management Console",
-        description: "The Accessibility Conformance Report for the AWS Management Console \
-                      records how the console's user interfaces meet the accessibility \
-                      criteria of Section 508 of the US Rehabilitation Act, EN 301 549 and \
-                      the Web Content Accessibility Guidelines, reported in the Voluntary \
-                      Product Accessibility Template that the Information Technology \
-                      Industry Council publishes. The evaluation covers the console's \
-                      navigation, the service consoles reached from it and the \
-                      documentation it links to. Each criterion is reported as supported, \
-                      partially supported or not applicable, with the remarks the evaluator \
-                      recorded for it. Customer teams use it to assess the console against \
-                      their own accessibility obligations before they roll it out to their \
-                      users.",
+        name: "Accessibility Conformance Report (VPAT) - AWS Transfer Family",
+        description: ACCESSIBILITY_DESCRIPTION,
         series: ACCESSIBILITY_SERIES,
         category: ACCESSIBILITY_CATEGORY,
         acceptance_type: ACCESSIBILITY_ACCEPTANCE,
-        document_object: "Accessibility-Conformance-Report-AWS-Management-Console.pdf",
-        term_object: "Accessibility-Conformance-Report-AWS-Management-Console-Term.txt",
+        document_object: "Accessibility-Conformance-Report-AWS-Transfer-Family.pdf",
+        term_object: "Accessibility-Conformance-Report-AWS-Transfer-Family-Term.txt",
+        // The window the corpus records for this report opens on 1 November 2024; its
+        // close is the one this catalog publishes, which the recording does not contradict.
         versions: &[SeedVersion {
             version: 1,
-            period_start: T2024JAN,
+            period_start: T2024NOV,
             period_end: T2025JAN,
-            published_at: T2025JAN,
+            published_at: T2024NOV,
             sequence_number: 1,
         }],
     },
     SeedReport {
         id: "report-M2hXsL5bQw9TnF4j",
-        name: "Accessibility Conformance Report VPAT - Amazon WorkSpaces",
-        description: "The Accessibility Conformance Report for Amazon WorkSpaces records \
-                      how the product's user interfaces meet the accessibility criteria of \
-                      Section 508 of the US Rehabilitation Act, EN 301 549 and the Web \
-                      Content Accessibility Guidelines, reported in the Voluntary Product \
-                      Accessibility Template that the Information Technology Industry \
-                      Council publishes. The evaluation covers the desktop clients, the web \
-                      access client and the administration website. Each criterion is \
-                      reported as supported, partially supported or not applicable, with \
-                      the remarks the evaluator recorded for it. Customer teams use it to \
-                      assess the product against their own accessibility obligations before \
-                      they roll it out to their users.",
+        name: "Accessibility Conformance Report (VPAT) - Amazon WorkSpaces",
+        description: ACCESSIBILITY_DESCRIPTION,
         series: ACCESSIBILITY_SERIES,
         category: ACCESSIBILITY_CATEGORY,
         acceptance_type: ACCESSIBILITY_ACCEPTANCE,
@@ -159,18 +151,8 @@ pub(super) const ACCESSIBILITY_SEED: &[SeedReport] = &[
     },
     SeedReport {
         id: "report-N7kDvR3mYt8ZpB6c",
-        name: "Accessibility Conformance Report VPAT - Amazon QuickSight",
-        description: "The Accessibility Conformance Report for Amazon QuickSight records \
-                      how the product's user interfaces meet the accessibility criteria of \
-                      Section 508 of the US Rehabilitation Act, EN 301 549 and the Web \
-                      Content Accessibility Guidelines, reported in the Voluntary Product \
-                      Accessibility Template that the Information Technology Industry \
-                      Council publishes. The evaluation covers dashboard authoring, the \
-                      reader experience and the embedded analytics surfaces. Each criterion \
-                      is reported as supported, partially supported or not applicable, with \
-                      the remarks the evaluator recorded for it. Customer teams use it to \
-                      assess the product against their own accessibility obligations before \
-                      they roll it out to their users.",
+        name: "Accessibility Conformance Report (VPAT) - Amazon QuickSight",
+        description: ACCESSIBILITY_DESCRIPTION,
         series: ACCESSIBILITY_SERIES,
         category: ACCESSIBILITY_CATEGORY,
         acceptance_type: ACCESSIBILITY_ACCEPTANCE,
@@ -186,18 +168,8 @@ pub(super) const ACCESSIBILITY_SEED: &[SeedReport] = &[
     },
     SeedReport {
         id: "report-P5qZmJ8hXc2VtL9d",
-        name: "Accessibility Conformance Report VPAT - Amazon Chime SDK",
-        description: "The Accessibility Conformance Report for the Amazon Chime SDK records \
-                      how the product's user interfaces meet the accessibility criteria of \
-                      Section 508 of the US Rehabilitation Act, EN 301 549 and the Web \
-                      Content Accessibility Guidelines, reported in the Voluntary Product \
-                      Accessibility Template that the Information Technology Industry \
-                      Council publishes. The evaluation covers the meeting client, the \
-                      messaging surfaces and the call controls. Each criterion is reported \
-                      as supported, partially supported or not applicable, with the remarks \
-                      the evaluator recorded for it. Customer teams use it to assess the \
-                      product against their own accessibility obligations before they roll \
-                      it out to their users.",
+        name: "Accessibility Conformance Report (VPAT) - Amazon Chime SDK",
+        description: ACCESSIBILITY_DESCRIPTION,
         series: ACCESSIBILITY_SERIES,
         category: ACCESSIBILITY_CATEGORY,
         acceptance_type: ACCESSIBILITY_ACCEPTANCE,
@@ -229,18 +201,8 @@ pub(super) const ACCESSIBILITY_SEED: &[SeedReport] = &[
     },
     SeedReport {
         id: "report-Q8tBnW4fKz6RmS3h",
-        name: "Accessibility Conformance Report VPAT - AWS CloudShell",
-        description: "The Accessibility Conformance Report for AWS CloudShell records how \
-                      the product's user interfaces meet the accessibility criteria of \
-                      Section 508 of the US Rehabilitation Act, EN 301 549 and the Web \
-                      Content Accessibility Guidelines, reported in the Voluntary Product \
-                      Accessibility Template that the Information Technology Industry \
-                      Council publishes. The evaluation covers the terminal surface, its \
-                      keyboard interaction and the file transfer controls. Each criterion is \
-                      reported as supported, partially supported or not applicable, with \
-                      the remarks the evaluator recorded for it. Customer teams use it to \
-                      assess the product against their own accessibility obligations before \
-                      they roll it out to their users.",
+        name: "Accessibility Conformance Report (VPAT) - AWS CloudShell",
+        description: ACCESSIBILITY_DESCRIPTION,
         series: ACCESSIBILITY_SERIES,
         category: ACCESSIBILITY_CATEGORY,
         acceptance_type: ACCESSIBILITY_ACCEPTANCE,
@@ -256,18 +218,8 @@ pub(super) const ACCESSIBILITY_SEED: &[SeedReport] = &[
     },
     SeedReport {
         id: "report-R3vYkT9pLd5XnQ7b",
-        name: "Accessibility Conformance Report VPAT - Amazon SageMaker Studio",
-        description: "The Accessibility Conformance Report for Amazon SageMaker Studio \
-                      records how the product's user interfaces meet the accessibility \
-                      criteria of Section 508 of the US Rehabilitation Act, EN 301 549 and \
-                      the Web Content Accessibility Guidelines, reported in the Voluntary \
-                      Product Accessibility Template that the Information Technology \
-                      Industry Council publishes. The evaluation covers the notebook \
-                      workspace, the experiment views and the model registry. Each \
-                      criterion is reported as supported, partially supported or not \
-                      applicable, with the remarks the evaluator recorded for it. Customer \
-                      teams use it to assess the product against their own accessibility \
-                      obligations before they roll it out to their users.",
+        name: "Accessibility Conformance Report (VPAT) - Amazon SageMaker Studio",
+        description: ACCESSIBILITY_DESCRIPTION,
         series: ACCESSIBILITY_SERIES,
         category: ACCESSIBILITY_CATEGORY,
         acceptance_type: ACCESSIBILITY_ACCEPTANCE,
@@ -292,18 +244,8 @@ pub(super) const ACCESSIBILITY_SEED: &[SeedReport] = &[
     },
     SeedReport {
         id: "report-S6mFqH2xVb8JtZ4n",
-        name: "Accessibility Conformance Report VPAT - Amazon Lex",
-        description: "The Accessibility Conformance Report for Amazon Lex records how the \
-                      product's user interfaces meet the accessibility criteria of Section \
-                      508 of the US Rehabilitation Act, EN 301 549 and the Web Content \
-                      Accessibility Guidelines, reported in the Voluntary Product \
-                      Accessibility Template that the Information Technology Industry \
-                      Council publishes. The evaluation covers the bot authoring surface, \
-                      the test window and the conversation logs. Each criterion is reported \
-                      as supported, partially supported or not applicable, with the remarks \
-                      the evaluator recorded for it. Customer teams use it to assess the \
-                      product against their own accessibility obligations before they roll \
-                      it out to their users.",
+        name: "Accessibility Conformance Report (VPAT) - Amazon Lex",
+        description: ACCESSIBILITY_DESCRIPTION,
         series: ACCESSIBILITY_SERIES,
         category: ACCESSIBILITY_CATEGORY,
         acceptance_type: ACCESSIBILITY_ACCEPTANCE,

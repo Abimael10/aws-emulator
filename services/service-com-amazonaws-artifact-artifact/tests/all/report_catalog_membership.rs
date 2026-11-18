@@ -35,8 +35,8 @@ use serde_json::Value;
 use smithy_server_runtime::MultiServiceRouter;
 
 use super::harness::{
-    emulator, get_report_metadata, list_report_versions, list_reports, Expected, CATALOG,
-    HOME_REGION,
+    emulator, get_report_metadata, list_report_versions, page_size_case, walk_reports, Expected,
+    CATALOG, HOME_REGION,
 };
 
 /// The page sizes the enumeration is walked at: the floor and the ceiling of
@@ -124,50 +124,16 @@ struct Entry {
 
 /// Every entry of one whole walk of the enumeration, a page at a time.
 ///
-/// Asserts only what the walk needs to BE a walk — each page is served and holds at most
-/// `maxResults` entries — so the membership rules below assert over the entries rather
-/// than over the paging.
+/// The walk itself is the harness's ([`walk_reports`]), which asserts what makes it a walk
+/// — each page served and cut at `maxResults`, and the walk terminating; this reads each
+/// reported summary into an [`Entry`], so the membership rules below assert over the
+/// entries rather than over the paging.
 async fn walk(router: &MultiServiceRouter, case: &str, max_results: Option<i32>) -> Vec<Entry> {
-    let mut entries: Vec<Entry> = Vec::new();
-    let mut token: Option<String> = None;
-    let mut page = 0usize;
-    loop {
-        page += 1;
-        assert!(
-            page <= CATALOG.len() + 1,
-            "case {case:?}: a walk of {} reports must terminate, got {page} pages",
-            CATALOG.len()
-        );
-        let mut query = String::new();
-        if let Some(size) = max_results {
-            query.push_str(&format!("?maxResults={size}"));
-        }
-        if let Some(value) = token.as_deref() {
-            query.push(if query.is_empty() { '?' } else { '&' });
-            query.push_str(&format!("nextToken={value}"));
-        }
-        let answer = list_reports(router, &query).await;
-        assert_eq!(
-            answer.status, 200,
-            "case {case:?}: page {page} of the enumeration must be served, got {} with {:?}",
-            answer.status, answer.body
-        );
-        if let Some(size) = max_results {
-            assert!(
-                i32::try_from(answer.reports().len()).unwrap_or(i32::MAX) <= size,
-                "case {case:?}: page {page} is cut at maxResults, got {} entries",
-                answer.reports().len()
-            );
-        }
-        for summary in answer.reports() {
-            entries.push(entry(case, summary, page));
-        }
-        match answer.next_token() {
-            None => break,
-            Some(issued) => token = Some(issued),
-        }
-    }
-    entries
+    walk_reports(router, case, max_results)
+        .await
+        .into_iter()
+        .map(|(page, summary)| entry(case, &summary, page))
+        .collect()
 }
 
 /// One reported summary read into an [`Entry`], asserting it carries every member a report
@@ -196,14 +162,6 @@ fn entry(case: &str, summary: &Value, page: usize) -> Entry {
     }
 }
 
-/// A case label for one page size.
-fn label(max_results: Option<i32>) -> String {
-    match max_results {
-        None => "maxResults absent".to_string(),
-        Some(size) => format!("maxResults={size}"),
-    }
-}
-
 /// The catalog row `id` names, or a failure saying the enumeration reported a report the
 /// published set does not hold.
 fn row(case: &str, id: &str) -> &'static Expected {
@@ -217,7 +175,7 @@ async fn every_catalog_report_is_enumerated_on_exactly_one_page_at_every_page_si
     let router = emulator();
 
     for max_results in PAGE_SIZES {
-        let case = label(*max_results);
+        let case = page_size_case(*max_results);
         let entries = walk(&router, &case, *max_results).await;
 
         // Exactly once: a report the walk reported twice is one a client pages into its

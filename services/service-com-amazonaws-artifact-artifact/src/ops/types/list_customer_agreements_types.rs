@@ -132,10 +132,10 @@ impl ::aws_smithy_schema::serde::SerializableStruct for CustomerAgreementSummary
             s.write_string(&Self::M_ORGANIZATION_ARN, v.as_str())?;
         }
         if let Some(v) = self.effective_start.as_ref() {
-            s.write_timestamp(&Self::M_EFFECTIVE_START, v)?;
+            write_artifact_date_time(s, &Self::M_EFFECTIVE_START, v)?;
         }
         if let Some(v) = self.effective_end.as_ref() {
-            s.write_timestamp(&Self::M_EFFECTIVE_END, v)?;
+            write_artifact_date_time(s, &Self::M_EFFECTIVE_END, v)?;
         }
         if let Some(v) = self.state.as_ref() {
             s.write_string(&Self::M_STATE, v.as_str())?;

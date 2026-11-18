@@ -101,9 +101,9 @@ impl ::aws_smithy_schema::serde::SerializableStruct for InquiryDetail {
         s.write_string(&Self::M_STATUS, self.status.as_str())?;
         s.write_string(&Self::M_STATUS_MESSAGE, self.status_message.as_str())?;
         s.write_string(&Self::M_INPUT_SOURCE, self.input_source.as_str())?;
-        s.write_timestamp(&Self::M_CREATED_AT, &self.created_at)?;
+        write_artifact_date_time(s, &Self::M_CREATED_AT, &self.created_at)?;
         if let Some(v) = self.updated_at.as_ref() {
-            s.write_timestamp(&Self::M_UPDATED_AT, v)?;
+            write_artifact_date_time(s, &Self::M_UPDATED_AT, v)?;
         }
         if let Some(v) = self.support_mode.as_ref() {
             s.write_string(&Self::M_SUPPORT_MODE, v.as_str())?;

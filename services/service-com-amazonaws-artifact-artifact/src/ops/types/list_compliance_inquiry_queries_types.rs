@@ -115,7 +115,7 @@ impl ::aws_smithy_schema::serde::SerializableStruct for QuerySummary {
         }
         s.write_string(&Self::M_STATUS, self.status.as_str())?;
         s.write_string(&Self::M_STATUS_MESSAGE, self.status_message.as_str())?;
-        s.write_timestamp(&Self::M_CREATED_AT, &self.created_at)?;
+        write_artifact_date_time(s, &Self::M_CREATED_AT, &self.created_at)?;
         if let Some(v) = self.updated_response_versions.as_ref() {
             s.write_list(&Self::M_UPDATED_RESPONSE_VERSIONS, &|sl| {
                 for version in v.iter() {
@@ -239,7 +239,7 @@ impl ::aws_smithy_schema::serde::SerializableStruct for ResponseVersion {
         s: &mut dyn ::aws_smithy_schema::serde::ShapeSerializer,
     ) -> ::std::result::Result<(), ::aws_smithy_schema::serde::SerdeError> {
         s.write_string(&Self::M_RESPONSE_TEXT, self.response_text.as_str())?;
-        s.write_timestamp(&Self::M_TIMESTAMP, &self.timestamp)?;
+        write_artifact_date_time(s, &Self::M_TIMESTAMP, &self.timestamp)?;
         Ok(())
     }
 }

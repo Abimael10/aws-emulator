@@ -20,10 +20,59 @@
 
 use std::sync::Arc;
 
+use aws_smithy_types::date_time::Format;
+use aws_smithy_types::DateTime;
 use bytes::Bytes;
 use serde_json::Value;
 use service_com_amazonaws_artifact_artifact::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
+
+/// How many digits wide the fraction of a rendered date-time is: the millisecond
+/// resolution this service reports an instant at, whatever the value of the milliseconds
+/// (a recorded catalog entry carries `2024-11-01T00:00:00.000Z`).
+pub const MILLISECOND_DIGITS: usize = 3;
+
+/// Assert one `TimestampAttribute` member's wire form and answer the instant it names.
+///
+/// The ONE date-time form assertion of this crate's suites — the form is one service-wide
+/// rule, so a suite checking a member's wire form builds on this rather than on a copy of
+/// it: a JSON STRING (never restJson1's default epoch-seconds number) that the `date-time`
+/// format parses, closed by `Z`, carrying a fraction exactly [`MILLISECOND_DIGITS`] wide.
+/// A suite's own extra expectations about the instant are asserted by the suite, over the
+/// value this hands back.
+pub fn assert_rendered_date_time(case: &str, member: &str, value: &Value) -> DateTime {
+    assert!(
+        !value.is_number(),
+        "case {case:?}: {member} targets TimestampAttribute (@timestampFormat date-time), so it \
+         must be an RFC 3339 string and never an epoch-seconds number, got {value:?}"
+    );
+    let text = value.as_str().unwrap_or_else(|| {
+        panic!("case {case:?}: {member} must be an RFC 3339 date-time string, got {value:?}")
+    });
+    let parsed = DateTime::from_str(text, Format::DateTime).unwrap_or_else(|error| {
+        panic!("case {case:?}: {member} must parse as a date-time ({error}), got {text:?}")
+    });
+    assert!(
+        text.contains('T'),
+        "case {case:?}: {member} must be an ISO-8601 date-time, got {text:?}"
+    );
+    let fraction = text
+        .strip_suffix('Z')
+        .and_then(|civil| civil.split_once('.').map(|(_, fraction)| fraction))
+        .unwrap_or_else(|| {
+            panic!(
+                "case {case:?}: {member} must be a UTC date-time carrying a fraction of a \
+                 second, got {text:?}"
+            )
+        });
+    assert!(
+        fraction.len() == MILLISECOND_DIGITS
+            && fraction.chars().all(|digit| digit.is_ascii_digit()),
+        "case {case:?}: {member} must carry a {MILLISECOND_DIGITS}-digit millisecond fraction, \
+         got {text:?}"
+    );
+    parsed
+}
 
 /// The endpoint host every request of this harness is addressed to — and therefore the
 /// host an announced document URL names, since a document URL names the endpoint the
@@ -120,6 +169,11 @@ pub fn a_report_requiring_acceptance() -> &'static Expected {
 /// is a report AWS publishes in Artifact under an id this emulator assigns (see `SEED` and
 /// `accessibility_reports` in `src/state.rs`).
 ///
+/// A published title is spelled as it is published, punctuation included: the recorded
+/// entry of the accessibility-conformance class is titled
+/// "Accessibility Conformance Report (VPAT) - <product>", which `ShortStringAttribute`'s
+/// `@pattern` (a bound on what a REQUEST may send) does not admit.
+///
 /// The rows differ along everything the rules generalise over: report series, category,
 /// `AcceptanceType`, and how many versions a report has (one, two, three and seven). The
 /// catalog holds both of the classes AWS publishes: one row per compliance programme, and
@@ -135,7 +189,7 @@ pub const CATALOG: &[Expected] = &[
     },
     Expected {
         id: "report-0QjvdIs6Bsw4uPxb",
-        name: "Accessibility Conformance Report VPAT - Amazon Connect",
+        name: "Accessibility Conformance Report (VPAT) - Amazon Connect",
         series: "ACR",
         category: "Certifications and Attestations",
         acceptance_type: "PASSTHROUGH",
@@ -154,12 +208,12 @@ pub const CATALOG: &[Expected] = &[
         name: "UAE IAR Compliance Report",
         series: "UAE TDRA IAR",
         category: "Certifications and Attestations",
-        acceptance_type: "EXPLICIT",
+        acceptance_type: "PASSTHROUGH",
         versions: &[1, 2, 3, 4, 5, 6, 7],
     },
     Expected {
         id: "report-7g5j2DTVeNXWx7St",
-        name: "Accessibility Conformance Report VPAT - AWS Management Console",
+        name: "Accessibility Conformance Report (VPAT) - AWS Transfer Family",
         series: "ACR",
         category: "Certifications and Attestations",
         acceptance_type: "PASSTHROUGH",
@@ -263,7 +317,7 @@ pub const CATALOG: &[Expected] = &[
     },
     Expected {
         id: "report-M2hXsL5bQw9TnF4j",
-        name: "Accessibility Conformance Report VPAT - Amazon WorkSpaces",
+        name: "Accessibility Conformance Report (VPAT) - Amazon WorkSpaces",
         series: "ACR",
         category: "Certifications and Attestations",
         acceptance_type: "PASSTHROUGH",
@@ -271,7 +325,7 @@ pub const CATALOG: &[Expected] = &[
     },
     Expected {
         id: "report-N7kDvR3mYt8ZpB6c",
-        name: "Accessibility Conformance Report VPAT - Amazon QuickSight",
+        name: "Accessibility Conformance Report (VPAT) - Amazon QuickSight",
         series: "ACR",
         category: "Certifications and Attestations",
         acceptance_type: "PASSTHROUGH",
@@ -279,7 +333,7 @@ pub const CATALOG: &[Expected] = &[
     },
     Expected {
         id: "report-P5qZmJ8hXc2VtL9d",
-        name: "Accessibility Conformance Report VPAT - Amazon Chime SDK",
+        name: "Accessibility Conformance Report (VPAT) - Amazon Chime SDK",
         series: "ACR",
         category: "Certifications and Attestations",
         acceptance_type: "PASSTHROUGH",
@@ -287,7 +341,7 @@ pub const CATALOG: &[Expected] = &[
     },
     Expected {
         id: "report-Q8tBnW4fKz6RmS3h",
-        name: "Accessibility Conformance Report VPAT - AWS CloudShell",
+        name: "Accessibility Conformance Report (VPAT) - AWS CloudShell",
         series: "ACR",
         category: "Certifications and Attestations",
         acceptance_type: "PASSTHROUGH",
@@ -295,7 +349,7 @@ pub const CATALOG: &[Expected] = &[
     },
     Expected {
         id: "report-R3vYkT9pLd5XnQ7b",
-        name: "Accessibility Conformance Report VPAT - Amazon SageMaker Studio",
+        name: "Accessibility Conformance Report (VPAT) - Amazon SageMaker Studio",
         series: "ACR",
         category: "Certifications and Attestations",
         acceptance_type: "PASSTHROUGH",
@@ -303,7 +357,7 @@ pub const CATALOG: &[Expected] = &[
     },
     Expected {
         id: "report-S6mFqH2xVb8JtZ4n",
-        name: "Accessibility Conformance Report VPAT - Amazon Lex",
+        name: "Accessibility Conformance Report (VPAT) - Amazon Lex",
         series: "ACR",
         category: "Certifications and Attestations",
         acceptance_type: "PASSTHROUGH",
@@ -426,6 +480,69 @@ pub async fn get_signed(router: &MultiServiceRouter, uri: &str, authorization: &
 
 pub async fn list_reports(router: &MultiServiceRouter, query: &str) -> Answer {
     get(router, &format!("/v1/report/list{query}")).await
+}
+
+/// A case label for one page size, for a suite walking the catalog at several of them.
+pub fn page_size_case(max_results: Option<i32>) -> String {
+    match max_results {
+        None => "maxResults absent".to_string(),
+        Some(size) => format!("maxResults={size}"),
+    }
+}
+
+/// Every entry of ONE whole walk of `ListReports` at `max_results`, in the order the pages
+/// reported them, each paired with the 1-based page it came on.
+///
+/// The ONE catalog walker of this crate's suites: a suite asserting about the entries, the
+/// pages they arrive on, or how a page size changes them builds on this rather than on a
+/// copy of the paging loop. It asserts only what makes the walk a walk — every page is
+/// served, a page holds at most `maxResults` entries, and the walk terminates — so each
+/// suite's own rule is asserted over what it hands back.
+pub async fn walk_reports(
+    router: &MultiServiceRouter,
+    case: &str,
+    max_results: Option<i32>,
+) -> Vec<(usize, Value)> {
+    let mut entries: Vec<(usize, Value)> = Vec::new();
+    let mut token: Option<String> = None;
+    let mut page = 0usize;
+    loop {
+        page += 1;
+        assert!(
+            page <= CATALOG.len() + 1,
+            "case {case:?}: a walk of {} reports must terminate, got {page} pages",
+            CATALOG.len()
+        );
+        let mut query = String::new();
+        if let Some(size) = max_results {
+            query.push_str(&format!("?maxResults={size}"));
+        }
+        if let Some(value) = token.as_deref() {
+            query.push(if query.is_empty() { '?' } else { '&' });
+            query.push_str(&format!("nextToken={value}"));
+        }
+        let answer = list_reports(router, &query).await;
+        assert_eq!(
+            answer.status, 200,
+            "case {case:?}: page {page} of the enumeration must be served, got {} with {:?}",
+            answer.status, answer.body
+        );
+        if let Some(size) = max_results {
+            assert!(
+                i32::try_from(answer.reports().len()).unwrap_or(i32::MAX) <= size,
+                "case {case:?}: page {page} is cut at maxResults, got {} entries",
+                answer.reports().len()
+            );
+        }
+        for summary in answer.reports() {
+            entries.push((page, summary.clone()));
+        }
+        match answer.next_token() {
+            None => break,
+            Some(issued) => token = Some(issued),
+        }
+    }
+    entries
 }
 
 pub async fn list_report_versions(router: &MultiServiceRouter, query: &str) -> Answer {

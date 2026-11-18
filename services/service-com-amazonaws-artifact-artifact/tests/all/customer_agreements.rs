@@ -87,8 +87,9 @@ const ACTIVE: &[Expected] = &[
         name: "AWS Business Associate Addendum",
         agreement: "AWS-BAA",
         agreement_type: "DEFAULT",
-        // 2024-01-01T00:00:00Z
-        effective_start: "2024-01-01T00:00:00Z",
+        // 2024-01-01T00:00:00Z, rendered at the millisecond resolution this service
+        // reports an instant at.
+        effective_start: "2024-01-01T00:00:00.000Z",
         acceptance_terms: 2,
         terminate_terms: 1,
     },
@@ -98,7 +99,7 @@ const ACTIVE: &[Expected] = &[
         agreement: "AWS-GDPR-DPA",
         agreement_type: "MODIFIED",
         // 2024-07-01T00:00:00Z
-        effective_start: "2024-07-01T00:00:00Z",
+        effective_start: "2024-07-01T00:00:00.000Z",
         acceptance_terms: 3,
         terminate_terms: 2,
     },
@@ -108,7 +109,7 @@ const ACTIVE: &[Expected] = &[
         agreement: "AWS-NDA",
         agreement_type: "CUSTOM",
         // 2025-01-01T00:00:00Z
-        effective_start: "2025-01-01T00:00:00Z",
+        effective_start: "2025-01-01T00:00:00.000Z",
         acceptance_terms: 1,
         terminate_terms: 1,
     },

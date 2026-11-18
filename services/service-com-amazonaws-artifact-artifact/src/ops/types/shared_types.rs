@@ -85,6 +85,55 @@ macro_rules! artifact_date_time_member_schema {
 
 pub(crate) use artifact_date_time_member_schema;
 
+/// Nanoseconds in one millisecond — the resolution [`artifact_date_time_text`] renders a
+/// date-time at.
+const NANOS_PER_MILLI: u32 = 1_000_000;
+
+/// One instant as the date-time TEXT this service renders it as: an RFC 3339 UTC instant
+/// whose fraction is three digits wide, the millisecond resolution AWS Artifact reports an
+/// instant at (a recorded catalog entry carries e.g. `2024-11-01T00:00:00.000Z`).
+///
+/// `None` only for an instant the date type cannot render at all.
+///
+/// The calendar part is rendered by the very same `aws-smithy-types` date type the codec's
+/// own timestamp writer uses, so there is no second date implementation here. Only the
+/// FRACTION is written out, because that renderer emits a fraction of as many digits as the
+/// value needs and none at all for a whole second, so the width of a stamp would otherwise
+/// depend on the value of its milliseconds: a whole second would render `…:00Z` where the
+/// service renders `…:00.000Z`, and 120 ms as `.12` where the service renders `.120`.
+///
+/// Sub-millisecond digits are dropped rather than rounded: this is the resolution the
+/// service reports at, so a stamp read twice names the same instant both times.
+pub fn artifact_date_time_text(at: &::aws_smithy_types::DateTime) -> Option<String> {
+    let whole = ::aws_smithy_types::DateTime::from_secs(at.secs())
+        .fmt(::aws_smithy_types::date_time::Format::DateTime)
+        .ok()?;
+    // The renderer closes a UTC instant with `Z`; anything else is not the form this
+    // service reports, so it is answered as unrenderable rather than emitted without the
+    // fraction every stamp of this service carries.
+    let civil = whole.strip_suffix('Z')?;
+    let millis = at.subsec_nanos() / NANOS_PER_MILLI;
+    Some(format!("{civil}.{millis:03}Z"))
+}
+
+/// Write one `TimestampAttribute` member as the text [`artifact_date_time_text`] renders.
+///
+/// The member schema keeps `@timestampFormat("date-time")`
+/// ([`artifact_date_time_member_schema`]) — that is what the model declares — and a
+/// `date-time` is a JSON string on restJson1, so the member's wire TYPE is unchanged by
+/// writing the rendered text here rather than handing the instant to the codec's own
+/// renderer, which cannot carry a fraction this service always carries.
+pub fn write_artifact_date_time(
+    s: &mut dyn ::aws_smithy_schema::serde::ShapeSerializer,
+    schema: &::aws_smithy_schema::Schema,
+    at: &::aws_smithy_types::DateTime,
+) -> ::std::result::Result<(), ::aws_smithy_schema::serde::SerdeError> {
+    let rendered = artifact_date_time_text(at).ok_or_else(|| {
+        ::aws_smithy_schema::serde::SerdeError::custom("invalid timestamp".to_string())
+    })?;
+    s.write_string(schema, &rendered)
+}
+
 #[smithy_macros::smithy(shape = "com.amazonaws.artifact#AccessDeniedException")]
 #[derive(Debug, Clone, Default)]
 pub struct AccessDeniedException {
@@ -224,7 +273,7 @@ impl ::aws_smithy_schema::serde::SerializableStruct for InquirySummary {
         s.write_string(&Self::M_STATUS, self.status.as_str())?;
         s.write_string(&Self::M_STATUS_MESSAGE, self.status_message.as_str())?;
         s.write_string(&Self::M_INPUT_SOURCE, self.input_source.as_str())?;
-        s.write_timestamp(&Self::M_CREATED_AT, &self.created_at)?;
+        write_artifact_date_time(s, &Self::M_CREATED_AT, &self.created_at)?;
         Ok(())
     }
 }
@@ -395,10 +444,10 @@ impl ::aws_smithy_schema::serde::SerializableStruct for ReportSummary {
             s.write_string(&Self::M_DESCRIPTION, v.as_str())?;
         }
         if let Some(v) = self.period_start.as_ref() {
-            s.write_timestamp(&Self::M_PERIOD_START, v)?;
+            write_artifact_date_time(s, &Self::M_PERIOD_START, v)?;
         }
         if let Some(v) = self.period_end.as_ref() {
-            s.write_timestamp(&Self::M_PERIOD_END, v)?;
+            write_artifact_date_time(s, &Self::M_PERIOD_END, v)?;
         }
         if let Some(v) = self.series.as_ref() {
             s.write_string(&Self::M_SERIES, v.as_str())?;

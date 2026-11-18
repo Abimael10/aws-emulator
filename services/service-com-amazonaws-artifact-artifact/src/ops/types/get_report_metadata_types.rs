@@ -160,19 +160,19 @@ impl ::aws_smithy_schema::serde::SerializableStruct for ReportDetail {
             s.write_string(&Self::M_DESCRIPTION, v.as_str())?;
         }
         if let Some(v) = self.period_start.as_ref() {
-            s.write_timestamp(&Self::M_PERIOD_START, v)?;
+            write_artifact_date_time(s, &Self::M_PERIOD_START, v)?;
         }
         if let Some(v) = self.period_end.as_ref() {
-            s.write_timestamp(&Self::M_PERIOD_END, v)?;
+            write_artifact_date_time(s, &Self::M_PERIOD_END, v)?;
         }
         if let Some(v) = self.created_at.as_ref() {
-            s.write_timestamp(&Self::M_CREATED_AT, v)?;
+            write_artifact_date_time(s, &Self::M_CREATED_AT, v)?;
         }
         if let Some(v) = self.last_modified_at.as_ref() {
-            s.write_timestamp(&Self::M_LAST_MODIFIED_AT, v)?;
+            write_artifact_date_time(s, &Self::M_LAST_MODIFIED_AT, v)?;
         }
         if let Some(v) = self.deleted_at.as_ref() {
-            s.write_timestamp(&Self::M_DELETED_AT, v)?;
+            write_artifact_date_time(s, &Self::M_DELETED_AT, v)?;
         }
         if let Some(v) = self.state.as_ref() {
             s.write_string(&Self::M_STATE, v.as_str())?;

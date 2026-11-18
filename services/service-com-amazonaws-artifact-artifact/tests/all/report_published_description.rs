@@ -4,20 +4,29 @@
 //!
 //! RULE D — a report's `description` is the PUBLISHED description of the document: the
 //! prose its publisher writes about it. So it is the document's own description rather
-//! than a label naming it (a published description is several complete sentences, not a
-//! restatement of the row's `name`), it satisfies the constraints the member's target
-//! declares, and every operation that projects it — `ListReports`, `ListReportVersions`
-//! and `GetReportMetadata` at every published version — reports that same one text, read
-//! from the one stored record.
+//! than a label naming it (a complete sentence about the document, never a restatement of
+//! the row's `name`), it is as long as the publisher wrote it — one sentence for one
+//! document and a paragraph for another, which is why nothing here bounds it below — it
+//! satisfies the constraints the member's target declares, and every operation that
+//! projects it — `ListReports`, `ListReportVersions` and `GetReportMetadata` at every
+//! published version — reports that same one text, read from the one stored record.
+//!
+//! A description belongs to the DOCUMENT, so two documents of different publication
+//! classes never share one. Within one class they can: the accessibility-conformance class
+//! publishes one description about the template it reports on ("the relevant AWS product or
+//! service"), which every report of the class carries — the recorded catalog entry of that
+//! class is what shows it — while the product each one reports on is carried by its title.
 //!
 //! The rows below span the whole catalog, which differs along what the rule generalises
-//! over: the report series it publishes, two categories, both `AcceptanceType` values, and
-//! reports publishing one, two, three and seven versions. The FIRST row's text is the
-//! published description the corpus records for that report (quoted in
-//! `issues/things-that-now-work/20261029T192742Z-artifact-read-plane-serves-an-incomplete-report-catalog.md`);
-//! the rest are the catalog's own, which this suite spells out independently of
-//! `src/state.rs` so a row reseeded with a label fails here rather than redefining what
-//! the suite asserts.
+//! over: the report series it publishes, two categories, both `AcceptanceType` values,
+//! reports publishing one, two, three and seven versions, and a published description that
+//! is one sentence as well as ones that run to a paragraph. The texts the corpus records
+//! are quoted from it — `report-073F0fUCdVVNKJrF`'s in
+//! `issues/things-that-now-work/20261029T192742Z-artifact-read-plane-serves-an-incomplete-report-catalog.md`,
+//! the accessibility class's and `report-5eevElBv6MyRmQsD`'s in the `ListReports` issue
+//! that reported them — and the rest are the catalog's own, which this suite spells out
+//! independently of `src/state.rs` so a row reseeded with a label fails here rather than
+//! redefining what the suite asserts.
 
 use serde_json::Value;
 
@@ -28,16 +37,23 @@ use crate::harness::{emulator, get_report_metadata, list_report_versions, list_r
 /// ^[^<>]*$` (`smithy_query(query="shape",shape="LongStringAttribute")`).
 const DESCRIPTION_MAX: usize = 2048;
 
-/// The fewest complete sentences a PUBLISHED description carries. A document description
-/// states what the document is, who it is for and what it covers; a single clause naming
-/// the document is the label this rule rejects.
-const SENTENCES_MIN: usize = 2;
+/// The published description of every report of the accessibility-conformance class, as
+/// the corpus records it for an entry of that class: one text about the template, which
+/// every report of the class carries.
+const ACCESSIBILITY_DESCRIPTION: &str =
+    "This document is an Accessibility Conformance Report (ACR) based on the ITI VPAT® \
+     and is intended to provide information on the accessibility of the relevant AWS \
+     product or service. The VPAT references accessibility standards for information and \
+     communications technology including: Section 508 (U.S.), EN 301 549 (EU), and \
+     W3C/WAI WCAG.";
 
 /// The published description of every report in the catalog, keyed by its `ReportId`.
 ///
-/// Source for `report-073F0fUCdVVNKJrF`: the recorded `ListReports` body for that report,
-/// as the issue named in this file's header quotes it. The others are the catalog's own
-/// published text (see `SEED` in `src/state.rs`).
+/// Source for `report-073F0fUCdVVNKJrF` and `report-5eevElBv6MyRmQsD`: the recorded
+/// `ListReports` body for those reports, as the issues named in this file's header quote
+/// it. The accessibility-conformance rows carry that class's one published description,
+/// also recorded. The others are the catalog's own published text (see `SEED` in
+/// `src/state.rs`).
 const PUBLISHED: &[(&str, &str)] = &[
     (
         "report-073F0fUCdVVNKJrF",
@@ -49,16 +65,7 @@ const PUBLISHED: &[(&str, &str)] = &[
     ),
     (
         "report-0QjvdIs6Bsw4uPxb",
-        "The Accessibility Conformance Report for Amazon Connect records how the \
-         product's user interfaces meet the accessibility criteria of Section 508 of the \
-         US Rehabilitation Act, EN 301 549 and the Web Content Accessibility Guidelines, \
-         reported in the Voluntary Product Accessibility Template that the Information \
-         Technology Industry Council publishes. The evaluation covers the agent workspace, \
-         the contact control panel and the administration website. Each criterion is \
-         reported as supported, partially supported or not applicable, with the remarks \
-         the evaluator recorded for it. Customer teams use it to assess the product \
-         against their own accessibility obligations before they roll it out to their \
-         users.",
+        ACCESSIBILITY_DESCRIPTION,
     ),
     (
         "report-0c1IXmudeXuTlHJJ",
@@ -70,25 +77,12 @@ const PUBLISHED: &[(&str, &str)] = &[
     ),
     (
         "report-5eevElBv6MyRmQsD",
-        "The UAE Information Assurance Regulation compliance report describes how the AWS \
-         Regions in its scope meet the controls that the Telecommunications and Digital \
-         Government Regulatory Authority publishes in its Information Assurance Regulation. \
-         It is prepared by an independent assessor and covers the assessment period stated \
-         on the report. Customer teams use it to support their own assurance obligations \
-         for workloads operated in the United Arab Emirates.",
+        "Independent compliance assessment against the United Arab Emirates (UAE) \
+         Information Assurance Regulation (IAR).",
     ),
     (
         "report-7g5j2DTVeNXWx7St",
-        "The Accessibility Conformance Report for the AWS Management Console records how \
-         the console's user interfaces meet the accessibility criteria of Section 508 of \
-         the US Rehabilitation Act, EN 301 549 and the Web Content Accessibility \
-         Guidelines, reported in the Voluntary Product Accessibility Template that the \
-         Information Technology Industry Council publishes. The evaluation covers the \
-         console's navigation, the service consoles reached from it and the documentation \
-         it links to. Each criterion is reported as supported, partially supported or not \
-         applicable, with the remarks the evaluator recorded for it. Customer teams use it \
-         to assess the console against their own accessibility obligations before they \
-         roll it out to their users.",
+        ACCESSIBILITY_DESCRIPTION,
     ),
     (
         "report-9pQ2mT8xLbV4sZ1c",
@@ -195,78 +189,27 @@ const PUBLISHED: &[(&str, &str)] = &[
     ),
     (
         "report-M2hXsL5bQw9TnF4j",
-        "The Accessibility Conformance Report for Amazon WorkSpaces records how the \
-         product's user interfaces meet the accessibility criteria of Section 508 of the \
-         US Rehabilitation Act, EN 301 549 and the Web Content Accessibility Guidelines, \
-         reported in the Voluntary Product Accessibility Template that the Information \
-         Technology Industry Council publishes. The evaluation covers the desktop clients, \
-         the web access client and the administration website. Each criterion is reported \
-         as supported, partially supported or not applicable, with the remarks the \
-         evaluator recorded for it. Customer teams use it to assess the product against \
-         their own accessibility obligations before they roll it out to their users.",
+        ACCESSIBILITY_DESCRIPTION,
     ),
     (
         "report-N7kDvR3mYt8ZpB6c",
-        "The Accessibility Conformance Report for Amazon QuickSight records how the \
-         product's user interfaces meet the accessibility criteria of Section 508 of the \
-         US Rehabilitation Act, EN 301 549 and the Web Content Accessibility Guidelines, \
-         reported in the Voluntary Product Accessibility Template that the Information \
-         Technology Industry Council publishes. The evaluation covers dashboard authoring, \
-         the reader experience and the embedded analytics surfaces. Each criterion is \
-         reported as supported, partially supported or not applicable, with the remarks \
-         the evaluator recorded for it. Customer teams use it to assess the product \
-         against their own accessibility obligations before they roll it out to their \
-         users.",
+        ACCESSIBILITY_DESCRIPTION,
     ),
     (
         "report-P5qZmJ8hXc2VtL9d",
-        "The Accessibility Conformance Report for the Amazon Chime SDK records how the \
-         product's user interfaces meet the accessibility criteria of Section 508 of the \
-         US Rehabilitation Act, EN 301 549 and the Web Content Accessibility Guidelines, \
-         reported in the Voluntary Product Accessibility Template that the Information \
-         Technology Industry Council publishes. The evaluation covers the meeting client, \
-         the messaging surfaces and the call controls. Each criterion is reported as \
-         supported, partially supported or not applicable, with the remarks the evaluator \
-         recorded for it. Customer teams use it to assess the product against their own \
-         accessibility obligations before they roll it out to their users.",
+        ACCESSIBILITY_DESCRIPTION,
     ),
     (
         "report-Q8tBnW4fKz6RmS3h",
-        "The Accessibility Conformance Report for AWS CloudShell records how the product's \
-         user interfaces meet the accessibility criteria of Section 508 of the US \
-         Rehabilitation Act, EN 301 549 and the Web Content Accessibility Guidelines, \
-         reported in the Voluntary Product Accessibility Template that the Information \
-         Technology Industry Council publishes. The evaluation covers the terminal \
-         surface, its keyboard interaction and the file transfer controls. Each criterion \
-         is reported as supported, partially supported or not applicable, with the remarks \
-         the evaluator recorded for it. Customer teams use it to assess the product \
-         against their own accessibility obligations before they roll it out to their \
-         users.",
+        ACCESSIBILITY_DESCRIPTION,
     ),
     (
         "report-R3vYkT9pLd5XnQ7b",
-        "The Accessibility Conformance Report for Amazon SageMaker Studio records how the \
-         product's user interfaces meet the accessibility criteria of Section 508 of the \
-         US Rehabilitation Act, EN 301 549 and the Web Content Accessibility Guidelines, \
-         reported in the Voluntary Product Accessibility Template that the Information \
-         Technology Industry Council publishes. The evaluation covers the notebook \
-         workspace, the experiment views and the model registry. Each criterion is \
-         reported as supported, partially supported or not applicable, with the remarks \
-         the evaluator recorded for it. Customer teams use it to assess the product \
-         against their own accessibility obligations before they roll it out to their \
-         users.",
+        ACCESSIBILITY_DESCRIPTION,
     ),
     (
         "report-S6mFqH2xVb8JtZ4n",
-        "The Accessibility Conformance Report for Amazon Lex records how the product's \
-         user interfaces meet the accessibility criteria of Section 508 of the US \
-         Rehabilitation Act, EN 301 549 and the Web Content Accessibility Guidelines, \
-         reported in the Voluntary Product Accessibility Template that the Information \
-         Technology Industry Council publishes. The evaluation covers the bot authoring \
-         surface, the test window and the conversation logs. Each criterion is reported as \
-         supported, partially supported or not applicable, with the remarks the evaluator \
-         recorded for it. Customer teams use it to assess the product against their own \
-         accessibility obligations before they roll it out to their users.",
+        ACCESSIBILITY_DESCRIPTION,
     ),
 ];
 
@@ -289,6 +232,16 @@ fn sentences(text: &str) -> usize {
     text.split_terminator(". ")
         .filter(|part| !part.trim().is_empty())
         .count()
+}
+
+/// The series the catalog reports for `id`, which is the publication CLASS a description
+/// may be shared within.
+fn series_of(id: &str) -> &'static str {
+    CATALOG
+        .iter()
+        .find(|row| row.id == id)
+        .map(|row| row.series)
+        .unwrap_or_else(|| panic!("case {id:?}: the catalog holds no such report"))
 }
 
 /// The report the listing reports under `id`.
@@ -351,11 +304,13 @@ async fn a_published_description_is_prose_about_the_document_not_a_label() {
             "case {case:?}: a description must match ^[^<>]*$ within 1..=2048 characters, \
              got {actual:?}"
         );
-        // Prose about the document: complete sentences, not a clause naming it.
+        // Prose about the document: at least one complete sentence, closed by a full
+        // stop. How MANY is the publisher's business — a recorded published description
+        // runs to one sentence as well as to a paragraph.
         assert!(
-            sentences(&actual) >= SENTENCES_MIN && actual.ends_with('.'),
-            "case {case:?}: expected at least {SENTENCES_MIN} complete sentences of \
-             published description, got {actual:?}"
+            sentences(&actual) >= 1 && actual.ends_with('.'),
+            "case {case:?}: expected a complete sentence of published description, got \
+             {actual:?}"
         );
         // And it describes the document rather than restating the row's identity.
         assert!(
@@ -363,16 +318,20 @@ async fn a_published_description_is_prose_about_the_document_not_a_label() {
             "case {case:?}: a description must not restate the row's own name, series or \
              category, got {actual:?}"
         );
-        // Two documents do not share one description.
-        let shared: Vec<&str> = PUBLISHED
+        // A description belongs to the document, so two documents share one only when
+        // their publication CLASS publishes one text for the class (the
+        // accessibility-conformance class publishes one description about the template).
+        let shared_across_classes: Vec<&str> = PUBLISHED
             .iter()
-            .filter(|(id, text)| *id != case && *text == actual.as_str())
+            .filter(|(id, text)| {
+                *id != case && *text == actual.as_str() && series_of(id) != expected.series
+            })
             .map(|(id, _)| *id)
             .collect();
         assert!(
-            shared.is_empty(),
-            "case {case:?}: a published description belongs to one document, also found on \
-             {shared:?}"
+            shared_across_classes.is_empty(),
+            "case {case:?}: a published description is shared only inside one class, also \
+             found on {shared_across_classes:?}"
         );
     }
 }

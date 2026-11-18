@@ -28,13 +28,12 @@
 
 use std::time::Duration;
 
-use aws_smithy_types::date_time::Format;
 use aws_smithy_types::DateTime;
 use bytes::Bytes;
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::harness::{call, emulator, get, Answer};
+use crate::harness::{assert_rendered_date_time, call, emulator, get, Answer};
 
 /// The front door's authorization refusal: the status, the wire error code, and the
 /// gateway's own constant text, which names neither member nor resource.
@@ -200,34 +199,17 @@ fn assert_refused(case: &str, answer: &Answer) {
     );
 }
 
-/// Assert a `TimestampAttribute` member's wire form: a JSON STRING that parses as an RFC
-/// 3339 date-time and renders back to the very same text, naming a real instant.
+/// Assert a `TimestampAttribute` member's wire form — the harness's one rule, an RFC 3339
+/// UTC string carrying the three-digit millisecond fraction this service renders with —
+/// and that it names a real instant.
 ///
-/// Parsed and re-rendered rather than compared against a literal: the instant is the
-/// environment's clock, so what is under test is the JSON type and the lexical form.
+/// Parsed rather than compared against a literal: the instant is the environment's clock,
+/// so what is under test is the JSON type and the lexical form.
 fn assert_date_time(case: &str, member: &str, value: &Value) -> DateTime {
-    assert!(
-        !value.is_number(),
-        "case {case:?}: {member} targets TimestampAttribute (@timestampFormat date-time), so it \
-         must be an RFC 3339 string and never an epoch-seconds number, got {value:?}"
-    );
-    let text = value.as_str().unwrap_or_else(|| {
-        panic!("case {case:?}: {member} must be an RFC 3339 date-time string, got {value:?}")
-    });
-    let parsed = DateTime::from_str(text, Format::DateTime).unwrap_or_else(|error| {
-        panic!("case {case:?}: {member} must parse as a date-time ({error}), got {text:?}")
-    });
-    let rendered = parsed
-        .fmt(Format::DateTime)
-        .unwrap_or_else(|error| panic!("case {case:?}: {member} does not re-render ({error})"));
-    assert_eq!(
-        rendered, text,
-        "case {case:?}: {member} must already be in the canonical date-time form, got {text:?} \
-         against {rendered:?}"
-    );
+    let parsed = assert_rendered_date_time(case, member, value);
     assert!(
         parsed.secs() > 0,
-        "case {case:?}: {member} must name a real instant, got {text:?}"
+        "case {case:?}: {member} must name a real instant, got {value:?}"
     );
     parsed
 }

@@ -63,7 +63,7 @@ impl ::aws_smithy_schema::serde::SerializableStruct for PutComplianceInquiryFeed
         &self,
         s: &mut dyn ::aws_smithy_schema::serde::ShapeSerializer,
     ) -> ::std::result::Result<(), ::aws_smithy_schema::serde::SerdeError> {
-        s.write_timestamp(&Self::M_SUBMITTED_AT, &self.submitted_at)?;
+        write_artifact_date_time(s, &Self::M_SUBMITTED_AT, &self.submitted_at)?;
         Ok(())
     }
 }

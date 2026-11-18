@@ -1434,10 +1434,15 @@ impl ComplianceInquiry {
 }
 
 /// One timestamp as the service renders every `TimestampAttribute` on the wire — RFC 3339
-/// date-time, which is the `@timestampFormat` the model declares for them.
+/// date-time, which is the `@timestampFormat` the model declares for them, at the
+/// millisecond resolution this service reports an instant at.
+///
+/// The ONE renderer, shared with the output serializers
+/// ([`crate::ops::types::artifact_date_time_text`]), so a document this service renders an
+/// instant into and the response member reporting the same instant cannot disagree about
+/// its form.
 fn rendered_timestamp(value: SystemTime) -> String {
-    ::aws_smithy_types::DateTime::from(value)
-        .fmt(::aws_smithy_types::date_time::Format::DateTime)
+    crate::ops::types::artifact_date_time_text(&::aws_smithy_types::DateTime::from(value))
         .unwrap_or_default()
 }
 
@@ -3342,11 +3347,11 @@ const PRODUCT_NAME: &str = "AWS";
 ///
 /// Every row's `description` is the PUBLISHED description of its document — the prose a
 /// publisher writes about a compliance document, which is what the member carries — and
-/// never a label restating the row's `name`. The first row's text is the published one the
-/// corpus records for that report
-/// (`issues/things-that-now-work/20261029T192742Z-artifact-read-plane-serves-an-incomplete-report-catalog.md`
-/// quotes it); the rest are this emulator's own, written in that same register, because
-/// the corpus discloses no other published description and no rule derives one.
+/// never a label restating the row's `name`. It is as long as the publisher wrote it: the
+/// rows whose published text the corpus records carry that text, one of them a single
+/// sentence and one a paragraph, so nothing here pads a description out to a fixed shape.
+/// The remaining rows' texts are this emulator's own, written in that same register,
+/// because the corpus discloses no published description for them and no rule derives one.
 ///
 /// The rows span what the report surface generalises over: nine compliance-programme
 /// series (the accessibility-conformance series beside them makes ten), two categories,
@@ -3354,9 +3359,10 @@ const PRODUCT_NAME: &str = "AWS";
 /// reporting periods on the calendar-annual, the November-annual and the semiannual
 /// windows AWS publishes on.
 ///
-/// Every value satisfies the member's modelled constraints — `id` matches `ReportId`'s
-/// `^report-[a-zA-Z0-9]{16}$`, and `name`, `series` and `category` match
-/// `ShortStringAttribute`'s `^[a-zA-Z0-9_\-\s]*$`.
+/// Every `id` matches `ReportId`'s `^report-[a-zA-Z0-9]{16}$`. A published title is
+/// reported as it is published, punctuation included: `ShortStringAttribute`'s `@pattern`
+/// bounds what a REQUEST may send, and the recorded catalog carries titles outside it (see
+/// [`accessibility_reports`]).
 ///
 /// Each report publishes its OWN term document, so a term grant minted for one report
 /// covers every version of that report and no other report here. (Nothing in the rule
@@ -3442,16 +3448,17 @@ const SEED: &[SeedReport] = &[
     SeedReport {
         id: "report-5eevElBv6MyRmQsD",
         name: "UAE IAR Compliance Report",
-        description: "The UAE Information Assurance Regulation compliance report describes \
-                      how the AWS Regions in its scope meet the controls that the \
-                      Telecommunications and Digital Government Regulatory Authority \
-                      publishes in its Information Assurance Regulation. It is prepared by \
-                      an independent assessor and covers the assessment period stated on \
-                      the report. Customer teams use it to support their own assurance \
-                      obligations for workloads operated in the United Arab Emirates.",
+        // The description AWS publishes for this document, as the corpus records it: one
+        // sentence naming the assessment and the regulation it was made against. A
+        // published description is as long as its publisher wrote it — this one is a single
+        // sentence where the rows below carry a paragraph — so nothing here pads it out.
+        description: "Independent compliance assessment against the United Arab Emirates \
+                      (UAE) Information Assurance Regulation (IAR).",
         series: "UAE TDRA IAR",
         category: "Certifications and Attestations",
-        acceptance_type: "EXPLICIT",
+        // `PASSTHROUGH`, as the recorded catalog entry for this report carries it: no
+        // click-through acceptance of its term is required of a downloader.
+        acceptance_type: ACCEPTANCE_TYPE_PASSTHROUGH,
         document_object: "UAE-TDRA-IAR.pdf",
         term_object: "UAE-TDRA-IAR-Term.txt",
         versions: &[
