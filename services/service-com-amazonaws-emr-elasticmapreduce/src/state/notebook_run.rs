@@ -38,7 +38,10 @@
 //! The cells share one set of globals and run in order, which is what a notebook kernel does
 //! ([`NOTEBOOK_KERNEL_SOURCE`]), and the execution's end is what that run answered:
 //!
-//! * every code cell ran without raising — the execution FINISHES;
+//! * every code cell ran without raising — the execution FINISHES, and the EXECUTED
+//!   notebook (each code cell carrying what its own run produced) is stored at the output
+//!   location the request named, which is what `OutputNotebookURI` then points at
+//!   ([`super::store_output_notebook`]);
 //! * a cell raised — the execution FAILS, and `LastStateChangeReason` is the exception the
 //!   cells produced, which is the engine's own reason for the failure;
 //! * the run outlasted one of its bounds — the execution FAILS for that bound;
@@ -46,7 +49,10 @@
 //!   holds no such object, the object is no readable notebook, or its kernel is not a
 //!   Python one this emulator can run) — the execution keeps the lifecycle's own
 //!   not-executed failure ([`super::NOTEBOOK_NOT_EXECUTED_REASON`]), which says no notebook
-//!   was run rather than reporting an outcome for work nothing performed.
+//!   was run rather than reporting an outcome for work nothing performed;
+//! * the run never reported at all — the lifecycle ends the execution at the longest a run
+//!   may take to answer ([`NOTEBOOK_RUN_CEILING`]), so an execution is never left `RUNNING`
+//!   for good.
 
 use ::service_com_amazonaws_lambda_awsgirapiservice::state::execution::package::PackageModule;
 use ::service_com_amazonaws_lambda_awsgirapiservice::state::execution::python::{
@@ -55,7 +61,7 @@ use ::service_com_amazonaws_lambda_awsgirapiservice::state::execution::python::{
 use smithy_server_runtime::EmbeddedEmulator;
 
 use super::*;
-use crate::ops::types::NotebookS3LocationFromInput;
+use crate::ops::types::{NotebookS3LocationFromInput, OutputNotebookS3LocationFromInput};
 
 /// The KERNEL a notebook execution's cells run in: the program that compiles and executes
 /// each cell, in order, against one set of globals.
@@ -66,15 +72,54 @@ use crate::ops::types::NotebookS3LocationFromInput;
 /// interpreter, and the answer is how many of them ran. A cell that raises propagates out
 /// of here, so the exception the run reports is the notebook's own.
 const NOTEBOOK_KERNEL_SOURCE: &str = r#"
+import sys
+
+
+class _CellOutput:
+    """What one cell writes to the standard output stream, kept as the cell's own output.
+
+    A notebook records each cell's output on the cell, so the kernel has to know which cell
+    wrote what: the stream is bound to this for the length of one cell and the text is
+    passed through to the stream it replaced, so the run's own log still carries everything
+    the notebook wrote.
+    """
+
+    def __init__(self, stream):
+        self.stream = stream
+        self.parts = []
+
+    def write(self, text):
+        self.parts.append(text)
+        return self.stream.write(text)
+
+    def flush(self):
+        self.stream.flush()
+
+    def isatty(self):
+        return False
+
+    def text(self):
+        return "".join(self.parts)
+
+
 def execute(event, context):
     cells = event.get("cells") or []
     namespace = {"__name__": "__main__"}
-    ran = 0
+    outputs = []
     for index, source in enumerate(cells):
-        exec(compile(source, "In[{}]".format(index + 1), "exec"), namespace)
-        ran += 1
-    return {"cells": ran}
+        captured = _CellOutput(sys.stdout)
+        sys.stdout = captured
+        try:
+            exec(compile(source, "In[{}]".format(index + 1), "exec"), namespace)
+        finally:
+            sys.stdout = captured.stream
+        outputs.append(captured.text())
+    return {"cells": outputs}
 "#;
+
+/// What the kernel is HANDED and what it ANSWERS under: the cells it is to run, and the
+/// output of each cell it ran, in the order it ran them.
+const NOTEBOOK_KERNEL_ANSWER: &str = "cells";
 
 /// The module the kernel is imported from, and the handler the runtime resolves in it.
 const NOTEBOOK_KERNEL_MODULE: &str = "emr_notebook_kernel.py";
@@ -93,7 +138,14 @@ const RUN_STACK_BYTES: usize = 16 * 1024 * 1024;
 /// cluster. Here it runs off the request path, so the bound is what one execution of this
 /// emulator may spend on a notebook — and a notebook that outlasts it is reported as having
 /// failed on this bound rather than left running.
-const NOTEBOOK_WALL_CLOCK: Duration = Duration::from_secs(5);
+///
+/// It is the bound the INTERPRETER the cells run in is built under as well, not only the
+/// cells' own work, and several runs of this process are performed at once
+/// ([`MAX_CONCURRENT_NOTEBOOK_RUNS`]) — so it has to leave room for that construction on a
+/// host doing all of them at once, or a notebook of one cell that computes would be reported
+/// as having outlasted a bound it never reached. Generous for that reason: it is a ceiling on
+/// a runaway notebook, never a budget a notebook that runs has to fit in.
+const NOTEBOOK_WALL_CLOCK: Duration = Duration::from_secs(15);
 
 /// How much longer than its own wall clock a run is waited for before it is given up on.
 ///
@@ -118,13 +170,29 @@ const MAX_CONCURRENT_NOTEBOOK_RUNS: usize = 4;
 ///
 /// CHOSEN: nothing is waiting on the answer — `StartNotebookExecution` has already answered,
 /// and the execution whose run this is sits at `RUNNING`, "being processed by the cluster",
-/// while it queues — so the wait covers two full-length runs ahead of it, each spending its
-/// own wall clock and the grace on top of it, which is the longest a place is ever held. It
-/// stays SHORT enough that a queued execution still settles inside the wait a client polling
-/// it allows: past it, the execution is reported as one nothing ran rather than left queued.
+/// while it queues — so the wait covers TWO full-length runs ahead of it, each spending its
+/// own wall clock and the grace on top of it, which leaves a queued run headroom when the
+/// pool is busy rather than reporting a notebook that would have run as one nothing ran. It
+/// stays bounded ([`NOTEBOOK_RUN_CEILING`] is what the wait costs the execution): past it,
+/// the execution is reported as one nothing ran rather than left queued.
 const NOTEBOOK_PERMIT_WAIT: Duration = NOTEBOOK_WALL_CLOCK
     .saturating_add(NOTEBOOK_RUN_GRACE)
     .saturating_mul(2);
+
+/// The longest a run may take to REPORT what the notebook came to, counted from the moment
+/// the execution reached `RUNNING`.
+///
+/// DERIVED, not chosen: every part of it is a bound this module already holds — a run waits
+/// for a place in the pool ([`NOTEBOOK_PERMIT_WAIT`]) and then spends at most its own wall
+/// clock and the grace on top of it — so a run that is going to answer at all has answered
+/// by then, and nothing that WOULD have answered is cut short by this. It is what the
+/// lifecycle owes an execution still `RUNNING`
+/// ([`NotebookExecutionRecord::advance_to`]): past it the execution ends for having no
+/// outcome rather than staying `RUNNING` for good, so a client polling one always reaches a
+/// status it can act on.
+pub const NOTEBOOK_RUN_CEILING: Duration = NOTEBOOK_PERMIT_WAIT
+    .saturating_add(NOTEBOOK_WALL_CLOCK)
+    .saturating_add(NOTEBOOK_RUN_GRACE);
 
 /// The runs this process may perform at once ([`MAX_CONCURRENT_NOTEBOOK_RUNS`]).
 fn notebook_run_permits() -> &'static ::std::sync::Arc<::tokio::sync::Semaphore> {
@@ -167,36 +235,42 @@ pub const MAX_NOTEBOOK_BYTES: usize = 16 * 1024 * 1024;
 /// program one request submits.
 pub const MAX_NOTEBOOK_CELLS: usize = 1_000;
 
-/// The code cells of the notebook `document`, in the order the notebook holds them, or
-/// `None` when `document` is no notebook this emulator can run.
+/// The notebook DOCUMENT `document` holds, or `None` when it is no notebook this emulator
+/// can run.
 ///
 /// The Jupyter notebook format holds its cells in a top-level `cells` array, each with a
-/// `cell_type` and a `source` that is either one string or the list of its lines; a cell
-/// whose type is not `code` carries no program (a Markdown cell is prose), so only the code
-/// cells are the notebook's program. A document with no `cells` array is no notebook, and
-/// one whose kernel is not a Python kernel is a notebook this emulator cannot run: the
-/// interpreter it runs cells in is a Python one, so a Scala or R notebook is reported as not
-/// having been run rather than run as something it is not. A notebook that states no kernel
-/// at all is taken as the Python kind, which is what an Amazon EMR notebook's default kernel
-/// is.
-pub fn notebook_code_cells(document: &[u8]) -> Option<Vec<String>> {
+/// `cell_type` and a `source` that is either one string or the list of its lines. A document
+/// with no `cells` array is no notebook, and one whose kernel is not a Python kernel is a
+/// notebook this emulator cannot run: the interpreter it runs cells in is a Python one, so a
+/// Scala or R notebook is reported as not having been run rather than run as something it is
+/// not. A notebook that states no kernel at all is taken as the Python kind, which is what
+/// an Amazon EMR notebook's default kernel is.
+///
+/// The document is kept whole, rather than only its cells' sources: it is what the EXECUTED
+/// notebook is built from once the cells have run ([`super::executed_notebook`]).
+pub fn notebook_document(document: &[u8]) -> Option<::serde_json::Value> {
     let notebook: ::serde_json::Value = ::serde_json::from_slice(document).ok()?;
     if !notebook_is_python(&notebook) {
         return None;
     }
-    let cells = notebook.get("cells")?.as_array()?;
-    Some(
-        cells
-            .iter()
-            .filter(|cell| {
-                cell.get("cell_type")
-                    .and_then(::serde_json::Value::as_str)
-                    .is_some_and(|kind| kind == "code")
-            })
-            .filter_map(cell_source)
-            .take(MAX_NOTEBOOK_CELLS)
-            .collect(),
-    )
+    notebook.get("cells")?.as_array()?;
+    Some(notebook)
+}
+
+/// The code cells of `notebook`, in the order the notebook holds them: the program the
+/// execution submits.
+///
+/// A cell that submits no program carries none of it ([`notebook_cell_program`]).
+pub fn notebook_code_cells(notebook: &::serde_json::Value) -> Vec<String> {
+    notebook
+        .get("cells")
+        .and_then(::serde_json::Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or_default()
+        .iter()
+        .filter_map(notebook_cell_program)
+        .take(MAX_NOTEBOOK_CELLS)
+        .collect()
 }
 
 /// Whether `notebook`'s kernel is a Python one — the kind whose cells this emulator can
@@ -204,7 +278,7 @@ pub fn notebook_code_cells(document: &[u8]) -> Option<Vec<String>> {
 ///
 /// The notebook format states its language in `metadata.kernelspec.language` and in
 /// `metadata.language_info.name`; either saying Python is enough, and a notebook that states
-/// neither is taken as the Python kind (see [`notebook_code_cells`]).
+/// neither is taken as the Python kind (see [`notebook_document`]).
 fn notebook_is_python(notebook: &::serde_json::Value) -> bool {
     let metadata = notebook.get("metadata");
     let stated = |path: [&str; 2]| -> Option<String> {
@@ -225,11 +299,38 @@ fn notebook_is_python(notebook: &::serde_json::Value) -> bool {
     stated.is_empty() || stated.iter().any(|language| language.contains("python"))
 }
 
+/// The PROGRAM one cell of a notebook submits, or `None` for a cell that submits none: a
+/// cell whose type is not `code` (a Markdown cell is prose) and a cell whose `source` is
+/// neither spelling the notebook format allows.
+///
+/// The one reading of what the kernel is handed, so the cells whose outputs are recorded on
+/// the EXECUTED notebook ([`super::executed_notebook`]) are exactly the cells that ran.
+pub fn notebook_cell_program(cell: &::serde_json::Value) -> Option<String> {
+    if cell
+        .get("cell_type")
+        .and_then(::serde_json::Value::as_str)
+        .is_none_or(|kind| kind != "code")
+    {
+        return None;
+    }
+    cell_source(cell)
+}
+
 /// One cell's `source`, as the notebook format spells it: one string, or the list of the
 /// cell's lines.
 fn cell_source(cell: &::serde_json::Value) -> Option<String> {
-    match cell.get("source")? {
-        ::serde_json::Value::String(source) => Some(source.clone()),
+    notebook_text(cell.get("source"))
+}
+
+/// The TEXT a member of a notebook holds, as the notebook format spells it: one string, or
+/// the list of its lines.
+///
+/// The ONE reading of that spelling in this crate: a cell's `source` is spelled this way and
+/// so is a stream output's `text` on the EXECUTED notebook
+/// ([`super::executed_notebook`]), so neither can come to read it differently.
+pub fn notebook_text(value: Option<&::serde_json::Value>) -> Option<String> {
+    match value? {
+        ::serde_json::Value::String(text) => Some(text.clone()),
         ::serde_json::Value::Array(lines) => Some(
             lines
                 .iter()
@@ -260,8 +361,7 @@ pub fn start_notebook_run<Eng: Send + Sync + 'static>(
     engine: &::std::sync::Arc<Eng>,
     region: &str,
     execution_id: String,
-    location: Option<NotebookS3LocationFromInput>,
-    environment: Option<HashMap<String, String>>,
+    notebook: NotebookRunRequest,
 ) {
     let Some(state) = service_state(&**engine) else {
         return;
@@ -280,8 +380,7 @@ pub fn start_notebook_run<Eng: Send + Sync + 'static>(
     // and the run stays abandonable for as long as it lasts.
     let mut store = state.lock();
     let handle = runtime.spawn(async move {
-        let outcome =
-            run_notebook(&callback, &region, location.as_ref(), environment.as_ref()).await;
+        let outcome = run_notebook(&callback, &region, &run_id, &notebook).await;
         let now = SystemTime::now();
         let mut store = run_state.lock();
         if let Some(record) = store.notebook_execution_mut(&run_id, now) {
@@ -291,6 +390,29 @@ pub fn start_notebook_run<Eng: Send + Sync + 'static>(
         store.forget_notebook_run(&run_id);
     });
     store.set_notebook_run(execution_id, handle);
+}
+
+/// Everything OF THE REQUEST that reaches a run: the notebook to fetch, where its output
+/// notebook is stored and in which format, and the environment the cells see.
+///
+/// Nothing else a caller sent steers any part of a run — not the engine it names, not its
+/// tags, not its parameters — which is why the run is handed this and not the request.
+#[derive(Debug, Clone, Default)]
+pub struct NotebookRunRequest {
+    /// "The Amazon S3 location that the notebook execution input is stored in"
+    /// (`StartNotebookExecutionInput$NotebookS3Location` doc): the object to read.
+    pub location: Option<NotebookS3LocationFromInput>,
+    /// "The Amazon S3 location for the notebook execution output"
+    /// (`StartNotebookExecutionInput$OutputNotebookS3Location` doc): where the executed
+    /// notebook is stored ([`super::store_output_notebook`]).
+    pub output_location: Option<OutputNotebookS3LocationFromInput>,
+    /// "The output format for the notebook execution"
+    /// (`StartNotebookExecutionInput$OutputNotebookFormat` doc).
+    pub output_format: Option<String>,
+    /// "The environment variables associated with the notebook execution"
+    /// (`StartNotebookExecutionInput$EnvironmentVariables` doc): what the cells see, and the
+    /// only environment they see.
+    pub environment: Option<HashMap<String, String>>,
 }
 
 impl ComAmazonawsEmrElasticmapreduceState {
@@ -322,39 +444,61 @@ impl ComAmazonawsEmrElasticmapreduceState {
     }
 }
 
-/// What a notebook execution's own run answered, for the Amazon S3 notebook `location` and
-/// the execution's own `environment`.
+/// What the notebook execution `execution_id`'s own run answered, for the request's
+/// `notebook`.
 ///
 /// Called with NO store guard held: it follows the notebook's Amazon S3 reference over the
-/// emulator's own in-process transport and then runs the notebook's cells, neither of which
-/// may happen under this service's lock. The two arguments are everything of the request
-/// that reaches a run — the object to read and the environment the cells see — so nothing
-/// else a caller sent can steer either half.
+/// emulator's own in-process transport, runs the notebook's cells, and stores the EXECUTED
+/// notebook back into Amazon S3 for a run whose cells all ran — none of which may happen
+/// under this service's lock. Its one argument of the request is
+/// [`NotebookRunRequest`], so nothing else a caller sent can steer any part of a run.
 pub async fn run_notebook(
     callback: &EmbeddedEmulator,
     region: &str,
-    location: Option<&NotebookS3LocationFromInput>,
-    environment: Option<&HashMap<String, String>>,
+    execution_id: &str,
+    notebook: &NotebookRunRequest,
 ) -> NotebookOutcome {
     // "The Amazon S3 location that the notebook execution input is stored in"
     // (`StartNotebookExecutionInput$NotebookS3Location` doc): an execution that names no
     // such location names a notebook under an editor this emulator holds no notebook
     // storage for, so there is nothing to fetch and nothing is reported as having run.
-    let Some(location) = location else {
+    let Some(location) = notebook.location.as_ref() else {
         return NotebookOutcome::NotRun;
     };
-    let Some(document) = notebook_object(callback, region, location).await else {
+    let Some(object) = notebook_object(callback, region, location).await else {
         return NotebookOutcome::NotRun;
     };
-    let Some(cells) = notebook_code_cells(&document) else {
+    let Some(document) = notebook_document(&object) else {
         return NotebookOutcome::NotRun;
     };
-    let environment: BTreeMap<String, String> = environment
-        .into_iter()
+    let cells = notebook_code_cells(&document);
+    let environment: BTreeMap<String, String> = notebook
+        .environment
+        .iter()
         .flatten()
         .map(|(name, value)| (name.clone(), value.clone()))
         .collect();
-    run_notebook_cells(cells, environment).await
+    match run_notebook_cells(cells, environment).await {
+        // Every cell ran, so there is an EXECUTED notebook to store — the document the run
+        // produced, at the location the request named ([`super::store_output_notebook`]).
+        // `OutputNotebookURI` names what was really stored, and nothing at all when there
+        // was no output location to store it at.
+        CellRun::Finished(outputs) => NotebookOutcome::Finished {
+            cells: outputs.len(),
+            output_notebook_uri: store_output_notebook(
+                callback,
+                region,
+                notebook.output_location.as_ref(),
+                notebook.output_format.as_deref(),
+                execution_id,
+                &document,
+                &outputs,
+            )
+            .await,
+        },
+        CellRun::Failed(reason) => NotebookOutcome::Failed { reason },
+        CellRun::NotRun => NotebookOutcome::NotRun,
+    }
 }
 
 /// The notebook object the Amazon S3 location `location` names, or `None` when Amazon S3
@@ -414,10 +558,12 @@ async fn notebook_object(
 async fn run_notebook_cells(
     cells: Vec<String>,
     environment: BTreeMap<String, String>,
-) -> NotebookOutcome {
+) -> CellRun {
     let budget = notebook_budget();
-    let Ok(event) = ::serde_json::to_string(&::serde_json::json!({ "cells": cells })) else {
-        return NotebookOutcome::NotRun;
+    let mut submitted = ::serde_json::Map::new();
+    submitted.insert(NOTEBOOK_KERNEL_ANSWER.to_string(), ::serde_json::json!(cells));
+    let Ok(event) = ::serde_json::to_string(&submitted) else {
+        return CellRun::NotRun;
     };
     let Ok(Ok(permit)) = ::tokio::time::timeout(
         NOTEBOOK_PERMIT_WAIT,
@@ -430,7 +576,7 @@ async fn run_notebook_cells(
             "no run came free inside the wait for a place in the pool, so the notebook was \
              not run"
         );
-        return NotebookOutcome::NotRun;
+        return CellRun::NotRun;
     };
     let (sender, receiver) = ::tokio::sync::oneshot::channel();
     let spawned = ::std::thread::Builder::new()
@@ -469,7 +615,7 @@ async fn run_notebook_cells(
             let _ = sender.send(finished);
         });
     if spawned.is_err() {
-        return NotebookOutcome::NotRun;
+        return CellRun::NotRun;
     }
     let waited = ::tokio::time::timeout(
         budget.wall_clock.saturating_add(NOTEBOOK_RUN_GRACE),
@@ -477,45 +623,65 @@ async fn run_notebook_cells(
     )
     .await;
     match waited {
-        Ok(Ok(finished)) => notebook_outcome(&finished),
+        Ok(Ok(finished)) => cell_run(&finished),
         // The run was given up on, or its thread ended without reporting: nothing is known
         // about what the notebook came to, so nothing is reported as having run.
-        Ok(Err(_)) | Err(_) => NotebookOutcome::NotRun,
+        Ok(Err(_)) | Err(_) => CellRun::NotRun,
     }
 }
 
-/// What the finished run answered, as the execution's own end.
-fn notebook_outcome(finished: &Finished) -> NotebookOutcome {
+/// What RUNNING a notebook's cells came to: the lifecycle's own end
+/// ([`NotebookOutcome`]) follows from it, once the output notebook a finished run produced
+/// has been stored.
+enum CellRun {
+    /// Every code cell ran without raising, and this is what each of them wrote to the
+    /// standard output stream, in the order they ran.
+    Finished(Vec<String>),
+    /// The run ended in a failure, with the reason the engine gave for it.
+    Failed(String),
+    /// Nothing ran, so nothing is known about what the notebook came to.
+    NotRun,
+}
+
+/// What the finished run answered.
+fn cell_run(finished: &Finished) -> CellRun {
     match &finished.completion {
-        // The kernel returns how many cells it ran, which is the answer this reads: a run
-        // that returned ran every cell of the notebook without raising.
-        Completion::Returned(answer) => NotebookOutcome::Finished {
-            cells: ::serde_json::from_str::<::serde_json::Value>(answer)
-                .ok()
-                .and_then(|document| {
-                    document
-                        .get("cells")
-                        .and_then(::serde_json::Value::as_u64)
-                })
-                .and_then(|cells| usize::try_from(cells).ok())
-                .unwrap_or_default(),
-        },
+        // The kernel returns what each cell it ran wrote, which is the answer this reads: a
+        // run that returned ran every cell of the notebook without raising.
+        Completion::Returned(answer) => CellRun::Finished(cell_outputs(answer)),
         // The notebook's own exception, as the engine raised it: the type it is and the
         // message it carries, which is the reason the execution failed.
         Completion::Raised {
             error_type,
             error_message,
             ..
-        } => NotebookOutcome::Failed {
-            reason: notebook_failure_reason(error_type, error_message),
-        },
+        } => CellRun::Failed(notebook_failure_reason(error_type, error_message)),
         // A bound the run ran past, named by the bound it was.
-        Completion::Stopped(stop) => NotebookOutcome::Failed {
-            reason: notebook_bound_reason(*stop),
-        },
+        Completion::Stopped(stop) => CellRun::Failed(notebook_bound_reason(*stop)),
         // The interpreter could not be built or driven, so no cell of the notebook ran.
-        Completion::Internal(_) | Completion::Streamed { .. } => NotebookOutcome::NotRun,
+        Completion::Internal(_) | Completion::Streamed { .. } => CellRun::NotRun,
     }
+}
+
+/// The output of each cell the kernel ran, read off the answer it returned.
+fn cell_outputs(answer: &str) -> Vec<String> {
+    ::serde_json::from_str::<::serde_json::Value>(answer)
+        .ok()
+        .as_ref()
+        .and_then(|document| document.get(NOTEBOOK_KERNEL_ANSWER))
+        .and_then(::serde_json::Value::as_array)
+        .map(|outputs| {
+            outputs
+                .iter()
+                .map(|output| {
+                    output
+                        .as_str()
+                        .unwrap_or_default()
+                        .to_string()
+                })
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// `NotebookExecution$LastStateChangeReason` for a notebook whose own cells raised: the

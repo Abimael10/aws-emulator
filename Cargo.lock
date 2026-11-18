@@ -14031,6 +14031,7 @@ dependencies = [
  "chrono",
  "flate2",
  "hex",
+ "html-escape",
  "http",
  "serde_json",
  "service-com-amazonaws-ec2-amazonec2",

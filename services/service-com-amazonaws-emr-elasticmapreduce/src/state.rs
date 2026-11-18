@@ -96,6 +96,12 @@ pub use notebook_executions::*;
 mod notebook_run;
 pub use notebook_run::*;
 
+/// The OUTPUT NOTEBOOK a finished execution leaves in Amazon S3 — the executed notebook and
+/// the address it was stored at — split out of the run above as its own concern and
+/// re-exported the same way.
+mod notebook_output;
+pub use notebook_output::*;
+
 /// The sentences every MODIFICATION refusal of this service is worded by, split out and
 /// re-exported the same way.
 mod modification_refusals;

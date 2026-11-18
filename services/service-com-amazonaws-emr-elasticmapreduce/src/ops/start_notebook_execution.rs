@@ -194,7 +194,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
-        let (id, location, environment) = {
+        let (id, notebook) = {
             let mut store = state.lock();
 
             // Every transition the clock already made due is materialised before the store
@@ -238,14 +238,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // run at this point, which is exactly what that status says.
             let id = store.mint_notebook_execution_id();
             let arn = crate::state::notebook_execution_arn(&region, &id);
-            // The two halves of the request a run reaches: the object to read and the
-            // environment the cells see. Taken before the request is recorded, since the
-            // record is built from the request itself.
-            let location = input.notebook_s3_location.clone();
-            let environment = input.environment_variables.clone();
+            // Everything of the request a run reaches: the object to read, where its
+            // executed notebook is stored and in which format, and the environment the
+            // cells see. Taken before the request is recorded, since the record is built
+            // from the request itself.
+            let notebook = crate::state::NotebookRunRequest {
+                location: input.notebook_s3_location.clone(),
+                output_location: input.output_notebook_s3_location.clone(),
+                output_format: input.output_notebook_format.clone(),
+                environment: input.environment_variables.clone(),
+            };
             let record = NotebookExecutionRecord::from_request(id.clone(), arn, input, now);
             store.notebook_executions.insert(id.clone(), record);
-            (id, location, environment)
+            (id, notebook)
         };
 
         // The notebook itself: fetched out of Amazon S3 and RUN, OFF this request path and
@@ -274,14 +279,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         //   counted, the runs this process performs at once are a bounded pool, the run has a
         //   thread and a stack of its own rather than the async executor's, and it is waited
         //   for no longer than the run's own wall clock and the grace on top of it.
-        crate::state::start_notebook_run(
-            ctx,
-            &self.engine,
-            &region,
-            id.clone(),
-            location,
-            environment,
-        );
+        // * WHAT it leaves: for a run whose cells all ran, the EXECUTED notebook, stored at
+        //   the `OutputNotebookS3Location` the request named — one object of this emulator's
+        //   own Amazon S3 store, addressed by that bucket and key alone — which is what the
+        //   execution's `OutputNotebookURI` then points at.
+        crate::state::start_notebook_run(ctx, &self.engine, &region, id.clone(), notebook);
 
         Ok(StartNotebookExecutionOutput {
             notebook_execution_id: Some(id),

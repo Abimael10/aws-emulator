@@ -94,7 +94,8 @@ pub const NOTEBOOK_EXECUTION_FINISH_PROGRESSION: &[&str] = &[
 /// Two kinds of execution end here, and `LastStateChangeReason` is what tells them apart
 /// ([`NotebookOutcome::failure_reason`]): one whose notebook RAN and raised, which carries
 /// the engine's own exception, and one nothing ran at all, which carries
-/// [`NOTEBOOK_NOT_EXECUTED_REASON`].
+/// [`NOTEBOOK_NOT_EXECUTED_REASON`] — or, for one whose run never reported what it came to,
+/// [`NOTEBOOK_RUN_UNREPORTED_REASON`].
 pub const NOTEBOOK_EXECUTION_FAILURE_PROGRESSION: &[&str] = &[
     notebook_execution_status::FAILING,
     notebook_execution_status::FAILED,
@@ -113,11 +114,25 @@ pub enum NotebookOutcome {
     /// such object, the object is no readable notebook, or its kernel is not a kind this
     /// emulator can run.
     NotRun,
+    /// The run of this execution's notebook never reported what it came to, so the clock
+    /// ended the execution at the longest a run may take to answer
+    /// ([`NOTEBOOK_RUN_CEILING`]).
+    ///
+    /// An execution is never left `RUNNING` for good: a run this process gave up on, or one
+    /// that ended without reporting, still ends the execution — with the reason that says
+    /// the run produced no answer ([`NOTEBOOK_RUN_UNREPORTED_REASON`]) rather than an
+    /// outcome for work nothing reported.
+    Unreported,
     /// Every code cell of the notebook ran without raising, and this is how many there
     /// were.
     Finished {
         /// How many code cells ran.
         cells: usize,
+        /// `NotebookExecution$OutputNotebookURI` — "the location of the notebook
+        /// execution's output file in Amazon S3" — for the output notebook this run
+        /// really stored ([`super::store_output_notebook`]), and `None` for an execution
+        /// that named no output location and for one whose output could not be stored.
+        output_notebook_uri: Option<String>,
     },
     /// The run ended in a failure, with the reason the engine gave for it.
     Failed {
@@ -132,7 +147,9 @@ impl NotebookOutcome {
     pub fn end_progression(&self) -> &'static [&'static str] {
         match self {
             Self::Finished { .. } => NOTEBOOK_EXECUTION_FINISH_PROGRESSION,
-            Self::NotRun | Self::Failed { .. } => NOTEBOOK_EXECUTION_FAILURE_PROGRESSION,
+            Self::NotRun | Self::Unreported | Self::Failed { .. } => {
+                NOTEBOOK_EXECUTION_FAILURE_PROGRESSION
+            }
         }
     }
 
@@ -143,7 +160,19 @@ impl NotebookOutcome {
         match self {
             Self::Finished { .. } => None,
             Self::NotRun => Some(NOTEBOOK_NOT_EXECUTED_REASON.to_string()),
+            Self::Unreported => Some(NOTEBOOK_RUN_UNREPORTED_REASON.to_string()),
             Self::Failed { reason } => Some(reason.clone()),
+        }
+    }
+
+    /// The output notebook this outcome left in Amazon S3, for an outcome that stored one.
+    pub fn output_notebook_uri(&self) -> Option<&str> {
+        match self {
+            Self::Finished {
+                output_notebook_uri,
+                ..
+            } => output_notebook_uri.as_deref(),
+            Self::NotRun | Self::Unreported | Self::Failed { .. } => None,
         }
     }
 }
@@ -161,6 +190,17 @@ impl NotebookOutcome {
 pub const NOTEBOOK_NOT_EXECUTED_REASON: &str =
     "This emulator records notebook executions but runs no notebook, so the execution \
      ended without running.";
+
+/// `NotebookExecution$LastStateChangeReason` for an execution whose own run never reported
+/// what it came to.
+///
+/// The run has a longest it may take to answer ([`NOTEBOOK_RUN_CEILING`]), and an execution
+/// still `RUNNING` past it is ended rather than left there: a client polling an execution
+/// always reaches a status it can act on. `FINISHED` would be a success for work nothing
+/// reported, which is why the execution fails with this reason instead.
+pub const NOTEBOOK_RUN_UNREPORTED_REASON: &str =
+    "The notebook execution's run did not report what the notebook came to, so the \
+     execution ended without an outcome.";
 
 /// The statuses a notebook execution passes through once a caller has asked it to stop:
 /// "`STOP_PENDING` indicates that the cluster has received a `StopNotebookExecution`
@@ -313,20 +353,29 @@ impl NotebookExecutionRecord {
     /// The run happens off the `StartNotebookExecution` request path, so this is how its
     /// answer reaches the record: an execution already at `RUNNING` — "being processed by
     /// the cluster", which is where one waits for its run — is owed the first status of that
-    /// end one phase later, and one the clock has not walked to `RUNNING` yet picks the same
-    /// end up when it gets there ([`Self::advance_to`]). An execution a caller stopped, or
-    /// one that has already ended, keeps the status it is walking to: the stop abandoned
-    /// whatever the run still owed.
+    /// end one phase later, IN PLACE of the ceiling that would have ended it had no answer
+    /// come ([`NOTEBOOK_RUN_CEILING`]); and one the clock has not walked to `RUNNING` yet
+    /// picks the same end up when it gets there ([`Self::advance_to`]). An execution a
+    /// caller stopped, or one that has already ended, keeps the status it is walking to: the
+    /// stop abandoned whatever the run still owed.
+    ///
+    /// The output notebook the run stored is recorded here too: the object exists from the
+    /// moment the run reports it, so `OutputNotebookURI` names an object Amazon S3 really
+    /// holds — whatever status the record is in when the report arrives, since the object is
+    /// there either way.
     pub fn record_outcome(&mut self, outcome: NotebookOutcome, now: SystemTime) {
         if self.outcome.is_some() {
             return;
         }
+        if let Some(uri) = outcome.output_notebook_uri() {
+            self.execution.output_notebook_uri = Some(uri.to_string());
+        }
         self.outcome = Some(outcome);
         let status = self.execution.status.clone().unwrap_or_default();
-        if notebook_execution_status::TERMINAL.contains(&status.as_str())
-            || NOTEBOOK_EXECUTION_STOP_PROGRESSION.contains(&status.as_str())
-            || self.pending_status.is_some()
-        {
+        // Only an execution the clock has walked to `RUNNING` is waiting for this answer:
+        // one still on its way there picks the end up when it arrives, and one that has
+        // ended or is stopping is past caring what its run came to.
+        if status != notebook_execution_status::RUNNING {
             return;
         }
         if let Some(next) = next_notebook_execution_status(&status, self.outcome.as_ref()) {
@@ -354,6 +403,14 @@ impl NotebookExecutionRecord {
             if let Some(reason) = pending.reason {
                 self.execution.last_state_change_reason = Some(reason);
             }
+            // A failing status reached with no outcome to end on is the ceiling the clock
+            // owed an execution whose run never reported ([`NOTEBOOK_RUN_CEILING`]): that
+            // IS the outcome, so the rest of the failing progression follows from it.
+            if self.outcome.is_none()
+                && NOTEBOOK_EXECUTION_FAILURE_PROGRESSION.contains(&pending.status.as_str())
+            {
+                self.outcome = Some(NotebookOutcome::Unreported);
+            }
             // A status the execution never leaves is where it ended, and the instant it
             // ended is the one the transition was owed at — not the instant somebody
             // looked.
@@ -370,6 +427,19 @@ impl NotebookExecutionRecord {
                     due: pending.due + notebook_phase_span(&pending.status),
                     status: next.to_string(),
                     reason,
+                });
+            } else if pending.status == notebook_execution_status::RUNNING
+                && self.outcome.is_none()
+            {
+                // An execution at `RUNNING` is "being processed by the cluster" until its
+                // own run reports ([`Self::record_outcome`]), which replaces this. What the
+                // clock owes it meanwhile is the END of that wait: past the longest a run
+                // may take to answer, the execution fails for having no outcome rather than
+                // staying `RUNNING` for good.
+                self.pending_status = Some(PendingNotebookExecutionStatus {
+                    due: pending.due + NOTEBOOK_RUN_CEILING,
+                    status: NOTEBOOK_EXECUTION_FAILURE_PROGRESSION[0].to_string(),
+                    reason: Some(NOTEBOOK_RUN_UNREPORTED_REASON.to_string()),
                 });
             }
         }

@@ -6,23 +6,28 @@
 //! object the request names in Amazon S3 ("the Amazon S3 location that the notebook
 //! execution input is stored in"), its code cells are the program it submits, and they are
 //! executed in order against one namespace: an execution whose cells all ran leaves
-//! `START_PENDING` without failing and reaches `FINISHED`, one whose cell raised reaches
-//! `FAILED` with the exception the cells produced as its `LastStateChangeReason`, and one
-//! whose notebook could not be fetched, read or run keeps the emulator's own not-executed
-//! failure rather than reporting an outcome for work nothing performed. A caller that asks a
-//! running execution to stop takes it to `STOPPED` instead.
+//! `START_PENDING` without failing and reaches `FINISHED` — with the EXECUTED notebook
+//! stored at the `OutputNotebookS3Location` the request named and `OutputNotebookURI`, "the
+//! location of the notebook execution's output file in Amazon S3", naming that object — one
+//! whose cell raised reaches `FAILED` with the exception the cells produced as its
+//! `LastStateChangeReason` and stores no output notebook, and one whose notebook could not
+//! be fetched, read or run keeps the emulator's own not-executed failure rather than
+//! reporting an outcome for work nothing performed. A caller that asks a running execution
+//! to stop takes it to `STOPPED` instead, and an execution whose run never reports at all is
+//! still ended by the clock rather than left `RUNNING`.
 //!
 //! The rows span what the rule generalises over: whether the notebook is there at all (an
 //! object, a key the bucket holds nothing under, no Amazon S3 location in the request), what
 //! the object is (a notebook, bytes that are no notebook, a notebook whose kernel is not a
 //! Python one), how a cell's source is spelled (one string, the list of its lines), how many
 //! code cells there are (none, one, several sharing a namespace), what the cells do (compute,
-//! import the standard library, reach for the host, raise), and whether the caller stops the
-//! execution.
+//! import the standard library, reach for the host, raise), where and in which format the
+//! output notebook is asked for, and whether the caller stops the execution.
 //!
 //! Amazon S3 is mounted BESIDE Amazon EMR on one engine, and every notebook is written
 //! through S3's own `CreateBucket`/`PutObject` — so the cells that run are the ones that
-//! bucket holds rather than ones this test handed EMR.
+//! bucket holds rather than ones this test handed EMR, and the output notebook is read back
+//! with S3's own `GetObject` rather than believed.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -237,6 +242,404 @@ pub(crate) async fn walked(
             "case {case:?}: no terminal status after {DEADLINE:?}, saw {seen:?}"
         );
         tokio::time::sleep(POLL_INTERVAL).await;
+    }
+}
+
+/// One path-style Amazon S3 `GetObject`, as its status and the bytes it answered with.
+async fn s3_get(router: &MultiServiceRouter, uri: &str) -> (u16, Vec<u8>) {
+    let host = format!("s3.{REGION}.amazonaws.com");
+    let request = ::http::Request::builder()
+        .method("GET")
+        .uri(format!("https://{host}{uri}"))
+        .header("host", host.clone())
+        .header(
+            "authorization",
+            format!(
+                "AWS4-HMAC-SHA256 Credential=emulator-test-key/20261109/{REGION}/s3/\
+                 aws4_request, SignedHeaders=host, Signature=00"
+            ),
+        )
+        .body(bytes::Bytes::new())
+        .expect("a well-formed request");
+    let response = router.dispatch(request).await;
+    let (parts, answered) = response.into_parts();
+    (parts.status.as_u16(), answered.to_vec())
+}
+
+/// The key an `s3://bucket/key` URI names, for the bucket this suite writes to.
+fn key_of_uri(uri: &str) -> Option<&str> {
+    uri.strip_prefix(&format!("s3://{BUCKET}/"))
+}
+
+/// One row of the output-notebook table: what the execution asks for, and what the object
+/// store must then hold.
+struct Output {
+    label: &'static str,
+    /// The cells of the notebook this execution runs.
+    cells: Value,
+    /// `OutputNotebookS3Location.Key`, or `None` for a request naming no output location.
+    output_key: Option<&'static str>,
+    /// `OutputNotebookFormat`, or `None` for a request naming no format.
+    format: Option<&'static str>,
+    /// The key the stored object must be found under, `None` when nothing is stored.
+    stored_at: Option<&'static str>,
+    /// What each code cell of the notebook must be recorded as having produced, in the
+    /// notebook's own order: `None` for a code cell the kernel was never handed (one that
+    /// carries no program at all), which records no execution of its own.
+    cell_outputs: &'static [Option<&'static str>],
+}
+
+/// The rows span what the rule generalises over: whether an output location is named at
+/// all, whether its key names an object or a prefix, which output format is asked for, how
+/// many code cells there are and what each of them wrote, whether the notebook holds cells
+/// that are not code, and whether a code cell carries a program at all.
+fn output_cases() -> Vec<Output> {
+    vec![
+        Output {
+            label: "a key naming the output object itself",
+            cells: json!([code_cell("print(1 + 1)")]),
+            output_key: Some("executed/one.ipynb"),
+            format: None,
+            stored_at: Some("executed/one.ipynb"),
+            cell_outputs: &[Some("2\n")],
+        },
+        Output {
+            label: "a key naming a prefix many executions store under",
+            cells: json!([code_cell("print('from the prefix')")]),
+            output_key: Some("executed/prefix/"),
+            format: None,
+            // One object per execution, named after the execution: filled in below, since
+            // the id is minted by the service.
+            stored_at: None,
+            cell_outputs: &[Some("from the prefix\n")],
+        },
+        Output {
+            label: "the HTML output format",
+            cells: json!([code_cell("print('<b>bold</b>')")]),
+            output_key: Some("executed/html/"),
+            format: Some("HTML"),
+            stored_at: None,
+            cell_outputs: &[Some("<b>bold</b>\n")],
+        },
+        Output {
+            label: "several cells, each with its own output",
+            cells: json!([
+                code_cell("rows = [1, 2, 3]\nprint(len(rows))"),
+                code_cell("print(sum(rows))"),
+            ]),
+            output_key: Some("executed/many.ipynb"),
+            format: None,
+            stored_at: Some("executed/many.ipynb"),
+            cell_outputs: &[Some("3\n"), Some("6\n")],
+        },
+        Output {
+            label: "a cell that writes nothing at all",
+            cells: json!([code_cell("answer = 6 * 7")]),
+            output_key: Some("executed/quiet.ipynb"),
+            format: None,
+            stored_at: Some("executed/quiet.ipynb"),
+            cell_outputs: &[Some("")],
+        },
+        Output {
+            label: "a notebook holding prose beside its code",
+            cells: json!([
+                { "cell_type": "markdown", "source": "# report", "metadata": {} },
+                code_cell("print('after the prose')"),
+            ]),
+            output_key: Some("executed/prose.ipynb"),
+            format: None,
+            stored_at: Some("executed/prose.ipynb"),
+            cell_outputs: &[Some("after the prose\n")],
+        },
+        Output {
+            label: "a code cell carrying no program, before one that does",
+            cells: json!([
+                { "cell_type": "code", "source": 42, "metadata": {}, "outputs": [] },
+                code_cell("print('after the cell with no program')"),
+            ]),
+            output_key: Some("executed/no-program.ipynb"),
+            format: None,
+            stored_at: Some("executed/no-program.ipynb"),
+            // The kernel was handed only the second cell, so only the second cell records
+            // an execution: a cell that never ran is given no other cell's output.
+            cell_outputs: &[None, Some("after the cell with no program\n")],
+        },
+        Output {
+            label: "a request naming no output location",
+            cells: json!([code_cell("print('nowhere to store this')")]),
+            output_key: None,
+            format: None,
+            stored_at: None,
+            cell_outputs: &[Some("nowhere to store this\n")],
+        },
+    ]
+}
+
+/// A finished execution's OUTPUT NOTEBOOK is a real object in the bucket the request named,
+/// holding what the cells really produced, and `OutputNotebookURI` is where it was stored.
+#[tokio::test]
+async fn a_finished_execution_stores_its_executed_notebook_where_the_request_asked() {
+    let router = emulator();
+    let cluster_id = notebook_cluster(&router).await;
+    s3_ok(&router, "bucket", &format!("/{BUCKET}"), &[]).await;
+
+    let cases = output_cases();
+    let mut started: Vec<(usize, String)> = Vec::new();
+    for (index, case) in cases.iter().enumerate() {
+        let key = format!("output-{index}.ipynb");
+        s3_ok(
+            &router,
+            case.label,
+            &format!("/{BUCKET}/{key}"),
+            &notebook(case.cells.clone(), None),
+        )
+        .await;
+        let mut request = json!({
+            "ExecutionEngine": { "Id": cluster_id.clone(), "Type": "EMR" },
+            "ServiceRole": NOTEBOOK_ROLE,
+            "NotebookExecutionName": case.label,
+            "NotebookS3Location": { "Bucket": BUCKET, "Key": key },
+        });
+        if let Some(output_key) = case.output_key {
+            request["OutputNotebookS3Location"] =
+                json!({ "Bucket": BUCKET, "Key": output_key });
+        }
+        if let Some(format) = case.format {
+            request["OutputNotebookFormat"] = json!(format);
+        }
+        let answer = emr_ok(&router, "StartNotebookExecution", request).await;
+        let id = answer["NotebookExecutionId"]
+            .as_str()
+            .unwrap_or_else(|| panic!("case {:?}: an execution id, got {answer}", case.label))
+            .to_string();
+        started.push((index, id));
+    }
+
+    for (index, id) in started {
+        let case = &cases[index];
+        let label = case.label;
+        let (seen, execution) = walked(label, &router, &id).await;
+        assert_eq!(
+            execution["Status"].as_str(),
+            Some("FINISHED"),
+            "case {label:?}: a notebook whose cells all ran finishes, saw {seen:?} ending in \
+             {execution}"
+        );
+
+        let uri = execution["OutputNotebookURI"].as_str().map(str::to_string);
+        // An execution that named no output location has no output file to point at.
+        if case.output_key.is_none() {
+            assert_eq!(
+                uri, None,
+                "case {label:?}: an execution naming no output location reports no \
+                 OutputNotebookURI, got {uri:?}"
+            );
+            continue;
+        }
+        let uri = uri.unwrap_or_else(|| {
+            panic!("case {label:?}: a finished execution reports its output file, got {execution}")
+        });
+        let stored_key = key_of_uri(&uri)
+            .unwrap_or_else(|| {
+                panic!("case {label:?}: the URI names an object of the bucket, got {uri:?}")
+            })
+            .to_string();
+        // A key naming an object is where the output went; a key naming a prefix holds one
+        // object per execution, named after the execution and the format it was stored in.
+        let expected_key = case.stored_at.map(str::to_string).unwrap_or_else(|| {
+            let extension = if case.format == Some("HTML") {
+                "html"
+            } else {
+                "ipynb"
+            };
+            format!("{}{id}.{extension}", case.output_key.unwrap_or_default())
+        });
+        assert_eq!(
+            stored_key, expected_key,
+            "case {label:?}: expected the output notebook at {expected_key:?}, got {uri:?}"
+        );
+
+        // The object the URI names is really there, and it holds what the cells produced.
+        let (status, body) = s3_get(&router, &format!("/{BUCKET}/{stored_key}")).await;
+        assert_eq!(
+            status,
+            200,
+            "case {label:?}: the output notebook must be readable at {stored_key:?}, got \
+             {status} with {}",
+            String::from_utf8_lossy(&body)
+        );
+        let document = String::from_utf8_lossy(&body).to_string();
+        if case.format == Some("HTML") {
+            assert!(
+                document.starts_with("<!DOCTYPE html>"),
+                "case {label:?}: the HTML format stores an HTML document, got {document:?}"
+            );
+            for output in case.cell_outputs.iter().flatten() {
+                let written = output.trim_end();
+                // The text a cell wrote is in the document...
+                for word in written
+                    .split(|character: char| !character.is_alphanumeric())
+                    .filter(|word| !word.is_empty())
+                {
+                    assert!(
+                        document.contains(word),
+                        "case {label:?}: expected the rendered output to carry {word:?}, got \
+                         {document:?}"
+                    );
+                }
+                // ... and the markup it wrote is text in it rather than markup of it.
+                if written.contains('<') {
+                    assert!(
+                        !document.contains(written),
+                        "case {label:?}: a cell's output carrying markup is escaped, got \
+                         {document:?}"
+                    );
+                    assert!(
+                        document.contains("&lt;"),
+                        "case {label:?}: expected the markup escaped as a character \
+                         reference, got {document:?}"
+                    );
+                }
+            }
+            continue;
+        }
+
+        // The notebook format records each cell's own execution on the cell: which
+        // execution of the kernel ran it, and what it produced.
+        let executed: Value = serde_json::from_str(&document).unwrap_or_else(|error| {
+            panic!("case {label:?}: the stored notebook is a notebook document: {error}")
+        });
+        let code: Vec<&Value> = executed["cells"]
+            .as_array()
+            .map(|cells| {
+                cells
+                    .iter()
+                    .filter(|cell| cell["cell_type"].as_str() == Some("code"))
+                    .collect()
+            })
+            .unwrap_or_default();
+        assert_eq!(
+            code.len(),
+            case.cell_outputs.len(),
+            "case {label:?}: expected {} code cells, got {executed}",
+            case.cell_outputs.len()
+        );
+        // Which execution of the kernel each cell that RAN was, counted over the cells the
+        // kernel was handed rather than over every code cell.
+        let mut ran = 0_u64;
+        for (position, (cell, expected)) in code.iter().zip(case.cell_outputs).enumerate() {
+            let count = cell["execution_count"].as_u64();
+            let Some(expected) = expected else {
+                // A code cell the kernel was never handed records no execution of its own,
+                // and no other cell's output is attributed to it.
+                assert!(
+                    count.is_none() && cell["outputs"].as_array().is_none_or(Vec::is_empty),
+                    "case {label:?}: cell {position} submitted no program, so it records no \
+                     execution, got {cell}"
+                );
+                continue;
+            };
+            ran += 1;
+            assert_eq!(
+                count,
+                Some(ran),
+                "case {label:?}: cell {position} records which execution ran it, got {cell}"
+            );
+            let outputs = cell["outputs"].as_array().cloned().unwrap_or_default();
+            if expected.is_empty() {
+                assert!(
+                    outputs.is_empty(),
+                    "case {label:?}: cell {position} wrote nothing, so it records no output, \
+                     got {cell}"
+                );
+                continue;
+            }
+            let text = outputs
+                .iter()
+                .filter(|output| output["output_type"].as_str() == Some("stream"))
+                .map(|output| output["text"].as_str().unwrap_or_default().to_string())
+                .collect::<Vec<String>>()
+                .concat();
+            assert_eq!(
+                text, *expected,
+                "case {label:?}: cell {position} must record what it wrote, got {cell}"
+            );
+        }
+        // The prose the notebook held is still the notebook's, untouched by the run.
+        let prose: Vec<&Value> = executed["cells"]
+            .as_array()
+            .map(|cells| {
+                cells
+                    .iter()
+                    .filter(|cell| cell["cell_type"].as_str() == Some("markdown"))
+                    .collect()
+            })
+            .unwrap_or_default();
+        for cell in prose {
+            assert!(
+                cell["outputs"].is_null(),
+                "case {label:?}: a prose cell records no execution, got {cell}"
+            );
+        }
+    }
+}
+
+/// A notebook that RAISED stores no output notebook: there is no executed notebook to
+/// store, so nothing points a caller at an object the store does not hold.
+#[tokio::test]
+async fn an_execution_whose_notebook_raised_stores_no_output_notebook() {
+    let router = emulator();
+    let cluster_id = notebook_cluster(&router).await;
+    s3_ok(&router, "bucket", &format!("/{BUCKET}"), &[]).await;
+
+    let rows: Vec<(&str, Option<Vec<u8>>)> = vec![
+        (
+            "a cell that raises",
+            Some(notebook(
+                json!([code_cell("raise ValueError('no output for this')")]),
+                None,
+            )),
+        ),
+        ("a key the bucket holds nothing under", None),
+    ];
+    for (index, (label, object)) in rows.iter().enumerate() {
+        let key = format!("unstored-{index}.ipynb");
+        if let Some(object) = object.as_ref() {
+            s3_ok(&router, label, &format!("/{BUCKET}/{key}"), object).await;
+        }
+        let output_key = format!("unstored/{index}/");
+        let answer = emr_ok(
+            &router,
+            "StartNotebookExecution",
+            json!({
+                "ExecutionEngine": { "Id": cluster_id.clone(), "Type": "EMR" },
+                "ServiceRole": NOTEBOOK_ROLE,
+                "NotebookExecutionName": label,
+                "NotebookS3Location": { "Bucket": BUCKET, "Key": key },
+                "OutputNotebookS3Location": { "Bucket": BUCKET, "Key": output_key.clone() },
+            }),
+        )
+        .await;
+        let id = answer["NotebookExecutionId"]
+            .as_str()
+            .unwrap_or_else(|| panic!("case {label:?}: an execution id, got {answer}"))
+            .to_string();
+        let (seen, execution) = walked(label, &router, &id).await;
+        assert_eq!(
+            execution["Status"].as_str(),
+            Some("FAILED"),
+            "case {label:?}: a notebook that did not run through fails, saw {seen:?}"
+        );
+        assert!(
+            execution["OutputNotebookURI"].is_null(),
+            "case {label:?}: no output notebook was produced, so none is reported, got \
+             {execution}"
+        );
+        let (status, _) = s3_get(&router, &format!("/{BUCKET}/{output_key}{id}.ipynb")).await;
+        assert_eq!(
+            status, 404,
+            "case {label:?}: nothing is stored under {output_key:?}, got {status}"
+        );
     }
 }
 
@@ -674,6 +1077,169 @@ async fn an_execution_the_caller_stops_reaches_stopped() {
             assert!(
                 seen.iter().any(|status| status == stopping),
                 "case {label:?}: the stop walk passes through {stopping}, saw {seen:?}"
+            );
+        }
+    }
+}
+
+/// An execution is never left `RUNNING` for good: whatever the run comes to, the clock ends
+/// it.
+///
+/// The record's own clock is driven here rather than waited on, so the rows can span what
+/// the rule generalises over — WHEN an execution's run reports relative to the walk (before
+/// the execution reached `RUNNING`, while it is `RUNNING`, not at all) and WHAT it reports —
+/// without any test sleeping for the span a run may take. Nothing of the host's clock is
+/// asserted on: each row states the instant it reads the record at.
+#[tokio::test]
+async fn an_execution_whose_run_never_reports_still_ends() {
+    use service_com_amazonaws_emr_elasticmapreduce::ops::types::{
+        ExecutionEngineConfig, NotebookS3LocationFromInput, StartNotebookExecutionInput,
+    };
+    use service_com_amazonaws_emr_elasticmapreduce::state::{
+        NotebookExecutionRecord, NotebookOutcome, NOTEBOOK_PHASE_SPAN, NOTEBOOK_RUN_CEILING,
+        NOTEBOOK_RUN_SPAN, NOTEBOOK_RUN_UNREPORTED_REASON,
+    };
+    use std::time::SystemTime;
+
+    /// When a row's run reports, counted from the start of the execution.
+    enum Reports {
+        /// The run answers straight away, before the clock has walked the execution on.
+        AtOnce,
+        /// The run answers once the execution is `RUNNING` and waiting for it.
+        WhileRunning,
+        /// The run never answers at all.
+        Never,
+    }
+
+    // (case, when the run reports, what it reports, the status the execution ends in, the
+    // reason it ends with)
+    let rows: Vec<(&str, Reports, NotebookOutcome, &str, Option<&str>)> = vec![
+        (
+            "a run that answers before the walk reaches RUNNING",
+            Reports::AtOnce,
+            NotebookOutcome::Finished {
+                cells: 1,
+                output_notebook_uri: None,
+            },
+            "FINISHED",
+            None,
+        ),
+        (
+            "a run that answers while the execution waits at RUNNING",
+            Reports::WhileRunning,
+            NotebookOutcome::Finished {
+                cells: 2,
+                output_notebook_uri: Some("s3://a-bucket/executed.ipynb".to_string()),
+            },
+            "FINISHED",
+            None,
+        ),
+        (
+            "a run whose notebook raised, answering at RUNNING",
+            Reports::WhileRunning,
+            NotebookOutcome::Failed {
+                reason: "ValueError: the cell failed".to_string(),
+            },
+            "FAILED",
+            Some("ValueError: the cell failed"),
+        ),
+        (
+            "a run that never answers at all",
+            Reports::Never,
+            NotebookOutcome::NotRun,
+            "FAILED",
+            Some(NOTEBOOK_RUN_UNREPORTED_REASON),
+        ),
+    ];
+
+    for (case, reports, outcome, ends_in, reason) in rows {
+        let started = SystemTime::UNIX_EPOCH;
+        let mut record = NotebookExecutionRecord::from_request(
+            "ex-ONE".to_string(),
+            "arn:aws:elasticmapreduce:us-east-1:000000000000:notebook-execution/ex-ONE"
+                .to_string(),
+            StartNotebookExecutionInput {
+                execution_engine: ExecutionEngineConfig {
+                    id: "j-ONE".to_string(),
+                    ..ExecutionEngineConfig::default()
+                },
+                service_role: "EMR_Notebooks_DefaultRole".to_string(),
+                notebook_s3_location: Some(NotebookS3LocationFromInput {
+                    bucket: Some("a-bucket".to_string()),
+                    key: Some("demo.ipynb".to_string()),
+                }),
+                ..StartNotebookExecutionInput::default()
+            },
+            started,
+        );
+
+        // The walk to `RUNNING` is two phases: "the execution is starting on the cluster",
+        // then "the execution is being processed by the cluster".
+        let running_at = started + NOTEBOOK_PHASE_SPAN * 2;
+        match reports {
+            Reports::AtOnce => record.record_outcome(outcome, started),
+            Reports::WhileRunning => {
+                record.advance_to(running_at);
+                assert_eq!(
+                    record.execution.status.as_deref(),
+                    Some("RUNNING"),
+                    "case {case:?}: an execution waiting for its run is RUNNING, got {:?}",
+                    record.execution.status
+                );
+                record.record_outcome(outcome, running_at);
+            }
+            Reports::Never => {}
+        }
+
+        // Well past everything the clock owes it: the walk, the longest a run may take to
+        // report, and the two phases of the end it then walks.
+        let settled = running_at
+            + NOTEBOOK_RUN_CEILING
+            + NOTEBOOK_RUN_SPAN
+            + NOTEBOOK_PHASE_SPAN * 2
+            + NOTEBOOK_PHASE_SPAN;
+        record.advance_to(settled);
+        assert_eq!(
+            record.execution.status.as_deref(),
+            Some(ends_in),
+            "case {case:?}: expected the execution to end in {ends_in}, got {:?}",
+            record.execution
+        );
+        assert_eq!(
+            record.execution.last_state_change_reason.as_deref(),
+            reason,
+            "case {case:?}: expected the reason {reason:?}, got {:?}",
+            record.execution.last_state_change_reason
+        );
+        assert!(
+            record.execution.end_time.is_some(),
+            "case {case:?}: an ended execution reports when it ended, got {:?}",
+            record.execution
+        );
+
+        // An execution still waiting for its run is RUNNING right up to the ceiling, so a
+        // run that reports inside it is never pre-empted by the end of the wait.
+        if matches!(reports, Reports::Never) {
+            let mut waiting = NotebookExecutionRecord::from_request(
+                "ex-TWO".to_string(),
+                "arn:aws:elasticmapreduce:us-east-1:000000000000:notebook-execution/ex-TWO"
+                    .to_string(),
+                StartNotebookExecutionInput {
+                    execution_engine: ExecutionEngineConfig {
+                        id: "j-ONE".to_string(),
+                        ..ExecutionEngineConfig::default()
+                    },
+                    service_role: "EMR_Notebooks_DefaultRole".to_string(),
+                    ..StartNotebookExecutionInput::default()
+                },
+                started,
+            );
+            waiting.advance_to(running_at + NOTEBOOK_RUN_CEILING - NOTEBOOK_PHASE_SPAN);
+            assert_eq!(
+                waiting.execution.status.as_deref(),
+                Some("RUNNING"),
+                "case {case:?}: an execution inside the ceiling is still RUNNING, got {:?}",
+                waiting.execution
             );
         }
     }

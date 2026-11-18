@@ -91,6 +91,11 @@ service-com-amazonaws-lambda-awsgirapiservice = { workspace = true }
 # implementation this workspace already uses for every other gzipped artifact
 # (`state::step_logs`).
 flate2 = "1"
+# `html-escape`: a notebook execution asking for the `HTML` output format has its executed
+# notebook stored as one HTML document, whose text (a cell's source and the output that cell
+# produced) is escaped with the maintained escaper other crates of this workspace already
+# render HTML with (`state::notebook_output`).
+html-escape = "0.2"
 # `sha2` and `hex`: the USERNAME of a cluster's session credentials is a digest of the cluster
 # and the identity the session belongs to, so one pair always identifies one session and two
 # pairs never share it (`state::session_credentials`).
