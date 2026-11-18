@@ -308,5 +308,13 @@ pub(super) fn cluster_runtime_of(
         group.map(|group| &group.parameters),
         record.cluster_create_time.as_secs_f64(),
         record.master_username.clone(),
+        // The hardware a Multi-AZ DB cluster's members run on is its own
+        // `DBClusterInstanceClass`; an Aurora cluster names no class here — its members each
+        // carry their own, and its serverless capacity is no fixed hardware at all — so such
+        // a cluster evaluates no instance-class formula.
+        record
+            .db_cluster_instance_class
+            .as_deref()
+            .and_then(crate::ops::describe_orderable_db_instance_options::class_memory_bytes),
     )
 }

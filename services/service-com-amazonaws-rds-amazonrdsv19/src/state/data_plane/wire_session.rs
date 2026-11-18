@@ -653,6 +653,10 @@ pub(super) fn parameter_group_family(
 /// publishes in `catalog`, with the values the resource's own group sets over them), when
 /// the engine came up, and the master user that owns its databases.
 ///
+/// `class_memory_bytes` is the memory of the DB instance class the engine runs on, which is
+/// what the published defaults written as a formula over the instance's hardware are
+/// evaluated with; `None` for a resource that runs on no fixed class.
+///
 /// Whether the engine is REPLAYING a primary's writes is not decided here: it follows the
 /// role of the endpoint the session is on, which [`replaying`] writes onto the runtime.
 pub(super) fn running_engine(
@@ -661,6 +665,7 @@ pub(super) fn running_engine(
     group: Option<&BTreeMap<String, crate::state::ParameterSetting>>,
     engine_started_at: f64,
     master_username: Option<String>,
+    class_memory_bytes: Option<u64>,
 ) -> EngineRuntime {
     EngineRuntime {
         parameters: super::pg_server::running_parameters(
@@ -668,6 +673,7 @@ pub(super) fn running_engine(
             catalogs,
             group,
             engine_started_at,
+            class_memory_bytes,
         ),
         postmaster_start_time: engine_started_at,
         in_recovery: false,
@@ -696,6 +702,11 @@ pub(super) fn engine_runtime_of(
         group.map(|group| &group.parameters),
         record.engine_started_at.as_secs_f64(),
         record.master_username.clone(),
+        // The hardware the engine runs on is the instance's own DB instance class, which is
+        // what the formula-valued defaults are computed from.
+        crate::ops::describe_orderable_db_instance_options::class_memory_bytes(
+            &record.db_instance_class,
+        ),
     )
 }
 

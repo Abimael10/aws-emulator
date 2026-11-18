@@ -129,6 +129,22 @@ pub fn check_custom_engine_version_name(engine_version: &str) -> Result<(), Stri
     Err(INVALID_DB_ENGINE_MESSAGE.to_string())
 }
 
+/// What a `CreateCustomDBEngineVersion` naming an `ImageId` the calling account does not
+/// own is refused with.
+///
+/// `ImageId` is "the ID of the AMI", and a CEV of an AMI-backed engine IS that image, so an
+/// id the account owns no image for names nothing the version could be built from. Amazon
+/// RDS words it as two sentences: that the image is not in the account, and what the caller
+/// should check — the ownership of the EC2 image, which is the condition that was not met.
+/// The id comes from the request and the account from the caller's identity; nothing else
+/// varies.
+pub fn ec2_image_not_in_account_message(image_id: &str, account: &str) -> String {
+    format!(
+        "Image {image_id} doesn't exist in your account {account}. Verify {account} is the \
+         owner of the EC2 image."
+    )
+}
+
 /// Whether a CEV of `engine` is created from an Amazon Machine Image rather than from
 /// installation files: RDS Custom for SQL Server, whose `ImageId` documentation states
 /// that "for RDS Custom for SQL Server, an AMI ID is required to create a CEV".

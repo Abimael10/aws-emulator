@@ -55,16 +55,36 @@ macro_rules! params {
 
 /// Create a DB instance, wait for it to settle, and answer with the endpoint it
 /// publishes.
+///
+/// The class is [`DEFAULT_INSTANCE_CLASS`]; a suite whose subject is the class itself names
+/// its own with [`available_instance_of_class`].
 pub(crate) async fn available_instance(
     router: &smithy_server_runtime::MultiServiceRouter,
     identifier: &str,
     engine: &str,
     extra: &[(&str, String)],
 ) -> (String, u16) {
+    available_instance_of_class(router, identifier, engine, DEFAULT_INSTANCE_CLASS, extra).await
+}
+
+/// The DB instance class every instance of these suites runs on unless the suite names
+/// another one: the smallest burstable class, which is enough for a session.
+pub(crate) const DEFAULT_INSTANCE_CLASS: &str = "db.t3.micro";
+
+/// [`available_instance`] on the DB instance CLASS `class`, for a suite whose subject is
+/// what the class decides — the hardware the engine's published formula defaults are
+/// computed from.
+pub(crate) async fn available_instance_of_class(
+    router: &smithy_server_runtime::MultiServiceRouter,
+    identifier: &str,
+    engine: &str,
+    class: &str,
+    extra: &[(&str, String)],
+) -> (String, u16) {
     let mut request: Vec<(&str, String)> = params![
         "DBInstanceIdentifier" => identifier,
         "Engine" => engine,
-        "DBInstanceClass" => "db.t3.micro",
+        "DBInstanceClass" => class,
         "AllocatedStorage" => 20,
         "MasterUsername" => MASTER_USER,
         "MasterUserPassword" => MASTER_PASSWORD,

@@ -160,22 +160,27 @@ pub struct RunningParameter {
 /// reports `database` for a setting that came from the server's per-database configuration,
 /// which is where a DB parameter group's value lands.
 const SOURCE_DATABASE: &str = "database";
+/// `pg_settings.source` for a value this SERVICE computed and wrote into the server's
+/// configuration file — a published default that is a formula over the instance's hardware,
+/// which the engine cannot compute for itself and so reads from `postgresql.conf`.
+/// PostgreSQL reports `configuration file` for a setting that came from there.
+const SOURCE_CONFIGURATION_FILE: &str = "configuration file";
 /// `pg_settings.source` for a parameter still on the engine's own value.
 const SOURCE_DEFAULT: &str = "default";
 
 /// The engine's own compiled default for a parameter whose RDS default is an instance-class
 /// FORMULA rather than a value.
 ///
-/// Amazon RDS writes some defaults as an expression over the instance class's memory
-/// (`LEAST({DBInstanceClassMemory/9531392},5000)`). This emulator models no instance-class
-/// memory, so it cannot evaluate those expressions, and reporting the expression as the
-/// running value would report something that is not a value at all. What a server runs with
-/// when its configuration sets nothing is ITS OWN engine's compiled default, which each
-/// engine's documentation publishes per parameter — PostgreSQL's `postgresql.conf` ships
-/// `max_connections = 100` and `shared_buffers = 128MB` (16384 pages of 8 kB), MySQL's
-/// server ships `max_connections = 151` — so the default is read from the engine the
-/// parameter's FAMILY belongs to, and a parameter the named engine does not have resolves
-/// to nothing.
+/// Amazon RDS writes some defaults as an expression over the instance class's hardware
+/// (`LEAST({DBInstanceClassMemory/9531392},5000)`). That expression is what the SERVICE
+/// evaluates for the class the instance runs ([`crate::state::parameter_formula`]) and
+/// writes into the engine's configuration; what the engine itself starts with when nothing
+/// sets a value is ITS OWN compiled default, which is what `pg_settings.boot_val` reports and
+/// what stands for a class this service publishes no memory for. Each engine's documentation
+/// publishes that compiled default per parameter — PostgreSQL's `postgresql.conf` ships
+/// `max_connections = 100` and `shared_buffers = 128MB` (16384 pages of 8 kB), MySQL's server
+/// ships `max_connections = 151` — so it is read from the engine the parameter's FAMILY
+/// belongs to, and a parameter the named engine does not have resolves to nothing.
 fn engine_compiled_default(family: &str, name: &str) -> Option<&'static str> {
     let family = family.to_ascii_lowercase();
     // Which engine the family's own name says it runs — the one predicate the catalogs are
@@ -192,17 +197,45 @@ fn engine_compiled_default(family: &str, name: &str) -> Option<&'static str> {
     }
 }
 
-/// The value a parameter's published default stands for: the default column of the record
-/// the FAMILY publishes (already resolved by the caller through
-/// [`crate::state::published_spec_for_family`]), or the engine's compiled default where the
-/// published one is a formula ([`engine_compiled_default`]).
-fn resolved_default(family: &str, spec: &ClusterParameterSpec) -> String {
+/// The value the ENGINE boots with for a parameter when nothing sets one: the default column
+/// of the record the FAMILY publishes (already resolved by the caller through
+/// [`crate::state::published_spec_for_family`]), or the engine's compiled default
+/// ([`engine_compiled_default`]) where the published one is a formula — a formula is not a
+/// value, and the engine has no way to compute one.
+///
+/// This is `pg_settings.boot_val`, and it is NOT what the server runs with where the service
+/// can evaluate the formula: see [`effective_default`].
+fn engine_boot_value(family: &str, spec: &ClusterParameterSpec) -> String {
     if spec.default_value.contains('{') || spec.default_value.contains('(') {
         if let Some(compiled) = engine_compiled_default(family, spec.name) {
             return compiled.to_string();
         }
     }
     spec.default_value.to_string()
+}
+
+/// The default a running instance's engine is CONFIGURED with for a parameter its group sets
+/// no value for, and whether that configuration is the SERVICE's rather than the engine's.
+///
+/// A published default that is a formula over the instance class's hardware is a value
+/// Amazon RDS computes for the class and writes into the engine's configuration, so an
+/// instance of a class whose memory this service publishes
+/// ([`crate::ops::describe_orderable_db_instance_options::class_memory_bytes`]) runs the
+/// evaluated formula and not the engine's compiled default — which is why
+/// `pg_settings.source` for such a parameter is the configuration that set it rather than
+/// `default`. Everything else is the engine's own boot value ([`engine_boot_value`]), left
+/// exactly where it was.
+fn effective_default(
+    family: &str,
+    spec: &ClusterParameterSpec,
+    class_memory_bytes: Option<u64>,
+) -> (String, bool) {
+    if let Some(evaluated) = class_memory_bytes
+        .and_then(|memory| crate::state::parameter_formula::evaluate(spec.default_value, memory))
+    {
+        return (evaluated.to_string(), true);
+    }
+    (engine_boot_value(family, spec), false)
 }
 
 /// `pg_settings.vartype` for a parameter the catalog publishes, from the data type and the
@@ -242,6 +275,13 @@ fn context(spec: &ClusterParameterSpec) -> &'static str {
 /// `engine_started_at` is when this instance's engine last came up, as epoch seconds, and
 /// `family` is the parameter-group family whose engine the compiled defaults come from.
 ///
+/// `class_memory_bytes` is the memory of the DB instance class the engine runs on, which is
+/// what a published default written as a formula over the instance's hardware is evaluated
+/// with ([`effective_default`]); `None` for a resource that runs on no fixed class — an
+/// Aurora cluster's serverless capacity — and for a class whose memory this service
+/// publishes nothing about, both of which leave such a parameter on the engine's own
+/// compiled default.
+///
 /// `catalogs` are the published catalogs the resource's parameters come from, in the order
 /// that resolves one a parameter is in several of. A DB INSTANCE has one — the parameters its
 /// family publishes — while a DB CLUSTER has TWO: its family's cluster-level list and the
@@ -253,6 +293,7 @@ pub fn running_parameters(
     catalogs: &[&'static [ClusterParameterSpec]],
     group: Option<&BTreeMap<String, ParameterSetting>>,
     engine_started_at: f64,
+    class_memory_bytes: Option<u64>,
 ) -> Vec<RunningParameter> {
     let mut parameters: Vec<RunningParameter> = Vec::new();
     for spec in catalogs.iter().flat_map(|catalog| catalog.iter()) {
@@ -267,7 +308,8 @@ pub fn running_parameters(
         // between versions is the one this family's version carries: the engine runs, and
         // reports, what its own release publishes.
         let spec = &crate::state::published_spec_for_family(family, spec);
-        let default = resolved_default(family, spec);
+        let (default, configured_by_the_service) =
+            effective_default(family, spec, class_memory_bytes);
         let setting = group.and_then(|group| group.get(spec.name));
         let pending = setting.is_some_and(|setting| {
             crate::state::change_is_pending_for(Some(spec), &setting.apply_method)
@@ -286,16 +328,19 @@ pub fn running_parameters(
                 Some(setting) if !pending => setting.value.clone(),
                 _ => default.clone(),
             },
-            boot_value: default,
+            boot_value: engine_boot_value(family, spec),
             reset_value: setting.map_or_else(
-                || resolved_default(family, spec),
+                || default.clone(),
                 |setting| setting.value.clone(),
             ),
             pending_restart: pending,
-            source: if setting.is_some() && !pending {
-                SOURCE_DATABASE
-            } else {
-                SOURCE_DEFAULT
+            // Which configuration the value in force came from: the group's own setting, the
+            // configuration file this service wrote the class's formula value into, or — only
+            // when neither set one — the engine's own compiled default.
+            source: match (setting.is_some() && !pending, configured_by_the_service) {
+                (true, _) => SOURCE_DATABASE,
+                (false, true) => SOURCE_CONFIGURATION_FILE,
+                (false, false) => SOURCE_DEFAULT,
             },
             vartype: vartype(spec),
             context: context(spec),

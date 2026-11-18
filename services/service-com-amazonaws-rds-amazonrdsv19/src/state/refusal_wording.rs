@@ -268,6 +268,34 @@ pub fn unrecognized_filter_name_message(name: &str) -> String {
     format!("Unrecognized filter name: {name}")
 }
 
+/// What a request carrying a value one of the service's own member CONSTRAINTS does not
+/// admit is refused with: the standard constraint report, over the one member that carried
+/// it.
+///
+/// A constraint the service enforces on a member — rather than one the model declares, which
+/// the boundary already reports — is still a constraint ON THAT MEMBER, so it is reported the
+/// way every other one is: the count of findings, the offending value, the path of the member
+/// it sat at and the requirement it broke. The envelope and the clause are the framework's
+/// own (`aws_smithy_schema_server`), the same two this service restates a modelled refusal
+/// with (`crate::service`), so a refusal a handler makes and one the boundary makes cannot
+/// drift apart; `member_path` is spelled by the framework's path helpers for the same reason.
+///
+/// The requirement is stated as the regular expression the value had to match, which is what
+/// lets a caller tell which entry of a list it sent is wrong and what would be accepted
+/// instead.
+pub fn member_pattern_violation_message(member_path: &str, value: &str, pattern: &str) -> String {
+    let violation = ::aws_smithy_schema_server::Violation {
+        path: member_path.to_string(),
+        kind: ::aws_smithy_schema_server::ViolationKind::Pattern(pattern.to_string()),
+        value: Some(value.to_string()),
+        sensitive: false,
+    };
+    // `None` only for an EMPTY violation list, which this one is not; the clause itself is
+    // the fallback so no refusal is ever left without a message.
+    ::aws_smithy_schema_server::envelope(std::slice::from_ref(&violation))
+        .unwrap_or_else(|| violation.message())
+}
+
 /// Refuse a `BackupRetentionPeriod` outside the range the addressed resource accepts,
 /// whichever operation carries the member: the creates, the modifications, the restores and
 /// the promotion hold ONE rule, so none of them can drift from the others. `Err` carries the

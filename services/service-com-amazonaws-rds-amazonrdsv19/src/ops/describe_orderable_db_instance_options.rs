@@ -476,6 +476,76 @@ fn vcpus(size: &str) -> Option<i32> {
         .map(|(_, vcpus)| *vcpus)
 }
 
+/// One gibibyte, the unit the published instance-class table states memory in.
+const GIB: u64 = 1024 * 1024 * 1024;
+
+/// The memory a BURSTABLE class below `large` has, in GiB: the three sizes whose memory the
+/// per-vCPU rule below does not give, because their vCPUs are shared.
+///
+/// Source: the "DB instance classes — hardware specifications" table in the Amazon RDS User
+/// Guide, which publishes the vCPU count and the memory of every class. The burstable
+/// generations (`t2`, `t3`, `t4g`) publish the same memory for these three sizes.
+const BURSTABLE_SIZE_MEMORY_GIB: &[(&str, u64)] = &[("micro", 1), ("small", 2), ("medium", 4)];
+
+/// The memory a class has PER vCPU, in GiB, by the family's own generation letter — which is
+/// what the published table's families are grouped by.
+///
+/// Source: the same hardware-specification table. It states one ratio per family class, so a
+/// class's memory follows from its vCPU count: a compute family carries 2 GiB per vCPU
+/// (`db.c6gd.large`, 2 vCPUs, 4 GiB), a general-purpose or burstable family 4
+/// (`db.m5.large`, 2 vCPUs, 8 GiB; `db.t3.xlarge`, 4 vCPUs, 16 GiB) and a memory-optimised
+/// one 8 (`db.r5.large`, 2 vCPUs, 16 GiB). The ratio is stated per family rather than per
+/// class so a SIZE this service does not publish an option for still has the memory its
+/// family gives it.
+const FAMILY_MEMORY_GIB_PER_VCPU: &[(&str, u64)] = &[
+    // Compute optimised.
+    ("c", 2),
+    // General purpose, and the burstable families from `large` up.
+    ("m", 4),
+    ("t", 4),
+    // Memory optimised.
+    ("r", 8),
+    ("z", 8),
+    // The memory-optimised `x2iedn` line, whose ratio is its own
+    // (`db.x2iedn.xlarge`, 4 vCPUs, 128 GiB).
+    ("x2iedn", 32),
+];
+
+/// The memory the DB instance class `db_instance_class` has, in BYTES, or `None` for a class
+/// whose memory this service publishes nothing about.
+///
+/// This is what a published parameter default written as a formula over
+/// `DBInstanceClassMemory` is evaluated with
+/// ([`crate::state::parameter_formula`]), so the engine of an instance runs with the value
+/// its own class gives. The figure is the class's published memory: the share of it Amazon
+/// RDS reserves for the operating system and its own processes is not published per class,
+/// so nothing is subtracted here rather than a reservation being invented.
+///
+/// `None` for the serverless capacity class, which is not a family-and-size class and has no
+/// fixed memory at all, and for a family or size outside the tables above — a class whose
+/// hardware this service does not know is one no formula can be evaluated for.
+pub fn class_memory_bytes(db_instance_class: &str) -> Option<u64> {
+    let lowered = db_instance_class.to_ascii_lowercase();
+    let (family, size) = lowered.strip_prefix("db.")?.split_once('.')?;
+    if let Some((_, gib)) = BURSTABLE_SIZE_MEMORY_GIB
+        .iter()
+        .find(|(named, _)| *named == size)
+        .filter(|_| family.starts_with('t'))
+    {
+        return gib.checked_mul(GIB);
+    }
+    let vcpus = u64::try_from(vcpus(size)?).ok()?;
+    // The longest matching family key wins, so a line with a ratio of its own
+    // (`x2iedn`) is not read as its generation letter.
+    let (_, gib_per_vcpu) = FAMILY_MEMORY_GIB_PER_VCPU
+        .iter()
+        .filter(|(named, _)| family.starts_with(named))
+        .max_by_key(|(named, _)| named.len())?;
+    // Checked, so a table entry or a size the published naming grows past `u64` answers no
+    // memory rather than a wrapped one.
+    gib_per_vcpu.checked_mul(vcpus)?.checked_mul(GIB)
+}
+
 /// The classes `engine` can be ordered in, built from the family tables above.
 ///
 /// `pub` because this catalogue is the service's one published answer to "what can a DB

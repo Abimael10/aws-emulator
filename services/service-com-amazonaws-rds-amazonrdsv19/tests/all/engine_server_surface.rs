@@ -100,8 +100,10 @@ async fn a_postgresql_endpoint_answers_for_every_parameter_its_family_publishes(
     // The table spans the two sources a value can come from and the three ways a client
     // reads one. The engine defaults are the ones the family publishes
     // (`DescribeEngineDefaultParameters` reports the same catalog), and `max_connections`
-    // is a parameter whose published RDS default is an instance-class formula, so the
-    // engine's own compiled default stands for it.
+    // is a parameter whose published RDS default is an instance-class formula, so what
+    // stands for it is that formula evaluated for this instance's class — the smallest
+    // burstable one, whose 1 GiB gives `LEAST({DBInstanceClassMemory/9531392},5000)` the
+    // value below (the `instance_class_memory_formula` suite spans that rule over classes).
     for (case, parameter, expected) in [
         ("a dynamic parameter the group sets", "log_statement", "all"),
         ("an engine default the group leaves alone", "statement_timeout", "0"),
@@ -113,7 +115,7 @@ async fn a_postgresql_endpoint_answers_for_every_parameter_its_family_publishes(
         (
             "a parameter whose published default is an instance-class formula",
             "max_connections",
-            "100",
+            "112",
         ),
         ("a parameter the server itself answers for", "server_encoding", "UTF8"),
     ] {
@@ -204,7 +206,7 @@ async fn a_static_parameter_change_takes_effect_only_once_the_instance_has_reboo
     let mut before = session(&address, port).await;
     let running = value(&mut before, "SHOW max_connections").await;
     assert_eq!(
-        running, "100",
+        running, "112",
         "a change waiting for a reboot must not be in force yet, got {running:?}"
     );
     let pending = value(

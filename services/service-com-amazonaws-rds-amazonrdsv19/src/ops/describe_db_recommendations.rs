@@ -233,10 +233,42 @@ const SUPPORTED_FILTER_NAMES: [&str; 8] = [
     "cluster-pg-arn",
 ];
 
-/// Refuse a filter this operation does not support, in the sentence Amazon RDS answers an
-/// unrecognized filter name with: fixed text, then the name the request carried and
-/// nothing after it. "Filter names are case-sensitive."
+/// The character set this report's filter NAMES are drawn from: lowercase letters and the
+/// hyphen that separates their words, which is exactly what every name in
+/// [`SUPPORTED_FILTER_NAMES`] is spelled with.
+///
+/// It is the constraint the service holds `Filter$Name` to on this report, and it is stated
+/// as the regular expression a constraint refusal reports, because that expression is part
+/// of the refusal's own text ([`crate::state::member_pattern_violation_message`]).
+const FILTER_NAME_PATTERN: &str = "[a-z-]+";
+
+/// Refuse a filter this operation cannot narrow by.
+///
+/// Two refusals, for two different things wrong with `Filter$Name`:
+///
+/// 1. a value outside the character set the names are drawn from
+///    ([`FILTER_NAME_PATTERN`]) is a value the MEMBER does not admit at all, so it is
+///    refused as the modelled member constraint it broke — the service's standard
+///    constraint report, naming the offending value, the path of the member that carried it
+///    and the expression it had to satisfy — which is what tells a caller WHICH entry of
+///    its list is wrong and why;
+/// 2. a value the member does admit but this report does not narrow by is refused with the
+///    sentence Amazon RDS answers an unrecognized filter name with: fixed text, then the
+///    name the request carried and nothing after it. "Filter names are case-sensitive."
+///
+/// The member's own domain is checked FIRST, and over the whole list in the order the
+/// request wrote it, because the constraint report names the position it refuses
+/// (`filters.<1-based position>.member.name`).
 fn check_filter_names(filters: &[Filter]) -> Result<(), String> {
+    for (position, filter) in filters.iter().enumerate() {
+        if !filter_name_is_admitted(&filter.name) {
+            return Err(crate::state::member_pattern_violation_message(
+                &filter_name_path(position),
+                &filter.name,
+                FILTER_NAME_PATTERN,
+            ));
+        }
+    }
     for filter in filters {
         if !SUPPORTED_FILTER_NAMES.contains(&filter.name.as_str()) {
             return Err(crate::state::unrecognized_filter_name_message(
@@ -245,6 +277,25 @@ fn check_filter_names(filters: &[Filter]) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+/// Whether `name` is drawn from [`FILTER_NAME_PATTERN`]'s character set: one or more
+/// lowercase ASCII letters and hyphens, and nothing else.
+fn filter_name_is_admitted(name: &str) -> bool {
+    !name.is_empty() && name.chars().all(|c| c.is_ascii_lowercase() || c == '-')
+}
+
+/// The path of the `Name` member of the `Filters` entry at `position` (0-based), spelled the
+/// way a constraint report spells a member path — the list member, the element's 1-based
+/// position and the step into it, then the member itself — through the framework's own
+/// spelling of each segment, so this path cannot drift from the ones the boundary reports.
+fn filter_name_path(position: usize) -> String {
+    use ::aws_smithy_schema_server::constraints::path;
+    path::join(&[
+        path::member("Filters"),
+        path::element(position + 1),
+        path::member("Name"),
+    ])
 }
 
 /// Whether `record` matches one filter: true when any of the filter's values matches the

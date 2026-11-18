@@ -202,7 +202,8 @@ pub use custom_engine_versions::{
     check_custom_engine, check_custom_engine_version_name,
     custom_db_engine_version_denied_message,
     custom_db_engine_version_key, custom_db_engine_version_resource_arn,
-    custom_engine_version_is_modifiable, is_ami_backed_custom_engine, reports_engine_media_type,
+    custom_engine_version_is_modifiable, ec2_image_not_in_account_message,
+    is_ami_backed_custom_engine, reports_engine_media_type,
     CustomDbEngineVersionRecord, CUSTOM_DB_ENGINE_VERSION_QUOTA_PER_REGION,
     CUSTOM_ENGINE_VERSION_ENGINES, CUSTOM_ENGINE_VERSION_STATUS_AVAILABLE,
     CUSTOM_ENGINE_VERSION_STATUS_CREATING, MEDIA_TYPE_CUSTOMER_PROVIDED,
@@ -286,6 +287,12 @@ pub mod default_subnet_group;
 // The VPC security groups a request NAMES, resolved against the service that owns them:
 // whether a group exists is Amazon EC2's fact, asked here and nowhere else.
 mod ec2_security_groups;
+// The Amazon Machine Image a request NAMES, resolved against the service that owns images:
+// whether the account owns that AMI is Amazon EC2's fact, asked here and nowhere else.
+pub mod ec2_images;
+// The published parameter defaults Amazon RDS writes as a FORMULA over the instance's
+// hardware, evaluated for one DB instance class: what the engine of that instance runs with.
+pub mod parameter_formula;
 mod instances;
 mod clusters;
 // The weekly maintenance window both resource kinds keep: the form it is STORED in, and
@@ -354,6 +361,7 @@ pub use data_plane::{
 pub use ec2_subnets::{invalid_subnets_message, subnet_zones, SubnetZones};
 pub use default_subnet_group::{default_vpc_network, DefaultSubnetGroupNetwork};
 pub use ec2_security_groups::{invalid_security_group_message, unresolved_vpc_security_groups};
+pub use ec2_images::{image_ownership, ImageOwnership};
 
 /// Per-service state for com-amazonaws-rds-amazonrdsv19. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]

@@ -353,8 +353,35 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         }
 
-        // The combinations the operation documents as unserveable, refused before anything
-        // is resolved: each value is fine on its own, so what fails is the pair.
+        // `ImageId` is "the ID of the AMI": for an engine whose CEV IS an image, the version
+        // is built from the AMI the request names, so the IMAGE is resolved before anything
+        // is decided about the members that name one. The owner of images answers whether
+        // the account has it ([`crate::state::image_ownership`]), and an id it answered the
+        // account owns no image for is refused with the modelled
+        // `Ec2ImagePropertiesNotSupportedFault`: the AMI configuration prerequisite of this
+        // create is exactly that the account owns the image. A hop that could not be made
+        // is evidence of nothing, so nothing is refused on it.
+        if let Some(image_id) = &input.image_id {
+            if crate::state::image_ownership(ctx, &region, image_id).await
+                == crate::state::ImageOwnership::NotInTheAccount
+            {
+                return Err(
+                    CreateCustomDBEngineVersionErrorModeled::Ec2ImagePropertiesNotSupportedFault(
+                        Ec2ImagePropertiesNotSupportedFault {
+                            message: Some(crate::state::ec2_image_not_in_account_message(
+                                image_id,
+                                emulator_server::emulator_account_id(),
+                            )),
+                        },
+                    )
+                    .into(),
+                );
+            }
+        }
+
+        // The combinations the operation documents as unserveable, refused once the resources
+        // the request names have been resolved: each value is fine on its own, so what fails
+        // is the pair.
         if input.image_id.is_some() && input.use_aws_provided_latest_image == Some(true) {
             return Err(
                 CreateCustomDBEngineVersionError::invalid_parameter_combination(
