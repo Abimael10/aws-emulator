@@ -10,6 +10,8 @@
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use smithy_server_runtime::MultiServiceRouter;
+
 use service_com_amazonaws_autoscaling_autoscaling_2011_01_01 as autoscaling;
 
 use crate::support::{new_engine, query, router_with, tag_value, tag_values, REGION};
@@ -1785,17 +1787,105 @@ async fn state_changing_operations_emit_an_audit_record() {
     );
 }
 
-/// The instances a group holds — including the ones still terminating, which stay
-/// stored until the clock retires them — never exceed the per-group ceiling, so a
-/// caller cycling the capacity faster than the transition comes due cannot stack
-/// one ceiling's worth of instances on top of another. A change that does not fit
-/// beside them is the modelled `ScalingActivityInProgressFault`.
+/// How long a leg of the ceiling test below looks for what it is waiting on, and how
+/// often it looks again.
+///
+/// Every span this service owes is a stored due instant that nothing sleeps for, so a leg
+/// looks again until the group REPORTS what it is waiting for instead of sleeping a span
+/// and assuming that was enough. The deadline is far above the work one capacity change at
+/// the group ceiling makes, so a loaded host delays a leg rather than breaking it.
+const CEILING_DEADLINE: Duration = Duration::from_secs(60);
+const CEILING_POLL: Duration = Duration::from_millis(25);
+
+/// How many instances are in each `LifecycleState`, for an assertion about a group holding
+/// a ceiling's worth of them: the states and their counts rather than a thousand entries.
+fn lifecycle_state_counts(states: &[String]) -> std::collections::BTreeMap<&str, usize> {
+    let mut counts: std::collections::BTreeMap<&str, usize> = std::collections::BTreeMap::new();
+    for state in states {
+        *counts.entry(state.as_str()).or_insert(0) += 1;
+    }
+    counts
+}
+
+/// Look at the group over the wire until it reports `count` instances with every one of
+/// them in `lifecycle_state`, or [`CEILING_DEADLINE`] passes.
+async fn poll_until_every_instance_is(
+    router: &MultiServiceRouter,
+    group: &str,
+    lifecycle_state: &str,
+    count: usize,
+) {
+    let deadline = std::time::Instant::now() + CEILING_DEADLINE;
+    loop {
+        let (status, body) = query(
+            router,
+            "DescribeAutoScalingGroups",
+            &[("AutoScalingGroupNames.member.1", group)],
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "DescribeAutoScalingGroups for {group:?}: got {status}: {body}"
+        );
+        let states = tag_values(&body, "LifecycleState");
+        if states.len() == count && states.iter().all(|state| state == lifecycle_state) {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "case {group:?}: expected {count} instances in {lifecycle_state:?}, got {} in {:?}",
+            states.len(),
+            lifecycle_state_counts(&states)
+        );
+        tokio::time::sleep(CEILING_POLL).await;
+    }
+}
+
+/// Move the deadline of every lifecycle hold the group has taken into the past, so each one
+/// resolves to its hook's own `DefaultResult` on the next pass over the store — exactly what
+/// the service does for a hold nobody completed by the instant it was owed at.
+///
+/// The shortest hold the service accepts outlives any wait a test may make, so this drives
+/// the stored deadline instead of waiting for it, the way the hook suite
+/// (`lifecycle_hooks.rs`) times a hold out. Answers how many holds it released, so a leg
+/// that found none to release says so rather than passing by accident.
+fn release_every_lifecycle_hold(engine: &Arc<engine::InMemoryEngine>, group: &str) -> usize {
+    let state = autoscaling::state::service_state(&**engine).expect("the service store");
+    let mut state = state.lock();
+    let stored = state
+        .groups
+        .get_mut(group)
+        .unwrap_or_else(|| panic!("the group {group:?} must be stored for its holds to resolve"));
+    let mut released = 0;
+    for instance in &mut stored.instances {
+        for action in &mut instance.pending_lifecycle_actions {
+            action.heartbeat_due = std::time::SystemTime::UNIX_EPOCH;
+            action.global_due = std::time::SystemTime::UNIX_EPOCH;
+            released += 1;
+        }
+    }
+    released
+}
+
+/// The instances a group holds — including the ones on their way out of it, which stay
+/// stored until the group has finished taking them out of service — never exceed the
+/// per-group ceiling, so a caller asking for a fresh ceiling's worth while the last one is
+/// still leaving cannot stack one on top of the other. A change that does not fit beside
+/// them is the modelled `ScalingActivityInProgressFault`.
+///
+/// The instances are kept on their way out by a TERMINATION LIFECYCLE HOOK, the modelled
+/// way a termination waits: nothing the clock owes moves a held instance on, so the state
+/// this rule is about holds for as long as the assertions take, however slow the host is,
+/// and no leg here races a transient span. The hold is then resolved the way the service's
+/// own clock resolves one nobody completed, and the last leg looks again until the group
+/// has its headroom back.
 #[tokio::test]
 async fn instances_still_terminating_occupy_the_group_ceiling() {
     let engine = new_engine();
     let router = router_with(engine.clone());
 
     let ceiling = autoscaling::state::MAX_GROUP_CAPACITY;
+    let stored_ceiling = usize::try_from(ceiling).expect("the ceiling fits");
     let full = ceiling.to_string();
     let (status, body) = query(
         &router,
@@ -1811,9 +1901,33 @@ async fn instances_still_terminating_occupy_the_group_ceiling() {
     )
     .await;
     assert_eq!(status, 200, "a group filled to the ceiling: got {status}: {body}");
-    wait_for_the_lifecycle_transition();
+    // The launches the create owes settle on the clock, so the group is looked at again
+    // until it reports them in service.
+    poll_until_every_instance_is(&router, "asg-full", "InService", stored_ceiling).await;
 
-    // Scale all the way in: every instance is now Terminating, and still stored.
+    // A hook for the scale-in transition, so the instances the next change takes out of
+    // service wait at it rather than leaving on the clock.
+    let (status, body) = query(
+        &router,
+        "PutLifecycleHook",
+        &[
+            ("AutoScalingGroupName", "asg-full"),
+            ("LifecycleHookName", "hold-the-terminations"),
+            (
+                "LifecycleTransition",
+                autoscaling::state::TRANSITION_TERMINATING,
+            ),
+            (
+                "DefaultResult",
+                autoscaling::state::LIFECYCLE_ACTION_CONTINUE,
+            ),
+        ],
+    )
+    .await;
+    assert_eq!(status, 200, "PutLifecycleHook: got {status}: {body}");
+
+    // Scale all the way in: every instance is now leaving the group, waiting at that hook,
+    // and still stored.
     let (status, body) = query(
         &router,
         "SetDesiredCapacity",
@@ -1821,13 +1935,20 @@ async fn instances_still_terminating_occupy_the_group_ceiling() {
     )
     .await;
     assert_eq!(status, 200, "scaling in: got {status}: {body}");
+    poll_until_every_instance_is(
+        &router,
+        "asg-full",
+        autoscaling::state::LIFECYCLE_TERMINATING_WAIT,
+        stored_ceiling,
+    )
+    .await;
     {
         let state = autoscaling::state::service_state(&*engine).expect("the service store");
         let state = state.lock();
         let group = state.groups.get("asg-full").expect("the group");
         assert_eq!(
             group.instances.len(),
-            usize::try_from(ceiling).expect("the ceiling fits"),
+            stored_ceiling,
             "the terminating instances are still stored"
         );
         assert_eq!(
@@ -1872,34 +1993,49 @@ async fn instances_still_terminating_occupy_the_group_ceiling() {
         let state = state.lock();
         let group = state.groups.get("asg-full").expect("the group");
         assert!(
-            group.instances.len() <= usize::try_from(ceiling).expect("the ceiling fits"),
+            group.instances.len() <= stored_ceiling,
             "the stored instances must never exceed the ceiling, got {}",
             group.instances.len()
         );
     }
 
-    // Once the terminations are due the group is empty and has its headroom back.
-    wait_for_the_lifecycle_transition();
-    let (status, body) = query(
-        &router,
-        "SetDesiredCapacity",
-        &[
-            ("AutoScalingGroupName", "asg-full"),
-            ("DesiredCapacity", full.as_str()),
-        ],
-    )
-    .await;
+    // Once the group has finished taking them out of service it is empty and has its
+    // headroom back. The holds are resolved by their own deadline, as the service's clock
+    // resolves ones nobody completed, and the leg then looks again until the raise is
+    // accepted.
+    let released = release_every_lifecycle_hold(&engine, "asg-full");
     assert_eq!(
-        status, 200,
-        "once the terminations are due the capacity can be raised again: got {status}: {body}"
+        released, stored_ceiling,
+        "every instance leaving the group must be waiting at the group's one termination \
+         hook, got {released} holds"
     );
+    let deadline = std::time::Instant::now() + CEILING_DEADLINE;
+    loop {
+        let (status, body) = query(
+            &router,
+            "SetDesiredCapacity",
+            &[
+                ("AutoScalingGroupName", "asg-full"),
+                ("DesiredCapacity", full.as_str()),
+            ],
+        )
+        .await;
+        if status == 200 {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "once the terminations are due the capacity can be raised again: got {status}: {body}"
+        );
+        tokio::time::sleep(CEILING_POLL).await;
+    }
     {
         let state = autoscaling::state::service_state(&*engine).expect("the service store");
         let state = state.lock();
         let group = state.groups.get("asg-full").expect("the group");
         assert_eq!(
             group.instances.len(),
-            usize::try_from(ceiling).expect("the ceiling fits"),
+            stored_ceiling,
             "the group holds exactly its capacity again"
         );
     }
