@@ -8,13 +8,15 @@
 //!
 //! The rule under test: a network ACL's reported `entrySet` is that ACL's whole stored rule
 //! table, projected ONE way — the egress rules first, then the ingress rules, each by
-//! ascending rule number — and every reported entry carries the members its RULE has beside
-//! the rule number, protocol, action, direction and range it was written with: "the ICMP type
-//! and code" (`NetworkAclEntry$IcmpTypeCode`) for a rule written with one and "the range of
-//! ports the rule applies to" (`$PortRange`) for a rule written with one, and NEITHER for a
-//! rule whose protocol has no ports and no ICMP numbers — whether a caller wrote it or the
-//! service itself did onto an ACL it created, since what decides whether a member is there is
-//! the rule and not who wrote it.
+//! ascending rule number — and every reported entry carries the rule number, protocol, action,
+//! direction and range it was written with. The two sub-structures depend on WHO wrote the
+//! rule: a rule a CALLER wrote carries "the ICMP type and code"
+//! (`NetworkAclEntry$IcmpTypeCode`) and "the range of ports the rule applies to"
+//! (`$PortRange`) only where the rule names one, and NEITHER for a rule whose protocol has no
+//! ports and no ICMP numbers; the IMPLICIT entries the service itself writes onto an ACL — the
+//! catch-all deny every ACL ends with, and the allow-everything pair a VPC's default ACL comes
+//! with — carry both members as present-but-EMPTY elements, which is what an ACL a create
+//! answers carries, so a client that reads either member of such an entry always finds it.
 //!
 //! So the list `CreateNetworkAcl` answers, the list `DescribeNetworkAcls` answers for that
 //! same ACL — named by id, selected by a filter, or listed with the whole store — and the
@@ -53,8 +55,8 @@ const REGION: &str = "us-east-1";
 /// One entry of a reported network ACL, with every member of the modelled `NetworkAclEntry`
 /// told apart from an ABSENT one: `None` is a member the response left out, and
 /// `Some((None, None))` one it wrote as a present-but-empty element — which is what this suite
-/// pins the readers against writing for a rule that has no such member, whoever wrote the
-/// rule.
+/// pins the readers to writing for an entry the SERVICE wrote and to never writing for a rule
+/// a caller wrote that has no such member.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ReportedEntry {
     rule_number: String,
@@ -238,7 +240,7 @@ impl Rule {
 
 /// One rule-32767 entry every network ACL ends with, in the direction `egress` names: the
 /// catch-all deny over every protocol and every IPv4 address, an IMPLICIT entry that carries
-/// neither a port range nor an ICMP type and code.
+/// an empty port range and an empty ICMP type and code.
 fn catch_all(egress: bool) -> ReportedEntry {
     every_protocol_entry(DEFAULT_NETWORK_ACL_DENY_RULE_NUMBER, egress, RULE_ACTION_DENY)
 }
@@ -254,9 +256,11 @@ fn allow_everything(egress: bool) -> ReportedEntry {
 }
 
 /// An IMPLICIT entry over every protocol and every IPv4 address — the shape both entries a
-/// network ACL is created with take. Such an entry has no ports and no ICMP numbers, so each
-/// of those two members is left out of it rather than reported as an empty element, which is
-/// `None` here — the same shape a rule a caller wrote over every protocol takes.
+/// network ACL is created with take. Such an entry has no ports and no ICMP numbers, and it
+/// reports each of those two members as a present-but-EMPTY element, which is
+/// `Some((None, None))` here: the elements are there and carry no value, which is how an entry
+/// the service wrote is reported and what separates it from a rule a caller wrote over every
+/// protocol, which leaves both members out.
 fn every_protocol_entry(rule_number: i32, egress: bool, rule_action: &str) -> ReportedEntry {
     ReportedEntry {
         rule_number: rule_number.to_string(),
@@ -265,8 +269,8 @@ fn every_protocol_entry(rule_number: i32, egress: bool, rule_action: &str) -> Re
         cidr_block: Some(ALL_IPV4_ADDRESSES.to_string()),
         ipv6_cidr_block: None,
         egress: egress.to_string(),
-        port_range: None,
-        icmp_type_code: None,
+        port_range: Some((None, None)),
+        icmp_type_code: Some((None, None)),
     }
 }
 
@@ -655,16 +659,17 @@ async fn removing_and_replacing_a_rule_leaves_the_one_reported_order() {
 // Which members an entry carries at all
 // ---------------------------------------------------------------------------
 
-/// RULE: whether a reported entry carries `portRange` and `icmpTypeCode` is decided by the
-/// RULE and by nothing else — present only for a rule that names ports, respectively an ICMP
-/// type and code — so a rule over every protocol carries neither, whether a caller wrote it
-/// or the service itself wrote it onto an ACL it created. Neither member is ever reported as
-/// a present-but-empty element.
+/// RULE: whether a reported entry carries `portRange` and `icmpTypeCode` is decided by WHO
+/// wrote the rule and, for a rule a CALLER wrote, by the rule alone: a caller's rule reports
+/// each member only where it names one — so a caller's rule over every protocol reports
+/// neither, and never a present-but-empty element — while an entry the SERVICE wrote onto an
+/// ACL reports both as present-but-empty elements, which is what an ACL a create answers
+/// carries.
 ///
 /// The rows differ along everything that decides it: the protocol (TCP and UDP, which require
 /// ports; ICMP, which requires a type and code; a protocol with neither; and every protocol),
 /// the direction, and who wrote the rule — the two implicit entries an ACL is created with
-/// and the four rules the caller then adds.
+/// and the five rules the caller then adds.
 #[tokio::test]
 async fn an_entry_carries_a_port_range_only_where_its_rule_names_ports() {
     let (router, _engine) = super::ec2_query::emulator();
@@ -699,22 +704,32 @@ async fn an_entry_carries_a_port_range_only_where_its_rule_names_ports() {
     );
     let reported = entries_of(case, "DescribeNetworkAcls by id", &body, &network_acl_id);
 
-    // One row per reported entry: the rule it is, and whether the rule names ports and an
-    // ICMP type and code. The implicit catch-all pair is in each direction at 32767.
-    let mut rows: Vec<(String, i32, bool, bool, bool)> = vec![
+    /// What one row expects of an entry's two sub-structures.
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    enum Members {
+        /// An entry the SERVICE wrote: both members present and empty.
+        EmptyBoth,
+        /// A rule a CALLER wrote: each member present only where the rule names one.
+        ByTheRule {
+            names_ports: bool,
+            names_icmp: bool,
+        },
+    }
+
+    // One row per reported entry: the rule it is, and what its members must be. The implicit
+    // catch-all pair is in each direction at 32767.
+    let mut rows: Vec<(String, i32, bool, Members)> = vec![
         (
             "the implicit catch-all deny, ingress".to_string(),
             DEFAULT_NETWORK_ACL_DENY_RULE_NUMBER,
             false,
-            false,
-            false,
+            Members::EmptyBoth,
         ),
         (
             "the implicit catch-all deny, egress".to_string(),
             DEFAULT_NETWORK_ACL_DENY_RULE_NUMBER,
             true,
-            false,
-            false,
+            Members::EmptyBoth,
         ),
     ];
     rows.extend(authored.iter().map(|rule| {
@@ -725,8 +740,10 @@ async fn an_entry_carries_a_port_range_only_where_its_rule_names_ports() {
             ),
             rule.rule_number,
             rule.egress,
-            rule.port_range.is_some(),
-            rule.icmp_type_code.is_some(),
+            Members::ByTheRule {
+                names_ports: rule.port_range.is_some(),
+                names_icmp: rule.icmp_type_code.is_some(),
+            },
         )
     }));
     assert_eq!(
@@ -735,7 +752,7 @@ async fn an_entry_carries_a_port_range_only_where_its_rule_names_ports() {
         "case {case:?}: expected one reported entry per rule, got {reported:?}"
     );
 
-    for (row, rule_number, egress, names_ports, names_icmp) in rows {
+    for (row, rule_number, egress, members) in rows {
         let entry = reported
             .iter()
             .find(|entry| {
@@ -743,29 +760,51 @@ async fn an_entry_carries_a_port_range_only_where_its_rule_names_ports() {
                     && entry.egress == egress.to_string()
             })
             .unwrap_or_else(|| panic!("case {row:?}: no entry {rule_number} in {reported:?}"));
-        assert_eq!(
-            entry.port_range.is_some(),
-            names_ports,
-            "case {row:?}: portRange is reported only for a rule that names ports, got {:?}",
-            entry.port_range
-        );
-        assert_eq!(
-            entry.icmp_type_code.is_some(),
-            names_icmp,
-            "case {row:?}: icmpTypeCode is reported only for a rule that names an ICMP type \
-             and code, got {:?}",
-            entry.icmp_type_code
-        );
-        // ...and never as a present-but-empty element, whichever member it is.
-        for (member, reported) in [
-            ("portRange", entry.port_range.clone()),
-            ("icmpTypeCode", entry.icmp_type_code.clone()),
-        ] {
-            assert_ne!(
-                reported,
-                Some((None, None)),
-                "case {row:?}: {member} is left out rather than reported empty, got {reported:?}"
-            );
+        match members {
+            Members::EmptyBoth => {
+                for (member, reported) in [
+                    ("portRange", entry.port_range.clone()),
+                    ("icmpTypeCode", entry.icmp_type_code.clone()),
+                ] {
+                    assert_eq!(
+                        reported,
+                        Some((None, None)),
+                        "case {row:?}: {member} is reported as a present-but-empty element on \
+                         an entry the service wrote, got {reported:?}"
+                    );
+                }
+            }
+            Members::ByTheRule {
+                names_ports,
+                names_icmp,
+            } => {
+                assert_eq!(
+                    entry.port_range.is_some(),
+                    names_ports,
+                    "case {row:?}: portRange is reported only for a caller's rule that names \
+                     ports, got {:?}",
+                    entry.port_range
+                );
+                assert_eq!(
+                    entry.icmp_type_code.is_some(),
+                    names_icmp,
+                    "case {row:?}: icmpTypeCode is reported only for a caller's rule that \
+                     names an ICMP type and code, got {:?}",
+                    entry.icmp_type_code
+                );
+                // ...and never as a present-but-empty element, whichever member it is.
+                for (member, reported) in [
+                    ("portRange", entry.port_range.clone()),
+                    ("icmpTypeCode", entry.icmp_type_code.clone()),
+                ] {
+                    assert_ne!(
+                        reported,
+                        Some((None, None)),
+                        "case {row:?}: {member} is left out of a caller's rule rather than \
+                         reported empty, got {reported:?}"
+                    );
+                }
+            }
         }
     }
 }

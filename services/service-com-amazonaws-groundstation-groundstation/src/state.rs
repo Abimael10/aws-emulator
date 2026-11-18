@@ -499,6 +499,11 @@ pub const RECORDING_BUCKET_UNRESOLVABLE: &str =
 pub const RECORDING_BUCKET_ABSENT: &str =
     "Unable to create new S3 endpoint config - bucket does not exist.";
 
+/// The service principal Ground Station takes a caller-supplied role on as, so that role's
+/// trust policy has to admit it: an `s3RecordingConfig` names the role Ground Station assumes
+/// to reach the recording bucket, and the assume is made in the service's own name.
+pub const GROUNDSTATION_SERVICE_PRINCIPAL: &str = "groundstation.amazonaws.com";
+
 /// Refuse a `configData` whose recording bucket cannot be resolved — and only then.
 ///
 /// An `s3RecordingConfig` names the bucket to record to by ARN, and Ground Station
@@ -507,13 +512,22 @@ pub const RECORDING_BUCKET_ABSENT: &str =
 /// modelled `InvalidParameterException` (HTTP 431) instead of being stored, so a caller
 /// never holds a recording config that cannot record. A bucket that RESOLVES is accepted.
 ///
-/// There are TWO refusals, told apart by WHICH answer came back about the bucket: a bucket
-/// that is not there — S3 reporting no such bucket, and a `bucketArn` that names no bucket at
-/// all, which is the same thing settled without asking — is [`RECORDING_BUCKET_ABSENT`],
-/// while a bucket S3 answers about while WITHHOLDING its location is
-/// [`RECORDING_BUCKET_UNRESOLVABLE`]. The two are what a caller can act on differently (create
-/// the bucket or fix the ARN, against grant the read the permission it needs), so they are not
-/// collapsed into one sentence.
+/// There are TWO refusals, told apart by whether the location read could be MADE at all and,
+/// where it could, by WHICH answer came back about the bucket:
+///
+/// * the read is made by taking on the role the config names (`S3RecordingConfig$roleArn`),
+///   so a role Ground Station cannot take on is a read it cannot make — the bucket's location
+///   was never obtained, and nothing is known about whether the bucket is there. That is
+///   [`RECORDING_BUCKET_UNRESOLVABLE`], the refusal naming the permission such a read needs,
+///   which is what the sentence tells the caller to grant;
+/// * a read that WAS made and answered "no such bucket" — and a `bucketArn` that names no
+///   bucket at all, which is the same thing settled without asking — is
+///   [`RECORDING_BUCKET_ABSENT`];
+/// * a bucket S3 answers about while WITHHOLDING its location is
+///   [`RECORDING_BUCKET_UNRESOLVABLE`] again: the location is what could not be had.
+///
+/// The two sentences are what a caller can act on differently (grant the read the permission
+/// it needs, against create the bucket or fix the ARN), so they are not collapsed into one.
 ///
 /// S3 is reached the way the framework documents a handler reaching another emulated
 /// service ([`smithy_server_runtime::OperationContext::callback`]): an AWS SDK client
@@ -551,6 +565,24 @@ pub async fn unresolvable_recording_bucket(
     let Some(bucket) = bucket_name_of(&recording.bucket_arn) else {
         return Some(refusal(RECORDING_BUCKET_ABSENT));
     };
+    // Ground Station reaches the bucket by taking on the role the config names ("the ARN of
+    // the role Ground Station assumes to write data to the bucket",
+    // `S3RecordingConfig$roleArn`), so a role it cannot take on is a location read it cannot
+    // make: the caller is told what that read needs rather than told a bucket is absent that
+    // nothing ever looked for. Read through the tree's one reading of a caller-supplied role
+    // for one assume (`service_common::iam_role::role_is_unassumable`), which refuses only
+    // what IAM ANSWERED — a role this account's IAM holds nothing under, or one whose trust
+    // policy does not admit this service — and stays silent where there is no IAM to ask.
+    if ::service_common::iam_role::role_is_unassumable(
+        ctx,
+        region,
+        &recording.role_arn,
+        GROUNDSTATION_SERVICE_PRINCIPAL,
+    )
+    .await
+    {
+        return Some(refusal(RECORDING_BUCKET_UNRESOLVABLE));
+    }
     let answer = s3_client(ctx, region, ctx.callback().aws_credentials_provider())
         .head_bucket()
         .bucket(bucket)

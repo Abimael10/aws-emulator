@@ -203,20 +203,21 @@ pub fn network_acl_entry_limit_exceeded<E>(message: impl Into<String>) -> Scaffo
     Scaffolded::service_error(NETWORK_ACL_ENTRY_LIMIT_EXCEEDED, 400, message)
 }
 
-/// `entry` as a reader reports a STORED network ACL entry.
+/// `entry` as a reader reports a STORED network ACL entry A CALLER WROTE.
 ///
 /// Such an entry carries exactly the members the RULE has: "the ICMP type and code"
 /// (`NetworkAclEntry$IcmpTypeCode`) only for a rule written with one — the protocols that need
 /// it — and "the range of ports the rule applies to" (`$PortRange`) only for a rule written
 /// with one, which is "required if specifying protocol 6 (TCP) or 17 (UDP)"
 /// (`CreateNetworkAclEntryRequest$PortRange`). A rule over every protocol has neither ports
-/// nor ICMP numbers, so it reports neither member rather than an empty one — which holds for
-/// the IMPLICIT entries the service itself writes onto an ACL it creates
-/// ([`implicit_network_acl_entry`]) exactly as it holds for a rule a caller wrote: a reader
-/// reports an ACL's entries one way, and what decides whether a member is there is the rule,
-/// not who wrote it.
+/// nor ICMP numbers, so it reports neither member rather than an empty one.
 ///
-/// The ONE place this is applied, so every writer of an entry
+/// The IMPLICIT entries the service itself writes onto an ACL are the other hand: they report
+/// both members as present-but-empty elements ([`implicit_network_acl_entry`]), which is what
+/// an ACL a create answers carries. So this projection is applied where a CALLER's rule enters
+/// a stored ACL and nowhere else.
+///
+/// The ONE place this is applied, so every writer of a caller's entry
 /// ([`ComAmazonawsEc2Amazonec2State::insert_network_acl_entry`]) stores the same shape and no
 /// two readers report one entry differently.
 pub fn reported_network_acl_entry(mut entry: NetworkAclEntry) -> NetworkAclEntry {
@@ -233,10 +234,21 @@ pub fn reported_network_acl_entry(mut entry: NetworkAclEntry) -> NetworkAclEntry
 /// than one a caller wrote — over every protocol and every IPv4 address, in the direction
 /// and at the rule number and action given.
 ///
-/// It matches every protocol, so it carries no ICMP type and code and no port range, and
-/// those two members are therefore LEFT OUT of it rather than reported empty — the same
-/// entry shape a rule a caller wrote over every protocol has
-/// ([`reported_network_acl_entry`]).
+/// It matches every protocol, so it names no ICMP type and code and no port range; but the
+/// two members are still PRESENT on it, each as the empty structure, because that is how an
+/// entry the service wrote reports them: the ACL a create answers carries `icmpTypeCode` and
+/// `portRange` as empty elements on each of its implicit entries, so a client that reads
+/// either member unconditionally finds it. That is what separates such an entry from a rule a
+/// CALLER wrote, which carries each member only where the rule names one
+/// ([`reported_network_acl_entry`], the shape `NetworkAclEntry$PortRange` and `$IcmpTypeCode`
+/// describe for a rule) — the two are written by different hands and report differently.
+///
+/// Stated here because the discriminator is WHO wrote the entry rather than what the rule
+/// says, which is not something the model distinguishes: the recorded answers do. A create's
+/// recorded answer carries both elements on the pair it mints, while a rule a caller then
+/// adds over a protocol with neither ports nor ICMP numbers carries neither — so a later
+/// recording that showed a service-written entry WITHOUT them would be a change to this rule
+/// and not a projection bug to patch at one reader.
 ///
 /// The ONE definition of such an entry, so the implicit entries of a VPC's default ACL
 /// ([`super::default_network_acl_entries`]) and of an ACL a caller created
@@ -249,9 +261,9 @@ pub fn implicit_network_acl_entry(
     NetworkAclEntry {
         cidr_block: Some(ALL_IPV4_ADDRESSES.to_string()),
         egress: Some(egress),
-        icmp_type_code: None,
+        icmp_type_code: Some(IcmpTypeCode::default()),
         ipv6_cidr_block: None,
-        port_range: None,
+        port_range: Some(PortRange::default()),
         protocol: Some(ALL_IP_PROTOCOLS.to_string()),
         rule_action: Some(rule_action.to_string()),
         rule_number: Some(rule_number),

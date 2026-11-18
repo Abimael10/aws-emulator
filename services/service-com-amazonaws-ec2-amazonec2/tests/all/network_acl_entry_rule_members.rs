@@ -7,15 +7,17 @@
 //!
 //! Two rules, each asserted over a TABLE rather than over one request:
 //!
-//! 1. A reported entry carries exactly the optional members its RULE has: "the range of ports
-//!    the rule applies to … Required if specifying protocol 6 (TCP) or 17 (UDP)"
+//! 1. A reported entry a CALLER wrote carries exactly the optional members its RULE has: "the
+//!    range of ports the rule applies to … Required if specifying protocol 6 (TCP) or 17 (UDP)"
 //!    (`CreateNetworkAclEntryRequest$PortRange`) and "the ICMP or ICMPv6 type and code …
 //!    Required if specifying protocol 1 (ICMP) or protocol 58 (ICMPv6) with an IPv6 CIDR block"
 //!    (`$IcmpTypeCode`) — so a rule written with ports reports a port range, a rule written with
 //!    an ICMP type and code reports one, and a rule whose protocol has neither (every protocol,
 //!    or a protocol that is not TCP, UDP or ICMP) reports NEITHER member rather than an empty
-//!    one. An empty port range on an all-traffic rule reads as a port restriction the rule does
-//!    not carry.
+//!    one. An empty port range on an all-traffic rule a caller wrote reads as a port
+//!    restriction the rule does not carry. An IMPLICIT entry — one the SERVICE wrote onto the
+//!    ACL — reports both members as present-but-empty elements instead, which is what an ACL a
+//!    create answers carries.
 //!
 //! 2. "The protocol number. A value of `-1` means all protocols" (`$Protocol`): a value that is
 //!    not a protocol number is refused with EC2's own sentence for an unknown IP protocol,
@@ -270,9 +272,9 @@ async fn an_entry_reports_only_the_optional_members_its_rule_carries() {
         );
     }
 
-    // And the catch-all deny the ACL was created with — an IMPLICIT entry over every
-    // protocol, so neither member is reported for it either — is reported the same way by the
-    // same read.
+    // And the catch-all deny the ACL was created with — an IMPLICIT entry the SERVICE wrote,
+    // over every protocol — reports each member as a present-but-empty element, which is what
+    // separates it from a caller's rule over every protocol.
     let described = ok(
         "the catch-all deny",
         &router,
@@ -293,9 +295,10 @@ async fn an_entry_reports_only_the_optional_members_its_rule_carries() {
                 children,
             );
             assert_eq!(
-                reported, None,
-                "case {case:?} (egress {egress}): an implicit rule over every protocol leaves \
-                 {member} out, got {reported:?}"
+                reported,
+                Some((None, None)),
+                "case {case:?} (egress {egress}): an implicit rule over every protocol reports \
+                 {member} as a present-but-empty element, got {reported:?}"
             );
         }
     }

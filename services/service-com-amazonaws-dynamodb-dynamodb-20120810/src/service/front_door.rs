@@ -208,9 +208,8 @@ pub fn announced(req: &RtRequest, mut resp: RtResponse) -> RtResponse {
 /// other question (a URL a caller must be able to reach back) and so prefers the host the
 /// request arrived at, which would make this report name the loopback address a client
 /// reaches this emulator at rather than the endpoint it addressed. `DescribeEndpoints`
-/// answers the other question and so publishes the other value: an address a client DIALS,
-/// which names this service and the region in a zone this emulator answers, on the port it
-/// is served at.
+/// answers the other question and so publishes the other value: the `host[:port]` this
+/// emulator is served at, which is the address a client DIALS.
 fn health_response(parts: &::http::request::Parts) -> RtResponse {
     let endpoint = addressed_endpoint(parts);
     let mut resp = RtResponse::new(

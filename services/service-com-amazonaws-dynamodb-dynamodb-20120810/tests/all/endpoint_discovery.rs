@@ -5,28 +5,26 @@
 //!
 //! The rule these tests pin:
 //!
-//! > endpoint discovery reports exactly one endpoint, whose `Address` names THIS service and
-//! > the region the request addresses, in the zone the address this emulator is reached at
-//! > names (loopback for an address), at the port this emulator is served on — a host and a
-//! > port, no scheme and no path — with a positive cache TTL in minutes, and never a name in
-//! > a zone AWS publishes its own endpoints in; nothing but the region moves it, so neither
-//! > the endpoint variant a request arrives on nor the host it arrives at changes it, a
-//! > request addressing no region is told the default region's endpoint, and the answer is
-//! > the same across an immediate repeat call. The address it names routes back to this
-//! > service and that region's store.
+//! > endpoint discovery reports exactly one endpoint, whose `Address` is the `host[:port]`
+//! > THIS emulator is served at, exactly as the emulator publishes it — a host and a port, no
+//! > scheme and no path — with a positive cache TTL in minutes, and never a name in a zone AWS
+//! > publishes its own endpoints in and never a name derived from the serving host; nothing of
+//! > a request moves it, so neither the endpoint variant a request arrives on, nor the host it
+//! > arrives at, nor the region it addresses changes the answer, and the answer is the same
+//! > across an immediate repeat call. The address it names routes back to this service and to
+//! > the store of the region a later request signs for.
 //!
 //! One form of arrival is one row of [`ARRIVALS`]; the rows differ along the FORM of the
 //! endpoint a client reaches this emulator through (the regional host, its FIPS sibling, the
 //! dual-stack endpoint as an HTTP/2 `:authority` with no `Host` header at all, the legacy
 //! global host, loopback with a port, a bare name on a port of the caller's choosing, no
 //! host at all, a `Host` that is not an address, a `Host` carrying a path) and along the
-//! REGION each addresses — regions of six different AWS partitions — because the region is
-//! the one thing the answer carries of a request and the serving address is a property of the
-//! PROCESS.
-//! [`the_announced_endpoint_is_served_at_the_address_this_emulator_is_reached_at`] drives the
-//! other half: a set of addresses this emulator is published at, each of whose zone and port
-//! the answer must then carry, which is what keeps the announced address one this emulator
-//! answers at rather than one AWS does.
+//! REGION each addresses — regions of six different AWS partitions — because the serving
+//! address is a property of the PROCESS and nothing a request carries may move it.
+//! [`the_announced_endpoint_is_the_address_this_emulator_is_reached_at`] drives the other
+//! half: a set of addresses this emulator is published at, each of which the answer must then
+//! carry, which is what keeps the announced address one this emulator answers at rather than
+//! one AWS does or one that resolves nowhere.
 
 use bytes::Bytes;
 use serde_json::{json, Value};
@@ -108,31 +106,15 @@ const ARRIVALS: &[Arrival] = &[
     },
 ];
 
-/// The base URL this suite's emulator is published at, and the zone and port the answer must
-/// then carry: an address names no zone, so a name of this emulator's own is announced in the
-/// zone a resolver answers with the loopback interface, at the port the base names.
+/// The base URL this suite's emulator is published at, and the `host[:port]` of it, which is
+/// the whole answer discovery gives.
 const SERVING_BASE: &str = "https://127.0.0.1:34567";
-const SERVING_ZONE: &str = "localhost";
-const SERVING_PORT: u16 = 34567;
-
-/// The first label of every endpoint host this service is served on, which an announced
-/// endpoint of this service's is named by: its own `endpointPrefix`.
-const ENDPOINT_PREFIX: &str = "dynamodb";
-
-/// The address discovery announces for `region` on an emulator served at [`SERVING_BASE`]:
-/// this service, that region, the zone the serving address names, and the serving port.
-fn announced_for(region: &str) -> String {
-    format!("{ENDPOINT_PREFIX}.{region}.{SERVING_ZONE}:{SERVING_PORT}")
-}
-
-/// The region a request that addresses none is served, which is the region this service
-/// defaults to.
-const DEFAULT_REGION: &str = "us-east-1";
+const SERVING_AUTHORITY: &str = "127.0.0.1:34567";
 
 /// The most characters a Region LABEL may hold where it reaches an endpoint's authority,
 /// read from the tree's one statement of that grammar
 /// (`service_common::arn::MAX_REGION_LENGTH`), so the rows at its bounds cannot drift from
-/// the figure the service holds the value to.
+/// the figure the tree holds the value to.
 const MAX_REGION_LABEL_LENGTH: usize = service_common::arn::MAX_REGION_LENGTH;
 
 /// The DNS zones AWS publishes its OWN endpoints in, none of which the announced address may
@@ -244,7 +226,7 @@ fn probe_table(name: &str) -> Value {
 }
 
 #[tokio::test]
-async fn discovery_names_this_service_and_the_region_in_a_zone_this_emulator_answers() {
+async fn discovery_names_the_endpoint_this_emulator_is_served_at() {
     let router = emulator_served_at(SERVING_BASE);
 
     for arrival in ARRIVALS {
@@ -281,13 +263,12 @@ async fn discovery_names_this_service_and_the_region_in_a_zone_this_emulator_ans
             arrival.case
         );
         let addresses = reported_addresses(arrival.case, &body);
-        let expected = announced_for(arrival.region);
         assert_eq!(
             addresses,
-            vec![expected.clone()],
-            "case {:?}: the endpoint of the region the request addresses, in the zone and on \
-             the port this emulator is reached at, whatever endpoint the request arrived on, \
-             expected {expected:?}, got {addresses:?}",
+            vec![SERVING_AUTHORITY.to_string()],
+            "case {:?}: the address this emulator is served at, whatever endpoint the request \
+             arrived on and whatever region it addresses, expected {SERVING_AUTHORITY:?}, got \
+             {addresses:?}",
             arrival.case
         );
 
@@ -318,37 +299,28 @@ async fn discovery_names_this_service_and_the_region_in_a_zone_this_emulator_ans
 }
 
 #[tokio::test]
-async fn the_announced_endpoint_is_served_at_the_address_this_emulator_is_reached_at() {
+async fn the_announced_endpoint_is_the_address_this_emulator_is_reached_at() {
     // Each row is an address this emulator is published at — a loopback address with a
     // port, a port the OS could hand out, an IPv6 literal, a host name with a port, one
-    // without — and the address the answer must then carry: this service and the region the
-    // request addresses, under the zone that address names (loopback for an address, which
-    // names no zone) and on the port it is served at.
+    // without — and the address the answer must then carry, which is that same `host[:port]`
+    // and nothing derived from it.
     let rows: [(&str, &str, &str); 5] = [
-        (
-            "loopback on a fixed port",
-            SERVING_BASE,
-            "dynamodb.us-west-2.localhost:34567",
-        ),
+        ("loopback on a fixed port", SERVING_BASE, SERVING_AUTHORITY),
         (
             "loopback on an ephemeral port",
             "https://127.0.0.1:49512",
-            "dynamodb.us-west-2.localhost:49512",
+            "127.0.0.1:49512",
         ),
-        (
-            "an IPv6 loopback literal",
-            "https://[::1]:9297",
-            "dynamodb.us-west-2.localhost:9297",
-        ),
+        ("an IPv6 loopback literal", "https://[::1]:9297", "[::1]:9297"),
         (
             "a host name with a port",
             "https://emulator.internal:8443",
-            "dynamodb.us-west-2.emulator.internal:8443",
+            "emulator.internal:8443",
         ),
         (
             "a host name on no port of its own",
             "https://emulator.internal",
-            "dynamodb.us-west-2.emulator.internal",
+            "emulator.internal",
         ),
     ];
 
@@ -364,8 +336,8 @@ async fn the_announced_endpoint_is_served_at_the_address_this_emulator_is_reache
         assert_eq!(
             addresses,
             vec![expected.to_string()],
-            "case {case:?}: the announced endpoint is named in the zone and on the port this \
-             emulator is reached at, expected {expected:?}, got {addresses:?}"
+            "case {case:?}: the announced endpoint is the address this emulator is reached at, \
+             expected {expected:?}, got {addresses:?}"
         );
     }
 }
@@ -411,11 +383,10 @@ async fn the_announced_address_is_never_a_public_aws_endpoint() {
                      publishes its own endpoints in, but {address:?} ends in {zone:?}"
                 );
             }
-            let expected = announced_for(region);
             assert_eq!(
-                address, expected,
-                "case {region:?}: the address is named in the zone and on the port this \
-                 emulator is reached at, expected {expected:?}, got {address:?}"
+                address, SERVING_AUTHORITY,
+                "case {region:?}: the address is the one this emulator is reached at, expected \
+                 {SERVING_AUTHORITY:?}, got {address:?}"
             );
         }
     }
@@ -454,55 +425,14 @@ async fn discovery_is_stable_across_calls_through_one_endpoint() {
 }
 
 #[tokio::test]
-async fn a_request_that_names_no_region_is_told_the_default_regions_endpoint() {
-    let router = emulator_served_at(SERVING_BASE);
-    // The region is the one part of the answer a request decides, and the answer is an
-    // address a client DIALS, so a value that is no region LABEL is not advertised: such a
-    // request addresses no region and is told the endpoint of the region this service
-    // defaults to — never an empty list, and never an address whose authority the value
-    // moved. The rows span what the rule generalises over: a region-shaped value in the
-    // wrong case, prose, each URL delimiter that could relocate an authority (`/`, `@`, `:`,
-    // `#`, `?`), a leading dot, an underscore, and the two values past the published length
-    // of a Region label (one octet past it, and far past it).
-    for scope in [
-        "US_WEST_2",
-        "not a region",
-        "us-west-2/attacker.example.com",
-        "us-west-2@attacker.example.com",
-        "us-west-2:9999",
-        "us-west-2#f",
-        "us-west-2?q",
-        ".us-west-2",
-        "us_west_2",
-        &"a".repeat(MAX_REGION_LABEL_LENGTH + 1),
-        &"a".repeat(64),
-    ] {
-        let (status, body) =
-            call_through(&router, scope, None, None, "DescribeEndpoints", &json!({})).await;
-        assert_eq!(
-            status, 200,
-            "case {scope:?}: expected HTTP 200, got {status} with {body}"
-        );
-        let addresses = reported_addresses(scope, &body);
-        let expected = announced_for(DEFAULT_REGION);
-        assert_eq!(
-            addresses,
-            vec![expected.clone()],
-            "case {scope:?}: a request that addresses no region is told the default region's \
-             endpoint, expected {expected:?}, got {addresses:?}"
-        );
-    }
-}
-
-#[tokio::test]
 async fn the_advertised_address_is_one_authority_whatever_a_request_carries() {
     let router = emulator_served_at(SERVING_BASE);
-    // Whatever a request puts in the region it addresses, the address it is handed is ONE
-    // authority on the interface this process is reached on: it ends in the zone this
-    // emulator may announce in, carries exactly one `:` (the serving port) and none of the
-    // delimiters that would move the authority a client dials — a host or a path of its own.
-    // The rows are the regions of ARRIVALS, which are real, beside the values that are no
-    // region label at all.
+    // Whatever a request puts in the region it addresses, the address it is handed is the ONE
+    // authority this process is served at: the region is no part of the answer, so a value
+    // that is no region label at all — including every delimiter that could move the
+    // authority a client dials — reaches nothing. The rows are the regions of ARRIVALS, which
+    // are real, beside the values that are no region label at all and the two at the bounds of
+    // what a Region label may hold.
     let regions: Vec<String> = ARRIVALS
         .iter()
         .map(|arrival| arrival.region.to_string())
@@ -514,13 +444,16 @@ async fn the_advertised_address_is_one_authority_whatever_a_request_carries() {
                 "us-west-2@attacker.example.com",
                 "us-west-2:9999",
                 "us-west-2#f",
+                "us-west-2?q",
+                ".us-west-2",
+                "us_west_2",
             ]
             .into_iter()
             .map(ToString::to_string),
         )
-        // The published length of a Region label, which IS advertised as the region it
-        // names, beside the hostile values above.
+        // The published length of a Region label and one octet past it.
         .chain(["a".repeat(MAX_REGION_LABEL_LENGTH)])
+        .chain(["a".repeat(MAX_REGION_LABEL_LENGTH + 1)])
         .collect();
     for region in regions {
         let (status, body) = call_through(
@@ -536,28 +469,12 @@ async fn the_advertised_address_is_one_authority_whatever_a_request_carries() {
             status, 200,
             "case {region:?}: expected HTTP 200, got {status} with {body}"
         );
-        for address in reported_addresses(region.as_str(), &body) {
-            let (host, port) = address.rsplit_once(':').unwrap_or_else(|| {
-                panic!("case {region:?}: {address:?} names the port this emulator is served on")
-            });
-            assert_eq!(
-                port,
-                SERVING_PORT.to_string(),
-                "case {region:?}: the address names the port this emulator is served on, got \
-                 {address:?}"
-            );
-            assert!(
-                host.ends_with(&format!(".{SERVING_ZONE}")),
-                "case {region:?}: the address is named in the zone this emulator may announce \
-                 in, got {address:?}"
-            );
-            for delimiter in ['/', '@', ':', '#', '?'] {
-                assert!(
-                    !host.contains(delimiter),
-                    "case {region:?}: the address is one authority, so its host carries no \
-                     {delimiter:?}, got {address:?}"
-                );
-            }
-        }
+        let addresses = reported_addresses(region.as_str(), &body);
+        assert_eq!(
+            addresses,
+            vec![SERVING_AUTHORITY.to_string()],
+            "case {region:?}: the address is the one authority this emulator is served at, \
+             expected {SERVING_AUTHORITY:?}, got {addresses:?}"
+        );
     }
 }

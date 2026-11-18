@@ -209,6 +209,10 @@ mod tests {
                 "that unique id in upper-case hexadecimal",
                 "0E81D159-090A-7B61-9856-04D0999CB465",
             ),
+            (
+                "a unique id led by a digit with no groups at all",
+                "0e81d159090a7b61985604d0999cb465",
+            ),
             ("an ARN of a partition no stack carries", "arn aws:x"),
         ] {
             let expected = Some(format!(

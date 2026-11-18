@@ -17,7 +17,8 @@
 //!   presented over — SMS message, email message or a time-based one-time
 //!   password — to be enabled by the same request (`SetUserPoolMfaConfig`);
 //! * MFA is turned on when a pool is created or through `SetUserPoolMfaConfig`,
-//!   not by an update of a created pool;
+//!   not by an update of a created pool — a question about the mode TRANSITION
+//!   alone, answered before the delivery path the mode rests on is judged;
 //! * a self-service password reset applies to the password the user OWNS, so a
 //!   user that owns none is refused rather than sent a code (`ForgotPassword`);
 //! * a pool that reserves user creation to administrators registers nobody
@@ -79,6 +80,12 @@ const DUPLICATE_RECOVERY_MECHANISMS: &str =
     "Invalid account recovery setting parameter. Account Recovery Setting cannot have \
      duplicate priorities or recovery mechanisms.";
 
+/// The sentence a user-pool write is refused with when its `AccountRecoverySetting`
+/// combines `admin_only` with another recovery mechanism.
+const ADMIN_ONLY_RECOVERY_COMBINED: &str =
+    "Invalid account recovery setting parameter. Account Recovery Setting cannot use \
+     admin_only setting with any other recovery mechanisms.";
+
 /// The sentence `SetUserPoolMfaConfig` is refused with when it turns MFA on with
 /// no factor enabled.
 const MFA_METHOD_REQUIRED: &str =
@@ -87,6 +94,13 @@ const MFA_METHOD_REQUIRED: &str =
 /// The sentence an update that would turn a created pool's MFA on is refused with.
 const MFA_NOT_TURNED_ON_BY_UPDATE: &str =
     "Cannot turn MFA functionality ON, once the user pool has been created.";
+
+/// The sentence a user-pool write is refused with when it leaves the pool's MFA
+/// mode on without the SMS delivery path that factor rests on — the refusal that
+/// is reached only once the mode TRANSITION itself is allowed.
+const MFA_SMS_DELIVERY_REQUIRED: &str =
+    "SMS configuration and Auto verification for phone_number are required when MFA is \
+     required/optional";
 
 /// The sentence a self-service reset is refused with for a user that owns no
 /// password for a reset to apply to.
@@ -793,60 +807,132 @@ async fn turning_a_pools_mfa_on_takes_a_factor_to_challenge_with() {
 // MFA is not turned on by an update of a created pool
 // ---------------------------------------------------------------------------
 
+/// One `UpdateUserPool` row: the mode the pool was CREATED with, the mode the
+/// update asks for, whether the update carries the SMS delivery path the mode
+/// rests on, and the sentence the answer must carry (`None` for an update that
+/// is served).
+struct MfaUpdateRow {
+    label: &'static str,
+    created: Option<&'static str>,
+    requested: Option<&'static str>,
+    /// Whether the UPDATE carries `SmsConfiguration` and the auto-verified phone
+    /// number — the delivery path a pool whose mode is on challenges over.
+    carries_delivery: bool,
+    /// The refusal the update earns, or `None` where it is served.
+    refusal: Option<&'static str>,
+}
+
 #[tokio::test]
 async fn an_update_of_a_created_pool_cannot_turn_its_mfa_on() {
     let router = router();
 
-    // The rows differ along the mode the pool was CREATED with and the mode the
-    // update asks for, which is what decides whether the update would turn MFA on:
-    // every `UserPoolMfaType` value is asked for from a pool that is off and from
-    // one that is not.
-    // (created mode, requested mode, served)
-    let rows: &[(&str, Option<&str>, Option<&str>, bool)] = &[
-        ("a pool that is off, asked to stay off", None, Some("OFF"), true),
-        ("a pool that is off, asked for nothing", None, None, true),
-        ("a pool that is off, asked for ON", None, Some("ON"), false),
-        (
-            "a pool that is off, asked for OPTIONAL",
-            None,
-            Some("OPTIONAL"),
-            false,
-        ),
-        (
-            "a pool created OPTIONAL, asked for OPTIONAL",
-            Some("OPTIONAL"),
-            Some("OPTIONAL"),
-            true,
-        ),
-        (
-            "a pool created OPTIONAL, asked for ON",
-            Some("OPTIONAL"),
-            Some("ON"),
-            true,
-        ),
-        (
-            "a pool created ON, asked for ON",
-            Some("ON"),
-            Some("ON"),
-            true,
-        ),
-        (
-            "a pool created ON, asked to turn MFA off",
-            Some("ON"),
-            Some("OFF"),
-            true,
-        ),
-        (
-            "a pool created ON, asked for nothing, which turns MFA off",
-            Some("ON"),
-            None,
-            true,
-        ),
+    // The rows differ along the three things that decide the answer: the mode the
+    // pool was CREATED with, the mode the update asks for — every `UserPoolMfaType`
+    // value is asked for from a pool that is off and from one that is not — and
+    // whether the update carries the SMS delivery path the mode rests on. The last
+    // is what pins the ORDER of the two refusals: an update that may not turn MFA on
+    // at all is told THAT, whether or not it carried a delivery path, while an
+    // update whose transition is allowed is then judged on the path.
+    let rows: &[MfaUpdateRow] = &[
+        MfaUpdateRow {
+            label: "a pool that is off, asked to stay off",
+            created: None,
+            requested: Some("OFF"),
+            carries_delivery: false,
+            refusal: None,
+        },
+        MfaUpdateRow {
+            label: "a pool that is off, asked for nothing",
+            created: None,
+            requested: None,
+            carries_delivery: false,
+            refusal: None,
+        },
+        MfaUpdateRow {
+            label: "a pool that is off, asked for ON with the delivery path",
+            created: None,
+            requested: Some("ON"),
+            carries_delivery: true,
+            refusal: Some(MFA_NOT_TURNED_ON_BY_UPDATE),
+        },
+        MfaUpdateRow {
+            label: "a pool that is off, asked for ON with no delivery path",
+            created: None,
+            requested: Some("ON"),
+            carries_delivery: false,
+            refusal: Some(MFA_NOT_TURNED_ON_BY_UPDATE),
+        },
+        MfaUpdateRow {
+            label: "a pool that is off, asked for OPTIONAL with the delivery path",
+            created: None,
+            requested: Some("OPTIONAL"),
+            carries_delivery: true,
+            refusal: Some(MFA_NOT_TURNED_ON_BY_UPDATE),
+        },
+        MfaUpdateRow {
+            label: "a pool that is off, asked for OPTIONAL with no delivery path",
+            created: None,
+            requested: Some("OPTIONAL"),
+            carries_delivery: false,
+            refusal: Some(MFA_NOT_TURNED_ON_BY_UPDATE),
+        },
+        MfaUpdateRow {
+            label: "a pool created OPTIONAL, asked for OPTIONAL",
+            created: Some("OPTIONAL"),
+            requested: Some("OPTIONAL"),
+            carries_delivery: true,
+            refusal: None,
+        },
+        MfaUpdateRow {
+            label: "a pool created OPTIONAL, asked for ON",
+            created: Some("OPTIONAL"),
+            requested: Some("ON"),
+            carries_delivery: true,
+            refusal: None,
+        },
+        MfaUpdateRow {
+            label: "a pool created ON, asked for ON",
+            created: Some("ON"),
+            requested: Some("ON"),
+            carries_delivery: true,
+            refusal: None,
+        },
+        // The transition is allowed here — the pool is already on — so what is
+        // judged is the delivery path the mode rests on, and that is the sentence
+        // the caller gets.
+        MfaUpdateRow {
+            label: "a pool created ON, asked for ON with no delivery path",
+            created: Some("ON"),
+            requested: Some("ON"),
+            carries_delivery: false,
+            refusal: Some(MFA_SMS_DELIVERY_REQUIRED),
+        },
+        MfaUpdateRow {
+            label: "a pool created ON, asked for OPTIONAL with no delivery path",
+            created: Some("ON"),
+            requested: Some("OPTIONAL"),
+            carries_delivery: false,
+            refusal: Some(MFA_SMS_DELIVERY_REQUIRED),
+        },
+        MfaUpdateRow {
+            label: "a pool created ON, asked to turn MFA off",
+            created: Some("ON"),
+            requested: Some("OFF"),
+            carries_delivery: false,
+            refusal: None,
+        },
+        MfaUpdateRow {
+            label: "a pool created ON, asked for nothing, which turns MFA off",
+            created: Some("ON"),
+            requested: None,
+            carries_delivery: false,
+            refusal: None,
+        },
     ];
 
-    for (index, (label, created, requested, served)) in rows.iter().enumerate() {
+    for (index, row) in rows.iter().enumerate() {
         let mut create = Map::new();
-        if let Some(mode) = created {
+        if let Some(mode) = row.created {
             create.insert("MfaConfiguration".to_string(), json!(mode));
             for (member, value) in sms_delivery() {
                 create.insert(member, value);
@@ -861,12 +947,12 @@ async fn an_update_of_a_created_pool_cannot_turn_its_mfa_on() {
         )
         .await;
         let mut members = Map::new();
-        if let Some(mode) = requested {
+        if let Some(mode) = row.requested {
             members.insert("MfaConfiguration".to_string(), json!(mode));
-            if *mode != "OFF" {
-                for (member, value) in sms_delivery() {
-                    members.insert(member, value);
-                }
+        }
+        if row.carries_delivery {
+            for (member, value) in sms_delivery() {
+                members.insert(member, value);
             }
         }
         let (status, payload) = call(
@@ -877,31 +963,112 @@ async fn an_update_of_a_created_pool_cannot_turn_its_mfa_on() {
         .await;
         let stored = described(&router, &user_pool_id).await;
 
-        if *served {
-            assert_eq!(
-                status, 200,
-                "case {label:?}: the update must be served, got {status} with {payload}"
-            );
-            let expected = requested.unwrap_or("OFF");
-            assert_eq!(
-                stored["MfaConfiguration"],
-                json!(expected),
-                "case {label:?}: the pool must hold {expected:?} afterwards, got {stored}"
-            );
-        } else {
-            assert_refusal(
-                label,
-                status,
-                &payload,
-                "InvalidParameterException",
-                MFA_NOT_TURNED_ON_BY_UPDATE,
-            );
-            assert_eq!(
-                stored["MfaConfiguration"],
-                json!(created.unwrap_or("OFF")),
-                "case {label:?}: a refused update leaves the pool's mode as it was, got {stored}"
-            );
+        match row.refusal {
+            None => {
+                assert_eq!(
+                    status, 200,
+                    "case {:?}: the update must be served, got {status} with {payload}",
+                    row.label
+                );
+                let expected = row.requested.unwrap_or("OFF");
+                assert_eq!(
+                    stored["MfaConfiguration"],
+                    json!(expected),
+                    "case {:?}: the pool must hold {expected:?} afterwards, got {stored}",
+                    row.label
+                );
+            }
+            Some(message) => {
+                assert_refusal(
+                    row.label,
+                    status,
+                    &payload,
+                    "InvalidParameterException",
+                    message,
+                );
+                assert_eq!(
+                    stored["MfaConfiguration"],
+                    json!(row.created.unwrap_or("OFF")),
+                    "case {:?}: a refused update leaves the pool's mode as it was, got {stored}",
+                    row.label
+                );
+            }
         }
+    }
+}
+
+/// RULE: the order the refusals above are answered in follows what each is ABOUT — a
+/// refusal of the REQUEST ALONE (one that holds whatever pool the request addresses, and so
+/// is answered without the store being read) comes before the one about whether this pool
+/// may move its MFA mode at all, which comes before the one about the configuration the
+/// moved-to mode rests on. So an update that both breaks a request-alone precondition and
+/// would turn a created pool's MFA on is told what is wrong with the request, not that the
+/// move is unavailable.
+///
+/// The rows are the request-alone preconditions this operation answers — the auto-verified
+/// phone number with no SMS delivery configuration, and the two the account-recovery setting
+/// carries — each sent on an update that ALSO asks a pool that is off for MFA `ON`.
+#[tokio::test]
+async fn a_request_alone_precondition_is_answered_before_the_mfa_transition() {
+    let router = router();
+
+    for (index, (label, members, expected)) in [
+        (
+            "an auto-verified phone number with no SMS configuration",
+            json!({ "AutoVerifiedAttributes": ["phone_number"] }),
+            SMS_CONFIGURATION_REQUIRED,
+        ),
+        (
+            "an account-recovery setting repeating a priority",
+            json!({ "AccountRecoverySetting": { "RecoveryMechanisms": [
+                { "Name": "verified_email", "Priority": 1 },
+                { "Name": "verified_phone_number", "Priority": 1 },
+            ]}}),
+            DUPLICATE_RECOVERY_MECHANISMS,
+        ),
+        (
+            "an account-recovery setting combining admin_only with another mechanism",
+            json!({ "AccountRecoverySetting": { "RecoveryMechanisms": [
+                { "Name": "admin_only", "Priority": 1 },
+                { "Name": "verified_email", "Priority": 2 },
+            ]}}),
+            ADMIN_ONLY_RECOVERY_COMBINED,
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        // A pool that is OFF, so the same update would ALSO be refused the MFA transition
+        // if the order were the other way round.
+        let user_pool_id = pool(
+            &router,
+            &create_request(&format!("mfa-order-{index}"), &json!({})),
+        )
+        .await;
+        let mut body = members
+            .as_object()
+            .cloned()
+            .unwrap_or_else(|| panic!("case {label:?}: the row's members are an object"));
+        body.insert("MfaConfiguration".to_string(), json!("ON"));
+        let (status, payload) = call(
+            &router,
+            "UpdateUserPool",
+            &update_request(&user_pool_id, &Value::Object(body)),
+        )
+        .await;
+        assert_refusal(
+            label,
+            status,
+            &payload,
+            "InvalidParameterException",
+            expected,
+        );
+        let stored = described(&router, &user_pool_id).await;
+        assert_eq!(
+            stored["MfaConfiguration"],
+            json!("OFF"),
+            "case {label:?}: a refused update leaves the pool's mode as it was, got {stored}"
+        );
     }
 }
 

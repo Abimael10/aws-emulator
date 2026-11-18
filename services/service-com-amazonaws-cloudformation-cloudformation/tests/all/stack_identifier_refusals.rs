@@ -21,11 +21,11 @@
 //!    request is refused, even though the stack itself stays readable by its own id.
 //!
 //! The tables span the class rather than one recorded request: the malformed-identifier side
-//! over fourteen values differing along what the rule generalises over (an empty value,
+//! over fifteen values differing along what the rule generalises over (an empty value,
 //! values that are no name at all — digits, hyphens, punctuation and spaces alone, and
 //! combinations of them — and values only PART of which is a name run: a character a stack
-//! name may not carry, a leading character it may not begin with, and the digit-led form a
-//! stack's unique id takes) crossed with
+//! name may not carry (an underscore, a dot, a space), a leading character it may not begin
+//! with, and the digit-led form a stack's unique id takes) crossed with
 //! every operation whose identifier member this service checks itself; the admitted side over
 //! the values the check admits that no stack carries — names, a stack ARN and the letter-led
 //! form a stack's unique id takes, which is pinned on its own by
@@ -53,8 +53,9 @@ const POLICY: &str = r#"{"Statement":[{"Effect":"Allow","Action":"Update:*",
 ///
 /// Source: the service's own constant (`state::stack_identifier::STACK_IDENTIFIER_PATTERN`),
 /// spelled out here because the sentence IS the requirement — a reworded message must fail
-/// this suite. It is not the anchored spelling the model writes for the members that do carry
-/// a `@pattern` (`smithy_query(query="shape", shape="StackNameOrId")`).
+/// this suite. It carries none of the anchors the model writes for the members that do carry
+/// a `@pattern` (`smithy_query(query="shape", shape="StackNameOrId")`), though the value is
+/// held to the whole expression.
 const IDENTIFIER_PATTERN: &str = "[a-zA-Z][-a-zA-Z0-9]*|arn:[-a-zA-Z0-9:/._+]*";
 
 /// The whole refusal a malformed identifier is answered with: one clause per constraint the
@@ -205,6 +206,7 @@ const MALFORMED: &[(&str, &str)] = &[
     ("digits either side of a space", "12 34"),
     ("a name with an underscore", "identifier_stack"),
     ("a name with a dot", "identifier.stack"),
+    ("a name with a space in it", "identifier stack"),
     ("a name starting with a digit", "9identifier"),
     ("a name starting with a hyphen", "-identifier"),
     (
@@ -228,6 +230,10 @@ const ADMITTED_BUT_ABSENT: &[(&str, &str)] = &[
     (
         "the letter-led unique id a stack id ends in",
         "af2504e0-4f89-11d3-9a0c-0305e82c3301",
+    ),
+    (
+        "that form with a non-hexadecimal letter",
+        "ag2504e0-4f89-11d3-9a0c-0305e82c3301",
     ),
     (
         "a letter-led unique id with no groups at all",

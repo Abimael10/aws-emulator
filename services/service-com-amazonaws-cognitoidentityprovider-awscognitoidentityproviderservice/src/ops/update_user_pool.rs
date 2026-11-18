@@ -343,6 +343,40 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 crate::state::SMS_CONFIGURATION_REQUIRED_MESSAGE.to_string(),
             ));
         }
+        // MFA is turned on when a pool is CREATED or through `SetUserPoolMfaConfig`,
+        // which is also where the factor an MFA challenge is presented over is
+        // configured — this operation models no factor at all — so an update that
+        // would move a pool from MFA `OFF` to `ON` or `OPTIONAL` is refused. That is
+        // a question about the TRANSITION alone, so it is asked before the
+        // configuration the MFA MODE would rest on is judged: a request that cannot
+        // turn MFA on at all is told so rather than being told to supply the delivery
+        // path of a mode it may not reach.
+        //
+        // It is asked AFTER the three refusals above, and only before the one below,
+        // because of what each of them is about: those three are refusals of the
+        // REQUEST ALONE — they hold whatever pool the request addresses, and so are
+        // answered without the store being read at all — while this one is about the
+        // pool the request addresses and the one below is about the configuration this
+        // mode needs. So the order is: what is wrong with the request, then whether
+        // this pool may make the move, then what the moved-to mode rests on.
+        //
+        // The pool's stored mode is read in a scope of its own, so no guard is held
+        // across the awaits below; a request that repeats the mode the pool already
+        // holds, or turns MFA off, changes nothing about whether the pool can
+        // challenge and is served, and a `user_pool_id` this account holds no pool
+        // under constrains nothing here — it is answered as the missing pool it is
+        // where the pool is looked up.
+        let stored_mfa_configuration = state
+            .lock()
+            .pool(&input.user_pool_id)
+            .map(|pool| pool.mfa_configuration.clone());
+        if stored_mfa_configuration.as_deref() == Some(crate::state::MFA_OFF)
+            && mfa_configuration != crate::state::MFA_OFF
+        {
+            return Err(invalid_parameter(
+                MFA_NOT_TURNED_ON_BY_UPDATE_MESSAGE.to_string(),
+            ));
+        }
         // A pool left requiring or offering MFA takes the whole delivery path of
         // the factor this surface configures — an SMS caller to send through and
         // the phone number auto-verified — so an update that would leave it with
@@ -390,20 +424,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             input.user_pool_add_ons.as_ref(),
         ) {
             return Err(feature_unavailable_in_tier(message));
-        }
-
-        // MFA is turned on when a pool is CREATED or through
-        // `SetUserPoolMfaConfig`, which is also where the factor an MFA challenge
-        // is presented over is configured — this operation models no factor at
-        // all — so an update that would move a pool from MFA `OFF` to `ON` or
-        // `OPTIONAL` is refused. A request that repeats the mode the pool already
-        // holds, or turns MFA off, changes nothing about whether the pool can
-        // challenge and is served. Judged before the first member is written, so a
-        // refused update leaves the pool exactly as it was.
-        if pool.mfa_configuration == crate::state::MFA_OFF
-            && mfa_configuration != crate::state::MFA_OFF
-        {
-            return Err(invalid_parameter(MFA_NOT_TURNED_ON_BY_UPDATE_MESSAGE.to_string()));
         }
 
         // `PoolName` is "the updated name of your user pool" and a pool must carry a
