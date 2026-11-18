@@ -37,6 +37,7 @@ use bytes::Bytes;
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
+use service_com_amazonaws_sfn_awsstepfunctions::state::integration::{Family, APIS};
 use service_com_amazonaws_sfn_awsstepfunctions::state::EVENT_TASK_FAILED;
 use service_com_amazonaws_sfn_awsstepfunctions::EmulatedService;
 
@@ -1013,5 +1014,322 @@ async fn a_refused_publish_carries_the_envelope_of_the_client_its_family_is_serv
             delivered.is_empty(),
             "case {case:?}: a refused publish delivers nothing, got {delivered:?}"
         );
+    }
+}
+
+/// The status both refusals of a message attribute carry
+/// (`smithy_query(query="shape",shape="InvalidParameterValueException,
+/// InvalidParameterException",model_path="services/
+/// service-com-amazonaws-sns-amazonsimplenotificationservice/smithy-model/
+/// com-amazonaws-sns-amazonsimplenotificationservice.json")`: `httpError` 400 for each).
+const REFUSED_ATTRIBUTE_STATUS: u16 = 400;
+
+/// A `Number` attribute value carrying one more significant digit than the type holds:
+/// 39 digits, where "a number can have up to 38 digits of precision" (the Amazon SNS
+/// Developer Guide, "Amazon SNS message attributes"). The sentence the row expects spells
+/// the same digits, because that refusal names the value it would not take.
+const PAST_THE_NUMBER_PRECISION: &str = "123456789012345678901234567890123456789";
+
+/// A `Number` attribute value standing at the first power of ten the type does not hold:
+/// the magnitudes run "between 10^-128 to 10^+126" (the same guide), so `10^126` is out.
+const PAST_THE_NUMBER_SCALE: &str = "1e126";
+
+/// One row of the attribute table: the attribute the publish carries, and the answer
+/// Amazon SNS gives it — the error name the task must report, the query code that answer
+/// names its class by, and the sentence the service states.
+struct Rejected {
+    case: &'static str,
+    /// Which `Resource` names the publish, and so which client's name the service half of
+    /// the error name is.
+    resource: &'static str,
+    /// The one attribute the publish carries, as `(name, DataType, StringValue)`.
+    attribute: (&'static str, &'static str, &'static str),
+    /// The error name the task must report.
+    error: &'static str,
+    /// The query code the answer named its class by, which belongs in the cause's
+    /// metadata and nowhere else.
+    code: &'static str,
+    /// The sentence the cause opens with: the service's own, naming the member at fault.
+    sentence: &'static str,
+}
+
+/// RULE 1 over the whole CLASS of refusals a publish's message attributes meet: whatever
+/// Amazon SNS refuses an attribute for, the task's error name is the class of the error
+/// SHAPE that service's model binds the answered query code to — so every refusal the
+/// model binds to `ParameterValueInvalid` is reported as `InvalidParameterValueException`
+/// and the one bound to `InvalidParameter` as `InvalidParameterException`, with the query
+/// code itself appearing only in the `Error Code:` field of the cause's metadata.
+///
+/// The rows differ along what the rule generalises over: which of the service's attribute
+/// rules the publish breaks — a value that is no number, each of the two numeric bounds,
+/// an attribute carrying no value, a type the service does not define, a name under a
+/// prefix it reserves, a name holding a character a name may not, and a value holding a
+/// character an attribute value may not — so both the sentence and the member at fault
+/// differ; which query code the refusal is answered under, and therefore whether that code
+/// names its own shape; and which integration family named the publish, which is the only
+/// half of the error name allowed to differ with it. The sentences are the ones that
+/// service states for each rule.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_refused_attribute_is_named_by_the_shape_its_query_code_is_bound_to() {
+    let chain = Chain::new();
+    let topic = chain.topic("attribute-orders").await;
+    let url = chain.subscriber("attribute-orders-queue", &topic).await;
+    // ONE role for every row: each publish below is one the role may make, so what
+    // refuses it is the attribute and nothing else.
+    let role_arn = chain
+        .role("AttributeRole", "/", Some(&policy(&["SNS:Publish"], &topic)))
+        .await;
+
+    let rows: &[Rejected] = &[
+        Rejected {
+            // The query code `ParameterValueInvalid` is bound to the shape
+            // `InvalidParameterValueException`, so the class is that shape's.
+            case: "a Number attribute whose value is no number",
+            resource: OPTIMIZED_PUBLISH,
+            attribute: ("count", "Number", "not-a-number"),
+            error: "SNS.InvalidParameterValueException",
+            code: "ParameterValueInvalid",
+            sentence: "Could not cast message attribute 'count' value to number.",
+        },
+        Rejected {
+            // The same refusal through the other family: the SDK that serves it names the
+            // service its own way, and the exception class is the same shape's.
+            case: "the same value through the AWS SDK family",
+            resource: SDK_PUBLISH,
+            attribute: ("count", "Number", "not-a-number"),
+            error: "Sns.InvalidParameterValueException",
+            code: "ParameterValueInvalid",
+            sentence: "Could not cast message attribute 'count' value to number.",
+        },
+        Rejected {
+            case: "a Number attribute past the precision the type carries",
+            resource: OPTIMIZED_PUBLISH,
+            attribute: ("ratio", "Number", PAST_THE_NUMBER_PRECISION),
+            error: "SNS.InvalidParameterValueException",
+            code: "ParameterValueInvalid",
+            sentence: "Message attribute 'ratio' number value \
+                       [123456789012345678901234567890123456789] must have less than 38 \
+                       precision digits.",
+        },
+        Rejected {
+            case: "a Number attribute past the scale the type holds",
+            resource: OPTIMIZED_PUBLISH,
+            attribute: ("huge", "Number", PAST_THE_NUMBER_SCALE),
+            error: "SNS.InvalidParameterValueException",
+            code: "ParameterValueInvalid",
+            sentence: "Message attribute 'huge' number value [1e126] scale must be \
+                       10^-128 and 10^126.",
+        },
+        Rejected {
+            case: "an attribute carrying no value at all",
+            resource: OPTIMIZED_PUBLISH,
+            attribute: ("label", "String", ""),
+            error: "SNS.InvalidParameterValueException",
+            code: "ParameterValueInvalid",
+            sentence: "The message attribute 'label' must contain non-empty message \
+                       attribute value for message attribute type 'String'.",
+        },
+        Rejected {
+            case: "a data type the service does not define",
+            resource: OPTIMIZED_PUBLISH,
+            attribute: ("flag", "Boolean", "true"),
+            error: "SNS.InvalidParameterValueException",
+            code: "ParameterValueInvalid",
+            sentence: "The message attribute 'flag' has an invalid message attribute \
+                       type, the set of supported type prefixes is Binary, Number and \
+                       String.",
+        },
+        Rejected {
+            case: "a name under a prefix the service reserves",
+            resource: OPTIMIZED_PUBLISH,
+            attribute: ("AWS.Reserved", "String", "a value"),
+            error: "SNS.InvalidParameterValueException",
+            code: "ParameterValueInvalid",
+            sentence: "Message attribute names starting with 'AWS.' or 'Amazon.' are \
+                       reserved for use by Amazon.",
+        },
+        Rejected {
+            case: "a name holding a character a name may not",
+            resource: OPTIMIZED_PUBLISH,
+            attribute: ("order id", "String", "A-1"),
+            error: "SNS.InvalidParameterValueException",
+            code: "ParameterValueInvalid",
+            sentence: "Invalid non-alphanumeric character '#x20' was found in the message \
+                       attribute name. Can only include alphanumeric characters, hyphens, \
+                       underscores, or dots.",
+        },
+        Rejected {
+            // The contrast row: a character an attribute VALUE may not hold is answered
+            // under `InvalidParameter`, a code that names its own shape — so the class is
+            // another one, from the same request member.
+            case: "a value holding a character an attribute value may not",
+            resource: OPTIMIZED_PUBLISH,
+            attribute: ("note", "String", "a \u{1F600} face"),
+            error: "SNS.InvalidParameterException",
+            code: "InvalidParameter",
+            sentence: "Invalid parameter: Invalid binary character '#x1F600' was found in \
+                       the message attribute 'note' value, the set of allowed characters \
+                       is #x9 | #xA | #xD | [#x20 to #xD7FF] | [#xE000 to #xFFFD]",
+        },
+    ];
+
+    for (index, row) in rows.iter().enumerate() {
+        let case = row.case;
+        let (name, data_type, value) = row.attribute;
+        let machine = chain
+            .machine(
+                &format!("attribute-{index}"),
+                &definition(
+                    row.resource,
+                    json!({
+                        "TopicArn": topic,
+                        "Message.$": "$.message",
+                        "MessageAttributes": {
+                            name: { "DataType": data_type, "StringValue": value },
+                        },
+                    }),
+                    false,
+                ),
+                &role_arn,
+            )
+            .await;
+        let input = json!({ "message": "a notification" });
+        let (execution_arn, described) = chain.ran(&machine, "only", &input, case).await;
+        assert_eq!(
+            described.get("status").and_then(Value::as_str),
+            Some("FAILED"),
+            "case {case:?}: a refused publish fails the task, got {described:?}"
+        );
+        let (error, cause) = reported(case, &described);
+        assert_eq!(
+            error, row.error,
+            "case {case:?}: expected the error {:?}, got {error:?} with cause {cause:?}",
+            row.error
+        );
+        // The exception half is the SHAPE's class, so the query code with the suffix a
+        // class name carries is a DIFFERENT name — and no row reports that one.
+        let service_half = row
+            .error
+            .split_once('.')
+            .map(|(service, _)| service)
+            .unwrap_or_else(|| panic!("case {case:?}: an error name has two halves"));
+        let from_the_query_code = format!("{service_half}.{}Exception", row.code);
+        if from_the_query_code != row.error {
+            assert_ne!(
+                error, from_the_query_code,
+                "case {case:?}: the error is the modelled shape's class, not the query \
+                 code {:?} with a class suffix",
+                row.code
+            );
+        }
+        // The code belongs to the cause's metadata, which is held whole: the service's
+        // sentence, the client's own name, the status, the code and the refused request.
+        assert_cause(
+            case,
+            &cause,
+            row.resource,
+            row.sentence,
+            REFUSED_ATTRIBUTE_STATUS,
+            row.code,
+        );
+
+        // The same message reaches the history the failed work was reported in.
+        let events = chain.history(&execution_arn).await;
+        let failed: Vec<String> = events
+            .iter()
+            .filter(|event| event.get("type").and_then(Value::as_str) == Some(EVENT_TASK_FAILED))
+            .filter_map(|event| event.get("taskFailedEventDetails").cloned())
+            .map(|details| string(&details, "cause"))
+            .collect();
+        assert_eq!(
+            failed,
+            vec![cause.clone()],
+            "case {case:?}: expected exactly one {EVENT_TASK_FAILED} carrying the cause \
+             {cause:?}, got {events:?}"
+        );
+
+        // And the refused message is never delivered: the subscribed queue stays empty.
+        let delivered = chain.drain(&url).await;
+        assert!(
+            delivered.is_empty(),
+            "case {case:?}: a refused publish delivers nothing, got {delivered:?}"
+        );
+    }
+}
+
+/// Every legacy query code Amazon SNS names an error class by, beside the error SHAPE its
+/// own model binds that code to, as `(code, shape)`.
+///
+/// Read off that service's model — each error shape carries its own `awsQueryError`
+/// (`smithy_query(query="shape",shape="InvalidParameterValueException,
+/// InvalidParameterException,NotFoundException,AuthorizationErrorException,
+/// InternalErrorException,EndpointDisabledException,ThrottledException,TagPolicyException,
+/// SubscriptionLimitExceededException,KMSAccessDeniedException,KMSNotFoundException,
+/// ResourceNotFoundException,ConcurrentAccessException,StaleTagException,OptedOutException,
+/// UserErrorException,ValidationException",model_path="services/
+/// service-com-amazonaws-sns-amazonsimplenotificationservice/smithy-model/
+/// com-amazonaws-sns-amazonsimplenotificationservice.json")`). The rows cover a code bound
+/// to ANOTHER shape's name (`ParameterValueInvalid`), the codes that are their own shape's
+/// name without the class suffix, and the one code that already carries the suffix.
+const SNS_QUERY_CODES: &[(&str, &str)] = &[
+    ("ParameterValueInvalid", "InvalidParameterValueException"),
+    ("InvalidParameter", "InvalidParameterException"),
+    ("NotFound", "NotFoundException"),
+    ("AuthorizationError", "AuthorizationErrorException"),
+    ("InternalError", "InternalErrorException"),
+    ("EndpointDisabled", "EndpointDisabledException"),
+    ("Throttled", "ThrottledException"),
+    ("TagPolicy", "TagPolicyException"),
+    ("SubscriptionLimitExceeded", "SubscriptionLimitExceededException"),
+    ("KMSAccessDenied", "KMSAccessDeniedException"),
+    ("KMSNotFound", "KMSNotFoundException"),
+    ("ResourceNotFound", "ResourceNotFoundException"),
+    ("ConcurrentAccess", "ConcurrentAccessException"),
+    ("StaleTag", "StaleTagException"),
+    ("OptedOut", "OptedOutException"),
+    ("UserError", "UserErrorException"),
+    ("ValidationException", "ValidationException"),
+];
+
+/// RULE 1 over the invoked service's WHOLE error set rather than over the refusals one
+/// publish can meet: the exception half of a failed task's error name is the class of the
+/// error SHAPE the answered query code is bound to — which is the code itself with the
+/// class suffix only where the code is that shape's own name, and the shape's name
+/// wherever the model binds the code to another.
+///
+/// Held over the catalogue because a code bound to another shape's name is discoverable
+/// only against the model, and such a code is exactly the one a client's `Retry` or
+/// `Catch` would be written wrong for.
+#[test]
+fn every_sns_query_code_names_the_class_of_the_shape_it_is_bound_to() {
+    let api = APIS
+        .iter()
+        .find(|api| api.namespace == "sns")
+        .expect("Amazon SNS is one of the services a Task state calls");
+    for (code, shape) in SNS_QUERY_CODES {
+        // Only the SERVICE half may differ with the family: the class is the answer's
+        // own, whichever client read it.
+        for (family, service) in [
+            (Family::Optimized, api.error_prefix),
+            (Family::AwsSdk, api.sdk_error_prefix),
+        ] {
+            let named = api.task_error(family, code);
+            let expected = format!("{service}.{shape}");
+            assert_eq!(
+                named, expected,
+                "case {code:?}: expected the class of the shape the code is bound to \
+                 ({expected}) for {family:?}, got {named:?}"
+            );
+            // The code with a class suffix is a DIFFERENT name wherever the model binds
+            // the code to another shape, and is never what the task reports.
+            let from_the_code = format!("{service}.{code}Exception");
+            if from_the_code != expected {
+                assert_ne!(
+                    named, from_the_code,
+                    "case {code:?}: the name is built from the shape, not from the query \
+                     code with a suffix"
+                );
+            }
+        }
     }
 }
