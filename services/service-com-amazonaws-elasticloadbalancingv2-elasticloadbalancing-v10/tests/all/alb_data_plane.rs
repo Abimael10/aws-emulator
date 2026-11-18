@@ -39,17 +39,32 @@
 //! published address, because the address a request comes from exists only on one, and the
 //! blocks each row is judged against are written through `ModifyRule` and read back through
 //! `DescribeRules` first. A second table pins which VALUES name a block at all.
+//!
+//! The last table of this suite is about the ADDRESS the client sends to rather than the
+//! request it sends: **the value a load balancer publishes as its `DNSName` is an address of
+//! THIS emulator — the `host:port` of the socket it opened for that load balancer — reported
+//! identically by the create and by every later read, held by one load balancer alone, and
+//! answered out of that load balancer's own stored configuration for as long as it exists.**
+//! `LoadBalancer$DNSName` is "the public DNS name of the load balancer", the name a client
+//! resolves and connects to in order to reach a listener, so a value naming a host no client
+//! of this machine resolves announces an address the service does not answer on. Those rows
+//! DIAL the published value over a real connection, as a client that reads it does, and they
+//! are driven against two load balancers at once so what decides the answer is the address
+//! dialled and not the path asked for.
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
+use ::service_com_amazonaws_ec2_amazonec2::ops::types as ec2_types;
+use ::service_com_amazonaws_ec2_amazonec2::state as ec2;
 use service_com_amazonaws_elasticloadbalancingv2_elasticloadbalancing_v10::state::ComAmazonawsElasticloadbalancingv2ElasticloadbalancingV10State as ElbState;
 use smithy_server_runtime::MultiServiceRouter;
+use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
 use crate::alb_desync_mitigation_and_forwarded_for::{raw_exchange, CONNECTION_ADDRESS};
 use crate::provisioning_loop::{
-    action, call, create_http_target_group, emulator, members, p, Reply,
+    action, call, create_http_target_group, emulator, first_text, members, p, Reply,
 };
 use crate::target_group_attributes_and_modification::unescaped;
 
@@ -1280,4 +1295,511 @@ async fn a_source_ip_condition_value_that_is_no_cidr_block_is_refused_and_change
         &fields,
     )
     .await;
+}
+
+/// The paths the published-address table below writes rules for, and the body each of the two
+/// load balancers answers the shared one with — different bodies for one path, so a row that
+/// reached the other load balancer fails rather than passing.
+const PUBLISHED_PATH: &str = "/status";
+const GONE_PATH: &str = "/withdrawn";
+const FIRST_BODY: &str = "the-first-load-balancer";
+const SECOND_BODY: &str = "the-second-load-balancer";
+const GONE_BODY: &str = "withdrawn-by-the-first-load-balancer";
+
+/// The two paths whose rules FORWARD: one to a group holding no registration at all, one to a
+/// group holding the address a network interface of the account holds.
+const FORWARD_TO_NO_TARGET_PATH: &str = "/to-an-empty-group";
+const FORWARD_TO_A_REGISTRATION_PATH: &str = "/to-a-registered-address";
+
+/// The status a load balancer answers a `forward` whose group has no target it may send the
+/// request to: "if a target group contains no registered targets, or if a target group
+/// contains only unhealthy targets, the load balancer returns an HTTP 503".
+const NO_HEALTHY_TARGET: u16 = 503;
+
+/// The status it answers a request whose chosen target cannot be connected to — which is what
+/// a registered ADDRESS is in this emulator, because nothing of this emulator listens on one.
+/// What the row using it asserts is that the answer came from the load balancer at the address
+/// it published, not what a server behind the address would have returned.
+const TARGET_UNREACHABLE: u16 = 502;
+
+/// The network the registered address belongs to, and the address itself: the shape an
+/// `awsvpc` workload's own address has — a private address inside one subnet of one VPC, held
+/// by a network interface of the account.
+const WORKLOAD_VPC: &str = "vpc-0aa1b2c3d4e5f6071";
+const WORKLOAD_SUBNET: &str = "subnet-0aa1b2c3d4e5f6071";
+const WORKLOAD_ZONE: &str = "us-west-2a";
+const WORKLOAD_ADDRESS: &str = "10.80.1.10";
+
+/// The cadence the groups below are health-checked at: the shortest interval
+/// `HealthCheckIntervalSeconds` admits ("the range is 5-300"), so the verdict a row waits for
+/// is reached at the service's own pace rather than after a wait of this suite's choosing.
+const HEALTH_CHECK_INTERVAL_SECONDS: i32 = 5;
+
+/// How long a row waits for a verdict or for a withdrawn address to stop answering, and how
+/// often it looks again. Generous on purpose — many times the cadence above — because the
+/// deadline is only here so a failure is a failure rather than a hang.
+const SETTLING_DEADLINE: Duration = Duration::from_secs(120);
+const LOOK_AGAIN: Duration = Duration::from_millis(50);
+
+/// How long one dial of a published address is given, for the probe that asks whether the
+/// address still answers at all.
+const DIAL_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Seed the account's EC2 inventory with one VPC, one subnet of it and one network interface
+/// holding [`WORKLOAD_ADDRESS`], so a registration of that address is one the emulator holds
+/// something behind and the load balancer's own health checks report it `healthy`.
+///
+/// Written through the inventory's own writer seam, so the interface is the record EC2's own
+/// readers answer with rather than a value this suite made up.
+fn seed_workload_interface(engine: &Arc<engine::InMemoryEngine>) {
+    let state = ec2::service_state(&**engine).expect("the shared engine holds an EC2 inventory");
+    let mut store = state.lock();
+    store.vpcs.insert(
+        WORKLOAD_VPC.to_string(),
+        ec2_types::Vpc {
+            vpc_id: Some(WORKLOAD_VPC.to_string()),
+            cidr_block: Some("10.80.0.0/16".to_string()),
+            ..ec2_types::Vpc::default()
+        },
+    );
+    store.subnets.insert(
+        WORKLOAD_SUBNET.to_string(),
+        ec2_types::Subnet {
+            subnet_id: Some(WORKLOAD_SUBNET.to_string()),
+            vpc_id: Some(WORKLOAD_VPC.to_string()),
+            cidr_block: Some("10.80.1.0/24".to_string()),
+            availability_zone: Some(WORKLOAD_ZONE.to_string()),
+            ..ec2_types::Subnet::default()
+        },
+    );
+    store
+        .insert_network_interface(ec2::NetworkInterfaceSpec {
+            subnet_id: WORKLOAD_SUBNET.to_string(),
+            vpc_id: WORKLOAD_VPC.to_string(),
+            availability_zone: WORKLOAD_ZONE.to_string(),
+            region: crate::provisioning_loop::REGION.to_string(),
+            description: "a workload of the account".to_string(),
+            interface_type: ec2::NETWORK_INTERFACE_TYPE_INTERFACE.to_string(),
+            private_ip_addresses: vec![WORKLOAD_ADDRESS.to_string()],
+            ..ec2::NetworkInterfaceSpec::default()
+        })
+        .expect("the inventory holds the interface");
+}
+
+/// Create an `ip` target group in `vpc` — the target type a workload addressed by its own
+/// private address is registered under — and answer its ARN.
+async fn ip_target_group(router: &MultiServiceRouter, name: &str, vpc: &str) -> String {
+    let mut form = action("CreateTargetGroup");
+    form.push(p("Name", name));
+    form.push(p("Protocol", "HTTP"));
+    form.push(p("Port", "80"));
+    form.push(p("TargetType", "ip"));
+    form.push(p("VpcId", vpc));
+    form.push(p(
+        "HealthCheckIntervalSeconds",
+        &HEALTH_CHECK_INTERVAL_SECONDS.to_string(),
+    ));
+    let reply = call(router, &form).await;
+    assert_eq!(
+        reply.status, 200,
+        "case create {name}: expected 200 from CreateTargetGroup, got {} body {}",
+        reply.status, reply.body
+    );
+    reply
+        .text("TargetGroupArn")
+        .unwrap_or_else(|| panic!("case create {name}: no TargetGroupArn in {}", reply.body))
+}
+
+/// Register `address` with the target group `arn` names.
+async fn register_address(router: &MultiServiceRouter, case: &str, arn: &str, address: &str) {
+    let mut form = action("RegisterTargets");
+    form.push(p("TargetGroupArn", arn));
+    form.push(p("Targets.member.1.Id", address));
+    let reply = call(router, &form).await;
+    assert_eq!(
+        reply.status, 200,
+        "case {case:?}: expected 200 from RegisterTargets, got {} body {}",
+        reply.status, reply.body
+    );
+}
+
+/// A `forward` action's fields, naming the one target group it forwards to.
+fn forward_to(target_group_arn: &str) -> Vec<(String, String)> {
+    vec![
+        p("Actions.member.1.Type", "forward"),
+        p("Actions.member.1.TargetGroupArn", target_group_arn),
+    ]
+}
+
+/// The `DNSName` a later read reports for the load balancer `arn` names.
+async fn described_dns_name(router: &MultiServiceRouter, case: &str, arn: &str) -> String {
+    let mut form = action("DescribeLoadBalancers");
+    form.push(p("LoadBalancerArns.member.1", arn));
+    let reply = call(router, &form).await;
+    assert_eq!(
+        reply.status, 200,
+        "case {case:?}: expected 200 from DescribeLoadBalancers, got {} body {}",
+        reply.status, reply.body
+    );
+    reply
+        .text("DNSName")
+        .unwrap_or_else(|| panic!("case {case:?}: no DNSName in {}", reply.body))
+}
+
+/// Wait until every registration of the group `arn` names reports `wanted`, looking again
+/// rather than sleeping for the span the checks take, and answer the states it reported.
+async fn health_reaching(
+    router: &MultiServiceRouter,
+    case: &str,
+    arn: &str,
+    wanted: &str,
+) -> Vec<String> {
+    let deadline = Instant::now() + SETTLING_DEADLINE;
+    loop {
+        let reported: Vec<String> = described_health(router, arn)
+            .await
+            .iter()
+            .map(|description| first_text(description, "State").unwrap_or_default())
+            .collect();
+        let settled = !reported.is_empty() && reported.iter().all(|state| state == wanted);
+        if settled || Instant::now() >= deadline {
+            assert!(
+                settled,
+                "case {case:?}: expected every registration to reach {wanted:?}, got {reported:?}"
+            );
+            return reported;
+        }
+        tokio::time::sleep(LOOK_AGAIN).await;
+    }
+}
+
+/// Whether `published` still ANSWERS: a connection it accepts, and a request on it that comes
+/// back with bytes. A closed port, a connection nothing reads and an empty answer are all an
+/// address this emulator no longer serves.
+async fn still_answers(published: &str) -> bool {
+    let Some(port) = published
+        .rsplit(':')
+        .next()
+        .and_then(|port| port.parse::<u16>().ok())
+    else {
+        return false;
+    };
+    let dialed = tokio::time::timeout(
+        DIAL_TIMEOUT,
+        tokio::net::TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, port)),
+    )
+    .await;
+    let Ok(Ok(mut stream)) = dialed else {
+        return false;
+    };
+    let request =
+        format!("GET / HTTP/1.1\r\nHost: {published}\r\nConnection: close\r\n\r\n");
+    if stream.write_all(request.as_bytes()).await.is_err() {
+        return false;
+    }
+    let mut answer = Vec::new();
+    match tokio::time::timeout(DIAL_TIMEOUT, stream.read_to_end(&mut answer)).await {
+        Ok(Ok(_read)) => !answer.is_empty(),
+        _ => false,
+    }
+}
+
+/// The body of one answer read off a connection: everything after the blank line that ends
+/// its head.
+fn body_of(case: &str, raw: &str) -> String {
+    raw.split_once("\r\n\r\n")
+        .map(|(_head, body)| body.to_string())
+        .unwrap_or_else(|| panic!("case {case:?}: no head and body in {raw:?}"))
+}
+
+/// Which of the two load balancers' published addresses a row dials.
+#[derive(Clone, Copy)]
+enum Dialed {
+    First,
+    Second,
+}
+
+/// One row of the published-address table: the address it dials, the request line it writes,
+/// and the answer that address must give it.
+struct Published {
+    case: &'static str,
+    dialed: Dialed,
+    method: &'static str,
+    target: &'static str,
+    status: u16,
+    body: &'static str,
+}
+
+/// The rows, spanning what the rule generalises over: which of the two addresses is dialled,
+/// each terminating action a listener holds (a rule's fixed response, the listener's default
+/// action, a `forward`), the method and query a client writes beside the path, a path the
+/// address dialled has a rule for and one it has none for, and the same path on both
+/// addresses.
+fn published_rows() -> Vec<Published> {
+    vec![
+        Published {
+            case: "the rule the dialled load balancer holds for the path",
+            dialed: Dialed::First,
+            method: "GET",
+            target: PUBLISHED_PATH,
+            status: 200,
+            body: FIRST_BODY,
+        },
+        Published {
+            case: "the same path asked for with another method",
+            dialed: Dialed::First,
+            method: "POST",
+            target: PUBLISHED_PATH,
+            status: 200,
+            body: FIRST_BODY,
+        },
+        Published {
+            case: "the same path carrying a query string",
+            dialed: Dialed::First,
+            method: "GET",
+            target: "/status?probe=1",
+            status: 200,
+            body: FIRST_BODY,
+        },
+        Published {
+            case: "another rule of the same listener, answering another status",
+            dialed: Dialed::First,
+            method: "GET",
+            target: GONE_PATH,
+            status: 410,
+            body: GONE_BODY,
+        },
+        Published {
+            case: "a path no rule of the dialled load balancer matches",
+            dialed: Dialed::First,
+            method: "GET",
+            target: "/nothing-here",
+            status: 404,
+            body: DEFAULT_BODY,
+        },
+        Published {
+            case: "a forward to a group holding no registration",
+            dialed: Dialed::First,
+            method: "GET",
+            target: FORWARD_TO_NO_TARGET_PATH,
+            status: NO_HEALTHY_TARGET,
+            body: "",
+        },
+        Published {
+            case: "a forward to the registered address of a healthy workload",
+            dialed: Dialed::First,
+            method: "GET",
+            target: FORWARD_TO_A_REGISTRATION_PATH,
+            status: TARGET_UNREACHABLE,
+            body: "",
+        },
+        Published {
+            case: "the other load balancer's own rule for the shared path",
+            dialed: Dialed::Second,
+            method: "GET",
+            target: PUBLISHED_PATH,
+            status: 200,
+            body: SECOND_BODY,
+        },
+        Published {
+            case: "a path only the first load balancer has a rule for",
+            dialed: Dialed::Second,
+            method: "GET",
+            target: FORWARD_TO_NO_TARGET_PATH,
+            status: 404,
+            body: DEFAULT_BODY,
+        },
+    ]
+}
+
+/// Two load balancers, each with an HTTP:80 listener of its own, and the groups the first
+/// one's rules forward to.
+struct PublishedDeployment {
+    router: MultiServiceRouter,
+    first_arn: String,
+    /// The address the first load balancer published, which the rows above dial.
+    first: String,
+    second_arn: String,
+    /// The address the second one published.
+    second: String,
+    /// The group holding the workload's own address, whose health a row waits for.
+    registered_group: String,
+}
+
+/// Build them, every resource through the control plane's own operations.
+async fn published_deployment() -> PublishedDeployment {
+    let (router, engine) = emulator();
+    seed_workload_interface(&engine);
+
+    let (first_arn, first) = create_load_balancer(&router, "published-one").await;
+    let listener_arn = create_listener(&router, &first_arn).await;
+    let empty_group = ip_target_group(&router, "published-empty", WORKLOAD_VPC).await;
+    let registered_group = ip_target_group(&router, "published-live", WORKLOAD_VPC).await;
+    register_address(
+        &router,
+        "the workload's own address",
+        &registered_group,
+        WORKLOAD_ADDRESS,
+    )
+    .await;
+
+    let mut fields = path_pattern(PUBLISHED_PATH);
+    fields.extend(fixed_response("200", FIRST_BODY, None));
+    add_rule(&router, "the first load balancer's path", &listener_arn, 10, &fields).await;
+    let mut fields = path_pattern(GONE_PATH);
+    fields.extend(fixed_response("410", GONE_BODY, None));
+    add_rule(&router, "the withdrawn path", &listener_arn, 20, &fields).await;
+    let mut fields = path_pattern(FORWARD_TO_NO_TARGET_PATH);
+    fields.extend(forward_to(&empty_group));
+    add_rule(&router, "the forward to an empty group", &listener_arn, 30, &fields).await;
+    let mut fields = path_pattern(FORWARD_TO_A_REGISTRATION_PATH);
+    fields.extend(forward_to(&registered_group));
+    add_rule(&router, "the forward to a registration", &listener_arn, 40, &fields).await;
+
+    // A SECOND load balancer, with an address of its own and its own answer for the path the
+    // first one answers: the address dialled is what decides which of them serves a request.
+    let (second_arn, second) = create_load_balancer(&router, "published-two").await;
+    let other_listener_arn = create_listener(&router, &second_arn).await;
+    let mut fields = path_pattern(PUBLISHED_PATH);
+    fields.extend(fixed_response("200", SECOND_BODY, None));
+    add_rule(
+        &router,
+        "the second load balancer's path",
+        &other_listener_arn,
+        10,
+        &fields,
+    )
+    .await;
+
+    // The moves to `active` the clock owes both of them, placed rather than slept for.
+    let past = SystemTime::now() - Duration::from_secs(1);
+    settle(&engine, &first_arn, past);
+    settle(&engine, &second_arn, past);
+
+    PublishedDeployment {
+        router,
+        first_arn,
+        first,
+        second_arn,
+        second,
+        registered_group,
+    }
+}
+
+/// RULE: the value a load balancer publishes as its `DNSName` is an address of THIS emulator —
+/// one a client on this machine dials — reported identically by the create and by every later
+/// read, held by one load balancer alone, answered out of that load balancer's own stored
+/// configuration, and withdrawn when the load balancer is deleted.
+#[tokio::test]
+async fn the_address_a_load_balancer_publishes_is_an_address_of_this_emulator_that_answers_for_it()
+{
+    let deployed = published_deployment().await;
+
+    // Each published value is an address a client dials — a host and a port, on an interface
+    // of this machine — and the read reports the very value the create answered with.
+    for (case, arn, published) in [
+        (
+            "the first load balancer",
+            &deployed.first_arn,
+            &deployed.first,
+        ),
+        (
+            "the second load balancer",
+            &deployed.second_arn,
+            &deployed.second,
+        ),
+    ] {
+        let dialable: std::net::SocketAddr = published.parse().unwrap_or_else(|error| {
+            panic!(
+                "case {case:?}: expected an address of this emulator a client can dial, got \
+                 {published:?} ({error})"
+            )
+        });
+        assert!(
+            dialable.ip().is_loopback(),
+            "case {case:?}: expected an address on an interface of this machine, got \
+             {published:?}"
+        );
+        assert_ne!(
+            dialable.port(), 0,
+            "case {case:?}: expected the port the socket answers on, got {published:?}"
+        );
+        let reported = described_dns_name(&deployed.router, case, arn).await;
+        assert_eq!(
+            reported, *published,
+            "case {case:?}: a read must report the address the create published, got \
+             {reported:?}"
+        );
+    }
+    assert_ne!(
+        deployed.first, deployed.second,
+        "expected each load balancer to publish an address of its own, {:?} repeated",
+        deployed.first
+    );
+
+    // The registration of an address a network interface of the account holds is one the load
+    // balancer sends requests to, so the forward row below is a forward to a HEALTHY target
+    // rather than to a group with nothing in it.
+    health_reaching(
+        &deployed.router,
+        "the workload's own address",
+        &deployed.registered_group,
+        "healthy",
+    )
+    .await;
+
+    for row in published_rows() {
+        let published = match row.dialed {
+            Dialed::First => &deployed.first,
+            Dialed::Second => &deployed.second,
+        };
+        let request = format!(
+            "{} {} HTTP/1.1\r\nHost: {published}\r\nConnection: close\r\n\r\n",
+            row.method, row.target
+        );
+        let (status, raw) = raw_exchange(row.case, published, &request).await;
+        assert_eq!(
+            status, row.status,
+            "case {:?}: expected the address it published to answer HTTP {}, got {status} in \
+             {raw:?}",
+            row.case, row.status
+        );
+        let body = body_of(row.case, &raw);
+        assert_eq!(
+            body, row.body,
+            "case {:?}: expected the body {:?}, got {body:?}",
+            row.case, row.body
+        );
+    }
+
+    // The address belongs to the load balancer: deleting one withdraws its address, and the
+    // load balancer beside it keeps serving on its own.
+    let mut form = action("DeleteLoadBalancer");
+    form.push(p("LoadBalancerArn", &deployed.second_arn));
+    let deleted = call(&deployed.router, &form).await;
+    assert_eq!(
+        deleted.status, 200,
+        "case delete the second load balancer: expected 200, got {} body {}",
+        deleted.status, deleted.body
+    );
+    let deadline = Instant::now() + SETTLING_DEADLINE;
+    while still_answers(&deployed.second).await {
+        assert!(
+            Instant::now() < deadline,
+            "case the deleted load balancer's address: expected {} to stop answering",
+            deployed.second
+        );
+        tokio::time::sleep(LOOK_AGAIN).await;
+    }
+    let case = "the load balancer beside the deleted one";
+    let request = format!(
+        "GET {PUBLISHED_PATH} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n",
+        deployed.first
+    );
+    let (status, raw) = raw_exchange(case, &deployed.first, &request).await;
+    assert_eq!(
+        (status, body_of(case, &raw).as_str()),
+        (200, FIRST_BODY),
+        "case {case:?}: expected its own address to keep serving, got {status} in {raw:?}"
+    );
 }
