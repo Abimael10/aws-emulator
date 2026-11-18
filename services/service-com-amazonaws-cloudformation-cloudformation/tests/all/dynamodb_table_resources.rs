@@ -75,6 +75,51 @@ pub(crate) async fn describe_table(router: &MultiServiceRouter, name: &str) -> O
     None
 }
 
+/// The tags DynamoDB holds for the table `name`, as the `(Key, Value)` pairs its own
+/// `ListTagsOfResource` reports them in, looked at again until they are `expected` or a
+/// generous deadline passes.
+///
+/// A tag write of that service is eventually consistent — "ListTagsOfResource API will only
+/// reflect the changes after a few seconds" — so a suite that reads a tag set back waits for
+/// the CONDITION rather than for a fixed time. The ONE such read of this crate's suites, kept
+/// beside the other DynamoDB reads so the poll has a single definition
+/// (`managed_table_stack_tags.rs` and `cdk_imported_table_estate.rs` both read a managed
+/// table's tags back through it).
+pub(crate) async fn table_tags(
+    router: &MultiServiceRouter,
+    name: &str,
+    expected: &[(&str, &str)],
+) -> Vec<(String, String)> {
+    let arn = format!("arn:aws:dynamodb:{REGION}:{ACCOUNT_ID}:table/{name}");
+    let wanted: Vec<(String, String)> = expected
+        .iter()
+        .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
+        .collect();
+    let mut held = Vec::new();
+    for _ in 0..8 {
+        let (_, answered) =
+            dynamodb(router, "ListTagsOfResource", &json!({"ResourceArn": arn})).await;
+        held = answered
+            .get("Tags")
+            .and_then(Value::as_array)
+            .map(|tags| {
+                tags.iter()
+                    .filter_map(|tag| {
+                        let key = tag.get("Key").and_then(Value::as_str)?;
+                        let value = tag.get("Value").and_then(Value::as_str)?;
+                        Some((key.to_string(), value.to_string()))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        if held == wanted {
+            break;
+        }
+        wait_for_the_transition().await;
+    }
+    held
+}
+
 /// Every output a `DescribeStacks` response reports, as `(OutputKey, OutputValue)` pairs
 /// read INSIDE each `<member>` block — so an output that carries NO `OutputValue` member at
 /// all is visible as `None` rather than shifting the pairing of two flat lists.

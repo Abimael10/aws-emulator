@@ -64,6 +64,25 @@ pub fn deletion_policy_required(logical_ids: &[String]) -> String {
 pub const RESOURCES_TO_IMPORT_REQUIRED: &str =
     "ResourcesToImport must be specified when ChangeSetType is IMPORT";
 
+/// The `StatusReason` a change set whose IMPORT cannot resolve a resource fails with: the
+/// not-found diagnostic the RESOURCE PROVIDER that owns the type states.
+///
+/// CloudFormation plans an import by calling the type's own `read` handler for the identifier
+/// the mapping names, so the failure it reports is that HANDLER's verdict: a type whose
+/// handler words the absence itself is failed in that wording
+/// ([`::service_common::cfn_resource_handlers`], which holds it once for every API that
+/// reports a handler's not-found), and a type whose handler reports through the generic
+/// resource-provider base class is failed in the uniform sentence naming only the type and
+/// the identifier ([`super::early_validation::not_found`]).
+///
+/// The variable parts are the type the request named and the physical identifier it gave,
+/// wherever the handler's wording names them; nothing else of the request reaches the
+/// sentence.
+pub fn not_found_reason(resource_type: &str, identifier: &str) -> String {
+    ::service_common::cfn_resource_handlers::not_found_sentence(resource_type, identifier)
+        .unwrap_or_else(|| super::early_validation::not_found(resource_type, identifier))
+}
+
 /// The refusal for an entry naming a logical id the template does not declare: the
 /// identifier would be adopted as a resource nothing describes.
 ///

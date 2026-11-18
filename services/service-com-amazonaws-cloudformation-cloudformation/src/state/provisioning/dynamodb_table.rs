@@ -231,6 +231,33 @@ const PUBLISHED_ATTRIBUTES: &[(&str, &str)] = &[
 /// [`await_settled`] and [`creation_window`].
 const TABLE_STATUS_MEMBER: &str = "TableStatus";
 
+/// The attribute the type publishes the table's ARN as, and the `TableDescription` member it
+/// is read off — the pair [`PUBLISHED_ATTRIBUTES`] states, named here because DynamoDB's
+/// TAGGING calls address a resource by that ARN ([`retag`]).
+const ARN_ATTRIBUTE: &str = "Arn";
+const TABLE_ARN_MEMBER: &str = "TableArn";
+
+/// The members DynamoDB's tagging calls take: the ARN that addresses the resource
+/// (`TagResource`/`UntagResource`/`ListTagsOfResource`'s `ResourceArn`), the keys a removal
+/// states (`UntagResource$TagKeys`) and the cursor a listing hands out
+/// (`ListTagsOfResource$NextToken`); the tags themselves travel under the same `Tags` the type
+/// declares them as ([`TAGS_PROPERTY`]).
+///
+/// Source: those operations' member lists
+/// (`smithy_query(query="operation",operation="TagResource,UntagResource,ListTagsOfResource")`).
+const RESOURCE_ARN_MEMBER: &str = "ResourceArn";
+const TAG_KEYS_MEMBER: &str = "TagKeys";
+const NEXT_TOKEN_MEMBER: &str = "NextToken";
+
+/// The members one reported tag is made of (`Tag$Key`, `Tag$Value`).
+const TAG_KEY_MEMBER: &str = "Key";
+const TAG_VALUE_MEMBER: &str = "Value";
+
+/// How many pages of a table's tags one reconciliation reads: `ListTagsOfResource` is
+/// paginated, and a table carries at most a bounded tag set, so the whole set is reached in a
+/// bounded number of pages and a cursor that never ends cannot hold a deployment open.
+const MAX_TAG_PAGES: usize = 16;
+
 /// Create the table an `AWS::DynamoDB::Table` declares, in Amazon DynamoDB itself — so a
 /// client that deployed the stack reads it back with `dynamodb describe-table`, writes items
 /// to it, and reaches the stream its `StreamSpecification` enabled through the DynamoDB
@@ -304,6 +331,148 @@ pub(super) async fn create(
     Ok(Created::attributes(published_attributes(
         answered.get(TABLE_DESCRIPTION_MEMBER),
     )))
+}
+
+/// Bring the table's tag set back into step with the one CloudFormation gives it, through
+/// DynamoDB's own `TagResource` and `UntagResource`.
+///
+/// `CreateTable`'s `Tags` member applies to the table that call creates and to no table that
+/// already exists — and a table the stack ADOPTED was created by no call of this service's at
+/// all — so this is where the set a table is to end up carrying is reconciled: a stack
+/// operation's `Tags` are propagated to the resources in the stack, and a deployment can state
+/// them differently with no declaration changing.
+///
+/// Idempotent: a table whose tags already agree with the set has nothing called about it, and
+/// only the keys that really differ travel. The keys in the namespace DynamoDB reserves are
+/// not a caller's to write ([`storable_tags`]), so CloudFormation's own records of the stack
+/// reach neither call.
+pub(super) async fn retag(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    resource: &StoredResource,
+    declared: &Value,
+    propagated: &[(String, String)],
+) -> Result<(), Refusal> {
+    // DynamoDB's tagging calls address a resource by ARN: the one the record publishes, or
+    // the one that service reports for the table right now — never a value this builds, so a
+    // resource whose attributes were not re-pointed still has its tags reconciled rather than
+    // silently left as they were. A table that service holds none of has no tags to reconcile,
+    // which the deployment's own reads are what report.
+    let arn = match resource.attributes.get(ARN_ATTRIBUTE) {
+        Some(arn) if !arn.is_empty() => arn.clone(),
+        _ => {
+            let reported = describe(ctx, region, &resource.physical_resource_id).await?;
+            match reported
+                .as_ref()
+                .and_then(|description| description.get(TABLE_ARN_MEMBER))
+                .and_then(Value::as_str)
+            {
+                Some(arn) => arn.to_string(),
+                None => return Ok(()),
+            }
+        }
+    };
+    let wanted = storable_tags(declared, propagated);
+    let held = held_tags(ctx, region, &arn).await?;
+    // A key the table carries that the set no longer states is removed; the two calls are
+    // made in that order, so a set stating fewer tags than the table has leaves exactly the
+    // stated ones. A key in the namespace DynamoDB reserves is in neither call: that service
+    // refuses the WHOLE request on one, so a reserved key the table carries from elsewhere
+    // would turn a tag reconciliation into a failed resource rather than being taken off.
+    let removed: Vec<Value> = held
+        .iter()
+        .filter(|(key, _)| !key.to_ascii_lowercase().starts_with(RESERVED_TAG_PREFIX))
+        .filter(|(key, _)| !wanted.iter().any(|(stated, _)| stated == key))
+        .map(|(key, _)| Value::String(key.clone()))
+        .collect();
+    if !removed.is_empty() {
+        let mut request = Map::new();
+        request.insert(RESOURCE_ARN_MEMBER.to_string(), Value::String(arn.clone()));
+        request.insert(TAG_KEYS_MEMBER.to_string(), Value::Array(removed));
+        call_json_rpc(
+            ctx,
+            DYNAMODB_SIGNING_NAME,
+            region,
+            AWS_JSON_1_0,
+            &format!("{DYNAMODB_TARGET_PREFIX}.UntagResource"),
+            &Value::Object(request),
+        )
+        .await?;
+    }
+    let added: Vec<(String, String)> = wanted
+        .into_iter()
+        .filter(|(key, value)| {
+            !held
+                .iter()
+                .any(|(held_key, held_value)| held_key == key && held_value == value)
+        })
+        .collect();
+    if !added.is_empty() {
+        let mut request = Map::new();
+        request.insert(RESOURCE_ARN_MEMBER.to_string(), Value::String(arn));
+        request.insert(TAGS_PROPERTY.to_string(), tag_list(&added));
+        call_json_rpc(
+            ctx,
+            DYNAMODB_SIGNING_NAME,
+            region,
+            AWS_JSON_1_0,
+            &format!("{DYNAMODB_TARGET_PREFIX}.TagResource"),
+            &Value::Object(request),
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+/// The tags DynamoDB holds for the resource `arn`, as the `(key, value)` pairs its own
+/// `ListTagsOfResource` reports them in.
+///
+/// Every page is read ([`MAX_TAG_PAGES`]): the reconciliation above is about the WHOLE set the
+/// resource carries, so a tag on a later page is one a removal would otherwise miss.
+async fn held_tags(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    arn: &str,
+) -> Result<Vec<(String, String)>, Refusal> {
+    let mut held: Vec<(String, String)> = Vec::new();
+    let mut cursor: Option<String> = None;
+    for _ in 0..MAX_TAG_PAGES {
+        let mut request = Map::new();
+        request.insert(
+            RESOURCE_ARN_MEMBER.to_string(),
+            Value::String(arn.to_string()),
+        );
+        if let Some(token) = &cursor {
+            request.insert(NEXT_TOKEN_MEMBER.to_string(), Value::String(token.clone()));
+        }
+        let answered = call_json_rpc(
+            ctx,
+            DYNAMODB_SIGNING_NAME,
+            region,
+            AWS_JSON_1_0,
+            &format!("{DYNAMODB_TARGET_PREFIX}.ListTagsOfResource"),
+            &Value::Object(request),
+        )
+        .await?;
+        if let Some(Value::Array(tags)) = answered.get(TAGS_PROPERTY) {
+            for tag in tags {
+                let key = tag.get(TAG_KEY_MEMBER).and_then(Value::as_str);
+                let value = tag.get(TAG_VALUE_MEMBER).and_then(Value::as_str);
+                if let (Some(key), Some(value)) = (key, value) {
+                    held.push((key.to_string(), value.to_string()));
+                }
+            }
+        }
+        cursor = answered
+            .get(NEXT_TOKEN_MEMBER)
+            .and_then(Value::as_str)
+            .filter(|token| !token.is_empty())
+            .map(ToString::to_string);
+        if cursor.is_none() {
+            break;
+        }
+    }
+    Ok(held)
 }
 
 /// Whether DynamoDB reports the table this create or change made ready.

@@ -125,15 +125,19 @@ pub fn name_conflict_failure(conflicting: &NamedResource) -> super::StoredValida
     }
 }
 
-/// The converse sentence, for a resource that is NOT there: what a resource handler reports
-/// for an identifier the service that owns the type does not hold, whose variable parts are
+/// The converse sentence, for a resource that is NOT there: the UNIFORM not-found a resource
+/// handler built on the generic resource-provider base class reports, whose variable parts are
 /// the declared type and the identifier that was looked for.
 ///
 /// Read by the IMPORT change sets `CreateChangeSet` plans
 /// ([`super::resource_import`]): a resource to import that the owning service does not hold
-/// is no resource to adopt, so the plan cannot be carried out.
+/// is no resource to adopt, so the plan cannot be carried out. A type whose own handler words
+/// that absence differently reports THAT wording instead, which is what
+/// [`super::resource_import::not_found_reason`] asks before falling back here — the sentence
+/// is the handler's, so it is held once for every API that reports one
+/// ([`::service_common::cfn_resource_handlers`]).
 pub fn not_found(resource_type: &str, identifier: &str) -> String {
-    format!("Resource of type '{resource_type}' with identifier '{identifier}' was not found.")
+    ::service_common::cfn_resource_handlers::uniform_not_found(resource_type, identifier)
 }
 
 /// Whether a resource of `resource_type` can be READ BACK from the service that owns it at

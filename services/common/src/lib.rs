@@ -365,6 +365,11 @@ pub mod chime_tags;
 /// such a type, and the one an API that acts through a provider's handlers has nothing to
 /// call for — so the registry and that API cannot disagree about one type.
 pub mod cfn_provisioning;
+/// The ONE answer to what the resource provider that owns a CloudFormation resource type
+/// reports for a resource it cannot find: the diagnostic Cloud Control API carries in its
+/// refusal and the one CloudFormation fails an IMPORT of a missing resource with, so the two
+/// APIs acting through the same handler cannot word one type's absence differently.
+pub mod cfn_resource_handlers;
 /// The ONE rendering and delivery of an API Gateway stage's ACCESS LOG — the `$context`
 /// format turned into a record, and the write of that record into the CloudWatch Logs
 /// destination the stage names — for both API Gateway planes, which configure and render it

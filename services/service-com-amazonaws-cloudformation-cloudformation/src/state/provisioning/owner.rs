@@ -892,10 +892,14 @@ impl Owner {
             Self::LambdaFunction => {
                 lambda_function::retag(ctx, region, resource, declared, propagated).await
             }
-            // The tags of a table that already exists are reconciled by no arm here yet —
-            // as for every type whose arm states no `retag` ([`Provisioner::retag`]'s own
-            // default) — so nothing is asked about them.
-            Self::DynamodbTable => Ok(()),
+            // A table's tags are DynamoDB's own `TagResource`/`UntagResource`:
+            // `CreateTable`'s `Tags` member applies to the table that call creates and to no
+            // table that already exists — a table the stack ADOPTED was created by no call of
+            // that service's at all — so this is where the set a table is to end up carrying
+            // is reconciled ([`dynamodb_table::retag`]).
+            Self::DynamodbTable => {
+                dynamodb_table::retag(ctx, region, resource, declared, propagated).await
+            }
             // Neither a layer version nor a policy statement is taggable, and neither is an
             // inline policy, so nothing is asked about their tags; the tags of a mapping that
             // already exists are reconciled by no arm here yet ([`Provisioner::retag`]'s own

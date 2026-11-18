@@ -1310,9 +1310,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // managing a resource that already exists, so one the service that owns the type does
         // not hold — asked above, by reading the identifier the request named — is no resource
         // to import at all, and the change set fails rather than offering a plan whose
-        // execution would record a resource nobody has. A type nothing here owns is not read
-        // and so establishes neither, and a request that turned the reads off reports nothing
-        // missing: an unanswered read is not evidence of absence.
+        // execution would record a resource nobody has. The reason it fails with is the one
+        // the type's own resource provider states for a resource it cannot read
+        // (`crate::state::resource_import::not_found_reason`). A type nothing here owns is not
+        // read and so establishes neither, and a request that turned the reads off reports
+        // nothing missing: an unanswered read is not evidence of absence.
         let missing_import = held_imports.as_ref().and_then(|held| {
             import_candidates
                 .iter()
@@ -1323,7 +1325,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         .any(|read_back| read_back.logical_id == candidate.logical_id)
                 })
                 .map(|candidate| {
-                    early_validation::not_found(
+                    crate::state::resource_import::not_found_reason(
                         &candidate.resource_type,
                         &candidate.physical_resource_id,
                     )

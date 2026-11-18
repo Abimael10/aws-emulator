@@ -1839,76 +1839,13 @@ pub const HANDLER_ERROR_NOT_FOUND: &str = "NotFound";
 /// The `HandlerErrorCode` for a resource the owning handler found already there.
 pub const HANDLER_ERROR_ALREADY_EXISTS: &str = "AlreadyExists";
 
-/// One resource type's own not-found diagnostic, for the types whose handler states one
-/// of its own rather than Cloud Control API's generic sentence.
-struct HandlerDiagnostic {
-    /// The sentence that handler states, carrying [`IDENTIFIER_PLACEHOLDER`] wherever the
-    /// sentence names the resource itself — which is a value taken from the request rather
-    /// than part of the fixed text.
-    sentence: &'static str,
-    /// The `Service` the owning handler's client is for, where that handler carries its
-    /// client's rendering of the service's exception rather than the bare sentence.
-    sdk_service: Option<&'static str>,
-}
-
-/// Where a [`HandlerDiagnostic::sentence`] names the resource the refusal is about.
-const IDENTIFIER_PLACEHOLDER: &str = "{Identifier}";
-
-/// What the owning resource type's handler states for a resource it cannot find, keyed
-/// by `TypeName` — the registry's own key.
-///
-/// Cloud Control API is a facade over the type's handler, so the diagnostic inside a
-/// not-found refusal is that HANDLER's, not Cloud Control's: CloudWatch's handler says an
-/// alarm does not exist, SNS's says a topic does not exist. A type absent from here is
-/// reported in Cloud Control's own generic sentence
-/// ([`resource_not_found_message`]), which is what a handler built on the generic
-/// resource-provider base class states.
-///
-/// Each sentence is the one RECORDED for that type's handler through this API, which is
-/// not always how the owning service words the same absence on its own wire: the
-/// `AWS::S3::Bucket` handler states "Bucket not found" where `s3:HeadBucket` answers
-/// `NoSuchBucket` "The specified bucket does not exist", and the `AWS::DynamoDB::Table`
-/// handler states "Table: <name> does not exist." where `dynamodb:DescribeTable` answers
-/// "Requested resource not found". The handler's own sentence is what a Cloud Control API
-/// client reads, so it is what this catalog holds; only the resource's name inside it
-/// comes from the request ([`IDENTIFIER_PLACEHOLDER`]).
-const HANDLER_NOT_FOUND_DIAGNOSTICS: &[(&str, HandlerDiagnostic)] = &[
-    (
-        "AWS::CloudWatch::Alarm",
-        HandlerDiagnostic {
-            sentence: "Alarm does not exist",
-            sdk_service: None,
-        },
-    ),
-    (
-        "AWS::DynamoDB::Table",
-        HandlerDiagnostic {
-            sentence: "Table: {Identifier} does not exist.",
-            sdk_service: None,
-        },
-    ),
-    (
-        "AWS::S3::Bucket",
-        HandlerDiagnostic {
-            sentence: "Bucket not found",
-            sdk_service: None,
-        },
-    ),
-    (
-        "AWS::SNS::Topic",
-        HandlerDiagnostic {
-            sentence: "Topic does not exist",
-            sdk_service: Some("Sns"),
-        },
-    ),
-];
-
 /// What the owning resource type's handler states for a create whose resource is already
 /// there, keyed by `TypeName`.
 ///
-/// Same rule as [`HANDLER_NOT_FOUND_DIAGNOSTICS`]: the sentence belongs to the service
-/// that owns the type. A type absent from here is reported in Cloud Control's own
-/// generic sentence ([`already_exists_message`]).
+/// Same rule as the not-found diagnostics every API acting through a type's handler reports
+/// ([`service_common::cfn_resource_handlers`]): the sentence belongs to the service that owns
+/// the type. A type absent from here is reported in Cloud Control's own generic sentence
+/// ([`already_exists_message`]).
 const HANDLER_ALREADY_EXISTS_DIAGNOSTICS: &[(&str, &str)] = &[(
     "AWS::SQS::Queue",
     "Queue creation failed because the queue already exists",
@@ -1921,9 +1858,12 @@ const HANDLER_NOT_FOUND_STATUS: u16 = 404;
 /// can't be found", with the type the request named and the resource as the owning
 /// handler names it ([`handler_rendered_identifier`]).
 pub fn resource_not_found_message(type_name: &str, identifier: &str) -> String {
-    format!(
-        "Resource of type '{type_name}' with identifier '{}' was not found.",
-        handler_rendered_identifier(type_name, identifier)
+    // The UNIFORM sentence a handler built on the generic resource-provider base class
+    // states, worded once for every API that reports one
+    // ([`service_common::cfn_resource_handlers`]).
+    ::service_common::cfn_resource_handlers::uniform_not_found(
+        type_name,
+        &handler_rendered_identifier(type_name, identifier),
     )
 }
 
@@ -1939,15 +1879,14 @@ pub fn handler_not_found_detail(type_name: &str, identifier: &str) -> String {
 /// ([`resource_not_found_message`]) — which is what a handler built on the generic
 /// resource-provider base class states, because the not-found exception that base class
 /// throws names nothing but the type and the identifier.
+///
+/// The diagnostic is the HANDLER's, so it is held once for every API that acts through a
+/// type's handlers ([`service_common::cfn_resource_handlers`]); the envelope below is this
+/// API's, which reports a whole handler invocation.
 fn owning_not_found_detail(type_name: &str, identifier: &str) -> Option<String> {
-    let (_, diagnostic) = HANDLER_NOT_FOUND_DIAGNOSTICS
-        .iter()
-        .find(|(name, _)| *name == type_name)?;
-    // The sentence names the resource wherever the owning service's wording does, with the
-    // identifier the request carried.
-    let sentence = diagnostic
-        .sentence
-        .replace(IDENTIFIER_PLACEHOLDER, identifier);
+    let diagnostic =
+        ::service_common::cfn_resource_handlers::not_found_diagnostic(type_name, identifier)?;
+    let sentence = diagnostic.sentence;
     Some(match diagnostic.sdk_service {
         // The handler carries its client's rendering of the owning service's own
         // exception, which names the service, the status it answered and the request the
