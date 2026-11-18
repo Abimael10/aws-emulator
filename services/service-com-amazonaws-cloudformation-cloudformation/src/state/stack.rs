@@ -1811,6 +1811,11 @@ impl StoredStack {
         // status was updated — read before the walk is drained, since draining it is what
         // retires it.
         let finished_at = self.resource_finished_instants();
+        // ...and what that walk left each resource it acted on in, read from the same records
+        // and for the same reason: a resource the operation re-tagged carries its own RECORD
+        // unchanged, so the walk is what says the operation acted on it at all
+        // ([`Self::walked_resource_statuses`]).
+        let walked = self.walked_resource_statuses();
         // Everything the operation did happened before it concluded, so whatever its walk
         // still owed is recorded now — ahead of the stack's own terminal event, and never
         // later than the last instant the walk itself computed.
@@ -1896,6 +1901,7 @@ impl StoredStack {
                 deployment.resources,
                 due_at,
                 &finished_at,
+                &walked,
             );
             self.outputs = deployment.outputs;
             // The imports the template that finished deploying resolved are the stack's
@@ -2072,6 +2078,30 @@ impl StoredStack {
             Some(walk) => walk.finished_instants(&self.gate_releases()),
             None => BTreeMap::new(),
         }
+    }
+
+    /// The status the walk in flight left each resource it ACTED ON in, by logical id: the
+    /// LAST transition it recorded for that resource which ENDED.
+    ///
+    /// What the operation DID to a resource is what that resource then reports
+    /// ([`installed_resources`]), and the walk is the only record of which resources it acted
+    /// on at all: a resource whose own RECORD the operation left as it found it may still be
+    /// one it changed — a stack-level tag change re-tags a resource whose declaration is
+    /// untouched ([`provisioning::StackProvenance::tags_changed`]) — and then the status it
+    /// reports is that update's rather than the one it carried before. A resource the walk
+    /// recorded nothing for is absent, because nothing happened to it.
+    ///
+    /// A transition still IN PROGRESS is not what became of the resource, for the reason
+    /// [`Self::record_resource_statuses`] skips one.
+    pub(super) fn walked_resource_statuses(&self) -> BTreeMap<String, String> {
+        let mut statuses = BTreeMap::new();
+        for transition in self.walked_transitions() {
+            if transition.status.ends_with(IN_PROGRESS_SUFFIX) {
+                continue;
+            }
+            statuses.insert(transition.logical_id.clone(), transition.status.clone());
+        }
+        statuses
     }
 }
 
@@ -3088,8 +3118,13 @@ impl StoredStack {
             })
             .cloned()
             .collect();
-        let mut reported =
-            installed_resources(&self.resources, started, opened_at, &self.resource_finished_instants());
+        let mut reported = installed_resources(
+            &self.resources,
+            started,
+            opened_at,
+            &self.resource_finished_instants(),
+            &self.walked_resource_statuses(),
+        );
         for deployed in &mut reported {
             // A wait condition is in the status of the OPERATION that is waiting at it — it
             // is a resource that operation is creating or updating — and so is a resource
@@ -3273,6 +3308,13 @@ impl StoredStack {
             // nothing; the operation deploying a template says otherwise
             // ([`provisioning::StackProvenance::declarations_resolve_again`]).
             declarations_resolve_again: false,
+            // ...and the tags above are the ones the stack's resources already carry unless
+            // the operation DEPLOYING a client's tag set says they are a change to them
+            // ([`provisioning::StackProvenance::tags_changed`]).
+            tags_changed: false,
+            // ...and a deployment adopts nothing unless the call that executes a plan which
+            // does says so ([`provisioning::StackProvenance::adopted`]).
+            adopted: ::std::collections::BTreeSet::new(),
             // A stack holds no record of another stack's resources, so the index of which
             // stack manages which physical name is the STORE's to read: the operation that
             // deploys this stack fills it in
@@ -4690,6 +4732,13 @@ pub(super) fn holds_the_resource(record: &DeployedResource) -> bool {
 /// keeps the status and the instant it already carried: nothing about that resource's
 /// status was updated, so its timestamp must not move.
 ///
+/// A resource whose RECORD the operation left unchanged is not always one it left alone: the
+/// stack's tags are the tags of the resources it manages, so a deployment that states them
+/// differently updates a resource whose declaration is untouched and whose record therefore
+/// compares equal. `walked` is what the operation's own walk did to each resource it acted on
+/// ([`StoredStack::walked_resource_statuses`]), so such a resource reports that update rather
+/// than the status it carried before it.
+///
 /// The instant a resource's status was updated is that RESOURCE's own: `finished_at` is
 /// when the operation's walk finished each one ([`timeline`]), and `at` is the fallback for
 /// a resource the walk recorded nothing for.
@@ -4698,6 +4747,7 @@ fn installed_resources(
     deployed: Vec<StoredResource>,
     at: SystemTime,
     finished_at: &BTreeMap<String, SystemTime>,
+    walked: &BTreeMap<String, String>,
 ) -> Vec<DeployedResource> {
     deployed
         .into_iter()
@@ -4710,8 +4760,14 @@ fn installed_resources(
                 .iter()
                 .find(|before| before.resource.logical_id == resource.logical_id)
             {
-                // Deployed before and identical: this operation did not touch it.
-                Some(before) if before.resource == resource => before.clone(),
+                // Deployed before and identical: this operation touched the resource only if
+                // its walk acted on it, which a re-tagging does.
+                Some(before) if before.resource == resource => {
+                    match walked.get(&resource.logical_id) {
+                        Some(status) => DeployedResource::new(resource, status, updated_at),
+                        None => before.clone(),
+                    }
+                }
                 // The stack HELD the resource under this logical id and it is now different:
                 // the operation updated it.
                 Some(before) if holds_the_resource(before) => DeployedResource::new(

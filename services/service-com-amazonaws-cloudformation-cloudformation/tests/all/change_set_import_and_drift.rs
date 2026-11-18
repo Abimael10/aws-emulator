@@ -531,9 +531,9 @@ async fn an_import_change_set_needs_a_deletion_policy_on_every_imported_resource
             xml_text(&resource, "PhysicalResourceId").unwrap_or_default(),
             xml_text(&resource, "ResourceStatus").unwrap_or_default(),
         ),
-        ("/import/one".to_string(), "IMPORT_COMPLETE".to_string()),
-        "the imported resource must be reported as imported, under the identifier it \
-         already had, got {resource}"
+        ("/import/one".to_string(), "UPDATE_COMPLETE".to_string()),
+        "the imported resource must be reported under the identifier it already had, at the \
+         status the tag set the stack gives it left it in, got {resource}"
     );
     assert_eq!(
         parameter_value(&router, "/import/one").await.as_deref(),

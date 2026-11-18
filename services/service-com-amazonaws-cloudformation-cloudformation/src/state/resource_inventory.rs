@@ -338,7 +338,12 @@ async fn sqs_queue_urls(
 
 /// The tags one queue carries: `ListQueueTags` takes the queue's url and answers `Tags`, a
 /// map of the tag keys to their values.
-async fn sqs_queue_tags(
+///
+/// The ONE reading of that call, shared with the re-tagging arm that reconciles a queue's tags
+/// with the set the stack gives it ([`super::provisioner::retag_queue`]): an inventory row and
+/// a re-tagging both report the tags Amazon SQS really holds, so neither can read them
+/// differently.
+pub(super) async fn sqs_queue_tags(
     ctx: &smithy_server_runtime::OperationContext<'_>,
     region: &str,
     queue_url: &str,

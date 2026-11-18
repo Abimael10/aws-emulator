@@ -1426,6 +1426,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     // ([`crate::state::provisioning::StackProvenance::reads_unpublished_attributes`]).
                     reads_unpublished_attributes: stack
                         .declarations_reading_unpublished_attributes(),
+                    // ...and whether this update states the stack's TAGS differently from the
+                    // set its resources carry, which is a change to every one of them
+                    // ([`crate::state::provisioning::StackProvenance::tags_changed`]).
+                    tags_changed: !crate::state::same_tags(&previous.tags, &stack.tags),
                     ..stack.provenance()
                 },
                 refused_deployment,

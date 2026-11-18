@@ -470,9 +470,10 @@ async fn an_executed_import_adopts_the_queue_that_already_exists() {
                 first_element(&resource, "PhysicalResourceId").unwrap_or_default(),
                 first_element(&resource, "ResourceStatus").unwrap_or_default(),
             ),
-            (url.clone(), "IMPORT_COMPLETE".to_string()),
-            "case {case:?}: the adopted resource must be reported as imported under the \
-             identifier it already had, got {resource}"
+            (url.clone(), "UPDATE_COMPLETE".to_string()),
+            "case {case:?}: the adopted resource must be reported under the identifier it \
+             already had, at the status the tag set the stack gives it left it in, got \
+             {resource}"
         );
         // Nothing was asked of Amazon SQS about it: the queue is exactly as it was, and no
         // second queue was created under the name CloudFormation would have generated.

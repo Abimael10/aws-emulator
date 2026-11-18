@@ -637,7 +637,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             stack.set_template_body(template_body, processed_template);
             stack.parameters = parameters;
             stack.capabilities = capabilities;
-            stack.tags = tags;
+            // The tag set the stack's resources carry, read before the change set's own is
+            // put in force: a change set that states them differently changes every resource
+            // the stack holds ([`crate::state::provisioning::StackProvenance::tags_changed`]).
+            let tags_in_force = ::std::mem::replace(&mut stack.tags, tags);
             stack.notification_arns = notification_arns;
             // "CloudFormation uses this role for all future operations on the stack … If you
             // don't specify a value, CloudFormation uses the role that was previously
@@ -790,6 +793,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     now,
                 ));
             }
+            // ...and WHICH resources those are: the stack's own tag set is applied to each of
+            // them as they come under its management, since nothing created them with it
+            // ([`crate::state::provisioning::StackProvenance::adopted`]).
+            let adopted_logical_ids: ::std::collections::BTreeSet<String> = adopted
+                .iter()
+                .map(|record| record.logical_id.clone())
+                .collect();
             previous_resources.extend(adopted);
             // The configuration a DRIFTED resource is REALLY in, read above: the deployment
             // reconciles against the live state rather than against the configuration the
@@ -825,6 +835,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // ([`crate::state::provisioning::StackProvenance::reads_unpublished_attributes`]).
                 reads_unpublished_attributes: stack
                     .declarations_reading_unpublished_attributes(),
+                // ...and whether the change set states the stack's TAGS differently from the
+                // set its resources carry, which is a change to every one of them
+                // ([`crate::state::provisioning::StackProvenance::tags_changed`]).
+                tags_changed: !crate::state::same_tags(&tags_in_force, &stack.tags),
+                // ...and which resources it ADOPTS, which come under the stack's management
+                // with the stack's own tags
+                // ([`crate::state::provisioning::StackProvenance::adopted`]).
+                adopted: adopted_logical_ids,
                 ..stack.provenance()
             };
 

@@ -1845,6 +1845,67 @@ pub(super) async fn update_queue(
     Ok(Created::default())
 }
 
+/// Bring the tags of the queue a resource record names to the ones this deployment gives it,
+/// through Amazon SQS's own `TagQueue` and `UntagQueue`.
+///
+/// The set is the declaration's own `Tags` beside the ones CloudFormation propagates
+/// ([`tags_of`]) — the same set the CREATE applied — so a key outside it is one this
+/// deployment no longer gives the queue and is removed, and one in it with another value is
+/// re-valued. The tags the queue really carries are read first, through the one reader of
+/// Amazon SQS's `ListQueueTags` this crate has
+/// ([`crate::state::resource_inventory::sqs_queue_tags`]), so a queue the stack ADOPTED rather
+/// than created — which carries whatever tags it already had — ends up with the stack's set as
+/// much as one the stack created does. Where the two sets already agree nothing is called at
+/// all, which is what makes this safe to ask on every deployment.
+///
+/// A queue SQS no longer has (`QueueDoesNotExist`) has no tags to reconcile.
+pub(super) async fn retag_queue(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    resource: &StoredResource,
+    declared: &Value,
+    propagated: &[(String, String)],
+) -> Result<(), Refusal> {
+    let url = resource.physical_resource_id.clone();
+    let held: Vec<(String, String)> =
+        match crate::state::resource_inventory::sqs_queue_tags(ctx, region, &url).await {
+            Ok(held) => held.into_iter().collect(),
+            Err(refusal) if refusal.code == QUEUE_DOES_NOT_EXIST => return Ok(()),
+            Err(refusal) => return Err(refusal),
+        };
+    let desired = tags_of(declared, propagated);
+    let (added, removed) = tag_delta(&held, &desired);
+    if !added.is_empty() {
+        call_json_rpc(
+            ctx,
+            SQS_SIGNING_NAME,
+            region,
+            AWS_JSON_1_0,
+            &format!("{SQS_TARGET_PREFIX}.TagQueue"),
+            &serde_json::json!({
+                "QueueUrl": url,
+                "Tags": Value::Object(tags_as_map(&added)),
+            }),
+        )
+        .await?;
+    }
+    if !removed.is_empty() {
+        call_json_rpc(
+            ctx,
+            SQS_SIGNING_NAME,
+            region,
+            AWS_JSON_1_0,
+            &format!("{SQS_TARGET_PREFIX}.UntagQueue"),
+            &serde_json::json!({
+                "QueueUrl": url,
+                "TagKeys": tag_keys_as_list(&removed),
+            }),
+        )
+        .await?;
+    }
+    Ok(())
+}
+
 /// Delete the queue a stack created. A queue SQS no longer has (`QueueDoesNotExist`) is
 /// already in the state the delete asks for.
 ///

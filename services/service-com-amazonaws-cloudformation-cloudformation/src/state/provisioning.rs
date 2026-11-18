@@ -676,6 +676,40 @@ pub struct StackProvenance {
     /// resumption, a revert — which has no declaration to resolve a second time, so nothing is
     /// withheld for one of those.
     pub reads_unpublished_attributes: BTreeSet<String>,
+    /// Whether this deployment puts a DIFFERENT stack-level tag set in force than the one the
+    /// resources it holds carry — so the tags above are a change to every one of them.
+    ///
+    /// The stack's tags are the tags of the resources it manages ("CloudFormation also
+    /// propagates these tags to resources in the stack"), so a deployment that states them
+    /// differently CHANGES every resource the stack holds whose type a service tags, under the
+    /// `Tags` attribute rather than under `Properties` — which is why such a resource reports
+    /// its own update even where its declaration is untouched ([`reconcile`]). This is the
+    /// same comparison the PLAN of such a deployment makes
+    /// ([`super::change_plan::tag_changes`]), read off the stack's own tag sets
+    /// ([`super::same_tags`]), so a plan and its execution cannot disagree about which
+    /// resources a tag change touches.
+    ///
+    /// Set by the operations that deploy a client's tag set (`UpdateStack`,
+    /// `ExecuteChangeSet`). `false` everywhere else: a create tags the resources it creates as
+    /// it creates them, and a rollback, a resumption and a revert put back a configuration the
+    /// stack's resources already carry.
+    pub tags_changed: bool,
+    /// The logical ids this deployment ADOPTS: resources that already exist in the services
+    /// that own them, which this deployment brings under the stack's management
+    /// ([`super::resource_import`]).
+    ///
+    /// Nothing CREATED such a resource, so the tags CloudFormation gives a resource it
+    /// provisions were never applied to it: a resource comes under the stack's management with
+    /// the stack's own tags and the three records naming the stack and its place in it
+    /// ([`StackProvenance::tags_for`]), so that set is applied to it as it is adopted — and
+    /// since adopting it is what makes the resource the STACK's, applying that set is a change
+    /// to it, which its own status and events report as the update it is, while the operation
+    /// as a whole stays the import it is ([`reconcile`]).
+    ///
+    /// Set by `ExecuteChangeSet`, the one call that adopts anything; EMPTY for every other
+    /// deployment, which creates and changes resources rather than adopting them — and for
+    /// every later deployment over the adopted resource, which is one the stack HAS by then.
+    pub adopted: BTreeSet<String>,
 }
 
 /// How a deployment puts back a resource whose change it could not carry through
@@ -2707,6 +2741,36 @@ pub async fn reconcile(
             // change. Only a type with a re-tagging arm has anything asked of its service
             // ([`super::provisioner::Provisioner::retag`]), and that arm is idempotent, so a
             // resource whose tags already agree with the set has nothing called about it.
+            //
+            // A resource this deployment ADOPTS is tagged here too, and that is where its tags
+            // come from at all: nothing created it, so the set CloudFormation gives a resource
+            // it manages was never applied to it ([`StackProvenance::adopted`]).
+            let adopting = stack.adopted.contains(&resource.logical_id);
+            // ...and a deployment that states the stack's tags DIFFERENTLY is a change to this
+            // resource even where its declaration is untouched: the stack's tags are the tags
+            // of the resources it manages, so such a resource is UPDATED by this operation —
+            // which is what its status and its events report — exactly as the plan of the same
+            // deployment reports it ([`super::change_plan::tag_changes`]). So is a resource
+            // being ADOPTED, whatever the stack's tags are: what changes there is WHOSE the
+            // resource now is — it comes under the stack's management, under this logical id,
+            // which is what CloudFormation's own three records state
+            // ([`StackProvenance::tags_for`]) — so adopting a resource a service tags is that
+            // resource's own update, which is what the recorded adoption reports it as. Which
+            // of those keys the owning service's tagging path will carry is that service's own
+            // rule ([`super::provisioner::Provisioner::applicable_tags`]) and says nothing
+            // about whether the resource changed hands. A type no service here tags holds no
+            // tags for either change to change, so nothing about it is
+            // reported, which is the set that plan leaves out as well. The pair opens BEFORE
+            // the tagging call, as every transition pair of this walk does.
+            let retags_only = !changed
+                && (stack.tags_changed || adopting)
+                && owner_for(&resource.resource_type).is_some();
+            if retags_only {
+                outcome.transitions.push(ResourceTransition::starting(
+                    &resource,
+                    super::resource_status::UPDATE_IN_PROGRESS,
+                ));
+            }
             let retagged = match owner_for(&resource.resource_type) {
                 Some(provisioner) => {
                     let tags = stack.tags_for(&resource.logical_id);
@@ -2723,7 +2787,7 @@ pub async fn reconcile(
                 // Both halves of the change landed, which is what ends a resource this
                 // deployment acted on.
                 Ok(()) => {
-                    if changed {
+                    if changed || retags_only {
                         outcome.transitions.push(ResourceTransition::finished(
                             &resource,
                             super::resource_status::UPDATE_COMPLETE,
@@ -2732,7 +2796,7 @@ pub async fn reconcile(
                     }
                 }
                 Err(refusal) => {
-                    if !changed {
+                    if !changed && !retags_only {
                         // A tag-only change opens the resource's transition pair here: the
                         // configuration half never asked anything of the owning service.
                         outcome.transitions.push(ResourceTransition::starting(

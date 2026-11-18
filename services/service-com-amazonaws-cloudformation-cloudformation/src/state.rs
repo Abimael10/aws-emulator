@@ -2205,7 +2205,12 @@ fn same_parameters(stored: &[StoredParameter], submitted: &[StoredParameter]) ->
 
 /// Whether two tag sets state the same tags, keyed by `Key` for the same reason
 /// [`same_parameters`] keys by `ParameterKey`.
-fn same_tags(stored: &[StoredTag], submitted: &[StoredTag]) -> bool {
+///
+/// Read by the operations that DEPLOY a tag set as well as by the plan of one: a deployment
+/// that states the stack's tags differently propagates them to the resources it holds
+/// ([`provisioning::StackProvenance::tags_changed`]), so the execution and the plan
+/// ([`change_plan::tag_changes`]) decide that from the same comparison.
+pub fn same_tags(stored: &[StoredTag], submitted: &[StoredTag]) -> bool {
     fn by_key(tags: &[StoredTag]) -> BTreeMap<&str, &str> {
         tags.iter()
             .map(|tag| (tag.key.as_str(), tag.value.as_str()))

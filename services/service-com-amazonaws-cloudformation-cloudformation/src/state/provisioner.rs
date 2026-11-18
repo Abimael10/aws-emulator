@@ -3467,6 +3467,11 @@ impl Provisioner {
             // member of `CreateTopic` and no attribute of a topic — which is why
             // [`update_topic`] does not carry them.
             Self::SnsTopic => retag_topic(ctx, region, resource, declared, propagated).await,
+            // A queue's tags are Amazon SQS's own `TagQueue`/`UntagQueue`: `CreateQueue`'s
+            // `tags` map applies to the queue that call creates, and [`update_queue`] carries
+            // only the tags the DECLARATION states — so this is where the set a queue is to
+            // end up carrying, the stack's own tags included, is reconciled.
+            Self::SqsQueue => retag_queue(ctx, region, resource, declared, propagated).await,
             // A schedule group's tags are EventBridge Scheduler's own `TagResource` and
             // `UntagResource`: `CreateScheduleGroup`'s `Tags` member applies to the group
             // that call creates and to no group that already exists, so this is where the
