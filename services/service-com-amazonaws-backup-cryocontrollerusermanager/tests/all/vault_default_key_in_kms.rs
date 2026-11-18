@@ -35,7 +35,7 @@ use super::vault_and_backup_job::{call_in_region, error_code, REGION};
 const OTHER_REGION: &str = "eu-central-1";
 
 /// The alias KMS holds this service's Amazon Web Services managed key under.
-const MANAGED_KEY_ALIAS: &str = "alias/aws/backup";
+pub(crate) const MANAGED_KEY_ALIAS: &str = "alias/aws/backup";
 
 /// `KeyManager` of a key Amazon Web Services manages, and of one the customer
 /// does (`smithy_query(query="shape",shape="KeyManagerType")` in the KMS model).
@@ -63,7 +63,7 @@ const NOT_FOUND_STATUS: u16 = 400;
 /// Backup AND KMS on ONE engine, plus that engine's router: the key a vault
 /// publishes is KMS's own resource, so KMS has to be mounted for the vault's key
 /// to resolve at all.
-fn router_with_kms() -> MultiServiceRouter {
+pub(crate) fn router_with_kms() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
@@ -81,7 +81,10 @@ fn router_with_kms() -> MultiServiceRouter {
 /// Call one KMS operation: `awsJson1_1`, `POST /` with
 /// `X-Amz-Target: TrentService.<Operation>`, signed for `region` — the Region
 /// whose endpoint the keys it answers for live in.
-async fn kms(
+///
+/// Shared with the sibling suites of this test crate, so there is ONE KMS
+/// request harness here rather than one per file.
+pub(crate) async fn kms(
     router: &MultiServiceRouter,
     region: &str,
     operation: &str,
@@ -125,7 +128,7 @@ fn refusal_code(body: &Value) -> String {
 }
 
 /// A body member as a string, or `"<unset>"` when the member is absent.
-fn member(body: &Value, name: &str) -> String {
+pub(crate) fn member(body: &Value, name: &str) -> String {
     body.get(name)
         .and_then(Value::as_str)
         .unwrap_or("<unset>")
@@ -134,7 +137,10 @@ fn member(body: &Value, name: &str) -> String {
 
 /// Create a vault named `name` in `region` with the request `body`, and answer
 /// the `EncryptionKeyArn` a later `DescribeBackupVault` of it reports.
-async fn vault_key(
+///
+/// Shared with the sibling suites of this test crate, so a vault's published key
+/// is read ONE way here.
+pub(crate) async fn vault_key(
     router: &MultiServiceRouter,
     region: &str,
     path: &str,
