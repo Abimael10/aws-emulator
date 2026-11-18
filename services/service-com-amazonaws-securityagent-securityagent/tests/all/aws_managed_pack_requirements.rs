@@ -503,6 +503,362 @@ async fn a_shipped_name_does_not_collide_with_a_callers_own() {
     );
 }
 
+/// The requirement NAMES each AWS managed pack is published with, written out here rather
+/// than read from the catalog table, so that a table which loses or gains an entry fails a
+/// case instead of moving both sides of the comparison at once.
+///
+/// Source: the recorded content of each pack, as the
+/// `securityagent-catalog-list-security-requirements` fixture reports it for `srp-am-base`
+/// (step `task#1`), `srp-am-nist-csf` (`task#2`), `srp-am-pci-dss` (`task#3`) and
+/// `srp-am-well-architected` (`task#4`) — the model enumerates neither which packs AWS
+/// ships nor what they hold. Every entry of every pack is asserted, so the names the issue
+/// never cited are covered as closely as the ones it did.
+const PUBLISHED_REQUIREMENT_NAMES: [(&str, &[&str]); 4] = [
+    (
+        "srp-am-base",
+        &[
+            "audit-logging-best-practices",
+            "authentication-best-practices",
+            "authorization-best-practices",
+            "information-protection-best-practices",
+            "log-protection-best-practices",
+            "privileged-access-best-practices",
+            "secret-protection-best-practices",
+            "secure-by-default-best-practices",
+            "tenant-isolation-best-practices",
+            "trusted-cryptography-best-practices",
+        ],
+    ),
+    (
+        "srp-am-nist-csf",
+        &[
+            "adverse-event-analysis-and-threat-intelligence-integration",
+            "ai-component-risk-assessment-and-security-integration",
+            "compliance-driven-workload-security-design",
+            "comprehensive-logging-and-continuous-monitoring-coverage",
+            "continuous-workload-cybersecurity-risk-management",
+            "forensic-readiness-and-evidence-integrity-for-workloads",
+            "holistic-cybersecurity-coverage-across-all-risk-functions",
+            "incident-response-recovery-communication-planning",
+            "least-privilege-and-separation-of-duties-for-workload-access",
+            "platform-configuration-software-lifecycle-management",
+            "privacy-cybersecurity-coordinated-risk-management",
+            "risk-informed-security-control-selection-and-prioritization",
+            "secure-software-development-lifecycle-integration",
+            "security-control-mapping-to-recognized-frameworks",
+            "security-design-consistency-and-repeatable-pattern-application",
+            "sensitive-data-inventory-classification-and-flow-documentation",
+            "software-supply-chain-integrity-and-acquisition-verification",
+            "structured-incident-triage-escalation-and-recovery",
+            "structured-post-incident-recovery-and-return-to-operations",
+            "third-party-dependency-risk-assessment-and-governance",
+            "user-third-party-activity-monitoring-for-anomaly-detection",
+            "vulnerability-disclosure-and-change-risk-management",
+            "workload-asset-inventory-and-lifecycle-management",
+            "workload-backup-integrity-and-recovery-verification",
+            "workload-continuous-monitoring-and-adverse-event-detection",
+            "workload-cybersecurity-risk-assessment",
+            "workload-cybersecurity-risk-prioritization-action-planning",
+            "workload-data-lifecycle-cia-protection",
+            "workload-identity-authentication-and-access-control",
+            "workload-incident-containment-and-eradication-design",
+            "workload-incident-recovery-architecture-and-communication",
+            "workload-incident-response-readiness",
+            "workload-infrastructure-resilience-architecture",
+            "workload-network-protection-and-continuous-monitoring",
+            "workload-resilience-and-availability-architecture",
+            "workload-risk-visibility-and-communication-design",
+            "workload-third-party-dependency-risk-management",
+        ],
+    ),
+    (
+        "srp-am-pci-dss",
+        &[
+            "account-data-classification-and-retention-controls",
+            "anti-malware-protection-for-workload-components",
+            "anti-phishing-controls-for-workload-communications",
+            "application-and-system-account-security-management",
+            "audit-log-protection-integrity-and-retention",
+            "automated-audit-log-review-and-anomaly-detection",
+            "cardholder-data-encryption-scope-isolation",
+            "cde-network-segmentation-and-scope-minimization",
+            "cde-network-segmentation-and-traffic-control",
+            "cde-scope-documentation-and-data-flow-validation",
+            "comprehensive-audit-logging-for-sensitive-data-access",
+            "continuous-security-control-monitoring-and-failure-response",
+            "cryptographic-agility-and-technology-lifecycle-risk",
+            "cryptographic-key-management-for-stored-account-data",
+            "documented-security-control-rationale-and-objectives",
+            "incident-response-and-recovery-workflow",
+            "intrusion-detection-file-integrity-and-page-tamper",
+            "least-privilege-access-control-with-default-deny",
+            "mfa-for-cardholder-data-environment-access",
+            "multi-tenant-isolation-and-per-tenant-security",
+            "network-architecture-and-data-flow-documentation",
+            "network-config-security-and-internal-address-protection",
+            "network-security-controls-for-traffic-segmentation",
+            "pan-display-masking-and-storage-protection",
+            "pci-dss-scope-documentation-and-change-impact-assessment",
+            "penetration-testing-readiness-and-remediation",
+            "poi-device-inventory-and-integrity-management",
+            "programmatic-access-control-for-cardholder-data-stores",
+            "protection-of-security-posture-artifacts",
+            "public-facing-web-application-attack-protection",
+            "regular-vulnerability-scanning-and-remediation",
+            "sad-non-retention-after-authorization",
+            "scheduled-security-activities-and-change-triggered-reviews",
+            "secure-change-management-and-environment-separation",
+            "secure-configuration-and-system-hardening",
+            "secure-data-channel-scoping-and-unintended-data-handling",
+            "secure-data-lifecycle-and-media-destruction",
+            "secure-development-lifecycle-and-vulnerability-prevention",
+            "secure-payment-software-lifecycle-and-configuration",
+            "secure-wireless-network-configuration-for-cde",
+            "session-idle-timeout-and-re-authentication",
+            "stored-account-data-protection-and-retention",
+            "strong-authentication-and-credential-management",
+            "strong-cryptography-for-cardholder-data-in-transit",
+            "strong-cryptography-for-pos-poi-terminal-connections",
+            "third-party-service-provider-security-accountability",
+            "time-synchronization",
+            "unauthorized-network-access-path-detection",
+            "unique-user-identification-and-account-lifecycle",
+            "vulnerability-identification-and-patch-management",
+        ],
+    ),
+    (
+        "srp-am-well-architected",
+        &[
+            "authenticated-network-communication-architecture",
+            "automated-certificate-management-architecture",
+            "automated-credential-governance-architecture",
+            "automated-data-classification-architecture",
+            "automated-remediation-with-oversight-architecture",
+            "automated-security-testing-architecture",
+            "automated-threat-intelligence-integration",
+            "automated-vulnerability-management-architecture",
+            "automation-first-operational-access-architecture",
+            "code-review-process-architecture",
+            "compliance-framework-control-mapping",
+            "comprehensive-security-logging-architecture",
+            "controlled-cross-account-access-architecture",
+            "data-at-rest-access-control-architecture",
+            "data-classification-and-tagging-architecture",
+            "data-lifecycle-management-architecture",
+            "encryption-at-rest-enforcement-architecture",
+            "encryption-in-transit-enforcement-architecture",
+            "fine-grained-traffic-flow-control-architecture",
+            "incident-management-plan-architecture",
+            "layered-network-segmentation-architecture",
+            "least-privilege-permission-architecture",
+            "secrets-management-architecture",
+            "secure-key-management-architecture",
+            "secure-third-party-access-architecture",
+            "security-design-principles-integration",
+            "sensitivity-based-data-protection-architecture",
+            "shared-responsibility-model-documentation",
+            "software-integrity-validation-architecture",
+            "systematic-threat-modeling-in-design",
+            "temporary-credentials-architecture",
+            "traffic-inspection-architecture",
+        ],
+    ),
+];
+
+/// How many sentences `description` is written in: the full stops that END one, which is a
+/// full stop at the end of the text or one followed by a space and a capital letter. A full
+/// stop inside an abbreviation or a version (`e.g. `, `v4.0.1 `) is followed by a lower
+/// case letter or a digit, so it is not counted as a statement of its own.
+fn sentences(description: &str) -> usize {
+    description
+        .match_indices('.')
+        .filter(|(at, _)| {
+            let mut rest = description[at + 1..].chars();
+            match rest.next() {
+                None => true,
+                Some(' ') => rest.next().is_some_and(char::is_uppercase),
+                Some(_) => false,
+            }
+        })
+        .count()
+}
+
+/// RULE: a pack AWS manages reports the COMPLETE requirement set that pack is published
+/// with — every name it defines and no name it does not — so a client that reads a managed
+/// pack to discover or evaluate against what AWS ships sees the whole framework rather
+/// than a sample of it.
+///
+/// The rows are the four packs the catalog advertises, each asserted over its whole
+/// published name set, so an entry dropped from or added to one pack's table fails here
+/// whichever pack and whichever name it is.
+#[tokio::test]
+async fn every_managed_pack_reports_its_complete_published_requirement_set() {
+    let router = emulator();
+
+    for (pack_id, published) in PUBLISHED_REQUIREMENT_NAMES {
+        let case = format!("{pack_id} published set");
+        let listed: Vec<String> = list_all(&router, pack_id, None, &case)
+            .await
+            .iter()
+            .map(|summary| {
+                member(summary, "name")
+                    .unwrap_or_else(|| panic!("case {case:?}: a summary carries no name"))
+            })
+            .collect();
+        // Sorted, because the operation reports a pack's requirements "in name order"
+        // (this crate's OPERATIONS.md) and the cursor resumes at a NAME: the comparison
+        // below is therefore an ordering assertion as well as a membership one.
+        let mut wanted: Vec<String> = published.iter().map(|name| name.to_string()).collect();
+        wanted.sort();
+
+        // The membership check first: `assert_eq!` below already fails on a missing or an
+        // extra name, but it reports two long lists, where this names exactly which names
+        // are absent and which the pack does not publish.
+        let listed_set: BTreeSet<&str> = listed.iter().map(String::as_str).collect();
+        let wanted_set: BTreeSet<&str> = published.iter().copied().collect();
+        let missing: Vec<&str> = wanted_set.difference(&listed_set).copied().collect();
+        let unexpected: Vec<&str> = listed_set.difference(&wanted_set).copied().collect();
+        assert!(
+            missing.is_empty() && unexpected.is_empty(),
+            "case {case:?}: expected the {} published requirements, {} missing \
+             ({missing:?}) and {} not published ({unexpected:?}) in the {} reported",
+            published.len(),
+            missing.len(),
+            unexpected.len(),
+            listed.len()
+        );
+        assert_eq!(
+            listed, wanted,
+            "case {case:?}: expected the published set in name order, got {listed:?}"
+        );
+    }
+}
+
+/// What the published statement of a requirement whose recorded text is quoted SAYS: the
+/// phrases that statement is published with, each of which the reported `description` must
+/// contain.
+///
+/// Source: the recorded `description` of each of these requirements on its own step of the
+/// `securityagent-catalog-list-security-requirements` fixture, quoted in the report that
+/// filed the paraphrases. A row is a pack id, a requirement name and the phrases that
+/// requirement's statement states — so a table edit that swaps a statement for other prose
+/// of the same shape fails here even though it still passes the form case above.
+const PUBLISHED_STATEMENT_PHRASES: [(&str, &str, &[&str]); 5] = [
+    (
+        "srp-am-nist-csf",
+        "adverse-event-analysis-and-threat-intelligence-integration",
+        &[
+            "Workloads should be designed to support the detection and analysis of \
+             anomalies, indicators of compromise (IoCs), and other potentially adverse \
+             events.",
+            "cyber threat intelligence",
+            "establishing defined criteria for escalating adverse events to formal \
+             incident declarations",
+        ],
+    ),
+    (
+        "srp-am-pci-dss",
+        "account-data-classification-and-retention-controls",
+        &[
+            "cardholder data (CHD)",
+            "sensitive authentication data (SAD)",
+            "must not be retained after authorization completes, even when it is \
+             encrypted",
+            "rendered unreadable",
+        ],
+    ),
+    (
+        "srp-am-pci-dss",
+        "anti-malware-protection-for-workload-components",
+        &["protected against malicious software", "anti-malware"],
+    ),
+    (
+        "srp-am-well-architected",
+        "authenticated-network-communication-architecture",
+        &[
+            "east-west",
+            "north-south",
+            "mutual TLS (mTLS), IPsec, or request signing with a service identity such \
+             as SigV4",
+        ],
+    ),
+    (
+        "srp-am-well-architected",
+        "automated-certificate-management-architecture",
+        &["issued, distributed, renewed and revoked automatically"],
+    ),
+];
+
+/// RULE: a shipped requirement's `description` is that requirement's OWN published
+/// statement — what the rule demands, in the words the pack publishes it in — and not a
+/// summary of it, because a client renders and evaluates the rule from that member; the
+/// framework packs state both what the workload must do and what its design has to
+/// demonstrate, which is prose of several sentences, while the base pack's own rules are
+/// published as single statements.
+///
+/// The rows are every requirement of every managed pack, so the form is asserted for the
+/// names the issue cited and for every name beside them; the length and sentence bounds
+/// are what separates a published statement from the one-line paraphrase a pack must not
+/// answer with. The requirements whose recorded statement is quoted are asserted on what
+/// that statement SAYS as well, from [`PUBLISHED_STATEMENT_PHRASES`].
+#[tokio::test]
+async fn a_shipped_requirements_description_is_its_published_statement() {
+    let router = emulator();
+
+    for (pack_id, published) in PUBLISHED_REQUIREMENT_NAMES {
+        // The base pack holds the service's own default rules, published as one
+        // statement each; the other three track a framework whose requirements are
+        // published as prose.
+        let single_statement = pack_id == "srp-am-base";
+        let summaries = list_all(&router, pack_id, None, pack_id).await;
+
+        for name in published {
+            let case = format!("{pack_id} / {name}");
+            let summary = summaries
+                .iter()
+                .find(|summary| member(summary, "name").as_deref() == Some(*name))
+                .unwrap_or_else(|| panic!("case {case:?}: the listing does not report it"));
+            let description = member(summary, "description")
+                .unwrap_or_else(|| panic!("case {case:?}: no description was reported"));
+            let count = sentences(&description);
+
+            if single_statement {
+                assert_eq!(
+                    count, 1,
+                    "case {case:?}: expected the rule's single published statement, got \
+                     {count} sentences: {description:?}"
+                );
+            } else {
+                assert!(
+                    count >= 2 && description.len() >= 200,
+                    "case {case:?}: expected the requirement's published prose — what the \
+                     workload must do and what the design must demonstrate — got {count} \
+                     sentence(s) of {} characters: {description:?}",
+                    description.len()
+                );
+            }
+            assert!(
+                description.trim() == description && description.ends_with('.'),
+                "case {case:?}: expected a trimmed, terminated statement, got \
+                 {description:?}"
+            );
+
+            for (quoted_pack, quoted_name, phrases) in PUBLISHED_STATEMENT_PHRASES {
+                if (quoted_pack, quoted_name) != (pack_id, *name) {
+                    continue;
+                }
+                for phrase in phrases {
+                    assert!(
+                        description.contains(phrase),
+                        "case {case:?}: the published statement states {phrase:?}, which \
+                         the reported description does not: {description:?}"
+                    );
+                }
+            }
+        }
+    }
+}
+
 /// RULE: reading the shipped content changes nothing — two listings of an untouched
 /// account agree member for member, and the catalog table every case above is driven from
 /// names each requirement of a pack exactly once with no empty field.
