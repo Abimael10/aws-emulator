@@ -41,6 +41,17 @@ use crate::support::{
     SeededSubnet, REGION,
 };
 
+/// `DescribeTrafficSources`, in its own file beside this one: the reader of the OTHER member
+/// that carries the same association — a client must not read two states for one attachment —
+/// and this suite's sibling concern, driven through the same harness.
+///
+/// Declared here rather than in `tests/all.rs`, which declares the suites directly under
+/// `tests/all/`: a file deeper than that is declared by its own parent module, which this
+/// suite is. The `#[path]` is relative to this file's own directory, and is needed because
+/// `tests/all.rs` pulled this file in with a `#[path]` of its own.
+#[path = "describe_load_balancer_target_groups/traffic_sources.rs"]
+mod traffic_sources;
+
 /// The API version an Elastic Load Balancing v2 client puts in its awsQuery body, read from
 /// that service's own statement of it rather than written out here.
 const ELBV2_VERSION: &str = elbv2_service::service::shared_endpoint::API_VERSION;
