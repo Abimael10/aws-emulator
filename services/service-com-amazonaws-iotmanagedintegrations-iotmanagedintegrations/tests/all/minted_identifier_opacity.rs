@@ -23,6 +23,15 @@
 //! any of it. [`collections`] is that table, one row per collection read of this service
 //! that reports an identifier it minted.
 //!
+//! And it holds for an identifier a response carries for ANOTHER resource: a read or a list
+//! reports every identifier-bearing member exactly as the service holds it, so a member
+//! naming another resource carries the identifier the creating request supplied, character
+//! for character — an echoed handle a later call can address that other resource by, never a
+//! value this service re-derived or normalised. [`references`] is that table, one row per
+//! read of this service that reports an identifier of another resource, and
+//! [`echoed_references`] varies the FORM of the supplied identifier over what its modelled
+//! shape admits.
+//!
 //! Every case drives the real restJson1 request path (`MultiServiceRouter::dispatch`), so
 //! the routes, statuses and bodies asserted here are the ones a client sees.
 
@@ -719,14 +728,8 @@ fn collections() -> Vec<Collection> {
     ]
 }
 
-/// Create a C2C connector and a connector destination against it, answering the identifier
-/// the destination minted.
-///
-/// `CreateAccountAssociation` resolves its `ConnectorDestinationId` against this service's
-/// own connector-destination store, so the associations below are created against a
-/// destination a client really created; a destination in turn names a C2C connector
-/// (`CloudConnectorId` is `@required`), so the connector comes first.
-async fn connector_destination(router: &MultiServiceRouter) -> String {
+/// Create a C2C cloud connector, answering the identifier it minted.
+async fn cloud_connector(router: &MultiServiceRouter) -> String {
     let connector = call(
         router,
         "POST",
@@ -742,23 +745,41 @@ async fn connector_destination(router: &MultiServiceRouter) -> String {
         "seeding a cloud connector: expected HTTP 201, got {} with body {:?}",
         connector.status, connector.body
     );
+    connector.string("Id").unwrap_or_default().to_string()
+}
+
+/// `CreateConnectorDestination` (POST `/connector-destinations`): the destination of the C2C
+/// connector `cloud_connector_id`, whose `CloudConnectorId` member is `@required`.
+fn connector_destination_body(cloud_connector_id: &str) -> Value {
+    json!({
+        "CloudConnectorId": cloud_connector_id,
+        "AuthConfig": {},
+        // Inside the `SecretsManagerArn` `@pattern` and the `SecretsManagerVersionId`
+        // `@length` (32..64).
+        "SecretsManager": {
+            "arn": format!(
+                "arn:aws:secretsmanager:{REGION}:{}:secret:destination-A1b2C3",
+                engine::EMULATOR_ACCOUNT_ID
+            ),
+            "versionId": "a".repeat(32),
+        },
+    })
+}
+
+/// Create a C2C connector and a connector destination against it, answering the identifier
+/// the destination minted.
+///
+/// `CreateAccountAssociation` resolves its `ConnectorDestinationId` against this service's
+/// own connector-destination store, so the associations below are created against a
+/// destination a client really created; a destination in turn names a C2C connector
+/// (`CloudConnectorId` is `@required`), so the connector comes first.
+async fn connector_destination(router: &MultiServiceRouter) -> String {
+    let connector = cloud_connector(router).await;
     let destination = call(
         router,
         "POST",
         "/connector-destinations",
-        Some(json!({
-            "CloudConnectorId": connector.string("Id").unwrap_or_default(),
-            "AuthConfig": {},
-            // Inside the `SecretsManagerArn` `@pattern` and the `SecretsManagerVersionId`
-            // `@length` (32..64).
-            "SecretsManager": {
-                "arn": format!(
-                    "arn:aws:secretsmanager:{REGION}:{}:secret:destination-A1b2C3",
-                    engine::EMULATOR_ACCOUNT_ID
-                ),
-                "versionId": "a".repeat(32),
-            },
-        })),
+        Some(connector_destination_body(&connector)),
     )
     .await;
     assert_eq!(
@@ -1107,6 +1128,537 @@ async fn paging_a_collection_read_changes_no_identifier() {
                 seen, minted,
                 "case {case:?}: expected the token chain to report exactly the identifiers the \
                  creates minted, got {seen:?}"
+            );
+        }
+    }
+}
+
+/// A resource of this service that another resource REFERS to, so a reference a read echoes
+/// is a handle that really resolves.
+#[derive(Clone, Copy, Debug)]
+enum Referent {
+    /// A credential locker, named by `CreateManagedThing`'s `CredentialLockerId` and by an
+    /// event log configuration scoped to one.
+    CredentialLocker,
+    /// A managed thing, named by a hub discovery's `ControllerIdentifier` and by an event log
+    /// configuration scoped to one.
+    ManagedThing,
+    /// A C2C cloud connector, named by `CreateConnectorDestination`'s `CloudConnectorId`.
+    CloudConnector,
+    /// A connector destination, named by `CreateAccountAssociation`'s
+    /// `ConnectorDestinationId`.
+    ConnectorDestination,
+    /// An account association, named by a cloud discovery's `AccountAssociationId`.
+    AccountAssociation,
+}
+
+impl Referent {
+    /// The collection route this resource is created at, and under which its own read
+    /// resolves it by identifier.
+    fn route(self) -> &'static str {
+        match self {
+            Self::CredentialLocker => "/credential-lockers",
+            Self::ManagedThing => "/managed-things",
+            Self::CloudConnector => "/cloud-connectors",
+            Self::ConnectorDestination => "/connector-destinations",
+            Self::AccountAssociation => "/account-associations",
+        }
+    }
+
+    /// The member this resource's own read reports its identifier on: `Id` for every resource
+    /// of this service except an account association, whose read names it
+    /// `AccountAssociationId` (`smithy_query(query="operation",
+    /// operation="GetAccountAssociation")`).
+    fn id_member(self) -> &'static str {
+        match self {
+            Self::AccountAssociation => "AccountAssociationId",
+            _ => "Id",
+        }
+    }
+}
+
+/// Create one resource of `referent` through the wire, answering the identifier it minted.
+async fn mint_referent(router: &MultiServiceRouter, referent: Referent) -> String {
+    match referent {
+        Referent::CredentialLocker => {
+            created_id(router, referent, credential_locker_body(0)).await
+        }
+        Referent::ManagedThing => created_id(router, referent, managed_thing_body(0)).await,
+        Referent::CloudConnector => cloud_connector(router).await,
+        Referent::ConnectorDestination => connector_destination(router).await,
+        Referent::AccountAssociation => {
+            let destination = connector_destination(router).await;
+            created_id(router, referent, account_association_element(0, &destination)).await
+        }
+    }
+}
+
+/// Create one resource of `referent` from `body`, asserting the modelled 201, and answer the
+/// identifier it minted.
+async fn created_id(router: &MultiServiceRouter, referent: Referent, body: Value) -> String {
+    let reply = call(router, "POST", referent.route(), Some(body)).await;
+    assert_eq!(
+        reply.status, 201,
+        "seeding a referent at {:?}: expected HTTP 201, got {} with body {:?}",
+        referent.route(),
+        reply.status,
+        reply.body
+    );
+    reply
+        .string(referent.id_member())
+        .unwrap_or_else(|| {
+            panic!(
+                "seeding a referent at {:?}: expected the minted identifier on {:?}, got body \
+                 {:?}",
+                referent.route(),
+                referent.id_member(),
+                reply.body
+            )
+        })
+        .to_string()
+}
+
+/// One read of this service that reports an identifier of ANOTHER resource, with everything
+/// the rule is asserted through: which resource the reference points at, where the referring
+/// resource is created, read and listed, which member carries the reference, and whether the
+/// list element declares that member too.
+struct Reference {
+    case: &'static str,
+    referent: Referent,
+    /// The collection route the referring resource is created at, read under and listed from.
+    route: &'static str,
+    /// The member the referring resource's OWN identifier is reported on, which is also how
+    /// its element is found in the page.
+    id_member: &'static str,
+    /// The member carrying the reference, on the read and on the list element alike (the
+    /// model names the same member on both).
+    reference_member: &'static str,
+    /// The member the list reports its page on, or `None` for a resource whose collection
+    /// read this emulator still answers 501 for (its own stub issue), where there is no page
+    /// to assert anything about.
+    items_member: Option<&'static str>,
+    /// Whether the list element's own shape declares `reference_member`: the model gives it to
+    /// some of these summaries and leaves it to the resource's own read for the others.
+    element_declares_reference: bool,
+    /// The create request body naming the reference.
+    body: fn(&str) -> Value,
+}
+
+/// `CreateManagedThing` naming the credential locker the thing's credentials live in.
+fn managed_thing_with_locker(credential_locker_id: &str) -> Value {
+    let mut body = managed_thing_body(0);
+    body["CredentialLockerId"] = json!(credential_locker_id);
+    body
+}
+
+/// `CreateEventLogConfiguration` scoped to ONE credential locker: `ResourceType` is the
+/// resource kind and `ResourceId` the resource within it
+/// (`smithy_query(query="operation",operation="CreateEventLogConfiguration")` ->
+/// `SmartHomeResourceType` is `^[*]$|^(managed-thing|credential-locker|provisioning-profile|
+/// ota-task|account-association)$`).
+fn event_log_configuration_for_locker(credential_locker_id: &str) -> Value {
+    json!({
+        "ResourceType": "credential-locker",
+        "ResourceId": credential_locker_id,
+        "EventLogLevel": "DEBUG",
+    })
+}
+
+/// `CreateEventLogConfiguration` scoped to ONE managed thing.
+fn event_log_configuration_for_thing(managed_thing_id: &str) -> Value {
+    json!({
+        "ResourceType": "managed-thing",
+        "ResourceId": managed_thing_id,
+        "EventLogLevel": "WARN",
+    })
+}
+
+/// `StartDeviceDiscovery` over a hub's own network: a hub protocol names the controller whose
+/// network is searched.
+fn device_discovery_for_controller(managed_thing_id: &str) -> Value {
+    json!({"DiscoveryType": "ZWAVE", "ControllerIdentifier": managed_thing_id})
+}
+
+/// `StartDeviceDiscovery` over a partner cloud: a cloud discovery names the account
+/// association whose destination is searched.
+fn device_discovery_for_association(account_association_id: &str) -> Value {
+    json!({"DiscoveryType": "CLOUD", "AccountAssociationId": account_association_id})
+}
+
+/// `CreateAccountAssociation` naming the connector destination it associates an account with.
+fn account_association_for_destination(connector_destination_id: &str) -> Value {
+    account_association_element(0, connector_destination_id)
+}
+
+/// Every read of this service that reports an identifier of another resource, with the
+/// summary shapes the model declares for the matching list elements
+/// (`smithy_query(query="shape",shape="ManagedThingSummary,EventLogConfigurationSummary,
+/// ConnectorDestinationSummary,AccountAssociationItem,DeviceDiscoverySummary")`).
+///
+/// The rows differ along what the rule generalises over: which operation serves the read,
+/// which member carries the reference, which kind of resource it points at, whether the
+/// reference is one this service resolves before storing it, and whether the list element
+/// carries the reference at all.
+fn references() -> Vec<Reference> {
+    vec![
+        Reference {
+            case: "GetManagedThing.CredentialLockerId",
+            referent: Referent::CredentialLocker,
+            route: "/managed-things",
+            id_member: "Id",
+            reference_member: "CredentialLockerId",
+            items_member: Some("Items"),
+            element_declares_reference: true,
+            body: managed_thing_with_locker,
+        },
+        Reference {
+            case: "GetEventLogConfiguration.ResourceId (credential-locker)",
+            referent: Referent::CredentialLocker,
+            route: "/event-log-configurations",
+            id_member: "Id",
+            reference_member: "ResourceId",
+            items_member: Some("EventLogConfigurationList"),
+            element_declares_reference: true,
+            body: event_log_configuration_for_locker,
+        },
+        Reference {
+            case: "GetEventLogConfiguration.ResourceId (managed-thing)",
+            referent: Referent::ManagedThing,
+            route: "/event-log-configurations",
+            id_member: "Id",
+            reference_member: "ResourceId",
+            items_member: Some("EventLogConfigurationList"),
+            element_declares_reference: true,
+            body: event_log_configuration_for_thing,
+        },
+        Reference {
+            case: "GetDeviceDiscovery.ControllerId",
+            referent: Referent::ManagedThing,
+            route: "/device-discoveries",
+            id_member: "Id",
+            reference_member: "ControllerId",
+            items_member: Some("Items"),
+            // `DeviceDiscoverySummary` declares `Id`, `DiscoveryType` and `Status` only.
+            element_declares_reference: false,
+            body: device_discovery_for_controller,
+        },
+        Reference {
+            case: "GetDeviceDiscovery.AccountAssociationId",
+            referent: Referent::AccountAssociation,
+            route: "/device-discoveries",
+            id_member: "Id",
+            reference_member: "AccountAssociationId",
+            items_member: Some("Items"),
+            element_declares_reference: false,
+            body: device_discovery_for_association,
+        },
+        Reference {
+            case: "GetConnectorDestination.CloudConnectorId",
+            referent: Referent::CloudConnector,
+            route: "/connector-destinations",
+            id_member: "Id",
+            reference_member: "CloudConnectorId",
+            // `ListConnectorDestinations` is still scaffolded in this emulator (it answers
+            // 501), so this row asserts the read only.
+            items_member: None,
+            element_declares_reference: true,
+            body: connector_destination_body,
+        },
+        Reference {
+            case: "GetAccountAssociation.ConnectorDestinationId",
+            referent: Referent::ConnectorDestination,
+            route: "/account-associations",
+            id_member: "AccountAssociationId",
+            reference_member: "ConnectorDestinationId",
+            items_member: Some("Items"),
+            element_declares_reference: true,
+            body: account_association_for_destination,
+        },
+    ]
+}
+
+/// RULE (see the module docs): a read reports the identifier of the resource it refers to
+/// exactly as the creating request supplied it — the identifier that other resource's own
+/// create minted, so the reference read back resolves that resource — and the element a list
+/// reports for the referring resource carries the same reference wherever the model declares
+/// it on the summary.
+#[tokio::test]
+async fn a_read_echoes_the_identifier_of_the_resource_it_refers_to() {
+    for reference in references() {
+        // One store per row, so the page below is exactly what this row created.
+        let router = emulator();
+        let referent = mint_referent(&router, reference.referent).await;
+
+        let created = call(
+            &router,
+            "POST",
+            reference.route,
+            Some((reference.body)(&referent)),
+        )
+        .await;
+        assert_eq!(
+            created.status, 201,
+            "case {:?}: expected HTTP 201 from the create, got {} with body {:?}",
+            reference.case, created.status, created.body
+        );
+        let id = created
+            .string(reference.id_member)
+            .unwrap_or_else(|| {
+                panic!(
+                    "case {:?}: expected the minted identifier on {:?}, got body {:?}",
+                    reference.case, reference.id_member, created.body
+                )
+            })
+            .to_string();
+
+        // The read reports the referring resource's own identifier AND, unchanged, the
+        // identifier of the resource it refers to.
+        let read = call(&router, "GET", &format!("{}/{id}", reference.route), None).await;
+        assert_eq!(
+            read.status, 200,
+            "case {:?}: expected HTTP 200 reading {id:?} back, got {} with body {:?}",
+            reference.case, read.status, read.body
+        );
+        assert_eq!(
+            read.string(reference.id_member),
+            Some(id.as_str()),
+            "case {:?}: expected the read to report {id:?} on {:?}, got {:?}",
+            reference.case,
+            reference.id_member,
+            read.string(reference.id_member)
+        );
+        assert_eq!(
+            read.string(reference.reference_member),
+            Some(referent.as_str()),
+            "case {:?}: expected the read to echo the referenced identifier {referent:?} on \
+             {:?}, got {:?}",
+            reference.case,
+            reference.reference_member,
+            read.string(reference.reference_member)
+        );
+
+        // Both identifiers this ONE read reports — the resource's own and the one it refers
+        // to — are opaque on the terms the create side is held to above: two resources minted
+        // moments apart in one store share no long prefix or suffix, which a mint folding the
+        // wall clock or a store counter into its identifiers could not satisfy.
+        let prefix = shared_prefix(&id, &referent);
+        assert!(
+            prefix <= MAX_SHARED_AFFIX,
+            "case {:?}: expected the read's own identifier and the one it refers to to share \
+             at most {MAX_SHARED_AFFIX} leading characters, got {prefix} shared by {id:?} and \
+             {referent:?}",
+            reference.case
+        );
+        let suffix = shared_suffix(&id, &referent);
+        assert!(
+            suffix <= MAX_SHARED_AFFIX,
+            "case {:?}: expected the read's own identifier and the one it refers to to share \
+             at most {MAX_SHARED_AFFIX} trailing characters, got {suffix} shared by {id:?} and \
+             {referent:?}",
+            reference.case
+        );
+
+        // The echoed reference is a HANDLE: the referent's own read, addressed by exactly the
+        // value the echo reported, resolves that resource and answers with it.
+        let resolved = call(
+            &router,
+            "GET",
+            &format!("{}/{referent}", reference.referent.route()),
+            None,
+        )
+        .await;
+        assert_eq!(
+            resolved.status, 200,
+            "case {:?}: expected the echoed reference {referent:?} to resolve at {:?}, got {} \
+             with body {:?}",
+            reference.case,
+            reference.referent.route(),
+            resolved.status,
+            resolved.body
+        );
+        assert_eq!(
+            resolved.string(reference.referent.id_member()),
+            Some(referent.as_str()),
+            "case {:?}: expected the referent's read to report {referent:?} on {:?}, got {:?}",
+            reference.case,
+            reference.referent.id_member(),
+            resolved.string(reference.referent.id_member())
+        );
+
+        // The list reports the same reference on the element of that resource, wherever the
+        // model declares the member on the summary.
+        let Some(items_member) = reference.items_member else {
+            continue;
+        };
+        let listed = call(&router, "GET", reference.route, None).await;
+        assert_eq!(
+            listed.status, 200,
+            "case {:?}: expected HTTP 200 from the list, got {} with body {:?}",
+            reference.case, listed.status, listed.body
+        );
+        let page = listed
+            .body
+            .get(items_member)
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        let element = page
+            .iter()
+            .find(|element| element_string(element, reference.id_member) == Some(id.as_str()))
+            .unwrap_or_else(|| {
+                panic!(
+                    "case {:?}: expected an element reporting {id:?} on {:?}, got body {:?}",
+                    reference.case, reference.id_member, listed.body
+                )
+            });
+        let reported = element_string(element, reference.reference_member);
+        if reference.element_declares_reference {
+            assert_eq!(
+                reported,
+                Some(referent.as_str()),
+                "case {:?}: expected the element to echo the referenced identifier \
+                 {referent:?} on {:?}, got {element:?}",
+                reference.case,
+                reference.reference_member
+            );
+        } else {
+            assert!(
+                reported.is_none(),
+                "case {:?}: this element's shape declares no {:?} member, got {element:?}",
+                reference.case,
+                reference.reference_member
+            );
+        }
+    }
+}
+
+/// The `@length` maximum of `CredentialLockerId` and of `ManagedThingId`
+/// (`smithy_query(query="shape",shape="CredentialLockerId,ManagedThingId")` -> len 1..64):
+/// the longest value [`echoed_references`] supplies, so an echo that truncated at the
+/// modelled bound reports fewer characters than the request named.
+const LONGEST_REFERENCE: usize = 64;
+
+/// One reference member this service stores as the request named it, with the values its
+/// modelled shape admits.
+///
+/// These are the references `tests/all/referenced_resource_validation.rs` states are not
+/// resolved before being stored — nothing can be shown about them — so the value a create
+/// supplies here is free to span the whole modelled shape.
+struct EchoedReference {
+    case: &'static str,
+    /// The collection route the referring resource is created at and read under.
+    route: &'static str,
+    /// The member the referring resource's own identifier is reported on.
+    id_member: &'static str,
+    /// The member carrying the reference.
+    reference_member: &'static str,
+    /// The `@pattern` of the referenced identifier's shape, for the assertion messages.
+    pattern: &'static str,
+    /// The create request body naming the reference.
+    body: fn(&str) -> Value,
+    /// The reference values this row supplies, differing along what the rule generalises
+    /// over: length (the modelled minimum and maximum), case, and which characters of the
+    /// pattern the value uses.
+    values: fn() -> Vec<String>,
+}
+
+/// `CredentialLockerId` is `^[a-zA-Z0-9]*$`, len 1..64: one character, digits only, mixed
+/// case, and the full modelled width.
+fn credential_locker_reference_values() -> Vec<String> {
+    vec![
+        "A".to_string(),
+        "0123456789".to_string(),
+        "MiXeDcAsE0".to_string(),
+        "b".repeat(LONGEST_REFERENCE),
+    ]
+}
+
+/// `ManagedThingId` is `^[a-zA-Z0-9:_-]*$`, len 1..64: the same spread, plus a value using
+/// every punctuation character the pattern admits beyond the alphanumerics.
+fn managed_thing_reference_values() -> Vec<String> {
+    vec![
+        "c".to_string(),
+        "9876543210".to_string(),
+        "Hub:Zone_1-North".to_string(),
+        "d".repeat(LONGEST_REFERENCE),
+    ]
+}
+
+/// The reference members whose value a client chooses, one row per member.
+fn echoed_references() -> Vec<EchoedReference> {
+    vec![
+        EchoedReference {
+            case: "GetManagedThing.CredentialLockerId",
+            route: "/managed-things",
+            id_member: "Id",
+            reference_member: "CredentialLockerId",
+            pattern: "^[a-zA-Z0-9]*$",
+            body: managed_thing_with_locker,
+            values: credential_locker_reference_values,
+        },
+        EchoedReference {
+            case: "GetDeviceDiscovery.ControllerId",
+            route: "/device-discoveries",
+            id_member: "Id",
+            reference_member: "ControllerId",
+            pattern: "^[a-zA-Z0-9:_-]*$",
+            body: device_discovery_for_controller,
+            values: managed_thing_reference_values,
+        },
+    ]
+}
+
+/// RULE (see the module docs): the identifier a read reports for another resource is the one
+/// the creating request supplied, character for character — whatever its length, case or
+/// punctuation within the modelled shape, so nothing is truncated, lowercased or re-derived
+/// on the way through the store.
+#[tokio::test]
+async fn a_read_echoes_a_supplied_reference_character_for_character() {
+    for reference in echoed_references() {
+        let router = emulator();
+        for value in (reference.values)() {
+            let case = format!("{} = {value:?}", reference.case);
+            assert!(
+                (1..=LONGEST_REFERENCE).contains(&value.chars().count()),
+                "case {case:?}: this row's value must stay inside the modelled \
+                 1..={LONGEST_REFERENCE} characters of {:?}",
+                reference.pattern
+            );
+
+            let created = call(
+                &router,
+                "POST",
+                reference.route,
+                Some((reference.body)(&value)),
+            )
+            .await;
+            assert_eq!(
+                created.status, 201,
+                "case {case:?}: expected HTTP 201 from the create, got {} with body {:?}",
+                created.status, created.body
+            );
+            let id = created
+                .string(reference.id_member)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "case {case:?}: expected the minted identifier on {:?}, got body {:?}",
+                        reference.id_member, created.body
+                    )
+                })
+                .to_string();
+
+            let read = call(&router, "GET", &format!("{}/{id}", reference.route), None).await;
+            assert_eq!(
+                read.status, 200,
+                "case {case:?}: expected HTTP 200 reading {id:?} back, got {} with body {:?}",
+                read.status, read.body
+            );
+            assert_eq!(
+                read.string(reference.reference_member),
+                Some(value.as_str()),
+                "case {case:?}: expected the read to echo {value:?} on {:?}, got {:?}",
+                reference.reference_member,
+                read.string(reference.reference_member)
             );
         }
     }
