@@ -6,12 +6,23 @@
 //! stamps `CreatedAt` / `ModifiedAt`, then answers from the STORED record —
 //! `GetSamplingRules` returns the same record afterwards.
 //!
-//! The collision check and the insert are ONE step on the locked store, so N
-//! concurrent calls for one `RuleName` have exactly one winner: every loser sees
-//! the winner's record already there and is refused with
-//! `InvalidRequestException` (400) for THAT resource, naming the internal id it
-//! is held under ([`crate::state::sampling_rule_exists_message`]) rather than
-//! only reporting that the name is in use. A store already holding
+//! The read of the name and the insert are the service's own two steps, so a
+//! duplicate `RuleName` is refused by whichever of them catches it, in that
+//! layer's own words: a name already held when the request arrived is refused by
+//! the read, with X-Ray's fixed sentence for that condition
+//! ([`crate::state::SAMPLING_RULE_EXISTS_MESSAGE`]); a create that read the name
+//! as free and then lost the insert to another create in flight is refused by
+//! the uniqueness constraint of the store it writes through, which names the
+//! resource that won by the internal id it is held under
+//! ([`crate::state::sampling_rule_exists_message`]). Both are
+//! `InvalidRequestException` (400), and the insert itself is ONE step on the
+//! locked store, so N callers racing for one name have exactly one winner.
+//!
+//! WHICH of the two a loser of a RACE is answered with therefore follows from
+//! how the two in-flight requests interleave, exactly as it does against a
+//! service whose read and write are two steps: what is fixed is that a name
+//! already committed when the request arrived takes the read's sentence, and a
+//! request that got past the read takes the constraint's. A store already holding
 //! [`crate::state::MAX_SAMPLING_RULES`] rules answers the modelled
 //! `RuleLimitExceededException` instead, which is the one refusal that reports a
 //! limit rather than the request.
@@ -179,6 +190,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let region = crate::state::request_region(ctx.parts());
         let now = crate::state::now_epoch_seconds();
 
+        // The service's OWN read of the name, taken as the request arrives and
+        // before any of the work below: a duplicate name is refused by one of
+        // two layers, and this read is what decides which
+        // (`crate::state::SamplingRuleNameOnArrival`). The guard is released
+        // again at once — this is a read, not the write's critical section.
+        let on_arrival = {
+            let store = state.lock();
+            let held = crate::state::sampling_rule_name(&input.sampling_rule)
+                .is_ok_and(|name| store.holds_sampling_rule_name(name));
+            if held {
+                crate::state::SamplingRuleNameOnArrival::Held
+            } else {
+                crate::state::SamplingRuleNameOnArrival::Free
+            }
+        };
+
         // The same tag restrictions `TagResource` and `CreateGroup` enforce,
         // from the one place they are written down
         // (`crate::state::validate_tag`): tags arrive the same way whichever
@@ -208,10 +235,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )));
         }
 
-        // One lock, so the name check and the insert cannot interleave with
-        // another call for the same name.
+        // Between that read and the write, the runtime is given a point to
+        // serve another request at: a create of the same name that is in flight
+        // beside this one then reads the name while it is still free, as it
+        // would against a service whose read and write are two steps, instead of
+        // being starved until this request has finished writing.
+        ::tokio::task::yield_now().await;
+
+        // One lock, so the uniqueness check and the insert cannot interleave
+        // with another call for the same name: whichever of the racers reaches
+        // it first is the one winner.
         let mut store = state.lock();
-        match store.insert_sampling_rule(&region, input.sampling_rule, tags, now) {
+        match store.insert_sampling_rule(&region, input.sampling_rule, tags, now, on_arrival) {
             Ok(stored) => Ok(CreateSamplingRuleOutput {
                 sampling_rule_record: Some(stored.to_record()),
             }),

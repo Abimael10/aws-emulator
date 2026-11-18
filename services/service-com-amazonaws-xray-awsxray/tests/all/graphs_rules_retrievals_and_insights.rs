@@ -40,8 +40,8 @@ use serde_json::{json, Value};
 
 use service_com_amazonaws_xray_awsxray::ops::types::Insight;
 use service_com_amazonaws_xray_awsxray::state::{
-    ComAmazonawsXrayAwsxrayState, MAX_WINDOW_FUTURE_SKEW_SECONDS, SAMPLING_RULE_EXISTS_PREFIX,
-    TRACE_RETRIEVAL_BURST, TRACE_RETRIEVAL_RATE_PER_SECOND,
+    ComAmazonawsXrayAwsxrayState, MAX_WINDOW_FUTURE_SKEW_SECONDS, TRACE_RETRIEVAL_BURST,
+    TRACE_RETRIEVAL_RATE_PER_SECOND,
 };
 
 use crate::trace_ingest_and_groups::{array, close, root_document, trace_id, Answer, Xray};
@@ -1153,18 +1153,21 @@ async fn concurrent_creates_of_one_rule_name_have_exactly_one_winner() {
             "a losing concurrent create must be refused as invalid, got {answer:?}"
         );
     }
-    // Each loser lost to the ONE winner, so each refusal reports that resource:
-    // the service's fixed text for a held name, then the internal id the winning
-    // rule is stored under — one id across every loser.
+    // Each loser read the name as FREE when its request arrived and then lost
+    // the write, so what refuses it is the store's uniqueness constraint, which
+    // names the resource that won by the internal id it is held under: AWS's
+    // fixed prefix, written out here, then one id across every loser.
+    const RACE_LOST_PREFIX: &str =
+        "A resource with the same resourceName but a different internalId already exists: ";
     let named: Vec<&str> = answers
         .iter()
         .filter(|answer| answer.status != 200)
         .map(|answer| {
             let said = answer.message().unwrap_or_default();
-            said.strip_prefix(SAMPLING_RULE_EXISTS_PREFIX).unwrap_or_else(|| {
+            said.strip_prefix(RACE_LOST_PREFIX).unwrap_or_else(|| {
                 panic!(
-                    "a losing concurrent create must be refused for the resource holding the \
-                     name, got {said:?}"
+                    "a create that lost the race must be refused for the resource that won, \
+                     got {said:?}"
                 )
             })
         })

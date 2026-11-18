@@ -23,6 +23,10 @@
 //!   reaches the store: a document carrying one is refused at ingest, and one at
 //!   the far edge of the accepted range is served.
 //!
+//! Which services the map of a window carries at all — and that a host which
+//! only uploaded daemon telemetry is on no map — is the concern of
+//! `service_map_reachability`, which owns that rule in one place.
+//!
 //! The rows differ along what each rule generalises over: the topology (a chain,
 //! a fan-out, repeated calls, two traces through one service, a cycle), the
 //! recorded status (200, 404, 429, 503), completeness (an in-progress segment),

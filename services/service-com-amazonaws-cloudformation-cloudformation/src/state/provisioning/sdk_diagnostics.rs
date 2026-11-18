@@ -206,6 +206,19 @@ pub(super) const SDK_SERVICE_NAMES: &[(&str, &str, SdkDiagnostic)] = &[
         "ServiceDiscovery",
         SdkDiagnostic::Attempts,
     ),
+    // AWS X-Ray's SDK names it by that model's own `sdkId` (`XRay`,
+    // `smithy_query(query="service_info")` on that service's model), which is also the
+    // `cloudFormationName` the type names of its resources carry. The shape is the bare
+    // ENVELOPE, with no attempt count after it, as the recorded `ResourceStatusReason` of an
+    // `AWS::XRay::Group` whose declared filter expression that service refuses carries it (in
+    // the behavioral corpus `simparity-behavioral-aws-v1`, check
+    // `xray.deploy-group-via-cloudformation-invalid-filter-expression-rejected`, whose reason
+    // reads `Resource handler returned message: "<the service's sentence> (Service: XRay,
+    // Status Code: 400, Request ID: …)" (RequestToken: …, HandlerErrorCode: InvalidRequest)`).
+    // The two resource types this emulator provisions over this signing name are both that
+    // service's ([`provisioner::xray_groups`] and the sampling-rule arms of
+    // [`provisioner::platform_services`]).
+    ("xray", "XRay", SdkDiagnostic::Envelope),
 ];
 
 /// The SHAPE of the parenthesis an SDK appends to the message of the exception it raises for
