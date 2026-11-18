@@ -422,16 +422,22 @@ async fn the_discovered_archived_media_origin_serves_its_plane_to_a_stock_client
             "case {api_name:?}: every API the archived-media endpoint binds resolves to one \
              origin, expected {endpoint:?}, got {discovered:?}"
         );
-        // The same endpoint is announced for a stream whose retention differs, so the
-        // origin is the endpoint's and not a stream's.
+        // Another stream's archived-media origin is its OWN: the discovery call names the
+        // stream it wants an endpoint for, so the value it reports belongs to that stream
+        // rather than to the plane at large.
         let for_other_stream = data_endpoint(&router, UNRETAINED, api_name).await;
-        assert_eq!(
+        assert_ne!(
             for_other_stream, endpoint,
-            "case {api_name:?}: the plane's origin is the endpoint's, not one stream's, \
-             expected {endpoint:?}, got {for_other_stream:?}"
+            "case {api_name:?}: another stream must be announced its own origin, \
+             got {endpoint:?} for both"
         );
         announced_authority(api_name, &discovered);
+        announced_authority(api_name, &for_other_stream);
     }
+
+    // The origin announced for the other stream's archive, which the rows about THAT
+    // stream are dialled at.
+    let unretained_endpoint = data_endpoint(&router, UNRETAINED, ARCHIVED_MEDIA_API_NAMES[0]).await;
 
     let client = stock_client();
     // (case, the route asked for on the discovered origin, the request, what it earns)
@@ -531,7 +537,15 @@ async fn the_discovered_archived_media_origin_serves_its_plane_to_a_stock_client
     ];
 
     for (case, path, body, expected) in &rows {
-        let answer = dial(&client, case, &endpoint, path, body).await;
+        // Each row is dialled at the origin announced for the stream it NAMES: an announced
+        // endpoint serves the stream it was discovered for, so the row about a stream that
+        // retains nothing is sent to that stream's own origin.
+        let origin = if body.get("StreamName").and_then(Value::as_str) == Some(UNRETAINED) {
+            &unretained_endpoint
+        } else {
+            &endpoint
+        };
+        let answer = dial(&client, case, origin, path, body).await;
         match expected {
             Expected::NoFragmentsListed => {
                 assert_eq!(
@@ -699,4 +713,121 @@ async fn the_announced_scheme_is_the_only_transport_the_plane_serves() {
         answer.status, 200,
         "the announced origin must still serve its plane, got {answer:?}"
     );
+}
+
+/// RULE: an announced endpoint belongs to the STREAM it was discovered for — "Gets an
+/// endpoint for a specified stream for either reading or writing", with the stream named in
+/// the discovery call's own input — so the reads served there read that stream and no
+/// other: a read naming a different stream asked an endpoint for a stream it does not
+/// serve, which is as unreadable as a stream that is not there and is refused with the same
+/// class and sentence, while each stream's own endpoint keeps serving it.
+///
+/// The rows differ in which endpoint the read was sent to (the archived-media one and the
+/// live media one, so the scoping is a property of the announced address rather than of one
+/// plane) and in which stream it named (the endpoint's own stream, another stream of the
+/// account, and a name that exists nowhere).
+#[tokio::test(flavor = "multi_thread")]
+async fn an_announced_endpoint_reads_only_the_stream_it_was_discovered_for() {
+    /// A second retained stream of the same account, so one stream's endpoint can be asked
+    /// for the other's archive.
+    const SECOND: &str = "kvam-discovered-second";
+
+    let router = emulator();
+    create_stream(&router, RETAINED, 1).await;
+    create_stream(&router, SECOND, 1).await;
+    await_active(&router, RETAINED).await;
+    await_active(&router, SECOND).await;
+
+    let own_archive = data_endpoint(&router, RETAINED, "LIST_FRAGMENTS").await;
+    let own_media = data_endpoint(&router, RETAINED, "GET_MEDIA").await;
+    let second_archive = data_endpoint(&router, SECOND, "LIST_FRAGMENTS").await;
+    let second_media = data_endpoint(&router, SECOND, "GET_MEDIA").await;
+    assert_ne!(
+        own_archive, second_archive,
+        "each stream is announced its own archived-media origin, got {own_archive:?} for both"
+    );
+    assert_ne!(
+        own_media, second_media,
+        "each stream is announced its own live media origin, got {own_media:?} for both"
+    );
+
+    let client = stock_client();
+    // (case, the origin the read is sent to, the route, the stream it names, served).
+    let rows: Vec<(&str, &String, &str, &str, bool)> = vec![
+        (
+            "the archive listing of another stream, on this stream's archive origin",
+            &own_archive,
+            "/listFragments",
+            SECOND,
+            false,
+        ),
+        (
+            "the archive listing of a stream that exists nowhere",
+            &own_archive,
+            "/listFragments",
+            ABSENT,
+            false,
+        ),
+        (
+            "the archive listing of this origin's own stream",
+            &own_archive,
+            "/listFragments",
+            RETAINED,
+            true,
+        ),
+        (
+            "the live read of another stream, on this stream's media origin",
+            &own_media,
+            "/getMedia",
+            SECOND,
+            false,
+        ),
+        (
+            "the live read of this origin's own stream",
+            &own_media,
+            "/getMedia",
+            RETAINED,
+            true,
+        ),
+        (
+            "the other stream's archive listing on its OWN archive origin",
+            &second_archive,
+            "/listFragments",
+            SECOND,
+            true,
+        ),
+    ];
+    for (case, origin, path, named, served) in rows {
+        let body = match path {
+            "/getMedia" => json!({
+                "StreamName": named,
+                "StartSelector": { "StartSelectorType": "EARLIEST" },
+            }),
+            _ => json!({ "StreamName": named, "FragmentSelector": whole_archive() }),
+        };
+        let answer = dial(&client, case, origin, path, &body).await;
+        if served {
+            assert_eq!(
+                answer.status, 200,
+                "case {case:?}: an origin serves the stream it was announced for, got {answer:?}"
+            );
+        } else {
+            assert_eq!(
+                answer.status, 404,
+                "case {case:?}: an origin must not read a stream it was not announced for, \
+                 got {answer:?}"
+            );
+            assert_eq!(
+                answer.error_code(),
+                "ResourceNotFoundException",
+                "case {case:?}: expected the missing-stream class, got {answer:?}"
+            );
+            assert_eq!(
+                answer.message(),
+                STREAM_NOT_FOUND,
+                "case {case:?}: expected {STREAM_NOT_FOUND:?}, got {:?}",
+                answer.message()
+            );
+        }
+    }
 }

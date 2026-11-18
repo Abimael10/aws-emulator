@@ -43,6 +43,22 @@
 //! addressing header — is an HTTP error, in this service's own modelled error
 //! vocabulary.
 //!
+//! # What is admitted before any media is taken
+//!
+//! Two things about the request itself are settled before the container is read, and both
+//! refuse with nothing ingested:
+//!
+//! - the payload hash the producer's signature covers has to be DECLARED in
+//!   `x-amz-content-sha256` ([`undeclared_payload_hash`]), because this front end does
+//!   not buffer the stream it is handed and so has no body to hash: a request that
+//!   declares none carries a signature over a payload nothing can check, which is
+//!   refused as the signature failure it is;
+//! - the stream the request names has to be the stream the ADDRESS it arrived on was
+//!   announced for ([`serves_the_addressed_stream`]): `GetDataEndpoint` resolves an
+//!   endpoint for the stream the discovery call named, so an ingest address is that one
+//!   stream's and a request naming any other reached an endpoint that does not serve the
+//!   stream it asked for.
+//!
 //! Every accepted Cluster is persisted through
 //! [`crate::state::ComAmazonawsKinesisvideomediaAwsacuityinletserviceState::ingest_fragment`],
 //! the one write of the producer plane, so a fragment this plane acknowledges is the
@@ -73,6 +89,14 @@ const STREAM_ARN_HEADER: &str = "x-amzn-stream-arn";
 
 /// The header saying how the container's Cluster timecodes are to be read.
 const TIMECODE_TYPE_HEADER: &str = "x-amzn-fragment-timecode-type";
+
+/// The header a producer declares the payload hash its SigV4 signature covers in.
+///
+/// The ingest front end is handed a stream rather than a body — a producer sends its
+/// container as it captures it — so there is no payload for it to hash: what the
+/// signature covers has to be the marker the producer declared here, which is why a
+/// request that declares nothing cannot be verified at all.
+const CONTENT_SHA256_HEADER: &str = "x-amz-content-sha256";
 
 /// The header carrying the producer's clock at the start of the session, in epoch
 /// seconds — what a RELATIVE Cluster timecode is relative to.
@@ -110,6 +134,12 @@ const RESOURCE_NOT_FOUND: &str = "ResourceNotFoundException";
 /// ([`crate::service::authorization`]). No Kinesis Video media model declares a shape for
 /// it, so it is stated here in this plane's own error envelope.
 const ACCESS_DENIED: &str = "AccessDeniedException";
+
+/// `InvalidSignatureException` — the class a request whose SigV4 signature cannot be
+/// verified is refused with (HTTP 403), which is what a producer's credential-refresh and
+/// re-signing path branches on. Declared by no Kinesis Video model either, so it too is
+/// stated in this plane's own error envelope.
+const INVALID_SIGNATURE: &str = "InvalidSignatureException";
 
 /// The code this emulator states for a fault of its OWN — the one it answers when a
 /// handler cannot run at all (HTTP 500). It is not a limit the caller reached and not a
@@ -251,6 +281,12 @@ impl<Eng: Send + Sync + 'static> PutMediaIngest<Eng> {
     /// Serve one ingest request: take the Clusters its container carries, and answer the
     /// acknowledgement stream for them.
     pub async fn serve(&self, req: &RtRequest, ctx: &OperationContext<'_>) -> RtResponse {
+        // The signature is settled before the request is read at all: a request whose
+        // signature cannot be verified is refused as presented, with nothing read from
+        // its headers, nothing resolved and nothing taken from its container.
+        if let Some(refusal) = undeclared_payload_hash(req) {
+            return refusal.response();
+        }
         let session = match submitted_session(req) {
             Ok(session) => session,
             Err(refusal) => return refusal.response(),
@@ -296,11 +332,18 @@ impl<Eng: Send + Sync + 'static> PutMediaIngest<Eng> {
         // nothing about the submitted media changes that answer. The guard is taken for
         // that resolution alone and released again, so the container is read while no
         // other caller of this service is held up.
-        if store
+        let addressed = store
             .lock()
             .resolve_stream(&*self.engine, name, arn)
-            .is_none()
-        {
+            .map(|stream| stream.arn);
+        let Some(stream_arn) = addressed else {
+            return stream_not_found(&session).response();
+        };
+        // And it has to be the stream this ADDRESS serves: an announced ingest endpoint
+        // belongs to the stream it was discovered for, so a session naming any other
+        // stream — whether or not that stream exists — asked an endpoint for a stream it
+        // does not serve, which is the same refusal as a stream that is not there.
+        if !serves_the_addressed_stream(&*self.engine, req, &stream_arn) {
             return stream_not_found(&session).response();
         }
 
@@ -613,6 +656,57 @@ fn stream_not_found(_session: &SubmittedSession) -> Refusal {
         // carrying nothing from the request, as the recorded refusal carries nothing.
         message: archive::STREAM_NOT_FOUND_MESSAGE.to_string(),
     }
+}
+
+/// The refusal a request earns when its signature covers no payload hash the ingest front
+/// end can check: HTTP 403 `InvalidSignatureException`, with nothing read and nothing
+/// ingested, or `None` when the request declares one.
+///
+/// SigV4 signs a canonical request that includes the payload's hash, and this front end
+/// never buffers the stream it is handed, so the hash the signature covers is the one the
+/// producer DECLARED in [`CONTENT_SHA256_HEADER`] (the unsigned-payload marker a producer
+/// sends for a stream of unknown length). A request that declares none offers nothing to
+/// verify the signature over, so the signature cannot be held to cover the request as
+/// presented — the failure a mis-signing producer meets, and what its re-signing path
+/// branches on.
+fn undeclared_payload_hash(req: &RtRequest) -> Option<Refusal> {
+    let declared = req
+        .headers()
+        .get(CONTENT_SHA256_HEADER)
+        .map(str::trim)
+        .filter(|declared| !declared.is_empty());
+    declared.is_none().then(|| Refusal {
+        status: 403,
+        code: INVALID_SIGNATURE,
+        // The sentence AWS states for this class, fixed text: nothing in it comes from
+        // the request, and no header, credential or signature value is echoed back.
+        message: SIGNATURE_NOT_VERIFIED.to_string(),
+    })
+}
+
+/// The one sentence an unverifiable signature is refused with.
+const SIGNATURE_NOT_VERIFIED: &str = "The request signature we calculated does not match the \
+                                      signature you provided. Check your AWS Secret Access Key \
+                                      and signing method. Consult the service documentation for \
+                                      details.";
+
+/// Whether the address a request arrived on is the ingest endpoint OF the stream whose
+/// ARN is `stream_arn`.
+///
+/// A `DataEndpoint` is resolved per stream — `GetDataEndpoint` takes `StreamName`/
+/// `StreamARN` so that "an endpoint for a specified stream" is what it hands back — so the
+/// ingest address a producer was given serves that one stream, and a session naming
+/// another stream on it reached an endpoint that does not serve the stream it asked for.
+/// Which stream an address was announced for comes from the control plane that announced
+/// it ([`control_plane::endpoint_serves_stream`]), so an address this emulator published
+/// nothing at carries no stream to check against and nothing here narrows it.
+fn serves_the_addressed_stream<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    req: &RtRequest,
+    stream_arn: &str,
+) -> bool {
+    let host = req.headers().get(::http::header::HOST.as_str());
+    control_plane::endpoint_serves_stream(engine, req.uri(), host, stream_arn)
 }
 
 /// What the request's headers say about this session, or the refusal they earn.

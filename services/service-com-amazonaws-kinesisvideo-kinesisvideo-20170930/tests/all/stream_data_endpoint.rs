@@ -644,10 +644,12 @@ async fn a_panic_behind_an_announced_endpoint_is_contained_as_an_internal_failur
     }
 }
 
-/// The endpoint is the PLANE's: stable however often it is read, shared by every stream
-/// of the store that asks for that plane, and never the other plane's.
+/// The endpoint is ONE STREAM's plane: stable however often that stream reads it, shared
+/// by every API the same media endpoint binds, never the other plane's — and never another
+/// stream's, since `GetDataEndpoint` resolves "an endpoint for a specified stream" and so
+/// hands each stream its own.
 #[tokio::test]
-async fn a_data_endpoint_is_stable_across_reads_and_is_the_planes_own() {
+async fn a_data_endpoint_is_stable_across_reads_and_is_the_streams_own_plane() {
     let control = CONTROL_PLANES[0];
     let router = harness();
     let streams = ["alpha", "beta", "a.b_c-1"];
@@ -655,7 +657,8 @@ async fn a_data_endpoint_is_stable_across_reads_and_is_the_planes_own() {
         create_stream(&router, control, stream).await;
     }
 
-    let mut seen: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    // api_name -> stream -> the one endpoint announced for that pair.
+    let mut seen: BTreeMap<String, BTreeMap<String, String>> = BTreeMap::new();
     for api_name in [PUT_MEDIA, "GET_MEDIA", "LIST_FRAGMENTS"] {
         for stream in streams {
             let mut values = Vec::new();
@@ -678,36 +681,57 @@ async fn a_data_endpoint_is_stable_across_reads_and_is_the_planes_own() {
                 "case {stream:?} {api_name:?}: reading the endpoint must not change it, \
                  got {values:?}"
             );
-            seen.entry(api_name.to_string()).or_default().insert(first);
+            seen.entry(api_name.to_string())
+                .or_default()
+                .insert(stream.to_string(), first);
         }
     }
 
-    for (api_name, values) in &seen {
+    // Each stream is announced an endpoint of its own on every plane: the discovery call
+    // names a stream precisely so the address it reports belongs to that stream.
+    for (api_name, by_stream) in &seen {
+        let distinct: BTreeSet<&String> = by_stream.values().collect();
         assert_eq!(
-            values.len(),
-            1,
-            "case {api_name:?}: one plane is served at one address, whichever stream asks \
-             for it, got {values:?}"
+            distinct.len(),
+            streams.len(),
+            "case {api_name:?}: each stream must be announced its own endpoint, \
+             got {by_stream:?}"
         );
     }
-    // The partition is by the media endpoint that serves each API: the live media
-    // endpoint `PUT_MEDIA` and `GET_MEDIA` share, and the archived-media one.
-    let media = seen
-        .get(PUT_MEDIA)
-        .unwrap_or_else(|| panic!("no endpoint for {PUT_MEDIA}"));
+
+    // And for ONE stream the partition is by the media endpoint that serves each API: the
+    // live media endpoint `PUT_MEDIA` and `GET_MEDIA` share, and the archived-media one is
+    // another address.
+    let announced = |api_name: &str, stream: &str| {
+        seen.get(api_name)
+            .and_then(|by_stream| by_stream.get(stream))
+            .cloned()
+            .unwrap_or_else(|| panic!("case {stream:?} {api_name:?}: no endpoint was announced"))
+    };
+    let mut every_address: BTreeSet<String> = BTreeSet::new();
+    for stream in streams {
+        let media = announced(PUT_MEDIA, stream);
+        assert_eq!(
+            announced("GET_MEDIA", stream),
+            media,
+            "case {stream:?} \"GET_MEDIA\": the live read is served by the endpoint the \
+             ingest is, got {seen:?}"
+        );
+        let archive = announced("LIST_FRAGMENTS", stream);
+        assert_ne!(
+            archive, media,
+            "case {stream:?} \"LIST_FRAGMENTS\": the endpoint that reads stored fragments is \
+             not the live media one, got {seen:?}"
+        );
+        every_address.insert(media);
+        every_address.insert(archive);
+    }
+    // Two addresses per stream, and no address is shared by two streams or two planes.
     assert_eq!(
-        seen.get("GET_MEDIA"),
-        Some(media),
-        "case \"GET_MEDIA\": the live read is served by the endpoint the ingest is, \
-         got {seen:?}"
-    );
-    let archive = seen
-        .get("LIST_FRAGMENTS")
-        .unwrap_or_else(|| panic!("no endpoint for LIST_FRAGMENTS"));
-    assert_ne!(
-        archive, media,
-        "case \"LIST_FRAGMENTS\": the endpoint that reads stored fragments is not the live \
-         media one, got {seen:?}"
+        every_address.len(),
+        streams.len() * 2,
+        "case \"every announced address\": each stream's two media endpoints are two \
+         addresses of its own, got {every_address:?}"
     );
 }
 

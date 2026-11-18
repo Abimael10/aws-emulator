@@ -645,6 +645,17 @@ pub const STREAM_NOT_FOUND_MESSAGE: &str = "The requested stream is not found or
 pub const ONE_STREAM_IDENTIFIER_MESSAGE: &str =
     "One of StreamName or StreamARN must be provided, but not both.";
 
+/// The emulator endpoint this request reached, when it reached one this emulator serves
+/// rather than a host that names a service.
+///
+/// This is what scopes a read to the stream the address it arrived on was announced for
+/// ([`ComAmazonawsKinesisvideoarchivedmediaAwsacuityreaderState::resolve_stream`]): a
+/// `GetDataEndpoint` call names the stream it wants an endpoint for, so the archived-media
+/// address it hands back is that stream's.
+pub fn addressed_endpoint(ctx: &::smithy_server_runtime::OperationContext<'_>) -> Option<String> {
+    ::service_common::data_plane_addressing::reached_emulator_endpoint_of_parts(ctx.parts())
+}
+
 /// The refusal a timestamp range whose end does not come after its start
 /// carries: `EndTimestamp` "must be later than the StartTimestamp value".
 pub const TIMESTAMP_RANGE_ORDER_MESSAGE: &str = "StartTimestamp must be before EndTimestamp.";
@@ -806,7 +817,7 @@ impl ComAmazonawsKinesisvideoarchivedmediaAwsacuityreaderState {
         true
     }
 
-    /// Resolve the one stream a request names.
+    /// Resolve the one stream a request names, at the address it arrived on.
     ///
     /// The model documents `StreamName` and `StreamARN` as "Specify either this
     /// parameter or the StreamName parameter", so exactly one must be present:
@@ -825,12 +836,25 @@ impl ComAmazonawsKinesisvideoarchivedmediaAwsacuityreaderState {
     /// neither that registry nor this service's own archive answers to is a
     /// missing resource too.
     ///
+    /// `addressed_endpoint` is the emulator address the request reached, when it
+    /// reached one this emulator serves
+    /// ([`::service_common::data_plane_addressing::reached_emulator_endpoint_of_parts`]).
+    /// A `GetDataEndpoint` call names the stream it wants an endpoint for and is
+    /// answered with that stream's own endpoint, so an announced address serves
+    /// the ONE stream it was discovered for: a read at it naming another stream
+    /// asked an endpoint for a stream it does not serve, which is as unreadable
+    /// as a stream that is not there and carries the same sentence. An address
+    /// this emulator announced nothing at — its control-plane front door, a
+    /// public AWS host a client resolved — scopes nothing, so a read there
+    /// resolves on the registry alone.
+    ///
     /// The control-plane store is locked while this service's own store is
     /// already locked (the caller holds that guard); the control plane never
     /// reads this service's state, so there is no cycle between the two.
     pub fn resolve_stream<Eng: Send + Sync + 'static>(
         &self,
         engine: &Eng,
+        addressed_endpoint: Option<&str>,
         stream_name: Option<&str>,
         stream_arn: Option<&str>,
     ) -> Result<ResolvedStream<'_>, StreamLookupError> {
@@ -843,6 +867,12 @@ impl ComAmazonawsKinesisvideoarchivedmediaAwsacuityreaderState {
             _ => {}
         }
 
+        // Which stream the ADDRESS serves, when it is one this emulator announced for a
+        // stream: everything resolved below has to be that stream.
+        let announced_for = addressed_endpoint
+            .and_then(|address| control_plane::published_endpoint_stream(engine, address));
+        let serves = |arn: &str| announced_for.as_deref().is_none_or(|served| served == arn);
+
         // The stream as the control plane holds it right now, with this
         // service's archive for it — which is empty for a registered stream
         // nothing has been ingested into, and that emptiness is what the
@@ -852,7 +882,7 @@ impl ComAmazonawsKinesisvideoarchivedmediaAwsacuityreaderState {
             // is not a readable stream: the archived-media plane refuses it as
             // the missing resource it is, rather than reporting the archive of
             // a stream that is not there yet or is on its way out.
-            if !registered.readable() {
+            if !registered.readable() || !serves(&registered.arn) {
                 return Err(StreamLookupError::NotFound(
                     STREAM_NOT_FOUND_MESSAGE.to_string(),
                 ));
@@ -879,14 +909,14 @@ impl ComAmazonawsKinesisvideoarchivedmediaAwsacuityreaderState {
             (None, None) => None,
         };
         match archive {
-            Some(held) => Ok(ResolvedStream {
+            Some(held) if serves(&held.arn) => Ok(ResolvedStream {
                 name: held.name.clone(),
                 arn: held.arn.clone(),
                 data_retention_in_hours: i64::from(held.data_retention_in_hours),
                 archive_content_type: held.archive_content_type.clone(),
                 fragments: held.fragments.as_slice(),
             }),
-            None => Err(StreamLookupError::NotFound(
+            _ => Err(StreamLookupError::NotFound(
                 STREAM_NOT_FOUND_MESSAGE.to_string(),
             )),
         }

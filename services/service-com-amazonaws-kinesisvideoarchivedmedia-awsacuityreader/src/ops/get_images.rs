@@ -400,6 +400,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
             let stream = match state.resolve_stream(
                 &*self.engine,
+                crate::state::addressed_endpoint(ctx).as_deref(),
                 input.stream_name.as_deref(),
                 input.stream_arn.as_deref(),
             ) {

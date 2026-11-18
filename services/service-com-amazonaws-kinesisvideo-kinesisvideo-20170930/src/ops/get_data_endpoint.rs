@@ -187,22 +187,32 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The endpoint is reported only for a stream that is actually in the store, so
         // both forms of identifier resolve against the same record and an identifier
-        // that names nothing is refused rather than handed an address. The guard is
-        // dropped here, before the plane's address is resolved: no lock is held across
-        // an await.
-        {
+        // that names nothing is refused rather than handed an address. The record's ARN
+        // is the stream's one identity, and the endpoint announced below is THAT
+        // stream's: the discovery call names a stream precisely so the address it hands
+        // back belongs to it. The guard is dropped here, before the plane's address is
+        // resolved: no lock is held across an await.
+        let stream_arn = {
             let mut store = state.lock();
             store.settle_clock();
             store
                 .resolve(input.stream_name.as_deref(), input.stream_arn.as_deref())
-                .map_err(lookup_error)?;
-        }
+                .map_err(lookup_error)?
+                .stream_arn
+                .clone()
+        };
 
-        // The plane's own address, which this emulator answers on — see
+        // The stream's own address on that plane, which this emulator answers on — see
         // [`crate::state::ensure_data_endpoint`]. An address that cannot be opened is
         // reported as a failure rather than announced as an endpoint nothing serves.
-        let Some(endpoint) =
-            crate::state::ensure_data_endpoint(&*self.engine, &state, plane, ctx.callback()).await
+        let Some(endpoint) = crate::state::ensure_data_endpoint(
+            &*self.engine,
+            &state,
+            plane,
+            &stream_arn,
+            ctx.callback(),
+        )
+        .await
         else {
             return Err(GetDataEndpointErrorModeled::ClientLimitExceededException(
                 ClientLimitExceededException {

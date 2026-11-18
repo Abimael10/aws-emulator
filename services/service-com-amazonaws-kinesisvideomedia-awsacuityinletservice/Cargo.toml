@@ -47,6 +47,9 @@ webm-iterable = "0.7"
 emulator-core-build-support = { workspace = true }
 
 [dev-dependencies]
+# Declares one suite per `tests/all/<name>.rs` from `tests/all/main.rs`, so a new suite
+# is picked up by being added.
+automod = { workspace = true }
 sha2 = { workspace = true }
 hex = { workspace = true }
 # IAM and the token service, mounted beside this one in the authorization suite's harness:

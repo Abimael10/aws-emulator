@@ -358,14 +358,23 @@ async fn the_ingest_route_is_served_only_at_the_origin_announced_for_the_write_p
             address,
             served,
         } = *row;
+        let name = format!("plane-probe-{index}");
+        harness.create_stream(control, &name).await;
+        // The announced rows are addressed at the endpoint announced for the row's OWN
+        // stream: a data endpoint belongs to the stream it was discovered for, so the
+        // address under test here is that stream's plane and nothing else varies.
         let authority = match address {
-            Address::AnnouncedWritePlane => write_plane.clone(),
-            Address::AnnouncedArchivePlane => archive_plane.clone(),
+            Address::AnnouncedWritePlane => {
+                harness.announced_authority(control, &name, "PUT_MEDIA").await
+            }
+            Address::AnnouncedArchivePlane => {
+                harness
+                    .announced_authority(control, &name, "LIST_FRAGMENTS")
+                    .await
+            }
             Address::FrontDoor(literal) => literal.to_string(),
             Address::PublishedHost => PUBLISHED_HOST.to_string(),
         };
-        let name = format!("plane-probe-{index}");
-        harness.create_stream(control, &name).await;
 
         // The identical request, differing only in the address it is sent to.
         let headers = ingest_headers(

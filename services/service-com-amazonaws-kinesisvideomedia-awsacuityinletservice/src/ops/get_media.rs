@@ -505,6 +505,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                             .to_string(),
                     )
                 })?;
+            // And the stream has to be the one the ADDRESS serves: an announced data
+            // endpoint is the endpoint of the stream it was discovered for, so a read at
+            // it naming another stream asked an endpoint for a stream it does not serve —
+            // as unreadable as a stream that is not there, and the same sentence.
+            if !crate::service::read_plane::serves_the_addressed_stream(
+                &*self.engine,
+                ctx.parts(),
+                &stream.arn,
+            ) {
+                return Err(resource_not_found(
+                    ::service_com_amazonaws_kinesisvideoarchivedmedia_awsacuityreader::state::STREAM_NOT_FOUND_MESSAGE
+                        .to_string(),
+                ));
+            }
             let fragments = stream.fragments;
             let start = match selector_type {
                 // "EARLIEST - Start with earliest available chunk on the stream."

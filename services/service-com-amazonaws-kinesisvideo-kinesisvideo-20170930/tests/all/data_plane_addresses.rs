@@ -237,6 +237,113 @@ async fn a_control_call_is_not_served_at_an_address_announced_for_a_data_plane()
     }
 }
 
+/// RULE: an announced address belongs to the stream it was discovered for, so it stops
+/// being an address of this store when that stream is removed — the record that holds the
+/// port goes with the stream, and the address no longer places on any plane.
+///
+/// The rows are the two planes of the removed stream, so the release is a property of the
+/// stream rather than of one endpoint; a second stream's addresses are announced beside
+/// them and keep placing on their planes, so the release is about the removed stream alone.
+#[tokio::test]
+async fn an_announced_address_is_released_when_its_stream_is_removed() {
+    let harness = Harness::new();
+    let removed_arn = harness.create_stream("released").await;
+    harness.create_stream("retained").await;
+    let mut released: Vec<(&str, String)> = Vec::new();
+    let mut kept: Vec<(&str, String)> = Vec::new();
+    for api_name in ["PUT_MEDIA", "LIST_FRAGMENTS"] {
+        released.push((
+            api_name,
+            harness
+                .announced_authority(serde_json::json!({ "StreamName": "released" }), api_name)
+                .await,
+        ));
+        kept.push((
+            api_name,
+            harness
+                .announced_authority(serde_json::json!({ "StreamName": "retained" }), api_name)
+                .await,
+        ));
+    }
+    for (api_name, authority) in released.iter().chain(kept.iter()) {
+        assert!(
+            kvs::state::published_plane(&*harness.engine, authority).is_some(),
+            "case {api_name:?}: the announced address must place on its plane before the \
+             delete, got none for {authority:?}"
+        );
+    }
+
+    // A delete is accepted on an ACTIVE stream, so the record is awaited in its terminal
+    // status first: the CONDITION is polled for, under a deadline far longer than the
+    // transition needs.
+    await_status(&harness, "released", "ACTIVE").await;
+    let (status, body) = harness
+        .call(
+            "/deleteStream",
+            serde_json::json!({ "StreamARN": removed_arn }),
+        )
+        .await;
+    assert_eq!(
+        status, 200,
+        "DeleteStream of an ACTIVE stream expected HTTP 200, got {status} with {body:?}"
+    );
+    // And the removal itself is what releases the endpoints, so the case waits until the
+    // record is gone rather than for a span.
+    await_removed(&harness, "released").await;
+
+    for (api_name, authority) in &released {
+        let placed = kvs::state::published_plane(&*harness.engine, authority);
+        assert_eq!(
+            placed, None,
+            "case {api_name:?}: the removed stream's announced address belongs to no plane, \
+             got {placed:?} for {authority:?}"
+        );
+    }
+    for (api_name, authority) in &kept {
+        assert!(
+            kvs::state::published_plane(&*harness.engine, authority).is_some(),
+            "case {api_name:?}: another stream's address keeps placing on its plane, got none \
+             for {authority:?}"
+        );
+    }
+}
+
+/// Poll `DescribeStream` until the stream `name` reports `wanted`, under a deadline far
+/// longer than a status transition needs.
+async fn await_status(harness: &Harness, name: &str, wanted: &str) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    let mut last = serde_json::Value::Null;
+    while std::time::Instant::now() < deadline {
+        let (_, body) = harness
+            .call("/describeStream", serde_json::json!({ "StreamName": name }))
+            .await;
+        last = body;
+        if last["StreamInfo"]["Status"].as_str() == Some(wanted) {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    panic!("case {name:?}: expected Status {wanted:?} before the deadline, got {last:?}");
+}
+
+/// Poll `DescribeStream` until the stream `name` is gone from the registry, which is the
+/// instant its announced endpoints are owed their release.
+async fn await_removed(harness: &Harness, name: &str) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    let mut last = 0;
+    while std::time::Instant::now() < deadline {
+        let (status, _) = harness
+            .call("/describeStream", serde_json::json!({ "StreamName": name }))
+            .await;
+        last = status;
+        if status == 404 {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    panic!("case {name:?}: expected the record to be gone before the deadline, got HTTP {last}");
+}
+
 /// An address that is not a plane's belongs to no plane: the control-plane front door the
 /// discovery call arrived on, the published service host, an announced host on another
 /// port, and a value no host is shaped like.

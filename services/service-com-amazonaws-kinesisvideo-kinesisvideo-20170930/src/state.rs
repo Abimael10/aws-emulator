@@ -16,8 +16,9 @@ pub mod data_endpoint;
 pub mod data_plane_serving;
 
 pub use data_endpoint::{
-    data_plane_of, ensure_data_endpoint, published_plane, serve_on_data_plane, service_host,
-    DataPlane, DataPlaneEndpoint, DATA_PLANE_SCHEME,
+    data_plane_of, endpoint_serves_stream, ensure_data_endpoint, published_endpoint,
+    published_endpoint_stream, published_plane, serve_on_data_plane, service_host, DataPlane,
+    DataPlaneEndpoint, StreamPlane, DATA_PLANE_SCHEME,
 };
 
 use crate::ops::types::{
@@ -507,11 +508,13 @@ pub struct ComAmazonawsKinesisvideoKinesisvideo20170930State {
     /// so two mints never ask the same question of the entropy source. It is NOT part
     /// of the token it helps mint.
     pub version_seq: u64,
-    /// The address each data plane of this store is published at, with the listener
-    /// that answers there — opened on the first `GetDataEndpoint` for that plane (see
-    /// [`ensure_data_endpoint`]) and held here for the life of the store, so a plane's
-    /// announced endpoint never moves under a client.
-    pub data_endpoints: BTreeMap<DataPlane, DataPlaneEndpoint>,
+    /// The address each announced endpoint of this store is published at, with the
+    /// listener that answers there — opened on the first `GetDataEndpoint` for that
+    /// stream and plane (see [`ensure_data_endpoint`]) and held here for the life of the
+    /// store, so an announced endpoint never moves under a client. Keyed by both halves
+    /// of what a discovery call resolves ([`StreamPlane`]), because the endpoint it
+    /// reports is the endpoint of the stream the call named.
+    pub data_endpoints: BTreeMap<StreamPlane, DataPlaneEndpoint>,
 }
 
 impl ComAmazonawsKinesisvideoKinesisvideo20170930State {
@@ -538,6 +541,11 @@ impl ComAmazonawsKinesisvideoKinesisvideo20170930State {
         for (stream_name, stream_arn) in due {
             self.streams.remove(&stream_name);
             self.stream_arn_index.remove(&stream_arn);
+            // A removed stream's announced endpoints go with it: an endpoint belongs to
+            // the stream it was discovered for, so once that stream is gone there is
+            // nothing for it to serve — and dropping the record closes the port it held.
+            self.data_endpoints
+                .retain(|announced, _| announced.stream_arn != stream_arn);
         }
 
         for stream in self.streams.values_mut() {
