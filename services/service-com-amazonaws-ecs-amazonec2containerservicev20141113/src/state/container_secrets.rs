@@ -34,9 +34,10 @@
 //! in-process callback — so what is injected is what a client reads back from that service,
 //! and nothing is fetched for a reference it would refuse.
 //!
-//! A reference this module decides nothing about is launched: a `valueFrom` naming a Systems
-//! Manager parameter is that service's to answer and is not decided here, and neither is one
-//! that is no ARN at all.
+//! A `valueFrom` naming a Systems Manager PARAMETER is the other store's — that service owns
+//! both halves of it the same way, so it is decided and retrieved beside this one
+//! ([`super::parameter_store_secrets`]). A reference naming neither store is launched with
+//! nothing decided for it.
 //!
 //! # Where each half happens
 //!
@@ -88,6 +89,10 @@ pub struct ContainerSecret {
     /// is exposed to the container as for a `secrets` entry, and the log-driver option it
     /// fills for a `secretOptions` one.
     pub name: String,
+    /// The Region the reference is RESOLVED at for a store that takes a name as well as an
+    /// ARN: the Region the task runs in, which is the Region of the revision it runs
+    /// ([`super::parameter_store_secrets::ParameterStoreReference::parse`]).
+    pub region: String,
     /// `Secret$valueFrom`: "the secret to expose to the container".
     pub value_from: String,
     /// Whether this entry is a `secrets` entry, whose value the container's process sees as
@@ -106,6 +111,11 @@ pub struct ContainerSecret {
 /// The order is what decides WHICH refusal a launch referencing several unreadable secrets
 /// stops with, so it is the revision's own order and nothing else.
 pub fn definition_secrets(definition: &TaskDefinitionRecord) -> Vec<ContainerSecret> {
+    // A reference written as a NAME rather than an ARN names no Region of its own, so it is
+    // resolved in the Region the task runs in, which is the Region of the revision it runs.
+    let region = ::service_common::arn::parse(&definition.arn)
+        .map(|arn| arn.region.to_string())
+        .unwrap_or_default();
     let mut collected = Vec::new();
     for container in &definition.container_definitions {
         let container_name = container.name.clone().unwrap_or_default();
@@ -113,6 +123,7 @@ pub fn definition_secrets(definition: &TaskDefinitionRecord) -> Vec<ContainerSec
             collected.push(ContainerSecret {
                 container_name: container_name.clone(),
                 name: secret.name.clone(),
+                region: region.clone(),
                 value_from: secret.value_from.clone(),
                 environment_variable: true,
             });
@@ -125,6 +136,7 @@ pub fn definition_secrets(definition: &TaskDefinitionRecord) -> Vec<ContainerSec
             collected.push(ContainerSecret {
                 container_name: container_name.clone(),
                 name: secret.name.clone(),
+                region: region.clone(),
                 value_from: secret.value_from.clone(),
                 environment_variable: false,
             });
@@ -206,9 +218,26 @@ const RETRIEVAL_ATTEMPTS: usize = 1;
 /// Secrets Manager read (`asm`) the fetch was; `failure` is the answer that service gave,
 /// which carries the authorization refusal or its own account of what it does not hold.
 pub fn unable_to_retrieve_secret_message(failure: &str) -> String {
+    unable_to_retrieve_resource_message(ASM_SECRET_RESOURCE, failure)
+}
+
+/// What the agent calls the resource it fetched from Secrets Manager: ONE secret's value,
+/// retrieved from `asm`.
+const ASM_SECRET_RESOURCE: &str = "secret from asm";
+
+/// The `Task$stoppedReason` of a task whose containers could not be launched because the
+/// execution resource `resource` could not be retrieved — the one wording of that stop, which
+/// each store the agent fetches from fills with its own resource and its own failure
+/// ([`unable_to_retrieve_secret_message`] for Secrets Manager,
+/// [`super::parameter_store_secrets::unable_to_fetch_parameter_message`] for Parameter
+/// Store).
+///
+/// The agent states how many times it retried the call it could not complete, which is the
+/// same for either store ([`RETRIEVAL_ATTEMPTS`]).
+pub fn unable_to_retrieve_resource_message(resource: &str, failure: &str) -> String {
     format!(
         "ResourceInitializationError: unable to pull secrets or registry auth: execution \
-         resource retrieval failed: unable to retrieve secret from asm: service call has been \
+         resource retrieval failed: unable to retrieve {resource}: service call has been \
          retried {RETRIEVAL_ATTEMPTS} time(s): {failure}"
     )
 }
@@ -260,25 +289,35 @@ pub fn unretrievable_secret<Eng: Send + Sync + 'static>(
             session_arn: session_arn.as_deref(),
         });
     launch.secrets.iter().find_map(|secret| {
-        // A reference naming anything but a secret of Secrets Manager is not that service's
-        // to answer, so nothing is decided for it here.
-        let reference = SecretsManagerReference::parse(&secret.value_from)?;
-        match secret_retrieval::serve_secret_retrieval(
-            engine,
-            &reference.region,
-            &reference.secret_arn,
-            principal,
-        ) {
-            Ok(()) => None,
-            Err(secret_retrieval::RetrievalRefusal::NotAuthorized { message, .. }) => Some(
-                unable_to_retrieve_secret_message(&format!("{ACCESS_DENIED_CLASS}: {message}")),
-            ),
-            Err(secret_retrieval::RetrievalRefusal::NotFound { message }) => {
-                Some(unable_to_retrieve_secret_message(&format!(
-                    "{RESOURCE_NOT_FOUND_CLASS}: {message}"
-                )))
-            }
+        // Each reference is the OWNING store's to answer: a secret of Secrets Manager here,
+        // and a parameter of Systems Manager through that service's own gate
+        // ([`super::parameter_store_secrets`]). A reference naming neither store is not
+        // decided at all.
+        if let Some(reference) = SecretsManagerReference::parse(&secret.value_from) {
+            return match secret_retrieval::serve_secret_retrieval(
+                engine,
+                &reference.region,
+                &reference.secret_arn,
+                principal,
+            ) {
+                Ok(()) => None,
+                Err(secret_retrieval::RetrievalRefusal::NotAuthorized { message, .. }) => Some(
+                    unable_to_retrieve_secret_message(&format!("{ACCESS_DENIED_CLASS}: {message}")),
+                ),
+                Err(secret_retrieval::RetrievalRefusal::NotFound { message }) => {
+                    Some(unable_to_retrieve_secret_message(&format!(
+                        "{RESOURCE_NOT_FOUND_CLASS}: {message}"
+                    )))
+                }
+            };
         }
+        let reference = ParameterStoreReference::parse(&secret.value_from, &secret.region)?;
+        unretrievable_parameter(
+            engine,
+            &reference,
+            launch.execution_role_arn.as_deref(),
+            session_arn.as_deref(),
+        )
     })
 }
 
@@ -372,12 +411,17 @@ pub async fn fetched_environment(
     let mut resolved = environment.clone();
     for secret in secrets {
         // A reference this emulator resolves nothing for leaves the variable as the
-        // container's own environment has it: the store it names is not this module's to
-        // read, exactly as the launch decision does not decide against it.
-        let Some(reference) = SecretsManagerReference::parse(&secret.value_from) else {
+        // container's own environment has it: the store it names is not one of the two these
+        // values are read from, exactly as the launch decision does not decide against it.
+        let value = if let Some(reference) = SecretsManagerReference::parse(&secret.value_from) {
+            retrieved_value(callback, &reference).await.ok()?
+        } else if let Some(reference) =
+            ParameterStoreReference::parse(&secret.value_from, &secret.region)
+        {
+            retrieved_parameter_value(callback, &reference).await.ok()?
+        } else {
             continue;
         };
-        let value = retrieved_value(callback, &reference).await.ok()?;
         resolved.insert(secret.name.clone(), value);
     }
     Some(resolved)
@@ -513,11 +557,16 @@ pub async fn unretrievable_secret_value(
     secrets: &[ContainerSecret],
 ) -> Option<String> {
     for secret in secrets {
-        let Some(reference) = SecretsManagerReference::parse(&secret.value_from) else {
-            continue;
-        };
-        if let Err(failure) = retrieved_value(callback, &reference).await {
-            return Some(unable_to_retrieve_secret_message(&failure));
+        if let Some(reference) = SecretsManagerReference::parse(&secret.value_from) {
+            if let Err(failure) = retrieved_value(callback, &reference).await {
+                return Some(unable_to_retrieve_secret_message(&failure));
+            }
+        } else if let Some(reference) =
+            ParameterStoreReference::parse(&secret.value_from, &secret.region)
+        {
+            if let Err(failure) = retrieved_parameter_value(callback, &reference).await {
+                return Some(unable_to_fetch_parameter_message(&failure));
+            }
         }
     }
     None

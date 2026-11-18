@@ -37,18 +37,28 @@
 //! encrypted at all: "This flag is ignored for String and StringList parameter types"
 //! (`smithy_query(query="doc",shape="GetParameterRequest",member="WithDecryption")`).
 //!
-//! A key's own KEY STATE decides every one of these calls before its policy is read: KMS
-//! runs no cryptographic operation under a key that is not usable right now, so a value
-//! can neither be sealed nor opened under a key that is disabled or awaiting deletion or
-//! key material ([`key_state_refusal`]). Parameter Store words none of that itself — it
-//! RELAYS what its KMS call failed with ([`relayed`]), KMS's own sentence followed by the
-//! metadata block an AWS error carries — and reports it as the `InvalidKeyId` both the
-//! read and the write model for a key that cannot serve the request.
+//! A key's own KEY STATE decides a call its POLICY has already admitted: KMS runs no
+//! cryptographic operation under a key that is not usable right now, so a value can neither be
+//! sealed nor opened under a key that is disabled or awaiting deletion or key material
+//! ([`key_state_refusal`]). The order matters where both would refuse a read: KMS decides
+//! whether the principal may USE the key first, so a principal the key does not permit is
+//! refused the same way whatever state the key is in and learns nothing about that state from
+//! the refusal, while a principal the key does permit is told what about the state refuses the
+//! call. A write names no principal for a key policy to be read against, so a put is decided
+//! by the key state alone. Parameter Store words none of that itself — it RELAYS what its KMS
+//! call failed with ([`relayed`]), KMS's own sentence followed by the metadata block an AWS
+//! error carries — and reports it as the `InvalidKeyId` both the read and the write model for
+//! a key that cannot serve the request.
 //!
 //! An Amazon Web Services managed key — the one [`super::DEFAULT_SECURE_STRING_KEY_ID`]
 //! names — carries a policy AWS manages for the service that owns it, so a caller needs
 //! no grant of its own on it; its value is still sealed and opened under it like any
 //! other.
+//!
+//! The same questions, in the same order, are asked of a retrieval ANOTHER service makes on a
+//! workload's behalf, as a role of the caller's account rather than for a caller of this
+//! service ([`may_open_as_role`], used by [`super::parameter_retrieval`]): the key's policy
+//! together with the documents in force on that role, and then the key's state.
 
 use std::collections::HashMap;
 
@@ -257,11 +267,7 @@ where
         return Ok(Vec::new());
     }
     let Some(kms) = kms_store::service_state(engine) else {
-        return Err(OpenRefusal::Key(
-            "no KMS service is mounted beside Systems Manager, so a SecureString cannot be \
-             decrypted"
-                .to_string(),
-        ));
+        return Err(OpenRefusal::Key(NO_KMS_MOUNTED.to_string()));
     };
     // The caller is resolved before the KMS store is locked, because resolving it reads
     // the STS and IAM stores.
@@ -269,71 +275,164 @@ where
     let store = kms.lock();
     let mut opened = Vec::with_capacity(values.len());
     for (at, value) in values {
-        let key = match store.resolve(region, &value.key_id) {
-            kms_store::KeyRef::Found(key) => key,
-            // An identifier whose account segment is not an account id is refused for
-            // want of permission before any key is looked up, so the value cannot be
-            // opened under it at all.
-            kms_store::KeyRef::UnauthorizedAccount => {
-                return Err(OpenRefusal::Denied(
-                    kms_store::unauthorized_account_message(DECRYPT_OPERATION),
-                ))
-            }
-            // The key the value was sealed under is no longer there, so nothing can open
-            // the ciphertext this read would have to report.
-            kms_store::KeyRef::NotFound | kms_store::KeyRef::MalformedArn => {
-                return Err(OpenRefusal::Key(kms_store::key_not_found_message(
-                    region,
-                    &value.key_id,
-                )))
-            }
-        };
-        // The key's own key state decides the read before its policy is read and before
-        // its material is reached, exactly as a direct `kms:Decrypt` is decided: a key KMS
-        // runs no cryptographic operation under opens nothing here either, so a key
-        // suspended as a kill switch refuses every value sealed under it instead of the
-        // plaintext being served.
-        if let Some(refusal) = key_state_refusal(key) {
-            return Err(OpenRefusal::Key(refusal));
-        }
-        let context = context(&value.parameter_arn);
-        // An Amazon Web Services managed key's policy is AWS's own, managed for the
-        // service that owns the key, so a caller needs no grant of its own on it.
-        if key.key_manager == kms_store::KEY_MANAGER_CUSTOMER {
-            kms_store::authorization::authorize_use(
-                &caller,
-                &store,
-                region,
-                key,
-                kms_store::authorization::RequestedUse::through_service(
-                    DECRYPT_OPERATION,
-                    &via_service(region),
-                ),
-                Some(&context),
-                None,
-            )
-            .map_err(OpenRefusal::Denied)?;
-        }
-        // The ciphertext opens only under the key that sealed it and the encryption
-        // context it was bound to, so a value whose key has been rotated past its
-        // material, or whose stored bytes are not that key's envelope, has no plaintext
-        // to report rather than one being invented.
-        let decoded = ::aws_smithy_types::base64::decode(&value.stored).ok();
-        let plaintext = decoded
-            .as_deref()
-            .and_then(kms_store::parse_envelope)
-            .and_then(|envelope| kms_store::unseal(key, &envelope, Some(&context)))
-            .and_then(|opened| String::from_utf8(opened.plaintext).ok())
-            .ok_or_else(|| {
-                OpenRefusal::Key(format!(
-                    "the value of {} is not a ciphertext {} opens",
-                    value.parameter_arn, key.arn
-                ))
-            })?;
-        opened.push((*at, plaintext));
+        let key = resolved_key(&store, region, value)?;
+        // The key's POLICY decides the read before its STATE: KMS tells a principal the key
+        // does not permit nothing about the key's state (see the module docs).
+        authorize_decrypt(&caller, &store, region, key, value)?;
+        usable(key)?;
+        opened.push((*at, plaintext_of(key, value)?));
     }
     Ok(opened)
 }
+
+/// The ROLE another AWS service opens a value AS, for a retrieval it performs on a
+/// workload's behalf rather than for a caller of this service
+/// ([`super::parameter_retrieval`]).
+#[derive(Debug, Clone, Copy)]
+pub struct OpeningRole<'a> {
+    /// The IAM role whose identity-based documents are in force on the decrypt, and which a
+    /// key policy grants it by naming.
+    pub role_arn: &'a str,
+    /// The ARN a refusal NAMES as the principal: the session the retrieving service assumed
+    /// that role in, which is what AWS reports for a call made under one. `None` names the
+    /// role itself.
+    pub session_arn: Option<&'a str>,
+}
+
+/// Whether `value` could be opened for `role` right now, without opening it.
+///
+/// The two halves a decrypt turns on, in the order KMS takes them: the key's POLICY together
+/// with the documents in force on the role, and then the key's own KEY STATE, which runs no
+/// cryptographic operation for anybody. A role the key does not permit is therefore refused
+/// the same way whatever state the key is in, and learns nothing about that state from the
+/// refusal; a role the key DOES permit is told what about the state refuses the retrieval. A
+/// retrieval made as NO role (`None`) states no principal for a policy to be read against, so
+/// it is decided on the key state alone — the same rule every other gate over a role's
+/// documents in this tree keeps.
+///
+/// What this answers is whether the value a workload is to be given could be produced at
+/// all, which is what decides whether that workload starts; the VALUE itself is read through
+/// this service's own `GetParameter` ([`open`] is what opens one).
+///
+/// Reaches no state of THIS service, and takes IAM's store lock before KMS's, so a caller
+/// reaches it with no guard of its own held.
+pub fn may_open_as_role<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    region: &str,
+    role: Option<OpeningRole<'_>>,
+    value: &SealedValue,
+) -> Result<(), OpenRefusal> {
+    let Some(kms) = kms_store::service_state(engine) else {
+        return Err(OpenRefusal::Key(NO_KMS_MOUNTED.to_string()));
+    };
+    // The role's own documents are read through KMS's reading of a role principal, before
+    // that service's store is locked: reading them takes IAM's lock.
+    let caller = role.map(|role| {
+        let mut caller = kms_store::authorization::role_caller(engine, role.role_arn);
+        if let Some(session_arn) = role.session_arn {
+            // A key policy may name either spelling of the principal, and a refusal names
+            // the session the role was assumed in.
+            caller.principals.push(session_arn.to_string());
+            caller.arn = session_arn.to_string();
+        }
+        caller
+    });
+    let store = kms.lock();
+    let key = resolved_key(&store, region, value)?;
+    if let Some(caller) = &caller {
+        authorize_decrypt(caller, &store, region, key, value)?;
+    }
+    usable(key)
+}
+
+/// The key `value` is sealed under, when the identifier it was stored under still resolves to
+/// a key of this endpoint.
+fn resolved_key<'store>(
+    store: &'store kms_store::ComAmazonawsKmsTrentserviceState,
+    region: &str,
+    value: &SealedValue,
+) -> Result<&'store kms_store::Cmk, OpenRefusal> {
+    match store.resolve(region, &value.key_id) {
+        kms_store::KeyRef::Found(key) => Ok(key),
+        // An identifier whose account segment is not an account id is refused for
+        // want of permission before any key is looked up, so the value cannot be
+        // opened under it at all.
+        kms_store::KeyRef::UnauthorizedAccount => Err(OpenRefusal::Denied(
+            kms_store::unauthorized_account_message(DECRYPT_OPERATION),
+        )),
+        // The key the value was sealed under is no longer there, so nothing can open
+        // the ciphertext this read would have to report.
+        kms_store::KeyRef::NotFound | kms_store::KeyRef::MalformedArn => Err(OpenRefusal::Key(
+            kms_store::key_not_found_message(region, &value.key_id),
+        )),
+    }
+}
+
+/// Whether `key`'s own key state lets KMS run the decrypt: a key KMS runs no cryptographic
+/// operation under opens nothing here either, so a key suspended as a kill switch refuses
+/// every value sealed under it instead of the plaintext being served.
+fn usable(key: &kms_store::Cmk) -> Result<(), OpenRefusal> {
+    match key_state_refusal(key) {
+        Some(refusal) => Err(OpenRefusal::Key(refusal)),
+        None => Ok(()),
+    }
+}
+
+/// Whether `key`'s policy and the documents in force on `caller` permit it the decrypt of
+/// `value`, under the encryption context that value is bound to.
+///
+/// An Amazon Web Services managed key's policy is AWS's own, managed for the service that
+/// owns the key, so a caller needs no grant of its own on it.
+fn authorize_decrypt(
+    caller: &kms_store::authorization::Caller,
+    store: &kms_store::ComAmazonawsKmsTrentserviceState,
+    region: &str,
+    key: &kms_store::Cmk,
+    value: &SealedValue,
+) -> Result<(), OpenRefusal> {
+    if key.key_manager != kms_store::KEY_MANAGER_CUSTOMER {
+        return Ok(());
+    }
+    kms_store::authorization::authorize_use(
+        caller,
+        store,
+        region,
+        key,
+        kms_store::authorization::RequestedUse::through_service(
+            DECRYPT_OPERATION,
+            &via_service(region),
+        ),
+        Some(&context(&value.parameter_arn)),
+        None,
+    )
+    .map_err(OpenRefusal::Denied)
+}
+
+/// The plaintext `key` opens `value` into.
+///
+/// The ciphertext opens only under the key that sealed it and the encryption context it was
+/// bound to, so a value whose key has been rotated past its material, or whose stored bytes
+/// are not that key's envelope, has no plaintext to report rather than one being invented.
+fn plaintext_of(key: &kms_store::Cmk, value: &SealedValue) -> Result<String, OpenRefusal> {
+    let context = context(&value.parameter_arn);
+    let decoded = ::aws_smithy_types::base64::decode(&value.stored).ok();
+    decoded
+        .as_deref()
+        .and_then(kms_store::parse_envelope)
+        .and_then(|envelope| kms_store::unseal(key, &envelope, Some(&context)))
+        .and_then(|opened| String::from_utf8(opened.plaintext).ok())
+        .ok_or_else(|| {
+            OpenRefusal::Key(format!(
+                "the value of {} is not a ciphertext {} opens",
+                value.parameter_arn, key.arn
+            ))
+        })
+}
+
+/// What a decrypt answers on an engine carrying no KMS service: there is no key service to
+/// open a value under.
+const NO_KMS_MOUNTED: &str =
+    "no KMS service is mounted beside Systems Manager, so a SecureString cannot be decrypted";
 
 /// The encryption context a value of the parameter `parameter_arn` names is bound to.
 fn context(parameter_arn: &str) -> HashMap<String, String> {

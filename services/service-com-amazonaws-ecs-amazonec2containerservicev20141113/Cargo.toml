@@ -85,6 +85,18 @@ service-com-amazonaws-autoscaling-autoscaling-2011-01-01 = { workspace = true }
 # shared engine, so the decision is answered by the service that owns them rather than by a
 # copy kept here. No cycle: that crate does not depend on this one.
 service-com-amazonaws-secretsmanager-secretsmanager = { workspace = true }
+# AWS Systems Manager, for the other half of that same launch decision: a container's
+# `secrets` entry may name a Parameter Store PARAMETER, so whether the task's EXECUTION role
+# may retrieve it, whether this account holds a value to retrieve, and whether the KMS key a
+# `SecureString` is sealed under would open it for that role are answered by that service's
+# own gate (`crate::state::parameter_store_secrets` ->
+# `…ssm…::state::parameter_retrieval::serve_parameter_retrieval`). The parameter, the
+# policies on it and the key its value is sealed under are that service's and KMS's own
+# records, held in their own stores in the shared engine, so the decision is answered by the
+# service that owns them rather than by a copy kept here. The VALUE is read through that
+# service's own `GetParameter` over the in-process callback, so what a container is given is
+# what a client reads back from it. No cycle: that crate does not depend on this one.
+service-com-amazonaws-ssm-amazonssm = { workspace = true }
 # `eventbridge_client`: the ONE in-process EventBridge client an emulated service publishes
 # an event through, so this crate configures no second copy of that hop. `iam_trust_policy`:
 # the tree's ONE reading of a role's trust document, which the execution-role assume above is

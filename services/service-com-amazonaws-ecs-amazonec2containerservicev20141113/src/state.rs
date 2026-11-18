@@ -376,6 +376,11 @@ pub use container_volumes::*;
 mod container_secrets;
 pub use container_secrets::*;
 
+/// The half of those values that names a SYSTEMS MANAGER PARAMETER: the authorization and the
+/// KMS decrypt a `SecureString` reference turns on, and the value the container is given.
+mod parameter_store_secrets;
+pub use parameter_store_secrets::*;
+
 /// The container HEALTH CHECK: the probe a container definition declares, what running it
 /// makes of `healthStatus`, and the containers whose start waits on it.
 mod container_health;

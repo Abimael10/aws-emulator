@@ -10,6 +10,10 @@
 //! operation") are the ones that can carry that refusal, and each of them asks [`refusal`] —
 //! or, for a call that addresses one parameter, [`parameter_refusal`] — first.
 //!
+//! A call another AWS service makes on a workload's behalf is decided by the same three
+//! pieces, with the ROLE that service acts as in place of the signing principal
+//! ([`parameter_refusal_as_role`]).
+//!
 //! The three pieces, each held in exactly one place:
 //!
 //! 1. **who** — the principal the request's access key id speaks for, read from the SAME
@@ -146,7 +150,7 @@ pub fn refusal<Eng: Send + Sync + 'static>(
     operation: &str,
     resource: &str,
 ) -> Option<String> {
-    decide(engine, ctx, operation, resource, &[])
+    decide(&caller(engine, ctx), operation, resource, &[])
 }
 
 /// `Some(message)` when IAM does not allow `ssm:<operation>` on the PARAMETER `name` for the
@@ -169,8 +173,35 @@ pub fn parameter_refusal<Eng: Send + Sync + 'static>(
 ) -> Option<String> {
     let attached = attached_parameter_policies(engine, region, name);
     decide(
-        engine,
-        ctx,
+        &caller(engine, ctx),
+        operation,
+        &super::parameter_arn(region, name),
+        &attached,
+    )
+}
+
+/// [`parameter_refusal`] for a call another AWS service performs as a ROLE of the account on
+/// a workload's behalf, rather than for a caller that signed a request of its own
+/// ([`super::parameter_retrieval`]).
+///
+/// The documents in force are the ROLE's, which is the whole difference: a grant that sits on
+/// some other role decides nothing, and the refusal names the session that role was assumed
+/// in ([`role_caller`]). Both kinds of document take part exactly as they do for a signed
+/// request, so one statement covers a caller's own read of a parameter and a retrieval made
+/// for it by another service.
+///
+/// Asked with NO store guard held: reading the role's documents takes IAM's lock.
+pub fn parameter_refusal_as_role<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    role_arn: &str,
+    session_arn: Option<&str>,
+    operation: &str,
+    region: &str,
+    name: &str,
+) -> Option<String> {
+    let attached = attached_parameter_policies(engine, region, name);
+    decide(
+        &role_caller(engine, role_arn, session_arn),
         operation,
         &super::parameter_arn(region, name),
         &attached,
@@ -220,15 +251,13 @@ fn attached_parameter_policies<Eng: Send + Sync + 'static>(
 /// identity-based documents gave is capped by the permissions boundary, since "a permissions
 /// boundary sets the maximum permissions that an identity-based policy can grant" (IAM,
 /// permissions boundaries).
-fn decide<Eng: Send + Sync + 'static>(
-    engine: &Eng,
-    ctx: &::smithy_server_runtime::OperationContext<'_>,
+fn decide(
+    caller: &Caller,
     operation: &str,
     resource: &str,
     resource_policies: &[String],
 ) -> Option<String> {
     let action = action_for(operation);
-    let caller = caller(engine, ctx);
     let refused = |reason: &str| Some(not_authorized(&caller.arn, &action, resource, reason));
     // A GRANT is read under the caller's own spellings — the session ARN and the role behind
     // it — because a statement naming the ACCOUNT delegates rather than grants. An
@@ -445,6 +474,45 @@ fn caller<Eng: Send + Sync + 'static>(
         // An IAM user's permissions are its own, under the ARN it was resolved by.
         let user_arn = caller.arn.clone();
         caller.read_policies_of(&store, &user_arn);
+    }
+    caller
+}
+
+/// The principal a call another AWS service makes AS a role of this account speaks for, with
+/// the identity-based policies in force on that role.
+///
+/// Such a caller holds exactly what a session of the role holds: the role's ARN is the
+/// spelling a resource-based policy names it by, the role's own documents are what the
+/// decision is taken over, and the refusal names the SESSION the retrieving service assumed
+/// it in when it has one. It presents no credential of the account's own.
+///
+/// A role this account's IAM holds no record for may belong to another account, so its
+/// documents are not this store's to read: nothing can be shown about what it may do, so such
+/// a caller is left unbounded rather than refused on evidence this emulator does not have —
+/// the same rule a principal carrying a document the store cannot read is read by (see the
+/// module docs). An explicit `Deny` in a document that CAN be read still refuses it.
+fn role_caller<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    role_arn: &str,
+    session_arn: Option<&str>,
+) -> Caller {
+    let mut caller = Caller {
+        arn: session_arn.unwrap_or(role_arn).to_string(),
+        principals: vec![role_arn.to_string()],
+        ..Caller::default()
+    };
+    if let Some(session_arn) = session_arn {
+        caller.principals.push(session_arn.to_string());
+    }
+    let Some(iam) = iam_store::service_state(engine) else {
+        caller.unreadable_attachment = true;
+        return caller;
+    };
+    let store = iam.lock();
+    if store.roles.values().any(|role| role.arn == role_arn) {
+        caller.read_policies_of(&store, role_arn);
+    } else {
+        caller.unreadable_attachment = true;
     }
     caller
 }

@@ -13684,6 +13684,7 @@ dependencies = [
  "service-com-amazonaws-secretsmanager-secretsmanager",
  "service-com-amazonaws-servicediscovery-route53autonaming-v20170314",
  "service-com-amazonaws-sqs-amazonsqs",
+ "service-com-amazonaws-ssm-amazonssm",
  "service-com-amazonaws-sts-awssecuritytokenservicev20110615",
  "service-common",
  "sha2 0.10.9",

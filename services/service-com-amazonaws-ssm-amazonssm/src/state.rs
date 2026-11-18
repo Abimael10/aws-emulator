@@ -230,6 +230,10 @@ pub mod document_permissions;
 /// decision the KMS key the value is sealed under makes rather than this service.
 pub mod secure_string;
 
+/// Serving the retrieval of a parameter another AWS service makes on a ROLE's behalf, for the
+/// workload it runs — the decision that service's launch of that workload turns on.
+pub mod parameter_retrieval;
+
 /// The parameters AWS itself publishes in the `/aws` hierarchy of every Region, which a
 /// read resolves beside the parameters this account wrote.
 pub mod public_parameters;

@@ -760,3 +760,93 @@ async fn the_refusal_carries_the_sentence_kms_words() {
         "case {case}: the refusal carries KMS's own sentence, got {response}"
     );
 }
+
+/// The key's POLICY decides a decrypting read before the key's STATE: KMS tells a principal
+/// the key does not permit nothing about that key's state, so such a caller is refused
+/// `AccessDeniedException` whether the key is usable or not, while a caller the key DOES
+/// permit is told what about the state refuses the read (the `InvalidKeyId` this service
+/// relays).
+///
+/// The rows differ along the two things that decide it: whether the key's policy admits this
+/// caller the decrypt, and whether the key's own state runs a cryptographic operation at all.
+#[tokio::test]
+async fn the_key_policy_decides_a_read_before_the_key_state_does() {
+    /// The error code a read is refused with when the key's policy withholds the decrypt.
+    const ACCESS_DENIED: &str = "AccessDeniedException";
+    /// The error code a read is refused with when the key's own state runs no cryptographic
+    /// operation, which is the one Parameter Store models for a key that cannot serve the
+    /// request.
+    const INVALID_KEY_ID: &str = "InvalidKeyId";
+
+    // (case, whether the policy admits this caller the decrypt, whether the key is disabled,
+    // the answer the read must carry: `None` for a read that is served)
+    let rows: &[(&str, bool, bool, Option<&str>)] = &[
+        ("an admitted caller on a usable key", true, false, None),
+        (
+            "an admitted caller on a disabled key",
+            true,
+            true,
+            Some(INVALID_KEY_ID),
+        ),
+        (
+            "a caller the policy does not admit, on a usable key",
+            false,
+            false,
+            Some(ACCESS_DENIED),
+        ),
+        (
+            "a caller the policy does not admit, on a disabled key",
+            false,
+            true,
+            Some(ACCESS_DENIED),
+        ),
+    ];
+    for (case, admitted, disabled, expected) in rows {
+        let router = router();
+        // A policy that admits the decrypt, and one that admits only a read of the key's own
+        // metadata — which leaves the decrypt to no statement at all.
+        let document = policy(vec![allow_caller(
+            json!(if *admitted {
+                DECRYPT_ACTION
+            } else {
+                "kms:DescribeKey"
+            }),
+            None,
+        )]);
+        let (key_id, _arn) = key_with_policy(&router, case, &document).await;
+        put_secure(&router, case, IN_SCOPE, &key_id).await;
+        if *disabled {
+            kms_ok(&router, case, "DisableKey", &json!({ "KeyId": key_id })).await;
+            let described = kms_ok(&router, case, "DescribeKey", &json!({ "KeyId": key_id })).await;
+            assert_eq!(
+                described["KeyMetadata"]["KeyState"],
+                json!("Disabled"),
+                "case {case}: DisableKey must leave the key disabled, got {described}"
+            );
+        }
+        let (status, response) = call(
+            &router,
+            "GetParameter",
+            &json!({ "Name": IN_SCOPE, "WithDecryption": true }),
+        )
+        .await;
+        match expected {
+            None => assert_eq!(
+                status, 200,
+                "case {case}: the read must be served, got {status} with {response}"
+            ),
+            Some(code) => {
+                assert_eq!(
+                    status, 400,
+                    "case {case}: the read must be refused with HTTP 400, got {status} with \
+                     {response}"
+                );
+                assert_eq!(
+                    error_code(&response),
+                    *code,
+                    "case {case}: the read must be refused with {code}, got {response}"
+                );
+            }
+        }
+    }
+}
