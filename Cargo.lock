@@ -12289,6 +12289,7 @@ dependencies = [
  "hmac 0.12.1",
  "http",
  "ipnet",
+ "pkcs1",
  "rcgen",
  "ring",
  "serde_json",

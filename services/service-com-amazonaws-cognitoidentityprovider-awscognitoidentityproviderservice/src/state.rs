@@ -4020,9 +4020,9 @@ pub fn undetermined_attribute_type_message(attribute_name: &str) -> String {
 /// admitted the pool.
 ///
 /// The pool's SAML signing certificate IS issued here, once its id is settled:
-/// the certificate is issued to the SAML entity id that id implies, and the key
-/// pair it is signed with is an elliptic-curve one, generated in microseconds
-/// rather than in the milliseconds an RSA key pair costs.
+/// the certificate is issued to the SAML entity id that id implies, over the
+/// pool's own signing key — the RSA key pair its key set publishes — so the
+/// certificate and that document describe one key pair.
 pub fn new_user_pool(
     name: String,
     region: &str,

@@ -281,6 +281,16 @@ impl PoolSigningKeys {
         }
     }
 
+    /// The key the pool's SAML 2.0 signing certificate is issued over: the pool
+    /// has ONE signing identity, so the certificate
+    /// `GetSigningCertificate` reports describes a key pair this same key set
+    /// publishes rather than a key pair of its own, and a verifier configured
+    /// from either source checks against the same key.
+    #[must_use]
+    pub fn saml_signing_key(&self) -> &::service_common::jws_signing::SigningKey {
+        &self.id_token
+    }
+
     /// The PUBLIC half of every key this pool signs with, as the entries of its
     /// published key set, in a stable order.
     #[must_use]

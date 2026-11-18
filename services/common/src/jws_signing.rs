@@ -206,6 +206,25 @@ impl SigningKey {
         jwk
     }
 
+    /// This key's PUBLIC half in the DER encoding of its own family, as the bytes a
+    /// certificate carries in its `SubjectPublicKeyInfo`: the PKCS #1 `RSAPublicKey`
+    /// (RFC 8017 §A.1.1) of an RSA key, and the uncompressed point (SEC 1 §2.3.3) of an
+    /// elliptic-curve one.
+    ///
+    /// An issuer that publishes this key in its key set and ALSO has to certify it — a
+    /// user pool whose X.509 signing certificate must describe the key pair its key set
+    /// publishes — needs the key in that encoding, and gets it without the private half
+    /// leaving this module: the certificate over it is signed through [`Self::sign`].
+    #[must_use]
+    pub fn public_key_der(&self) -> Vec<u8> {
+        use ::aws_lc_rs::signature::KeyPair as _;
+
+        match &self.private {
+            PrivateKey::Rsa(key) => key.public_key().as_ref().to_vec(),
+            PrivateKey::Ecdsa(key) => key.public_key().as_ref().to_vec(),
+        }
+    }
+
     /// The signature over `signing_input` under this key's own algorithm, in the form
     /// RFC 7518 puts in a JWS's third segment: the modulus's width for RSASSA-PKCS1-v1_5,
     /// and the fixed `R || S` of §3.4 for ECDSA — never the ASN.1 encoding, which no JOSE

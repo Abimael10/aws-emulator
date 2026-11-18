@@ -16,6 +16,12 @@
 //! answer different ones, and a `UserPoolId` no stored pool answers to is refused
 //! rather than issued a certificate.
 //!
+//! The certificate describes the pool's OWN signing key pair: an RSA key, signed
+//! `sha256WithRSAEncryption`, whose modulus and exponent are those of one of the
+//! keys the pool publishes at `<iss>/.well-known/jwks.json` — the one key pair a
+//! pool signs with, so a verifier configured from the certificate and a verifier
+//! configured from the published key set check against the same key.
+//!
 //! This suite reads the member the way the operator who installs it at an
 //! identity provider does — decode the base64, parse the DER, then read the
 //! certificate's own fields — rather than matching on its text, so nothing but a
@@ -37,6 +43,19 @@ use x509_cert::der::{Decode, Encode};
 
 use cognito_idp::state;
 use service_com_amazonaws_cognitoidentityprovider_awscognitoidentityproviderservice as cognito_idp;
+
+/// The object identifier of an `rsaEncryption` subject public key (RFC 4055 §1.2,
+/// PKCS #1 `rsaEncryption`), which is what an RSA public key is carried under.
+const RSA_ENCRYPTION_OID: &str = "1.2.840.113549.1.1.1";
+
+/// The object identifier of a `sha256WithRSAEncryption` signature (RFC 4055 §5),
+/// the signature an RSA key signing under RSASSA-PKCS1-v1_5 with SHA-256 writes.
+const SHA256_WITH_RSA_ENCRYPTION_OID: &str = "1.2.840.113549.1.1.11";
+
+/// How many bytes the modulus of the key a pool signs with carries: 2048 bits,
+/// the width RSASSA-PKCS1-v1_5 with SHA-256 is used at and the smallest a JOSE
+/// verifier accepts.
+const RSA_MODULUS_BYTES: usize = 256;
 
 /// One emulator with just this service mounted.
 fn router() -> MultiServiceRouter {
@@ -263,6 +282,97 @@ where
         .and_then(|extension| T::from_der(extension.extn_value.as_bytes()).ok())
 }
 
+/// The key set the pool publishes, fetched the way a verifier does: an ANONYMOUS
+/// GET of `/<UserPoolId>/.well-known/jwks.json`.
+async fn published_key_set(router: &MultiServiceRouter, user_pool_id: &str) -> Value {
+    let request = http::Request::builder()
+        .method("GET")
+        .uri(format!("/{user_pool_id}/.well-known/jwks.json"))
+        .header("host", "cognito-idp.us-east-1.amazonaws.com")
+        .body(Bytes::new())
+        .expect("the request is well formed");
+    let response = router.dispatch(request).await;
+    let status = response.status().as_u16();
+    assert_eq!(
+        status,
+        200,
+        "the pool {user_pool_id} must serve its key set, got {status} with {:?}",
+        String::from_utf8_lossy(response.body())
+    );
+    serde_json::from_slice(response.body()).unwrap_or_else(|error| {
+        panic!(
+            "the key set of {user_pool_id} must be JSON ({error}): {:?}",
+            String::from_utf8_lossy(response.body())
+        )
+    })
+}
+
+/// The RSA public key `certificate` certifies, as the unsigned big-endian
+/// modulus and exponent RFC 7518 §6.3.1 publishes a key by.
+///
+/// The `SubjectPublicKeyInfo` of an RSA key names `rsaEncryption` and carries the
+/// PKCS #1 `RSAPublicKey` (RFC 8017 §A.1.1) of that key, which is read here with
+/// the library that defines that structure rather than by scanning the bytes.
+fn certified_rsa_key(case: &str, certificate: &x509_cert::Certificate) -> (Vec<u8>, Vec<u8>) {
+    let key_info = &certificate.tbs_certificate.subject_public_key_info;
+    let algorithm = key_info.algorithm.oid.to_string();
+    assert_eq!(
+        algorithm, RSA_ENCRYPTION_OID,
+        "case {case:?}: the certificate must carry an RSA public key ({RSA_ENCRYPTION_OID}), got \
+         {algorithm}"
+    );
+    let signature_algorithm = certificate.signature_algorithm.oid.to_string();
+    assert_eq!(
+        signature_algorithm, SHA256_WITH_RSA_ENCRYPTION_OID,
+        "case {case:?}: the certificate must be signed sha256WithRSAEncryption \
+         ({SHA256_WITH_RSA_ENCRYPTION_OID}), got {signature_algorithm}"
+    );
+    let encoded = key_info.subject_public_key.raw_bytes();
+    let key = <pkcs1::RsaPublicKey as pkcs1::der::Decode>::from_der(encoded).unwrap_or_else(
+        |error| {
+            panic!(
+                "case {case:?}: the subject public key must be a PKCS #1 RSAPublicKey ({error}), \
+                 got {} bytes",
+                encoded.len()
+            )
+        },
+    );
+    let modulus = key.modulus.as_bytes().to_vec();
+    assert_eq!(
+        modulus.len(),
+        RSA_MODULUS_BYTES,
+        "case {case:?}: expected a {} bit modulus, got {} bits",
+        RSA_MODULUS_BYTES * 8,
+        modulus.len() * 8
+    );
+    (modulus, key.public_exponent.as_bytes().to_vec())
+}
+
+/// Every key the pool publishes, as the same pair of unsigned big-endian
+/// integers: `(n, e)` of each RSA entry of its key set.
+fn published_rsa_keys(case: &str, key_set: &Value) -> Vec<(Vec<u8>, Vec<u8>)> {
+    let keys = key_set["keys"]
+        .as_array()
+        .unwrap_or_else(|| panic!("case {case:?}: a key set carries a keys list, got {key_set}"));
+    assert!(
+        !keys.is_empty(),
+        "case {case:?}: the pool publishes at least one key, got {key_set}"
+    );
+    keys.iter()
+        .map(|jwk| {
+            let integer = |member: &str| {
+                let encoded = jwk[member].as_str().unwrap_or_else(|| {
+                    panic!("case {case:?}: a published RSA key carries {member}, got {jwk}")
+                });
+                service_common::jwt::decode_base64url(encoded).unwrap_or_else(|| {
+                    panic!("case {case:?}: the key's {member} must be base64url, got {jwk}")
+                })
+            };
+            (integer("n"), integer("e"))
+        })
+        .collect()
+}
+
 /// Read `certificate` the way the operator installing it at an identity provider
 /// does: the member is base64, with none of the armour or line breaks a PEM block
 /// carries, and what it decodes to is a DER X.509 certificate.
@@ -358,6 +468,10 @@ fn assert_usable_signing_certificate(
         not_after - not_before
     );
 
+    // An RSA key, signed sha256WithRSAEncryption: the key kind a SAML verifier
+    // reads out of a signing certificate.
+    certified_rsa_key(case, &parsed);
+
     tbs.subject_public_key_info
         .to_der()
         .unwrap_or_else(|error| {
@@ -441,6 +555,43 @@ async fn repeated_reads_answer_the_one_issued_certificate() {
             "case {:?}: another pool must answer its own certificate, got {neighbour:?}",
             case.case
         );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// RULE: the certificate describes the pool's OWN signing key pair — the key it
+// publishes in its key set — so a verifier configured from the certificate and
+// one configured from that document check against the same key.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn the_certificate_certifies_a_key_the_pool_publishes() {
+    let router = router();
+    // Every published key of every pool this suite creates, so a certificate
+    // cannot pass by describing ANOTHER pool's published key.
+    let mut published_elsewhere: BTreeSet<(Vec<u8>, Vec<u8>)> = BTreeSet::new();
+
+    for case in cases() {
+        let (user_pool_id, _) = create_pool(&router, &case).await;
+        let certificate = signing_certificate(&router, case.region, &user_pool_id).await;
+        let certified = certified_rsa_key(case.case, &parse(case.case, &certificate));
+        let key_set = published_key_set(&router, &user_pool_id).await;
+        let published = published_rsa_keys(case.case, &key_set);
+        assert!(
+            published.contains(&certified),
+            "case {:?}: the certified key must be one the pool publishes at its key set, got a \
+             modulus of {} bytes against {} published keys ({key_set})",
+            case.case,
+            certified.0.len(),
+            published.len()
+        );
+        assert!(
+            !published_elsewhere.contains(&certified),
+            "case {:?}: a pool's certificate must certify its OWN key, but this one repeats a \
+             key another pool published",
+            case.case
+        );
+        published_elsewhere.extend(published);
     }
 }
 

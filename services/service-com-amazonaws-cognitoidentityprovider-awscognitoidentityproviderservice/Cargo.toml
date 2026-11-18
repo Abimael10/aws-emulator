@@ -79,9 +79,9 @@ base64 = "0.22"
 subtle = "2.6"
 # A user pool's SAML 2.0 signing certificate is "the x.509 certificate that signs SAML
 # 2.0 authentication requests for your user pool", so this service issues a REAL
-# self-signed X.509 certificate for every pool it creates
-# (`src/state/saml_signing_certificate.rs`). rcgen is the generator this tree already
-# uses for certificate material.
+# self-signed X.509 certificate over the pool's own RSA signing key for every pool it
+# creates (`src/state/saml_signing_certificate.rs`). rcgen is the generator this tree
+# already uses for certificate material.
 rcgen = "0.13"
 # Spells the private key of a user's software token in base32, the encoding an
 # authenticator app provisioned with a shared secret reads a key in
@@ -121,6 +121,10 @@ hex = { workspace = true }
 # the X.509 certificate inside it the way the SAML identity provider an operator
 # installs it at would, rather than matching on its text.
 x509-cert = "0.2"
+# That suite reads the RSA public key out of the certificate's `SubjectPublicKeyInfo`
+# with the library that defines the PKCS #1 `RSAPublicKey` structure it carries, so it
+# can be compared with the key the pool publishes in its key set.
+pkcs1 = "0.7"
 # The custom-sender suite mounts the services that own the other halves of that trigger
 # beside this one on a single engine — exactly as the assembled emulator does — because the
 # trigger wraps the code with a key the key service holds and hands it to a function Lambda

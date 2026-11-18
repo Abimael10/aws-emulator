@@ -13,11 +13,18 @@
 //! configuration, where it is read as the base64 of a DER X.509 certificate —
 //! the same coding a SAML metadata `X509Certificate` element carries.
 //!
-//! A child module of [`super`] rather than more of `state.rs`: issuing that
-//! certificate is one concern, and the private half of its key pair is generated
-//! here, used to sign the certificate, and dropped. Nothing stores or reports
-//! it — no shape of this service has a member for a private key — so a pool
-//! publishes only the certificate.
+//! The certificate describes the pool's OWN signing key pair — the RSA key pair
+//! the pool signs with and publishes at `<iss>/.well-known/jwks.json` — rather
+//! than a key pair minted for the certificate alone: a pool has one signing
+//! identity, so a verifier that reads the key out of this certificate and a
+//! verifier that reads it out of the pool's published key set are configured for
+//! the same key, and an RSA-expecting SAML verifier can parse it at all.
+//!
+//! A child module of [`super`] rather than more of `state.rs`: certifying that
+//! key is one concern. The private half of the key never comes here — the
+//! certificate is signed by handing the bytes to sign back to the key that holds
+//! it ([`::service_common::jws_signing::SigningKey::sign`]) — so nothing of this
+//! service stores or reports a private key.
 
 use super::*;
 
@@ -37,21 +44,28 @@ pub fn saml_service_provider_entity_id(user_pool_id: &str) -> String {
     format!("urn:amazon:cognito:sp:{user_pool_id}")
 }
 
-/// The signing certificate of the pool `user_pool_id`, issued at `issued_at`:
-/// the base64 of a REAL self-signed X.509 certificate, issued to that pool's
-/// SAML service-provider entity id ([`saml_service_provider_entity_id`]) and
-/// valid for [`SIGNING_CERTIFICATE_VALIDITY`] from the date of issue.
+/// The signing certificate of the pool `user_pool_id`, issued at `issued_at`
+/// over the pool's own signing key `signing_key`: the base64 of a REAL
+/// self-signed X.509 certificate, issued to that pool's SAML service-provider
+/// entity id ([`saml_service_provider_entity_id`]) and valid for
+/// [`SIGNING_CERTIFICATE_VALIDITY`] from the date of issue.
 ///
 /// Issued ONCE, when the pool is created, and kept on the pool's record: the
 /// operation that reports it renders the stored value, so every read of one pool
 /// answers the same certificate, and two pools answer different ones because
-/// each is issued to its own entity id under its own freshly generated key.
+/// each certifies its own pool's key under its own entity id.
 ///
-/// `None` when the certificate does not issue, which the caller reports rather
-/// than storing a pool whose signing certificate is a value nothing signed.
+/// `None` when the certificate does not issue — including for a key of an
+/// algorithm no X.509 signature algorithm here corresponds to — which the caller
+/// reports rather than storing a pool whose signing certificate is a value
+/// nothing signed.
 #[must_use]
-pub fn issue_signing_certificate(user_pool_id: &str, issued_at: SystemTime) -> Option<String> {
-    let certificate = signing_certificate_der(user_pool_id, issued_at);
+pub fn issue_signing_certificate(
+    user_pool_id: &str,
+    issued_at: SystemTime,
+    signing_key: &::service_common::jws_signing::SigningKey,
+) -> Option<String> {
+    let certificate = signing_certificate_der(user_pool_id, issued_at, signing_key);
     match certificate {
         Some(der) => Some(::aws_smithy_types::base64::encode(der)),
         None => {
@@ -69,12 +83,12 @@ pub fn issue_signing_certificate(user_pool_id: &str, issued_at: SystemTime) -> O
 
 /// The DER-encoded certificate itself, which [`issue_signing_certificate`] is
 /// the base64 of.
-///
-/// The key pair is generated here and its private half is dropped with this
-/// function's frame: signing a SAML authentication request is the pool's own
-/// work, and nothing this service stores or reports can present the key.
-fn signing_certificate_der(user_pool_id: &str, issued_at: SystemTime) -> Option<Vec<u8>> {
-    let key = ::rcgen::KeyPair::generate().ok()?;
+fn signing_certificate_der(
+    user_pool_id: &str,
+    issued_at: SystemTime,
+    signing_key: &::service_common::jws_signing::SigningKey,
+) -> Option<Vec<u8>> {
+    let key = ::rcgen::KeyPair::from_remote(Box::new(PoolSigningKey::new(signing_key)?)).ok()?;
     // No subject alternative name: the pool is named by a URN entity id rather
     // than by a host it serves, so there is no DNS name or address to certify.
     let mut params = ::rcgen::CertificateParams::new(Vec::<String>::new()).ok()?;
@@ -92,6 +106,68 @@ fn signing_certificate_der(user_pool_id: &str, issued_at: SystemTime) -> Option<
     params.is_ca = ::rcgen::IsCa::ExplicitNoCa;
     params.key_usages = vec![::rcgen::KeyUsagePurpose::DigitalSignature];
     Some(params.self_signed(&key).ok()?.der().to_vec())
+}
+
+/// The pool's own signing key, presented to the certificate generator as the key
+/// the certificate describes and is signed by.
+///
+/// The generator needs two things of a key: the PUBLIC half, which it certifies,
+/// and a signature over the certificate body. Both come from the key the pool
+/// already holds and publishes, so the certificate and the pool's key set
+/// describe one key pair; the private half stays inside that key and is reached
+/// only to sign.
+struct PoolSigningKey {
+    /// The pool's key, which signs the certificate body.
+    key: ::service_common::jws_signing::SigningKey,
+    /// Its PUBLIC half, in the encoding the certificate's
+    /// `SubjectPublicKeyInfo` carries.
+    public_key: Vec<u8>,
+    /// The X.509 signature algorithm matching the key's own JWS algorithm.
+    algorithm: &'static ::rcgen::SignatureAlgorithm,
+}
+
+impl PoolSigningKey {
+    /// `key` as the generator's key, or `None` for a key whose algorithm no
+    /// X.509 signature algorithm here corresponds to.
+    fn new(key: &::service_common::jws_signing::SigningKey) -> Option<Self> {
+        Some(Self {
+            key: key.clone(),
+            public_key: key.public_key_der(),
+            algorithm: certificate_signature_algorithm(key.algorithm())?,
+        })
+    }
+}
+
+impl ::rcgen::RemoteKeyPair for PoolSigningKey {
+    fn public_key(&self) -> &[u8] {
+        &self.public_key
+    }
+
+    fn sign(&self, message: &[u8]) -> Result<Vec<u8>, ::rcgen::Error> {
+        self.key
+            .sign(message)
+            .ok_or(::rcgen::Error::RemoteKeyError)
+    }
+
+    fn algorithm(&self) -> &'static ::rcgen::SignatureAlgorithm {
+        self.algorithm
+    }
+}
+
+/// The X.509 signature algorithm a certificate over a key of the JWS algorithm
+/// `algorithm` is signed under: a pool's keys are RSA and sign RSASSA-PKCS1-v1_5
+/// over SHA-256, which X.509 names `sha256WithRSAEncryption` over an
+/// `rsaEncryption` subject public key.
+///
+/// `None` for an algorithm this correspondence does not cover, so a certificate
+/// is either signed under the key's own algorithm or not issued.
+fn certificate_signature_algorithm(
+    algorithm: &str,
+) -> Option<&'static ::rcgen::SignatureAlgorithm> {
+    match algorithm {
+        ::service_common::jws_signing::RS256 => Some(&::rcgen::PKCS_RSA_SHA256),
+        _ => None,
+    }
 }
 
 /// `at` as the date-time type the certificate generator takes a validity bound

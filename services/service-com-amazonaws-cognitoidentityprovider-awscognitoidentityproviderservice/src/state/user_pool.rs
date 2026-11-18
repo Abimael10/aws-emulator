@@ -178,10 +178,10 @@ pub struct UserPool {
     pub signing_keys: PoolSigningKeys,
     /// The X.509 certificate this pool signs its SAML 2.0 authentication
     /// requests with, as `GetSigningCertificate` reports it — issued to this
-    /// pool when the pool was created ([`issue_signing_certificate`]) and kept
-    /// for its lifetime, so every read of one pool answers the same certificate
-    /// and the identity provider an operator installed it at keeps verifying
-    /// against it.
+    /// pool when the pool was created ([`issue_signing_certificate`]), over one
+    /// of the signing keys its key set publishes, and kept for its lifetime, so
+    /// every read of one pool answers the same certificate and the identity
+    /// provider an operator installed it at keeps verifying against it.
     ///
     /// `None` only when the certificate did not issue, which the operation that
     /// reports it answers its modelled server error for rather than reporting a
@@ -499,14 +499,20 @@ impl UserPool {
     }
 
     /// Issue this pool's SAML 2.0 signing certificate, to the entity id its
-    /// CURRENT id implies and dated from its creation.
+    /// CURRENT id implies, dated from its creation and over this pool's own
+    /// signing key — the key pair its key set publishes — so the certificate and
+    /// that document describe one key pair.
     ///
     /// Called where a pool's id is settled — when the pool is built, and again
     /// when a minted id turned out to be taken ([`UserPool::with_new_id`]) —
     /// because the certificate is issued to the pool's SAML service-provider
     /// entity id, which is derived from that id.
     pub(super) fn issue_saml_signing_certificate(&mut self) {
-        self.saml_signing_certificate = issue_signing_certificate(&self.id, self.creation_date);
+        self.saml_signing_certificate = issue_signing_certificate(
+            &self.id,
+            self.creation_date,
+            self.signing_keys.saml_signing_key(),
+        );
     }
 
     /// This pool's JSON Web Key Set (RFC 7517 §5): the public half of every key
