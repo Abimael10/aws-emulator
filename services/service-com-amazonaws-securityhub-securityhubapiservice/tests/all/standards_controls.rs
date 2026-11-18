@@ -77,6 +77,7 @@ const STANDARDS: [StandardRow; 13] = [
         expected_control_id: "CloudTrail.1",
         every_control_id: &[
             "ACM.1",
+            "ACM.2",
             "CloudTrail.1",
             "CloudTrail.2",
             "CloudWatch.1",
@@ -92,7 +93,7 @@ const STANDARDS: [StandardRow; 13] = [
         version: "1.0.0",
         partition_wide_ruleset: false,
         expected_control_id: "EC2.52",
-        every_control_id: &["EC2.52", "ECS.13"],
+        every_control_id: &["ACM.3", "EC2.52", "ECS.13"],
     },
     StandardRow {
         slug: "azure-foundational-security-best-practices",

@@ -161,6 +161,16 @@ fn catalog_entry(security_control_id: &str) -> &'static SecurityControlCatalogEn
         .expect("a published control id")
 }
 
+/// The listed element reported for `security_control_id` in a walked listing, which
+/// every published control must carry one of.
+fn entry_for_listing(listed: &[Value], security_control_id: &str) -> Value {
+    listed
+        .iter()
+        .find(|definition| definition["SecurityControlId"].as_str() == Some(security_control_id))
+        .cloned()
+        .unwrap_or_else(|| panic!("control {security_control_id} must be listed"))
+}
+
 /// Walk every page of `query` and return the concatenated definitions, asserting that
 /// no page exceeds `page_size` and that only the final page omits `NextToken`.
 async fn page_through_definitions(harness: &Harness, query: &str, page_size: usize) -> Vec<Value> {
@@ -433,6 +443,7 @@ async fn a_standards_arn_selects_the_controls_that_standard_applies() {
             "1.0.0",
             &[
                 "ACM.1",
+                "ACM.2",
                 "CloudTrail.1",
                 "CloudTrail.2",
                 "CloudWatch.1",
@@ -446,7 +457,7 @@ async fn a_standards_arn_selects_the_controls_that_standard_applies() {
         (
             "aws-resource-tagging-standard",
             "1.0.0",
-            &["EC2.52", "ECS.13"],
+            &["ACM.3", "EC2.52", "ECS.13"],
         ),
         (
             "azure-foundational-security-best-practices",
@@ -1428,5 +1439,181 @@ async fn a_definition_is_served_whatever_the_account_has_enabled() {
             &body, expected,
             "control {id}: disabling the hub must not change the definition, got {body}"
         );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The catalog's per-control CONTENT, spanned by service family
+// ---------------------------------------------------------------------------
+
+/// The service families the catalog publishes more than one control of, each named by
+/// the service whose resources its controls evaluate. Taken from the rows of
+/// `SECURITY_CONTROL_CATALOG`, which carry what the AWS Security Hub user guide's
+/// "Security Hub controls reference" publishes per control: its text, its remediation
+/// page and its parameters.
+///
+/// The rows differ along what the rule generalises over — how many controls one service
+/// publishes, which of them carry parameters and of which configuration type, and the
+/// cloud provider they evaluate. The ACM family alone spans an integer parameter
+/// (ACM.1), no parameter (ACM.2) and a string-list parameter (ACM.3), and the other four
+/// rows are families the issue did not cite.
+const CONTROL_FAMILIES: [(&str, &[&str]); 5] = [
+    ("ACM", &["ACM.1", "ACM.2", "ACM.3"]),
+    ("CloudTrail", &["CloudTrail.1", "CloudTrail.2"]),
+    ("S3", &["S3.1", "S3.5"]),
+    ("SageMaker", &["SageMaker.1", "SageMaker.2", "SageMaker.3"]),
+    (
+        "Azure",
+        &[
+            "AzureKeyVault.1",
+            "AzureSQL.1",
+            "AzureStorage.1",
+            "AzureVirtualMachine.1",
+        ],
+    ),
+];
+
+/// RULE: a security control's published metadata — the full text of its description and
+/// the documentation link that explains how to remediate a failed finding for it — is
+/// catalogued for that ONE control and reported as stored, so neither the control's id
+/// nor the service it evaluates determines either value: the controls of one service are
+/// each reported with their own text and their own link.
+#[tokio::test]
+async fn controls_of_one_service_each_report_their_own_catalogued_text_and_link() {
+    let harness = Harness::new("us-west-2");
+    let listed = page_through_definitions(&harness, "", 100).await;
+
+    for (family, ids) in CONTROL_FAMILIES {
+        let mut descriptions: Vec<&str> = Vec::new();
+        let mut links: Vec<&str> = Vec::new();
+        for id in ids {
+            let entry = catalog_entry(id);
+            let element = entry_for_listing(&listed, id);
+
+            let described = element["Description"].as_str().unwrap_or_default();
+            assert_eq!(
+                described, entry.control.description,
+                "family {family}/{id}: expected the catalogued Description, got {described:?}"
+            );
+            // The published form of a description: what the control checks, then the
+            // condition under which it fails.
+            assert!(
+                described.starts_with("This control checks whether ")
+                    && described.contains("control fails if"),
+                "family {family}/{id}: a description states what the control checks and when it fails, got {described:?}"
+            );
+
+            let link = element["RemediationUrl"].as_str().unwrap_or_default();
+            assert_eq!(
+                link, entry.remediation_url,
+                "family {family}/{id}: expected the catalogued RemediationUrl, got {link:?}"
+            );
+            assert!(
+                link.starts_with("https://") && !link.chars().any(char::is_whitespace),
+                "family {family}/{id}: a remediation link is an absolute https documentation URL, got {link:?}"
+            );
+            assert!(
+                !link.contains(id) && link != standards_control_remediation_url(id),
+                "family {family}/{id}: a catalogued link is not a form of the control id, got {link:?}"
+            );
+
+            descriptions.push(entry.control.description);
+            links.push(entry.remediation_url);
+        }
+
+        let control_count = ids.len();
+        descriptions.sort_unstable();
+        descriptions.dedup();
+        assert_eq!(
+            descriptions.len(),
+            control_count,
+            "family {family}: each of its {control_count} controls publishes its own description, got {} distinct",
+            descriptions.len()
+        );
+        links.sort_unstable();
+        links.dedup();
+        assert_eq!(
+            links.len(),
+            control_count,
+            "family {family}: each of its {control_count} controls links to its own page, got {} distinct",
+            links.len()
+        );
+    }
+}
+
+/// RULE: a control's parameter surface is catalogued per control as well — a listed
+/// element names the properties the control can be customized in and never the
+/// definitions of its parameters, while the read of ONE control carries exactly one
+/// `ParameterDefinitions` entry per parameter the catalog publishes for it and excludes
+/// the member entirely for a control that publishes none.
+///
+/// Spanned by the same families, so the member's presence follows the CONTROL and not
+/// the service: ACM publishes a control with an integer parameter, one with none and one
+/// with a string-list parameter.
+#[tokio::test]
+async fn the_parameter_surface_follows_the_control_not_the_service() {
+    let harness = Harness::new("eu-central-1");
+    let listed = page_through_definitions(&harness, "", 100).await;
+
+    for (family, ids) in CONTROL_FAMILIES {
+        for id in ids {
+            let entry = catalog_entry(id);
+            let element = entry_for_listing(&listed, id);
+            assert!(
+                element.get("ParameterDefinitions").is_none(),
+                "family {family}/{id}: a listed element carries no parameter definitions, got {element}"
+            );
+            let customizable: Vec<&str> = element["CustomizableProperties"]
+                .as_array()
+                .map(|properties| {
+                    properties
+                        .iter()
+                        .map(|property| property.as_str().unwrap_or_default())
+                        .collect()
+                })
+                .unwrap_or_default();
+            let expected_properties: Vec<&str> = if entry.parameters.is_empty() {
+                Vec::new()
+            } else {
+                // `SecurityControlProperty$Parameters`, the one property a definition
+                // can report as customizable.
+                assert!(
+                    SECURITY_CONTROL_PROPERTY_VALUES.contains(&"Parameters"),
+                    "Parameters must be a modelled SecurityControlProperty, got {SECURITY_CONTROL_PROPERTY_VALUES:?}"
+                );
+                vec!["Parameters"]
+            };
+            assert_eq!(
+                customizable, expected_properties,
+                "family {family}/{id}: expected {expected_properties:?}, got {element}"
+            );
+
+            let (status, body) = harness.definition(id).await;
+            assert_eq!(
+                status, 200,
+                "family {family}/{id}: expected 200, got {status} with {body}"
+            );
+            let single = &body["SecurityControlDefinition"];
+            let mut published: Vec<&str> =
+                entry.parameters.iter().map(|parameter| parameter.name).collect();
+            published.sort_unstable();
+            match single.get("ParameterDefinitions") {
+                None => assert!(
+                    published.is_empty(),
+                    "family {family}/{id}: a control publishing {published:?} must report them, got {body}"
+                ),
+                Some(definitions) => {
+                    let reported = definitions.as_object().unwrap_or_else(|| {
+                        panic!("family {family}/{id}: ParameterDefinitions must be a map")
+                    });
+                    let mut names: Vec<&str> = reported.keys().map(String::as_str).collect();
+                    names.sort_unstable();
+                    assert_eq!(
+                        names, published,
+                        "family {family}/{id}: expected the published parameters {published:?}, got {body}"
+                    );
+                }
+            }
+        }
     }
 }

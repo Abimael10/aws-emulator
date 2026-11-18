@@ -165,12 +165,24 @@ const REQUIRED_TAG_KEYS_PARAMETERS: [PublishedControlParameter; 1] = [PublishedC
 ///
 /// Ordered by `SecurityControlId`, which is the order a list of definitions is
 /// reported in, so a page boundary falls in the same place on every call.
-pub const SECURITY_CONTROL_CATALOG: [SecurityControlCatalogEntry; 22] = [
+pub const SECURITY_CONTROL_CATALOG: [SecurityControlCatalogEntry; 24] = [
     SecurityControlCatalogEntry {
         control: ACM_1,
         remediation_url: "https://docs.aws.amazon.com/acm/latest/userguide/email-renewal-validation.html",
         provider: SECURITY_CONTROLS_PROVIDER_AWS,
         parameters: &ACM_1_PARAMETERS,
+    },
+    SecurityControlCatalogEntry {
+        control: ACM_2,
+        remediation_url: "https://docs.aws.amazon.com/acm/latest/userguide/gs-acm-request-public.html",
+        provider: SECURITY_CONTROLS_PROVIDER_AWS,
+        parameters: &[],
+    },
+    SecurityControlCatalogEntry {
+        control: ACM_3,
+        remediation_url: "https://docs.aws.amazon.com/acm/latest/userguide/tags.html",
+        provider: SECURITY_CONTROLS_PROVIDER_AWS,
+        parameters: &REQUIRED_TAG_KEYS_PARAMETERS,
     },
     SecurityControlCatalogEntry {
         control: AZURE_KEY_VAULT_1,

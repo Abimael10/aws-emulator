@@ -964,6 +964,22 @@ const ACM_1: StandardsControlDefinition = StandardsControlDefinition {
     related_requirements: &[],
 };
 
+const ACM_2: StandardsControlDefinition = StandardsControlDefinition {
+    control_id: "ACM.2",
+    title: "RSA certificates managed by ACM should use a key length of at least 2,048 bits",
+    description: "This control checks whether RSA certificates managed by AWS Certificate Manager use a key length of at least 2,048 bits. The control fails if the key length is smaller than 2,048 bits.",
+    severity_rating: "HIGH",
+    related_requirements: &[],
+};
+
+const ACM_3: StandardsControlDefinition = StandardsControlDefinition {
+    control_id: "ACM.3",
+    title: "ACM certificates should be tagged",
+    description: "This control checks whether an AWS Certificate Manager (ACM) certificate has tags with the specific keys defined in the parameter requiredTagKeys. The control fails if the certificate doesn't have any tag keys or if it doesn't have all the keys specified in the parameter requiredTagKeys. If the parameter requiredTagKeys isn't provided, the control only checks for the existence of a tag key and fails if the certificate isn't tagged with any key.",
+    severity_rating: "LOW",
+    related_requirements: &[],
+};
+
 const CLOUDTRAIL_1: StandardsControlDefinition = StandardsControlDefinition {
     control_id: "CloudTrail.1",
     title: "CloudTrail should be enabled and configured with at least one multi-Region trail that includes read and write management events",
@@ -1142,8 +1158,9 @@ const AI_SECURITY_BEST_PRACTICES_CONTROLS: [StandardsControlDefinition; 4] =
 
 /// The controls of the AWS Foundational Security Best Practices standard, which
 /// addresses each one by the security control's own id.
-const FSBP_CONTROLS: [StandardsControlDefinition; 9] = [
+const FSBP_CONTROLS: [StandardsControlDefinition; 10] = [
     ACM_1,
+    ACM_2,
     CLOUDTRAIL_1,
     CLOUDTRAIL_2,
     CLOUDWATCH_1,
@@ -1157,7 +1174,7 @@ const FSBP_CONTROLS: [StandardsControlDefinition; 9] = [
 /// The controls of the AWS Resource Tagging Standard, which is made up of the
 /// "should be tagged" controls — the ones that check whether a resource carries the
 /// tag keys the control's parameters name.
-const RESOURCE_TAGGING_CONTROLS: [StandardsControlDefinition; 2] = [EC2_52, ECS_13];
+const RESOURCE_TAGGING_CONTROLS: [StandardsControlDefinition; 3] = [ACM_3, EC2_52, ECS_13];
 
 /// The controls of the Azure Foundational Security Best Practices standard.
 const AZURE_FSBP_CONTROLS: [StandardsControlDefinition; 4] =
