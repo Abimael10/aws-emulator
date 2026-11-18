@@ -1,28 +1,34 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! `DeleteAutomatedReasoningPolicy` is idempotent, and the artifact gate an unforced delete
-//! runs is about what the policy STILL holds — both asserted end-to-end over the same
-//! `MultiServiceRouter` the emulator boots.
+//! `DeleteAutomatedReasoningPolicy` resolves the ARN it is addressed by against the policies
+//! this account HOLDS, and the artifact gate an unforced delete runs is about what the policy
+//! STILL holds — both asserted end-to-end over the same `MultiServiceRouter` the emulator
+//! boots.
 //!
 //! The rules under test, each asserted over a SET of inputs rather than over one recorded
 //! request:
 //!
-//! 1. **Repeating the delete of a revision this account HELD succeeds**: the operation is
-//!    modelled `@idempotent` with success code `202` and documented "Deletes an Automated
-//!    Reasoning policy or policy version. This operation is idempotent. If you delete a
-//!    policy more than once, each call succeeds"
-//!    (`smithy_query(query="operation",operation="DeleteAutomatedReasoningPolicy")`), so a
-//!    second, third and fourth delete of the same `AutomatedReasoningPolicyArn` answers
-//!    `202` with an empty body and no error code — over every form of revision a delete can
-//!    take away (a policy holding nothing, a policy whose artifacts went with it, one
-//!    numbered version of several, and a version the removal of its policy took), and over
-//!    every spelling of `force` on the repeat, which decides nothing once there is nothing
-//!    left to hold.
-//! 2. **An ARN that never named a revision of this account is still refused**: the
-//!    documented idempotency is about repeating a delete, not about an ARN naming nothing,
-//!    so `404 ResourceNotFoundException` stands for a policy id nothing minted, for a live
-//!    policy addressed in another region, and for a version number no delete of this account
-//!    ever took away — whether the policy that would carry it is live or itself deleted.
+//! 1. **Repeating the delete of a revision this account held is refused**: the ARN no longer
+//!    resolves once the delete has taken the revision away, so a second, third and fourth
+//!    delete of the same `AutomatedReasoningPolicyArn` answers `404`
+//!    `ResourceNotFoundException` in the sentence the writes of the policy word that class
+//!    with — over every form of revision a delete can take away (a policy holding nothing, a
+//!    policy whose artifacts went with it, one numbered version of several, and a version the
+//!    removal of its policy took), and over every spelling of `force`, which decides nothing
+//!    once there is nothing left to resolve. RECORDED behaviour: the operation is modelled
+//!    `@idempotent` with success code `202` and documented "This operation is idempotent. If
+//!    you delete a policy more than once, each call succeeds"
+//!    (`smithy_query(query="operation",operation="DeleteAutomatedReasoningPolicy")`), and the
+//!    recording of a second delete of a deleted policy ARN shows that refusal instead — the
+//!    trait is safe-retry semantics on the wire, not a no-op for a resource that is gone.
+//! 2. **An ARN that never named a revision of this account is refused the same way**: `404
+//!    ResourceNotFoundException` stands for a policy id nothing minted, for a live policy
+//!    addressed in another region, and for a version number no policy of this account ever
+//!    cut — whether the policy that would carry it is live or itself deleted. The two
+//!    operations one ARN addresses keep their own wording of that class: the read reports an
+//!    absent policy as `GetAutomatedReasoningPolicy` words it and the delete as the policy's
+//!    writes word it, while a missing VERSION of a policy that IS there is the one sentence
+//!    both share.
 //! 3. **The artifact gate is about what the policy STILL holds**: with `force` false "Amazon
 //!    Bedrock validates if all artifacts have been deleted (e.g. policy version, test case,
 //!    test result) for a policy before deletion"
@@ -52,6 +58,10 @@ const POLICY_NOT_FOUND_ON_WRITE: &str = "Policy was not found";
 /// The same class as [`POLICY_NOT_FOUND_ON_WRITE`] for a version of a policy that IS there:
 /// the policy resolved and the revision did not.
 const POLICY_VERSION_NOT_FOUND: &str = "Policy version does not exist";
+
+/// The same class as [`POLICY_NOT_FOUND_ON_WRITE`] as a READ of the policy words it: Amazon
+/// Bedrock words this one class per operation, so the two sentences are not interchangeable.
+const POLICY_NOT_FOUND_ON_READ: &str = "Policy does not exist";
 
 /// The `buildWorkflowType` a seeded build workflow carries.
 const INGEST_CONTENT: &str = "INGEST_CONTENT";
@@ -185,7 +195,7 @@ fn assert_refused(case: &str, reply: &Reply, status: u16, error: &str, message: 
 }
 
 // ---------------------------------------------------------------------------------------
-// 1. Repeating the delete of a revision this account held succeeds.
+// 1. Repeating the delete of a revision this account held is refused.
 // ---------------------------------------------------------------------------------------
 
 /// What a row of rule 1 holds on its policy before the delete that takes the policy away, so
@@ -203,7 +213,7 @@ enum Held {
 }
 
 #[tokio::test]
-async fn repeating_the_delete_of_a_policy_this_account_held_succeeds() {
+async fn repeating_the_delete_of_a_policy_this_account_held_is_refused() {
     // Rows differ along what the policy still held when it was taken away, and along how
     // `force` is spelled on the REPEAT — which decides nothing once nothing is left to hold.
     let rows: [(&str, Held, Force); 6] = [
@@ -258,15 +268,19 @@ async fn repeating_the_delete_of_a_policy_this_account_held_succeeds() {
         // it and the repeats below have a policy this account HELD to repeat.
         assert_accepted(case, &delete_policy(&emu, &policy_arn, Force::True).await);
 
-        // Repeating it succeeds, however often it is repeated and however `force` is spelled
-        // on the repeat.
+        // Repeating it is refused, however often it is repeated and however `force` is
+        // spelled on the repeat: the ARN resolves to nothing, so there is no revision to
+        // report a delete of.
         for round in 1..=3 {
-            assert_accepted(
+            assert_refused(
                 &format!("{case}, repeat {round}"),
                 &delete_policy(&emu, &policy_arn, *repeat).await,
+                404,
+                "ResourceNotFoundException",
+                POLICY_NOT_FOUND_ON_WRITE,
             );
         }
-        // A repeated delete is not a resurrection: the policy is still gone from the read.
+        // The refusals changed nothing: the policy is still gone from the read.
         let read = get_policy(&emu, &policy_arn).await;
         assert_eq!(
             read.status, 404,
@@ -274,13 +288,17 @@ async fn repeating_the_delete_of_a_policy_this_account_held_succeeds() {
             read.status, read.body
         );
 
-        // Every version the policy held went with it, so repeating the delete of one of
-        // those versioned ARNs succeeds the same way.
+        // Every version the policy held went with it, so the versioned ARNs resolve to
+        // nothing either — and the policy that would carry them is gone, so the refusal
+        // reports the absent POLICY rather than an absent version.
         for version_arn in &version_arns {
             for force in EVERY_FORCE {
-                assert_accepted(
+                assert_refused(
                     &format!("{case}, the version {version_arn} it held, force {force:?}"),
                     &delete_policy(&emu, version_arn, force).await,
+                    404,
+                    "ResourceNotFoundException",
+                    POLICY_NOT_FOUND_ON_WRITE,
                 );
             }
         }
@@ -288,7 +306,7 @@ async fn repeating_the_delete_of_a_policy_this_account_held_succeeds() {
 }
 
 #[tokio::test]
-async fn repeating_the_delete_of_one_version_this_account_held_succeeds() {
+async fn repeating_the_delete_of_one_version_this_account_held_is_refused() {
     let emu = emulator();
     let (policy_arn, hash) = policy(&emu, "versioned repeated delete").await;
     let mut version_arns: Vec<String> = Vec::new();
@@ -305,10 +323,15 @@ async fn repeating_the_delete_of_one_version_this_account_held_succeeds() {
         ("the last of three", &version_arns[2]),
     ] {
         assert_accepted(case, &delete_policy(&emu, version_arn, Force::Omitted).await);
+        // The policy is still there and the version is not, so the refusal reports the
+        // missing VERSION rather than the policy — whichever way `force` is spelled.
         for force in EVERY_FORCE {
-            assert_accepted(
+            assert_refused(
                 &format!("{case}, repeated with force {force:?}"),
                 &delete_policy(&emu, version_arn, force).await,
+                404,
+                "ResourceNotFoundException",
+                POLICY_VERSION_NOT_FOUND,
             );
         }
         let read = get_policy(&emu, version_arn).await;
@@ -319,8 +342,9 @@ async fn repeating_the_delete_of_one_version_this_account_held_succeeds() {
         );
     }
 
-    // The policy itself was never deleted, so the repeats above took nothing else with them:
-    // its draft still reads back, and the unforced delete of the emptied policy goes through.
+    // The policy itself was never deleted, so the refusals above took nothing else with
+    // them: its draft still reads back, and the unforced delete of the emptied policy goes
+    // through.
     let read = get_policy(&emu, &policy_arn).await;
     assert_eq!(
         read.status, 200,
@@ -337,13 +361,99 @@ async fn repeating_the_delete_of_one_version_this_account_held_succeeds() {
 // 2. An ARN that never named a revision of this account is still refused.
 // ---------------------------------------------------------------------------------------
 
+/// Assert the ARN `policy_arn` resolves to nothing for BOTH operations addressed by it, each
+/// in its own sentence, and that repeating either call changes neither answer.
+async fn assert_gone(
+    emu: &Emulator,
+    case: &str,
+    policy_arn: &str,
+    read_message: &str,
+    delete_message: &str,
+) {
+    for round in 1..=2 {
+        let spelled = format!("{case}, round {round}");
+        assert_refused(
+            &format!("{spelled}, the read"),
+            &get_policy(emu, policy_arn).await,
+            404,
+            "ResourceNotFoundException",
+            read_message,
+        );
+        for force in EVERY_FORCE {
+            assert_refused(
+                &format!("{spelled}, the delete with force {force:?}"),
+                &delete_policy(emu, policy_arn, force).await,
+                404,
+                "ResourceNotFoundException",
+                delete_message,
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_gone_revision_is_refused_by_the_read_and_the_delete_in_their_own_sentences() {
+    let emu = emulator();
+    let (policy_arn, hash) = policy(&emu, "distinct sentences").await;
+    let taken = create_version(&emu, "setup", &policy_arn, &hash).await;
+    let kept = create_version(&emu, "setup", &policy_arn, &hash).await;
+    let taken_arn = format!("{policy_arn}:{taken}");
+    let kept_arn = format!("{policy_arn}:{kept}");
+    // A version number this policy never cut, so the rows cover a revision that was taken
+    // away and one that never existed under the same policy.
+    let uncut_arn = format!("{policy_arn}:4096");
+
+    // While the POLICY is still there, every ARN of it that resolves to no version is
+    // reported as the missing version by both operations — the one sentence they share.
+    assert_accepted(
+        "the version taken from a live policy",
+        &delete_policy(&emu, &taken_arn, Force::Omitted).await,
+    );
+    for (case, arn) in [
+        ("the version taken from a live policy", &taken_arn),
+        ("a version the live policy never cut", &uncut_arn),
+    ] {
+        assert_gone(
+            &emu,
+            case,
+            arn,
+            POLICY_VERSION_NOT_FOUND,
+            POLICY_VERSION_NOT_FOUND,
+        )
+        .await;
+    }
+
+    // Once the POLICY is gone, every ARN of it resolves to nothing and the two operations
+    // part: the read reports the absent policy in its sentence and the delete in its own.
+    assert_accepted(
+        "the policy itself",
+        &delete_policy(&emu, &policy_arn, Force::True).await,
+    );
+    for (case, arn) in [
+        ("the policy itself", &policy_arn),
+        ("the version it still held", &kept_arn),
+        ("the version taken before it", &taken_arn),
+        ("a version it never cut", &uncut_arn),
+    ] {
+        assert_gone(
+            &emu,
+            case,
+            arn,
+            POLICY_NOT_FOUND_ON_READ,
+            POLICY_NOT_FOUND_ON_WRITE,
+        )
+        .await;
+    }
+}
+
 #[tokio::test]
 async fn an_arn_this_account_never_held_is_still_refused() {
     let emu = emulator();
     let (live, live_hash) = policy(&emu, "the live policy").await;
     create_version(&emu, "setup", &live, &live_hash).await;
-    // A policy this account HELD and deleted, so the rows below separate "never held" from
-    // "held and taken away": the second is rule 1's success, the first is this refusal.
+    // A policy this account HELD and deleted, so the rows below cover both ways an ARN can
+    // resolve to nothing — never held, and held and taken away — which this operation
+    // refuses in the same sentence.
     let (gone, gone_hash) = policy(&emu, "the gone policy").await;
     create_version(&emu, "setup", &gone, &gone_hash).await;
     assert_accepted(
@@ -386,6 +496,11 @@ async fn an_arn_this_account_never_held_is_still_refused() {
             format!("{gone}:9"),
             POLICY_NOT_FOUND_ON_WRITE,
         ),
+        (
+            "the version the deleted policy did cut",
+            format!("{gone}:1"),
+            POLICY_NOT_FOUND_ON_WRITE,
+        ),
     ];
 
     for (case, policy_arn, message) in &rows {
@@ -403,8 +518,8 @@ async fn an_arn_this_account_never_held_is_still_refused() {
     }
 
     // The revision each row is contrasted with is unaffected: the live policy and its
-    // version still read back, and the policy this account held and deleted still answers
-    // the repeated delete with the documented success.
+    // version still read back, and the policy this account held and deleted stays refused
+    // however often the delete is repeated.
     for (case, arn) in [("the draft", live.clone()), ("version 1", format!("{live}:1"))] {
         let read = get_policy(&emu, &arn).await;
         assert_eq!(
@@ -413,9 +528,12 @@ async fn an_arn_this_account_never_held_is_still_refused() {
             read.status, read.body
         );
     }
-    assert_accepted(
+    assert_refused(
         "the gone policy, repeated",
         &delete_policy(&emu, &gone, Force::Omitted).await,
+        404,
+        "ResourceNotFoundException",
+        POLICY_NOT_FOUND_ON_WRITE,
     );
 }
 
@@ -595,9 +713,14 @@ async fn an_unforced_delete_is_refused_until_the_artifact_in_the_way_is_itself_d
             &format!("{case}, cleared"),
             &delete_policy(&emu, &policy_arn, Force::Omitted).await,
         );
-        assert_accepted(
+        // The policy is gone, so the same unforced delete no longer resolves an ARN and is
+        // refused rather than reporting the removal again.
+        assert_refused(
             &format!("{case}, cleared and repeated"),
             &delete_policy(&emu, &policy_arn, Force::Omitted).await,
+            404,
+            "ResourceNotFoundException",
+            POLICY_NOT_FOUND_ON_WRITE,
         );
     }
 }

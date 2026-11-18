@@ -28,8 +28,8 @@
 //! 5. **A `nextToken` this service did not issue is refused** with `ValidationException`,
 //!    over a set of malformed tokens, while a token the listing itself issued resumes it.
 //! 6. **A revision a DELETE took away names nothing either**, so the filter refuses it in
-//!    the same sentences as rule 4 rather than answering an empty page, and rather than
-//!    borrowing the documented idempotent SUCCESS the delete of a removed revision answers
+//!    the same sentences as rule 4 rather than answering an empty page, and in ITS OWN
+//!    sentence rather than the one the delete of that same ARN answers
 //!    — over the forms a delete can leave behind: a whole policy gone, a versioned ARN of a
 //!    policy gone, and one numbered version taken from a policy that is still there.
 //!
@@ -776,8 +776,13 @@ async fn a_next_token_this_service_did_not_issue_is_refused() {
 
 /// The status an accepted `DeleteAutomatedReasoningPolicy` answers with
 /// (`smithy_query(query="operation",operation="DeleteAutomatedReasoningPolicy")`: success
-/// 202), which that operation also answers for a revision one of its own calls removed.
+/// 202).
 const DELETE_ACCEPTED: u16 = 202;
+
+/// The same class as [`LISTING_POLICY_NOT_FOUND`] as a WRITE of one policy words it, which
+/// is what `DeleteAutomatedReasoningPolicy` answers for an ARN naming a policy this account
+/// no longer holds — a third wording of that class, and not this operation's.
+const WRITE_POLICY_NOT_FOUND: &str = "Policy was not found";
 
 /// `DeleteAutomatedReasoningPolicy` for the revision `policy_arn` names. `force` takes the
 /// policy's own artifacts with it, which is what lets a row remove a policy that still
@@ -960,13 +965,23 @@ async fn a_revision_a_delete_took_away_is_refused_by_the_filter() {
                 "case {case:?}: the listing and the read word the absent policy differently"
             );
         }
-        // The delete of the very same ARN answers its documented idempotent success, so the
-        // refusal above is the LISTING's own answer rather than the delete's.
+        // The delete of the very same ARN refuses it in the sentence the POLICY's writes
+        // word that class with — or, for a version of a policy that is still there, in the
+        // one sentence every operation reports a missing version with — so the refusal above
+        // is the LISTING's own answer rather than the delete's.
         let repeated = delete_policy(&emu, policy_arn, false).await;
+        let delete_message = if *read_words_it_the_same {
+            POLICY_VERSION_NOT_FOUND
+        } else {
+            WRITE_POLICY_NOT_FOUND
+        };
         assert_eq!(
-            repeated.status, DELETE_ACCEPTED,
-            "case {case:?}: repeating the delete of a removed revision succeeds, got {} {:?}",
-            repeated.status, repeated.body
+            (repeated.status, repeated.text("message")),
+            (404, delete_message.to_string()),
+            "case {case:?}: repeating the delete of a removed revision must be refused 404 \
+             {delete_message:?}, got {} {:?}",
+            repeated.status,
+            repeated.body
         );
         // And the refusal is stable: reading the filter again answers the same sentence.
         let again = list(&emu, &format!("policyArn={}", label(policy_arn))).await;

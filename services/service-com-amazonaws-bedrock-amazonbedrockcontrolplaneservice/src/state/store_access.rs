@@ -180,52 +180,6 @@ impl ComAmazonawsBedrockAmazonbedrockcontrolplaneserviceState {
         }
     }
 
-    /// Remember that the revision `policy_arn` named has been REMOVED by a delete, so a
-    /// later delete of the same ARN is answered as the delete that already happened.
-    ///
-    /// The ARN is the canonical spelling of the revision — the policy's own ARN, or that ARN
-    /// with the `:<version>` suffix of the version removed — so the entry is found by the
-    /// same ARN the removal was addressed by.
-    ///
-    /// Bounded by [`MAX_REMOVED_AUTOMATED_REASONING_POLICY_REVISIONS`], with the
-    /// longest-removed entry released first: nothing else releases one, so without the bound
-    /// a create-and-delete loop would grow the store without end.
-    pub fn remember_removed_automated_reasoning_policy_revision(&mut self, policy_arn: String) {
-        if !self
-            .automated_reasoning_policy_removed_revisions
-            .insert(policy_arn.clone())
-        {
-            return;
-        }
-        self.automated_reasoning_policy_removal_order
-            .push_back(policy_arn);
-        while self.automated_reasoning_policy_removal_order.len()
-            > MAX_REMOVED_AUTOMATED_REASONING_POLICY_REVISIONS
-        {
-            if let Some(released) = self.automated_reasoning_policy_removal_order.pop_front() {
-                self.automated_reasoning_policy_removed_revisions
-                    .remove(&released);
-            }
-        }
-    }
-
-    /// Whether the revision `policy_arn` names is one this account HELD and a delete has
-    /// taken away — the state in which a repeated delete of it is the documented idempotent
-    /// success rather than a missing resource.
-    ///
-    /// `false` for an ARN that never named a revision of this account, and for one whose
-    /// entry the bound above has released.
-    #[must_use]
-    pub fn removed_automated_reasoning_policy_revision(&self, policy_arn: &str) -> bool {
-        let (base_arn, version) = automated_reasoning_policy_arn_parts(policy_arn);
-        let canonical = match version {
-            None => base_arn.to_string(),
-            Some(number) => automated_reasoning_policy_version_arn(base_arn, number),
-        };
-        self.automated_reasoning_policy_removed_revisions
-            .contains(&canonical)
-    }
-
     /// Mint a fresh `AutomatedReasoningPolicyBuildWorkflowId`: the lowercase hyphenated
     /// UUIDv4 that member's pattern spells
     /// (`^[a-f0-9]{8}-?[a-f0-9]{4}-?4[a-f0-9]{3}-?[89ab][a-f0-9]{3}-?[a-f0-9]{12}$`),

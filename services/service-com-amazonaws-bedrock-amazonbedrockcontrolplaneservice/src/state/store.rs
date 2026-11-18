@@ -93,12 +93,6 @@ use super::*;
 ///   `automated_reasoning_policy_create_tokens` holds at most one entry per live policy for
 ///   the same reason `create_tokens` does.
 ///
-/// * `automated_reasoning_policy_removed_revisions` holds one entry per revision a delete
-///   has taken away, capped at [`MAX_REMOVED_AUTOMATED_REASONING_POLICY_REVISIONS`] with the
-///   longest-removed entry released first, so a create-and-delete loop cannot grow it
-///   without end; `automated_reasoning_policy_removal_order` is that same set in removal
-///   order and is capped with it.
-///
 /// * each policy's [`AutomatedReasoningPolicyRecord::versions`] holds one entry per version
 ///   cut from it, capped at [`MAX_AUTOMATED_REASONING_POLICY_VERSIONS_PER_POLICY`] by the
 ///   quota `CreateAutomatedReasoningPolicyVersion` enforces, and that policy's
@@ -374,20 +368,6 @@ pub struct ComAmazonawsBedrockAmazonbedrockcontrolplaneserviceState {
     /// How many Automated Reasoning policy ids this store has minted; the uniqueness half
     /// of a minted id.
     pub minted_automated_reasoning_policies: u64,
-    /// Every Automated Reasoning policy revision — a policy, or one numbered version of one
-    /// — that this account HELD and a delete has taken away, keyed by the
-    /// `AutomatedReasoningPolicyArn` that named it.
-    ///
-    /// `DeleteAutomatedReasoningPolicy` is modelled `@idempotent` and documented "This
-    /// operation is idempotent. If you delete a policy more than once, each call succeeds",
-    /// so a repeated delete of a revision this account held is answered as the delete that
-    /// already happened rather than as a missing resource; an ARN that never named a
-    /// revision of this account is still reported missing. Bounded by
-    /// [`MAX_REMOVED_AUTOMATED_REASONING_POLICY_REVISIONS`].
-    pub automated_reasoning_policy_removed_revisions: BTreeSet<String>,
-    /// The order [`Self::automated_reasoning_policy_removed_revisions`] was filled in, so
-    /// the longest-removed entry is the one released once that set is full.
-    pub automated_reasoning_policy_removal_order: VecDeque<String>,
     /// Every stored Automated Reasoning policy build workflow, keyed by the
     /// `(policyArn, buildWorkflowId)` pair every one of its operations addresses it by
     /// (`smithy_query(query="operation",operation="GetAutomatedReasoningPolicyBuildWorkflow")`),

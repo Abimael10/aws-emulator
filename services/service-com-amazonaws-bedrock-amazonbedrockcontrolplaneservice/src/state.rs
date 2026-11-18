@@ -187,7 +187,7 @@
 //! address ONE module.
 
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::time::{Duration, SystemTime};
 
 /// The INFERENCE plane's account-enforced guardrail: the one home of the enforcement an

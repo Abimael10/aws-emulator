@@ -14,7 +14,7 @@
 //!    policies carrying each form of the create's optional members, and over the three
 //!    spellings of `force` (omitted, so the modelled `@default(false)` applies, `false` and
 //!    `true`), which decides nothing for a policy holding no artifact. Repeating the delete
-//!    of the policy that is now gone succeeds, which
+//!    of the policy that is now gone is refused `404`, which
 //!    `automated_reasoning_policy_delete_idempotency.rs` pins over every form of revision.
 //! 2. **A versioned ARN removes only that version**: the `:<version>` suffix
 //!    `AutomatedReasoningPolicyArn` admits selects ONE snapshot, so the draft and every
@@ -325,12 +325,14 @@ async fn a_deleted_policy_is_gone_from_every_read() {
             "case {case:?}: the listing must report exactly the policies that are left"
         );
 
-        // A second delete has no policy left to remove and succeeds anyway: the operation
-        // is `@idempotent` and documented "This operation is idempotent. If you delete a
-        // policy more than once, each call succeeds".
-        assert_accepted(
+        // A second delete has no policy left to resolve: the ARN names nothing this account
+        // holds, so it is refused exactly as an ARN nothing ever minted is.
+        assert_refused(
             &format!("{case}, deleted twice"),
             &delete_policy(&emu, &policy_arn, row.force).await,
+            404,
+            "ResourceNotFoundException",
+            POLICY_NOT_FOUND,
         );
 
         // The name is free again, and the `clientRequestToken` that minted the policy no
@@ -469,11 +471,14 @@ async fn a_versioned_arn_removes_only_that_version() {
             cut.body
         );
 
-        // Deleting the same version again has nothing left to remove and succeeds anyway,
-        // by the same documented idempotency.
-        assert_accepted(
+        // Deleting the same version again has nothing left to resolve: the policy is there
+        // and the version is not, so the refusal reports the missing revision.
+        assert_refused(
             &format!("{case}, deleted twice"),
             &delete_policy(&emu, &victim_arn, Force::True).await,
+            404,
+            "ResourceNotFoundException",
+            POLICY_VERSION_NOT_FOUND,
         );
     }
 }
