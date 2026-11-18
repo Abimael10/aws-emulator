@@ -157,7 +157,7 @@ pub(crate) async fn backup_of(router: &MultiServiceRouter, file_system_id: &str)
 }
 
 /// Describe exactly one backup, requiring it to exist.
-async fn describe_one(router: &MultiServiceRouter, backup_id: &str) -> Value {
+pub(crate) async fn describe_one(router: &MultiServiceRouter, backup_id: &str) -> Value {
     let body = ok(router, "DescribeBackups", &json!({ "BackupIds": [backup_id] })).await;
     let backups = body["Backups"]
         .as_array()

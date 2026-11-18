@@ -19,9 +19,12 @@
 //! through the same front door as `file_system_lifecycle.rs` (its harness is reused), so
 //! nothing here reaches into the store directly.
 
+use std::time::{Duration, Instant};
+
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
+use crate::backup_lifecycle::describe_one as describe_backup;
 use crate::file_system_lifecycle::{
     call, emulator, ok, with_client_request_token, PAST_TRANSITION,
 };
@@ -605,6 +608,264 @@ async fn a_lustre_file_system_reports_no_disk_iops_configuration() {
             "case {deployment_type:?}: expected no DiskIopsConfiguration on a Lustre \
              configuration, got {:?}",
             file_system["LustreConfiguration"]
+        );
+    }
+}
+
+/// How long a wait below gives a clock-owed change to be materialised: far longer than the
+/// service's own transition span, so what each wait is bounded by is the CONDITION and not
+/// how fast the host runs.
+const POLL_DEADLINE: Duration = Duration::from_secs(60);
+/// How long a wait below pauses between two looks.
+const POLL_INTERVAL: Duration = Duration::from_millis(25);
+
+/// Read the file system `id` back until `settled` holds of what `DescribeFileSystems`
+/// reports, failing the case with `expectation` once [`POLL_DEADLINE`] has passed without
+/// it.
+async fn file_system_until(
+    router: &MultiServiceRouter,
+    id: &str,
+    case: &str,
+    expectation: &str,
+    settled: impl Fn(&Value) -> bool,
+) -> Value {
+    let started = Instant::now();
+    loop {
+        let described = describe_one(router, id).await;
+        if settled(&described) {
+            return described;
+        }
+        assert!(
+            started.elapsed() < POLL_DEADLINE,
+            "case {case:?}: expected the file system {id} to {expectation}, last read {described}"
+        );
+        tokio::time::sleep(POLL_INTERVAL).await;
+    }
+}
+
+/// Read the backup `id` back until `settled` holds of what `DescribeBackups` reports,
+/// failing the case with `expectation` once [`POLL_DEADLINE`] has passed without it.
+async fn backup_until(
+    router: &MultiServiceRouter,
+    id: &str,
+    case: &str,
+    expectation: &str,
+    settled: impl Fn(&Value) -> bool,
+) -> Value {
+    let started = Instant::now();
+    loop {
+        let described = describe_backup(router, id).await;
+        if settled(&described) {
+            return described;
+        }
+        assert!(
+            started.elapsed() < POLL_DEADLINE,
+            "case {case:?}: expected the backup {id} to {expectation}, last read {described}"
+        );
+        tokio::time::sleep(POLL_INTERVAL).await;
+    }
+}
+
+/// One row of the backup table: a file system, the SSD IOPS it has when the backup is
+/// taken, the capacity it is grown to afterwards and the IOPS it has once that growth has
+/// been carried out.
+struct BackupRow {
+    /// The modelled `FileSystemType` value.
+    file_system_type: &'static str,
+    /// The `FileSystem` member the per-type configuration is reported in.
+    member: &'static str,
+    /// The create request's per-type configuration.
+    configuration: Value,
+    /// `StorageCapacity` at create time, in GiB.
+    storage_capacity: i64,
+    /// The `(Mode, Iops)` the file system — and therefore the backup taken of it — has at
+    /// that capacity.
+    at_backup: (&'static str, i64),
+    /// The capacity the source is grown to afterwards, clearing the documented
+    /// "at least 10 percent greater than the current storage capacity value" floor.
+    grown_capacity: i64,
+    /// The `(Mode, Iops)` the SOURCE has once that growth has been carried out: the
+    /// automatic rate follows the new capacity, a provisioned value does not move.
+    after_growth: (&'static str, i64),
+}
+
+/// The table the backup case runs: the three configurations that model
+/// `DiskIopsConfiguration`, in both modes.
+fn backup_rows() -> Vec<BackupRow> {
+    vec![
+        BackupRow {
+            file_system_type: "OPENZFS",
+            member: "OpenZFSConfiguration",
+            configuration: json!({ "DeploymentType": "SINGLE_AZ_1", "ThroughputCapacity": 64 }),
+            storage_capacity: 64,
+            // 3 * 64
+            at_backup: (MODE_AUTOMATIC, 192),
+            grown_capacity: 256,
+            // 3 * 256
+            after_growth: (MODE_AUTOMATIC, 768),
+        },
+        BackupRow {
+            file_system_type: "WINDOWS",
+            member: "WindowsConfiguration",
+            configuration: json!({ "DeploymentType": "SINGLE_AZ_1", "ThroughputCapacity": 32 }),
+            storage_capacity: 32,
+            // 3 * 32
+            at_backup: (MODE_AUTOMATIC, 96),
+            grown_capacity: 2000,
+            // 3 * 2000
+            after_growth: (MODE_AUTOMATIC, 6000),
+        },
+        BackupRow {
+            file_system_type: "WINDOWS",
+            member: "WindowsConfiguration",
+            configuration: json!({
+                "DeploymentType": "SINGLE_AZ_1",
+                "ThroughputCapacity": 32,
+                "DiskIopsConfiguration": { "Mode": MODE_USER_PROVISIONED, "Iops": 1200 },
+            }),
+            storage_capacity: 32,
+            at_backup: (MODE_USER_PROVISIONED, 1200),
+            grown_capacity: 2000,
+            // A provisioned count is the caller's: growing the capacity leaves it alone.
+            after_growth: (MODE_USER_PROVISIONED, 1200),
+        },
+        BackupRow {
+            file_system_type: "ONTAP",
+            member: "OntapConfiguration",
+            configuration: json!({ "DeploymentType": "SINGLE_AZ_1", "ThroughputCapacity": 128 }),
+            storage_capacity: 1024,
+            // 3 * 1024 * the default 1 HA pair
+            at_backup: (MODE_AUTOMATIC, 3072),
+            grown_capacity: 2048,
+            // 3 * 2048 * 1
+            after_growth: (MODE_AUTOMATIC, 6144),
+        },
+    ]
+}
+
+/// RULE: a backup records the file system it was taken OF, so the `DiskIopsConfiguration`
+/// it embeds is the one that file system HAD at that moment — reported by `CreateBackup`
+/// itself as well as by every later `DescribeBackups`, and left exactly as recorded when
+/// the source file system's own capacity, and with it its automatic IOPS, moves afterwards.
+#[tokio::test]
+async fn a_backup_embeds_the_disk_iops_the_file_system_had_when_it_was_taken() {
+    let router = emulator().await;
+    for row in backup_rows() {
+        let case = format!(
+            "{} {} GiB {}",
+            row.file_system_type, row.storage_capacity, row.configuration
+        );
+        let subnets = [router.subnet_a(), router.subnet_b()];
+        let created = ok(
+            &router,
+            "CreateFileSystem",
+            &create_request(
+                row.file_system_type,
+                row.member,
+                &row.configuration,
+                row.storage_capacity,
+                &subnets,
+            ),
+        )
+        .await;
+        let file_system_id = created["FileSystem"]["FileSystemId"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        let recorded = Some((row.at_backup.0.to_string(), Some(row.at_backup.1)));
+
+        // A backup is taken of a file system that is in service, so the case waits for the
+        // lifecycle the create reported as still owed.
+        file_system_until(
+            &router,
+            &file_system_id,
+            &case,
+            "reach AVAILABLE",
+            |described| described["Lifecycle"] == "AVAILABLE",
+        )
+        .await;
+
+        // `CreateBackup`'s own answer embeds the file system it is of.
+        let backup = ok(
+            &router,
+            "CreateBackup",
+            &with_client_request_token(&json!({ "FileSystemId": file_system_id })),
+        )
+        .await["Backup"]
+            .clone();
+        let backup_id = backup["BackupId"].as_str().unwrap_or_default().to_string();
+        assert_eq!(
+            disk_iops(&backup["FileSystem"], row.member),
+            recorded,
+            "case {case:?}: expected CreateBackup to embed the file system's {recorded:?}, got \
+             {:?}",
+            backup["FileSystem"][row.member]
+        );
+
+        // The stored backup, read back once the clock has taken it into service.
+        let described = backup_until(&router, &backup_id, &case, "reach AVAILABLE", |backup| {
+            backup["Lifecycle"] == "AVAILABLE"
+        })
+        .await;
+        assert_eq!(
+            disk_iops(&described["FileSystem"], row.member),
+            recorded,
+            "case {case:?}: expected DescribeBackups to report the recorded {recorded:?}, got \
+             {:?}",
+            described["FileSystem"][row.member]
+        );
+        assert_eq!(
+            described["FileSystem"]["StorageCapacity"],
+            json!(row.storage_capacity),
+            "case {case:?}: expected the backup to record the capacity the file system had, \
+             got {:?}",
+            described["FileSystem"]["StorageCapacity"]
+        );
+
+        // The source grows. Its automatic IOPS follow its new capacity, which is carried
+        // out by the administrative action the update records rather than in line, so the
+        // case waits for the capacity itself to move.
+        ok(
+            &router,
+            "UpdateFileSystem",
+            &json!({
+                "FileSystemId": file_system_id,
+                "StorageCapacity": row.grown_capacity,
+            }),
+        )
+        .await;
+        let grown = file_system_until(
+            &router,
+            &file_system_id,
+            &case,
+            "report the capacity it was grown to",
+            |described| described["StorageCapacity"] == json!(row.grown_capacity),
+        )
+        .await;
+        assert_eq!(
+            disk_iops(&grown, row.member),
+            Some((row.after_growth.0.to_string(), Some(row.after_growth.1))),
+            "case {case:?}: expected the grown file system to report {:?}, got {:?}",
+            row.after_growth,
+            grown[row.member]
+        );
+
+        // The backup is of what the file system WAS: the source's growth does not reach it.
+        // It is already in service by now, so this is a plain read and not a wait.
+        let described = describe_backup(&router, &backup_id).await;
+        assert_eq!(
+            disk_iops(&described["FileSystem"], row.member),
+            recorded,
+            "case {case:?}: expected the backup to still report the recorded {recorded:?} after \
+             the source grew, got {:?}",
+            described["FileSystem"][row.member]
+        );
+        assert_eq!(
+            described["FileSystem"]["StorageCapacity"],
+            json!(row.storage_capacity),
+            "case {case:?}: expected the backup to still record the capacity it was taken at, \
+             got {:?}",
+            described["FileSystem"]["StorageCapacity"]
         );
     }
 }
