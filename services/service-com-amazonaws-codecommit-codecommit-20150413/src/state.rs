@@ -23,6 +23,8 @@ pub mod conflict_report;
 /// Which KMS key a repository is encrypted under: the selector forms this service
 /// accepts, and the resolution of one to the key it names.
 mod encryption_key;
+/// The one place this service publishes an event onto the account's default event bus.
+pub mod event_bus;
 pub mod git_endpoint;
 pub mod git_object;
 pub mod merge;
@@ -33,6 +35,8 @@ pub mod pull_request_events;
 /// scope for it, and the one handover a write makes once the store guard is gone.
 pub mod reference_changes;
 mod repository;
+/// The EventBridge envelope a write of a REFERENCE is published as.
+pub mod repository_state_events;
 /// What a repository TRIGGER is: how many of them a repository may hold, what a
 /// trigger's members have to say, and the modelled error each problem with one is
 /// answered with.

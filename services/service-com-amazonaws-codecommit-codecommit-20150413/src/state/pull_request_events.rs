@@ -28,13 +28,10 @@
 //! refused call records nothing, so it publishes nothing. It is handed to a task of its
 //! own ([`publish_all_detached`]) rather than awaited while the handler still holds
 //! this service's store guard, because delivery to a rule's targets is not part of the
-//! answer the write gives its caller. EventBridge is reached the way every emulated
-//! service reaches another — the AWS SDK over the framework's in-process callback,
-//! through the ONE client construction [`::service_common::eventbridge_client`] — so
-//! nothing here opens a socket. The only thing the address is built from is the Region
-//! the repository lives in, so no part of a caller's request is a destination.
-//! Publication is BEST EFFORT: an emulator with no EventBridge mounted has nowhere to
-//! publish, so a failure is traced and the operation's own answer stands.
+//! answer the write gives its caller. The hop itself — the bus, the `source`, the
+//! in-process client it is published through and the bound on how many publications are
+//! in flight — is the one [`super::event_bus`] holds for every kind of event this
+//! service publishes.
 //!
 //! The one write path that records a change and publishes none is the git transport's
 //! push ([`crate::service::git_http`]): the framework hook it is served through is
@@ -44,23 +41,15 @@
 
 use super::*;
 
-/// The `source` of every event CodeCommit publishes.
-///
-/// EventBridge names the publishing service in an event's `source` as `aws.<service>`,
-/// and this service's namespace is the one its ARNs carry
-/// (`smithy_query(query="service_info", model_path="services/service-com-amazonaws-codecommit-codecommit-20150413/smithy-model/com-amazonaws-codecommit-codecommit-20150413.json")`:
-/// `arnNamespace` `codecommit`).
-pub const EVENT_SOURCE: &str = "aws.codecommit";
+/// The `source` and the bus every event CodeCommit publishes carries, which are the
+/// same for every kind of change: stated once in [`super::event_bus`] and re-exported
+/// here, so a consumer of a pull request's events reads them from the module that
+/// renders those events.
+pub use super::event_bus::{DEFAULT_EVENT_BUS, EVENT_SOURCE};
 
 /// The `detail-type` every change to a PULL REQUEST is published under: one type for
 /// the whole lifecycle, with the change itself named by `detail.event`.
 pub const PULL_REQUEST_STATE_CHANGE_DETAIL_TYPE: &str = "CodeCommit Pull Request State Change";
-
-/// The event bus this service publishes onto.
-///
-/// The events an AWS service generates go to the account's default event bus, which is
-/// the bus a rule carrying no `EventBusName` is created on.
-pub const DEFAULT_EVENT_BUS: &str = "default";
 
 /// `detail.event` values: the name each kind of recorded change is published under.
 ///
@@ -231,106 +220,49 @@ impl PullRequestStateChange {
         }
     }
 
-    /// Publish this change onto the account's default event bus in the repository's
-    /// Region.
-    ///
-    /// Call it with NO store guard held. Nothing about the answer changes what the
-    /// caller of the operation is told, for the reason the module docs give.
-    pub async fn publish(self, callback: &::smithy_server_runtime::EmbeddedEmulator) {
-        let client = ::service_common::eventbridge_client::eventbridge_client(callback, &self.region);
-        let entry = ::aws_sdk_eventbridge::types::PutEventsRequestEntry::builder()
-            .event_bus_name(DEFAULT_EVENT_BUS)
-            .source(EVENT_SOURCE)
-            .detail_type(PULL_REQUEST_STATE_CHANGE_DETAIL_TYPE)
-            // The event's `time` is WHEN the pull request changed, not when it was
-            // published: `PutEventsRequestEntry$Time` is "the time stamp of the event,
-            // per RFC3339. If no time stamp is provided, the time stamp of the
-            // PutEvents call is used."
-            .time(::aws_sdk_eventbridge::primitives::DateTime::from_millis(
-                self.at,
-            ))
-            .resources(&self.repository_arn)
-            .detail(self.detail.to_string())
-            .build();
-        match client.put_events().entries(entry).send().await {
-            Ok(answer) if answer.failed_entry_count() > 0 => {
-                ::tracing::warn!(
-                    repository = %self.repository_arn,
-                    "a CodeCommit pull-request event was not accepted by the default event bus"
-                );
-            }
-            Ok(_) => {}
-            Err(error) => {
-                ::tracing::warn!(
-                    repository = %self.repository_arn,
-                    error = %::aws_smithy_types::error::display::DisplayErrorContext(&error),
-                    "a CodeCommit pull-request event could not be published"
-                );
-            }
+    /// This change as the envelope the default bus is given: the rendered `detail`,
+    /// published under the one `detail-type` a pull request's lifecycle is carried by.
+    #[must_use = "a recorded pull-request change is published onto the default event bus"]
+    pub fn into_event(self) -> event_bus::PublishedEvent {
+        event_bus::PublishedEvent {
+            repository_arn: self.repository_arn,
+            region: self.region,
+            at: self.at,
+            detail_type: PULL_REQUEST_STATE_CHANGE_DETAIL_TYPE,
+            detail: self.detail,
         }
     }
 }
 
-/// Publish `changes` in the order they were recorded.
+/// Publish `changes` in the order they were recorded, on a task of its OWN, for a
+/// handler that still holds this service's store guard.
 ///
-/// The one place a handler hands over what its write recorded, so no caller of it
-/// orders the publication of two changes of one call differently.
-pub async fn publish_all(
-    changes: Vec<PullRequestStateChange>,
-    callback: &::smithy_server_runtime::EmbeddedEmulator,
-) {
-    for change in changes {
-        change.publish(callback).await;
-    }
-}
-
-/// How many pull-request publications run at once, over the whole store.
-///
-/// A write that records a change starts one publication, so a caller driving writes
-/// drives tasks: this permit is what keeps the work in flight bounded however many
-/// writes arrive, exactly as the rest of this crate bounds what one request can grow.
-/// The task waits for a permit rather than dropping the event, because a change the
-/// pull request records is a change a consumer is owed.
-const CONCURRENT_PUBLICATIONS: usize = 16;
-
-/// The permits those publications take, one per publication in flight.
-static PUBLICATIONS: ::tokio::sync::Semaphore =
-    ::tokio::sync::Semaphore::const_new(CONCURRENT_PUBLICATIONS);
-
-/// The same publication, on a task of its OWN, for a handler that still holds this
-/// service's store guard.
-///
-/// EventBridge delivery is not part of the answer the caller of the write is given —
-/// the event reaches a rule's targets after the call that caused it, which is what a
-/// consumer polling for it observes — so the publication is handed to its own task
-/// rather than awaited under the guard: a guard held across an await would make a
-/// handler's future non-`Send`, and the write's answer waits for nothing that is not
-/// part of it. Nothing to publish starts no task, and a task that starts takes one of
-/// [`CONCURRENT_PUBLICATIONS`] permits before it publishes.
+/// The one place a handler whose write touched only a pull request hands over what it
+/// recorded; a write that moved a REFERENCE hands its pull-request changes over
+/// together with the reference's own event
+/// ([`super::reference_changes::ReferenceChange::publish_detached`]), so one write
+/// publishes everything it owes on one task. Both reach the bus through the one
+/// publication routine [`event_bus::publish_all_detached`], which is also what bounds
+/// how many publications one caller can have in flight.
 pub fn publish_all_detached(
     changes: Vec<PullRequestStateChange>,
     callback: &::smithy_server_runtime::EmbeddedEmulator,
 ) {
-    if changes.is_empty() {
-        return;
-    }
-    let callback = callback.clone();
-    ::tokio::spawn(async move {
-        // One permit per publication in flight; a closed semaphore is not something
-        // this process creates, so a permit that cannot be taken leaves the events
-        // untouched rather than published twice.
-        let Ok(_permit) = PUBLICATIONS.acquire().await else {
-            return;
-        };
-        publish_all(changes, &callback).await;
-    });
+    event_bus::publish_all_detached(
+        changes
+            .into_iter()
+            .map(PullRequestStateChange::into_event)
+            .collect(),
+        callback,
+    );
 }
 
 impl Repository {
     /// The envelopes for the `newest` most recently recorded changes to the pull
     /// request `pull_request_id` names in this repository, OLDEST FIRST.
     ///
-    /// What a handler that has just recorded its changes hands to [`publish_all`]: the
+    /// What a handler that has just recorded its changes hands to
+    /// [`publish_all_detached`]: the
     /// changes are read back out of the pull request's own log, so what is published
     /// is what the log records. An id this repository does not hold, and a request for
     /// no changes, render nothing.

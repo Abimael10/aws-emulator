@@ -36,14 +36,15 @@
 //! can move a reference without running them.
 //!
 //! A write is handed back as a [`ReferenceChange`]: the records the triggers owe their
-//! destinations, together with the pull-request changes the write recorded
-//! ([`super::pull_request_events`]). Both are DELIVERED by the handler once the store
-//! guard is gone ([`ReferenceChange::publish_detached`]), because each reaches another
-//! service's handler, which takes that service's own lock. The git transport is the one
-//! write path that delivers neither: the framework hook it is served through is
-//! synchronous and is handed no callback to deliver over, so a push records what
-//! happened and leaves it undelivered rather than reaching for a channel this crate does
-//! not have there.
+//! destinations, the EventBridge event the write itself publishes
+//! ([`super::repository_state_events`]), and the pull-request changes the write recorded
+//! ([`super::pull_request_events`]). All three are DELIVERED by the handler once the
+//! store guard is gone ([`ReferenceChange::publish_detached`]), because each reaches
+//! another service's handler, which takes that service's own lock. The git transport is
+//! the one write path that delivers none of them: the framework hook it is served
+//! through is synchronous and is handed no callback to deliver over, so a push records
+//! what happened and leaves it undelivered rather than reaching for a channel this crate
+//! does not have there.
 
 use super::*;
 
@@ -94,14 +95,18 @@ fn runs_for(trigger: &RepositoryTrigger, branch: &str, event: ReferenceEvent) ->
 
 /// What one write of a reference leaves to be delivered once the store guard is gone.
 ///
-/// The two things such a write is observable by outside this service: the records the
-/// repository's triggers owe their destinations, and the pull-request changes the write
-/// recorded. They are handed over TOGETHER, so no write path can deliver one and forget
-/// the other.
+/// The three things such a write is observable by outside this service: the records the
+/// repository's triggers owe their destinations, the event the reference's own move is
+/// published as onto the account's default event bus, and the pull-request changes the
+/// write recorded. They are handed over TOGETHER, so no write path can deliver one and
+/// forget another.
 #[derive(Debug, Default)]
 #[must_use = "a write of a reference runs the repository's triggers and publishes the \
-              pull-request changes it recorded"]
+              event and the pull-request changes it recorded"]
 pub struct ReferenceChange {
+    /// The event this write of the reference is published as, or `None` for a write that
+    /// moved no reference at all.
+    pub repository_state_change: Option<event_bus::PublishedEvent>,
     /// The pull-request changes this write recorded, oldest first.
     pub pull_request_changes: Vec<pull_request_events::PullRequestStateChange>,
     /// The records the triggers in scope for this write owe their destinations, in the
@@ -112,10 +117,19 @@ pub struct ReferenceChange {
 impl ReferenceChange {
     /// Deliver everything this write owes, each on a task of its own.
     ///
-    /// Call it with NO store guard held, for the reason the module docs give.
+    /// Call it with NO store guard held, for the reason the module docs give. The
+    /// reference's own event is published BEFORE the changes it caused on the pull
+    /// requests reading from it, which is the order they happened in.
     pub fn publish_detached(self, callback: &::smithy_server_runtime::EmbeddedEmulator) {
         trigger_notifications::deliver_all_detached(self.trigger_notifications, callback);
-        pull_request_events::publish_all_detached(self.pull_request_changes, callback);
+        let mut events: Vec<event_bus::PublishedEvent> =
+            self.repository_state_change.into_iter().collect();
+        events.extend(
+            self.pull_request_changes
+                .into_iter()
+                .map(pull_request_events::PullRequestStateChange::into_event),
+        );
+        event_bus::publish_all_detached(events, callback);
     }
 }
 
@@ -178,7 +192,8 @@ impl Repository {
     /// The record names the reference at the git object name a deleted reference's
     /// update carries ([`git_object::NULL_OBJECT_ID`]), which is what says the reference
     /// points at nothing now; the commit it held before the removal is what the
-    /// operation's own answer reports.
+    /// operation's own answer reports, and what the published event names as the commit
+    /// the reference pointed at before.
     #[must_use = "removing a reference runs the repository's triggers"]
     pub fn remove_branch_tip(
         &mut self,
@@ -194,9 +209,18 @@ impl Repository {
             actor,
             at,
         );
+        let repository_state_change = Some(self.reference_state_change(
+            branch,
+            git_object::NULL_OBJECT_ID,
+            Some(&removed.commit_id),
+            ReferenceEvent::Deleted,
+            actor,
+            at,
+        ));
         Some((
             removed,
             ReferenceChange {
+                repository_state_change,
                 pull_request_changes: Vec::new(),
                 trigger_notifications,
             },

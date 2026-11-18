@@ -75,16 +75,16 @@ impl Repository {
     ///
     /// Answers what the write leaves to be DELIVERED once this repository's store
     /// guard is gone ([`reference_changes::ReferenceChange::publish_detached`]): the
-    /// change each updated pull request recorded, which a consumer of the account's
-    /// default event bus observes, and the record each of the repository's triggers
-    /// that is in scope for this write owes its destination — a trigger naming this
-    /// branch, or naming none, and naming the class of write this is
+    /// event the reference's own move is published as onto the account's default event
+    /// bus ([`repository_state_events`]), the change each updated pull request
+    /// recorded, which a consumer of that same bus observes, and the record each of the
+    /// repository's triggers that is in scope for this write owes its destination — a
+    /// trigger naming this branch, or naming none, and naming the class of write this is
     /// ([`reference_changes`]). This is the one place that knows both which pull
-    /// requests the move updated and which reference moved how, so it is where both
-    /// are rendered. A move that updated no pull request and that no trigger is in
-    /// scope for answers nothing.
+    /// requests the move updated and which reference moved how, so it is where all three
+    /// are rendered. A move that changed nothing answers nothing.
     #[must_use = "a write of a reference runs the repository's triggers and publishes \
-                  the pull-request changes it recorded"]
+                  the event and the pull-request changes it recorded"]
     pub fn set_branch_tip(
         &mut self,
         branch: &str,
@@ -189,20 +189,31 @@ impl Repository {
         // Rendered from the pull requests as they now stand, so what is published
         // is what the next read of each of them reports — together with the record
         // each trigger in scope for this write owes its destination, read off the
-        // configuration the repository holds. A reference the repository did not
-        // hold before is a `createReference` write; one that moved from another
-        // commit is an `updateReference` write.
+        // configuration the repository holds, and the event the reference's own move
+        // is published as onto the account's default event bus
+        // ([`reference_changes::ReferenceChange::publish_detached`]). A reference the
+        // repository did not hold before is a `createReference` write; one that moved
+        // from another commit is an `updateReference` write.
         let event = match previous {
             Some(_) => reference_changes::ReferenceEvent::Updated,
             None => reference_changes::ReferenceEvent::Created,
         };
         let trigger_notifications =
             self.reference_change_notifications(branch, commit_id, event, actor, at);
+        let repository_state_change = Some(self.reference_state_change(
+            branch,
+            commit_id,
+            previous.as_deref(),
+            event,
+            actor,
+            at,
+        ));
         let pull_request_changes = updated
             .into_iter()
             .flat_map(|pull_request_id| self.pull_request_changes(pull_request_id, 1))
             .collect();
         reference_changes::ReferenceChange {
+            repository_state_change,
             pull_request_changes,
             trigger_notifications,
         }
