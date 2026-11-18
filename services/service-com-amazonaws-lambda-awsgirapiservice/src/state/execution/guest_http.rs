@@ -475,7 +475,8 @@ fn refusal_document(refused: &Refusal) -> String {
 /// conversions a program reads off `socket` are the first's, the sockets themselves are the
 /// second's, and the connections a stream socket carries bytes on are the third's — so there
 /// is ONE `socket` a handler can import, whose reachable destinations are the in-process
-/// X-Ray daemon and the data-plane listeners this emulator has opened.
+/// X-Ray daemon, the data-plane listeners this emulator has opened and the addresses of the
+/// VPC the function is attached to.
 #[must_use]
 pub fn runtime_stdlib_modules() -> Vec<PackageModule> {
     [

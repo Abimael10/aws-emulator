@@ -728,11 +728,12 @@ impl Session {
         self.sockets.release();
     }
 
-    /// ONE call the invocation being served made on a STREAM socket of its own
+    /// ONE call the invocation being served made on a SOCKET of its own
     /// ([`super::guest_socket`]): the connections are this environment's, WHERE a connection
-    /// may be opened is decided by the register of the planes this emulator has opened, and
-    /// the plane's own handler runs on the async runtime the invocation's seam holds. An
-    /// invocation with no seam reaches no plane, which is what a run with no seam is.
+    /// may be opened is decided by the register of the planes this emulator has opened and by
+    /// the VPC the function is attached to, and the plane's own handler runs on the async
+    /// runtime the invocation's seam holds. An invocation with no seam reaches no plane and no
+    /// VPC, which is what a run with no seam is.
     fn socket_call(&self, verb: &str, document: &str, within: Duration) -> Option<String> {
         let access = self
             .serving
@@ -1802,12 +1803,13 @@ fn host_module(vm: &VirtualMachine, session: &Arc<Session>) -> PyResult<PyRef<Py
             Ok(vm.ctx.new_str(answered).into())
         },
     );
-    // The ONE call a handler makes on a STREAM SOCKET of its own, for a data plane whose wire
-    // protocol is its own rather than HTTP. WHERE a connection may be opened, the connections
-    // themselves and how many bytes one invocation may carry are all
-    // [`super::guest_socket`]'s; the two bounds that are this run's — how many calls it may
-    // make when it OPENS one, and how long any one call may wait — are held here, where no
-    // guest code can reach them.
+    // The calls a handler makes on a SOCKET of its own: one on a STREAM socket, for a data
+    // plane whose wire protocol is its own rather than HTTP, and the route lookup and the
+    // datagram of a function attached to a VPC. WHERE a connection may be opened, the
+    // connections themselves, which addresses a datagram reaches and how many bytes one
+    // invocation may carry are all [`super::guest_socket`]'s; the two bounds that are this
+    // run's — how many calls it may make when it OPENS one, and how long any one call may wait
+    // — are held here, where no guest code can reach them.
     let dialing = Arc::clone(session);
     set_function(
         vm,

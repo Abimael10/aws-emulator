@@ -1274,7 +1274,9 @@ fn unrunnable(why: crate::state::Unrunnable) -> InvokeError {
 /// generates a unique identifier automatically." A name the function already holds never
 /// starts a second execution — the one already started answers the repeat that carries the
 /// same payload, and the repeat whose payload differs is the modelled
-/// `DurableExecutionAlreadyStartedException`.
+/// `DurableExecutionAlreadyStartedException`. `tenant_id` is the `TenantId` the invocation
+/// named, which is part of whose execution a held name is (see
+/// [`crate::state::FunctionRecord::start_durable_execution`]).
 fn start_durable_execution(
     record: &mut crate::state::FunctionRecord,
     requested_name: Option<&str>,
