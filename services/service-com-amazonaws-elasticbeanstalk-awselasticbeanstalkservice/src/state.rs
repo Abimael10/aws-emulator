@@ -58,9 +58,11 @@ pub mod environment_health;
 pub mod environment_launch;
 pub mod environment_plane_endpoint;
 pub mod event_notifications;
+pub mod instance_log_streaming;
 pub mod managed_action_schedule;
 pub mod platform_build;
 pub mod platform_catalog;
+pub mod python_application;
 /// Declared but not glob-re-exported: this module adds only methods to the
 /// store (an inherent `impl`), which every caller already reaches through the
 /// store itself, so there is no name to re-export.
@@ -78,9 +80,11 @@ pub use environment_health::*;
 pub use environment_launch::*;
 pub use environment_plane_endpoint::*;
 pub use event_notifications::*;
+pub use instance_log_streaming::*;
 pub use managed_action_schedule::*;
 pub use platform_build::*;
 pub use platform_catalog::*;
+pub use python_application::*;
 pub use version_processing::*;
 
 /// This service's ARN namespace, from the model's `aws.api#service` trait
@@ -4421,8 +4425,18 @@ impl ComAmazonawsElasticbeanstalkAwselasticbeanstalkserviceState {
             .application_versions
             .get(&(environment.application_name.clone(), version_label.clone()))?;
         let bundle = version.bundle.clone()?;
+        // What the environment's platform starts that bundle from: the platform
+        // version it runs decides, where this emulator embeds an engine for that
+        // platform's own language ([`application_entry`]).
+        let platform_category = named_platform_version(
+            &environment.region,
+            environment.solution_stack_name.as_deref(),
+            environment.platform_arn.as_deref(),
+        )
+        .map(|version| version.stack.platform_category);
         Some(DeployedApplication {
             version_label,
+            entry: application_entry(&bundle, platform_category, &environment.option_settings),
             bundle,
             environment: application_environment(&environment.option_settings),
         })

@@ -390,6 +390,58 @@ pub async fn provisioned_over(
     created_group(&logs_client(callback, region), log_group).await
 }
 
+/// Keep the records of `log_group` for `retention_in_days`, the retention the delivering
+/// service's own configuration states for the group it publishes.
+///
+/// A service whose log configuration carries a retention period applies that period to the
+/// GROUP it publishes, so a client reading the group back sees it: the period is CloudWatch
+/// Logs' own property of a group (`DescribeLogGroups` reports it as `retentionInDays`), set
+/// through that service's own ingest path (`PutRetentionPolicy`) rather than kept beside the
+/// group in the delivering service's store, where no reader of the group would find it.
+///
+/// Call it on a group CloudWatch Logs already holds ([`provisioned`] or [`delivered`] put it
+/// there): a period cannot be attached to a group that is not there. Best effort, as every
+/// vended-logs write is — `true` once the period is on the group, `false` when it could not be
+/// set, and the configuration the caller is being answered for is not failed by it. Call it
+/// with NO state guard held: it awaits.
+pub async fn retention_set(
+    ctx: &::smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    log_group: &str,
+    retention_in_days: i32,
+) -> bool {
+    retention_set_over(ctx.callback(), region, log_group, retention_in_days).await
+}
+
+/// [`retention_set`] for a deliverer that holds the in-process transport ITSELF rather than a
+/// request's context, as [`delivered_over`] is for [`delivered`].
+pub async fn retention_set_over(
+    callback: &::smithy_server_runtime::EmbeddedEmulator,
+    region: &str,
+    log_group: &str,
+    retention_in_days: i32,
+) -> bool {
+    match logs_client(callback, region)
+        .put_retention_policy()
+        .log_group_name(log_group)
+        .retention_in_days(retention_in_days)
+        .send()
+        .await
+    {
+        Ok(_) => true,
+        Err(error) => {
+            ::tracing::warn!(
+                log_group = %log_group,
+                retention_in_days,
+                error = %::aws_smithy_types::error::display::DisplayErrorContext(&error),
+                "the retention this service's log configuration states could not be set on the \
+                 log group it publishes"
+            );
+            false
+        }
+    }
+}
+
 /// Create `log_group` where CloudWatch Logs does not hold it, which is what a group the
 /// delivering service publishes under its own name needs before anything is written to it.
 ///

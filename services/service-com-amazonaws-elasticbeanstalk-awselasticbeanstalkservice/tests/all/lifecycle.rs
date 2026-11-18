@@ -91,6 +91,28 @@ pub(crate) struct Emulator {
     engine: Arc<engine::InMemoryEngine>,
 }
 
+/// WHICH other services are mounted beside Elastic Beanstalk on the one shared
+/// engine, for the constructor that builds an emulator with them answering.
+///
+/// A struct rather than a row of booleans, so each constructor below says which
+/// service it mounts at the point it asks for it.
+struct Mounts {
+    object_storage: bool,
+    notifications: bool,
+    identity: bool,
+    log_service: bool,
+}
+
+impl Mounts {
+    /// Elastic Beanstalk alone, which every constructor starts from.
+    const NONE: Self = Self {
+        object_storage: false,
+        notifications: false,
+        identity: false,
+        log_service: false,
+    };
+}
+
 impl Emulator {
     pub(crate) fn new() -> Self {
         Self::over_engine(false)
@@ -106,6 +128,25 @@ impl Emulator {
         Self::over_engine(true)
     }
 
+    /// A fresh emulator with object storage and the CloudWatch Logs service
+    /// mounted beside Elastic Beanstalk on the SAME engine — which is what the
+    /// assembled emulator does.
+    ///
+    /// An environment whose configuration turns instance log streaming on
+    /// PUBLISHES a CloudWatch Logs group per on-instance log file its platform
+    /// streams and delivers the application's own output into one of them, by
+    /// calling CloudWatch Logs in process, so a suite that asserts the groups,
+    /// their retention or their events needs that service answering — and object
+    /// storage beside it, because the application whose output is delivered comes
+    /// out of the version's source bundle.
+    pub(crate) fn with_object_storage_and_logs() -> Self {
+        Self::mounting(Mounts {
+            object_storage: true,
+            log_service: true,
+            ..Mounts::NONE
+        })
+    }
+
     /// A fresh emulator with the SNS and SQS services mounted beside Elastic
     /// Beanstalk on the SAME engine — which is what the assembled emulator does.
     ///
@@ -114,7 +155,10 @@ impl Emulator {
     /// Amazon SNS in process, so a suite that asserts the delivery needs SNS
     /// answering and a queue of its own to read the notification from.
     pub(crate) fn with_notification_services() -> Self {
-        Self::mounting(false, true, false)
+        Self::mounting(Mounts {
+            notifications: true,
+            ..Mounts::NONE
+        })
     }
 
     /// A fresh emulator with object storage and the IAM service mounted beside
@@ -127,7 +171,11 @@ impl Emulator {
     /// credential needs IAM answering — and object storage beside it, because the
     /// creates such a caller makes read a caller-named archive.
     pub(crate) fn with_identity_services() -> Self {
-        Self::mounting(true, false, true)
+        Self::mounting(Mounts {
+            object_storage: true,
+            identity: true,
+            ..Mounts::NONE
+        })
     }
 
     /// The one shared engine the mounted services reach their stores through, for
@@ -140,25 +188,24 @@ impl Emulator {
 
     /// The one construction path both constructors use, so they cannot drift.
     fn over_engine(with_object_storage: bool) -> Self {
-        Self::mounting(with_object_storage, false, false)
+        Self::mounting(Mounts {
+            object_storage: with_object_storage,
+            ..Mounts::NONE
+        })
     }
 
     /// Mount Elastic Beanstalk, and the other services a suite needs answering
     /// beside it, on one shared engine.
-    fn mounting(
-        with_object_storage: bool,
-        with_notification_services: bool,
-        with_identity_services: bool,
-    ) -> Self {
+    fn mounting(mounts: Mounts) -> Self {
         let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
         let mut router = MultiServiceRouter::new();
         router.register_service(eb::EmulatedService::new(Arc::clone(&engine)));
-        if with_object_storage {
+        if mounts.object_storage {
             router.register_service(service_com_amazonaws_s3_amazons3::EmulatedService::new(
                 Arc::clone(&engine),
             ));
         }
-        if with_notification_services {
+        if mounts.notifications {
             router.register_service(
                 service_com_amazonaws_sns_amazonsimplenotificationservice::EmulatedService::new(
                     Arc::clone(&engine),
@@ -168,9 +215,16 @@ impl Emulator {
                 Arc::clone(&engine),
             ));
         }
-        if with_identity_services {
+        if mounts.identity {
             router.register_service(
                 service_com_amazonaws_iam_awsidentitymanagementv20100508::EmulatedService::new(
+                    Arc::clone(&engine),
+                ),
+            );
+        }
+        if mounts.log_service {
+            router.register_service(
+                service_com_amazonaws_cloudwatchlogs_logs_20140328::EmulatedService::new(
                     Arc::clone(&engine),
                 ),
             );

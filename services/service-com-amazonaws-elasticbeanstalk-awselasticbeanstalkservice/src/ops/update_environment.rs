@@ -237,6 +237,43 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let region = crate::state::request_region(ctx);
+        // The update takes this service's store and gives it back before this call
+        // awaits anything: what the configuration it deploys owes CloudWatch Logs
+        // is delivered afterwards, and that delivery calls another service and
+        // RUNS the deployed application, so the guard cannot be held across it.
+        let updated = self.update(&input, &region)?;
+        if let Some(streaming) = updated.streaming {
+            let started = match updated.deployed {
+                Some(deployed) => deployed.startup_output().await,
+                None => Vec::new(),
+            };
+            crate::state::stream_instance_logs(ctx, &streaming, &started).await;
+        }
+        Ok(updated.output)
+    }
+}
+
+/// What the update leaves for the call that performed it to finish: the
+/// description its caller is answered with, the instance log streaming the
+/// configuration it deploys turns on, and the application that configuration
+/// deploys — the two the delivery needs, read while the store was held.
+struct Updated {
+    output: UpdateEnvironmentOutput,
+    /// `None` for an environment whose configuration streams no instance log.
+    streaming: Option<crate::state::InstanceLogStreaming>,
+    /// `None` for an environment running no application this emulator starts.
+    deployed: Option<crate::state::DeployedApplication>,
+}
+
+impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> UpdateEnvironment<Eng> {
+    /// UPDATE the environment the request names: everything this operation decides
+    /// and stores, which is all of it that happens under this service's store.
+    fn update(
+        &self,
+        input: &UpdateEnvironmentInput,
+        region: &str,
+    ) -> Result<Updated, UpdateEnvironmentError> {
+        let region = region.to_string();
 
         // A statement about the REQUEST is answered BEFORE any resource it names
         // is resolved: it does not depend on what this account holds.
@@ -610,6 +647,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // when the clock makes that completion due.
         store.record_activity_start(&request_id, "updateEnvironment", subject);
 
-        Ok(output)
+        // The configuration this update DEPLOYS is what decides the environment's
+        // instance log streaming, so a client that turns `StreamLogs` on with this
+        // call has the groups it publishes — each with the retention it states —
+        // from here, and the output the deployed application wrote while starting
+        // is delivered into the group of the file it goes to on the instance.
+        let streaming = store.instance_log_streaming(&region, &environment_id);
+        let deployed = streaming
+            .as_ref()
+            .and_then(|_| store.deployed_application(&environment_id));
+        drop(store);
+
+        Ok(Updated {
+            output,
+            streaming,
+            deployed,
+        })
     }
 }

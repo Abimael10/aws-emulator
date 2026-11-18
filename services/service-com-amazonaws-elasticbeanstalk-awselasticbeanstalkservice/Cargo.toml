@@ -65,6 +65,10 @@ yaml-rust2 = { version = "0.10", default-features = false }
 # subscribed (`state::event_notifications`). Only the generated client is needed — the
 # emulator supplies the transport.
 aws-sdk-sns = { version = "1", default-features = false }
+# Decodes the base64 the WSGI server side of the Python platform encodes a response body as
+# (`state::python_application`), so the BYTES a deployed application answered reach the client
+# unchanged whether or not they are text.
+base64 = "0.22"
 # The ONE shared evaluation of IAM policy documents against a request, which the
 # authorization gate (`service::authorization`) takes its decision through.
 service-common = { path = "../common" }
@@ -77,6 +81,24 @@ service-com-amazonaws-iam-awsidentitymanagementv20100508 = { workspace = true }
 # `ValidateConfigurationSettings` matches a desired value against it with a
 # regular-expression engine rather than reading the pattern by hand.
 regex = "1"
+
+# The CONTAINED Python interpreter the application of an environment on a PYTHON platform is
+# run by (`state::python_application`), reached through the Lambda service crate, which is
+# where this workspace's ONE embedded Python execution substrate lives
+# (`state::execution::python`). Reused rather than stood up a second time here, so a deployed
+# application runs under exactly the containment and the bounds that engine already enforces,
+# and this crate adds no execution surface of its own: it supplies the bundle's own modules,
+# the WSGI entry point its platform starts and the ceilings one run is given, and nothing
+# else.
+#
+# Capability class: an execution substrate. What it re-opens is answered by that engine — the
+# interpreter is built with its host-reaching features compiled out, its native modules are
+# an allow-list that leaves every socket, subprocess, memory-map and host-library module
+# unregistered, the operating-system modules a run can import are the workspace's own
+# in-memory ones, and every bound (wall clock, steps, memory, recursion, output size) lives
+# in host code no run can reach. It brings no build-time code of its own beyond the generated
+# service scaffolding every service crate here builds.
+service-com-amazonaws-lambda-awsgirapiservice = { workspace = true }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
@@ -96,6 +118,12 @@ service-com-amazonaws-sns-amazonsimplenotificationservice = { workspace = true }
 # SQS is mounted with it, because that subscriber is a queue and the delivered
 # notification is read from it.
 service-com-amazonaws-sqs-amazonsqs = { workspace = true }
+# CloudWatch Logs is mounted beside Elastic Beanstalk on one engine in the deployed-
+# application suite, because an environment whose configuration turns instance log
+# streaming on publishes its log groups and delivers the application's own output into
+# them by calling that service in process — and the suite asserts the groups, their
+# retention and their events where a client reads them: in CloudWatch Logs itself.
+service-com-amazonaws-cloudwatchlogs-logs-20140328 = { workspace = true }
 
 [lints]
 workspace = true

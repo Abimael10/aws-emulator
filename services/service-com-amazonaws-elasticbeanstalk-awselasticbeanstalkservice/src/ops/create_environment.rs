@@ -249,6 +249,46 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // cannot happen while the store is held.
         let plane_authority =
             crate::state::environment_plane_authority(&*self.engine, ctx).await;
+        // The launch takes this service's store and gives it back before this call
+        // awaits anything again: what the launch owes CloudWatch Logs is delivered
+        // afterwards, and that delivery calls another service and RUNS the
+        // deployed application, so the guard cannot be held across it.
+        let launched = self.launch(&input, &region, &plane_authority)?;
+        if let Some(streaming) = launched.streaming {
+            let started = match launched.deployed {
+                Some(deployed) => deployed.startup_output().await,
+                None => Vec::new(),
+            };
+            crate::state::stream_instance_logs(ctx, &streaming, &started).await;
+        }
+        Ok(launched.output)
+    }
+}
+
+/// What the launch leaves for the call that performed it to finish: the
+/// description its caller is answered with, the instance log streaming the
+/// configuration it deployed turned on, and the application that configuration
+/// deploys — the two the delivery needs, read while the store was held.
+struct Launched {
+    output: CreateEnvironmentOutput,
+    /// `None` for an environment whose configuration streams no instance log.
+    streaming: Option<crate::state::InstanceLogStreaming>,
+    /// `None` for an environment running no application this emulator starts.
+    deployed: Option<crate::state::DeployedApplication>,
+}
+
+impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> CreateEnvironment<Eng> {
+    /// LAUNCH the environment the request asks for: everything this operation
+    /// decides and stores, which is all of it that happens under this service's
+    /// store.
+    fn launch(
+        &self,
+        input: &CreateEnvironmentInput,
+        region: &str,
+        plane_authority: &str,
+    ) -> Result<Launched, CreateEnvironmentError> {
+        let region = region.to_string();
+        let plane_authority = plane_authority.to_string();
 
         // A parameter this request needs but did not supply is answered BEFORE any
         // resource the request names is resolved: an absent input is a statement about
@@ -562,10 +602,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         });
 
         let output = crate::state::environment_description!(CreateEnvironmentOutput, &environment);
+        let environment_id = environment.environment_id.clone();
         // The launch has STARTED here; the event for its completion is recorded
         // when the clock makes that completion due.
         store.store_launched_environment(environment, &request_id, "createEnvironment");
 
-        Ok(output)
+        // "StreamLogs: whether to create groups in CloudWatch Logs for proxy and
+        // deployment logs, and stream logs from each instance in your
+        // environment." The configuration this launch deploys is what turns that
+        // on, so the groups it publishes exist from this call — with the
+        // retention it states on each of them — and the output the deployed
+        // application wrote while STARTING is delivered into the group of the
+        // file it goes to on the instance.
+        let streaming = store.instance_log_streaming(&region, &environment_id);
+        let deployed = streaming
+            .as_ref()
+            .and_then(|_| store.deployed_application(&environment_id));
+        drop(store);
+
+        Ok(Launched {
+            output,
+            streaming,
+            deployed,
+        })
     }
 }
