@@ -360,8 +360,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 return Ok(DeleteStackOutput);
             }
             // "If a user attempts to delete a stack with termination protection enabled,
-            // the operation fails and the stack remains unchanged."
-            if previous.enable_termination_protection {
+            // the operation fails and the stack remains unchanged." What is enabled on a
+            // stack of a NESTING HIERARCHY is the root stack's flag — "for nested stacks,
+            // termination protection is set on the root stack and can't be changed directly
+            // on the nested stack" — so the one reading of that is asked
+            // ([`crate::state::Nesting::termination_protection_in_force`]), which is also
+            // what makes an unprotected root's deletion CASCADE: the children it deletes
+            // carry no protection of their own to refuse it with.
+            if store
+                .nesting_in(&request_region)
+                .termination_protection_in_force(previous)
+            {
                 return Err(crate::scaffolded::Scaffolded::validation_error(format!(
                     "Stack [{}] cannot be deleted while TerminationProtection is enabled",
                     input.stack_name

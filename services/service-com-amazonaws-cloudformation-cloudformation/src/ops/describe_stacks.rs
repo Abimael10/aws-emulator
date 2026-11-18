@@ -102,6 +102,12 @@ use crate::state::StoredStack;
 /// derived from the resource record that created it ([`crate::state::stack_nesting`]) — both
 /// absent for a top-level stack, which is nested in nothing.
 ///
+/// `EnableTerminationProtection` is read off that same relation: "for nested stacks,
+/// termination protection is set on the root stack and can't be changed directly on the nested
+/// stack", so what a stack of a hierarchy reports is the ROOT stack's flag
+/// ([`crate::state::Nesting::termination_protection_in_force`]) and a top-level stack reports
+/// its own.
+///
 /// `Outputs` is the stack's evaluated outputs: one entry per output the template declares,
 /// as of the create or update that COMPLETED (see `crate::state::StoredStack`) — so a
 /// stack whose create failed reports none.
@@ -135,7 +141,7 @@ fn stack_view(nesting: &crate::state::Nesting, stored: &StoredStack) -> Stack {
         outputs: crate::state::output_views(&stored.outputs),
         role_arn: stored.role_arn.clone(),
         tags: crate::state::tag_views(&stored.tags),
-        enable_termination_protection: Some(stored.enable_termination_protection),
+        enable_termination_protection: Some(nesting.termination_protection_in_force(stored)),
         parent_id: nesting.parent_id_of(stored),
         root_id: nesting.root_id_of(stored),
         drift_information: crate::state::stack_drift_information(stored),

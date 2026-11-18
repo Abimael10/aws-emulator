@@ -3,7 +3,9 @@
 //! @op UpdateTerminationProtection
 //! IMPLEMENTED: sets the termination-protection flag on the stack this service persisted,
 //! so `DescribeStacks` reports it back and `DeleteStack` refuses a protected stack. A
-//! `StackName` that names no live stack is refused with `ValidationError`.
+//! `StackName` that names no live stack is refused with `ValidationError`, and so is one
+//! naming a stack NESTED in another — that flag is set on the root stack of a hierarchy and
+//! on no stack below it.
 //!
 //! ## Shape of an operation
 //!
@@ -96,6 +98,23 @@ impl From<UpdateTerminationProtectionErrorModeled> for UpdateTerminationProtecti
     }
 }
 
+/// The sentence `UpdateTerminationProtection` refuses a request that asks to change the flag
+/// on a stack NESTED in another with.
+///
+/// AWS publishes no wording for this refusal, so the sentence is the one the MODEL states for
+/// the flag — `Stack$EnableTerminationProtection` and this operation's own documentation: "for
+/// nested stacks, termination protection is set on the root stack and can't be changed
+/// directly on the nested stack". It therefore says both what cannot be done here and which
+/// stack it is done on instead, which is what a caller has to act on. The two variable parts
+/// are read from this store: the id of the stack the request resolved to, and the id of the
+/// stack at the top of its hierarchy ([`crate::state::Nesting::root_id_of`]).
+fn protection_is_the_root_stacks(stack_id: &str, root_id: &str) -> String {
+    format!(
+        "Cannot change termination protection directly on the nested stack [{stack_id}]. For \
+         nested stacks, termination protection is set on the root stack [{root_id}]."
+    )
+}
+
 /// The `UpdateTerminationProtection` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -151,6 +170,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
         };
         let region = crate::state::request_region(ctx.parts());
+        // Which stack is NESTED IN which, read once off the records this store already holds
+        // ([`crate::state::stack_nesting`]) — before the stack is resolved for the write,
+        // because the relation is a reading of every stack of the Region.
+        let nesting = store.nesting_in(&region);
+        let nested_in = {
+            let stack = store
+                .resolve(&region, &input.stack_name)
+                .filter(|stack| stack.is_live())
+                .ok_or_else(not_found)?;
+            nesting
+                .root_id_of(stack)
+                .map(|root_id| protection_is_the_root_stacks(&stack.stack_id, &root_id))
+        };
+        // "For nested stacks, termination protection is set on the root stack and can't be
+        // changed directly on the nested stack": a stack some other stack's
+        // `AWS::CloudFormation::Stack` resource created does not carry the flag, so the
+        // request is refused and nothing is written — the model declares no error for it, so
+        // it is the service-common refusal ([`protection_is_the_root_stacks`]).
+        if let Some(message) = nested_in {
+            return Err(crate::scaffolded::Scaffolded::validation_error(message));
+        }
         let stack = store
             .resolve_mut(&region, &input.stack_name)
             .filter(|stack| stack.is_live())
