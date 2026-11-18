@@ -451,7 +451,12 @@ pub(crate) const HANDLER_ERROR_SERVICE_FAILED: &str = "GeneralServiceException";
 
 /// The `HandlerErrorCode` an owning service's refusal is reported under — see
 /// [`HANDLER_ERROR_CLASSES`].
-pub(super) fn handler_error_code(code: &str) -> &'static str {
+///
+/// Read by the per-type arms too, for a provider whose own wording of a refusal is the wording
+/// of ONE class's exception: the class decides whether that wording applies, so the arm asks
+/// the same question of the same code this does
+/// ([`crate::state::provisioner::call_firewall_association`]).
+pub(in crate::state) fn handler_error_code(code: &str) -> &'static str {
     if let Some(status) = code.strip_prefix(UNNAMED_CODE_PREFIX) {
         // An answer that named no error at all: only the status it came back with says
         // whether the service failed or the request was refused.

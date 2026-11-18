@@ -6,6 +6,13 @@
 //! arms, dispatched to by its `Provisioner`.
 
 use super::*;
+// How the DNS Firewall rule group ASSOCIATION's provider words a refusal of the call it made,
+// and the rendering of the request that wording states, split out so this file stays readable;
+// re-exported, so this module is the one path to them.
+mod dns_firewall_handler;
+mod firewall_association_handler;
+pub(crate) use dns_firewall_handler::*;
+pub(crate) use firewall_association_handler::*;
 
 /// Import the certificate a declaration carries INTO the private CA it names, and leave
 /// that CA in the status the declaration asks for — which is what makes a CA a stack
@@ -1414,7 +1421,7 @@ pub(crate) async fn associate_firewall_rule_group(
     // here rather than with a request the owning service would have to reject.
     required_property(resource, "FirewallRuleGroupId")?;
     required_property(resource, "VpcId")?;
-    let reported = call_route53resolver(
+    let reported = call_firewall_association(
         ctx,
         region,
         "AssociateFirewallRuleGroup",
@@ -1452,7 +1459,8 @@ pub(crate) async fn disassociate_firewall_rule_group(
 ) -> Result<(), Refusal> {
     let request =
         serde_json::json!({ "FirewallRuleGroupAssociationId": physical_resource_id });
-    match call_route53resolver(ctx, region, "DisassociateFirewallRuleGroup", &request).await {
+    match call_firewall_association(ctx, region, "DisassociateFirewallRuleGroup", &request).await
+    {
         Ok(_) => Ok(()),
         Err(refusal) if refusal.code == RESOURCE_NOT_FOUND => Ok(()),
         Err(refusal) => Err(refusal),
@@ -1469,7 +1477,8 @@ pub(crate) async fn describe_firewall_rule_group_association(
     let request =
         serde_json::json!({ "FirewallRuleGroupAssociationId": physical_resource_id });
     let reported =
-        match call_route53resolver(ctx, region, "GetFirewallRuleGroupAssociation", &request).await
+        match call_firewall_association(ctx, region, "GetFirewallRuleGroupAssociation", &request)
+            .await
         {
             Ok(reported) => reported,
             Err(refusal) if refusal.code == RESOURCE_NOT_FOUND => return Ok(None),
