@@ -14,8 +14,8 @@
 //!
 //! The table spans what the rule generalises over: the OPERATION (every one that resolves
 //! a queue, addressed by url and by name), and the FORM of the absence (a name never
-//! created, a url of another account, an owner id that is not this emulator's, a value
-//! that is not a url at all, and a queue that was deleted). The expected message is the
+//! created, a url of another account, an owner id that is not this emulator's, a bare name
+//! no queue carries, and a queue that was deleted). The expected message is the
 //! constant exported by [`service_com_amazonaws_sqs_amazonsqs::state`], which one test
 //! pins to AWS's own sentence written out literally.
 
@@ -148,9 +148,9 @@ async fn every_url_addressed_operation_refuses_an_absent_queue_with_the_fixed_me
             "210987654321".to_string(),
         ),
         (
-            "a value that is not a url at all",
-            "present".to_string(),
-            "present".to_string(),
+            "a bare name no queue of this account carries",
+            "never-created".to_string(),
+            "never-created".to_string(),
         ),
         (
             "a url with no account segment",

@@ -891,7 +891,10 @@ async fn a_queue_url_no_queue_answers_to_is_refused_as_queue_does_not_exist() {
             "another account's queue of the same name",
             format!("https://{HOST}/210987654321/reachable"),
         ),
-        ("a value that is not a url at all", "reachable".to_string()),
+        (
+            "a bare name no queue of this account carries",
+            "never-created".to_string(),
+        ),
         ("an empty url", String::new()),
         (
             "a url with no account segment",

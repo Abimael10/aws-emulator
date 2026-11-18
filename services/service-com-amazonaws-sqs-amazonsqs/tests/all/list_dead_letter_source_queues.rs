@@ -435,8 +435,8 @@ async fn a_request_the_listing_will_not_take_is_refused_with_its_own_message() {
             message: QUEUE_DOES_NOT_EXIST_MESSAGE.to_string(),
         },
         Refusal {
-            case: "a value that is not a queue url at all",
-            request: json!({"QueueUrl": "refusing-dlq"}),
+            case: "a bare name no queue of this account carries",
+            request: json!({"QueueUrl": "never-created-dlq"}),
             status: 400,
             code: "QueueDoesNotExist",
             message: QUEUE_DOES_NOT_EXIST_MESSAGE.to_string(),

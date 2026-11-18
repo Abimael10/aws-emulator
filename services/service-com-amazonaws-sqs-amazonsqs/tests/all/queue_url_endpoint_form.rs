@@ -21,13 +21,26 @@
 //! the ADDRESS the request arrived on (the service's own endpoint, another region's
 //! endpoint, loopback with an ephemeral port, a host name with a port and an IPv6
 //! literal).
+//!
+//! The converse rule is tested here too, because it is the same `(account, QueueName)`
+//! pair read the other way round: **a value supplied where a `QueueUrl` is expected
+//! addresses the queue whose name is its last path segment, in the account the segment
+//! before it names — or in the caller's own account when it carries no account segment at
+//! all, so a bare `QueueName` is a queue address — and is refused `QueueDoesNotExist`
+//! only when the region the call was made in holds no such queue of this account.** Those
+//! tables span the FORM of the address (the minted url, that url with a trailing slash, a
+//! url built against another endpoint, the path alone, the account and name alone, and the
+//! bare name), the queue NAME, the OPERATION the address is handed to, and the REGION the
+//! call is made in.
 
 use serde_json::{json, Value};
-use service_com_amazonaws_sqs_amazonsqs::state::MAX_QUEUE_NAME_LENGTH;
+use service_com_amazonaws_sqs_amazonsqs::state::{
+    MAX_QUEUE_NAME_LENGTH, QUEUE_DOES_NOT_EXIST_MESSAGE,
+};
 
 use super::support::{
-    account, call_in, create_in, create_ok_in, emulator, expected_arn_in, expected_url_in,
-    fifo_attributes, host_in, ok_in, ok_on_host, REGION,
+    account, call_in, create_in, create_ok_in, emulator, error_code, expected_arn_in,
+    expected_url_in, fifo_attributes, host_in, ok_in, ok_on_host, OTHER_ACCOUNT, REGION,
 };
 
 /// The regions every table walks: the harness's own and three further ones, so no row can
@@ -484,4 +497,311 @@ async fn a_reported_url_round_trips_through_the_operations_that_take_one() {
         Some("url-form"),
         "case ListQueueTags through a reported url: expected the tag just set, got {tags}"
     );
+}
+
+/// The queue names every address-form table is walked over: a plain name, one mixing the
+/// character classes `CreateQueueRequest$QueueName` admits (alphanumeric, hyphen,
+/// underscore, and case, which is significant), a FIFO name, and the published 80-character
+/// bound — so no row can pass through a name of one shape alone.
+fn address_form_names() -> Vec<(&'static str, String, Value)> {
+    let at_the_bound = format!(
+        "address-form-{}",
+        "a".repeat(MAX_QUEUE_NAME_LENGTH - "address-form-".len())
+    );
+    assert_eq!(
+        at_the_bound.chars().count(),
+        MAX_QUEUE_NAME_LENGTH,
+        "case the length row: expected the published bound, got {}",
+        at_the_bound.chars().count()
+    );
+    vec![
+        ("a plain name", "address-form-plain".to_string(), json!({})),
+        (
+            "hyphens, underscores, digits and mixed case",
+            "Address-Form_07".to_string(),
+            json!({}),
+        ),
+        (
+            "a FIFO name",
+            "address-form-ordered.fifo".to_string(),
+            fifo_attributes(&[]),
+        ),
+        ("the published length bound", at_the_bound, json!({})),
+    ]
+}
+
+/// Every form of address that carries the queue's name as its last segment and this
+/// account — or no account segment at all — before it, as a function of the name.
+fn resolving_address_forms(name: &str) -> Vec<(&'static str, String)> {
+    let minted = expected_url_in(REGION, name);
+    vec![
+        ("the url the create minted", minted.clone()),
+        ("that url with a trailing slash", format!("{minted}/")),
+        (
+            "a url built against another endpoint this emulator answers on",
+            format!("http://127.0.0.1:40193/{}/{name}", account()),
+        ),
+        (
+            "a url built against the legacy global endpoint",
+            format!("https://queue.amazonaws.com/{}/{name}", account()),
+        ),
+        ("the path alone", format!("/{}/{name}", account())),
+        (
+            "the account and the name with no endpoint before them",
+            format!("{}/{name}", account()),
+        ),
+        ("the bare QueueName", name.to_string()),
+    ]
+}
+
+/// Every address form that names a live queue of this account resolves to THAT queue: the
+/// attributes read through it are the queue's own, and a change made through one form is
+/// seen through every other.
+#[tokio::test]
+async fn every_address_form_of_a_live_queue_resolves_to_that_queue() {
+    let router = emulator();
+    for (case, name, attributes) in address_form_names() {
+        let minted = create_ok_in(&router, REGION, &name, &attributes).await;
+        let expected_arn = expected_arn_in(REGION, &name);
+
+        for (form, address) in resolving_address_forms(&name) {
+            let reported = ok_in(
+                &router,
+                REGION,
+                "GetQueueAttributes",
+                json!({"QueueUrl": &address, "AttributeNames": ["QueueArn"]}),
+            )
+            .await;
+            assert_eq!(
+                reported["Attributes"]["QueueArn"].as_str(),
+                Some(expected_arn.as_str()),
+                "case {case} addressed by {form} ({address:?}): expected {expected_arn:?}, \
+                 got {reported}"
+            );
+
+            // A reporting operation that carries no url of its own resolves the same queue
+            // through the same address.
+            let tags = ok_in(
+                &router,
+                REGION,
+                "ListQueueTags",
+                json!({"QueueUrl": &address}),
+            )
+            .await;
+            assert!(
+                tags.get("Tags")
+                    .and_then(|tags| tags.get("form"))
+                    .is_none(),
+                "case {case} addressed by {form} ({address:?}): the queue carries no tag from \
+                 an earlier row, got {tags}"
+            );
+
+            // And a WRITE through this address lands on the same queue: the tag it sets is
+            // the one the minted url reports back, and the next form sees the queue
+            // untagged again.
+            let (status, tagged) = call_in(
+                &router,
+                REGION,
+                "TagQueue",
+                &json!({"QueueUrl": &address, "Tags": {"form": form}}),
+            )
+            .await;
+            assert_eq!(
+                status, 200,
+                "case {case} tagged by {form} ({address:?}): expected HTTP 200, \
+                 got {status} with {tagged}"
+            );
+            let through_minted = ok_in(
+                &router,
+                REGION,
+                "ListQueueTags",
+                json!({"QueueUrl": &minted}),
+            )
+            .await;
+            assert_eq!(
+                through_minted["Tags"]["form"].as_str(),
+                Some(form),
+                "case {case} tagged by {form} ({address:?}): the minted url must report the \
+                 tag that address set, got {through_minted}"
+            );
+            let (status, untagged) = call_in(
+                &router,
+                REGION,
+                "UntagQueue",
+                &json!({"QueueUrl": &address, "TagKeys": ["form"]}),
+            )
+            .await;
+            assert_eq!(
+                status, 200,
+                "case {case} untagged by {form} ({address:?}): expected HTTP 200, \
+                 got {status} with {untagged}"
+            );
+        }
+    }
+}
+
+/// An address that names no queue of this account in the region the call was made in is
+/// refused `QueueDoesNotExist` with AWS's own sentence — whichever operation it was handed
+/// to, and whatever makes it name nothing.
+#[tokio::test]
+async fn an_address_naming_no_queue_of_this_account_is_refused() {
+    let router = emulator();
+    let held = "address-form-held";
+    let _ = create_ok_in(&router, REGION, held, &json!({})).await;
+    assert_ne!(
+        OTHER_ACCOUNT,
+        account(),
+        "case another account: the rows below need an account that is not this emulator's"
+    );
+    // One character past the published name bound: no queue of any account carries a name
+    // that long, so neither spelling of it addresses one.
+    let past_the_bound = "b".repeat(MAX_QUEUE_NAME_LENGTH + 1);
+
+    let rows: Vec<(&str, String)> = vec![
+        ("a bare name no queue carries", "address-form-absent".to_string()),
+        (
+            "a url of a name no queue carries",
+            expected_url_in(REGION, "address-form-absent"),
+        ),
+        (
+            "another account's queue of a name this account holds",
+            format!("https://{}/{OTHER_ACCOUNT}/{held}", host_in(REGION)),
+        ),
+        (
+            "the bare account and a name this account holds, for another account",
+            format!("{OTHER_ACCOUNT}/{held}"),
+        ),
+        (
+            "a url carrying a path prefix but no account segment",
+            format!("https://{}/{held}", host_in(REGION)),
+        ),
+        ("an empty address", String::new()),
+        ("an address that is a single slash", "/".to_string()),
+        (
+            "a last segment longer than a queue name can be",
+            format!("{}/{past_the_bound}", account()),
+        ),
+        (
+            "a bare value longer than a queue name can be",
+            past_the_bound.clone(),
+        ),
+    ];
+
+    for (case, address) in &rows {
+        for operation in [
+            "GetQueueAttributes",
+            "ListQueueTags",
+            "SetQueueAttributes",
+            "SendMessage",
+        ] {
+            let request = match operation {
+                "GetQueueAttributes" => {
+                    json!({"QueueUrl": address, "AttributeNames": ["QueueArn"]})
+                }
+                "SetQueueAttributes" => {
+                    json!({"QueueUrl": address, "Attributes": {"VisibilityTimeout": "10"}})
+                }
+                "SendMessage" => json!({"QueueUrl": address, "MessageBody": "hello"}),
+                _ => json!({"QueueUrl": address}),
+            };
+            let (status, parsed) = call_in(&router, REGION, operation, &request).await;
+            assert_eq!(
+                (status, error_code(&parsed).as_str()),
+                (400, "QueueDoesNotExist"),
+                "case {operation} on {case} ({address:?}): expected a 400 QueueDoesNotExist, \
+                 got {status} with {parsed}"
+            );
+            assert_eq!(
+                parsed.get("message").and_then(Value::as_str),
+                Some(QUEUE_DOES_NOT_EXIST_MESSAGE),
+                "case {operation} on {case} ({address:?}): expected AWS's fixed sentence, \
+                 got {parsed}"
+            );
+        }
+    }
+
+    // The queue this account does hold still resolves through the same forms, so every
+    // refusal above is about the queue the address names and not about the form it is in.
+    for (form, address) in resolving_address_forms(held) {
+        let reported = ok_in(
+            &router,
+            REGION,
+            "GetQueueAttributes",
+            json!({"QueueUrl": &address, "AttributeNames": ["QueueArn"]}),
+        )
+        .await;
+        assert_eq!(
+            reported["Attributes"]["QueueArn"].as_str(),
+            Some(expected_arn_in(REGION, held).as_str()),
+            "case the queue this account holds addressed by {form} ({address:?}): \
+             expected its own ARN, got {reported}"
+        );
+    }
+}
+
+/// An address carrying no endpoint of its own resolves in the region the CALL was made in:
+/// the same bare name names each region's own queue, and nothing at all in a region that
+/// holds none.
+#[tokio::test]
+async fn an_address_resolves_in_the_region_the_call_was_made_in() {
+    let router = emulator();
+    let name = "address-form-regional";
+    let home = REGIONS[0];
+    let elsewhere = REGIONS[1];
+    assert_ne!(
+        home, elsewhere,
+        "case the two regions: the rows below need two different regions"
+    );
+    let _ = create_ok_in(&router, home, name, &json!({})).await;
+
+    for (form, address) in resolving_address_forms(name) {
+        // The region that holds the queue resolves the address to its own queue.
+        let reported = ok_in(
+            &router,
+            home,
+            "GetQueueAttributes",
+            json!({"QueueUrl": &address, "AttributeNames": ["QueueArn"]}),
+        )
+        .await;
+        assert_eq!(
+            reported["Attributes"]["QueueArn"].as_str(),
+            Some(expected_arn_in(home, name).as_str()),
+            "case {form} ({address:?}) in {home}: expected the queue of that region, \
+             got {reported}"
+        );
+
+        // The region that holds none has nothing of that name to report.
+        let (status, parsed) = call_in(
+            &router,
+            elsewhere,
+            "GetQueueAttributes",
+            &json!({"QueueUrl": &address, "AttributeNames": ["QueueArn"]}),
+        )
+        .await;
+        assert_eq!(
+            (status, error_code(&parsed).as_str()),
+            (400, "QueueDoesNotExist"),
+            "case {form} ({address:?}) in {elsewhere}: a region holding no queue of that \
+             name must refuse it, got {status} with {parsed}"
+        );
+    }
+
+    // Once that other region holds a queue of the same name, the same address resolves
+    // there as well — to THAT region's queue, which carries its own ARN.
+    let _ = create_ok_in(&router, elsewhere, name, &json!({})).await;
+    for (form, address) in resolving_address_forms(name) {
+        let reported = ok_in(
+            &router,
+            elsewhere,
+            "GetQueueAttributes",
+            json!({"QueueUrl": &address, "AttributeNames": ["QueueArn"]}),
+        )
+        .await;
+        assert_eq!(
+            reported["Attributes"]["QueueArn"].as_str(),
+            Some(expected_arn_in(elsewhere, name).as_str()),
+            "case {form} ({address:?}) in {elsewhere}: expected that region's own queue, \
+             got {reported}"
+        );
+    }
 }

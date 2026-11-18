@@ -2407,10 +2407,11 @@ impl ComAmazonawsSqsAmazonsqsState {
 
     /// The queue a `QueueUrl` addresses in `region`, for reading.
     ///
-    /// The url names the account and the queue ([`queue_name_from_url`]); which region's
-    /// queue it resolves is the region the REQUEST addressed, exactly as the real service
-    /// serves a url against the endpoint the call reached — so a url minted in another
-    /// region resolves only where that region holds a queue of the same name too.
+    /// The url names the queue, and the account when it carries an account segment
+    /// ([`queue_name_from_url`]); which region's queue it resolves is the region the
+    /// REQUEST addressed, exactly as the real service serves a url against the endpoint
+    /// the call reached — so a url minted in another region resolves only where that
+    /// region holds a queue of the same name too.
     pub fn queue_by_url(&self, region: &str, queue_url: &str) -> Option<&Queue> {
         self.queue(region, queue_name_from_url(queue_url)?)
     }
@@ -3445,21 +3446,46 @@ pub fn queue_url(region: &str, name: &str) -> String {
     )
 }
 
-/// The `QueueName` a `QueueUrl` addresses, or `None` for a value that is not a queue
-/// url of this account at all.
+/// The `QueueName` the value supplied for a `QueueUrl` addresses, or `None` for a value
+/// that addresses no queue of this account at all.
 ///
-/// A queue url is `<endpoint>/<accountId>/<QueueName>`, so the name is its last path
-/// segment and the account the segment before it. Keying on that pair rather than on
-/// the whole string is what lets a client reach its queue through any endpoint this
-/// emulator answers on — the url it was handed, or one built for another host name —
-/// while a url naming a different account resolves to nothing.
+/// A queue address names a queue by the `(account, QueueName)` pair it carries: the name is
+/// its last path segment, and the account is the segment BEFORE that one — when it carries
+/// one at all. An address with no path prefix therefore carries no account and names the
+/// caller's own queue of that name, so a bare `QueueName` is a queue address like any
+/// other: RECORDED — a `GetQueueAttributes` whose `QueueUrl` is the queue's name alone is
+/// served the queue's attributes, not refused. Reading the pair rather than the whole
+/// string is also what lets a client reach its queue through any endpoint this emulator
+/// answers on — the url it was handed, or one built for another host name.
+///
+/// What does NOT address a queue of this account:
+///
+/// - an address whose account segment is some other account's: that account's queues are
+///   not this one's to resolve, whatever name follows;
+/// - an address that carries a path prefix but no account segment
+///   (`<endpoint>/<QueueName>`): the segment before the name is then not an account id, so
+///   the pair names nothing;
+/// - an empty name, and a last segment longer than a queue name can be
+///   ([`MAX_QUEUE_NAME_LENGTH`]), which no queue of any account carries.
+///
+/// A trailing `/` is not part of the name. WHICH region's queue the name resolves in is
+/// the caller's to decide ([`ComAmazonawsSqsAmazonsqsState::queue_by_url`]), because a
+/// queue belongs to the region its create addressed.
 pub fn queue_name_from_url(queue_url: &str) -> Option<&str> {
-    let (prefix, name) = queue_url.trim_end_matches('/').rsplit_once('/')?;
-    if name.is_empty() {
+    let (account, name) = match queue_url.trim_end_matches('/').rsplit_once('/') {
+        // `<...>/<accountId>/<QueueName>`, or `<accountId>/<QueueName>` with no endpoint
+        // before it: whatever precedes the name has to end in this account's id.
+        Some((prefix, name)) => (
+            Some(prefix.rsplit_once('/').map_or(prefix, |(_, account)| account)),
+            name,
+        ),
+        // A bare `<QueueName>`: no account segment to read, so it is this account's.
+        None => (None, queue_url.trim_end_matches('/')),
+    };
+    if name.is_empty() || name.chars().count() > MAX_QUEUE_NAME_LENGTH {
         return None;
     }
-    let (_, account) = prefix.rsplit_once('/')?;
-    if account != ::engine::emulator_account_id() {
+    if account.is_some_and(|account| account != ::engine::emulator_account_id()) {
         return None;
     }
     Some(name)

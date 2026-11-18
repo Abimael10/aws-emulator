@@ -310,10 +310,13 @@ async fn a_queue_url_no_queue_answers_to_is_refused_as_queue_does_not_exist() {
             "another account's queue of the same name",
             format!("https://{HOST}/210987654321/existing"),
         ),
-        ("a value that is not a url at all", "existing".to_string()),
         (
-            "a url with no account segment",
+            "a value that carries no account segment",
             format!("https://{HOST}/existing"),
+        ),
+        (
+            "a bare name no queue of this account carries",
+            "never-created".to_string(),
         ),
     ];
 
