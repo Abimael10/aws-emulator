@@ -31,10 +31,11 @@ use service_com_amazonaws_rolesanywhere_rolesanywhere::ops::types::{
 };
 use smithy_server_runtime::MultiServiceRouter;
 
-/// A placeholder PEM bundle for a trust anchor's certificate source.
-/// `SourceData$x509CertificateData` is `@length(1, 204800)` with no `@pattern`.
-const CERTIFICATE_BUNDLE_PEM: &str =
-    "-----BEGIN CERTIFICATE-----\nZW11bGF0ZWQtdGVzdC1jZXJ0\n-----END CERTIFICATE-----\n";
+/// A PEM bundle holding one real certificate authority: a self-signed CA certificate,
+/// valid 2020-2100, written with `rcgen` and kept beside the suites that need one.
+/// `CreateTrustAnchor` refuses certificate data it cannot read as PEM X.509 certificates,
+/// so a suite that creates a trust anchor presents an authority a trust anchor can hold.
+const CERTIFICATE_BUNDLE_PEM: &str = include_str!("../data/certificate_authority_a.pem");
 
 /// A placeholder CRL in PEM form. `ImportCrlRequest$crlData` is a `Blob`
 /// `@length(1, 300000)` with no `@pattern`, so the bytes are opaque to the service.

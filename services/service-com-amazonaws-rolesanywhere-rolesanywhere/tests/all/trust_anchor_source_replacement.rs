@@ -10,6 +10,13 @@
 //! create path judges one, before anything is written, so a source that describes no
 //! certificate authority leaves the stored record untouched.
 //!
+//! A source describes no certificate authority when its members do not pair up the way the
+//! model pairs them AND when the certificate data it carries is not certificate data:
+//! `x509CertificateData` is "The PEM-encoded data for the certificate anchor"
+//! (`smithy_query(query="shape", shape="SourceData")`), so a value that does not read as
+//! PEM X.509 certificates is refused 400 `ValidationException` by both writes — a trust
+//! anchor holding it could authenticate nothing — and nothing is stored.
+//!
 //! Each test therefore spans a TABLE of inputs — which `sourceType` the stored anchor
 //! carries and which the update names, and each way a source can fail to describe a
 //! certificate authority — rather than one recorded request.
@@ -23,15 +30,14 @@ use std::sync::Arc;
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
-/// A placeholder PEM bundle. `SourceData$x509CertificateData` is `@length(1, 204800)`
-/// with no `@pattern`, so any non-empty string is a legal certificate bundle on the wire
-/// (`smithy_query(query="shape", shape="SourceData")`).
-const CERTIFICATE_BUNDLE_PEM: &str =
-    "-----BEGIN CERTIFICATE-----\nc291cmNlLXJlcGxhY2VtZW50LWE=\n-----END CERTIFICATE-----\n";
+/// A PEM bundle holding one real certificate authority: a self-signed CA certificate,
+/// valid 2020-2100, written with `rcgen` and kept beside the suites that need one.
+/// `CreateTrustAnchor` refuses certificate data it cannot read as PEM X.509 certificates,
+/// so a suite that creates a trust anchor presents an authority a trust anchor can hold.
+const CERTIFICATE_BUNDLE_PEM: &str = include_str!("../data/certificate_authority_a.pem");
 
-/// A second, different bundle, so replacing one bundle with another is observable.
-const OTHER_CERTIFICATE_BUNDLE_PEM: &str =
-    "-----BEGIN CERTIFICATE-----\nc291cmNlLXJlcGxhY2VtZW50LWI=\n-----END CERTIFICATE-----\n";
+/// A second, different authority, so replacing one bundle with another is observable.
+const OTHER_CERTIFICATE_BUNDLE_PEM: &str = include_str!("../data/certificate_authority_b.pem");
 
 /// The Region the suite signs for.
 const REGION: &str = "us-west-2";
@@ -469,6 +475,259 @@ async fn an_update_whose_source_describes_no_certificate_authority_stores_nothin
             Some(stored_name),
             "case {case:?}: a refused update must not write the name it carried, got \
              {read_back:?}"
+        );
+    }
+}
+
+/// The `sourceType`s whose source data is a certificate bundle: the one the model ties
+/// `x509CertificateData` to, and the one it ties neither member to, where a bundle stands
+/// in ([`source`]).
+const BUNDLE_SOURCE_TYPES: [&str; 2] = ["CERTIFICATE_BUNDLE", "SELF_SIGNED_REPOSITORY"];
+
+/// A third authority, so a bundle can hold more than two.
+const THIRD_CERTIFICATE_BUNDLE_PEM: &str = include_str!("../data/certificate_authority_c.pem");
+
+/// The base64 body of one authority's PEM, without the framing lines.
+fn certificate_body(pem: &str) -> String {
+    pem.lines()
+        .filter(|line| !line.starts_with("-----"))
+        .collect::<Vec<&str>>()
+        .join("\n")
+}
+
+/// Values that are NOT PEM-encoded X.509 certificates, as `(case, x509CertificateData)`.
+///
+/// The rows differ along HOW the value fails to be certificate data: it is not PEM at all
+/// (plain text, whitespace, a JSON document), it is PEM framing around nothing, around
+/// base64 that is not a DER certificate, or around half of one, it is a certificate's
+/// base64 without the framing, it is a PEM block of another kind, and it is one real
+/// authority followed by a block that is not a certificate — a bundle holds certificates,
+/// so one unreadable block makes the bundle unreadable.
+fn unreadable_certificate_data() -> Vec<(&'static str, String)> {
+    let body = certificate_body(CERTIFICATE_BUNDLE_PEM);
+    let half = &body[..body.len() / 2];
+    vec![
+        ("plain-text", "not a valid PEM certificate".to_string()),
+        ("one-space", " ".to_string()),
+        ("json-document", "{\"certificate\": \"none\"}".to_string()),
+        (
+            "framing-around-nothing",
+            "-----BEGIN CERTIFICATE-----\n-----END CERTIFICATE-----\n".to_string(),
+        ),
+        (
+            "framed-base64-that-is-not-der",
+            "-----BEGIN CERTIFICATE-----\nZW11bGF0ZWQtdGVzdC1jZXJ0\n-----END CERTIFICATE-----\n"
+                .to_string(),
+        ),
+        ("base64-without-framing", body.clone()),
+        (
+            "half-a-certificate",
+            format!("-----BEGIN CERTIFICATE-----\n{half}\n-----END CERTIFICATE-----\n"),
+        ),
+        (
+            "another-kind-of-pem-block",
+            CERTIFICATE_BUNDLE_PEM.replace("CERTIFICATE", "PUBLIC KEY"),
+        ),
+        (
+            "one-authority-then-a-block-that-is-not-one",
+            format!(
+                "{CERTIFICATE_BUNDLE_PEM}-----BEGIN CERTIFICATE-----\n\
+                 bm90LWEtY2VydGlmaWNhdGU=\n-----END CERTIFICATE-----\n"
+            ),
+        ),
+    ]
+}
+
+/// Values that ARE PEM-encoded X.509 certificates, as `(case, x509CertificateData)`: a
+/// bundle holds one or more certificate authorities, so the rows differ along HOW MANY it
+/// holds.
+fn readable_certificate_data() -> Vec<(&'static str, String)> {
+    vec![
+        ("one-authority", CERTIFICATE_BUNDLE_PEM.to_string()),
+        (
+            "two-authorities",
+            format!("{CERTIFICATE_BUNDLE_PEM}{OTHER_CERTIFICATE_BUNDLE_PEM}"),
+        ),
+        (
+            "three-authorities",
+            format!(
+                "{CERTIFICATE_BUNDLE_PEM}{OTHER_CERTIFICATE_BUNDLE_PEM}\
+                 {THIRD_CERTIFICATE_BUNDLE_PEM}"
+            ),
+        ),
+    ]
+}
+
+/// The fixed wording a trust-anchor write refuses certificate data it cannot read with:
+/// it names the write and nothing the request carried.
+fn bad_certificate_data_message(action: &str) -> String {
+    format!("Error {action} TrustAnchor. Bad certificate data")
+}
+
+/// The names the trust anchors a `ListTrustAnchors` page reports carry.
+fn listed_names(answer: &Answer) -> Vec<String> {
+    answer
+        .body
+        .get("trustAnchors")
+        .and_then(Value::as_array)
+        .map(|anchors| {
+            anchors
+                .iter()
+                .filter_map(|anchor| anchor.get("name").and_then(Value::as_str))
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// A create whose `x509CertificateData` does not read as PEM X.509 certificates is refused
+/// 400 `ValidationException` with the service's fixed certificate-data wording and mints
+/// no trust anchor, while one that does read as certificates is stored verbatim.
+///
+/// The rows differ along how the value fails to be certificate data
+/// ([`unreadable_certificate_data`]), how many authorities an accepted bundle holds
+/// ([`readable_certificate_data`]), and which `sourceType` carries it — the member the
+/// data travels in decides the rule, not the type beside it.
+#[tokio::test]
+async fn create_trust_anchor_refuses_certificate_data_it_cannot_read() {
+    let client = Client::new();
+
+    for source_type in BUNDLE_SOURCE_TYPES {
+        for (case, data) in unreadable_certificate_data() {
+            let case = format!("{source_type}/{case}");
+            let case = case.as_str();
+            let name = format!("refused {case}").replace('/', "-");
+            let answer = client
+                .create_trust_anchor(json!({"name": name, "source": source(source_type, &data)}))
+                .await;
+            assert_eq!(
+                answer.status, 400,
+                "case {case:?}: certificate data that is not certificate data must be \
+                 refused with HTTP 400, got {answer:?}"
+            );
+            assert_eq!(
+                answer.error_code, "ValidationException",
+                "case {case:?}: the refusal must be the operation's modelled error, got \
+                 {answer:?}"
+            );
+            assert_eq!(
+                message_of(&answer),
+                bad_certificate_data_message("creating"),
+                "case {case:?}: expected the service's certificate-data wording, got \
+                 {answer:?}"
+            );
+            assert!(
+                answer.body.get("trustAnchor").is_none(),
+                "case {case:?}: a refused create must report no trust anchor, got {answer:?}"
+            );
+
+            let listed = listed_names(&client.send("GET", "/trustanchors", None).await);
+            assert!(
+                !listed.contains(&name),
+                "case {case:?}: a refused create must mint nothing, got {listed:?}"
+            );
+        }
+
+        for (case, data) in readable_certificate_data() {
+            let case = format!("{source_type}/{case}");
+            let case = case.as_str();
+            let name = format!("stored {case}").replace('/', "-");
+            let created = anchor_of(
+                case,
+                201,
+                &client
+                    .create_trust_anchor(
+                        json!({"name": name, "source": source(source_type, &data)}),
+                    )
+                    .await,
+            );
+            let id = id_of(case, &created);
+            let read_back = anchor_of(case, 200, &client.get_trust_anchor(&id).await);
+            assert_eq!(
+                read_back.get("source"),
+                Some(&source(source_type, &data)),
+                "case {case:?}: a stored bundle must read back exactly as submitted, got \
+                 {read_back:?}"
+            );
+
+            let listed = listed_names(&client.send("GET", "/trustanchors", None).await);
+            assert!(
+                listed.contains(&name),
+                "case {case:?}: an accepted create must mint a trust anchor, got {listed:?}"
+            );
+        }
+    }
+}
+
+/// An update whose `x509CertificateData` does not read as PEM X.509 certificates is
+/// refused the same way — worded for the update — and leaves the stored source alone,
+/// while one that does read as certificates replaces it.
+#[tokio::test]
+async fn update_trust_anchor_refuses_certificate_data_it_cannot_read() {
+    let client = Client::new();
+    let created = anchor_of(
+        "setup",
+        201,
+        &client
+            .create_trust_anchor(json!({
+                "name": "certificate data under update",
+                "source": source("CERTIFICATE_BUNDLE", CERTIFICATE_BUNDLE_PEM),
+            }))
+            .await,
+    );
+    let id = id_of("setup", &created);
+    let stored_source = created
+        .get("source")
+        .cloned()
+        .expect("the create reports the stored source");
+
+    for source_type in BUNDLE_SOURCE_TYPES {
+        for (case, data) in unreadable_certificate_data() {
+            let case = format!("{source_type}/{case}");
+            let case = case.as_str();
+            let answer = client
+                .update_trust_anchor(&id, json!({"source": source(source_type, &data)}))
+                .await;
+            assert_eq!(
+                answer.status, 400,
+                "case {case:?}: certificate data that is not certificate data must be \
+                 refused with HTTP 400, got {answer:?}"
+            );
+            assert_eq!(
+                answer.error_code, "ValidationException",
+                "case {case:?}: the refusal must be the operation's modelled error, got \
+                 {answer:?}"
+            );
+            assert_eq!(
+                message_of(&answer),
+                bad_certificate_data_message("updating"),
+                "case {case:?}: expected the service's certificate-data wording for an \
+                 update, got {answer:?}"
+            );
+
+            let read_back = anchor_of(case, 200, &client.get_trust_anchor(&id).await);
+            assert_eq!(
+                read_back.get("source"),
+                Some(&stored_source),
+                "case {case:?}: a refused update must leave the stored source alone, got \
+                 {read_back:?}"
+            );
+        }
+    }
+
+    // And the same member carrying certificate data it CAN read replaces the source, so
+    // the refusals above are about the data rather than about the update path.
+    for (case, data) in readable_certificate_data() {
+        let submitted = source("CERTIFICATE_BUNDLE", &data);
+        let updated = anchor_of(
+            case,
+            200,
+            &client.update_trust_anchor(&id, json!({"source": submitted})).await,
+        );
+        assert_eq!(
+            updated.get("source"),
+            Some(&source("CERTIFICATE_BUNDLE", &data)),
+            "case {case:?}: an accepted update must store what it carried, got {updated:?}"
         );
     }
 }

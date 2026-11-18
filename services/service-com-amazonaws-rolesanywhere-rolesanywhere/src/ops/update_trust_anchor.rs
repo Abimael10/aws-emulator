@@ -162,14 +162,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A submitted `Source` is judged exactly as `CreateTrustAnchor` judges one, and
         // before anything is written, so a source naming no certificate authority never
         // replaces a usable one.
-        if let Some((member, constraint)) = input
+        if let Some(rejection) = input
             .source
             .as_ref()
             .and_then(crate::state::source_rejection)
         {
             return Err(UpdateTrustAnchorErrorModeled::ValidationException(
                 ValidationException {
-                    message: Some(crate::state::validation_message(member, &constraint)),
+                    message: Some(crate::state::source_rejection_message(
+                        &rejection,
+                        crate::state::TrustAnchorWrite::Update,
+                    )),
                 },
             )
             .into());

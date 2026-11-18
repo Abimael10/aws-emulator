@@ -42,9 +42,11 @@ use aws_smithy_types::DateTime;
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
-/// A placeholder PEM bundle for a trust anchor's certificate source.
-const CERTIFICATE_BUNDLE_PEM: &str =
-    "-----BEGIN CERTIFICATE-----\nZW11bGF0ZWQtdGVzdC1jZXJ0\n-----END CERTIFICATE-----\n";
+/// A PEM bundle holding one real certificate authority: a self-signed CA certificate,
+/// valid 2020-2100, written with `rcgen` and kept beside the suites that need one.
+/// `CreateTrustAnchor` refuses certificate data it cannot read as PEM X.509 certificates,
+/// so a suite that creates a trust anchor presents an authority a trust anchor can hold.
+const CERTIFICATE_BUNDLE_PEM: &str = include_str!("../data/certificate_authority_a.pem");
 
 /// A placeholder CRL in PEM form, as the import stores it.
 const CRL_PEM: &str = "-----BEGIN X509 CRL-----\nZW11bGF0ZWQtdGVzdC1jcmw=\n-----END X509 CRL-----\n";

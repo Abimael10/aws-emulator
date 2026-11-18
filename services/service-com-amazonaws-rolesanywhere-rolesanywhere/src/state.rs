@@ -862,6 +862,160 @@ pub fn merged_mapping_rule_count(
         .len()
 }
 
+/// The X.509 field each modelled `CertificateField` names, as a refusal of a specifier
+/// addresses that field: the certificate's subject, its issuer, and its
+/// subject-alternative-name extension (RFC 5280 sections 4.1.2.4, 4.1.2.6 and 4.2.1.6).
+/// One entry per value of the modelled enum
+/// (`smithy_query(query="shape", shape="CertificateField")`:
+/// `["x509Subject", "x509Issuer", "x509SAN"]`).
+const CERTIFICATE_FIELD_TARGETS: [(&str, &str); 3] = [
+    ("x509Subject", "SUBJECT"),
+    ("x509Issuer", "ISSUER"),
+    (SAN_CERTIFICATE_FIELD, "SUBJECT_ALTERNATIVE_NAME"),
+];
+
+/// The `CertificateField` naming the subject-alternative name, the one modelled field that
+/// is not a distinguished name.
+const SAN_CERTIFICATE_FIELD: &str = "x509SAN";
+
+/// The name forms the subject-alternative name carries, which are the specifiers a mapping
+/// on that field can name: `DNS` for a dNSName, `URI` for a uniformResourceIdentifier, and
+/// [`DIRECTORY_NAME_SPECIFIER`] for a directoryName — the general names RFC 5280 section
+/// 4.2.1.6 defines that carry a value a session can be tagged with. These are also the
+/// forms this service maps for the field by default ([`DEFAULT_ATTRIBUTE_MAPPINGS`]).
+const SAN_SPECIFIERS: [&str; 3] = ["DNS", "URI", DIRECTORY_NAME_SPECIFIER];
+
+/// The subject-alternative name's directory-name form. A directoryName IS a distinguished
+/// name, so it is the one form whose parts are addressable on their own, by a
+/// `Name/<attribute type>` path.
+const DIRECTORY_NAME_SPECIFIER: &str = "Name";
+
+/// The specifier that names a whole certificate field rather than one part of it, which
+/// every field accepts: it is what this service maps for the subject and the issuer by
+/// default ([`DEFAULT_ATTRIBUTE_MAPPINGS`]).
+const WHOLE_FIELD_SPECIFIER: &str = "*";
+
+/// The separator between a specifier and the part of it a sub-field path names
+/// (`Name/CN`).
+const SPECIFIER_PATH_SEPARATOR: char = '/';
+
+/// The `message` a write of attribute mapping rules is refused with when one submitted
+/// rule names a specifier the certificate field it is written on cannot carry, or `None`
+/// when every rule names one that field carries.
+///
+/// The FIRST unusable specifier decides the refusal, so a request carrying several is
+/// refused once and stores nothing at all.
+pub fn mapping_rules_rejection(
+    certificate_field: &str,
+    submitted: &[MappingRule],
+) -> Option<String> {
+    submitted
+        .iter()
+        .find(|rule| !specifier_fits_field(certificate_field, &rule.specifier))
+        .map(|rule| unvalidatable_specifier_message(certificate_field, &rule.specifier))
+}
+
+/// The wording a specifier the named certificate field cannot carry is refused with: the
+/// submitted specifier, and the X.509 field it was written on
+/// ([`CERTIFICATE_FIELD_TARGETS`]), each in parentheses of its own.
+pub fn unvalidatable_specifier_message(certificate_field: &str, specifier: &str) -> String {
+    format!(
+        "Unable to validate specifier ({specifier}) on the target ({})",
+        certificate_field_target(certificate_field)
+    )
+}
+
+/// The X.509 field a `certificateField` names ([`CERTIFICATE_FIELD_TARGETS`]), or the
+/// submitted value itself when it names none: a value outside the modelled enum names a
+/// field this service knows nothing about, so a refusal can only quote it back.
+fn certificate_field_target(certificate_field: &str) -> &str {
+    CERTIFICATE_FIELD_TARGETS
+        .iter()
+        .find(|(field, _)| *field == certificate_field)
+        .map_or(certificate_field, |(_, target)| *target)
+}
+
+/// Whether `specifier` names something the `certificate_field` of a certificate carries.
+///
+/// A mapping is "a single mapping entry for each supported specifier or sub-field"
+/// (`MappingRule` doc), and which specifiers a field supports follows from what that field
+/// IS: the subject and the issuer are distinguished names, so their parts are addressed by
+/// attribute type ("such as CN, OU, or UID from the Subject field",
+/// `MappingRule$specifier` doc), while the subject-alternative name holds general names,
+/// so its parts are addressed by name form ([`SAN_SPECIFIERS`]). The whole field is
+/// addressable on every field.
+fn specifier_fits_field(certificate_field: &str, specifier: &str) -> bool {
+    if specifier == WHOLE_FIELD_SPECIFIER {
+        return true;
+    }
+    match certificate_field {
+        SAN_CERTIFICATE_FIELD => fits_subject_alternative_name(specifier),
+        // The subject and the issuer are both distinguished names. A `certificateField`
+        // outside the modelled enum is judged the same way rather than refused here:
+        // which values that member accepts is the model's statement about the member, not
+        // this rule's about the specifier.
+        _ => is_distinguished_name_attribute_type(specifier),
+    }
+}
+
+/// Whether `specifier` names a name form the subject-alternative name carries
+/// ([`SAN_SPECIFIERS`]), with the part of a directory name it addresses when it names one
+/// (`Name/CN`, `Name/*`).
+fn fits_subject_alternative_name(specifier: &str) -> bool {
+    let (form, part) = match specifier.split_once(SPECIFIER_PATH_SEPARATOR) {
+        Some((form, part)) => (form, Some(part)),
+        None => (specifier, None),
+    };
+    if !SAN_SPECIFIERS.contains(&form) {
+        return false;
+    }
+    match part {
+        // Only the directory name has parts of its own, because only it is a
+        // distinguished name; a dNSName and a uniformResourceIdentifier are single values,
+        // so a path into one addresses nothing.
+        Some(part) => {
+            form == DIRECTORY_NAME_SPECIFIER
+                && (part == WHOLE_FIELD_SPECIFIER
+                    || is_distinguished_name_attribute_type(part))
+        }
+        None => true,
+    }
+}
+
+/// Whether `specifier` names an attribute type of a distinguished name: a short attribute
+/// type name, or the numeric object identifier form — the two ways RFC 4514 section 3
+/// writes the attribute type of a relative distinguished name, the second for a type with
+/// no registered short name.
+fn is_distinguished_name_attribute_type(specifier: &str) -> bool {
+    is_attribute_type_name(specifier) || is_numeric_object_identifier(specifier)
+}
+
+/// Whether `value` is an attribute type's short name: a letter followed by letters,
+/// digits and hyphens (RFC 4514's `descr`).
+fn is_attribute_type_name(value: &str) -> bool {
+    let mut characters = value.chars();
+    characters
+        .next()
+        .is_some_and(|first| first.is_ascii_alphabetic())
+        && characters.all(|character| character.is_ascii_alphanumeric() || character == '-')
+}
+
+/// Whether `value` is an object identifier in dotted-decimal form: two or more arcs of
+/// digits (RFC 4514's `numericoid`).
+fn is_numeric_object_identifier(value: &str) -> bool {
+    let mut arcs = value.split('.');
+    let leading = arcs.next().unwrap_or_default();
+    let mut remaining = 0usize;
+    let digits_only = |arc: &str| !arc.is_empty() && arc.chars().all(|c| c.is_ascii_digit());
+    for arc in arcs {
+        if !digits_only(arc) {
+            return false;
+        }
+        remaining += 1;
+    }
+    digits_only(leading) && remaining >= 1
+}
+
 /// Delete rules from the rules a profile enforces for one certificate field: "Delete an
 /// entry from the attribute mapping rules enforced by a given profile"
 /// (`DeleteAttributeMapping` doc).
@@ -900,34 +1054,95 @@ pub fn delete_attribute_mapping(
     });
 }
 
-/// The member and the constraint a `Source` fails, or `None` when it describes a
-/// certificate authority this service can store.
+/// Why a submitted `Source` describes no certificate authority this service can store.
+///
+/// Two refusals, worded differently because they are different failures: a member of the
+/// `Source` that is absent, outside its enum or paired with the wrong `sourceType` is a
+/// constraint failure on that member, while certificate data that is not certificate data
+/// at all is the service's own statement about the material it was handed.
+#[derive(Debug, Clone)]
+pub enum SourceRejection {
+    /// The member that failed, and the constraint it failed — rendered by
+    /// [`validation_message`], the way the boundary validator words its own refusals.
+    Member {
+        member: &'static str,
+        constraint: String,
+    },
+    /// `x509CertificateData` that is not readable as PEM-encoded X.509 certificates.
+    BadCertificateData,
+}
+
+/// Which trust-anchor write is refusing a `Source`, which its refusal of the certificate
+/// data names itself by.
+#[derive(Debug, Clone, Copy)]
+pub enum TrustAnchorWrite {
+    Create,
+    Update,
+}
+
+impl TrustAnchorWrite {
+    /// The verb the refusal words itself with: "Error creating TrustAnchor. …".
+    fn action(self) -> &'static str {
+        match self {
+            Self::Create => "creating",
+            Self::Update => "updating",
+        }
+    }
+}
+
+/// The `message` the trust-anchor write `write` refuses `rejection` with.
+///
+/// The certificate-data refusal is FIXED text naming the write: it quotes nothing the
+/// request carried, because the material it is about is the whole submitted value.
+pub fn source_rejection_message(rejection: &SourceRejection, write: TrustAnchorWrite) -> String {
+    match rejection {
+        SourceRejection::Member { member, constraint } => validation_message(member, constraint),
+        SourceRejection::BadCertificateData => {
+            format!("Error {} TrustAnchor. Bad certificate data", write.action())
+        }
+    }
+}
+
+/// Why a `Source` describes no certificate authority this service can store, or `None`
+/// when it describes one.
 ///
 /// `Source`'s own two members are optional even where the `Source` itself is
 /// `@required`, and the model names which certificate data member belongs to which
 /// `sourceType`, so a source that carries neither — or carries the data of the other
-/// type — describes no certificate authority at all. Shared, because every operation that
-/// accepts a `Source` has to judge it the same way.
-pub fn source_rejection(source: &Source) -> Option<(&'static str, String)> {
+/// type — describes no certificate authority at all. And `x509CertificateData` is "The
+/// PEM-encoded data for the certificate anchor"
+/// (`smithy_query(query="shape", shape="SourceData")`), so a value that does not read as
+/// PEM-encoded X.509 certificates names no authority either: it could authenticate no
+/// certificate, which is the one thing a trust anchor is for. Shared, because every
+/// operation that accepts a `Source` has to judge it the same way.
+pub fn source_rejection(source: &Source) -> Option<SourceRejection> {
     let source_type = match source
         .source_type
         .as_deref()
         .filter(|value| !value.is_empty())
     {
         Some(source_type) => source_type,
-        None => return Some(("source.sourceType", "Member must not be null".to_string())),
+        None => {
+            return Some(SourceRejection::Member {
+                member: "source.sourceType",
+                constraint: "Member must not be null".to_string(),
+            })
+        }
     };
     if !TRUST_ANCHOR_TYPE_VALUES.contains(&source_type) {
-        return Some((
-            "source.sourceType",
-            format!(
+        return Some(SourceRejection::Member {
+            member: "source.sourceType",
+            constraint: format!(
                 "Member must satisfy enum value set: [{}]",
                 TRUST_ANCHOR_TYPE_VALUES.join(", ")
             ),
-        ));
+        });
     }
     let Some(source_data) = source.source_data.as_ref() else {
-        return Some(("source.sourceData", "Member must not be null".to_string()));
+        return Some(SourceRejection::Member {
+            member: "source.sourceData",
+            constraint: "Member must not be null".to_string(),
+        });
     };
     let expected_data_member = match source_type {
         CERTIFICATE_BUNDLE_SOURCE_TYPE => Some("x509CertificateData"),
@@ -941,14 +1156,26 @@ pub fn source_rejection(source: &Source) -> Option<(&'static str, String)> {
         SourceData::x509CertificateData(_) => "x509CertificateData",
         SourceData::acmPcaArn(_) => "acmPcaArn",
     };
-    expected_data_member
-        .filter(|member| *member != actual_data_member)
-        .map(|expected| {
-            (
-                "source.sourceData",
-                format!("Member must be {expected} for a trust anchor of type {source_type}"),
-            )
-        })
+    if let Some(expected) = expected_data_member.filter(|member| *member != actual_data_member) {
+        return Some(SourceRejection::Member {
+            member: "source.sourceData",
+            constraint: format!(
+                "Member must be {expected} for a trust anchor of type {source_type}"
+            ),
+        });
+    }
+    // Whatever the `sourceType`, certificate data carried in `x509CertificateData` has to
+    // BE certificate data: it is read with the same parse the session plane reads a stored
+    // bundle's authorities with, so a bundle a trust anchor is allowed to hold is one that
+    // plane can actually chain a presented certificate to.
+    match source_data {
+        SourceData::x509CertificateData(bundle)
+            if !crate::service::x509_signature::reads_as_authority_bundle(bundle) =>
+        {
+            Some(SourceRejection::BadCertificateData)
+        }
+        _ => None,
+    }
 }
 
 /// The failure a `roleArns` list carries when one of its entries is not an IAM role ARN,

@@ -164,10 +164,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .ok_or_else(crate::state::state_unavailable)?;
 
         // A `Source` that names no certificate authority this service can store is
-        // refused rather than stored; `UpdateTrustAnchor` judges a submitted source the
-        // same way, so the rule lives beside the record it guards.
-        if let Some((member, constraint)) = crate::state::source_rejection(&input.source) {
-            return Err(validation(member, &constraint));
+        // refused rather than stored — certificate data that does not read as certificates
+        // included, because an anchor holding it could authenticate nothing;
+        // `UpdateTrustAnchor` judges a submitted source the same way, so the rule lives
+        // beside the record it guards.
+        if let Some(rejection) = crate::state::source_rejection(&input.source) {
+            return Err(CreateTrustAnchorErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(crate::state::source_rejection_message(
+                        &rejection,
+                        crate::state::TrustAnchorWrite::Create,
+                    )),
+                },
+            )
+            .into());
         }
 
         // A resource's tag set is addressed by key and bounded by the per-resource
@@ -236,13 +246,4 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         Ok(CreateTrustAnchorOutput { trust_anchor })
     }
-}
-
-/// Refuse the request with this operation's own modelled `ValidationException`
-/// (HTTP 400), worded the way the boundary validator words a constraint failure.
-fn validation(member: &str, constraint: &str) -> CreateTrustAnchorError {
-    CreateTrustAnchorErrorModeled::ValidationException(ValidationException {
-        message: Some(crate::state::validation_message(member, constraint)),
-    })
-    .into()
 }

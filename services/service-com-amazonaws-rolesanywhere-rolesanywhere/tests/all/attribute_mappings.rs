@@ -16,6 +16,13 @@
 //! member at all, which the model allows because `ResourceNotFoundException$message` is
 //! optional (`smithy_query(query="shape", shape="ResourceNotFoundException")`).
 //!
+//! And a put maps only specifiers the field it names can CARRY: a mapping is "a single
+//! mapping entry for each supported specifier or sub-field" (`MappingRule` doc), so a
+//! distinguished-name field (the subject, the issuer) takes an attribute type while the
+//! subject-alternative name takes one of the general-name forms that extension holds. A
+//! specifier the field does not carry is refused 400 `ValidationException` naming the
+//! specifier and the field's target, and nothing is mapped.
+//!
 //! Every expectation below is the rule applied to the mappings the profile held BEFORE the
 //! call, read back over the wire — never a literal list of mappings — so the suite states
 //! the rule rather than one store's starting point.
@@ -420,7 +427,12 @@ fn owned(specifiers: &[&str]) -> Vec<String> {
 /// sub-field path, and the longest specifier the model accepts.
 #[tokio::test]
 async fn put_adds_the_specifiers_it_carries_to_the_field_it_names() {
-    let longest = "s".repeat(MAX_SPECIFIER_LEN);
+    // The longest specifier the model accepts that the subject-alternative name can also
+    // carry: a directory-name path, padded to the bound.
+    let longest = format!(
+        "Name/{}",
+        "s".repeat(MAX_SPECIFIER_LEN - "Name/".len())
+    );
     let cases: Vec<(&str, &str, Vec<String>)> = vec![
         ("one-specifier-on-subject", "x509Subject", owned(&["CN"])),
         (
@@ -436,7 +448,7 @@ async fn put_adds_the_specifiers_it_carries_to_the_field_it_names() {
         (
             "sub-field-paths-on-san",
             "x509SAN",
-            owned(&["SAN/DNS", "SAN/URI"]),
+            owned(&["Name/CN", "Name/OU"]),
         ),
         (
             "longest-modelled-specifier-on-san",
@@ -596,7 +608,7 @@ async fn delete_unmaps_only_the_specifiers_it_names() {
         let id = profile_id(&client, case).await;
         for (written_field, specifiers) in [
             ("x509Subject", owned(&["CN", "OU", "UID"])),
-            ("x509SAN", owned(&["SAN/DNS"])),
+            ("x509SAN", owned(&["Name/CN"])),
         ] {
             let seeded = client.put_mapping(&id, written_field, &specifiers).await;
             assert_eq!(
@@ -919,6 +931,184 @@ async fn attribute_mapping_writes_refuse_an_unknown_profile() {
             missing.status, 404,
             "case {case:?}: a refused write must not re-create the deleted profile, got \
              {missing:?}"
+        );
+    }
+}
+
+/// The X.509 field each `CertificateField` value names, which is how a refusal of a
+/// specifier addresses the field: the certificate's subject, its issuer and its
+/// subject-alternative-name extension (RFC 5280 sections 4.1.2.4, 4.1.2.6 and 4.2.1.6).
+const FIELD_TARGETS: [(&str, &str); 3] = [
+    ("x509Subject", "SUBJECT"),
+    ("x509Issuer", "ISSUER"),
+    ("x509SAN", "SUBJECT_ALTERNATIVE_NAME"),
+];
+
+/// The target name a refusal addresses `certificate_field` by.
+fn target_of(certificate_field: &str) -> &'static str {
+    FIELD_TARGETS
+        .iter()
+        .find(|(field, _)| *field == certificate_field)
+        .map(|(_, target)| *target)
+        .unwrap_or_else(|| panic!("{certificate_field:?} is not a modelled certificate field"))
+}
+
+/// The wording a specifier the named field cannot carry is refused with: the submitted
+/// specifier, and the field's target name, each in parentheses of its own.
+fn unvalidatable_specifier_message(specifier: &str, target: &str) -> String {
+    format!("Unable to validate specifier ({specifier}) on the target ({target})")
+}
+
+/// One row of the specifier-compatibility table: the certificate field written, the
+/// specifier submitted, and whether that field carries it.
+type SpecifierCase = (&'static str, &'static str, bool);
+
+/// Every specifier a mapping names has to be one the certificate field it is written on
+/// carries: the subject and the issuer are distinguished names, so their parts are
+/// addressed by attribute type (RFC 4514's short name or numeric OID form — "such as CN,
+/// OU, or UID from the Subject field", `MappingRule$specifier` doc), while the
+/// subject-alternative name holds general names, so its parts are addressed by name form
+/// (`DNS`, `URI`, `Name`, and a `Name/<attribute type>` path into the directory name,
+/// which is what this service maps for the field by default). A specifier the field does
+/// not carry is refused 400 `ValidationException` naming the specifier and the field's
+/// target, and is not mapped.
+///
+/// The rows differ along which field is written, which form the specifier takes (a short
+/// attribute type, a numeric OID, a general-name form, a sub-field path, the whole-field
+/// wildcard), its case, and how it is malformed.
+fn specifier_cases() -> Vec<SpecifierCase> {
+    vec![
+        // A distinguished-name field carries attribute types and the whole-field wildcard.
+        ("x509Subject", "CN", true),
+        ("x509Subject", "OU", true),
+        ("x509Subject", "UID", true),
+        ("x509Subject", "STREET", true),
+        ("x509Subject", "x500UniqueIdentifier", true),
+        // `2.5.4.3` is commonName in numeric form, which RFC 4514 writes a type with no
+        // short name as.
+        ("x509Subject", "2.5.4.3", true),
+        ("x509Subject", "*", true),
+        ("x509Issuer", "O", true),
+        ("x509Issuer", "C", true),
+        ("x509Issuer", "2.5.4.10", true),
+        ("x509Issuer", "*", true),
+        // And nothing that is not an attribute type at all.
+        ("x509Subject", "-CN", false),
+        ("x509Subject", "CN,OU", false),
+        ("x509Subject", "cn=example", false),
+        ("x509Subject", "2..5", false),
+        // A path addresses a part of a directory name, which the subject itself is not
+        // reached through.
+        ("x509Subject", "Name/CN", false),
+        ("x509Issuer", "Name/CN", false),
+        // The subject-alternative name carries its general-name forms, the directory
+        // name's parts, and the whole-field wildcard.
+        ("x509SAN", "DNS", true),
+        ("x509SAN", "URI", true),
+        ("x509SAN", "Name", true),
+        ("x509SAN", "Name/CN", true),
+        ("x509SAN", "Name/OU", true),
+        ("x509SAN", "Name/*", true),
+        ("x509SAN", "*", true),
+        // And not a distinguished name's attribute types: the extension has no such
+        // parts. The first of these is the recorded refusal.
+        ("x509SAN", "CN", false),
+        ("x509SAN", "OU", false),
+        ("x509SAN", "UID", false),
+        ("x509SAN", "2.5.4.3", false),
+        // A name form is named as the extension names it, so another spelling is not one.
+        ("x509SAN", "dns", false),
+        ("x509SAN", "IP", false),
+        // Only the directory name has parts, and a path into it addresses ONE of them.
+        ("x509SAN", "DNS/CN", false),
+        ("x509SAN", "URI/CN", false),
+        ("x509SAN", "Name/CN/extra", false),
+    ]
+}
+
+/// A put stores only specifiers the certificate field it names can carry, and refuses the
+/// rest with the service's specifier wording while mapping nothing.
+#[tokio::test]
+async fn a_put_refuses_a_specifier_the_certificate_field_cannot_carry() {
+    let client = Client::new();
+    for (field, specifier, carried) in specifier_cases() {
+        let case = format!("{field}/{specifier}");
+        let case = case.as_str();
+        let id = profile_id(&client, "specifier compatibility").await;
+        let before = client.mappings(case, &id).await;
+
+        let submitted = owned(&[specifier]);
+        let answer = client.put_mapping(&id, field, &submitted).await;
+        if !carried {
+            assert_eq!(
+                answer.status, 400,
+                "case {case:?}: a specifier the field cannot carry must be refused with \
+                 HTTP 400, got {answer:?}"
+            );
+            assert_eq!(
+                answer.error_code, "ValidationException",
+                "case {case:?}: the refusal must be the operation's modelled error, got \
+                 {answer:?}"
+            );
+            assert_eq!(
+                answer.message(),
+                Some(unvalidatable_specifier_message(specifier, target_of(field)).as_str()),
+                "case {case:?}: expected the service's specifier wording, got {answer:?}"
+            );
+            let after = client.mappings(case, &id).await;
+            assert_eq!(
+                after, before,
+                "case {case:?}: a refused put must map nothing, mappings went from \
+                 {before:?} to {after:?}"
+            );
+            continue;
+        }
+
+        assert_eq!(
+            answer.status, 200,
+            "case {case:?}: a specifier the field carries must be stored, got {answer:?}"
+        );
+        let after = written_mappings(case, &client, &id, &answer).await;
+        let expected = specifiers_after_put(specifiers_in(&before, field).as_ref(), &submitted);
+        assert_eq!(
+            specifiers_in(&after, field).as_ref(),
+            Some(&expected),
+            "case {case:?}: expected {field:?} to map {expected:?}, got {after:?}"
+        );
+    }
+}
+
+/// A put is judged before anything is written, so one unusable specifier beside usable
+/// ones maps NONE of them — whichever position it is carried in.
+#[tokio::test]
+async fn a_put_carrying_one_unusable_specifier_maps_none_of_them() {
+    let client = Client::new();
+    for (case, submitted, unusable) in [
+        ("unusable-first", owned(&["CN", "DNS", "URI"]), "CN"),
+        ("unusable-last", owned(&["DNS", "URI", "CN"]), "CN"),
+        ("unusable-in-the-middle", owned(&["DNS", "OU", "URI"]), "OU"),
+    ] {
+        let id = profile_id(&client, "partial specifier set").await;
+        let before = client.mappings(case, &id).await;
+
+        let answer = client.put_mapping(&id, "x509SAN", &submitted).await;
+        assert_eq!(
+            answer.status, 400,
+            "case {case:?}: expected HTTP 400, got {answer:?}"
+        );
+        assert_eq!(
+            answer.message(),
+            Some(
+                unvalidatable_specifier_message(unusable, target_of("x509SAN"))
+                    .as_str()
+            ),
+            "case {case:?}: the refusal must name the unusable specifier, got {answer:?}"
+        );
+        let after = client.mappings(case, &id).await;
+        assert_eq!(
+            after, before,
+            "case {case:?}: a refused put must map none of the specifiers it carried, \
+             mappings went from {before:?} to {after:?}"
         );
     }
 }

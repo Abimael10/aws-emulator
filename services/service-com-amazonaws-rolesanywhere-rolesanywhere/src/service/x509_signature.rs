@@ -90,11 +90,11 @@ const MAX_CERTIFICATE_HEADER_BYTES: usize = 16 * 1024;
 
 /// The largest authority bundle this plane reads a trust anchor's certificates out of.
 ///
-/// `SourceData$x509CertificateData` is bounded by the model at 8000 characters
-/// (`smithy_query(query="shape", shape="SourceData")`); this ceiling is that bound with
-/// room for the PEM framing, so a stored bundle is always readable and nothing larger is
-/// walked.
-const MAX_AUTHORITY_BUNDLE_BYTES: usize = 64 * 1024;
+/// `SourceData$x509CertificateData` is bounded by the model at 204800 characters
+/// (`smithy_query(query="shape", shape="SourceData")`), and a PEM bundle's framing is part
+/// of that value, so this ceiling is that bound: every bundle a trust anchor is allowed to
+/// hold is one this plane reads, and nothing larger is walked.
+pub const MAX_AUTHORITY_BUNDLE_BYTES: usize = 204_800;
 
 /// The most certificates one bundle is searched for the issuer.
 const MAX_AUTHORITY_CERTIFICATES: usize = 32;
@@ -200,6 +200,20 @@ impl PresentedCertificate {
 fn is_current(certificate: &Certificate, now: SystemTime) -> bool {
     let validity = &certificate.tbs_certificate.validity;
     validity.not_before.to_system_time() <= now && now <= validity.not_after.to_system_time()
+}
+
+/// Whether `bundle` reads as the certificate authorities a trust anchor's
+/// `x509CertificateData` holds: PEM-framed X.509 certificates, at least one of them, each
+/// read with `x509-cert` rather than by hand.
+///
+/// This is the SAME read [`chains_to_authority_bundle`] does before it looks for the
+/// issuer of a presented certificate, so certificate data a trust anchor is allowed to
+/// hold is certificate data this plane can actually authenticate against — a bundle that
+/// does not read as certificates authenticates nothing.
+pub fn reads_as_authority_bundle(bundle: &str) -> bool {
+    bundle.len() <= MAX_AUTHORITY_BUNDLE_BYTES
+        && Certificate::load_pem_chain(bundle.as_bytes())
+            .is_ok_and(|authorities| !authorities.is_empty())
 }
 
 /// Whether `certificate` was issued by one of the certificate authorities `bundle` holds —

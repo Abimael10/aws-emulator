@@ -38,6 +38,12 @@ use smithy_server_runtime::MultiServiceRouter;
 /// against.
 const REGION: &str = "us-west-2";
 
+/// A PEM bundle holding one real certificate authority: a self-signed CA certificate,
+/// valid 2020-2100, written with `rcgen` and kept beside the suites that need one.
+/// `CreateTrustAnchor` refuses certificate data it cannot read as PEM X.509 certificates,
+/// so the allowed leg of the gate below presents an authority a trust anchor can hold.
+const CERTIFICATE_BUNDLE_PEM: &str = include_str!("../data/certificate_authority_a.pem");
+
 /// The action namespace this service's operations are published under, which is its
 /// `arnNamespace` and its `sigv4Name` alike (`smithy_query(query="service_info")`).
 const ACTION_PREFIX: &str = "rolesanywhere";
@@ -456,7 +462,7 @@ fn gated_operations() -> Vec<Gated> {
                 "name": "authorized",
                 "source": {
                     "sourceType": "CERTIFICATE_BUNDLE",
-                    "sourceData": {"x509CertificateData": "-----BEGIN CERTIFICATE-----\nMA==\n-----END CERTIFICATE-----\n"},
+                    "sourceData": {"x509CertificateData": CERTIFICATE_BUNDLE_PEM},
                 },
             })),
             resource: arn_of("trust-anchor/*"),

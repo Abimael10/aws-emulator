@@ -155,6 +155,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(PutAttributeMappingErrorModeled::AccessDeniedException(denied).into());
         }
 
+        // A mapping rule names a specifier the certificate field it is written on can
+        // actually carry; one that field cannot carry is refused before the store is
+        // reached, so no profile ever enforces a rule against a part of a certificate that
+        // field does not have.
+        if let Some(message) =
+            crate::state::mapping_rules_rejection(&input.certificate_field, &input.mapping_rules)
+        {
+            return Err(PutAttributeMappingErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(message),
+                },
+            )
+            .into());
+        }
+
         let state = crate::state::service_state(&*self.engine)
             .ok_or_else(crate::state::state_unavailable)?;
         let mut store = state.lock();

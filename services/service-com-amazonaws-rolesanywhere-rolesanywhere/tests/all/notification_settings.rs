@@ -33,14 +33,14 @@ use std::sync::Arc;
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
-/// A placeholder PEM bundle. `SourceData$x509CertificateData` is `@length(1, 204800)`
-/// with no `@pattern`, so any non-empty string is a legal certificate bundle on the wire.
-const CERTIFICATE_BUNDLE_PEM: &str =
-    "-----BEGIN CERTIFICATE-----\nZW11bGF0ZWQtdGVzdC1jZXJ0\n-----END CERTIFICATE-----\n";
+/// A PEM bundle holding one real certificate authority: a self-signed CA certificate,
+/// valid 2020-2100, written with `rcgen` and kept beside the suites that need one.
+/// `CreateTrustAnchor` refuses certificate data it cannot read as PEM X.509 certificates,
+/// so a suite that creates a trust anchor presents an authority a trust anchor can hold.
+const CERTIFICATE_BUNDLE_PEM: &str = include_str!("../data/certificate_authority_a.pem");
 
-/// A second, different bundle, so an update that replaces the source is observable.
-const REPLACEMENT_BUNDLE_PEM: &str =
-    "-----BEGIN CERTIFICATE-----\ncmVwbGFjZW1lbnQtY2VydA==\n-----END CERTIFICATE-----\n";
+/// A second, different authority, so an update that replaces the source is observable.
+const REPLACEMENT_BUNDLE_PEM: &str = include_str!("../data/certificate_authority_b.pem");
 
 /// The Region the suite signs for.
 const REGION: &str = "us-west-2";
