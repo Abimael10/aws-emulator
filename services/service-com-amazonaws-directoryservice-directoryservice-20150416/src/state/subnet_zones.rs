@@ -113,16 +113,18 @@ fn single_zone_defect(
 /// Availability Zone with.
 ///
 /// FIXED text, the rule the topology broke: it quotes neither the subnets nor the zone, so
-/// every caller that breaks it reads the same sentence. It is a different sentence from
+/// every caller that breaks it reads the same sentence. It is a DIFFERENT sentence from
 /// [`super::INVALID_SUBNET_IDS`], the one a settings block that names no two distinct subnets
-/// gets. [`super::refusal`] appends the request id, once.
+/// gets, and a different error class too — the two refusals are recorded apart, so a client
+/// that reads the sentence can tell a pick it must re-zone from a pick that names no pair at
+/// all. [`super::refusal`] appends the request id, once.
 pub const SUBNETS_IN_ONE_ZONE: &str =
     "Invalid subnet ID(s). The two subnets must be in different Availability Zones.";
 
 /// The diagnostic Directory Service refuses a placement whose subnets do not all sit in the
 /// VPC it names with: the invalid-subnets opener this service's recorded placement refusals
-/// share, and then the rule the check applies — that the subnets belong to the VPC the
-/// request named.
+/// share, and then the rule the check applies — that both of a placement's subnets belong to
+/// the VPC the request named.
 ///
 /// FIXED text, like its two siblings — [`SUBNETS_IN_ONE_ZONE`] for a pick in one zone and
 /// [`super::INVALID_SUBNET_IDS`] for a settings block naming no two distinct subnets — so a
@@ -130,4 +132,4 @@ pub const SUBNETS_IN_ONE_ZONE: &str =
 /// pick as the invalid part of the request and the rule a servable pick satisfies. It quotes
 /// neither the subnets nor either VPC. [`super::refusal`] appends the request id, once.
 pub const SUBNETS_OUTSIDE_THE_VPC: &str =
-    "Invalid subnet ID(s). The subnets must belong to the VPC specified.";
+    "Invalid subnet ID(s). Both subnets must belong to the specified VPC.";

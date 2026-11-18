@@ -383,6 +383,12 @@ pub fn subnet_pair_defect(subnet_ids: &[String]) -> Option<String> {
 /// FIXED text, the rule the subnets broke: it quotes none of them, so the message names
 /// neither the ids it rejected nor how many were sent. [`refusal`] appends the request id,
 /// once.
+///
+/// It is the REQUEST-level half of the two-subnets-in-two-zones rule that is stated in it
+/// ([`subnet_pair_defect`], a list naming no two distinct subnets). The network half
+/// ([`subnet_zones::single_zone_defect`], a pair the owner of subnets reports in one zone) is
+/// recorded apart, in its own error class and with its own sentence
+/// ([`subnet_zones::SUBNETS_IN_ONE_ZONE`]), so the two are not merged here.
 pub const INVALID_SUBNET_IDS: &str =
     "Invalid subnet ID(s). They must correspond to two subnets in different Availability \
      Zones.";

@@ -37,6 +37,14 @@
 //!   placement's subnets sit in it — in `DirectoryVpcSettingsDescription$AvailabilityZones`
 //!   and `DirectoryConnectSettingsDescription$AvailabilityZones`, "the list of Availability
 //!   Zones that the directory is in".
+//!
+//! And the rule about HOW those refusals are WORDED, over a table of every unservable pick
+//! crossed with every operation that places directory servers: a placement refusal states the
+//! rule the pick broke in one FIXED sentence — the invalid-subnets opener and then that rule,
+//! quoting nothing of the request — and the refusal envelope appends the call's own request id
+//! once, which is the only part of the message that varies between two calls. Each of the
+//! three placement rules carries its OWN sentence, so the sentence tells a client which pick
+//! to change.
 
 use std::collections::BTreeSet;
 
@@ -49,7 +57,7 @@ use crate::directory_lifecycle::{call, describe_one, ok, string, PASSWORD, REGIO
 /// The sentence Directory Service refuses a placement whose subnets are not all in the VPC it
 /// names with: fixed text, naming neither the subnets nor either VPC.
 const SUBNETS_OUTSIDE_THE_VPC: &str =
-    "Invalid subnet ID(s). The subnets must belong to the VPC specified.";
+    "Invalid subnet ID(s). Both subnets must belong to the specified VPC.";
 
 /// What this service's refusal envelope appends to every diagnostic it words.
 const REQUEST_ID_SEPARATOR: &str = " : RequestId: ";
@@ -549,6 +557,269 @@ async fn a_placement_naming_no_two_distinct_subnets_is_refused_with_the_stated_r
         stored_count(router, "after every refused placement").await,
         before,
         "expected a refused placement to store nothing"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// RULE: each placement rule is stated in its OWN fixed sentence, by every operation that
+// places directory servers, with the call's request id as the message's only variable part.
+// ---------------------------------------------------------------------------
+
+/// The FIXED sentence a pick the owner of subnets reports in ONE Availability Zone is refused
+/// with: the same documented rule as [`SUBNET_PAIR_REFUSAL`] — a directory's servers sit in two
+/// subnets in two different zones — stated in its own sentence and answered in its own error
+/// class, because the two refusals are recorded apart.
+const SUBNETS_IN_ONE_ZONE: &str =
+    "Invalid subnet ID(s). The two subnets must be in different Availability Zones.";
+
+/// The opener every one of this service's placement sentences names the invalid part of the
+/// request with.
+const INVALID_SUBNETS_OPENER: &str = "Invalid subnet ID(s). ";
+
+/// The modelled refusal a defect of the REQUEST is reported as.
+const REQUEST_REFUSAL: &str = "InvalidParameterException";
+
+/// The modelled refusal a defect of the account's NETWORK is reported as.
+const NETWORK_REFUSAL: &str = "ClientException";
+
+/// One row of the wording table: a subnet pick no placement can carry, and the refusal every
+/// operation that places directory servers has to answer it with.
+struct PickCase {
+    /// What is wrong with the pick, for the assertion messages.
+    case: String,
+    /// The VPC the placement names.
+    vpc: String,
+    /// The subnets the placement names.
+    subnets: Vec<String>,
+    /// The `__type` the refusal reports.
+    code: &'static str,
+    /// The sentence the refusal states the broken rule in.
+    sentence: &'static str,
+}
+
+/// Every unservable pick the wording table sends through every placement operation, with the
+/// refusal each one has to get.
+///
+/// The rows differ along what the rule generalises over: WHICH of the three placement rules the
+/// pick breaks, and how it breaks it — the number of entries the list carries, the repetition
+/// in it, the order the subnets are named in, and whether a named subnet is one a client cut or
+/// one the account holds by default.
+///
+/// Built over the network EC2 holds: the zones the one-zone rows rest on are ASKED for here, so
+/// a row whose subnets no longer share a zone fails loudly instead of passing for another
+/// reason.
+async fn unservable_picks(network: &crate::directory_dns_addresses::Network) -> Vec<PickCase> {
+    let router = &network.router;
+    let client = &network.client;
+    let default = &network.default;
+    let vpc = network.vpc.clone();
+
+    // A pair of subnets of the named VPC that EC2 reports in ONE zone, and one it reports in
+    // two: the zones come back from the owner of subnets, never from this suite.
+    let same_zone = vec![client[0].id.clone(), client[3].id.clone()];
+    let zones = zones_reported_for(router, &same_zone, "the one-zone pick").await;
+    assert_eq!(
+        zones.len(),
+        1,
+        "setup: the one-zone rows need a pair EC2 reports in one zone, got {zones:?}"
+    );
+
+    let mut rows = vec![
+        PickCase {
+            case: "one subnet of the named VPC".to_string(),
+            vpc: vpc.clone(),
+            subnets: vec![client[0].id.clone()],
+            code: REQUEST_REFUSAL,
+            sentence: SUBNET_PAIR_REFUSAL,
+        },
+        PickCase {
+            case: "the same subnet twice".to_string(),
+            vpc: vpc.clone(),
+            subnets: vec![client[1].id.clone(), client[1].id.clone()],
+            code: REQUEST_REFUSAL,
+            sentence: SUBNET_PAIR_REFUSAL,
+        },
+        PickCase {
+            case: "the same subnet three times".to_string(),
+            vpc: vpc.clone(),
+            subnets: vec![
+                client[2].id.clone(),
+                client[2].id.clone(),
+                client[2].id.clone(),
+            ],
+            code: REQUEST_REFUSAL,
+            sentence: SUBNET_PAIR_REFUSAL,
+        },
+        PickCase {
+            case: format!("two subnets EC2 reports in {}", zones[0]),
+            vpc: vpc.clone(),
+            subnets: same_zone.clone(),
+            code: NETWORK_REFUSAL,
+            sentence: SUBNETS_IN_ONE_ZONE,
+        },
+        PickCase {
+            case: "the same one-zone pair in the other order".to_string(),
+            vpc: vpc.clone(),
+            subnets: vec![same_zone[1].clone(), same_zone[0].clone()],
+            code: NETWORK_REFUSAL,
+            sentence: SUBNETS_IN_ONE_ZONE,
+        },
+    ];
+
+    // The membership rule: the placement names the VPC the client cut its subnets out of, and a
+    // subnet of ANOTHER VPC in either position, or only subnets of that other VPC.
+    for (where_foreign, picked) in [
+        (
+            "a subnet of another VPC named second",
+            vec![client[0].id.clone(), default[1].id.clone()],
+        ),
+        (
+            "a subnet of another VPC named first",
+            vec![default[1].id.clone(), client[0].id.clone()],
+        ),
+        (
+            "both subnets of another VPC",
+            vec![default[0].id.clone(), default[1].id.clone()],
+        ),
+    ] {
+        rows.push(PickCase {
+            case: where_foreign.to_string(),
+            vpc: vpc.clone(),
+            subnets: picked,
+            code: NETWORK_REFUSAL,
+            sentence: SUBNETS_OUTSIDE_THE_VPC,
+        });
+    }
+    rows
+}
+
+/// Assert `status`/`parsed` is the refusal `row` has to get, and return the message with the
+/// call's own request id taken back out of it.
+fn stated_sentence(status: u16, parsed: &Value, row: &PickCase, case: &str) -> String {
+    assert_eq!(
+        status, 400,
+        "case {case:?}: expected the placement to be refused, got {status} with {parsed}"
+    );
+    assert_eq!(
+        parsed["__type"],
+        json!(row.code),
+        "case {case:?}: expected the modelled {} refusal, got {parsed}",
+        row.code
+    );
+    let request_id = string(parsed, "RequestId", case);
+    let message = string(parsed, "Message", case);
+    assert_eq!(
+        message,
+        format!("{}{REQUEST_ID_SEPARATOR}{request_id}", row.sentence),
+        "case {case:?}: expected the sentence the broken rule is stated in, got {message:?}"
+    );
+    // The sentence states the rule and quotes nothing of the request: not a subnet, not the
+    // VPC, not how many subnets were named.
+    for quoted in [row.subnets[0].as_str(), row.vpc.as_str()] {
+        assert!(
+            !message.contains(quoted),
+            "case {case:?}: expected the sentence to quote nothing of the request, found \
+             {quoted:?} in {message:?}"
+        );
+    }
+    message.replace(&request_id, "")
+}
+
+/// RULE: every operation that places a directory's servers in a VPC refuses an unservable pick
+/// with the one FIXED sentence the rule that pick broke is stated in, followed by the call's own
+/// request id — and stores nothing. The three rules carry three DIFFERENT sentences, all opened
+/// by the same invalid-subnets clause, so the sentence is what tells a client which pick to
+/// change.
+#[tokio::test]
+async fn every_placement_states_the_rule_its_pick_broke_in_one_fixed_sentence() {
+    let network = network().await;
+    let router = &network.router;
+    let rows = unservable_picks(&network).await;
+
+    // The directory the add below replicates: placed in a pair EC2 reports in two zones of the
+    // VPC it names, so what refuses each row of that table is the row's own pick. The placement
+    // an add asks for is resolved before the Region and stage gates, which is why the rows reach
+    // the same decision a create's do.
+    let replicated = ok(
+        router,
+        "CreateMicrosoftAD",
+        json!({
+            "Name": "wording-replicated.example.com",
+            "Password": PASSWORD,
+            "Edition": "Enterprise",
+            "VpcSettings": {
+                "VpcId": &network.vpc,
+                "SubnetIds": [&network.client[0].id, &network.client[1].id]
+            }
+        }),
+        "the directory AddRegion replicates",
+    )
+    .await;
+    let replicated = string(&replicated, "DirectoryId", "the directory AddRegion replicates");
+
+    let before = stored_count(router, "before any refused placement").await;
+    for (index, row) in rows.iter().enumerate() {
+        for operation in [
+            "CreateDirectory",
+            "CreateMicrosoftAD",
+            "ConnectDirectory",
+            "AddRegion",
+        ] {
+            let case = format!("{operation} with {}", row.case);
+            let body = if operation == "AddRegion" {
+                json!({
+                    "DirectoryId": &replicated,
+                    "RegionName": REGION,
+                    "VPCSettings": { "VpcId": &row.vpc, "SubnetIds": &row.subnets },
+                })
+            } else {
+                create_body(
+                    operation,
+                    &format!("wording{index}.example.com"),
+                    &row.vpc,
+                    &row.subnets,
+                )
+            };
+            let (status, parsed) = call(router, operation, body).await;
+            let stated = stated_sentence(status, &parsed, row, &case);
+            // One sentence per rule: with the call's own request id taken out, nothing of the
+            // message differs between two calls that broke the same rule, whichever operation
+            // they called and however they broke it.
+            assert_eq!(
+                stated,
+                format!("{}{REQUEST_ID_SEPARATOR}", row.sentence),
+                "case {case:?}: expected the rule's one fixed sentence, got {stated:?}"
+            );
+        }
+    }
+
+    // The three rules are DISTINGUISHABLE, and each names the subnet pick as the invalid part of
+    // the request: a client that branches on the message can tell a pick it has to re-zone from
+    // one it has to re-pick inside the right VPC.
+    let sentences = [
+        SUBNET_PAIR_REFUSAL,
+        SUBNETS_IN_ONE_ZONE,
+        SUBNETS_OUTSIDE_THE_VPC,
+    ];
+    for (position, sentence) in sentences.iter().enumerate() {
+        assert!(
+            sentence.starts_with(INVALID_SUBNETS_OPENER),
+            "case \"the placement sentences\": expected every one to open with \
+             {INVALID_SUBNETS_OPENER:?}, got {sentence:?}"
+        );
+        for other in &sentences[position + 1..] {
+            assert_ne!(
+                sentence, other,
+                "case \"the placement sentences\": expected one sentence per rule, got \
+                 {sentence:?} twice"
+            );
+        }
+    }
+
+    assert_eq!(
+        stored_count(router, "after every refused placement").await,
+        before,
+        "case \"after every refused placement\": expected a refused placement to store nothing"
     );
 }
 
