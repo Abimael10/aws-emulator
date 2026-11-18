@@ -109,7 +109,9 @@ pub fn could_not_access_model_data(s3_url: &str, role_arn: &str, region: &str) -
         "Could not access model data at {s3_url}. Please ensure that the role \"{role_arn}\" \
          exists and that its trust relationship policy allows the action \"sts:AssumeRole\" \
          for the service principal \"{SERVICE_PRINCIPAL}\". Also ensure that the role has \
-         \"s3:GetObject\" permissions and that the object is located in {region}."
+         \"s3:GetObject\" permissions and that the object is located in {region}. If your \
+         Model uses multiple models or uncompressed models, please ensure that the role has \
+         \"s3:ListBucket\" permission."
     )
 }
 
@@ -118,16 +120,61 @@ pub fn could_not_access_model_data(s3_url: &str, role_arn: &str, region: &str) -
 /// that role has to be allowed to list — the three things that can make the location answer
 /// nothing.
 ///
-/// One sentence for one condition: whether the bucket is in another Region, holds nothing
-/// under that prefix, or is one the role may not list, what the caller is told is that the
-/// data source names no object.
+/// One sentence for the location, and a SECOND one for what Amazon S3 itself answered when
+/// the listing was refused by AUTHORIZATION rather than merely coming back empty
+/// ([`s3_listing_refusal`]): the two conditions are told apart by whether the sentence
+/// naming the Amazon S3 answer is there, which is how a client distinguishes "the prefix is
+/// empty" from "this role may not list the bucket". A listing that answered and held nothing
+/// carries no such clause, because Amazon S3 refused nothing.
 #[must_use]
-pub fn no_s3_objects_found(s3_url: &str, region: &str, role_arn: &str, bucket: &str) -> String {
+pub fn no_s3_objects_found(
+    s3_url: &str,
+    region: &str,
+    role_arn: &str,
+    bucket: &str,
+    s3_error: Option<&str>,
+) -> String {
+    let refused = s3_error.map(|error| format!(" Error message from S3: {error}"));
     format!(
         "No S3 objects found under S3 URL \"{s3_url}\" given in input data source. Please \
          ensure that the bucket exists in the selected region ({region}), that objects exist \
          under that S3 prefix, and that the role \"{role_arn}\" has \"s3:ListBucket\" \
-         permissions on bucket \"{bucket}\"."
+         permissions on bucket \"{bucket}\".{}",
+        refused.unwrap_or_default()
+    )
+}
+
+/// The session name SageMaker assumes an execution role under, which is what the Amazon S3
+/// refusal names the calling principal by: an assumed-role session ARN carries the role's own
+/// name and then the session's.
+pub const EXECUTION_ROLE_SESSION: &str = "SageMaker";
+
+/// What Amazon S3 ANSWERS a listing it refuses on the identity-based question: the principal
+/// the call was made by, the action it is not authorized to perform, the resource it was
+/// attempted on, and the IAM rule that withheld it.
+///
+/// The principal is the assumed-role SESSION SageMaker reads the data under — not the role ARN
+/// the request carried — because that is the identity the call is signed with
+/// (`arn:<partition>:sts::<account>:assumed-role/<role name>/<session name>`), and the
+/// resource is the BUCKET, quoted, which is what `s3:ListBucket` is granted on.
+///
+/// The sentence and its reason clause are the tree's ONE wording of an identity-based refusal
+/// ([`::service_common::iam_authorization::not_authorized_by_identity_policy`]), so this states
+/// only which principal, action and resource Amazon S3 names. Every variable part is taken from
+/// the request and from the role the request named; nothing of any one run is written here.
+#[must_use]
+pub fn s3_listing_refusal(role_arn: &str, bucket_arn: &str, partition: &str, reason: &str) -> String {
+    let parsed = ::service_common::arn::parse(role_arn);
+    let account = parsed.map_or("", |role| role.account);
+    let role_name = ::service_common::iam_role::role_name(role_arn)
+        .unwrap_or_else(|| role_arn.rsplit('/').next().unwrap_or(role_arn));
+    let session =
+        format!("arn:{partition}:sts::{account}:assumed-role/{role_name}/{EXECUTION_ROLE_SESSION}");
+    ::service_common::iam_authorization::not_authorized_by_identity_policy(
+        &session,
+        crate::state::LIST_BUCKET_ACTION,
+        &format!("\"{bucket_arn}\""),
+        reason,
     )
 }
 

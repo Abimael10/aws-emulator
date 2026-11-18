@@ -373,7 +373,13 @@ pub async fn run_auto_ml_job_v2(
         let name = candidate_name(job_name, index);
         let artifact = candidate_artifact(&output, job_name, &name);
         let document = candidate_document(job_name, &name, request, &model, &reads, &metrics);
-        let Ok(archive) = model_archive(&document) else {
+        let Ok(body) = ::serde_json::to_vec_pretty(&document) else {
+            return AutoMLRunOutcome::failed_in(
+                phases,
+                model_upload_failed(&artifact.uri(), "the model archive could not be built"),
+            );
+        };
+        let Ok(archive) = model_archive(&[(MODEL_ARCHIVE_ENTRY.to_string(), body)]) else {
             return AutoMLRunOutcome::failed_in(
                 phases,
                 model_upload_failed(&artifact.uri(), "the model archive could not be built"),

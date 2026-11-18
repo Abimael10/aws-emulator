@@ -113,7 +113,7 @@ impl Emulator {
     }
 
     /// One raw path-style request to the emulator's own Amazon S3 front door.
-    async fn s3(&self, method: &str, path: &str, body: &[u8]) -> (u16, Vec<u8>) {
+    pub(crate) async fn s3(&self, method: &str, path: &str, body: &[u8]) -> (u16, Vec<u8>) {
         let request = http::Request::builder()
             .method(method)
             .uri(format!("https://s3.{REGION}.amazonaws.com{path}"))
@@ -126,7 +126,7 @@ impl Emulator {
     }
 
     /// `PUT /<bucket>` — `CreateBucket`.
-    async fn given_bucket(&self, bucket: &str) {
+    pub(crate) async fn given_bucket(&self, bucket: &str) {
         let (status, body) = self.s3("PUT", &format!("/{bucket}"), &[]).await;
         assert_eq!(
             status,
@@ -137,7 +137,7 @@ impl Emulator {
     }
 
     /// `PUT /<bucket>/<key>` — `PutObject`.
-    async fn given_object(&self, bucket: &str, key: &str, body: &str) {
+    pub(crate) async fn given_object(&self, bucket: &str, key: &str, body: &str) {
         let (status, answered) = self
             .s3("PUT", &format!("/{bucket}/{key}"), body.as_bytes())
             .await;
@@ -150,7 +150,7 @@ impl Emulator {
     }
 
     /// `PUT /<bucket>?policy` — `PutBucketPolicy`, with `document` as the payload.
-    async fn given_bucket_policy(&self, bucket: &str, document: &Value) {
+    pub(crate) async fn given_bucket_policy(&self, bucket: &str, document: &Value) {
         let (status, answered) = self
             .s3(
                 "PUT",
@@ -166,7 +166,7 @@ impl Emulator {
     }
 
     /// One IAM call (`awsQuery`), as a client makes it.
-    async fn iam(&self, action: &str, params: &[(&str, &str)]) -> (u16, String) {
+    pub(crate) async fn iam(&self, action: &str, params: &[(&str, &str)]) -> (u16, String) {
         let mut body = format!("Action={action}&Version=2010-05-08");
         for (name, value) in params {
             body.push('&');
@@ -206,6 +206,52 @@ impl Emulator {
             "the role {role_name} must be created, got {status} {body}"
         );
         role_arn(role_name)
+    }
+
+    pub(crate) async fn given_role_policy(&self, role_name: &str, document: &Value) {
+        let (status, body) = self
+            .iam(
+                "PutRolePolicy",
+                &[
+                    ("RoleName", role_name),
+                    ("PolicyName", "granted"),
+                    ("PolicyDocument", &document.to_string()),
+                ],
+            )
+            .await;
+        assert_eq!(
+            status, 200,
+            "the role {role_name} must carry its policy, got {status} {body}"
+        );
+    }
+
+    /// Grant `role_name` the Amazon S3 reads SageMaker makes under it, through IAM's own
+    /// `PutRolePolicy`, so the identity-based half of the artifact's read is allowed and what
+    /// a case then observes is the location itself or the bucket's own policy.
+    pub(crate) async fn given_s3_read_grant(&self, role_name: &str) {
+        let document = json!({
+            "Version": "2012-10-17",
+            "Statement": [{
+                "Effect": "Allow",
+                "Action": ["s3:GetObject", "s3:ListBucket"],
+                "Resource": ["arn:aws:s3:::*", "arn:aws:s3:::*/*"],
+            }],
+        })
+        .to_string();
+        let (status, body) = self
+            .iam(
+                "PutRolePolicy",
+                &[
+                    ("RoleName", role_name),
+                    ("PolicyName", "artifact-read"),
+                    ("PolicyDocument", &document),
+                ],
+            )
+            .await;
+        assert_eq!(
+            status, 200,
+            "the role {role_name} must carry its read grant, got {status} {body}"
+        );
     }
 }
 
@@ -295,6 +341,7 @@ async fn a_model_whose_artifact_names_no_object_is_refused() {
     let role = emulator
         .given_role("artifact-reader", &trust_for(SERVICE_PRINCIPAL))
         .await;
+    emulator.given_s3_read_grant("artifact-reader").await;
     emulator.given_bucket(BUCKET).await;
     emulator
         .given_object(BUCKET, ARTIFACT_KEY, "a model archive")
@@ -559,6 +606,9 @@ async fn a_bucket_policy_that_withholds_the_read_refuses_the_model() {
         emulator
             .given_role("artifact-reader", &trust_for(SERVICE_PRINCIPAL))
             .await;
+        // The identity-based half of the read is granted, so what each row observes is the
+        // BUCKET's own policy and nothing else.
+        emulator.given_s3_read_grant("artifact-reader").await;
         // A bucket policy's `Principal.AWS` is resolved against IAM when it is stored, so
         // the role a row denies the read to has to be one the account holds.
         emulator
@@ -597,7 +647,9 @@ async fn a_bucket_policy_that_withholds_the_read_refuses_the_model() {
                      ensure that the role \"{role}\" exists and that its trust relationship \
                      policy allows the action \"sts:AssumeRole\" for the service principal \
                      \"{SERVICE_PRINCIPAL}\". Also ensure that the role has \"s3:GetObject\" \
-                     permissions and that the object is located in {REGION}."
+                     permissions and that the object is located in {REGION}. If your Model \
+                     uses multiple models or uncompressed models, please ensure that the role \
+                     has \"s3:ListBucket\" permission."
                 ),
                 "case {case:?}: the refusal must name the artifact, the role and the Region, \
                  got {:?}",

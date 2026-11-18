@@ -10,11 +10,19 @@
 //! persists the job as `InProgress` with the instant the clock owes it a terminal status,
 //! and answers its ARN.
 //!
-//! The run itself needs the model's inference container, which this emulator does not
-//! run, so the job reaches the modelled `Failed` with a `FailureReason` that says so
-//! rather than a `Completed` that would claim an S3 object nothing wrote — see
-//! [`crate::state::TRANSFORM_NOT_RUN_FAILURE`]. `DescribeTransformJob` materialises that
-//! transition when the clock has made it due.
+//! ## The accepted job is RUN, server-side
+//!
+//! The run is this emulator's own ([`crate::state::run_transform_job`]): it reads the input
+//! objects the request's `TransformInput` names out of Amazon S3 under the model's execution
+//! role, applies the model the job names — read out of the artifact that model's container
+//! names — to every record each object holds, and writes one `<object>.out` per input object
+//! under `TransformOutput.S3OutputPath`. It is performed HERE, before this handler answers,
+//! and its outcome is RECORDED on the stored job rather than revealed: the terminal status is
+//! owed by the clock, which [`crate::state::TransformJob::settle_status`] materialises, so a
+//! caller that describes the job straight after creating it still observes `InProgress`. A run
+//! that could not read its dataset, score it or write its output leaves the job's modelled
+//! `Failed` status with the reason naming that condition — never a `Completed` status for a job
+//! that transformed nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -228,8 +236,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Everything decided from the STORE is decided here, under one guard that is
         // released before the question below is put to another service: a transform job's
         // name, the store's bound, and the model the job would run — whose execution role is
-        // what the input location is then settled against.
-        let execution_role_arn = {
+        // what the input location is then settled against, and whose artifact the run applies.
+        let (execution_role_arn, model_data_url) = {
             let store = state.lock();
             // A name already taken is refused before the quota is consulted: the request
             // adds no record, so "the store is full" is not why it fails.
@@ -279,9 +287,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     ),
                 ));
             };
-            model.execution_role_arn.clone()
+            (
+                model.execution_role_arn.clone(),
+                crate::state::model_artifact_url(model),
+            )
         };
-
         // The transform reads the dataset the input names ("TransformInput - Describes the
         // dataset to be transformed and the Amazon S3 location where it is stored"), so a
         // location that holds no object, or one the role is denied the read of, backs no
@@ -305,7 +315,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     .map(|location| location.bucket)
                     .unwrap_or_default();
                 return Err(crate::scaffolded::Scaffolded::validation(
-                    crate::state::no_s3_objects_found(uri, &region, role_arn, &bucket),
+                    crate::state::no_s3_objects_found(uri, &region, role_arn, &bucket, None),
                 ));
             }
         }
@@ -313,6 +323,32 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Read from STS's and IAM's own records — other services' stores on the same engine
         // — BEFORE this service's store is reached again.
         let created_by = crate::state::caller_user_context(&*self.engine, ctx);
+
+        // The job's own WORK, performed here and recorded on the record below: it reads the
+        // dataset, scores every record with the model the job names and writes one `.out`
+        // object per input object. Performed with no store guard held, like every other
+        // question this handler puts to another service, and before the record exists so the
+        // record carries the outcome from the moment a caller can read it — the terminal
+        // status is still the clock's to materialise.
+        let outcome = crate::state::run_transform_job(
+            ctx,
+            &region,
+            &crate::state::TransformTarget {
+                model_name: input.model_name.clone(),
+                role_arn: execution_role_arn.clone(),
+                model_data_url,
+                input_uri: input_uri.clone(),
+                input_data_type: input
+                    .transform_input
+                    .data_source
+                    .s3_data_source
+                    .s3_data_type
+                    .clone(),
+                output_path: input.transform_output.s3_output_path.clone(),
+                accept: input.transform_output.accept.clone(),
+            },
+        )
+        .await;
 
         let mut store = state.lock();
         // The guard was released for the question above, so the name is resolved again: a
@@ -325,8 +361,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // The job starts out `InProgress` and is due to reach a terminal status a span
-        // later: stored, never slept on. See `state::TRANSFORM_NOT_RUN_FAILURE` for which
-        // terminal status it reaches and why.
+        // later: stored, never slept on. Which terminal status that is, is the one its own
+        // run reported (`state::TransformJob::settle_status`).
         let now = ::std::time::SystemTime::now();
         store.transform_jobs.insert(
             input.transform_job_name.clone(),
@@ -352,8 +388,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 tags: input.tags.unwrap_or_default(),
                 creation_time: now,
                 last_modified_time: now,
+                transform_start_time: None,
                 transform_end_time: None,
                 ends_at: now + crate::state::TRANSFORM_JOB_SETTLES_AFTER,
+                run: Some(outcome),
             },
         );
         // "Associates a SageMaker job as a trial component with an experiment and trial"

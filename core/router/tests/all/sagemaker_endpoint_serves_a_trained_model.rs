@@ -744,8 +744,8 @@ async fn an_invocation_nothing_can_compute_is_refused_with_model_error() {
     );
     assert_eq!(
         answer.message(),
-        "Model artifactless-model carries no ModelDataUrl, so the endpoint has no model \
-         artifacts to serve an inference from.",
+        "Model artifactless-model carries no ModelDataUrl, so there are no model artifacts \
+         to compute an inference from.",
         "case \"no artifact\": the refusal must name the model that carries none"
     );
 
@@ -766,22 +766,22 @@ async fn an_invocation_nothing_can_compute_is_refused_with_model_error() {
     // Rows: a record of the wrong width, and a payload that holds no record at all.
     let narrow = "1,2".to_string();
     let mismatch = format!(
-        "The request payload's records carry 2 feature values, and the model behind this \
-         endpoint was fitted on {TABLE_FEATURES}."
+        "The records carry 2 feature values, and the model they are applied to was fitted on \
+         {TABLE_FEATURES}."
     );
     let refusals: Vec<(&str, &[u8], String)> = vec![
         ("a record of the wrong width", narrow.as_bytes(), mismatch),
         (
             "a payload holding no record",
             b"not,a,record",
-            "The request payload holds no record to predict from: a record is a row of \
+            "The records hold nothing to predict from: a record is a row of \
              numeric feature values, as text/csv or as a JSON array of them."
                 .to_string(),
         ),
         (
             "an empty payload",
             b"",
-            "The request payload holds no record to predict from: a record is a row of \
+            "The records hold nothing to predict from: a record is a row of \
              numeric feature values, as text/csv or as a JSON array of them."
                 .to_string(),
         ),

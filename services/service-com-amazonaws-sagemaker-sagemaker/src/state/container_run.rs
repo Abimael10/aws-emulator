@@ -94,14 +94,20 @@ pub const MAX_PROGRAM_WORD_BYTES: usize = 4 * 1024;
 /// What one container's program did, or the fact that nothing was performed for it.
 #[derive(Debug, Clone)]
 pub enum ContainerOutcome {
-    /// The declared program WAS performed: the status it exited with, and the tail of what it
-    /// wrote on standard error.
+    /// The declared program WAS performed: the status it exited with, the tail of what it
+    /// wrote on standard error, and the files it left in the container's own storage.
     Performed {
         /// The exit status of the program, as the session performed it.
         status: i32,
         /// The last line the program wrote on standard error, empty when it wrote none — the
         /// `<stderr tail>` [`algorithm_error`] reports.
         error_tail: String,
+        /// The files the program left in the container's storage, as `(path, contents)` in
+        /// path order. A job's outputs are READ out of these — the model artifacts the
+        /// container wrote to `/opt/ml/model` and the checkpoints it wrote to its checkpoint
+        /// directory — so what the job uploads is what its own program produced rather than
+        /// anything synthesised beside it.
+        files: Vec<(String, String)>,
     },
     /// NOTHING was performed for the container, and this is why. No status and no output are
     /// claimed, because none was produced.
@@ -129,9 +135,43 @@ impl ContainerOutcome {
     pub fn failure_reason(&self) -> Option<String> {
         match self {
             Self::Performed { status, .. } if *status == 0 => None,
-            Self::Performed { status, error_tail } => Some(algorithm_error(error_tail, *status)),
+            Self::Performed {
+                status, error_tail, ..
+            } => Some(algorithm_error(error_tail, *status)),
             Self::NotPerformed { reason } => Some(reason.clone()),
         }
+    }
+
+    /// The contents of the file the program left at `path`, when it left one there.
+    #[must_use]
+    pub fn file(&self, path: &str) -> Option<&str> {
+        match self {
+            Self::Performed { files, .. } => files
+                .iter()
+                .find(|(left, _)| left == path)
+                .map(|(_, contents)| contents.as_str()),
+            Self::NotPerformed { .. } => None,
+        }
+    }
+
+    /// The files the program left UNDER the directory `directory`, each as `(name, contents)`
+    /// with the directory's own prefix cut off, so the name is the one an archive of that
+    /// directory carries.
+    ///
+    /// Empty for a program nothing performed, which left no file at all.
+    #[must_use]
+    pub fn files_under(&self, directory: &str) -> Vec<(String, String)> {
+        let Self::Performed { files, .. } = self else {
+            return Vec::new();
+        };
+        let prefix = format!("{}/", directory.trim_end_matches('/'));
+        files
+            .iter()
+            .filter_map(|(path, contents)| {
+                let name = path.strip_prefix(&prefix)?;
+                (!name.is_empty()).then(|| (name.to_string(), contents.clone()))
+            })
+            .collect()
     }
 }
 
@@ -275,6 +315,14 @@ pub fn run_container_program(
     ContainerOutcome::Performed {
         status,
         error_tail: session.errors().last().cloned().unwrap_or_default(),
+        // What the program left in the container's storage, which is where a training job's
+        // own outputs are: the artifacts it wrote to the model directory and the checkpoints
+        // it wrote to its checkpoint directory.
+        files: session
+            .tree_files()
+            .into_iter()
+            .map(|(path, contents)| (path.to_string(), contents.to_string()))
+            .collect(),
     }
 }
 
@@ -342,7 +390,10 @@ mod tests {
         for (case, program, expected) in rows {
             let words: Vec<String> = program.iter().map(|word| (*word).to_string()).collect();
             let outcome = run_container_program(&words, IMAGE, None);
-            let ContainerOutcome::Performed { status, error_tail } = &outcome else {
+            let ContainerOutcome::Performed {
+                status, error_tail, ..
+            } = &outcome
+            else {
                 panic!("case {case:?}: expected the program to be performed, got {outcome:?}");
             };
             assert_eq!(
@@ -474,6 +525,64 @@ mod tests {
             outcome.failure_reason(),
             Some(algorithm_error("", 4)),
             "expected the status the environment selected, got {outcome:?}"
+        );
+    }
+
+    /// RULE: what the container's program left in the container's own storage is what the job
+    /// takes its outputs out of, read back under the directory it wrote them to.
+    ///
+    /// The rows differ along where the program wrote: the model directory, a nested path under
+    /// it, the checkpoint directory, and a path outside both.
+    #[test]
+    fn the_files_the_program_left_are_read_back_under_their_directory() {
+        let program: Vec<String> = [
+            "/bin/sh",
+            "-c",
+            "mkdir -p /opt/ml/model/nested && echo fitted > /opt/ml/model/artifact.txt && \
+             echo deep > /opt/ml/model/nested/part.bin && \
+             echo step > /opt/ml/checkpoints/state.json && echo other > /tmp/scratch",
+        ]
+        .iter()
+        .map(|word| (*word).to_string())
+        .collect();
+        let outcome = run_container_program(&program, IMAGE, None);
+        assert_eq!(
+            outcome.failure_reason(),
+            None,
+            "the program has to run to success for its files to be the job's output, got \
+             {outcome:?}"
+        );
+        // (case, the directory, the names it holds)
+        let rows: [(&str, &str, &[&str]); 3] = [
+            (
+                "the model directory",
+                crate::state::MODEL_DIRECTORY,
+                &["artifact.txt", "nested/part.bin"],
+            ),
+            (
+                "the checkpoint directory",
+                crate::state::DEFAULT_CHECKPOINT_DIRECTORY,
+                &["state.json"],
+            ),
+            ("a directory the program wrote nothing under", "/opt/ml/input", &[]),
+        ];
+        for (case, directory, expected) in rows {
+            let mut names: Vec<String> = outcome
+                .files_under(directory)
+                .into_iter()
+                .map(|(name, _)| name)
+                .collect();
+            names.sort();
+            assert_eq!(
+                names, expected,
+                "case {case:?}: expected {expected:?}, got {names:?}"
+            );
+        }
+        assert_eq!(
+            outcome.file("/opt/ml/model/artifact.txt").map(str::trim),
+            Some("fitted"),
+            "the file's contents are the ones the program wrote, got {:?}",
+            outcome.file("/opt/ml/model/artifact.txt")
         );
     }
 }

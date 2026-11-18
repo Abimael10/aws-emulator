@@ -130,6 +130,23 @@ impl<'uri> UnreadableLocation<'uri> {
     }
 }
 
+/// Which reading of a bucket's own policy a question takes, and whether it also asks IAM about
+/// the role's own grant.
+///
+/// The two readings are both stated in this module's docs and differ in exactly one decision,
+/// so they are one implementation parameterised here rather than two that can drift apart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReadAuthorization {
+    /// The bucket's policy has to ALLOW the read, and a policy that merely states nothing
+    /// withholds it: the reading the HOSTING creates take of an artifact, for the reason
+    /// [`bucket_policy_withholds_read`] gives.
+    PolicyMustAllow,
+    /// The bucket's policy refuses only what it EXPLICITLY DENIES, and otherwise the role's own
+    /// identity grant decides: IAM's rule for a read inside ONE account, which is the reading
+    /// the reads a JOB's work makes take ([`bucket_policy_denies_read`]).
+    PolicyMayNotDeny,
+}
+
 /// The FIRST of `locations` this emulator's own Amazon S3 answers the execution role cannot
 /// read, as the request wrote it, and WHY — and `None` when it answers that about none of
 /// them.
@@ -140,13 +157,50 @@ impl<'uri> UnreadableLocation<'uri> {
 /// the modelled `@pattern` on the member and asked nothing here.
 ///
 /// "Unreadable" is the pair of facts stated in this module's docs: the location names no
-/// object, or the bucket policy explicitly denies the role the read. Both are grounded in an
-/// ANSWER; neither is guessed.
+/// object, or the bucket policy withholds the role the read. Both are grounded in an ANSWER;
+/// neither is guessed.
 pub async fn first_unreadable_location<'uri>(
     ctx: &smithy_server_runtime::OperationContext<'_>,
     region: &str,
     role_arn: &str,
     locations: impl IntoIterator<Item = &'uri str>,
+) -> Option<UnreadableLocation<'uri>> {
+    first_unreadable_location_under(ctx, region, role_arn, locations, false).await
+}
+
+/// The FIRST of `locations` the execution role cannot read, asked as the HOSTING creates ask
+/// it: everything [`first_unreadable_location`] settles, and — because those creates validate
+/// the artifact SYNCHRONOUSLY, before the model is registered — whether the role's own
+/// identity-based policies grant it the read at all.
+///
+/// "Also ensure that the role has `s3:GetObject` permissions" is what SageMaker tells a caller
+/// whose model data it could not access, so the grant in force ON THE ROLE is part of the same
+/// question: a role whose policies allow it nothing on the object cannot read the artifact
+/// however open the bucket is. The grant is decided by IAM itself over the in-process hop
+/// ([`::service_common::iam_role::role_withholds_action`]), so the documents in force are
+/// collected and evaluated by the service that holds them, and only what IAM ANSWERED refuses —
+/// a role this account's IAM holds nothing under, or any failure of the hop, withholds nothing.
+///
+/// The grant is asked BEFORE the listing: a principal that may not read the object learns
+/// nothing about whether it is there, so "could not access" is what such a caller is told
+/// rather than "could not find".
+pub async fn first_unreadable_location_as_role<'uri>(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    role_arn: &str,
+    locations: impl IntoIterator<Item = &'uri str>,
+) -> Option<UnreadableLocation<'uri>> {
+    first_unreadable_location_under(ctx, region, role_arn, locations, true).await
+}
+
+/// The one walk both readings above take, which differs only in whether the ROLE's own grant
+/// is one of the questions ([`first_unreadable_location_as_role`]).
+async fn first_unreadable_location_under<'uri>(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    role_arn: &str,
+    locations: impl IntoIterator<Item = &'uri str>,
+    ask_the_roles_grant: bool,
 ) -> Option<UnreadableLocation<'uri>> {
     let partition = arn_partition(role_arn);
     let client = s3_client(ctx, region);
@@ -163,11 +217,137 @@ pub async fn first_unreadable_location<'uri>(
         if bucket_policy_withholds_read(&client, &location, role_arn, &partition).await {
             return Some(UnreadableLocation::Denied(uri));
         }
+        if ask_the_roles_grant
+            && ::service_common::iam_role::role_withholds_action(
+                ctx,
+                region,
+                role_arn,
+                GET_OBJECT_ACTION,
+                &location.object_arn(&partition),
+            )
+            .await
+        {
+            return Some(UnreadableLocation::Denied(uri));
+        }
         if location_holds_no_object(&client, &location).await {
             return Some(UnreadableLocation::NoObject(uri));
         }
     }
     None
+}
+
+/// Whether the read of the object `location` names, made AS `role_arn`, is one neither the
+/// bucket's own policy nor the role's identity-based policies allow.
+///
+/// The one question the work a job performs asks per OBJECT it reads: a prefix resolves to
+/// concrete keys only when it is read, so each key is authorized where it is reached rather
+/// than in advance. Both halves of the decision are the ones stated in this module's docs, in
+/// the form IAM's own rule gives them for a read inside ONE account
+/// ([`ReadAuthorization::PolicyMayNotDeny`]): the bucket's policy refuses what it EXPLICITLY
+/// DENIES, and otherwise the grant the role itself carries decides. Only what was ANSWERED
+/// withholds anything.
+pub async fn object_read_is_unauthorized(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    client: &::aws_sdk_s3::Client,
+    region: &str,
+    role_arn: &str,
+    partition: &str,
+    location: &S3Location,
+) -> bool {
+    if bucket_policy_denies_read(client, location, role_arn, partition).await {
+        return true;
+    }
+    ::service_common::iam_role::role_withholds_action(
+        ctx,
+        region,
+        role_arn,
+        GET_OBJECT_ACTION,
+        &location.object_arn(partition),
+    )
+    .await
+}
+
+/// Whether the policy on `location`'s bucket EXPLICITLY DENIES the read of the object
+/// `location` names to the SageMaker read made under the role `role_arn`.
+///
+/// The narrower half of [`bucket_policy_withholds_read`], for the reads a job's own WORK makes
+/// rather than the admission of a resource: within one account IAM's rule is that "the request
+/// is allowed if either an identity-based policy or a resource-based policy allows it", and an
+/// explicit `Deny` in either wins over every `Allow` ("Determining whether a request is allowed
+/// or denied within an account"). So a bucket whose policy says NOTHING about the role leaves
+/// the role's own identity grant standing — which is what a job reading a bucket of its own
+/// account relies on — while a statement that denies the read is an answer the work must obey.
+///
+/// `false` — deny nothing — for a bucket with no policy, a policy this emulator cannot read,
+/// and a policy that merely does not allow the read.
+pub async fn bucket_policy_denies_read(
+    client: &::aws_sdk_s3::Client,
+    location: &S3Location,
+    role_arn: &str,
+    partition: &str,
+) -> bool {
+    bucket_policy_refuses_read(
+        client,
+        location,
+        role_arn,
+        partition,
+        ReadAuthorization::PolicyMayNotDeny,
+    )
+    .await
+}
+
+/// The ONE evaluation of a bucket's policy both readings above take: the decision it reaches
+/// over the read of `location` as `role_arn`, judged by the rule `under` names.
+///
+/// Stated once so the two readings cannot drift apart in WHICH principals they offer the
+/// document, WHICH action and resource they ask about, or what a document this emulator could
+/// not read means — they differ only in which decision refuses.
+async fn bucket_policy_refuses_read(
+    client: &::aws_sdk_s3::Client,
+    location: &S3Location,
+    role_arn: &str,
+    partition: &str,
+    under: ReadAuthorization,
+) -> bool {
+    let Some(document) = bucket_policy_document(client, location).await else {
+        // No policy on the bucket, no bucket, or no Amazon S3 to ask: nothing withheld.
+        return false;
+    };
+    let mut principals = vec![role_arn.to_string(), SERVICE_PRINCIPAL.to_string()];
+    principals.extend(::service_common::iam_authorization::account_principals(
+        role_arn,
+    ));
+    let object_arn = location.object_arn(partition);
+    let request = ::service_common::iam_authorization::Request::new(
+        GET_OBJECT_ACTION,
+        &object_arn,
+        &principals,
+    );
+    let decision = ::service_common::iam_authorization::resource_decision(&document, &request);
+    match under {
+        ReadAuthorization::PolicyMustAllow => {
+            decision != ::service_common::iam_authorization::Decision::Allowed
+        }
+        ReadAuthorization::PolicyMayNotDeny => {
+            decision == ::service_common::iam_authorization::Decision::Denied
+        }
+    }
+}
+
+/// The policy document `location`'s bucket carries, and `None` for a bucket with no policy, no
+/// bucket, or no Amazon S3 to ask.
+async fn bucket_policy_document(
+    client: &::aws_sdk_s3::Client,
+    location: &S3Location,
+) -> Option<String> {
+    client
+        .get_bucket_policy()
+        .bucket(&location.bucket)
+        .send()
+        .await
+        .ok()?
+        .policy()
+        .map(str::to_string)
 }
 
 /// Whether Amazon S3 ANSWERED that `location` holds no object: a listing under the location's
@@ -243,30 +423,14 @@ pub async fn bucket_policy_withholds_read(
     role_arn: &str,
     partition: &str,
 ) -> bool {
-    let answered = client
-        .get_bucket_policy()
-        .bucket(&location.bucket)
-        .send()
-        .await;
-    let Ok(answered) = answered else {
-        // No policy on the bucket, no bucket, or no Amazon S3 to ask: nothing withheld.
-        return false;
-    };
-    let Some(document) = answered.policy() else {
-        return false;
-    };
-    let mut principals = vec![role_arn.to_string(), SERVICE_PRINCIPAL.to_string()];
-    principals.extend(::service_common::iam_authorization::account_principals(
+    bucket_policy_refuses_read(
+        client,
+        location,
         role_arn,
-    ));
-    let object_arn = location.object_arn(partition);
-    let request = ::service_common::iam_authorization::Request::new(
-        GET_OBJECT_ACTION,
-        &object_arn,
-        &principals,
-    );
-    ::service_common::iam_authorization::resource_decision(document, &request)
-        != ::service_common::iam_authorization::Decision::Allowed
+        partition,
+        ReadAuthorization::PolicyMustAllow,
+    )
+    .await
 }
 
 /// An Amazon S3 client over the in-process callback into this same emulator.

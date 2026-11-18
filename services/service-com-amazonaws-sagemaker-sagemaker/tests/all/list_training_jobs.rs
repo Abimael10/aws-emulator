@@ -149,6 +149,7 @@ fn job(name: &str, status: &str, created: u64, modified: u64) -> TrainingJob {
         // A seeded row's run produced nothing to publish, for the same reason it carries no
         // recorded run at all.
         pending_artifact: None,
+        pending_checkpoints: Vec::new(),
         entered: 1,
         tuning_job_arn: None,
         request: CreateTrainingJobInput::default(),

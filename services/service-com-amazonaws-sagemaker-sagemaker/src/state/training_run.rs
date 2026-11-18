@@ -25,24 +25,30 @@
 //! * a least-squares LINEAR model is fitted on them by batch gradient descent, bounded by
 //!   [`MAX_FIT_OPERATIONS`]: every number the run reports is measured from the caller's
 //!   data;
-//! * the fitted model is serialized as the gzip-compressed tar `model.tar.gz` ("a SageMaker
-//!   container stores your trained model artifacts in the /opt/ml/model directory. After
-//!   training has completed, by default, these artifacts are uploaded to your Amazon S3
-//!   bucket as compressed files" — `ModelArtifacts`), to be PUBLISHED under
-//!   `<S3OutputPath>/<TrainingJobName>/output/` at the stage of the work that uploads it
-//!   ([`super::training_artifact`]), so the object the describe names is an object Amazon S3
-//!   itself holds from that stage on;
-//! * the root-mean-square error of the fitted model is measured over each channel and
-//!   reported as the run's final metrics.
+//! * the model artifact is the gzip-compressed tar of what the job's CONTAINER left in
+//!   `/opt/ml/model` ("a SageMaker container stores your trained model artifacts in the
+//!   /opt/ml/model directory. After training has completed, by default, these artifacts are
+//!   uploaded to your Amazon S3 bucket as compressed files" — `ModelArtifacts`): the files a
+//!   declared program wrote there, and otherwise the fitted model under the file name the
+//!   ALGORITHM's container writes its model as ([`super::training_algorithm`]). It is
+//!   PUBLISHED under `<S3OutputPath>/<TrainingJobName>/output/` once the stage of the work
+//!   that uploads it is over ([`super::training_artifact`]), so the object the describe names
+//!   is an object Amazon S3 itself holds from then on;
+//! * the checkpoints a job that asked for them gets are the files the container left in its
+//!   checkpoint directory, written to `CheckpointConfig.S3Uri`, and otherwise the state the
+//!   fit reached;
+//! * the error of the fitted model is measured over each channel and reported as the run's
+//!   final metrics, named per channel and per the metric the algorithm's learning task is
+//!   evaluated by ([`super::TrainingAlgorithm`]).
 //!
-//! The metric a run reports is therefore the one THIS fit measured, named for the channel it
-//! was measured over (`<channel>:rmse`). Nothing here runs the algorithm image the
-//! `AlgorithmSpecification` names, so the run emits neither a built-in algorithm's own metric
-//! names nor the `MetricDefinitions` a custom image's log lines would be scraped for, and the
-//! `HyperParameters` the request carried are reported as the job's own (and recorded in the
-//! artifact) rather than steering the fit. A caller that branches on a particular metric NAME
-//! will not find it; one that reads `FinalMetricDataList` finds a value that was genuinely
-//! measured over the data it supplied.
+//! The metric a run reports is therefore the one THIS fit measured, named the way the
+//! algorithm the job's `AlgorithmSpecification` identifies names it
+//! ([`super::training_algorithm`]). Nothing here runs the algorithm IMAGE, so the
+//! `MetricDefinitions` a custom image's log lines would be scraped for are not scraped, and
+//! the `HyperParameters` the request carried steer only which metric the run is evaluated by
+//! (and are recorded in the artifact) rather than the fit itself. A caller that reads
+//! `FinalMetricDataList` finds the names its algorithm emits, carrying values that were
+//! genuinely measured over the data it supplied.
 //!
 //! The run is the JOB's own work, so what it could not do is the job's modelled `Failed`
 //! status with the `FailureReason` naming the condition that failed — never a refusal of the
@@ -65,8 +71,8 @@
 //! the `SecondaryStatus` phases it reached ([`TrainingRunOutcome::phases`]) and the clock
 //! reveals them from the instant the run reported ([`super::TrainingJob::record_run`],
 //! [`super::TrainingJob::settle_status`]), so a caller polling the job sees the data come
-//! down, the fit run and the artifact go up before the terminal status \u2014 and the artifact
-//! appears in Amazon S3 at the stage that uploads it and not before
+//! down, the fit run and the artifact go up before the terminal status — and the artifact
+//! appears in Amazon S3 once the stage that uploads it is over and never before
 //! ([`super::training_artifact`]).
 //!
 //! # The job runs AS the execution role
@@ -165,6 +171,10 @@ pub enum TrainingRunOutcome {
         /// holds it ([`super::TrainingJob::record_run`]), so an outcome stored on a job
         /// carries none and nothing holds the bytes twice.
         artifact: Option<super::PendingArtifact>,
+        /// The checkpoint objects the run produced for `CheckpointConfig.S3Uri`, waiting for
+        /// the TRAINING stage that publishes them, and empty for a job that asked for none.
+        /// Taken out of the outcome the same way the artifact is.
+        checkpoints: Vec<super::PendingArtifact>,
     },
     /// The run did not finish, and this is the condition that stopped it — the job's
     /// `FailureReason`.
@@ -372,36 +382,59 @@ pub async fn absent_input_objects(
         let Some(location) = S3Location::parse(&source.s3_uri) else {
             continue;
         };
-        let refusal = || {
+        let refusal = |s3_error: Option<&str>| {
             crate::state::no_s3_objects_found(
                 &source.s3_uri,
                 region,
                 &request.role_arn,
                 &location.bucket,
+                s3_error,
             )
         };
+        let bucket_arn = location.bucket_arn(&partition);
         if ::service_common::iam_role::role_withholds_action(
             ctx,
             region,
             &request.role_arn,
             LIST_BUCKET_ACTION,
-            &location.bucket_arn(&partition),
+            &bucket_arn,
         )
         .await
         {
-            return Some(refusal());
+            // The listing was refused by AUTHORIZATION, so what Amazon S3 ANSWERED about it is
+            // part of what the caller is told: the two conditions this one sentence covers are
+            // told apart by that clause (see [`crate::state::no_s3_objects_found`]). WHICH of
+            // IAM's rules withheld it is part of the answer too — a statement that denies the
+            // listing is a different fact from no statement allowing it — so the narrower
+            // reading is asked only once the wider one has answered, and the clause follows it.
+            let reason = if ::service_common::iam_role::role_denies_action(
+                ctx,
+                region,
+                &request.role_arn,
+                LIST_BUCKET_ACTION,
+                &bucket_arn,
+            )
+            .await
+            {
+                ::service_common::iam_authorization::IDENTITY_POLICY_EXPLICIT_DENY.to_string()
+            } else {
+                ::service_common::iam_authorization::no_identity_policy_allows(LIST_BUCKET_ACTION)
+            };
+            return Some(refusal(Some(&crate::state::s3_listing_refusal(
+                &request.role_arn,
+                &bucket_arn,
+                &partition,
+                &reason,
+            ))));
         }
-        let listed = client
-            .list_objects_v2()
-            .bucket(&location.bucket)
-            .prefix(&location.key)
-            .max_keys(1)
-            .send()
-            .await;
-        // A listing that ANSWERED, with no object under the prefix, is the refusal; one that
-        // could not be made says nothing (see the doc above).
-        if listed.is_ok_and(|listed| listed.contents().is_empty()) {
-            return Some(refusal());
+        // A listing that ANSWERED, with no object under the prefix, is the refusal, and so is
+        // an answer that NAMES the absence of the bucket or the key itself; one that could not
+        // be made at all says nothing (see the doc above). The reading is the one this service
+        // takes of every Amazon S3 location ([`super::location_holds_no_object`]). Amazon S3
+        // refused nothing in that case, so the refusal carries no clause about an
+        // authorization failure.
+        if super::s3_access::location_holds_no_object(&client, &location).await {
+            return Some(refusal(None));
         }
     }
     None
@@ -495,6 +528,10 @@ pub async fn run_training_job(
     // the run performs over the records it read.
     phases.push(TRAINING_SECONDARY_STATUS_TRAINING.to_string());
 
+    // The ALGORITHM the job names, which decides the file its container writes the model into
+    // and the metric it emits per channel (see [`super::training_algorithm`]).
+    let algorithm = super::TrainingAlgorithm::of(request);
+
     // The program the request DECLARED for the algorithm container, when it declared one:
     // `AlgorithmSpecification$ContainerEntrypoint` "takes precedence over the default train
     // processing instructions", so that argument vector is what the container runs and the
@@ -504,6 +541,7 @@ pub async fn run_training_job(
     // zero leaves the default train instructions — performed below — to produce the artifact
     // `ModelArtifacts` promises, and a request declaring no program runs those instructions
     // alone.
+    let mut container: Option<crate::state::ContainerOutcome> = None;
     if let Some(specification) = request.algorithm_specification.as_ref() {
         let program = crate::state::container_program(
             specification.container_entrypoint.as_deref(),
@@ -531,6 +569,7 @@ pub async fn run_training_job(
                     if let Some(reason) = outcome.failure_reason() {
                         return TrainingRunOutcome::failed_in(phases, reason);
                     }
+                    container = Some(outcome);
                 }
                 None => {
                     return TrainingRunOutcome::failed_in(
@@ -556,13 +595,18 @@ pub async fn run_training_job(
         let model = fit(&fitted_on, fit_epochs(fitted_on.len(), columns));
         let metrics: Vec<MetricData> = measured
             .iter()
-            .map(|(name, records)| MetricData {
-                // The metric name SageMaker's built-in regression algorithms emit for the
-                // error they measure over a channel: the channel's own name, then the
-                // metric.
-                metric_name: Some(format!("{name}:rmse")),
-                value: Some(model.rmse(records) as f32),
-                timestamp: Some(measured_at),
+            .filter_map(|(name, records)| {
+                // The metric the ALGORITHM emits for this channel: the channel's own name,
+                // then the metric its learning task is evaluated by, with the value MEASURED
+                // over that channel's own records (see [`super::training_algorithm`]). A job
+                // whose requested metric nothing here measures emits none, rather than a
+                // number no measurement produced.
+                let metric = algorithm.metric?;
+                Some(MetricData {
+                    metric_name: algorithm.channel_metric_name(name),
+                    value: Some(metric.measure(&model, records) as f32),
+                    timestamp: Some(measured_at),
+                })
             })
             .collect();
         (model, metrics)
@@ -572,15 +616,62 @@ pub async fn run_training_job(
         return TrainingRunOutcome::failed_in(phases, crate::state::INTERNAL_FAILURE_REASON);
     };
 
+    // "CheckpointConfig - Contains information about the output location for managed spot
+    // training checkpoint data": the checkpoints the container wrote to its checkpoint
+    // directory go to that location, and they go there at the TRAINING stage rather than with
+    // the model artifacts. A job that asked for none has none to write.
+    let checkpoints = match checkpoint_objects(request, &model, &algorithm, container.as_ref()) {
+        Ok(checkpoints) => checkpoints,
+        Err(reason) => return TrainingRunOutcome::failed_in(phases, reason),
+    };
+    for checkpoint in &checkpoints {
+        if ::service_common::iam_role::role_withholds_action(
+            ctx,
+            region,
+            &request.role_arn,
+            PUT_OBJECT_ACTION,
+            &checkpoint.location.object_arn(&partition),
+        )
+        .await
+        {
+            return TrainingRunOutcome::failed_in(
+                phases,
+                checkpoint_upload_failed(&checkpoint.location.uri(), &access_denied_detail()),
+            );
+        }
+    }
+
     // "Uploading - Training is complete and the model artifacts are being uploaded to the S3
     // location" (`DescribeTrainingJob$SecondaryStatus`).
     phases.push(TRAINING_SECONDARY_STATUS_UPLOADING.to_string());
     let artifact = artifact_location(&output, job_name);
     let document = model_document(job_name, request, &model, &channels, &final_metrics);
-    let Ok(archive) = model_archive(&document) else {
+    // What the archive holds is what the container left in `/opt/ml/model`: the files the
+    // job's own program wrote when it wrote any, and otherwise the model the default train
+    // instructions fitted, under the file name the algorithm's container writes it as (see
+    // [`super::training_algorithm`]).
+    let written = container
+        .as_ref()
+        .map(|outcome| outcome.files_under(super::MODEL_DIRECTORY))
+        .unwrap_or_default();
+    let entries: Vec<(String, Vec<u8>)> = if written.is_empty() {
+        let Ok(body) = ::serde_json::to_vec_pretty(&document) else {
+            return TrainingRunOutcome::failed_in(
+                phases,
+                model_upload_failed(&artifact.uri(), ARCHIVE_NOT_BUILT),
+            );
+        };
+        vec![(algorithm.model_file().to_string(), body)]
+    } else {
+        written
+            .into_iter()
+            .map(|(name, contents)| (name, contents.into_bytes()))
+            .collect()
+    };
+    let Ok(archive) = model_archive(&entries) else {
         return TrainingRunOutcome::failed_in(
             phases,
-            model_upload_failed(&artifact.uri(), "the model archive could not be built"),
+            model_upload_failed(&artifact.uri(), ARCHIVE_NOT_BUILT),
         );
     };
     if ::service_common::iam_role::role_withholds_action(
@@ -610,7 +701,88 @@ pub async fn run_training_job(
             location: artifact,
             archive,
         }),
+        checkpoints,
     }
+}
+
+/// What [`model_upload_failed`] carries for an archive this run could not build at all.
+const ARCHIVE_NOT_BUILT: &str = " the model archive could not be built";
+
+/// How SageMaker words a run whose checkpoints could not be written: the leg that failed and
+/// what failed on it, in the `ClientError:` class a failure of the caller's own configuration
+/// carries.
+#[must_use]
+pub fn checkpoint_upload_failed(uri: &str, detail: &str) -> String {
+    format!("ClientError: Checkpoint upload failed:{detail} for {uri}")
+}
+
+/// The objects this job's checkpoints go to, and none at all for a job that asked for none.
+///
+/// "CheckpointConfig$S3Uri - Identifies the S3 path where you want SageMaker to store
+/// checkpoints", written from `LocalPath` ("the local directory where checkpoints are
+/// written. The default directory is /opt/ml/checkpoints/"). So the objects are the files the
+/// container left in that directory; a job whose own program wrote none — the default train
+/// instructions — checkpoints the model the fit reached, under the same file name the
+/// algorithm's container writes its model as, because a checkpoint is the model's own state at
+/// that point of the run.
+///
+/// `Err` is the job's `FailureReason`: a checkpoint location that names no bucket is a
+/// configuration nothing can be written to.
+fn checkpoint_objects(
+    request: &CreateTrainingJobInput,
+    model: &LinearModel,
+    algorithm: &super::TrainingAlgorithm,
+    container: Option<&crate::state::ContainerOutcome>,
+) -> Result<Vec<super::PendingArtifact>, String> {
+    let Some(config) = request.checkpoint_config.as_ref() else {
+        return Ok(Vec::new());
+    };
+    let Some(location) = S3Location::parse(&config.s3_uri) else {
+        return Err(checkpoint_upload_failed(
+            &config.s3_uri,
+            " the checkpoint location names no Amazon S3 bucket",
+        ));
+    };
+    let directory = config
+        .local_path
+        .as_deref()
+        .filter(|path| !path.is_empty())
+        .unwrap_or(super::DEFAULT_CHECKPOINT_DIRECTORY);
+    let mut written: Vec<(String, Vec<u8>)> = container
+        .map(|outcome| outcome.files_under(directory))
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(name, contents)| (name, contents.into_bytes()))
+        .collect();
+    if written.is_empty() {
+        let document = ::serde_json::json!({
+            "model": {
+                "type": "linear",
+                "intercept": model.intercept,
+                "weights": model.weights,
+                "epochs": model.epochs,
+            },
+        });
+        let body = ::serde_json::to_vec_pretty(&document).map_err(|_| {
+            checkpoint_upload_failed(&location.uri(), " the checkpoint could not be built")
+        })?;
+        written.push((algorithm.model_file().to_string(), body));
+    }
+    let prefix = location.key.trim_end_matches('/');
+    Ok(written
+        .into_iter()
+        .map(|(name, archive)| super::PendingArtifact {
+            location: S3Location {
+                bucket: location.bucket.clone(),
+                key: if prefix.is_empty() {
+                    name
+                } else {
+                    format!("{prefix}/{name}")
+                },
+            },
+            archive,
+        })
+        .collect())
 }
 
 /// Where a finished run writes the model artifact: under the output location the request
@@ -668,15 +840,12 @@ pub async fn read_channel(
         return Err(data_download_failed(name, &location.uri(), NO_OBJECT_DETAIL));
     }
     for object in objects {
-        if ::service_common::iam_role::role_withholds_action(
-            ctx,
-            region,
-            role_arn,
-            GET_OBJECT_ACTION,
-            &object.object_arn(partition),
-        )
-        .await
-        {
+        // The read is authorized against BOTH the policy on the object's bucket and the grant
+        // in force on the execution role: a bucket policy that explicitly denies the role is
+        // what stops the read whatever the role's own policies allow (see
+        // [`super::s3_access`]), so a job whose input bucket fences the role off reads nothing
+        // and fails here rather than completing over data it never saw.
+        if object_read_is_unauthorized(ctx, client, region, role_arn, partition, &object).await {
             return Err(data_download_failed(
                 name,
                 &object.uri(),
@@ -720,15 +889,7 @@ async fn channel_objects(
     location: &S3Location,
 ) -> Result<Vec<S3Location>, String> {
     if s3_data_type == MANIFEST_FILE {
-        if ::service_common::iam_role::role_withholds_action(
-            ctx,
-            region,
-            role_arn,
-            GET_OBJECT_ACTION,
-            &location.object_arn(partition),
-        )
-        .await
-        {
+        if object_read_is_unauthorized(ctx, client, region, role_arn, partition, location).await {
             return Err(data_download_failed(
                 channel,
                 &location.uri(),
@@ -775,7 +936,7 @@ async fn channel_objects(
 /// The prefix element is itself an `s3://` URI, so each object answered here is an object of
 /// THAT URI's bucket; a manifest that names no prefix leaves the objects in the manifest's own
 /// bucket (`held_in`), which is where a suffix with nothing in front of it resolves.
-fn manifest_objects(bytes: &[u8], held_in: &S3Location) -> Vec<S3Location> {
+pub fn manifest_objects(bytes: &[u8], held_in: &S3Location) -> Vec<S3Location> {
     let Ok(::serde_json::Value::Array(elements)) = ::serde_json::from_slice(bytes) else {
         return Vec::new();
     };
@@ -1068,24 +1229,28 @@ fn model_document(
     })
 }
 
-/// The `model.tar.gz` bytes for `document`: a gzip-compressed tar holding the single
-/// [`MODEL_ARCHIVE_ENTRY`] file, which is the form `ModelArtifacts` documents ("uploaded to
-/// your Amazon S3 bucket as compressed files").
-pub fn model_archive(document: &::serde_json::Value) -> ::std::io::Result<Vec<u8>> {
+/// The `model.tar.gz` bytes for `entries`: a gzip-compressed tar holding one file per entry,
+/// which is the form `ModelArtifacts` documents ("uploaded to your Amazon S3 bucket as
+/// compressed files").
+///
+/// The entries are the files the container left in its model directory, so the archive holds
+/// exactly what the job produced and nothing beside it.
+pub fn model_archive(entries: &[(String, Vec<u8>)]) -> ::std::io::Result<Vec<u8>> {
     use ::std::io::Write;
 
-    let body = ::serde_json::to_vec_pretty(document)?;
     let encoder = ::flate2::write::GzEncoder::new(Vec::new(), ::flate2::Compression::default());
     let mut archive = ::tar::Builder::new(encoder);
-    let mut header = ::tar::Header::new_gnu();
-    header.set_path(MODEL_ARCHIVE_ENTRY)?;
-    header.set_size(body.len() as u64);
-    header.set_mode(0o644);
-    // The archive is a function of the fitted model alone: nothing about the machine or the
-    // moment it was built takes part, so one model serializes to one archive.
-    header.set_mtime(0);
-    header.set_cksum();
-    archive.append(&header, body.as_slice())?;
+    for (name, body) in entries {
+        let mut header = ::tar::Header::new_gnu();
+        header.set_path(name)?;
+        header.set_size(body.len() as u64);
+        header.set_mode(0o644);
+        // The archive is a function of what the run produced: nothing about the machine or the
+        // moment it was built takes part, so one set of files serializes to one archive.
+        header.set_mtime(0);
+        header.set_cksum();
+        archive.append(&header, body.as_slice())?;
+    }
     let mut encoder = archive.into_inner()?;
     encoder.flush()?;
     encoder.finish()
@@ -1112,6 +1277,12 @@ pub const MAX_INFLATED_ARCHIVE_BYTES: u64 = 4 * 1024 * 1024;
 /// deciding again how the archive is laid out. `None` for bytes that are not an archive this
 /// emulator's own run produced — nothing is guessed for them.
 ///
+/// Every entry is examined rather than one name assumed: the file an algorithm's container
+/// writes its model as is the ALGORITHM's ([`super::training_algorithm`]), so the model is
+/// found by what the entry CARRIES and not by what it is called. The walk is bounded by
+/// [`super::MAX_ARTIFACT_ENTRIES`], the same ceiling every other reading of a caller's archive
+/// takes.
+///
 /// The bytes are a caller's own object, so the DECOMPRESSED side is bounded as explicitly as
 /// the download was: see [`MAX_INFLATED_ARCHIVE_BYTES`].
 #[must_use]
@@ -1122,22 +1293,22 @@ pub fn model_from_archive(bytes: &[u8]) -> Option<LinearModel> {
     // entries it declares and however large each says it is — can inflate past it.
     let decoder = ::flate2::read::GzDecoder::new(bytes).take(MAX_INFLATED_ARCHIVE_BYTES);
     let mut archive = ::tar::Archive::new(decoder);
-    let mut document: Option<::serde_json::Value> = None;
-    for entry in archive.entries().ok()? {
-        let entry = entry.ok()?;
-        let named = entry
-            .path()
-            .ok()
-            .is_some_and(|path| path.as_os_str() == MODEL_ARCHIVE_ENTRY);
-        if !named {
-            continue;
-        }
+    for entry in archive.entries().ok()?.take(super::MAX_ARTIFACT_ENTRIES) {
+        let Ok(entry) = entry else { continue };
         // And the one entry the reading wants is cut off at the same budget, so the parse
         // that consumes it cannot be fed more than that either.
-        document = ::serde_json::from_reader(entry.take(MAX_INFLATED_ARCHIVE_BYTES)).ok();
-        break;
+        let document: Option<::serde_json::Value> =
+            ::serde_json::from_reader(entry.take(MAX_INFLATED_ARCHIVE_BYTES)).ok();
+        if let Some(model) = document.and_then(fitted_model_in) {
+            return Some(model);
+        }
     }
-    let model = document?.get("model")?.clone();
+    None
+}
+
+/// The fitted model `document` carries, and `None` for a document that carries none.
+fn fitted_model_in(document: ::serde_json::Value) -> Option<LinearModel> {
+    let model = document.get("model")?;
     let weights: Vec<f64> = model
         .get("weights")?
         .as_array()?

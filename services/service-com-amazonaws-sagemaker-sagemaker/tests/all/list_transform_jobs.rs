@@ -30,7 +30,6 @@ use std::time::{Duration, SystemTime};
 use serde_json::{json, Value};
 use service_com_amazonaws_sagemaker_sagemaker::state::{
     ComAmazonawsSagemakerSagemakerState, TransformJob, MAX_PAGE_SIZE, TRANSFORM_JOB_SETTLES_AFTER,
-    TRANSFORM_NOT_RUN_FAILURE,
 };
 
 use super::inference_deployment_lifecycle::{error_code, str_field, Emulator, ACCOUNT};
@@ -120,7 +119,8 @@ fn job(name: &str, status: &str, created: u64, modified: u64) -> TransformJob {
         arn: transform_job_arn(name),
         model_name: "fixture-model".to_string(),
         status: status.to_string(),
-        failure_reason: (status == "Failed").then(|| TRANSFORM_NOT_RUN_FAILURE.to_string()),
+        failure_reason: (status == "Failed")
+            .then(|| "ClientError: Data download failed: AccessDenied".to_string()),
         max_concurrent_transforms: 1,
         model_client_config: None,
         max_payload_in_mb: 6,
@@ -135,12 +135,14 @@ fn job(name: &str, status: &str, created: u64, modified: u64) -> TransformJob {
         tags: Vec::new(),
         creation_time: at(created),
         last_modified_time: at(modified),
+        transform_start_time: terminal.then(|| at(created)),
         transform_end_time: terminal.then(|| at(modified)),
         ends_at: if terminal {
             at(modified)
         } else {
             SystemTime::now() + Duration::from_secs(3600)
         },
+        run: None,
     }
 }
 
@@ -551,7 +553,8 @@ async fn summaries_project_every_stored_member_of_each_listed_job() {
         );
         assert_eq!(
             summary.get("FailureReason").and_then(Value::as_str),
-            (status == "Failed").then_some(TRANSFORM_NOT_RUN_FAILURE),
+            (status == "Failed")
+                .then_some("ClientError: Data download failed: AccessDenied"),
             "case {case}: FailureReason must be present exactly where the job failed, \
              got {summary:?}"
         );

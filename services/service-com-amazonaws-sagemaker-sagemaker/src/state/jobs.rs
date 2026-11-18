@@ -231,6 +231,11 @@ pub struct TrainingJob {
     /// ([`crate::state::training_artifact`]). `None` for a run that produced none, once the
     /// object has been written, and for a job whose run the caller abandoned.
     pub pending_artifact: Option<crate::state::PendingArtifact>,
+    /// The checkpoint objects this job's run produced for `CheckpointConfig.S3Uri`, held
+    /// until the TRAINING stage that publishes them falls due and taken by the publication
+    /// that writes them. Empty for a job that asked for no checkpoints, once they have been
+    /// written, and for a job whose run the caller abandoned.
+    pub pending_checkpoints: Vec<crate::state::PendingArtifact>,
     /// How many of [`Self::phases`] the clock has already materialised — at least the
     /// `Starting` the job was accepted in, so a read never reports a stage that is not due
     /// yet and never un-reports one that is.
@@ -310,6 +315,7 @@ impl TrainingJob {
             }],
             // Filled in by the job's run too: nothing has been produced to publish yet.
             pending_artifact: None,
+            pending_checkpoints: Vec::new(),
             entered: 1,
             tuning_job_arn,
             tags: request.tags.clone().unwrap_or_default(),
@@ -483,24 +489,48 @@ impl TrainingJob {
             // What the run produced is held here until the stage that uploads it falls due;
             // a job the caller has already asked to stop holds nothing, because that stop
             // abandons the run.
-            if let crate::state::TrainingRunOutcome::Completed { artifact, .. } = &mut outcome {
+            if let crate::state::TrainingRunOutcome::Completed {
+                artifact,
+                checkpoints,
+                ..
+            } = &mut outcome
+            {
                 self.pending_artifact = artifact.take();
+                self.pending_checkpoints = ::std::mem::take(checkpoints);
             }
         }
         self.run = Some(outcome);
     }
 
     /// When the clock owes this job's artifact its appearance in Amazon S3: the instant the
-    /// job enters the stage that uploads it, and `None` for a job with no such stage.
+    /// job's work ENDS, for a job whose work has the stage that uploads it.
     ///
     /// "Uploading - Training is complete and the model artifacts are being uploaded to the S3
-    /// location" (`DescribeTrainingJob$SecondaryStatus`), so the object appears there and not
-    /// at an earlier stage.
+    /// location" (`DescribeTrainingJob$SecondaryStatus`): the upload is what that stage DOES,
+    /// so the object it leaves is there once the stage is over — which is the end of the job's
+    /// work. A client that polls `SecondaryStatus` to decide when the artifact exists
+    /// therefore never finds it before the job reported the stage that writes it, however
+    /// coarsely it polls; a job with no such stage uploaded nothing.
     #[must_use]
     pub fn artifact_due_at(&self) -> Option<SystemTime> {
+        self.phase_due_at(TRAINING_SECONDARY_STATUS_UPLOADING)
+            .map(|_| self.ends_at)
+    }
+
+    /// When the clock owes this job's checkpoints their appearance in Amazon S3: the instant
+    /// the job enters the stage that TRAINS, which is the stage a container writes its
+    /// checkpoints during (`CheckpointConfig`), and `None` for a job with no such stage.
+    #[must_use]
+    pub fn checkpoints_due_at(&self) -> Option<SystemTime> {
+        self.phase_due_at(TRAINING_SECONDARY_STATUS_TRAINING)
+    }
+
+    /// When the clock owes this job the stage `status`, and `None` for a job that has no such
+    /// stage in its work.
+    fn phase_due_at(&self, status: &str) -> Option<SystemTime> {
         self.phases
             .iter()
-            .find(|phase| phase.status == TRAINING_SECONDARY_STATUS_UPLOADING)
+            .find(|phase| phase.status == status)
             .map(|phase| phase.starts_at)
     }
 
@@ -515,6 +545,19 @@ impl TrainingJob {
             return None;
         }
         self.pending_artifact.take()
+    }
+
+    /// Take the held checkpoints once the stage that publishes them is due, so the caller can
+    /// write them ([`crate::state::publish_due_artifact`]).
+    ///
+    /// The same rule the artifact is claimed under: taking them is what makes the publication
+    /// happen exactly once, nothing is taken before the stage is due, and nothing at all for a
+    /// job whose run the caller abandoned.
+    pub fn claim_due_checkpoints(&mut self, now: SystemTime) -> Vec<crate::state::PendingArtifact> {
+        if self.checkpoints_due_at().is_none_or(|due| now < due) {
+            return Vec::new();
+        }
+        ::std::mem::take(&mut self.pending_checkpoints)
     }
 
     /// Record that the upload leg of this job's work failed, which is the job's own
@@ -570,6 +613,7 @@ impl TrainingJob {
         self.failure_reason = None;
         self.training_end_time = None;
         self.pending_artifact = None;
+        self.pending_checkpoints = Vec::new();
         self.last_modified_time = now;
         self.ends_at = now + TRAINING_JOB_STOPS_AFTER;
     }
@@ -1211,6 +1255,7 @@ mod tests {
                 starts_at: created,
             }],
             pending_artifact: None,
+            pending_checkpoints: Vec::new(),
             entered: 1,
             tuning_job_arn: None,
             request: crate::ops::types::CreateTrainingJobInput::default(),
@@ -1266,6 +1311,7 @@ mod tests {
                         final_metrics: Vec::new(),
                         phases: Vec::new(),
                         artifact: None,
+                        checkpoints: Vec::new(),
                     }
                 } else {
                     crate::state::TrainingRunOutcome::failed("ClientError: the probe's reason")
@@ -1306,6 +1352,7 @@ mod tests {
                 final_metrics: Vec::new(),
                 phases: Vec::new(),
                 artifact: None,
+                checkpoints: Vec::new(),
             },
             reported_at,
         );
@@ -1387,6 +1434,7 @@ mod tests {
                     final_metrics: Vec::new(),
                     phases: reached.clone(),
                     artifact: None,
+                    checkpoints: Vec::new(),
                 },
                 reported_at,
             );
@@ -1499,6 +1547,7 @@ mod tests {
                         },
                         archive: vec![1, 2, 3],
                     }),
+                    checkpoints: Vec::new(),
                 },
                 reported_at,
             );
@@ -1507,9 +1556,9 @@ mod tests {
                 .expect("a run that produced an artifact has a stage that uploads it");
             assert_eq!(
                 due,
-                stage_due_after(reported_at, TRAINING_JOB_PHASE_SPAN, reached.len() - 1),
-                "case {case:?}: expected the artifact owed at the stage that uploads it, \
-                 got {due:?}"
+                stage_due_after(reported_at, TRAINING_JOB_PHASE_SPAN, reached.len()),
+                "case {case:?}: expected the artifact owed once the stage that uploads it is \
+                 over, got {due:?}"
             );
             if stopped {
                 job.request_stop(reported_at);

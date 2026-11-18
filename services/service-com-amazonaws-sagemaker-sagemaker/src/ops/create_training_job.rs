@@ -25,7 +25,9 @@
 //! The run is this emulator's own ([`crate::state::run_training_job`]): it reads the
 //! training data the request's channels name out of Amazon S3 under the execution role,
 //! fits a model on those records, builds the model artifact for
-//! `OutputDataConfig.S3OutputPath` and measures the error it reports. It is performed HERE,
+//! `OutputDataConfig.S3OutputPath` out of what the job's CONTAINER left in `/opt/ml/model`
+//! and measures the error it reports, named per channel and per the metric the algorithm's
+//! learning task is evaluated by ([`crate::state::TrainingAlgorithm`]). It is performed HERE,
 //! before this handler answers, and its outcome is RECORDED on the stored job rather than
 //! revealed: the terminal status is owed by the clock, which
 //! [`crate::state::TrainingJob::settle_status`] materialises, so a caller that describes the
@@ -39,12 +41,13 @@
 //! clock materialises them in order ([`crate::state::TrainingJob::settle_status`]), so a
 //! caller polling the job observes `Downloading`, `Training` and `Uploading` before the
 //! terminal status, and `SecondaryStatusTransitions` reports every stage the job was in. The
-//! artifact the run built appears under the output location at the stage that UPLOADS it,
-//! which this call arms for the instant the clock owes it
-//! ([`crate::state::publish_when_due`]), so a client that polls `SecondaryStatus` to decide
-//! when the artifact exists never finds it before the job says so. A job whose
-//! `StoppingCondition.MaxRuntimeInSeconds` falls inside the span of its work is ended at that
-//! cap instead, with the `Stopped`/`MaxRuntimeExceeded` pair the model groups together.
+//! artifact the run built appears under the output location once the stage that UPLOADS it is
+//! over, and the checkpoints it produced from the stage that TRAINS, which this call arms for
+//! the instants the clock owes them ([`crate::state::publish_when_due`]), so a client that
+//! polls `SecondaryStatus` to decide when the artifact exists never finds it before the job
+//! says so. A job whose `StoppingCondition.MaxRuntimeInSeconds` falls inside the span of its
+//! work is ended at that cap instead, with the `Stopped`/`MaxRuntimeExceeded` pair the model
+//! groups together.
 //!
 //! ## Shape of an operation
 //!
@@ -671,12 +674,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // same held archive a read claims, so whichever gets there first writes it once.
         let due_at = {
             let store = state.lock();
-            store
-                .training_jobs
-                .get(&input.training_job_name)
-                .and_then(crate::state::TrainingJob::artifact_due_at)
+            let job = store.training_jobs.get(&input.training_job_name);
+            [
+                job.and_then(crate::state::TrainingJob::checkpoints_due_at),
+                job.and_then(crate::state::TrainingJob::artifact_due_at),
+            ]
         };
-        if let Some(due_at) = due_at {
+        for due_at in due_at.into_iter().flatten() {
             crate::state::publish_when_due(
                 ::std::sync::Arc::clone(&self.engine),
                 ctx.callback().clone(),

@@ -233,11 +233,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             creation_time: crate::state::timestamp(job.creation_time),
             // "Indicates when the transform job starts on ML compute instances. You are
             // billed for the time interval between this time and the value of
-            // TransformEndTime" (`TransformStartTime`'s model doc). This emulator starts
-            // no ML compute instance and bills no interval, so there is no start time to
-            // report; `TransformEndTime` is the instant the job reached its terminal
-            // status, which the clock did make happen.
-            transform_start_time: None,
+            // TransformEndTime" (`TransformStartTime`'s model doc): the job's own work
+            // begins once the job is accepted, which is the instant the clock records when
+            // it settles the job; `TransformEndTime` is the instant it reached its terminal
+            // status.
+            transform_start_time: job.transform_start_time.map(crate::state::timestamp),
             transform_end_time: job.transform_end_time.map(crate::state::timestamp),
             // This slice of SageMaker runs neither Ground Truth labeling jobs nor AutoML
             // jobs, so no transform job it holds was created by one.

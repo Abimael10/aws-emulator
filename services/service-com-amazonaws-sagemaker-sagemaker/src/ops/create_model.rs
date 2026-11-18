@@ -216,16 +216,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
             // The model's artifact is READ AS that role when the model is deployed, and
             // SageMaker settles that read before it registers the model: a container whose
-            // model data names no object, or one a bucket policy fences the role off, backs
-            // no deployable model, so the create is refused for it rather than accepted into
-            // a model that could only fail later (see `crate::state::s3_access`). A request
-            // that names no role assumes none, so there is nothing to read as and nothing to
-            // settle.
+            // model data names no object, or one neither the bucket's policy nor the role's
+            // own identity-based policies let the role read, backs no deployable model, so the
+            // create is refused for it rather than accepted into a model that could only fail
+            // later (see `crate::state::s3_access`). A request that names no role assumes
+            // none, so there is nothing to read as and nothing to settle.
             let artifacts = model_data_locations(
                 input.primary_container.as_ref(),
                 input.containers.as_deref(),
             );
-            if let Some(unreadable) = crate::state::first_unreadable_location(
+            if let Some(unreadable) = crate::state::first_unreadable_location_as_role(
                 ctx,
                 &region,
                 role_arn,

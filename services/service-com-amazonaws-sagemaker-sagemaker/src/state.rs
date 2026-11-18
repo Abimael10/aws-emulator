@@ -154,7 +154,7 @@ pub mod admission;
 pub use admission::{
     could_not_access_model_data, could_not_assume_role, could_not_find_model_data,
     execution_role_failure_reason, execution_role_is_unassumable, no_s3_objects_found,
-    vpc_placement_refusal, SECURITY_GROUPS_NOT_SPECIFIED, SERVICE_PRINCIPAL,
+    s3_listing_refusal, vpc_placement_refusal, SECURITY_GROUPS_NOT_SPECIFIED, SERVICE_PRINCIPAL,
 };
 
 /// The Amazon S3 ACCESS slice: the one reading of an Amazon S3 location a request names and
@@ -162,9 +162,9 @@ pub use admission::{
 /// Re-exported below, so a handler names them as `crate::state::…` like every other slice.
 pub mod s3_access;
 pub use s3_access::{
-    arn_partition, first_unreadable_location, s3_client, s3_client_through, S3Location,
-    UnreadableLocation, DEFAULT_PARTITION, GET_OBJECT_ACTION, LIST_BUCKET_ACTION,
-    PUT_OBJECT_ACTION,
+    arn_partition, first_unreadable_location, first_unreadable_location_as_role,
+    object_read_is_unauthorized, s3_client, s3_client_through, S3Location, UnreadableLocation,
+    DEFAULT_PARTITION, GET_OBJECT_ACTION, LIST_BUCKET_ACTION, PUT_OBJECT_ACTION,
 };
 
 /// The CONTAINER IMAGE slice: the one reading of a container image path a request names, and
@@ -868,9 +868,13 @@ pub fn mint_node_logical_id() -> String {
 }
 
 /// `TransformJobStatus`'s members this emulator moves a transform job through (the
-/// modelled enum also carries `Completed`, `Stopping` and `Stopped`, which this slice
-/// does not reach). Named once here so no handler compares a bare string literal.
+/// modelled enum also carries `Stopping` and `Stopped`, which this slice does not reach:
+/// `StopTransformJob` is still a stub). Named once here so no handler compares a bare
+/// string literal.
 pub const TRANSFORM_STATUS_IN_PROGRESS: &str = "InProgress";
+/// See [`TRANSFORM_STATUS_IN_PROGRESS`]: the status of a job whose run wrote the transformed
+/// objects it promised.
+pub const TRANSFORM_STATUS_COMPLETED: &str = "Completed";
 /// See [`TRANSFORM_STATUS_IN_PROGRESS`].
 pub const TRANSFORM_STATUS_FAILED: &str = "Failed";
 
@@ -881,18 +885,6 @@ pub const TRANSFORM_STATUS_FAILED: &str = "Failed";
 /// does) observes the terminal status. Real SageMaker takes minutes to provision the ML
 /// instances; the span is compressed, never zero.
 pub const TRANSFORM_JOB_SETTLES_AFTER: Duration = Duration::from_millis(300);
-
-/// Why a batch transform job this emulator accepted ends in the modelled `Failed`
-/// status.
-///
-/// A batch transform runs the model's inference container against every record of the
-/// input dataset; this emulator runs no container, so no inference is performed and no
-/// transformed object is written. Reporting `Completed` — with an `S3OutputPath` nothing
-/// wrote — would claim work that never ran, so the job ends in the status the model
-/// carries for a job that did not produce its output, with this reason saying why.
-pub const TRANSFORM_NOT_RUN_FAILURE: &str =
-    "This emulator runs no model inference container, so no records were transformed and \
-     no output object was written to the job's S3OutputPath.";
 
 /// `MaxPayloadInMB`'s documented ceiling: "The value of MaxPayloadInMB cannot be greater
 /// than 100 MB" and "the value of (MaxConcurrentTransforms * MaxPayloadInMB) also cannot
@@ -1121,10 +1113,22 @@ pub use jobs::*;
 pub mod training_run;
 pub use training_run::*;
 
+/// What the ALGORITHM a training job names decides about the job's observable outputs — the
+/// file its container writes the model into, and the metric it emits per input channel: see
+/// `state/training_algorithm.rs`.
+pub mod training_algorithm;
+pub use training_algorithm::*;
+
 /// The PUBLICATION of what a training run produced — the model artifact it built and the
 /// stage of the work at which it appears in Amazon S3: see `state/training_artifact.rs`.
 pub mod training_artifact;
 pub use training_artifact::*;
+
+/// The server-side RUN of an accepted batch transform job — the dataset it reads, the
+/// inference it computes for every record and the output objects it writes: see
+/// `state/transform_run.rs`.
+pub mod transform_run;
+pub use transform_run::*;
 
 /// The TRAINING SESSION slice — the session `CreateTrainingSession` writes and
 /// `DescribeTrainingSession` replays, with its ARN kind, statuses, store bound, clock span
@@ -1661,8 +1665,15 @@ pub struct TransformJob {
     pub tags: Vec<Tag>,
     pub creation_time: SystemTime,
     pub last_modified_time: SystemTime,
+    /// "Indicates when the transform job starts on ML compute instances"
+    /// (`DescribeTransformJob$TransformStartTime`): set once the clock has settled the job,
+    /// because its work begins after the job is accepted.
+    pub transform_start_time: Option<SystemTime>,
     pub transform_end_time: Option<SystemTime>,
     pub ends_at: SystemTime,
+    /// What the job's RUN reported ([`crate::state::run_transform_job`]), recorded by the
+    /// create that started it and revealed by the clock ([`Self::settle_status`]).
+    pub run: Option<crate::state::TransformRunOutcome>,
 }
 
 impl TransformJob {
@@ -1674,19 +1685,32 @@ impl TransformJob {
     /// value is stable across later reads, and `LastModifiedTime` moves to that same
     /// instant for the same reason.
     ///
-    /// The status is [`TRANSFORM_STATUS_FAILED`] with [`TRANSFORM_NOT_RUN_FAILURE`]: see
-    /// that constant for why a job this emulator accepted cannot end `Completed`.
+    /// The status is the one the job's own RUN reported: `Completed` for a run that wrote the
+    /// transformed objects the job promised, and the modelled `Failed` with the condition that
+    /// stopped it otherwise. A job whose run has not reported is not settled at all, because
+    /// the terminal status IS the run's.
     ///
     /// Answers whether the transition happened on this call, so the caller can record it.
     pub fn settle_status(&mut self, now: SystemTime) -> bool {
-        if self.status == TRANSFORM_STATUS_IN_PROGRESS && now >= self.ends_at {
-            self.status = TRANSFORM_STATUS_FAILED.to_string();
-            self.failure_reason = Some(TRANSFORM_NOT_RUN_FAILURE.to_string());
-            self.transform_end_time = Some(self.ends_at);
-            self.last_modified_time = self.ends_at;
-            return true;
+        if self.status != TRANSFORM_STATUS_IN_PROGRESS || now < self.ends_at {
+            return false;
         }
-        false
+        match self.run.as_ref() {
+            Some(crate::state::TransformRunOutcome::Completed { .. }) => {
+                self.status = TRANSFORM_STATUS_COMPLETED.to_string();
+                self.failure_reason = None;
+            }
+            Some(crate::state::TransformRunOutcome::Failed { reason }) => {
+                self.status = TRANSFORM_STATUS_FAILED.to_string();
+                self.failure_reason = Some(reason.clone());
+            }
+            // The run has not reported: nothing is owed until it does.
+            None => return false,
+        }
+        self.transform_start_time = Some(self.creation_time);
+        self.transform_end_time = Some(self.ends_at);
+        self.last_modified_time = self.ends_at;
+        true
     }
 }
 

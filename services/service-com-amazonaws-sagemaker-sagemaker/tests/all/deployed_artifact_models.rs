@@ -23,6 +23,7 @@
 use serde_json::{json, Value};
 use service_com_amazonaws_sagemaker_sagemaker::state::{
     fit, fit_epochs, model_archive, model_from_artifact, serve_inference, Record, ServedModel,
+    MODEL_ARCHIVE_ENTRY,
 };
 
 /// A serialized gradient-boosted model of one tree: the root splits feature 0 at `threshold`,
@@ -125,7 +126,8 @@ fn binary_length(length: usize) -> Vec<u8> {
 /// The archive a container uploads, with `document` as its single entry: the compressed tar the
 /// service writes its own model into, which is also where a container's model file lives.
 fn as_archive(document: &Value) -> Vec<u8> {
-    model_archive(document).expect("the archive is built")
+    let body = serde_json::to_vec_pretty(document).expect("the document serialises");
+    model_archive(&[(MODEL_ARCHIVE_ENTRY.to_string(), body)]).expect("the archive is built")
 }
 
 /// The artifact a training run of this emulator writes, and the model it holds: a fit over

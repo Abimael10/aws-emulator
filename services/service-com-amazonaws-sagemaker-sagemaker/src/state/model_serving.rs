@@ -108,8 +108,8 @@ impl ServingRefusal {
     pub fn message(&self) -> String {
         match self {
             Self::NoModelArtifact { model_name } => format!(
-                "Model {model_name} carries no ModelDataUrl, so the endpoint has no model \
-                 artifacts to serve an inference from."
+                "Model {model_name} carries no ModelDataUrl, so there are no model artifacts \
+                 to compute an inference from."
             ),
             Self::ArtifactUnreadable { uri } => format!(
                 "The model artifacts at {uri} could not be read, so no inference was computed."
@@ -121,16 +121,16 @@ impl ServingRefusal {
                  parameters."
             ),
             Self::PayloadNotRecords => format!(
-                "The request payload holds no record to predict from: a record is a row of \
+                "The records hold nothing to predict from: a record is a row of \
                  numeric feature values, as {CSV_MEDIA_TYPE} or as a JSON array of them."
             ),
             Self::PayloadTooManyRecords { records } => format!(
-                "The request payload holds {records} records, past the {MAX_PAYLOAD_RECORDS} \
-                 one invocation may carry."
+                "The records number {records}, past the {MAX_PAYLOAD_RECORDS} one \
+                 inference may carry."
             ),
             Self::FeatureCountMismatch { expected, found } => format!(
-                "The request payload's records carry {found} feature values, and the model \
-                 behind this endpoint was fitted on {expected}."
+                "The records carry {found} feature values, and the model they are applied to \
+                 was fitted on {expected}."
             ),
         }
     }

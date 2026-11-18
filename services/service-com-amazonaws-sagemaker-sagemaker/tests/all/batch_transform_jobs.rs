@@ -427,10 +427,12 @@ async fn describe_transform_job_replays_what_create_stored_with_documented_defau
     }
 }
 
-/// RULE: a transform job is created `InProgress` and the clock owes it a terminal status
-/// a span later; because this emulator runs no inference container, that terminal status
-/// is the modelled `Failed` with a `FailureReason` saying so and a `TransformEndTime`
-/// that is stable across later reads. Holds for every job, whatever its shape.
+/// RULE: a transform job is created `InProgress` and the clock owes it the terminal status
+/// its own RUN reported a span later, with a `TransformEndTime` that is stable across later
+/// reads. A job whose model carries no model artifact has no parameters to score its dataset
+/// with, so its run reports the modelled `Failed` with the `FailureReason` naming that
+/// condition — never a `Completed` for a job that transformed nothing. Holds for every job,
+/// whatever its shape.
 #[tokio::test]
 async fn a_transform_job_reaches_the_terminal_status_the_clock_owes_it() {
     // Rows differ along the shape of the job: the data-source kind, the split form and
@@ -481,17 +483,14 @@ async fn a_transform_job_reaches_the_terminal_status_the_clock_owes_it() {
         assert_eq!(
             str_field(&settled, "TransformJobStatus"),
             "Failed",
-            "case {case}: the terminal status the clock owes, got {settled:?}"
-        );
-        assert_eq!(
-            str_field(&settled, "FailureReason"),
-            service_com_amazonaws_sagemaker_sagemaker::state::TRANSFORM_NOT_RUN_FAILURE,
-            "case {case}: FailureReason must say why nothing was transformed, got {settled:?}"
+            "case {case}: the terminal status the clock owes a job whose model carries no \
+             artifact, got {settled:?}"
         );
         let reason = str_field(&settled, "FailureReason");
         assert!(
-            reason.contains("no records were transformed"),
-            "case {case}: FailureReason must say no record was transformed, got {reason:?}"
+            reason.contains("demo-model") && reason.contains("ModelDataUrl"),
+            "case {case}: FailureReason must name the model that carries no artifact, got \
+             {reason:?}"
         );
         let end_time = settled
             .get("TransformEndTime")
