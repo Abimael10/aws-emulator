@@ -1359,22 +1359,24 @@ pub fn decode_continuation_token(token: &str) -> Option<String> {
 /// outside the enum is refused at the boundary, so reaching here with an unknown
 /// one would mean the model changed under us; it is refused rather than silently
 /// picking an algorithm.
+///
+/// Each refusal is stated with the one FIXED sentence this service words that
+/// member's class with — [`INVALID_SSE_ALGORITHM_MESSAGE`] for the algorithm,
+/// [`INVALID_KMS_KEY_ARN_MESSAGE`] for the key — the same sentences the
+/// boundary's own constraint refusals carry ([`crate::service`]), so one member
+/// is refused one way however the value failed: a `kmsKeyArn` the configuration
+/// cannot encrypt under (absent where the algorithm takes one, present where it
+/// takes none, or outside the modelled form) names no key ARN of the one form
+/// this service takes, and the sentence that says so takes nothing from the
+/// request.
 pub fn stored_encryption(
     sse_algorithm: &str,
     kms_key_arn: Option<String>,
 ) -> Result<BucketEncryption, String> {
-    let algorithm = SseAlgorithm::from_wire(sse_algorithm).ok_or_else(|| {
-        format!("The server-side encryption algorithm {sse_algorithm} is not supported.")
-    })?;
+    let algorithm = SseAlgorithm::from_wire(sse_algorithm)
+        .ok_or_else(|| INVALID_SSE_ALGORITHM_MESSAGE.to_string())?;
     match (algorithm.takes_kms_key(), &kms_key_arn) {
-        (true, None) => Err(format!(
-            "kmsKeyArn is required when sseAlgorithm is {}.",
-            algorithm.as_wire()
-        )),
-        (false, Some(_)) => Err(format!(
-            "kmsKeyArn is not valid when sseAlgorithm is {}.",
-            algorithm.as_wire()
-        )),
+        (true, None) | (false, Some(_)) => Err(INVALID_KMS_KEY_ARN_MESSAGE.to_string()),
         _ => Ok(BucketEncryption {
             sse_algorithm: algorithm,
             kms_key_arn,
@@ -1676,6 +1678,13 @@ pub const INVALID_SSE_ALGORITHM_MESSAGE: &str = "The specified SSE algorithm is 
 /// patterns. FIXED text: the form it quotes is the key ARN's SHAPE, with a
 /// placeholder for each of its variable parts, so the sentence is the same
 /// whatever key the request named and nothing of that key appears in it.
+///
+/// It words every way a configuration can name no usable key: a value outside
+/// the modelled length or pattern, and a configuration whose algorithm and key
+/// disagree — `aws:kms` with no key ARN at all, or a key ARN under an algorithm
+/// that takes none ([`stored_encryption`]). In each the request names no key ARN
+/// of the one form this service encrypts under, which is what the sentence
+/// states.
 pub const INVALID_KMS_KEY_ARN_MESSAGE: &str =
     "The specified KMS key ARN is invalid. Only key ARN format \
      'arn:<partition>:kms:<region>:<account-id>:key/<key-id>' is supported.";
