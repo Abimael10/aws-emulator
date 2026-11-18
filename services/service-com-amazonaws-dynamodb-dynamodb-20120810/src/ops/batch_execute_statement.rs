@@ -759,7 +759,9 @@ fn update_item(
             .map_err(crate::state::stated_for_an_update)?;
     }
     crate::state::canonicalize_item(&mut item)?;
-    if crate::state::item_size(&item) > crate::state::MAX_ITEM_SIZE_BYTES {
+    if crate::state::charged_update_size(&item, &partition_key, sort_key.as_deref())
+        > crate::state::MAX_ITEM_SIZE_BYTES
+    {
         return Err(SlotFailure::validation(
             crate::state::ITEM_UPDATE_SIZE_EXCEEDED_MESSAGE,
         ));

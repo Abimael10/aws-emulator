@@ -41,6 +41,15 @@ pub fn is_multi_tenant_engine(engine: &str) -> bool {
     engine.to_ascii_lowercase().ends_with("-cdb")
 }
 
+/// The engine family every DB instance that holds tenant databases runs
+/// ([`is_multi_tenant_engine`]): the Oracle CDB engines.
+///
+/// Named so that a rule published PER ENGINE — the `MasterUsername` bound
+/// ([`super::master_username_len`]), for one — can be read for a tenant database's own master
+/// user before the DB instance holding it is resolved, which is the order an input constraint
+/// is checked in.
+pub const MULTI_TENANT_ENGINE: &str = "oracle";
+
 /// What a request addressed at a TENANT DATABASE of a DB instance that does not use the
 /// multi-tenant configuration is refused with.
 ///

@@ -434,7 +434,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The documented constraints of the remaining values, each refused with the Query API
         // error code the real service answers it with — never with a 501.
         if let Some(username) = &input.master_username {
-            crate::state::check_master_username(username)
+            crate::state::check_master_username(&input.engine, username)
                 .map_err(RestoreDBInstanceFromS3Error::invalid_parameter_value)?;
         }
         if let Some(password) = &input.master_user_password {

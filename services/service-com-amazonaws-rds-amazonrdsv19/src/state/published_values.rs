@@ -1214,21 +1214,28 @@ pub const DB_CLUSTER_ROLE_STATUS_ACTIVE: &str = "ACTIVE";
 /// 16 letters or numbers. First character must be a letter" and "Can't be a reserved word
 /// for the chosen database engine".
 ///
+/// The LENGTH half is read from the ENGINE the account is being created on
+/// ([`master_username_len`]): `MasterUsername` publishes the bound per engine, so a name the
+/// engine named in the request admits is accepted whatever another engine's line says.
+///
 /// The reserved-word half is read over [`RESERVED_MASTER_USERNAMES`]: the accounts Amazon
 /// RDS keeps for ITSELF on the engines this front door serves. The engines' own SQL keyword
 /// lists are not enforced — that list is each engine's, which this service does not hold, and
 /// refusing a name no published list carries would refuse names AWS accepts.
-pub fn check_master_username(value: &str) -> Result<(), String> {
+pub fn check_master_username(engine: &str, value: &str) -> Result<(), String> {
+    let allowed = master_username_len(engine);
     if !value.chars().all(|c| c.is_ascii_alphanumeric()) {
         return Err(format!(
-            "MasterUsername must be 1 to 16 letters or numbers; got '{value}'"
+            "MasterUsername must be 1 to {} letters or numbers; got '{value}'",
+            allowed.end()
         ));
     }
     let length = value.chars().count();
-    if length == 0 || length > MAX_MASTER_USERNAME_LEN {
+    if length < *allowed.start() || length > *allowed.end() {
         return Err(format!(
-            "MasterUsername must be 1 to {MAX_MASTER_USERNAME_LEN} letters or numbers; \
-             got {length} characters"
+            "MasterUsername must be {} to {} letters or numbers; got {length} characters",
+            allowed.start(),
+            allowed.end()
         ));
     }
     if !value
@@ -1247,6 +1254,33 @@ pub fn check_master_username(value: &str) -> Result<(), String> {
         return Err(master_username_is_reserved_message(value));
     }
     Ok(())
+}
+
+/// How long a `MasterUsername` may be on `engine`.
+///
+/// `MasterUsername` publishes the bound PER ENGINE, one constraint list per engine the
+/// operation serves ("Amazon RDS for Db2 … Must be 1 to 16 letters or numbers", "MariaDB …
+/// 1 to 16 letters or numbers", "MySQL … 1 to 16 letters or numbers", "Oracle … 1 to 30
+/// letters or numbers", "PostgreSQL … 1 to 63 letters or numbers", "Microsoft SQL Server …
+/// 1 to 128 letters or numbers"), so the bound is read from the engine the account is being
+/// created on rather than from one engine's line. Every engine publishes the SAME lower bound
+/// of 1, which is why an engine string this does not recognise still carries it, with the
+/// narrowest published upper bound ([`MAX_MASTER_USERNAME_LEN`]) — the bound the member's own
+/// summary states.
+pub fn master_username_len(engine: &str) -> std::ops::RangeInclusive<usize> {
+    let lowered = engine.to_ascii_lowercase();
+    let longest = match lowered.as_str() {
+        // The Aurora engines are the PostgreSQL and MySQL engines, and take their own
+        // engine's bound: `aurora-postgresql` matches on "postgres" below.
+        _ if lowered.contains("postgres") => 63,
+        _ if lowered.starts_with("sqlserver") || lowered.starts_with("custom-sqlserver") => 128,
+        _ if lowered.starts_with("oracle") || lowered.starts_with("custom-oracle") => 30,
+        // Amazon DocumentDB, whose SDK clients this front door serves too: "Must be from 1
+        // to 63 letters or numbers."
+        _ if lowered.starts_with("docdb") => 63,
+        _ => MAX_MASTER_USERNAME_LEN,
+    };
+    1..=longest
 }
 
 /// The master usernames no request may take, whichever engine it names: the accounts Amazon
@@ -1269,8 +1303,9 @@ pub fn master_username_is_reserved_message(value: &str) -> String {
     format!("MasterUsername {value} cannot be used as it is a reserved word used by the engine")
 }
 
-/// The longest `MasterUsername` a DB cluster accepts ("Must be 1 to 16 letters or
-/// numbers").
+/// The longest `MasterUsername` the member's own summary states ("Must be 1 to 16 letters or
+/// numbers"), which is the bound an engine with no published line of its own carries; the
+/// engines that publish a wider one take it from [`master_username_len`].
 pub const MAX_MASTER_USERNAME_LEN: usize = 16;
 
 /// The longest `RoleArn` an `AssociatedRoles` entry may carry: the bound the member's own

@@ -4857,6 +4857,13 @@ pub use reads::*;
 mod vectors;
 pub use vectors::*;
 
+/// What an UPDATE's resulting item is charged against the documented item-size ceiling — the
+/// floor the key portion of an item carries — in its own file: it is one rule, read by every
+/// surface that applies a change to a stored item. Re-exported below, so every caller still
+/// names it `crate::state::…`.
+mod update_item_size;
+pub use update_item_size::*;
+
 /// The on-demand capacity ceiling a table carries, in its own file: it is one setting of
 /// the on-demand capacity model, set and cleared through the same member. Re-exported
 /// below, so every caller still names it `crate::state::…`.

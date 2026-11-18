@@ -471,7 +471,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // what a parameter accepts is `InvalidParameterValue`, parameters that cannot hold
         // together are `InvalidParameterCombination` — never with a 501.
         if let Some(username) = &input.master_username {
-            crate::state::check_master_username(username)
+            crate::state::check_master_username(&input.engine, username)
                 .map_err(CreateDBClusterError::invalid_parameter_value)?;
         }
         if let Some(password) = &input.master_user_password {

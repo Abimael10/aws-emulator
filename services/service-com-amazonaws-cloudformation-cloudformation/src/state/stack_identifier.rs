@@ -12,19 +12,19 @@
 //! the value breaks is reported in one envelope, the expression first.
 //!
 //! The expression is what CloudFormation STATES when it will not take a value, and it is also
-//! what it TAKES: a stack NAME, or a stack ARN. It is applied the way a `@pattern` constraint
-//! is applied — as a SEARCH for the expression ANYWHERE in the value rather than a match of
-//! the whole of it, which is how the expression reaches a refusal: unanchored, as the message
-//! quotes it. So a value that carries a name run (a letter followed by letters, digits and
-//! hyphens) or an `arn:` prefix anywhere in it is admitted, and only a value carrying neither
-//! — digits, hyphens, punctuation or spaces alone, and the empty value — is refused for its
-//! own shape ahead of the lookup.
+//! what it TAKES: a stack NAME, or a stack ARN. A constraint expression is satisfied by the
+//! WHOLE of the value — the requirement is that the value IS one of the forms the expression
+//! describes, not that one of them can be found inside it — so a value only part of which is
+//! a name run or an ARN is refused for its own shape ahead of the lookup, whatever else it
+//! carries. That is why the value quoted in the refusal is the whole value as sent, while the
+//! expression is quoted unanchored, as the service states it.
 //!
 //! An admitted value is RESOLVED, and one that names no stack is answered as the missing stack
 //! it is ([`super::stack_does_not_exist`] and the forms beside it). The bare unique id a stack
-//! id (`arn:…:stack/<name>/<unique-id>`) ENDS in addresses no stack, but it carries a name run
-//! whatever hexadecimal digit it begins with, so it is admitted and answered as the stack it
-//! does not name rather than for its shape.
+//! id (`arn:…:stack/<name>/<unique-id>`) ENDS in addresses no stack; whether it is admitted is
+//! decided by its own FORM like any other value — one beginning with a hexadecimal LETTER is
+//! wholly a name run, so it reaches the lookup and is answered as the stack it does not name,
+//! while one beginning with a DIGIT is no name at all and is refused for its shape.
 //!
 //! ## Why the check lives here and not at the boundary
 //!
@@ -51,8 +51,8 @@ use ::aws_smithy_schema_server::constraints::{Violation, ViolationKind};
 /// the members that do carry a `@pattern`
 /// (`smithy_query(query="shape", shape="StackNameOrId")`): a requirement reaches a message as
 /// the layer that refuses states it. It is both the expression a refusal STATES and the set of
-/// values taken as addressing a stack ([`is_an_addressable_form`]), and it is unanchored in
-/// both — the one expression, read the one way.
+/// values taken as addressing a stack ([`is_an_addressable_form`]) — the one expression, read
+/// the one way: quoted unanchored, and satisfied by the whole of the value.
 pub const STACK_IDENTIFIER_PATTERN: &str = "[a-zA-Z][-a-zA-Z0-9]*|arn:[-a-zA-Z0-9:/._+]*";
 
 /// The least a stack identifier may hold: `@length(min: 1)`, which the model states for the
@@ -73,12 +73,12 @@ pub const STACK_NAME_PATH: &str = "stackName";
 /// refused.
 pub const STACK_NAME_OR_ID_PATH: &str = "stackNameOrId";
 
-/// [`STACK_IDENTIFIER_PATTERN`] as the expression an identifier is searched for, compiled once
-/// for the process.
+/// [`STACK_IDENTIFIER_PATTERN`] as the expression an identifier is held to, compiled once for
+/// the process.
 ///
-/// Compiled UNANCHORED, which is what a `@pattern` constraint states: the expression has to be
-/// found somewhere in the value rather than to describe the whole of it, and that is also how
-/// a refusal quotes it.
+/// Compiled to describe the WHOLE value: a constraint expression is satisfied by the value
+/// itself rather than by some run inside it, so the alternation is wrapped and anchored at
+/// both ends here while the refusal keeps quoting the expression as the service states it.
 ///
 /// `None` only if the expression itself could not be compiled, in which case nothing is
 /// refused by it rather than everything.
@@ -86,14 +86,17 @@ fn stated_expression() -> Option<&'static ::regex::Regex> {
     static COMPILED: ::std::sync::OnceLock<Option<::regex::Regex>> =
         ::std::sync::OnceLock::new();
     COMPILED
-        .get_or_init(|| ::regex::Regex::new(STACK_IDENTIFIER_PATTERN).ok())
+        .get_or_init(|| {
+            ::regex::Regex::new(&format!("^(?:{STACK_IDENTIFIER_PATTERN})$")).ok()
+        })
         .as_ref()
 }
 
-/// Whether CloudFormation takes `identifier` as naming a stack at all: whether the expression
-/// it states ([`STACK_IDENTIFIER_PATTERN`]) is FOUND in the value — a name run or an `arn:`
-/// prefix anywhere in it. Such a value is RESOLVED, so one that names no stack is answered as
-/// a missing stack; a value carrying neither is answered for its own shape.
+/// Whether CloudFormation takes `identifier` as naming a stack at all: whether the WHOLE value
+/// is one of the forms the expression it states ([`STACK_IDENTIFIER_PATTERN`]) describes — a
+/// stack name (a letter followed by letters, digits and hyphens) or a stack ARN. Such a value
+/// is RESOLVED, so one that names no stack is answered as a missing stack; a value of any
+/// other form is answered for its own shape.
 fn is_an_addressable_form(identifier: &str) -> bool {
     stated_expression().is_none_or(|expression| expression.is_match(identifier))
 }
@@ -154,12 +157,12 @@ pub fn refuse_malformed_identifier<E>(
 mod tests {
     use super::*;
 
-    /// RULE: the expression CloudFormation states for a stack identifier is SEARCHED for in
-    /// the value, so a value carrying a name run or an `arn:` prefix anywhere in it is
-    /// admitted and reaches the lookup — the bare unique id a stack id ends in included,
-    /// whichever hexadecimal digit it begins with — and only a value carrying neither is
-    /// refused for its own shape; a value breaking BOTH constraints is reported with both
-    /// clauses, the expression first.
+    /// RULE: the expression CloudFormation states for a stack identifier describes the WHOLE
+    /// value, so a value that IS a stack name or a stack ARN is admitted and reaches the
+    /// lookup — the bare unique id a stack id ends in included when it begins with a
+    /// hexadecimal LETTER, which makes the whole of it a name run — and a value of any other
+    /// form is refused for its own shape; a value breaking BOTH constraints is reported with
+    /// both clauses, the expression first.
     #[test]
     fn an_identifier_is_admitted_by_the_services_own_expression() {
         for admitted in [
@@ -168,18 +171,13 @@ mod tests {
             "Stack9",
             "arn:aws:cloudformation:us-east-1:123456789012:stack/a/0",
             "arn:aws-cn:cloudformation:cn-north-1:123456789012:stack/a/0",
-            // Values the expression is FOUND in, though it does not describe the whole of
-            // them: the unique id a stack id ends in, led by a digit and by a letter, in
-            // either case of hexadecimal, and names carrying a character a stack name may
-            // not. Each is resolved, so each is answered as the stack it does not name.
-            "0e81d159-090a-7b61-9856-04d0999cb465",
-            "0E81D159-090A-7B61-9856-04D0999CB465",
+            // Values the whole of which is a name run, though no stack carries them: the
+            // unique id a stack id ends in when it begins with a hexadecimal letter, in
+            // either case. Each is resolved, so each is answered as the stack it does not
+            // name.
             "af2504e0-4f89-11d3-9a0c-0305e82c3301",
-            "0e81d159090a7b61985604d0999cb465",
-            "a_stack",
-            "a.stack",
-            "9stack",
-            "-stack",
+            "AF2504E0-4F89-11D3-9A0C-0305E82C3301",
+            "ae81d159090a7b61985604d0999cb465",
         ] {
             assert_eq!(
                 malformed_identifier(STACK_NAME_PATH, admitted),
@@ -196,6 +194,22 @@ mod tests {
             ("a value of one space", " "),
             ("digits either side of a space", "12 34"),
             ("a value of symbols and digits", "+1.0"),
+            // Values only PART of which is a name run or an ARN: a character a stack name
+            // may not carry, or a leading one it may not begin with, is refused however much
+            // of the rest would pass on its own.
+            ("a name carrying an underscore", "a_stack"),
+            ("a name carrying a dot", "a.stack"),
+            ("a name led by a digit", "9stack"),
+            ("a name led by a hyphen", "-stack"),
+            (
+                "the unique id a stack id ends in, led by a digit",
+                "0e81d159-090a-7b61-9856-04d0999cb465",
+            ),
+            (
+                "that unique id in upper-case hexadecimal",
+                "0E81D159-090A-7B61-9856-04D0999CB465",
+            ),
+            ("an ARN of a partition no stack carries", "arn aws:x"),
         ] {
             let expected = Some(format!(
                 "1 validation error detected: Value '{refused}' at 'stackName' failed to \

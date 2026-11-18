@@ -190,8 +190,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let tenant_db_name = input.tenant_db_name.clone();
         crate::state::check_identifier("TenantDBName", &tenant_db_name, 63)
             .map_err(CreateTenantDatabaseError::invalid_parameter_value)?;
-        crate::state::check_master_username(&input.master_username)
-            .map_err(CreateTenantDatabaseError::invalid_parameter_value)?;
+        crate::state::check_master_username(
+            // Every instance that holds tenant databases runs an Oracle CDB engine, so that
+            // is the engine whose published bound this tenant's master user is held to —
+            // read before the instance itself is resolved, as an input constraint is.
+            crate::state::MULTI_TENANT_ENGINE,
+            &input.master_username,
+        )
+        .map_err(CreateTenantDatabaseError::invalid_parameter_value)?;
         for (member, value) in [
             ("CharacterSetName", input.character_set_name.as_deref()),
             (

@@ -540,10 +540,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         .map_err(crate::state::unenveloped)
                         .map_err(lift)?;
                     // Sized over what this element ASKED FOR, exactly as the single-item
-                    // `UpdateItem` of the same expression is: the stored item plus the
-                    // frame each clause of the update costs
-                    // ([`crate::state::ParsedUpdate::request_shape_charge`]).
-                    if crate::state::item_size(&item) + applied.request_shape_charge()
+                    // `UpdateItem` of the same expression is: the stored item — its KEY
+                    // portion charged at the floor an update charges one at
+                    // ([`crate::state::charged_update_size`]) — plus the frame each clause
+                    // of the update costs
+                    // ([`crate::state::ParsedUpdate::request_shape_charge`]). The refusal is
+                    // the CALL's, not one element's cancellation: the element states a write
+                    // no item could hold.
+                    if crate::state::charged_update_size(&item, &partition_key, sort_key.as_deref())
+                        + applied.request_shape_charge()
                         > crate::state::MAX_ITEM_SIZE_BYTES
                     {
                         return Err(crate::scaffolded::Scaffolded::validation(

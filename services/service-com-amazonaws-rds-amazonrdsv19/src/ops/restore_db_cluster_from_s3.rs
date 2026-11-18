@@ -473,7 +473,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // refused with the Query API error code the real service answers it with — a value
         // outside what a parameter accepts is `InvalidParameterValue`, parameters that cannot
         // hold together are `InvalidParameterCombination` — never with a 501.
-        crate::state::check_master_username(&input.master_username)
+        crate::state::check_master_username(&input.engine, &input.master_username)
             .map_err(RestoreDBClusterFromS3Error::invalid_parameter_value)?;
         if let Some(password) = &input.master_user_password {
             crate::state::check_supplied_master_user_password(&input.engine, password)

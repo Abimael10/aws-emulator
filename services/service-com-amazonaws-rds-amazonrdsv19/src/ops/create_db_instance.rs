@@ -430,13 +430,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         crate::state::check_db_instance_class(&input.db_instance_class)
             .map_err(CreateDBInstanceError::invalid_parameter_value)?;
         // `MasterUsername` carries the same documented constraints wherever it is taken —
-        // "must be 1 to 16 letters or numbers", "first character must be a letter" and
-        // "can't be a reserved word for the chosen database engine"
-        // ([`crate::state::check_master_username`], the one check `CreateDBCluster` and both
-        // restores read) — so one rule holds across every operation that names a master user
-        // and none of them stores an account the engine keeps for itself.
+        // the LENGTH its member publishes for the engine the account is created on, "first
+        // character must be a letter" and "can't be a reserved word for the chosen database
+        // engine" ([`crate::state::check_master_username`], the one check `CreateDBCluster`
+        // and both restores read) — so one rule holds across every operation that names a
+        // master user and none of them stores an account the engine keeps for itself.
         if let Some(username) = &input.master_username {
-            crate::state::check_master_username(username)
+            crate::state::check_master_username(&input.engine, username)
                 .map_err(CreateDBInstanceError::invalid_parameter_value)?;
         }
         // `MasterUserPassword` carries the engine's master-password policy wherever it is
