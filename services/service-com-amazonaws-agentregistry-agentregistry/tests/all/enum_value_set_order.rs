@@ -11,12 +11,15 @@
 //! any depth.
 //!
 //! The rows differ along what the rule generalises over: which element of the filter list
-//! carried the offending value (so the member path moves while the set does not), the FORM
-//! of the refused value (empty, a declared value in another casing, a value of another enum
-//! of this model, a long string), and how many clauses one refusal carries. The contrast
-//! tests pin the two other halves: every value the stated set lists is ACCEPTED (the
-//! listing re-orders a set, it does not decide membership), and nothing of the refused
-//! value reaches the sentence.
+//! carried the offending value (so the member path moves while the set does not) — every
+//! position up to the most filters a request may carry — the FORM of the refused value
+//! (empty, a declared value in another casing, a value of another enum of this model, a
+//! long string), how many clauses one refusal carries (one per offending element, up to one
+//! per element), and what ELSE the request carries: the other members of this read, the
+//! form of the registry identifier in the path, and whether the registry named there holds
+//! any record, or exists at all. The contrast tests pin the two other halves: every value
+//! the stated set lists is ACCEPTED (the listing re-orders a set, it does not decide
+//! membership), and nothing of the refused value reaches the sentence.
 //!
 //! The admissible values themselves come from the model, through this crate's own generated
 //! catalogue of them (`ops::types::REGISTRY_RECORD_FILTER_NAME_VALUES` for
@@ -28,7 +31,8 @@
 use serde_json::{json, Value};
 use service_com_amazonaws_agentregistry_agentregistry::ops::types::REGISTRY_RECORD_FILTER_NAME_VALUES;
 
-use crate::discovery_read_path::{list_path, post, seeded_router, REGISTRY};
+use crate::discovery_read_path::{list_path, post, seeded_router, EMPTY_REGISTRY, REGION, REGISTRY};
+use service_com_amazonaws_agentregistrycontrol_agentregistrycontrol::state as owner;
 
 /// The `message` member of a refusal body.
 fn stated(body: &Value) -> String {
@@ -230,4 +234,187 @@ async fn an_enum_clause_quotes_no_value() {
             "case a filter named {refused:?}: no value may be quoted, got {actual:?}"
         );
     }
+}
+
+/// The most filters one request may carry, and so the widest element position a clause can
+/// be stated at: `RegistryRecordFilterList` declares `@length(max: 10)`
+/// (`smithy_query(query="shape", shape="RegistryRecordFilterList")`).
+const MOST_FILTERS: usize = 10;
+
+/// A filter name the enumerated type admits, for the elements of a list whose offending
+/// element sits somewhere else.
+fn admissible_name() -> &'static str {
+    stated_value_set()[0]
+}
+
+/// The whole sentence a refusal states for offending filter names at `positions`: the
+/// count of clauses, then one clause per offending element at its own path, each listing
+/// the enumerated type's admissible set in the one order.
+fn expected_sentence(positions: &[usize]) -> String {
+    let set = enum_requirement(&stated_value_set());
+    let clauses: Vec<String> = positions
+        .iter()
+        .map(|position| {
+            format!("Value at 'filters.{position}.member.name' failed to satisfy constraint: {set}")
+        })
+        .collect();
+    let detected = if positions.len() == 1 {
+        "1 validation error detected".to_string()
+    } else {
+        format!("{} validation errors detected", positions.len())
+    };
+    format!("{detected}: {}", clauses.join("; "))
+}
+
+/// The list read of `registry` carrying `body`.
+async fn list_of(
+    router: &smithy_server_runtime::MultiServiceRouter,
+    registry: &str,
+    body: &Value,
+) -> (u16, Value) {
+    post(router, &list_path(registry), body).await
+}
+
+/// The set reads alike at EVERY element position the filter list admits, so the order
+/// belongs to the enumerated type and not to where the offending element sits: one
+/// offender walked across a full-length list, every other element admissible.
+#[tokio::test]
+async fn the_set_reads_alike_at_every_position_the_filter_list_admits() {
+    let router = seeded_router();
+    let admissible = admissible_name();
+    for position in 1..=MOST_FILTERS {
+        let filters: Vec<Value> = (1..=MOST_FILTERS)
+            .map(|at| {
+                if at == position {
+                    filter("no-such-filter-name")
+                } else {
+                    filter(admissible)
+                }
+            })
+            .collect();
+        let case = format!("the offending filter name at position {position} of {MOST_FILTERS}");
+        let (status, response) = list_with_filters(&router, json!(filters)).await;
+        assert_eq!(
+            status, 400,
+            "case {case:?}: expected 400, got {status}: {response}"
+        );
+        let expected = expected_sentence(&[position]);
+        let actual = stated(&response);
+        assert_eq!(
+            actual, expected,
+            "case {case:?}: expected {expected:?}, got {actual:?}"
+        );
+    }
+}
+
+/// However MANY elements offend — one, every one, or any number between — the refusal
+/// states one clause per offending element, in element order, and every clause lists the
+/// same set in the same order.
+#[tokio::test]
+async fn every_clause_lists_the_same_set_however_many_elements_offend() {
+    let router = seeded_router();
+    let admissible = admissible_name();
+    for offenders in 1..=MOST_FILTERS {
+        // The offending elements lead, so the clause count and the paths vary together.
+        let filters: Vec<Value> = (1..=MOST_FILTERS)
+            .map(|at| {
+                if at <= offenders {
+                    // A different form at each position, so one shape of value cannot be
+                    // what the order depends on.
+                    filter(&format!("not-a-filter-name-{at}"))
+                } else {
+                    filter(admissible)
+                }
+            })
+            .collect();
+        let case = format!("{offenders} of {MOST_FILTERS} filter names offending");
+        let (status, response) = list_with_filters(&router, json!(filters)).await;
+        assert_eq!(
+            status, 400,
+            "case {case:?}: expected 400, got {status}: {response}"
+        );
+        let positions: Vec<usize> = (1..=offenders).collect();
+        let expected = expected_sentence(&positions);
+        let actual = stated(&response);
+        assert_eq!(
+            actual, expected,
+            "case {case:?}: expected {expected:?}, got {actual:?}"
+        );
+    }
+}
+
+/// The sentence is a function of the request's offending member and of the enumerated type
+/// alone: whatever ELSE the read carries — the page members at their published bounds, a
+/// resumption token, the registry identifier in either admitted form — and whatever the
+/// store holds for the registry named there, including a registry it holds no record for
+/// and one it does not hold at all, the clause and its set do not move.
+#[tokio::test]
+async fn the_set_does_not_move_with_the_rest_of_the_request_or_with_the_store() {
+    let router = seeded_router();
+    let offending = json!([filter("no-such-filter-name")]);
+    // A registry identifier the model admits (12..16 alphanumerics) that the store does
+    // not hold, so the refusal cannot be read off what was seeded.
+    let absent_registry = "norecordsreg01";
+    // The identifier's other admitted form: the registry's ARN.
+    let arn_form = owner::registry_arn(REGION, REGISTRY);
+    // (case, the registry the path names, the body).
+    let cases: [(&str, &str, Value); 6] = [
+        (
+            "the offending filter alone",
+            REGISTRY,
+            json!({ "filters": offending }),
+        ),
+        (
+            "beside maxResults at its published minimum",
+            REGISTRY,
+            json!({ "filters": offending, "maxResults": 1 }),
+        ),
+        (
+            "beside maxResults at its published maximum",
+            REGISTRY,
+            json!({ "filters": offending, "maxResults": 100 }),
+        ),
+        (
+            "beside a resumption token and a page size",
+            REGISTRY,
+            json!({ "filters": offending, "maxResults": 20, "nextToken": "cGFnZQ" }),
+        ),
+        (
+            "a registry that holds no discoverable record",
+            EMPTY_REGISTRY,
+            json!({ "filters": offending }),
+        ),
+        (
+            "a registry the store does not hold",
+            absent_registry,
+            json!({ "filters": offending }),
+        ),
+    ];
+
+    let expected = expected_sentence(&[1]);
+    for (case, registry, body) in cases {
+        let (status, response) = list_of(&router, registry, &body).await;
+        assert_eq!(
+            status, 400,
+            "case {case:?}: expected 400, got {status}: {response}"
+        );
+        let actual = stated(&response);
+        assert_eq!(
+            actual, expected,
+            "case {case:?}: expected {expected:?}, got {actual:?}"
+        );
+    }
+
+    // The same read addressed by the identifier's ARN form.
+    let case = "the registry named by its ARN";
+    let (status, response) = list_of(&router, &arn_form, &json!({ "filters": offending })).await;
+    assert_eq!(
+        status, 400,
+        "case {case:?}: expected 400, got {status}: {response}"
+    );
+    let actual = stated(&response);
+    assert_eq!(
+        actual, expected,
+        "case {case:?}: expected {expected:?}, got {actual:?}"
+    );
 }
