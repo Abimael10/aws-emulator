@@ -25,7 +25,11 @@
 //!   are addressed for — on the create, on the modify and on the read back, and a request
 //!   naming a subnet the account does not hold, or subnets of two VPCs, is refused with
 //!   nothing written. Those rows mount Amazon EC2 beside this service on ONE engine, so
-//!   every subnet id in them is one EC2 minted.
+//!   every subnet id in them is one EC2 minted;
+//! * a subnet group's subnets must cover at least two of the Region's Availability Zones:
+//!   a list covering fewer is refused with the modelled
+//!   `DBSubnetGroupDoesNotCoverEnoughAZs` naming the coverage those subnets add up to, on
+//!   the create and on the modify, with nothing written either way.
 
 use service_com_amazonaws_docdb_amazonrdsv19::state;
 
@@ -33,9 +37,11 @@ use crate::cluster_lifecycle::{
     count, error_code, let_the_clock_catch_up, opt_text, text, texts, Docdb, REGION,
 };
 
-/// The two subnets a well-formed group needs; see
-/// `state::MIN_SUBNETS_PER_SUBNET_GROUP` for the rule and why the count is what this
-/// emulator can hold it to.
+/// The two subnets a well-formed group needs. These identifiers name no subnet of any
+/// account: the rows that use them mount this service ALONE, where the owner of subnets
+/// cannot be asked, so they stand for subnets whose zones are unknown rather than for
+/// subnets of a known zone (the Availability-Zone coverage rows below mount Amazon EC2 and
+/// use ids it minted).
 const SUBNET_A: &str = "subnet-0aaaaaaaaaaaaaaa1";
 const SUBNET_B: &str = "subnet-0bbbbbbbbbbbbbbb2";
 const SUBNET_C: &str = "subnet-0ccccccccccccccc3";
@@ -1303,6 +1309,278 @@ fn the_network_types_a_group_offers_follow_from_its_subnets_address_families() {
         assert_eq!(
             offered, expected,
             "case {case:?}: expected {expected:?}, got {offered:?}"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The Availability Zones a group's subnets have to add up to
+// ---------------------------------------------------------------------------
+
+/// The `DBSubnetGroupDoesNotCoverEnoughAZs` sentence pair for `coverage`, written here from
+/// AWS's own template rather than from the handler's helper: the fixed text around the
+/// zones the request's subnets COVER, comma-separated in zone order, and the number of
+/// zones a group must cover.
+fn expected_az_coverage_message(coverage: &[&str]) -> String {
+    format!(
+        "The DB subnet group doesn't meet Availability Zone (AZ) coverage requirement. \
+         Current AZ coverage: {}. Add subnets to cover at least {} AZs.",
+        coverage.join(", "),
+        state::MIN_SUBNET_GROUP_AVAILABILITY_ZONES
+    )
+}
+
+/// `CreateDBSubnetGroup`: "subnet groups must contain at least one subnet in at least two
+/// Availability Zones in the Amazon Web Services Region." A list whose subnets cover fewer
+/// is the modelled `DBSubnetGroupDoesNotCoverEnoughAZs`, whose message names the zones those
+/// subnets DO cover — read off the service that owns subnets — and nothing is stored; a list
+/// that covers two or more is accepted.
+///
+/// The rows differ along what the rule generalises over: how many subnets share the one
+/// zone, which zone of the Region that is, whether a subnet is named twice, and — on the
+/// accepted side — how many subnets and zones the group spans and in which order they are
+/// named. Every zone named in an expectation is one EC2 reported for the subnet, so no value
+/// here is one this service could have invented.
+#[tokio::test]
+async fn a_group_whose_subnets_cover_one_zone_is_refused_naming_that_coverage() {
+    let net = Network::new();
+    let zones = net.zones().await;
+
+    let vpc = net.vpc("10.69.0.0/16", None).await;
+    // Three subnets of the Region's FIRST zone, two of its second, one of its third: enough
+    // to build a list of any width inside one zone, and lists spanning two or three.
+    let first_a = net.subnet(&vpc, "10.69.1.0/24", &zones[0], None).await;
+    let first_b = net.subnet(&vpc, "10.69.2.0/24", &zones[0], None).await;
+    let first_c = net.subnet(&vpc, "10.69.3.0/24", &zones[0], None).await;
+    let second_a = net.subnet(&vpc, "10.69.4.0/24", &zones[1], None).await;
+    let second_b = net.subnet(&vpc, "10.69.5.0/24", &zones[1], None).await;
+    let third_a = net.subnet(&vpc, "10.69.6.0/24", &zones[2], None).await;
+
+    // (case, the subnets the request names, the zones the refusal must name)
+    let refused: [(&str, Vec<String>, Vec<String>); 6] = [
+        (
+            "two subnets of the first zone",
+            vec![first_a.clone(), first_b.clone()],
+            vec![net.zone_of(&first_a).await],
+        ),
+        (
+            "three subnets of the first zone",
+            vec![first_a.clone(), first_b.clone(), first_c.clone()],
+            vec![net.zone_of(&first_a).await],
+        ),
+        (
+            "a single subnet",
+            vec![first_a.clone()],
+            vec![net.zone_of(&first_a).await],
+        ),
+        (
+            // One subnet named twice is one subnet, so it covers the one zone it lies in.
+            "the same subnet twice",
+            vec![first_a.clone(), first_a.clone()],
+            vec![net.zone_of(&first_a).await],
+        ),
+        (
+            // Another zone of the Region: the coverage the message names comes from the
+            // subnets, not from a zone written into the service.
+            "two subnets of the second zone",
+            vec![second_a.clone(), second_b.clone()],
+            vec![net.zone_of(&second_a).await],
+        ),
+        (
+            "a single subnet of the third zone",
+            vec![third_a.clone()],
+            vec![net.zone_of(&third_a).await],
+        ),
+    ];
+
+    for (index, (case, subnets, coverage)) in refused.iter().enumerate() {
+        let name = format!("one-zone-{index}");
+        let members = group_members(&name, Some("a group inside one zone"), subnets);
+        let reply = net
+            .docdb
+            .call("CreateDBSubnetGroup", &borrowed(&members))
+            .await;
+        assert_eq!(
+            (reply.status, error_code(&reply.xml).as_str()),
+            // The model's `awsQueryError` code for the fault.
+            (400, "DBSubnetGroupDoesNotCoverEnoughAZs"),
+            "case {case:?}: expected 400 DBSubnetGroupDoesNotCoverEnoughAZs, got {} with {}",
+            reply.status,
+            reply.xml
+        );
+        let named: Vec<&str> = coverage.iter().map(String::as_str).collect();
+        assert_eq!(
+            text(&reply.xml, "Message"),
+            expected_az_coverage_message(&named),
+            "case {case:?}: the refusal names the coverage these subnets add up to, got {}",
+            reply.xml
+        );
+
+        let stored = net
+            .docdb
+            .call("DescribeDBSubnetGroups", &[("DBSubnetGroupName", &name)])
+            .await;
+        assert_eq!(
+            (stored.status, error_code(&stored.xml).as_str()),
+            (404, "DBSubnetGroupNotFoundFault"),
+            "case {case:?}: a refused create must store nothing, got {} with {}",
+            stored.status,
+            stored.xml
+        );
+    }
+
+    // The positive control: a list covering two or more zones is accepted, reports the
+    // subnets it named and the zones EC2 holds for them, and reads back the same. Every
+    // subnet of this VPC is addressed in IPv4 alone, so every row offers `IPV4`; which
+    // network types a group offers is the sibling rows' rule, not this one's.
+    let accepted: [(&str, Vec<String>); 4] = [
+        (
+            "one subnet in each of two zones",
+            vec![first_a.clone(), second_a.clone()],
+        ),
+        (
+            "two subnets of one zone beside one of another",
+            vec![first_a.clone(), first_b.clone(), second_a.clone()],
+        ),
+        (
+            "three zones, named last to first",
+            vec![third_a.clone(), second_a.clone(), first_a.clone()],
+        ),
+        (
+            "two subnets of the second and third zones",
+            vec![second_b.clone(), third_a.clone()],
+        ),
+    ];
+
+    for (index, (case, subnets)) in accepted.iter().enumerate() {
+        let name = format!("two-zones-{index}");
+        let expected = expected_placement(&net, &vpc, subnets, &["IPV4"]).await;
+        let members = group_members(&name, Some("a group spanning zones"), subnets);
+        let created = net
+            .docdb
+            .ok(case, "CreateDBSubnetGroup", &borrowed(&members))
+            .await;
+        let described = net
+            .docdb
+            .ok(
+                case,
+                "DescribeDBSubnetGroups",
+                &[("DBSubnetGroupName", name.as_str())],
+            )
+            .await;
+        for (reader, xml) in [("create", &created), ("describe", &described)] {
+            assert_eq!(
+                wire_placement(case, xml),
+                expected,
+                "case {case:?} / {reader}: expected the placement EC2 holds for these \
+                 subnets, got {xml}"
+            );
+            assert_eq!(
+                text(xml, "SubnetGroupStatus"),
+                state::SUBNET_GROUP_COMPLETE,
+                "case {case:?} / {reader}: a stored group is complete, got {xml}"
+            );
+        }
+    }
+}
+
+/// The same coverage rule on the modify path: a new list covering fewer than two zones is
+/// refused with the fault naming the coverage it would have had, the stored group is left
+/// exactly as it was, and a list that does cover two is applied.
+///
+/// The rows differ along how many subnets the refused list carries, which single zone they
+/// share, and whether one of them is the subnet the group already holds.
+#[tokio::test]
+async fn a_modify_to_a_one_zone_list_is_refused_and_changes_nothing() {
+    let net = Network::new();
+    let zones = net.zones().await;
+
+    let vpc = net.vpc("10.70.0.0/16", None).await;
+    let first_a = net.subnet(&vpc, "10.70.1.0/24", &zones[0], None).await;
+    let first_b = net.subnet(&vpc, "10.70.2.0/24", &zones[0], None).await;
+    let second_a = net.subnet(&vpc, "10.70.3.0/24", &zones[1], None).await;
+    let second_b = net.subnet(&vpc, "10.70.4.0/24", &zones[1], None).await;
+    let third_a = net.subnet(&vpc, "10.70.5.0/24", &zones[2], None).await;
+
+    // (case, the new list the modify names, the zones the refusal must name)
+    let refused: [(&str, Vec<String>, Vec<String>); 4] = [
+        (
+            "both subnets in the zone the group already covers",
+            vec![first_a.clone(), first_b.clone()],
+            vec![net.zone_of(&first_a).await],
+        ),
+        (
+            "a single subnet",
+            vec![second_a.clone()],
+            vec![net.zone_of(&second_a).await],
+        ),
+        (
+            "two subnets of the second zone",
+            vec![second_a.clone(), second_b.clone()],
+            vec![net.zone_of(&second_a).await],
+        ),
+        (
+            "the same subnet named twice",
+            vec![third_a.clone(), third_a.clone()],
+            vec![net.zone_of(&third_a).await],
+        ),
+    ];
+
+    for (index, (case, subnets, coverage)) in refused.iter().enumerate() {
+        let name = format!("modify-one-zone-{index}");
+        let held = vec![first_a.clone(), second_a.clone()];
+        let seed = group_members(&name, Some("a group spanning two zones"), &held);
+        net.docdb
+            .ok(case, "CreateDBSubnetGroup", &borrowed(&seed))
+            .await;
+
+        let members = group_members(&name, None, subnets);
+        let reply = net
+            .docdb
+            .call("ModifyDBSubnetGroup", &borrowed(&members))
+            .await;
+        assert_eq!(
+            (reply.status, error_code(&reply.xml).as_str()),
+            (400, "DBSubnetGroupDoesNotCoverEnoughAZs"),
+            "case {case:?}: expected 400 DBSubnetGroupDoesNotCoverEnoughAZs, got {} with {}",
+            reply.status,
+            reply.xml
+        );
+        let named: Vec<&str> = coverage.iter().map(String::as_str).collect();
+        assert_eq!(
+            text(&reply.xml, "Message"),
+            expected_az_coverage_message(&named),
+            "case {case:?}: the refusal names the coverage the new list adds up to, got {}",
+            reply.xml
+        );
+
+        let described = net
+            .docdb
+            .ok(
+                case,
+                "DescribeDBSubnetGroups",
+                &[("DBSubnetGroupName", name.as_str())],
+            )
+            .await;
+        assert_eq!(
+            texts(&described, "SubnetIdentifier"),
+            held,
+            "case {case:?}: a refused modify changes nothing, got {described}"
+        );
+
+        // And a list that does cover two zones is applied to that same group, so the
+        // refusals above are about the coverage rather than about the group.
+        let widened = vec![first_b.clone(), third_a.clone()];
+        let expected = expected_placement(&net, &vpc, &widened, &["IPV4"]).await;
+        let members = group_members(&name, None, &widened);
+        let modified = net
+            .docdb
+            .ok(case, "ModifyDBSubnetGroup", &borrowed(&members))
+            .await;
+        assert_eq!(
+            wire_placement(case, &modified),
+            expected,
+            "case {case:?}: a list covering two zones is applied, got {modified}"
         );
     }
 }

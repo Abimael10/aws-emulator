@@ -2,7 +2,8 @@
 
 //! @op CreateDBSubnetGroup
 //! IMPLEMENTED: this operation resolves every `SubnetIds` member against the service that
-//! OWNS subnets (`crate::state::ec2_subnets`), then inserts a subnet-group record into this
+//! OWNS subnets (`crate::state::ec2_subnets`), holds the resolved list to covering at least
+//! two of the Region's Availability Zones, then inserts a subnet-group record into this
 //! service's state, keyed by the lowercased `DBSubnetGroupName`, and answers with the stored
 //! record — including the placement EC2 answered with (the VPC, each subnet's Availability
 //! Zone and the network types the subnets are addressed for). The group is what
@@ -199,8 +200,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // The subnets, in request order and without repeats: a subnet named twice is one
-        // subnet, and the Availability Zone rule below counts subnets, not mentions. The
-        // `seen` set keeps the de-duplication linear in the (already bounded) count.
+        // subnet, and the Availability Zone rule below counts the zones those subnets lie
+        // in, not mentions. The `seen` set keeps the de-duplication linear in the (already
+        // bounded) count.
         let mut seen: ::std::collections::BTreeSet<String> = ::std::collections::BTreeSet::new();
         let mut subnet_ids: Vec<String> = Vec::with_capacity(input.subnet_ids.len());
         for subnet in input.subnet_ids {
@@ -240,19 +242,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // "subnet groups must contain at least one subnet in at least two Availability
-        // Zones"; see `docdb::MIN_SUBNETS_PER_SUBNET_GROUP` for the floor the request itself
-        // settles.
-        if subnet_ids.len() < docdb::MIN_SUBNETS_PER_SUBNET_GROUP {
+        // Zones": the coverage is counted over the zones the owner of subnets reports for
+        // the subnets this request names, and the refusal states the coverage they add up
+        // to (`docdb::zone_coverage_shortfall`). Nothing is written.
+        if let Some(message) = docdb::zone_coverage_shortfall(&subnet_ids, &resolved) {
             return Err(
                 CreateDBSubnetGroupErrorModeled::DBSubnetGroupDoesNotCoverEnoughAZs(
                     DBSubnetGroupDoesNotCoverEnoughAZs {
-                        message: Some(format!(
-                            "DB subnet group '{}' must contain at least \
-                             {} subnets covering at least two Availability Zones, got {}",
-                            input.db_subnet_group_name,
-                            docdb::MIN_SUBNETS_PER_SUBNET_GROUP,
-                            subnet_ids.len()
-                        )),
+                        message: Some(message),
                     },
                 )
                 .into(),

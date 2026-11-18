@@ -193,7 +193,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // The subnets, in request order and without repeats: a subnet named twice is one
-        // subnet, and the Availability Zone rule below counts subnets, not mentions.
+        // subnet, and the Availability Zone rule below counts the zones those subnets lie
+        // in, not mentions.
         let mut seen: ::std::collections::BTreeSet<String> = ::std::collections::BTreeSet::new();
         let mut subnet_ids: Vec<String> = Vec::with_capacity(input.subnet_ids.len());
         for subnet in input.subnet_ids {
@@ -288,19 +289,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // "subnet groups must contain at least one subnet in at least two Availability
-        // Zones" holds for the list a modify names just as for a create's; see
-        // `docdb::MIN_SUBNETS_PER_SUBNET_GROUP`.
-        if subnet_ids.len() < docdb::MIN_SUBNETS_PER_SUBNET_GROUP {
+        // Zones" holds for the list a modify names just as for a create's, and is counted
+        // over the zones the owner of subnets reports for those subnets; see
+        // `docdb::zone_coverage_shortfall`. A refused modify changes nothing.
+        if let Some(message) = docdb::zone_coverage_shortfall(&subnet_ids, &resolved) {
             return Err(
                 ModifyDBSubnetGroupErrorModeled::DBSubnetGroupDoesNotCoverEnoughAZs(
                     DBSubnetGroupDoesNotCoverEnoughAZs {
-                        message: Some(format!(
-                            "DB subnet group '{}' must contain at least \
-                             {} subnets covering at least two Availability Zones, got {}",
-                            input.db_subnet_group_name,
-                            docdb::MIN_SUBNETS_PER_SUBNET_GROUP,
-                            subnet_ids.len()
-                        )),
+                        message: Some(message),
                     },
                 )
                 .into(),

@@ -80,6 +80,40 @@ pub fn invalid_subnets_message(subnet_ids: &[String]) -> String {
     )
 }
 
+/// The Availability Zones the subnets of one subnet group have to add up to:
+/// `CreateDBSubnetGroup` states it — "subnet groups must contain at least one subnet in at
+/// least two Availability Zones in the Amazon Web Services Region" — and
+/// `DBSubnetGroupDoesNotCoverEnoughAZs` is the fault for a list that covers fewer.
+///
+/// The requirement's own exception ("unless there is only one Availability Zone") never
+/// applies here: every Region this emulator reports zones for offers at least three
+/// ([`::service_common::aws_availability_zones`]), so there is no Region a one-zone group
+/// could be the whole of.
+pub const MIN_SUBNET_GROUP_AVAILABILITY_ZONES: usize = 2;
+
+/// What a `SubnetIds` list covering too few Availability Zones is refused with: AWS states
+/// the requirement, then the coverage the request's own subnets add up to, then what to do
+/// about it.
+///
+/// The variable part is the zones those subnets COVER — read off the records the owner of
+/// subnets answered with, named once each and in zone order — so a list of two subnets of
+/// one zone names that one zone, and a request whose subnets this service knows no zone for
+/// names none. The sibling view of this same front door
+/// (`services/service-com-amazonaws-rds-amazonrdsv19/src/state.rs`) fills the same template
+/// the same way.
+pub fn az_coverage_message(covered: &BTreeSet<String>) -> String {
+    let coverage = covered
+        .iter()
+        .map(String::as_str)
+        .collect::<Vec<&str>>()
+        .join(", ");
+    format!(
+        "The DB subnet group doesn't meet Availability Zone (AZ) coverage requirement. \
+         Current AZ coverage: {coverage}. Add subnets to cover at least \
+         {MIN_SUBNET_GROUP_AVAILABILITY_ZONES} AZs."
+    )
+}
+
 /// What a `SubnetIds` list whose subnets do not all lie in ONE VPC is refused with: the
 /// sentence the `InvalidSubnet` fault states for that condition itself, which carries no
 /// identifier of its own — the condition is about the list, not about one subnet of it.
@@ -263,6 +297,40 @@ impl ResolvedSubnets {
             .collect()
     }
 
+    /// The zone EC2 reports the subnet `subnet_id` lies in, or `None` where it answered for
+    /// no such subnet or named no zone for it.
+    #[must_use]
+    pub fn zone_of(&self, subnet_id: &str) -> Option<&str> {
+        self.get(subnet_id)?.availability_zone.as_deref()
+    }
+
+    /// The zones `subnet_ids` COVER: the distinct zones of the subnets among them EC2 named
+    /// a zone for, in zone order.
+    ///
+    /// A subnet lies in exactly ONE zone, so two subnets of one zone cover one zone and two
+    /// subnets of two zones cover two — which is what makes this a count of coverage rather
+    /// than of subnets.
+    #[must_use]
+    pub fn covered_zones(&self, subnet_ids: &[String]) -> BTreeSet<String> {
+        subnet_ids
+            .iter()
+            .filter_map(|subnet_id| self.zone_of(subnet_id).map(str::to_string))
+            .collect()
+    }
+
+    /// How many DISTINCT identifiers among `subnet_ids` this service knows no zone for,
+    /// because EC2 answered for no such subnet or was never reached at all.
+    #[must_use]
+    pub fn zones_unknown(&self, subnet_ids: &[String]) -> usize {
+        subnet_ids
+            .iter()
+            .map(String::as_str)
+            .collect::<BTreeSet<&str>>()
+            .into_iter()
+            .filter(|subnet_id| self.zone_of(subnet_id).is_none())
+            .count()
+    }
+
     /// The network types a group holding `subnet_ids` supports; see
     /// [`group_network_types`], which states the rule.
     ///
@@ -285,6 +353,36 @@ impl ResolvedSubnets {
             resolved.iter().all(|subnet| subnet.has_ipv6_cidr),
         )
     }
+}
+
+/// The refusal a `SubnetIds` list earns when its subnets cover fewer Availability Zones
+/// than a subnet group must ([`MIN_SUBNET_GROUP_AVAILABILITY_ZONES`]), or `None` when they
+/// cover enough — whichever operation carries the list.
+///
+/// A subnet lies in exactly ONE zone and WHICH zone is the owner of subnets' fact, so the
+/// coverage is counted over the zones `resolved` carries for the request's own subnets: a
+/// subnet named twice is one subnet and two subnets of one zone are one zone's worth of
+/// coverage. The refusal NAMES the coverage those subnets add up to, which is the same
+/// placement the group would have reported.
+///
+/// An identifier this service knows no zone for lies in a zone that may be any of the
+/// Region's, which is not evidence that the list covers too few: it counts as a zone of its
+/// own, so nothing is refused on an assumed placement and a deployment where the owner of
+/// subnets cannot be asked at all refuses nothing on that silence.
+///
+/// Comes after the list has been held to naming subnets the account HOLDS, all of one VPC:
+/// coverage is a statement about subnets that are there.
+#[must_use]
+pub fn zone_coverage_shortfall(
+    subnet_ids: &[String],
+    resolved: &ResolvedSubnets,
+) -> Option<String> {
+    let covered = resolved.covered_zones(subnet_ids);
+    let unknown = resolved.zones_unknown(subnet_ids);
+    if covered.len().saturating_add(unknown) >= MIN_SUBNET_GROUP_AVAILABILITY_ZONES {
+        return None;
+    }
+    Some(az_coverage_message(&covered))
 }
 
 /// Every identifier in `subnet_ids` the account has a subnet for, in `region`, as EC2

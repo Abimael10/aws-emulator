@@ -23,7 +23,8 @@ use std::time::{Duration, Instant};
 pub mod ec2_subnets;
 
 pub use ec2_subnets::{
-    group_network_types, invalid_subnets_message, resolve_subnets, ResolvedSubnet, ResolvedSubnets,
+    az_coverage_message, group_network_types, invalid_subnets_message, resolve_subnets,
+    zone_coverage_shortfall, ResolvedSubnet, ResolvedSubnets, MIN_SUBNET_GROUP_AVAILABILITY_ZONES,
     NETWORK_TYPE_DUAL, NETWORK_TYPE_IPV4, SUBNETS_NOT_IN_ONE_VPC_MESSAGE,
 };
 
@@ -222,12 +223,11 @@ pub const MAX_SUBNET_GROUP_NAME_LEN: usize = 255;
 /// `DeleteDBSubnetGroupMessage$DBSubnetGroupName` both state it: "Must not be default".
 pub const RESERVED_SUBNET_GROUP_NAME: &str = "default";
 
-/// `CreateDBSubnetGroup`: "subnet groups must contain at least one subnet in at least two
-/// Availability Zones in the Amazon Web Services Region."
-///
-/// Fewer than this many distinct subnets cannot cover two zones whatever zones they lie in,
-/// so this is the floor the request itself settles, checked before any subnet is resolved.
-pub const MIN_SUBNETS_PER_SUBNET_GROUP: usize = 2;
+// "subnet groups must contain at least one subnet in at least two Availability Zones in the
+// Amazon Web Services Region" is a statement about the ZONES the request's subnets lie in,
+// so it lives beside the resolution that learns them:
+// `ec2_subnets::MIN_SUBNET_GROUP_AVAILABILITY_ZONES` states the requirement and
+// `ec2_subnets::zone_coverage_shortfall` applies it.
 
 /// `DBSubnetGroup$SubnetGroupStatus` for a group whose subnets are all usable.
 pub const SUBNET_GROUP_COMPLETE: &str = "Complete";
