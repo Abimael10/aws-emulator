@@ -66,13 +66,13 @@ const HOSTED: &str = "hosted";
 const ALL_AT_ONCE: &str = "AppConfig.AllAtOnce";
 
 /// The names the hierarchy is created under.
-const APPLICATION_NAME: &str = "orders-flags";
-const ENVIRONMENT_NAME: &str = "production";
-const PROFILE_NAME: &str = "backend-rollout";
+pub(crate) const APPLICATION_NAME: &str = "orders-flags";
+pub(crate) const ENVIRONMENT_NAME: &str = "production";
+pub(crate) const PROFILE_NAME: &str = "backend-rollout";
 
 /// The document the deployment puts in force: the flag document a feature-flagged handler
 /// branches on.
-const DEPLOYED: &[u8] = br#"{"useNewBackend": true}"#;
+pub(crate) const DEPLOYED: &[u8] = br#"{"useNewBackend": true}"#;
 
 /// The media type the documents here are written and served with.
 const JSON_CONTENT_TYPE: &str = "application/json";
@@ -89,7 +89,7 @@ const HANDLER_WRITTEN: &[u8] = &[0xff, 0x00, 0x7b, 0x22, 0x61, 0x22, 0x7d, 0x80]
 
 /// The modelled refusal AppConfig answers for an identifier that names nothing
 /// (`ResourceNotFoundException`, HTTP 404 in both models).
-const NOT_FOUND: &str = "ResourceNotFoundException";
+pub(crate) const NOT_FOUND: &str = "ResourceNotFoundException";
 
 /// The fallback document the handler serves when it cannot reach AppConfig at all.
 fn fallback() -> Value {
@@ -99,7 +99,7 @@ fn fallback() -> Value {
 /// Lambda, the AppConfig control plane and the AppConfig data plane over ONE shared engine, as
 /// `core/router/src/lib.rs` mounts them: the handler's SDK call is dispatched back into this
 /// same router, so the configuration it reads is the configuration this suite deployed.
-fn emulator() -> MultiServiceRouter {
+pub(crate) fn emulator() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
@@ -125,15 +125,15 @@ fn authorization(service: &str) -> String {
 }
 
 /// What one dispatched request answered.
-struct Answered {
-    status: u16,
-    headers: http::HeaderMap,
-    body: bytes::Bytes,
+pub(crate) struct Answered {
+    pub(crate) status: u16,
+    pub(crate) headers: http::HeaderMap,
+    pub(crate) body: bytes::Bytes,
 }
 
 impl Answered {
     /// The body as JSON, or `Value::Null` for an empty body.
-    fn json(&self) -> Value {
+    pub(crate) fn json(&self) -> Value {
         if self.body.is_empty() {
             return Value::Null;
         }
@@ -142,12 +142,12 @@ impl Answered {
     }
 
     /// The body text, for a failure message.
-    fn text(&self) -> String {
+    pub(crate) fn text(&self) -> String {
         String::from_utf8_lossy(&self.body).to_string()
     }
 
     /// One response header, as text.
-    fn header(&self, name: &str) -> Option<String> {
+    pub(crate) fn header(&self, name: &str) -> Option<String> {
         self.headers
             .get(name)
             .and_then(|value| value.to_str().ok())
@@ -198,7 +198,7 @@ async fn dispatch(
 }
 
 /// One Lambda `restJson1` call.
-async fn lambda(router: &MultiServiceRouter, method: &str, uri: &str, body: &[u8]) -> Answered {
+pub(crate) async fn lambda(router: &MultiServiceRouter, method: &str, uri: &str, body: &[u8]) -> Answered {
     dispatch(router, "lambda", method, uri, JSON_CONTENT_TYPE, &[], body).await
 }
 
@@ -215,7 +215,7 @@ async fn control_plane(
 }
 
 /// One AppConfig DATA-plane call, as a client makes one.
-async fn data_plane(
+pub(crate) async fn data_plane(
     router: &MultiServiceRouter,
     method: &str,
     uri: &str,
@@ -262,10 +262,10 @@ fn minted_id(case: &str, created: &Value) -> String {
 }
 
 /// The AppConfig hierarchy this suite deploys into, as the control plane minted it.
-struct Hierarchy {
-    application_id: String,
-    environment_id: String,
-    profile_id: String,
+pub(crate) struct Hierarchy {
+    pub(crate) application_id: String,
+    pub(crate) environment_id: String,
+    pub(crate) profile_id: String,
     /// The version number of the JSON document the deployment put in force.
     deployed_version: i64,
     /// The version number of the binary document, which is stored but never deployed.
@@ -275,7 +275,7 @@ struct Hierarchy {
 /// Create the application, environment and hosted configuration profile, write the two
 /// hosted configuration versions, and deploy the JSON one — all through AppConfig's own
 /// operations, exactly as a client sets a configuration up.
-async fn deployed_hierarchy(router: &MultiServiceRouter) -> Hierarchy {
+pub(crate) async fn deployed_hierarchy(router: &MultiServiceRouter) -> Hierarchy {
     let case = "the hierarchy the handler reads";
     let application = served(
         router,
@@ -479,7 +479,11 @@ async fn stored_version(
 /// The bytes a CLIENT's own session and poll serve for the deployed configuration — the
 /// control every served row is compared against, so what the handler read is what the data
 /// plane serves and not something the runtime composed.
-async fn client_poll(router: &MultiServiceRouter, case: &str, hierarchy: &Hierarchy) -> Vec<u8> {
+pub(crate) async fn client_poll(
+    router: &MultiServiceRouter,
+    case: &str,
+    hierarchy: &Hierarchy,
+) -> Vec<u8> {
     let session = data_plane(
         router,
         "POST",
