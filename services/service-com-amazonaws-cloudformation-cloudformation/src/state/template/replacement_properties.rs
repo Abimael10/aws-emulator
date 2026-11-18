@@ -42,6 +42,19 @@ pub fn replacement_deletes_first(resource_type: &str) -> bool {
 pub fn replacement_properties(resource_type: &str) -> &'static [&'static str] {
     match resource_type {
         IAM_ACCESS_KEY => &["Serial", "UserName"],
+        // An Amazon Athena SAVED QUERY keeps everything it was saved with: `CreateNamedQuery`
+        // takes the database, the SQL and the workgroup, and the one call that changes a query
+        // afterwards (`UpdateNamedQuery`) takes the query's id with a new name, description and
+        // query string and NO database or workgroup — Athena publishes no call that moves a
+        // saved query to another database or workgroup. So a declaration restating any of them
+        // asks for a DIFFERENT query, which CloudFormation replaces; the resource and property
+        // types reference publishes every property of this type with "Update requires:
+        // Replacement", and a replacement is how this emulator applies a change to one
+        // ([`crate::state::provisioning::athena_resources`]). (Its NAME is in that position
+        // through [`name_is_create_only`].)
+        crate::state::provisioning::athena_resources::ATHENA_NAMED_QUERY => {
+            &["Database", "Description", "QueryString", "WorkGroup"]
+        }
         // A MemoryDB parameter group's engine FAMILY and its description are fixed when
         // Amazon MemoryDB makes it: both are members of `CreateParameterGroup`, and the one
         // call that changes a group afterwards (`UpdateParameterGroup`) takes nothing but

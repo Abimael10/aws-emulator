@@ -220,11 +220,12 @@ pub fn new_named_query_id() -> String {
 
 /// The message a read of a named query no `CreateNamedQuery` minted answers with.
 ///
-/// The form this service words a missing resource in — the one
-/// [`super::query_execution_not_found`] and [`super::notebook_not_found`] use — with the
-/// `NamedQueryId` the CALLER supplied as its one variable part.
+/// Amazon Athena's own wording for this error class: the fixed text is `NamedQuery: ` and
+/// ` does not exist`, and the one variable part is the `NamedQueryId` the CALLER supplied. The
+/// ONE place it is worded, so the read of a single query and the per-id report a batch read
+/// carries for an id it could not resolve say the same thing about the same miss.
 pub fn named_query_not_found(id: &str) -> String {
-    format!("NamedQuery {id} was not found")
+    format!("NamedQuery: {id} does not exist")
 }
 
 /// The refusal message for a create that would take `work_group` past

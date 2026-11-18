@@ -204,10 +204,13 @@ use super::provisioner::{provisioner_for, Provisioner};
 use super::StoredResource;
 
 mod apigateway_rest_api;
-/// The two `AWS::Athena::*` types a stack declares — the workgroup its queries run in and the
-/// data catalog they are routed through: created in Amazon Athena itself
-/// ([`athena_resources`]).
-mod athena_resources;
+/// The three `AWS::Athena::*` types a stack declares — the workgroup its queries run in, the
+/// data catalog they are routed through and the query it saves in that workgroup: created in
+/// Amazon Athena itself ([`athena_resources`]). Visible to the rest of this service's state
+/// because the saved query's own type NAME lives here, beside the arm that provisions it (the
+/// identity in force is the id that create answers, and the properties such a query cannot take
+/// anew are read off the type).
+pub(in crate::state) mod athena_resources;
 /// The two AppSync custom-domain types a stack declares — the domain itself and the mapping
 /// of an API onto it: visible to the rest of this service's state because the types' own
 /// NAMES live here, beside the arms that provision them (the naming rules read the property
@@ -1136,9 +1139,10 @@ pub(super) enum Owner {
     /// instance registered in a service. Which of them it is travels with the owner, as it
     /// does for the types above.
     ServiceDiscovery(service_discovery::Kind),
-    /// One of the two Amazon Athena types [`athena_resources`] creates: the workgroup a stack's
-    /// queries run in, and the data catalog they are routed through. Which of them it is travels
-    /// with the owner, as it does for the types above.
+    /// One of the three Amazon Athena types [`athena_resources`] creates: the workgroup a
+    /// stack's queries run in, the data catalog they are routed through, and the query it saves
+    /// in that workgroup. Which of them it is travels with the owner, as it does for the types
+    /// above.
     Athena(athena_resources::Kind),
 }
 

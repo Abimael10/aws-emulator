@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! `AWS::Athena::WorkGroup` and `AWS::Athena::DataCatalog`: the workgroup a stack declares
-//! queries run in, and the data catalog they are routed through, created in Amazon Athena
-//! itself.
+//! `AWS::Athena::WorkGroup`, `AWS::Athena::DataCatalog` and `AWS::Athena::NamedQuery`: the
+//! workgroup a stack declares queries run in, the data catalog they are routed through, and the
+//! query a stack saves in that workgroup, created in Amazon Athena itself.
 //!
 //! This is the per-type half of provisioning for two resource types, the half
 //! [`super::super::provisioner`] holds for every other type this emulator creates; it lives in
@@ -42,10 +42,21 @@
 //! names: `Description`, `Name`, `Parameters`, `Tags` and the `Type` both the type and the call
 //! declare required.
 //!
+//! `AWS::Athena::NamedQuery`'s properties are `CreateNamedQuery`'s own members under the same
+//! names ([`NAMED_QUERY_PROPERTIES`]): `Database`, `Description`, `Name`, `QueryString` and the
+//! `WorkGroup` the query is saved in. None of them is this resource's identity: Athena MINTS a
+//! `NamedQueryId` for the saved query, which is what the create reports back as the resource's
+//! physical id ([`create_named_query`]) and what every call on one takes — the `Name` a
+//! declaration states is only what the query is called, and a workgroup may hold two queries
+//! under one name. The type publishes no `Tags` property and `CreateNamedQuery` takes no tag
+//! list, so CloudFormation propagates no tag to a saved query.
+//!
 //! A declared property this arm does not apply is REFUSED rather than dropped
 //! ([`refuse_unapplied_properties`]), at the top level and inside the workgroup configuration
 //! alike: a resource reported created with less than its declaration asked for is the shallow
 //! success this arm exists to avoid.
+
+use std::collections::BTreeMap;
 
 use serde_json::{Map, Value};
 
@@ -60,6 +71,12 @@ use crate::state::StoredResource;
 pub(super) const ATHENA_WORK_GROUP: &str = "AWS::Athena::WorkGroup";
 /// See [`ATHENA_WORK_GROUP`].
 pub(super) const ATHENA_DATA_CATALOG: &str = "AWS::Athena::DataCatalog";
+/// See [`ATHENA_WORK_GROUP`]. Visible to the rest of this service's state because more than one
+/// module answers about this type: the identity in force is the `NamedQueryId` Athena minted
+/// ([`crate::state::template::identity_is_service_assigned`]), and the properties a saved query
+/// cannot take anew live beside it
+/// ([`crate::state::template::replacement_properties`]).
+pub(in crate::state) const ATHENA_NAMED_QUERY: &str = "AWS::Athena::NamedQuery";
 
 /// Amazon Athena's signing name, which is what routes the in-process call to its own handlers,
 /// and the service shape an awsJson `X-Amz-Target` names an operation under (that model's
@@ -91,6 +108,8 @@ pub(in crate::state) enum Kind {
     WorkGroup,
     /// `AWS::Athena::DataCatalog`.
     DataCatalog,
+    /// `AWS::Athena::NamedQuery`.
+    NamedQuery,
 }
 
 /// The kind `resource_type` names, or `None` for a type this module does not own.
@@ -98,6 +117,7 @@ pub(super) fn kind_of(resource_type: &str) -> Option<Kind> {
     match resource_type {
         ATHENA_WORK_GROUP => Some(Kind::WorkGroup),
         ATHENA_DATA_CATALOG => Some(Kind::DataCatalog),
+        ATHENA_NAMED_QUERY => Some(Kind::NamedQuery),
         _ => None,
     }
 }
@@ -197,6 +217,24 @@ const DATA_CATALOG_PROPERTIES: &[&str] =
 /// type.
 const DATA_CATALOG_CREATE_MEMBERS: &[&str] = &["Description", "Parameters"];
 
+/// Every property `AWS::Athena::NamedQuery` publishes, which are `CreateNamedQuery`'s own
+/// members under the same names
+/// (`smithy_query(query="operation",operation="CreateNamedQuery")`, less the
+/// `ClientRequestToken` that call mints an idempotency token under, which the TYPE does not
+/// publish). A declared property this list does not carry is one no call here applies, and is
+/// refused rather than dropped.
+const NAMED_QUERY_PROPERTIES: &[&str] =
+    &["Database", "Description", "Name", "QueryString", "WorkGroup"];
+
+/// The members of `CreateNamedQuery` a declaration states under the same names, which for this
+/// type is every property it publishes: the name is a member of the CALL rather than this
+/// resource's identity, so none of them is held back for the identity the create answers with.
+const NAMED_QUERY_CREATE_MEMBERS: &[&str] = NAMED_QUERY_PROPERTIES;
+
+/// The member `CreateNamedQuery` answers the saved query's minted id under, and the member
+/// `GetNamedQuery` and `DeleteNamedQuery` address one by.
+const NAMED_QUERY_ID_MEMBER: &str = "NamedQueryId";
+
 /// The property, and member, naming what kind of catalog it is — required by the type and by
 /// `CreateDataCatalog` and `UpdateDataCatalog` alike, so a declaration stating none describes no
 /// catalog that could be created.
@@ -248,11 +286,12 @@ const BOOLEAN_MEMBERS: &[&str] = &[
 
 /// Create the resource one of these types declares, in Amazon Athena itself — so a client that
 /// deployed the stack can pass `!Ref <workgroup>` straight to `GetWorkGroup` or
-/// `StartQueryExecution`, and `!Ref <catalog>` to `GetDataCatalog` or a metadata read.
+/// `StartQueryExecution`, `!Ref <catalog>` to `GetDataCatalog` or a metadata read, and
+/// `!GetAtt <query>.NamedQueryId` to `GetNamedQuery`.
 ///
 /// `Err` is the owning service's own refusal of the create, which is what the resource fails
 /// with: a name the account already holds, a catalog type it will not take, a parameter set a
-/// catalog of that type does not admit.
+/// catalog of that type does not admit, a workgroup no query can be saved in.
 pub(super) async fn create(
     ctx: &smithy_server_runtime::OperationContext<'_>,
     region: &str,
@@ -263,6 +302,10 @@ pub(super) async fn create(
     match kind {
         Kind::WorkGroup => create_work_group(ctx, region, resource, propagated).await,
         Kind::DataCatalog => create_data_catalog(ctx, region, resource, propagated).await,
+        // A saved query is not taggable: the type publishes no `Tags` property and
+        // `CreateNamedQuery` takes no tag list, so there is no call that could carry one of
+        // the tags CloudFormation propagates to it.
+        Kind::NamedQuery => create_named_query(ctx, region, resource).await,
     }
 }
 
@@ -332,11 +375,56 @@ async fn create_data_catalog(
     Ok(Created::default())
 }
 
+/// Save the query an `AWS::Athena::NamedQuery` declares, and report the `NamedQueryId` Athena
+/// minted for it as this resource's identity.
+///
+/// That id is what `Ref` resolves to and what the type's `NamedQueryId` attribute carries, and
+/// no naming rule could compute it: Athena mints it, a workgroup may hold two queries under one
+/// name, and `GetNamedQuery`, `UpdateNamedQuery` and `DeleteNamedQuery` each address a query by
+/// that id and by nothing else. A create that answered no id would leave the stack publishing a
+/// handle that resolves to nothing, so it is refused rather than reported as a resource created.
+async fn create_named_query(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    resource: &StoredResource,
+) -> Result<Created, Refusal> {
+    refuse_unapplied_properties(
+        &resource.properties,
+        &resource.resource_type,
+        NAMED_QUERY_PROPERTIES,
+    )?;
+    let request = declared_members(&resource.properties, NAMED_QUERY_CREATE_MEMBERS);
+    let answered = call_athena(ctx, region, "CreateNamedQuery", &Value::Object(request)).await?;
+    let named_query_id = answered
+        .get(NAMED_QUERY_ID_MEMBER)
+        .and_then(Value::as_str)
+        .filter(|id| !id.is_empty())
+        .ok_or_else(|| Refusal {
+            code: MISSING_PROPERTY.to_string(),
+            message: format!(
+                "Amazon Athena reported no {NAMED_QUERY_ID_MEMBER} for the named query it saved, \
+                 which is what a reference to this resource resolves to"
+            ),
+        })?
+        .to_string();
+    Ok(Created {
+        physical_resource_id: Some(named_query_id),
+        // The `Id`/`NamedQueryId` attributes this type publishes are read off the identity
+        // above, which the deployment re-points through the one place that step is written
+        // ([`crate::state::template::adopt_identity`]), so none is reported a second time
+        // here.
+        attributes: BTreeMap::new(),
+    })
+}
+
 /// Whether the owning service reports the created resource ready.
 ///
 /// A WORKGROUP is nothing is asked about: it exists from the moment `CreateWorkGroup` answers —
 /// `GetWorkGroup` resolves it and a query can be submitted to it — and the state it is in is the
-/// one its declaration asked for rather than a transient state it settles out of.
+/// one its declaration asked for rather than a transient state it settles out of. A NAMED QUERY
+/// is in that same position: `CreateNamedQuery` answers with the id `GetNamedQuery` already
+/// resolves, and the modelled `NamedQuery` shape publishes no status at all, so there is nothing
+/// a read could wait for.
 ///
 /// A DATA CATALOG publishes a `Status` of its own, and Athena creates one of them
 /// asynchronously: "the `LAMBDA`, `GLUE`, and `HIVE` data catalog types are created
@@ -350,7 +438,7 @@ pub(super) async fn readiness(
     kind: Kind,
     physical_resource_id: &str,
 ) -> Result<Readiness, Refusal> {
-    if kind == Kind::WorkGroup {
+    if kind != Kind::DataCatalog {
         return Ok(Readiness::Ready);
     }
     let mut request = Map::new();
@@ -379,9 +467,9 @@ pub(super) async fn readiness(
 
 /// Whether the owning service has finished removing a deleted resource.
 ///
-/// Nothing is asked: `DeleteWorkGroup` and `DeleteDataCatalog` each take the resource away as
-/// they answer — the catalog's delete answers with the record the registry no longer holds — so
-/// Athena reports no state a removed one is still being deleted in.
+/// Nothing is asked: `DeleteWorkGroup`, `DeleteDataCatalog` and `DeleteNamedQuery` each take the
+/// resource away as they answer — the catalog's delete answers with the record the registry no
+/// longer holds — so Athena reports no state a removed one is still being deleted in.
 pub(super) fn removal() -> Removal {
     Removal::Gone
 }
@@ -409,6 +497,13 @@ pub(super) async fn update(
     match kind {
         Kind::WorkGroup => update_work_group(ctx, region, resource, declared_properties).await,
         Kind::DataCatalog => update_data_catalog(ctx, region, resource, declared_properties).await,
+        // A saved query takes no changed declaration at all: every property of the type is
+        // fixed when the query is saved, so a declaration stating one of them differently asks
+        // for a DIFFERENT query and is carried out by REPLACING the resource
+        // ([`crate::state::template::replacement_properties`] carries the four beside its
+        // name). Reporting a change that reached here as not applied is what keeps such a
+        // deployment from being called a success that left the old query in place.
+        Kind::NamedQuery => Ok(None),
     }
 }
 
@@ -492,7 +587,8 @@ async fn update_data_catalog(
     Ok(Some(Created::default()))
 }
 
-/// Delete the resource a stack created, addressed by the name it was created under.
+/// Delete the resource a stack created, addressed by the identifier it is known by: the name a
+/// workgroup and a data catalog were created under, and the id Athena minted for a saved query.
 ///
 /// A workgroup's delete carries the `RecursiveDeleteOption` its declaration asked for, which is
 /// what releases the named queries and prepared statements the workgroup holds with it.
@@ -514,6 +610,9 @@ pub(super) async fn delete(
             ("DeleteWorkGroup", WORK_GROUP_MEMBER)
         }
         Kind::DataCatalog => ("DeleteDataCatalog", NAME_MEMBER),
+        // A saved query is addressed by the id Athena minted for it, which is this resource's
+        // physical id ([`create_named_query`]).
+        Kind::NamedQuery => ("DeleteNamedQuery", NAMED_QUERY_ID_MEMBER),
     };
     request.insert(
         member.to_string(),
@@ -777,6 +876,11 @@ mod tests {
                 DATA_CATALOG_CREATE_MEMBERS,
                 DATA_CATALOG_PROPERTIES,
             ),
+            (
+                ATHENA_NAMED_QUERY,
+                NAMED_QUERY_CREATE_MEMBERS,
+                NAMED_QUERY_PROPERTIES,
+            ),
         ];
         for (resource_type, sent, published) in rows {
             for member in *sent {
@@ -803,13 +907,14 @@ mod tests {
         }
     }
 
-    /// The two types this module owns are the two it answers for, and nothing else is.
+    /// The three types this module owns are the three it answers for, and nothing else is.
     #[test]
     fn the_kind_is_resolved_from_the_type_name() {
         let rows: &[(&str, Option<Kind>)] = &[
             (ATHENA_WORK_GROUP, Some(Kind::WorkGroup)),
             (ATHENA_DATA_CATALOG, Some(Kind::DataCatalog)),
-            ("AWS::Athena::NamedQuery", None),
+            (ATHENA_NAMED_QUERY, Some(Kind::NamedQuery)),
+            ("AWS::Athena::NamedQuerySomethingElse", None),
             ("AWS::Athena::WorkGroupSomethingElse", None),
         ];
         for (resource_type, expected) in rows {
@@ -1028,6 +1133,55 @@ mod tests {
             Some(&expected),
             "case \"a declaration beside the propagated tags\": expected {expected}, got \
              {request:?}"
+        );
+    }
+
+    /// A named query's declaration reaches `CreateNamedQuery` under that call's own member
+    /// names, every published property included and nothing else added: the id the query is
+    /// known by is the one Athena answers with, so the request carries no identifier at all.
+    /// A property the type does not publish is refused rather than dropped.
+    #[test]
+    fn the_named_query_declaration_is_carried_under_the_api_member_names() {
+        let rows: &[(&str, Value, Value)] = &[
+            (
+                "every published property",
+                serde_json::json!({
+                    "Name": "answer",
+                    "Database": "default",
+                    "Description": "the one row",
+                    "QueryString": "SELECT 1 AS answer",
+                    "WorkGroup": "analytics",
+                }),
+                serde_json::json!({
+                    "Name": "answer",
+                    "Database": "default",
+                    "Description": "the one row",
+                    "QueryString": "SELECT 1 AS answer",
+                    "WorkGroup": "analytics",
+                }),
+            ),
+            (
+                "only the properties a minimal declaration states",
+                serde_json::json!({"Name": "answer", "Database": "db", "QueryString": "SELECT 2"}),
+                serde_json::json!({"Name": "answer", "Database": "db", "QueryString": "SELECT 2"}),
+            ),
+        ];
+        for (case, declared, expected) in rows {
+            let actual = Value::Object(declared_members(declared, NAMED_QUERY_CREATE_MEMBERS));
+            assert_eq!(
+                actual, *expected,
+                "case {case:?}: expected {expected}, got {actual}"
+            );
+        }
+        let unapplied = serde_json::json!({"Name": "answer", "Retention": "forever"});
+        let refusal =
+            refuse_unapplied_properties(&unapplied, ATHENA_NAMED_QUERY, NAMED_QUERY_PROPERTIES)
+                .expect_err("case \"a property the type does not publish\": expected a refusal");
+        assert!(
+            refusal.message.contains("Retention"),
+            "case \"a property the type does not publish\": expected the refusal to name it, \
+             got {:?}",
+            refusal.message
         );
     }
 }

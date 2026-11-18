@@ -2157,6 +2157,16 @@ fn prepared_statements_cursor(work_group: &str, position: usize) -> String {
     format!("statements{CURSOR_SEPARATOR}{work_group}{CURSOR_SEPARATOR}{position}")
 }
 
+/// The cursor a `ListNamedQueries` page hands back: the workgroup whose saved queries it is
+/// listing and the position to resume at.
+///
+/// Scoped by workgroup for the reason the two cursors above are: "provides a list of
+/// available query IDs only for queries saved in the specified workgroup", so a token minted
+/// while listing one workgroup names no page of another's listing.
+fn named_queries_cursor(work_group: &str, position: usize) -> String {
+    format!("namedqueries{CURSOR_SEPARATOR}{work_group}{CURSOR_SEPARATOR}{position}")
+}
+
 /// The cursor a `ListWorkGroups` page hands back: the scope it walked \u2014 the whole
 /// account, since the operation models no member that narrows it \u2014 and the position to
 /// resume at.
@@ -2473,6 +2483,22 @@ impl ComAmazonawsAthenaAmazonathenaState {
     ) -> Option<usize> {
         let cursor = self.page_cursor(token)?;
         cursor_position(&cursor, "statements", work_group)
+    }
+
+    /// The `NextToken` a `ListNamedQueries` page of `work_group` resumed at `position`
+    /// hands back.
+    pub fn named_queries_page_token(&self, work_group: &str, position: usize) -> String {
+        ::hex::encode(
+            self.page_token_key
+                .mint(&named_queries_cursor(work_group, position)),
+        )
+    }
+
+    /// The position `token` resumes a saved-query listing of `work_group` at, or `None` for a
+    /// token this store did not mint for THAT workgroup.
+    pub fn named_queries_page_position(&self, work_group: &str, token: &str) -> Option<usize> {
+        let cursor = self.page_cursor(token)?;
+        cursor_position(&cursor, "namedqueries", work_group)
     }
 
     /// The `NextToken` a `ListWorkGroups` page resumed at `position` hands back.

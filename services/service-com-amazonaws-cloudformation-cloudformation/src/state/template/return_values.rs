@@ -592,6 +592,16 @@ pub fn identity_is_service_assigned(resource_type: &str) -> bool {
             == crate::state::provisioning::application_auto_scaling::APPLICATION_AUTO_SCALING_SCALABLE_TARGET
         || resource_type
             == crate::state::provisioning::application_auto_scaling::APPLICATION_AUTO_SCALING_SCALING_POLICY
+        // An Amazon Athena NAMED QUERY is one more: `CreateNamedQuery` takes the query's
+        // `Name`, the database and the SQL and no identifier of its own, and answers the
+        // `NamedQueryId` Athena minted, which is what "Ref returns the named query ID"
+        // publishes and what `GetNamedQuery`, `UpdateNamedQuery` and `DeleteNamedQuery` each
+        // take — a workgroup may hold two queries under one name, so the declared name could
+        // not stand in for that id
+        // ([`crate::state::provisioning::athena_resources`]). (An `AWS::Athena::WorkGroup` and
+        // an `AWS::Athena::DataCatalog` are NOT: each is created UNDER the name its
+        // declaration states, which is what every Athena call on one takes.)
+        || resource_type == crate::state::provisioning::athena_resources::ATHENA_NAMED_QUERY
         || resource_type == FIS_EXPERIMENT_TEMPLATE
         || resource_type == WAF_REGIONAL_IP_SET
         || resource_type == WAFV2_WEB_ACL

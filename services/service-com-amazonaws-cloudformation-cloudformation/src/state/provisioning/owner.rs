@@ -221,7 +221,9 @@ impl Owner {
             // A workgroup and a data catalog are both taggable: each type publishes a `Tags`
             // property and its create takes that list, so the resource carries the tags
             // CloudFormation gives it beside its own — less the reserved namespace, which
-            // Athena refuses on every public call that takes a tag list.
+            // Athena refuses on every public call that takes a tag list. A SAVED QUERY is not:
+            // it publishes no `Tags` property and `CreateNamedQuery` takes none, so
+            // CloudFormation propagates no tag to one.
             Self::Athena(kind) => {
                 athena_resources::create(ctx, region, kind, resource, propagated).await
             }
@@ -369,9 +371,9 @@ impl Owner {
             // all, so nothing is asked and nothing waits
             // ([`service_discovery::ready`]).
             Self::ServiceDiscovery(_) => Ok(service_discovery::ready()),
-            // A WORKGROUP exists as its create answers and publishes no status at all; a DATA
-            // CATALOG publishes one, and Athena creates a federated catalog asynchronously, so
-            // that arm asks ([`athena_resources::readiness`]).
+            // A WORKGROUP exists as its create answers and publishes no status at all, and so
+            // does a SAVED QUERY; a DATA CATALOG publishes one, and Athena creates a federated
+            // catalog asynchronously, so that arm asks ([`athena_resources::readiness`]).
             Self::Athena(kind) => {
                 athena_resources::readiness(ctx, region, kind, physical_resource_id).await
             }
@@ -455,8 +457,9 @@ impl Owner {
                     .await
             }
             // A workgroup's and a data catalog's identity is the NAME the stack created it
-            // under, and neither type publishes an `Fn::GetAtt` attribute this emulator
-            // carries, so there is nothing to read once either is up.
+            // under, and a saved query's is the id its own create answered with, and none of
+            // the three publishes a further `Fn::GetAtt` attribute this emulator carries, so
+            // there is nothing to read once one is up.
             Self::Athena(_) => Ok(BTreeMap::new()),
             // A task-definition revision's `TaskDefinitionArn` is the one its own
             // registration answered with, so there is nothing left to read once it is up.
@@ -667,8 +670,9 @@ impl Owner {
             // away as they answer, so there is nothing to wait for
             // ([`service_discovery::removal`]).
             Self::ServiceDiscovery(_) => Ok(service_discovery::removal()),
-            // `DeleteWorkGroup` and `DeleteDataCatalog` each take the resource away as they
-            // answer, so there is nothing to wait for ([`athena_resources::removal`]).
+            // `DeleteWorkGroup`, `DeleteDataCatalog` and `DeleteNamedQuery` each take the
+            // resource away as they answer, so there is nothing to wait for
+            // ([`athena_resources::removal`]).
             Self::Athena(_) => Ok(athena_resources::removal()),
         }
     }
@@ -855,7 +859,8 @@ impl Owner {
             // A workgroup takes what `UpdateWorkGroup` carries and a catalog what
             // `UpdateDataCatalog` carries, each addressed by the name it was created under; a
             // declaration that DROPS a value neither call publishes a way to clear reports the
-            // change as not applied ([`athena_resources::update`]).
+            // change as not applied, and so does any change to a SAVED QUERY, every property of
+            // which is fixed when the query is saved ([`athena_resources::update`]).
             Self::Athena(kind) => {
                 athena_resources::update(ctx, region, kind, resource, declared).await
             }
@@ -980,8 +985,8 @@ impl Owner {
             // at all, so nothing is asked about them.
             Self::ServiceDiscovery(_) => Ok(()),
             // The tags of a workgroup or a data catalog that already exists are reconciled by
-            // no arm here yet ([`Provisioner::retag`]'s own default), so nothing is asked about
-            // them.
+            // no arm here yet ([`Provisioner::retag`]'s own default), and a saved query is not
+            // taggable at all, so nothing is asked about them.
             Self::Athena(_) => Ok(()),
         }
     }
@@ -1157,9 +1162,9 @@ impl Owner {
             Self::ServiceDiscovery(kind) => {
                 service_discovery::delete(ctx, region, kind, resource).await
             }
-            // Athena takes no snapshot of a workgroup or a data catalog on the way out: there is
-            // no such call, so a `Snapshot` deletion policy on either deletes the resource with
-            // no snapshot invented for it.
+            // Athena takes no snapshot of a workgroup, a data catalog or a saved query on the
+            // way out: there is no such call, so a `Snapshot` deletion policy on one of them
+            // deletes the resource with no snapshot invented for it.
             Self::Athena(kind) => athena_resources::delete(ctx, region, kind, resource).await,
         }
     }
@@ -1301,11 +1306,11 @@ impl Owner {
             Self::ServiceDiscovery(kind) => {
                 service_discovery::actual_configuration(ctx, region, kind, resource).await?
             }
-            // Neither Athena type reports a configuration of its own to compare yet. Athena
+            // No Athena type here reports a configuration of its own to compare yet. Athena
             // answers one error code for every refusal its reads make, so a read could not tell
             // the resource being GONE from any other refusal of it, and reporting a resource its
             // owning service still holds as deleted would report drift that is not there: this
-            // arm reads nothing back, so neither one's configuration is guessed at.
+            // arm reads nothing back, so no one's configuration is guessed at.
             Self::Athena(_) => return Ok(ActualConfiguration::Unchecked),
         };
         Ok(ActualConfiguration::read(reported))
