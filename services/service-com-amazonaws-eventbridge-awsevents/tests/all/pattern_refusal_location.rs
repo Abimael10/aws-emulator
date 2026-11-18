@@ -261,9 +261,13 @@ fn location_rows() -> Vec<Row> {
             read: r#"{"detail": {"ip": [{"cidr": ""#,
         },
         Row {
+            // An operand that is no TEXT is refused by the plain
+            // string-operand requirement, which the service states for the
+            // first match type that compares text — no block is read out of a
+            // value that is not a string.
             case: "a cidr operand that is not even text",
             pattern: r#"{"detail": {"ip": [{"cidr": 10}]}}"#,
-            reason: "cidr match pattern must be an IPv4 or IPv6 CIDR block",
+            reason: "prefix match pattern must be a string",
             read: r#"{"detail": {"ip": [{"cidr": 10"#,
         },
         // Two wildcard characters in a row, read out of the value's text.

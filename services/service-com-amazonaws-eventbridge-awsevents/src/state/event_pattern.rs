@@ -24,6 +24,15 @@ const IGNORE_CASE: &str = "equals-ignore-case";
 /// The match types that compare one END of a leaf against a string.
 const AFFIX_OPERATORS: [&str; 2] = ["prefix", "suffix"];
 
+/// How a refusal that states the plain string-operand requirement names the
+/// match type it names.
+///
+/// The requirement is one every match type that compares TEXT shares, and the
+/// service states it for the FIRST of them rather than for the match type that
+/// was written wherever the operand is not text at all and no reading of it
+/// was attempted ([`validate_operator`]'s `cidr` arm).
+const FIRST_STRING_OPERATOR: &str = "prefix";
+
 /// How a refusal names the affix match types NEGATED by `anything-but`.
 ///
 /// Both forms are read there by one reader, so the reason it states names the
@@ -34,6 +43,29 @@ const NEGATED_AFFIX: &str = "prefix/suffix";
 /// The operators that take a single string and may also appear nested
 /// inside `anything-but`.
 const STRING_OPERATORS: [&str; 4] = ["prefix", "suffix", IGNORE_CASE, "wildcard"];
+
+/// What `anything-but` negates, as the refusal of a value that is none of
+/// those forms states it.
+///
+/// `anything-but` excludes a VALUE, any value of a list, or whatever one
+/// nested string match type matches, so an operand that is none of these is
+/// not a value it was ever given: the reason names the forms the match type
+/// takes rather than the type the operand that was written must have, because
+/// the reader could not read it as any of them
+/// ([`validate_negated_operator`]).
+const ANYTHING_BUT_VALUE: &str =
+    "Value of anything-but must be an array or single string/number value.";
+
+/// The refusal of a member that is no string, of the LIST the case-folding
+/// match type is handed under `anything-but`.
+///
+/// That list holds the strings the comparison folds, so a member of any other
+/// kind is not one of them: the reason names the list the member sits in, and
+/// the kinds of token that are not strings, rather than the match type's own
+/// pattern — what was read is one member of a list and not the operand itself
+/// ([`validate_negated_operator`]).
+const ANYTHING_BUT_IGNORE_CASE_LIST: &str =
+    "Inside anything-but/equals-ignore-case list, number|start|null|boolean is not supported.";
 
 /// How deeply a pattern may nest objects.
 ///
@@ -122,6 +154,29 @@ const OR_NEEDS_TWO_OBJECTS: &str = "There must have at least 2 Objects in $or re
 /// The character `wildcard` matches any run of characters with.
 const WILDCARD: char = '*';
 
+/// The character that makes the one after it LITERAL inside a `wildcard`
+/// operand.
+///
+/// Only the two characters the operand's own grammar gives a meaning to may be
+/// escaped — the wildcard itself and this character — so an escape of anything
+/// else is a sequence the operand does not define
+/// ([`wildcard_violation`]).
+const ESCAPE: char = '\\';
+
+/// The feature a JSON reader needs for the words JSON cannot spell, as the
+/// refusal of such a word names it.
+///
+/// A pattern carrying `Infinity`, `-Infinity` or `NaN` was written by a
+/// serializer that had the extension enabled, so the refusal names the
+/// extension the reader would need rather than reporting arbitrary unquoted
+/// text ([`unreadable_json`]).
+const ALLOW_NON_NUMERIC_NUMBERS: &str = "JsonReadFeature.ALLOW_NON_NUMERIC_NUMBERS";
+
+/// What a refusal of a `numeric` bound outside the comparison's own numeric
+/// domain states, before the bound as the request wrote it
+/// ([`comparable_numeral`]).
+const CANNOT_COMPARE_NUMBER: &str = "Cannot compare number : ";
+
 /// Which of the two validators this service runs a pattern through is reading
 /// it.
 ///
@@ -193,15 +248,15 @@ fn parse_reason(pattern: &str, validator: Validator) -> Result<Map<String, Value
     let value: Value =
         ::serde_json::from_str(pattern).map_err(|error| unreadable_json(pattern, &error))?;
     let Value::Object(map) = value else {
-        return Err(At::root().refuse(Read::Opening, FILTER_NOT_AN_OBJECT));
+        return Err(At::root(pattern).refuse(Read::Opening, FILTER_NOT_AN_OBJECT));
     };
     if map.is_empty() {
-        return Err(At::root().refuse(
+        return Err(At::root(pattern).refuse(
             Read::Whole,
             "Event pattern must name at least one field",
         ));
     }
-    validate_object(&map, &At::root(), 1, validator)?;
+    validate_object(&map, &At::root(pattern), 1, validator)?;
     Ok(map)
 }
 
@@ -210,10 +265,11 @@ fn parse_reason(pattern: &str, validator: Validator) -> Result<Map<String, Value
 ///
 /// EventBridge refuses a pattern it cannot read with its JSON parser's own
 /// diagnostic rather than with a restatement of the member's type, and the
-/// two readings that diagnostic is built from — the unquoted word a parse
-/// stopped on where a value belongs, and the character or end-of-input it
-/// stopped on otherwise, with what was expected there — are the tree's
-/// shared ones ([`::service_common::json_parse_fault`]), taken from the parse
+/// three readings that diagnostic is built from — the word JSON has no
+/// spelling for that a parse stopped on, the unquoted word it stopped on
+/// where a value belongs, and the character or end-of-input it stopped on
+/// otherwise, with what was expected there — are the tree's shared ones
+/// ([`::service_common::json_parse_fault`]), taken from the parse
 /// that actually ran, so this service and every other one handed the same
 /// text cannot disagree about where it went wrong. A fault class worded
 /// wrongly or missing is corrected THERE, for every service that quotes it.
@@ -225,24 +281,35 @@ fn parse_reason(pattern: &str, validator: Validator) -> Result<Map<String, Value
 fn unreadable_json(pattern: &str, error: &::serde_json::Error) -> Refusal {
     use ::service_common::json_parse_fault as fault;
 
-    // A word where a value belongs is named WHOLE, at the position it
-    // STARTS; every other fault names the character, or the end of the
-    // input, the parse stopped on, and the position is the parse's own.
+    // A word JSON has no spelling for is named as the non-standard token it
+    // is, at the position just PAST it: the reader matches the whole word
+    // before it can say the extension that admits it is off, so that is how
+    // far it had read. A word where a value belongs is named WHOLE, at the
+    // position it STARTS; every other fault names the character, or the end of
+    // the input, the parse stopped on, and the position is the parse's own.
+    if let Some((token, line, column)) = fault::non_numeric_number_token(pattern, error) {
+        return Refusal::parsed(
+            format!(
+                "Non-standard token '{token}': enable `{ALLOW_NON_NUMERIC_NUMBERS}` to allow"
+            ),
+            line,
+            column + token.chars().count(),
+        );
+    }
     match fault::unrecognized_token(pattern, error) {
-        Some((word, line, column)) => Refusal {
-            reason: format!(
+        Some((word, line, column)) => Refusal::parsed(
+            format!(
                 "Unrecognized token '{word}': was expecting ({})",
                 fault::VALUE_CLASSES
             ),
-            spot: Some(Spot::Position { line, column }),
-        },
-        None => Refusal {
-            reason: fault::unexpected_input(pattern, error),
-            spot: Some(Spot::Position {
-                line: error.line(),
-                column: error.column(),
-            }),
-        },
+            line,
+            column,
+        ),
+        None => Refusal::parsed(
+            fault::unexpected_input(pattern, error),
+            error.line(),
+            error.column(),
+        ),
     }
 }
 
@@ -256,6 +323,15 @@ struct Refusal {
     /// Where the reader was when it found that out, and `None` for a reason
     /// the reader did not itself produce ([`Refusal::unplaced`]).
     spot: Option<Spot>,
+    /// How many readers STATED that position.
+    ///
+    /// One, for a refusal the reader that found the fault answers with. A
+    /// refusal about one argument of a LIST a match type was handed passes
+    /// back out through the reader that handed the whole list over, and that
+    /// reader states the position again — the same position, neither reader
+    /// having moved — so the message carries the location clause once for
+    /// each of them ([`Refusal::restated`]).
+    stated: usize,
 }
 
 impl Refusal {
@@ -266,13 +342,33 @@ impl Refusal {
         Self {
             reason: reason.into(),
             spot: None,
+            stated: 1,
+        }
+    }
+
+    /// A refusal the JSON PARSE itself stated, at the position it reports.
+    fn parsed(reason: String, line: usize, column: usize) -> Self {
+        Self {
+            reason,
+            spot: Some(Spot::Position { line, column }),
+            stated: 1,
+        }
+    }
+
+    /// This refusal as the reader ABOVE restates it: the same reason at the
+    /// same position, stated once more.
+    fn restated(self) -> Self {
+        Self {
+            stated: self.stated + 1,
+            ..self
         }
     }
 
     /// The whole message the refusal carries: the opening, the reason, and —
     /// for a reason the reader stated — the source location, which is the
     /// pattern exactly as it was submitted and the line and column of the
-    /// position the reader had reached in it.
+    /// position the reader had reached in it, once for each reader that
+    /// stated it.
     ///
     /// Every part of the location is derived from the request, so the
     /// caller's own text is what it points into: a tool that reads the
@@ -286,10 +382,10 @@ impl Refusal {
             None => opening,
             Some(spot) => {
                 let (line, column) = spot.line_and_column(pattern);
-                format!(
-                    "{opening}\n at [Source: (String)\"{pattern}\"; line: {line}, \
-                     column: {column}]"
-                )
+                let location = format!(
+                    "\n at [Source: (String)\"{pattern}\"; line: {line}, column: {column}]"
+                );
+                format!("{opening}{}", location.repeat(self.stated.max(1)))
             }
         }
     }
@@ -360,29 +456,39 @@ enum Read {
     Whole,
 }
 
-/// Where one step of the validation is: the steps that find this node in the
-/// submitted text.
+/// Where one step of the validation is: the submitted text, and the steps that
+/// find this node in it.
 ///
 /// A node is only ever a POSITION, never a name a reason states: the reasons
 /// this module words name the construct at fault — a match type, or a member
 /// as the pattern spells it — and the location clause the message carries
-/// ([`Refusal::message`]) is what points at the text.
+/// ([`Refusal::message`]) is what points at the text. The text travels with
+/// the node because a reason about a VALUE spells that value back as the
+/// request wrote it ([`Self::written`]), which the parsed tree no longer
+/// knows: a number the parse had to read as a double carries the double's
+/// own spelling and not the caller's.
 #[derive(Debug, Clone)]
-struct At {
+struct At<'a> {
+    /// The pattern as it was submitted.
+    source: &'a str,
     /// The steps from the pattern's root to this node.
     steps: Vec<Step>,
 }
 
-impl At {
+impl<'a> At<'a> {
     /// The pattern as a whole.
-    fn root() -> Self {
-        Self { steps: Vec::new() }
+    fn root(source: &'a str) -> Self {
+        Self {
+            source,
+            steps: Vec::new(),
+        }
     }
 
     /// The value of the member named `key`, whether that member names a field
     /// of the event or a match type and its argument.
     fn key(&self, key: &str) -> Self {
         Self {
+            source: self.source,
             steps: self.then(Step::Key(key.to_string())),
         }
     }
@@ -390,6 +496,7 @@ impl At {
     /// The value of the member this node writes at `nth`.
     fn nth_key(&self, nth: usize) -> Self {
         Self {
+            source: self.source,
             steps: self.then(Step::KeyAt(nth)),
         }
     }
@@ -397,6 +504,7 @@ impl At {
     /// The member of this list at `index`.
     fn index(&self, index: usize) -> Self {
         Self {
+            source: self.source,
             steps: self.then(Step::Index(index)),
         }
     }
@@ -408,6 +516,20 @@ impl At {
         steps
     }
 
+    /// Whether `other` is this very node of the submitted text.
+    fn is(&self, other: &Self) -> bool {
+        self.steps == other.steps
+    }
+
+    /// This node as the submitted text SPELLS it, and `None` when the walk
+    /// cannot follow the steps to it.
+    ///
+    /// A window onto the request's own characters ([`node_at`]), so a reason
+    /// that spells a value back spells back what was sent.
+    fn written(&self) -> Option<&'a str> {
+        node_at(self.source, &self.steps).map(RawValue::get)
+    }
+
     /// Refuse the pattern here, the reader having consumed `read` of this
     /// node.
     fn refuse(&self, read: Read, reason: impl Into<String>) -> Refusal {
@@ -417,6 +539,7 @@ impl At {
                 steps: self.steps.clone(),
                 read,
             }),
+            stated: 1,
         }
     }
 }
@@ -433,6 +556,33 @@ impl At {
 /// ([`offset_in`]). The reading is `serde_json`'s throughout: nothing here
 /// re-scans the document.
 fn offset_of(pattern: &str, steps: &[Step], read: Read) -> Option<usize> {
+    let text = node_at(pattern, steps)?.get();
+    let start = offset_in(pattern, text)?;
+    Some(match read {
+        // Reading the member name that introduces a value consumes the
+        // colon after the name and the value's first character too, so a
+        // refusal about the NAME stands one character into the value.
+        Read::Entered => start + text.chars().next().map_or(0, char::len_utf8),
+        // A string is read as far as its opening quote and an object or a
+        // list as far as its bracket; every other value is a single token,
+        // so reading it at all reads the whole of it.
+        Read::Opening => match text.as_bytes().first() {
+            Some(b'"' | b'{' | b'[') => start + 1,
+            _ => start + text.len(),
+        },
+        Read::Whole => start + text.len(),
+    })
+}
+
+/// The node the walk `steps` names, as the WINDOW onto `pattern` it is, and
+/// `None` when the walk cannot follow the steps.
+///
+/// `serde_json`'s `RawValue` is exactly such a window — a node borrowed from
+/// the text it came from and never re-interpreted — so both what a node is
+/// SPELLED as ([`At::written`]) and where it BEGINS ([`offset_in`]) are read
+/// off the one walk. The reading is `serde_json`'s throughout: nothing here
+/// re-scans the document.
+fn node_at<'a>(pattern: &'a str, steps: &[Step]) -> Option<&'a RawValue> {
     let mut node: &RawValue = ::serde_json::from_str(pattern).ok()?;
     for step in steps {
         node = match step {
@@ -457,22 +607,7 @@ fn offset_of(pattern: &str, steps: &[Step], read: Read) -> Option<usize> {
             }
         };
     }
-    let text = node.get();
-    let start = offset_in(pattern, text)?;
-    Some(match read {
-        // Reading the member name that introduces a value consumes the
-        // colon after the name and the value's first character too, so a
-        // refusal about the NAME stands one character into the value.
-        Read::Entered => start + text.chars().next().map_or(0, char::len_utf8),
-        // A string is read as far as its opening quote and an object or a
-        // list as far as its bracket; every other value is a single token,
-        // so reading it at all reads the whole of it.
-        Read::Opening => match text.as_bytes().first() {
-            Some(b'"' | b'{' | b'[') => start + 1,
-            _ => start + text.len(),
-        },
-        Read::Whole => start + text.len(),
-    })
+    Some(node)
 }
 
 /// The byte offset at which `window` sits inside `text`, or `None` when it is
@@ -645,7 +780,7 @@ fn argument_terms(argument: &Value) -> usize {
 /// sends.
 fn validate_object(
     pattern: &Map<String, Value>,
-    at: &At,
+    at: &At<'_>,
     depth: usize,
     validator: Validator,
 ) -> Result<(), Refusal> {
@@ -738,7 +873,12 @@ fn validate_object(
 /// A term object is a MATCH EXPRESSION, which names one match type: an
 /// object carrying several keys names several ([`ONE_KEY_ONLY`]) and one
 /// carrying none names no match type at all ([`EMPTY_OBJECT`]).
-fn validate_term(term: &Value, member: &str, at: &At) -> Result<(), Refusal> {
+///
+/// Every literal value is admitted, a NUMBER included whichever number it
+/// names: a literal term is matched by VALUE and not by comparison, so it
+/// needs no double to carry it ([`same_value`]) — which is why the numbers the
+/// comparisons refuse are still terms this one admits.
+fn validate_term(term: &Value, member: &str, at: &At<'_>) -> Result<(), Refusal> {
     match term {
         Value::String(_) | Value::Number(_) | Value::Bool(_) | Value::Null => Ok(()),
         Value::Object(map) if map.len() == 1 => {
@@ -746,7 +886,8 @@ fn validate_term(term: &Value, member: &str, at: &At) -> Result<(), Refusal> {
                 .iter()
                 .next()
                 .expect("a single-entry map has a first entry");
-            validate_operator(operator, argument, &at.key(operator))
+            let operand = at.key(operator);
+            validate_operator(operator, argument, &operand, &operand)
         }
         Value::Object(map) if map.is_empty() => Err(at.refuse(Read::Whole, EMPTY_OBJECT)),
         // The reader finds this out on the SECOND match type the object
@@ -761,7 +902,8 @@ fn validate_term(term: &Value, member: &str, at: &At) -> Result<(), Refusal> {
 }
 
 /// The argument an operator takes. `at` locates that ARGUMENT in the
-/// submitted text.
+/// submitted text, and `handed` the whole argument the match type was HANDED,
+/// which is a LIST where the one nested under `anything-but` was given one.
 ///
 /// A match type handed an argument whose TYPE it does not take is refused
 /// with that match type's own sentence — its name, then what its pattern
@@ -769,10 +911,32 @@ fn validate_term(term: &Value, member: &str, at: &At) -> Result<(), Refusal> {
 /// clause the message carries ([`Refusal::message`]) is what points at the
 /// argument, and the sentence `exists` is refused with
 /// ([`EXISTS_NOT_BOOLEAN`]) is worded the same way.
-fn validate_operator(operator: &str, argument: &Value, at: &At) -> Result<(), Refusal> {
+///
+/// The two positions differ for a refusal the match type states once it has
+/// COLLECTED the arguments it compares with rather than while reading each of
+/// them: a value's own type is read as that value is read, so it is reported
+/// there, while the grammar of a `wildcard` operand is read when the match
+/// type is built out of every operand it was handed, which is past the whole
+/// list. They are the same node everywhere a match type takes one argument.
+///
+/// A refusal about ONE argument of such a list is also stated twice, once by
+/// this reader and once by the reader that handed the list over
+/// ([`Refusal::restated`]).
+fn validate_operator(
+    operator: &str,
+    argument: &Value,
+    at: &At<'_>,
+    handed: &At<'_>,
+) -> Result<(), Refusal> {
     // A type the operator does not take is decided from the argument's
     // opening token alone, which is as much of it as the reader had read.
-    let bad = |what: &str| Err(at.refuse(Read::Opening, argument_type_fault(operator, what)));
+    let bad = |what: &str| {
+        Err(operand_refusal(
+            at.refuse(Read::Opening, argument_type_fault(operator, what)),
+            at,
+            handed,
+        ))
+    };
     match operator {
         "exists" => {
             if argument.is_boolean() {
@@ -787,7 +951,10 @@ fn validate_operator(operator: &str, argument: &Value, at: &At) -> Result<(), Re
         "prefix" | "suffix" => match argument {
             Value::String(_) => Ok(()),
             Value::Object(map) if map.len() == 1 => match map.get(IGNORE_CASE) {
-                Some(nested) => validate_operator(IGNORE_CASE, nested, &at.key(IGNORE_CASE)),
+                Some(nested) => {
+                    let folded = at.key(IGNORE_CASE);
+                    validate_operator(IGNORE_CASE, nested, &folded, &folded)
+                }
                 None => bad(A_STRING),
             },
             _ => bad(A_STRING),
@@ -800,39 +967,75 @@ fn validate_operator(operator: &str, argument: &Value, at: &At) -> Result<(), Re
             }
         }
         // A wildcard value is a string whose `*` stands for any run of
-        // characters, and the language admits no two of them in a row.
+        // characters, the language admits no two of them in a row, and a
+        // backslash makes the character after it literal.
+        //
+        // The grammar is read when the match type is BUILT out of every
+        // operand it was handed, so a refusal is stated there: past the whole
+        // of that argument, which is the list where one was given.
         "wildcard" => match argument.as_str() {
-            // Read from the value's own text, so the whole of it had been
-            // read before the refusal.
             Some(text) => wildcard_violation(text)
-                .map_or(Ok(()), |reason| Err(at.refuse(Read::Whole, reason))),
+                .map_or(Ok(()), |reason| Err(handed.refuse(Read::Whole, reason))),
             None => bad(A_STRING),
         },
         "cidr" => match argument.as_str().map(parse_cidr) {
             Some(Ok(_)) => Ok(()),
-            // The mask width is a rule of the CIDR NOTATION, which the
-            // address parser reads out of the block's own text and the
-            // service words for the notation, so what that parser says is
-            // the whole reason and there is no reading position to state.
-            Some(Err(CidrRefusal::MaskNotNarrowerThanTheFamily(reason))) => {
-                Err(Refusal::unplaced(reason))
-            }
+            // A rule of the CIDR NOTATION is read by the address parser out
+            // of the block's own text, and the service words it for the
+            // notation, so what that parser says is the whole reason and
+            // there is no reading position to state.
+            Some(Err(CidrRefusal::Notation(reason))) => Err(Refusal::unplaced(reason)),
             // Text that is no block at all is this operator's own argument
-            // check, worded and placed as every other one is — whether what
-            // was given is a string that names no block or no string at all.
-            Some(Err(CidrRefusal::NotABlock)) | None => bad("an IPv4 or IPv6 CIDR block"),
+            // check, worded and placed as every other one is.
+            Some(Err(CidrRefusal::NotABlock)) => bad("an IPv4 or IPv6 CIDR block"),
+            // An operand that is no TEXT is refused before any block is read
+            // out of it: it is the plain string-operand requirement every
+            // match type that compares text states, and the one the service
+            // words for the first of them ([`FIRST_STRING_OPERATOR`]) — the
+            // block's own notation is not what such an operand is wrong
+            // about.
+            None => Err(at.refuse(
+                Read::Opening,
+                argument_type_fault(FIRST_STRING_OPERATOR, A_STRING),
+            )),
         },
+        // What `anything-but` negates is EXCLUDED by comparison, so a NUMBER
+        // it negates is one the comparison has to be able to carry
+        // ([`comparable_numeral`]), whether it was written out on its own or
+        // as a member of the list. A number of a LIST is converted as that
+        // member is read, so the refusal stands just past it; one written out
+        // on its own is converted where the match type is built out of it,
+        // and that refusal carries no reading position at all
+        // ([`uncomparable_number`]).
         "anything-but" => match argument {
-            Value::String(_) | Value::Number(_) => Ok(()),
+            Value::Number(_) => match uncomparable_number(at) {
+                Some(written) => {
+                    Err(Refusal::unplaced(format!("{CANNOT_COMPARE_NUMBER}{written}")))
+                }
+                None => Ok(()),
+            },
+            Value::String(_) => Ok(()),
             Value::Array(values) if !values.is_empty() => {
-                if values
+                if !values
                     .iter()
                     .all(|value| value.is_string() || value.is_number())
                 {
-                    Ok(())
-                } else {
-                    bad("a list of strings or a list of numbers")
+                    return bad("a list of strings or a list of numbers");
                 }
+                for (index, _) in values
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, value)| value.is_number())
+                {
+                    let member = at.index(index);
+                    if let Some(written) = uncomparable_number(&member) {
+                        return Err(member.refuse(
+                            Read::Whole,
+                            format!("{CANNOT_COMPARE_NUMBER}{written}"),
+                        ));
+                    }
+                }
+                Ok(())
             }
             Value::Object(map) if map.len() == 1 => {
                 let (nested, nested_argument) = map
@@ -855,10 +1058,15 @@ fn validate_operator(operator: &str, argument: &Value, at: &At) -> Result<(), Re
                 match nested_argument {
                     Value::Array(arguments) if !arguments.is_empty() => {
                         arguments.iter().enumerate().try_for_each(|(index, one)| {
-                            validate_negated_operator(nested, one, &nested_at.index(index))
+                            validate_negated_operator(
+                                nested,
+                                one,
+                                &nested_at.index(index),
+                                &nested_at,
+                            )
                         })
                     }
-                    one => validate_negated_operator(nested, one, &nested_at),
+                    one => validate_negated_operator(nested, one, &nested_at, &nested_at),
                 }
             }
             _ => bad("a value, a list of values, or one nested string operator"),
@@ -903,7 +1111,30 @@ fn validate_operator(operator: &str, argument: &Value, at: &At) -> Result<(), Re
                     });
                 };
                 match pair.get(1) {
-                    Some(bound) if bound.is_number() => {}
+                    // A `numeric` comparison is a comparison of DOUBLES, so a
+                    // bound no double carries is one it cannot compare
+                    // against: refused, naming the bound as the request wrote
+                    // it, rather than silently compared as the different
+                    // number the conversion would give
+                    // ([`comparable_numeral`]). The bound is read from the
+                    // submitted TEXT, because that is the spelling the reason
+                    // states and the one whose digits decide the question: a
+                    // parsed number no longer knows them. The whole list of
+                    // pairs is the argument the reader was reading, so the
+                    // position is the one it reports for every other fault
+                    // read out of that list.
+                    Some(Value::Number(bound)) => {
+                        let bound_at = at.index(spelled_at + 1);
+                        let written = bound_at
+                            .written()
+                            .map_or_else(|| bound.to_string(), str::to_string);
+                        if !comparable_numeral(&written) {
+                            return Err(at.refuse(
+                                Read::Whole,
+                                format!("{CANNOT_COMPARE_NUMBER}{written}"),
+                            ));
+                        }
+                    }
                     Some(_) => {
                         return Err(at
                             .index(spelled_at + 1)
@@ -951,14 +1182,78 @@ fn validate_operator(operator: &str, argument: &Value, at: &At) -> Result<(), Re
 /// matcher go on agreeing — and a nested expression naming something else is
 /// refused by the match type that was written, which is the reader that
 /// entered it.
-fn validate_negated_operator(operator: &str, argument: &Value, at: &At) -> Result<(), Refusal> {
-    if AFFIX_OPERATORS.contains(&operator) && !argument.is_string() && !argument.is_object() {
-        return Err(at.refuse(
-            Read::Opening,
-            argument_type_fault(NEGATED_AFFIX, A_STRING),
+///
+/// `handed` is the whole argument the affix form was given, which is a LIST
+/// where it was given one: a refusal about one member of that list is stated
+/// by this reader and by the one that handed the list over
+/// ([`operand_refusal`]).
+///
+/// An operand that is an OBJECT is only one of the forms `anything-but`
+/// negates where the match type under it takes an object — the affix pair's
+/// case-folding form — so any other object is no value `anything-but` admits
+/// at all, and that is what the refusal states ([`ANYTHING_BUT_VALUE`]). A
+/// member of the LIST the case-folding match type was handed is refused for
+/// the list it sits in ([`ANYTHING_BUT_IGNORE_CASE_LIST`]).
+fn validate_negated_operator(
+    operator: &str,
+    argument: &Value,
+    at: &At<'_>,
+    handed: &At<'_>,
+) -> Result<(), Refusal> {
+    if operator == IGNORE_CASE && !at.is(handed) && !argument.is_string() {
+        return Err(operand_refusal(
+            at.refuse(Read::Opening, ANYTHING_BUT_IGNORE_CASE_LIST),
+            at,
+            handed,
         ));
     }
-    validate_operator(operator, argument, at)
+    if let Value::Object(map) = argument {
+        let folds_its_comparison = AFFIX_OPERATORS.contains(&operator)
+            && map.len() == 1
+            && map.contains_key(IGNORE_CASE);
+        if !folds_its_comparison {
+            return Err(at.refuse(Read::Opening, ANYTHING_BUT_VALUE));
+        }
+    }
+    if AFFIX_OPERATORS.contains(&operator) && !argument.is_string() && !argument.is_object() {
+        return Err(operand_refusal(
+            at.refuse(Read::Opening, argument_type_fault(NEGATED_AFFIX, A_STRING)),
+            at,
+            handed,
+        ));
+    }
+    validate_operator(operator, argument, at, handed)
+}
+
+/// `refusal`, as the readers of the operand at `at` state it: once by the
+/// reader that found the fault, and once more by the reader that handed the
+/// whole argument over when that argument is a LIST this operand is only one
+/// member of ([`Refusal::restated`]).
+///
+/// A refusal about one member of a list passes back out through the reader
+/// that collected the list, which states the position it is at as well — the
+/// same position, since neither reader moved — so the message carries the
+/// location clause twice. An argument a match type was handed whole is read
+/// by one reader only and its position is stated once.
+fn operand_refusal(refusal: Refusal, at: &At<'_>, handed: &At<'_>) -> Refusal {
+    if at.is(handed) {
+        refusal
+    } else {
+        refusal.restated()
+    }
+}
+
+/// The number written at `at` as the request SPELLS it, when no comparison of
+/// this language can carry that number ([`comparable_numeral`]) — and `None`
+/// when a double carries it, or when the node is no number of the submitted
+/// text at all.
+///
+/// The spelling is read from the text ([`At::written`]) because that is what
+/// the reason states and what decides the question: a parsed number no longer
+/// knows the digits it was written with. Where the refusal is PLACED is the
+/// caller's to say, because it differs with the form the number was given in.
+fn uncomparable_number<'a>(at: &At<'a>) -> Option<&'a str> {
+    at.written().filter(|written| !comparable_numeral(written))
 }
 
 /// A pattern value as the refusal spells it back: a string as its own text,
@@ -976,16 +1271,134 @@ fn spelled_out(value: &Value) -> String {
 /// A `*` stands for any run of characters, so two in a row ask for nothing
 /// the one does not: EventBridge refuses them and names the POSITION of the
 /// second of the pair, counted in characters from the start of the value.
+///
+/// An [`ESCAPE`] makes the character after it LITERAL, and the operand's
+/// grammar gives a meaning to exactly two characters — the wildcard and the
+/// escape itself — so those two are what may be escaped and an escape of
+/// anything else (a run of text that ends with one included) is a sequence the
+/// grammar does not define. An escaped character is literal text rather than a
+/// wildcard, so it neither opens nor continues a run of wildcards: `*\**` asks
+/// for any text around a literal asterisk and is a value the language admits.
+///
+/// Both positions are the one just PAST the character that showed the fault —
+/// the first of a pair of wildcards, and the escape marker — which is where
+/// reading that character leaves the reader.
 fn wildcard_violation(value: &str) -> Option<String> {
     let mut previous_was_wildcard = false;
-    for (at, character) in value.chars().enumerate() {
-        let is_wildcard = character == WILDCARD;
-        if is_wildcard && previous_was_wildcard {
-            return Some(format!("Consecutive wildcard characters at pos {at}"));
+    let mut characters = value.chars();
+    let mut at = 0usize;
+    while let Some(character) = characters.next() {
+        match character {
+            ESCAPE => {
+                match characters.next() {
+                    Some(escaped) if escaped == WILDCARD || escaped == ESCAPE => {}
+                    _ => return Some(format!("Invalid escape character at pos {}", at + 1)),
+                }
+                // The escape and the character it makes literal are one
+                // character of the text the operand compares.
+                at += 1;
+                previous_was_wildcard = false;
+            }
+            WILDCARD => {
+                if previous_was_wildcard {
+                    return Some(format!("Consecutive wildcard characters at pos {at}"));
+                }
+                previous_was_wildcard = true;
+            }
+            _ => previous_was_wildcard = false,
         }
-        previous_was_wildcard = is_wildcard;
+        at += 1;
     }
     None
+}
+
+/// Whether a `numeric` comparison can compare against the number the numeral
+/// `written` names: whether an IEEE-754 binary64 double carries that number
+/// exactly.
+///
+/// A `numeric` comparison compares DOUBLES, so a numeral the conversion to a
+/// double does not preserve names a number the comparison cannot answer about:
+/// the double it would be compared as is a DIFFERENT number, and a verdict
+/// drawn from it would be a verdict about that other number. The test is the
+/// round trip through the double — the numeral and the shortest decimal of the
+/// double it converts to must denote the same value ([`decimal_reading`]) —
+/// which admits every numeral a double carries, the ones no finite binary
+/// expansion states exactly (`0.1`) included, and refuses the ones it does not
+/// (an integer above 2^53 that the conversion rounds to its neighbour, a
+/// fraction carrying more digits than a double keeps). A numeral naming no
+/// finite number at all is not one either.
+fn comparable_numeral(written: &str) -> bool {
+    let Ok(value) = written.parse::<f64>() else {
+        return false;
+    };
+    if !value.is_finite() {
+        return false;
+    }
+    match (decimal_reading(written), decimal_reading(&format!("{value}"))) {
+        (Some(numeral), Some(represented)) => numeral == represented,
+        _ => false,
+    }
+}
+
+/// The number an event's leaf compares as where a `numeric` comparison is
+/// concerned: a number the comparison can answer about
+/// ([`comparable_numeral`]) and nothing else.
+///
+/// A leaf carrying a number no double carries is not a leaf the comparison
+/// withholds a verdict about — it is one the comparison does not consider, so
+/// a term over it holds for no such leaf, exactly as a term over a number
+/// holds for no leaf carrying text. The leaf is read through the numeral the
+/// parsed number spells, which is the event's own digits for every integer
+/// this answers `None` for.
+fn comparable_leaf(leaf: &Value) -> Option<f64> {
+    match leaf {
+        Value::Number(number) => number
+            .as_f64()
+            .filter(|_| comparable_numeral(&number.to_string())),
+        _ => None,
+    }
+}
+
+/// A decimal numeral as the VALUE it denotes: whether it is negative, its
+/// significant digits with no leading or trailing zero, and the power of ten
+/// the last of those digits carries.
+///
+/// Two numerals denote the same number exactly when this reading of them is
+/// equal, whichever of the forms a decimal may be written in each used
+/// (`1e3`, `1000`, `1000.00`), so comparing the readings compares the numbers
+/// and never their spelling. Zero is one value however it is spelled, and
+/// `None` is text this reading is not of a decimal numeral at all.
+fn decimal_reading(numeral: &str) -> Option<(bool, String, i64)> {
+    let (negative, rest) = match numeral.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, numeral),
+    };
+    let (mantissa, exponent) = match rest.split_once(['e', 'E']) {
+        Some((mantissa, exponent)) => (mantissa, exponent.parse::<i64>().ok()?),
+        None => (rest, 0),
+    };
+    let (whole, fraction) = mantissa.split_once('.').unwrap_or((mantissa, ""));
+    if whole.is_empty() && fraction.is_empty() {
+        return None;
+    }
+    if !whole
+        .chars()
+        .chain(fraction.chars())
+        .all(|character| character.is_ascii_digit())
+    {
+        return None;
+    }
+    // Each digit of the fraction lowers the power of ten its last digit
+    // carries, which is what makes `1.5` and `15e-1` one number.
+    let exponent = exponent.checked_sub(i64::try_from(fraction.len()).ok()?)?;
+    let digits = format!("{whole}{fraction}");
+    let significant = digits.trim_start_matches('0');
+    let carried = significant.trim_end_matches('0');
+    let exponent = exponent.checked_add(i64::try_from(significant.len() - carried.len()).ok()?)?;
+    if carried.is_empty() {
+        return Some((false, String::new(), 0));
+    }
+    Some((negative, carried.to_string(), exponent))
 }
 
 /// Why the bounds of a `numeric` term list admit no number, or `None` when at
@@ -1298,11 +1711,19 @@ fn leaf_exists(value: &Value) -> bool {
 /// Type-sensitive, as EventBridge's exact matching is — a string never equals a
 /// number — but two NUMBERS are compared numerically rather than by their JSON
 /// spelling, so `1` and `1.0` are one value and a pattern does not depend on
-/// how the publisher wrote it.
+/// how the publisher wrote it. That comparison runs through the double the
+/// numerals convert to, so it is only an answer about numbers a double carries
+/// ([`comparable_numeral`]): two numerals the conversion rounds to the one
+/// double are still the two different numbers they were written as, and a term
+/// matches such a leaf only when the leaf names the very number the term does.
 fn same_value(leaf: &Value, term: &Value) -> bool {
     match (leaf, term) {
         (Value::Number(found), Value::Number(wanted)) => {
-            found == wanted || found.as_f64() == wanted.as_f64()
+            found == wanted
+                || match (comparable_leaf(leaf), comparable_leaf(term)) {
+                    (Some(found), Some(wanted)) => found == wanted,
+                    _ => false,
+                }
         }
         (found, wanted) => found == wanted,
     }
@@ -1374,7 +1795,7 @@ fn match_operator(operator: &str, argument: &Value, leaf: &Value) -> bool {
             _ => false,
         },
         "anything-but" => !matches_anything_but(argument, leaf),
-        "numeric" => match (leaf.as_f64(), argument.as_array()) {
+        "numeric" => match (comparable_leaf(leaf), argument.as_array()) {
             (Some(number), Some(terms)) => {
                 terms.chunks(2).all(|pair| matches_numeric(pair, number))
             }
@@ -1479,30 +1900,30 @@ fn matches_numeric(pair: &[Value], number: f64) -> bool {
     }
 }
 
-/// `wildcard`: `*` stands for any run of characters, every other character
-/// is literal.
+/// `wildcard`: `*` stands for any run of characters, an [`ESCAPE`] makes the
+/// character after it literal, and every other character is literal.
 ///
-/// Matched by splitting the pattern on `*` and locating each literal
-/// segment in order, advancing through the text MONOTONICALLY: the first
-/// segment anchors at the start, the last at the end, and each one in
-/// between is found at its leftmost remaining position. Greedy-leftmost is
-/// exact for a `*`-only glob — a `*` absorbs any run, so a later segment
-/// can always use whatever an earlier one left — and because the cursor
-/// never rewinds, the whole match costs O(len(text) + len(pattern)). The
-/// previous shape (a cursor that rewound to the last `*` on a mismatch) was
-/// O(len(text) x len(pattern)) and could be driven quadratically by a
-/// caller choosing both operands.
+/// Matched by splitting the operand into the literal runs its wildcards
+/// separate ([`wildcard_segments`]) and locating each run in order, advancing
+/// through the text MONOTONICALLY: the first run anchors at the start, the
+/// last at the end, and each one in between is found at its leftmost
+/// remaining position. Greedy-leftmost is exact for a `*`-only glob — a `*`
+/// absorbs any run, so a later run can always use whatever an earlier one
+/// left — and because the cursor never rewinds, the whole match costs
+/// O(len(text) + len(pattern)). The previous shape (a cursor that rewound to
+/// the last `*` on a mismatch) was O(len(text) x len(pattern)) and could be
+/// driven quadratically by a caller choosing both operands.
 fn matches_wildcard(text: &str, pattern: &str) -> bool {
-    let segments: Vec<&str> = pattern.split('*').collect();
-    // `split` always yields at least one segment; exactly one means the
-    // pattern has no `*` at all and is therefore a literal.
+    let segments = wildcard_segments(pattern);
+    // There is always at least one run; exactly one means the operand has no
+    // wildcard at all and is therefore a literal.
     let (Some(first), Some(last)) = (segments.first(), segments.last()) else {
         return false;
     };
     if segments.len() == 1 {
-        return text == pattern;
+        return text == first.as_str();
     }
-    if !text.starts_with(first) || !text.ends_with(last) {
+    if !text.starts_with(first.as_str()) || !text.ends_with(last.as_str()) {
         return false;
     }
     // The two anchors must not overlap: `a*b` needs room for both.
@@ -1512,12 +1933,48 @@ fn matches_wildcard(text: &str, pattern: &str) -> bool {
     }
     rest = &rest[..rest.len() - last.len()];
     for segment in &segments[1..segments.len() - 1] {
-        match rest.find(segment) {
+        match rest.find(segment.as_str()) {
             Some(at) => rest = &rest[at + segment.len()..],
             None => return false,
         }
     }
     true
+}
+
+/// The literal runs a `wildcard` operand's wildcards separate, each as the
+/// text it compares against.
+///
+/// An ESCAPED character is one character of LITERAL text, so it belongs to the
+/// run it sits in and never separates two: `*\**` asks for any text, then a
+/// literal asterisk, then any text — which is why the escapes are read here
+/// rather than by splitting the operand on its own `*` characters. An escape
+/// the grammar does not define never reaches a match, because a pattern
+/// carrying one is refused before it is stored or tested
+/// ([`wildcard_violation`]); one left in an operand compares as the two
+/// characters it was written as, which invents no meaning for it.
+fn wildcard_segments(pattern: &str) -> Vec<String> {
+    let mut segments: Vec<String> = ::std::vec![String::new()];
+    let mut characters = pattern.chars();
+    while let Some(character) = characters.next() {
+        // The list is created with a run in it and only ever grows, so there
+        // is always a run to append to.
+        let Some(run) = segments.last_mut() else {
+            return segments;
+        };
+        match character {
+            ESCAPE => match characters.next() {
+                Some(escaped) if escaped == WILDCARD || escaped == ESCAPE => run.push(escaped),
+                Some(escaped) => {
+                    run.push(ESCAPE);
+                    run.push(escaped);
+                }
+                None => run.push(ESCAPE),
+            },
+            WILDCARD => segments.push(String::new()),
+            literal => run.push(literal),
+        }
+    }
+    segments
 }
 
 /// Why text is not a CIDR block this language compares against.
@@ -1528,65 +1985,89 @@ fn matches_wildcard(text: &str, pattern: &str) -> bool {
 /// no block at all is the `cidr` operator's own argument check (see
 /// [`validate_operator`]).
 enum CidrRefusal {
-    /// The mask leaves no RANGE of addresses, carrying the reason that
-    /// states the family's width.
-    MaskNotNarrowerThanTheFamily(String),
+    /// A rule of the NOTATION itself, carrying the reason the notation states
+    /// for it: the text carries exactly one mask separator, and the mask
+    /// leaves a RANGE of addresses.
+    Notation(&'static str),
     /// The text is not an address and a mask length at all.
     NotABlock,
 }
 
-/// Split `a.b.c.d/len` into its network address and prefix length, or say
-/// why the text is not a CIDR block this language compares against.
+/// What the notation requires of the text that names a block: one address,
+/// one separator, and the mask length after it.
+///
+/// The reason the ADDRESS parser states for text carrying no separator, or
+/// more than one, so the whole message is that reason
+/// ([`Refusal::unplaced`]).
+const ONE_MASK_SEPARATOR: &str = "Malformed CIDR, one '/' required";
+
+/// Split `a.b.c.d/len` into the network address of its block and its prefix
+/// length, or say why the text is not a CIDR block this language compares
+/// against.
 ///
 /// The mask must leave a RANGE of addresses for the comparison to be a
 /// range comparison at all, so it is narrower than the address family's
 /// width — a mask as wide as the family names one address rather than a
-/// block, and EventBridge refuses it naming that width. A CIDR block also
-/// names a NETWORK, so every bit beyond its prefix is zero; text whose
-/// address sets one of them names a host inside a block rather than the
-/// block.
+/// block, and EventBridge refuses it naming that width. The text names the
+/// mask with ONE separator ([`ONE_MASK_SEPARATOR`]), so text carrying none,
+/// or more than one, names no block either.
+///
+/// An address carrying bits BEYOND the prefix names a host inside a block,
+/// and the block it names is the one the comparison is about: the bits past
+/// the prefix are masked off and the operand stands for that containing
+/// block, so a block written from any address inside it compares exactly as
+/// the same block written canonically does.
 fn parse_cidr(block: &str) -> Result<(IpAddr, u8), CidrRefusal> {
-    let Some((address, length)) = block.split_once('/') else {
-        return Err(CidrRefusal::NotABlock);
+    let mut written = block.split('/');
+    let (Some(address), Some(length), None) = (written.next(), written.next(), written.next())
+    else {
+        return Err(CidrRefusal::Notation(ONE_MASK_SEPARATOR));
     };
-    let Ok(network) = address.parse::<IpAddr>() else {
+    let Ok(address) = address.parse::<IpAddr>() else {
         return Err(CidrRefusal::NotABlock);
     };
     let Ok(bits) = length.parse::<u8>() else {
         return Err(CidrRefusal::NotABlock);
     };
-    let (family, width) = if network.is_ipv4() {
-        ("IPv4", 32u8)
-    } else {
-        ("IPv6", 128u8)
-    };
+    let width = if address.is_ipv4() { 32u8 } else { 128u8 };
     if bits >= width {
-        return Err(CidrRefusal::MaskNotNarrowerThanTheFamily(format!(
-            "{family} mask bits must be < {width}"
-        )));
+        return Err(CidrRefusal::Notation(mask_too_wide(address.is_ipv4())));
     }
-    if !is_network_address(network, bits) {
-        return Err(CidrRefusal::NotABlock);
-    }
-    Ok((network, bits))
+    Ok((network_address(address, bits), bits))
 }
 
-/// Whether every bit of `network` outside its first `bits` is zero.
-fn is_network_address(network: IpAddr, bits: u8) -> bool {
-    let octets: Vec<u8> = match network {
-        IpAddr::V4(address) => address.octets().to_vec(),
-        IpAddr::V6(address) => address.octets().to_vec(),
-    };
+/// The reason the notation states for a mask as wide as the address family it
+/// is written for, which names that family and its width.
+fn mask_too_wide(ipv4: bool) -> &'static str {
+    if ipv4 {
+        "IPv4 mask bits must be < 32"
+    } else {
+        "IPv6 mask bits must be < 128"
+    }
+}
+
+/// `address` with every bit outside its first `bits` cleared: the network
+/// address of the block it sits in.
+fn network_address(address: IpAddr, bits: u8) -> IpAddr {
     let mut remaining = usize::from(bits);
-    for octet in octets {
+    let mut mask_octet = |octet: &mut u8| {
         let take = remaining.min(8);
         remaining -= take;
         let mask = u8::try_from(0xffu16 << (8 - take) & 0xff).unwrap_or(0xff);
-        if octet & !mask != 0 {
-            return false;
+        *octet &= mask;
+    };
+    match address {
+        IpAddr::V4(address) => {
+            let mut octets = address.octets();
+            octets.iter_mut().for_each(&mut mask_octet);
+            IpAddr::V4(::std::net::Ipv4Addr::from(octets))
+        }
+        IpAddr::V6(address) => {
+            let mut octets = address.octets();
+            octets.iter_mut().for_each(&mut mask_octet);
+            IpAddr::V6(::std::net::Ipv6Addr::from(octets))
         }
     }
-    true
 }
 
 /// Whether `address` is inside the block `network/bits`.

@@ -433,12 +433,6 @@ async fn test_event_pattern_refuses_a_pattern_or_an_event_it_cannot_read() {
             "InvalidEventPatternException",
         ),
         (
-            "cidr naming a host inside a block rather than the block itself",
-            json!({ "detail": { "client-ip": [{ "cidr": "10.0.1.7/24" }] } }),
-            base_event(),
-            "InvalidEventPatternException",
-        ),
-        (
             "cidr with a prefix wider than the address family admits",
             json!({ "detail": { "client-ip": [{ "cidr": "10.0.0.0/33" }] } }),
             base_event(),

@@ -135,6 +135,74 @@ fn expected_a_value(cause: &str) -> bool {
     cause == "expected value" || cause == "expected ident"
 }
 
+/// The words a JSON parser reads as a number only where it is configured to admit the
+/// non-numeric values IEEE-754 has and JSON does not.
+///
+/// JSON's grammar has no spelling for an infinity or for a not-a-number, so a parser that
+/// admits them reads these words — and one that does not names the word it found rather than
+/// reporting arbitrary unquoted text, because a document carrying one was written by a
+/// serializer that had the extension enabled.
+const NON_NUMERIC_NUMBER_WORDS: [&str; 3] = ["NaN", "Infinity", "INF"];
+
+/// The sign a non-numeric numeric word may be written with.
+const NEGATIVE: char = '-';
+
+/// The non-numeric numeric token the parse stopped on, with the line and the column that
+/// token begins at — or `None` when the parse stopped on something else.
+///
+/// A parser that refuses these words refuses them as a CLASS of their own rather than as
+/// unrecognised text ([`unrecognized_token`]): the word is one a JSON serializer writes for
+/// a value JSON cannot spell, so the token names the sign as well when one was written and a
+/// caller can say which value the document meant.
+///
+/// The word is read at the position the parse stopped, which is the sign, the word's first
+/// character, or — for a parse already matching the word — a character inside it; `None`
+/// covers every other fault, including an unquoted word that is not one of these.
+#[must_use]
+pub fn non_numeric_number_token<'a>(
+    document: &'a str,
+    error: &serde_json::Error,
+) -> Option<(&'a str, usize, usize)> {
+    let cause = cause(error);
+    // The fault a bare word gets where a value belongs, and the one a word gets where a
+    // NUMBER had already begun, which is what a sign in front of it makes it.
+    if !expected_a_value(&cause) && cause != "invalid number" {
+        return None;
+    }
+    let stopped_at = byte_offset(document, error.line(), error.column())?;
+    if !document.is_char_boundary(stopped_at) {
+        return None;
+    }
+    // A parse that stopped on the sign has not reached the word yet.
+    let reached = if document[stopped_at..].starts_with(NEGATIVE) {
+        stopped_at + NEGATIVE.len_utf8()
+    } else {
+        stopped_at
+    };
+    let word_start = document[..reached]
+        .char_indices()
+        .rev()
+        .take_while(|(_, character)| is_word_character(*character))
+        .map(|(offset, _)| offset)
+        .last()
+        .unwrap_or(reached);
+    let rest = document.get(word_start..)?;
+    let end = rest
+        .find(|character: char| !is_word_character(character))
+        .unwrap_or(rest.len());
+    if !NON_NUMERIC_NUMBER_WORDS.contains(&&rest[..end]) {
+        return None;
+    }
+    // The sign belongs to the token: it is what says which infinity was meant.
+    let start = if document[..word_start].ends_with(NEGATIVE) {
+        word_start - NEGATIVE.len_utf8()
+    } else {
+        word_start
+    };
+    let (line, column) = position_of(document, start);
+    Some((&document[start..word_start + end], line, column))
+}
+
 /// Whether `character` may begin an unquoted word: a letter, or one of the two marks an
 /// identifier starts with. A digit begins a NUMBER, whose own fault is not a word.
 fn is_word_start(character: char) -> bool {
@@ -405,6 +473,59 @@ mod tests {
         for (case, document, expected) in rows {
             let error = failure(document);
             let actual = unrecognized_token(document, &error);
+            assert_eq!(
+                actual, expected,
+                "case {case:?}: expected {expected:?}, got {actual:?} (the parser stopped at \
+                 line {}, column {}: {})",
+                error.line(),
+                error.column(),
+                cause(&error)
+            );
+        }
+    }
+
+    /// One row: what a failing assertion calls it, the document, and the non-numeric numeric
+    /// token the parse stopped on with the position it starts at (`None` when the fault names
+    /// no such token).
+    type NonNumericRow = (
+        &'static str,
+        &'static str,
+        Option<(&'static str, usize, usize)>,
+    );
+
+    /// The words JSON cannot spell are read as the class of their own they are, sign
+    /// included, and every other fault — an unquoted word among them — names none.
+    ///
+    /// The rows differ along which word was written, whether it carries a sign, where it
+    /// sits (the first value, a member's value, a later line), and which other fault class
+    /// the document carries.
+    #[test]
+    fn a_non_numeric_number_word_is_read_with_its_sign_at_the_position_it_starts() {
+        let rows: [NonNumericRow; 10] = [
+            ("an infinity", r#"{"n": Infinity}"#, Some(("Infinity", 1, 7))),
+            (
+                "a negative infinity",
+                r#"{"n": -Infinity}"#,
+                Some(("-Infinity", 1, 7)),
+            ),
+            ("a not-a-number", r#"{"n": NaN}"#, Some(("NaN", 1, 7))),
+            ("the short infinity", "[INF]", Some(("INF", 1, 2))),
+            ("the short negative infinity", "[-INF]", Some(("-INF", 1, 2))),
+            (
+                "an infinity on the second line",
+                "{\n  \"n\": Infinity\n}",
+                Some(("Infinity", 2, 8)),
+            ),
+            // Faults that name no such token.
+            ("an unquoted word that is not one", r#"{"n": nul}"#, None),
+            ("a word that merely begins with one", r#"{"n": NaNish}"#, None),
+            ("a missing comma between members", r#"{"a": 1 "b": 2}"#, None),
+            ("a document that ends early", "{", None),
+        ];
+
+        for (case, document, expected) in rows {
+            let error = failure(document);
+            let actual = non_numeric_number_token(document, &error);
             assert_eq!(
                 actual, expected,
                 "case {case:?}: expected {expected:?}, got {actual:?} (the parser stopped at \

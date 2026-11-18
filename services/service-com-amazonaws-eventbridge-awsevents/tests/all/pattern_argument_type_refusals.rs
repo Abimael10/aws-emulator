@@ -267,20 +267,21 @@ fn rows() -> Vec<Row> {
             must_be: A_STRING,
             read: r#"{"detail": {"group": [{"anything-but": {"suffix": true"#,
         },
-        Row {
-            case: "a prefix nested under anything-but given a number in its list",
-            pattern: r#"{"detail": {"group": [{"anything-but": {"prefix": ["re", 5]}}]}}"#,
-            match_type: "prefix/suffix",
-            must_be: A_STRING,
-            read: r#"{"detail": {"group": [{"anything-but": {"prefix": ["re", 5"#,
-        },
+        // A non-string MEMBER of a list such a match type was handed is
+        // refused with the same sentence, but its location is stated by two
+        // readers rather than one, so the message carries the location clause
+        // twice: that form is asserted where the rule about it is
+        // (`pattern_numeric_and_wildcard_operands`).
         // Match types whose argument is not text: the sentence is the same
         // shape, stating what each one's pattern must be.
         Row {
+            // A value that is not TEXT is refused before any block is read out
+            // of it: the plain string-operand requirement, which the service
+            // states for the first match type that compares text.
             case: "cidr given a number",
             pattern: r#"{"detail": {"group": [{"cidr": 10}]}}"#,
-            match_type: "cidr",
-            must_be: "an IPv4 or IPv6 CIDR block",
+            match_type: "prefix",
+            must_be: A_STRING,
             read: r#"{"detail": {"group": [{"cidr": 10"#,
         },
         Row {
