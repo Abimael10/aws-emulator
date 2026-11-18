@@ -5,10 +5,11 @@
 //! record that results. Every `UpdateThemeData` member the request leaves out keeps the
 //! value it was stored with, `modifiedAt` moves to this call's instant, and an id it cannot
 //! resolve answers the refusal its class calls for — the modelled
-//! `InvalidParameterException` (HTTP 400) for an id another app environment owns and the
-//! modelled `ResourceNotFoundException` (HTTP 404) for one that names no theme anywhere,
-//! the same two `GetTheme` and `DeleteTheme` tell apart. An update is never an
-//! upsert.
+//! `InvalidParameterException` (HTTP 400) for an id another app environment owns, and
+//! `ResourceNotFoundException` (HTTP 404) for one that names no theme anywhere: the shape
+//! this operation's own `errors` list omits and which is widened in through `extra_errors`
+//! (see below). Those are the same two `GetTheme` and `DeleteTheme` tell apart. An update
+//! is never an upsert.
 //!
 //! `clientToken` needs no replay record here: applying the same `updatedTheme` twice
 //! leaves the same record (only `modifiedAt`, which reports the last call that changed

@@ -9,13 +9,20 @@
 //! contract from the modelled one. A widening the block omits makes the file's own
 //! contract contradict the status the handler answers.
 //!
+//! The same rule binds the file's PROSE, which is what a reader meets first: a module
+//! calls an error shape modelled only when the shipped model declares that shape for
+//! that operation (its own `errors` list, or the service-wide errors every operation
+//! inherits), so a shape reaching the channel only because the file widens it in is
+//! described as widened in, never as modelled. Prose that calls a widened shape modelled
+//! tells an editor the widening is redundant.
+//!
 //! The rows span what the rule generalises over: EVERY operation module of this crate
 //! (each is checked, whichever errors it declares, widens or documents), every error
-//! shape this service models, and — for the three update operations, whose widened
-//! refusal a request can actually provoke — the FORM of the unresolvable id the refusal
-//! is provoked with. The last test closes the loop the issue is about: the status the
-//! block states is the status the emulator answers on the wire, so a block that states
-//! nothing cannot agree with it.
+//! shape this service models, every shape each module's prose calls modelled, and — for
+//! the three update operations, whose widened refusal a request can actually provoke —
+//! the FORM of the unresolvable id the refusal is provoked with. The last test closes the
+//! loop the issue is about: the status the block states is the status the emulator
+//! answers on the wire, so a block that states nothing cannot agree with it.
 //!
 //! The modelled status of an error shape comes from the shipped model, read by
 //! [`super::modelled_refusal_statuses::modelled_status`]: a documented status is checked
@@ -32,7 +39,7 @@ use serde_json::{json, Value};
 use service_com_amazonaws_amplifyuibuilder_amplifyuibuilder::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::modelled_refusal_statuses::modelled_status;
+use crate::modelled_refusal_statuses::{declared_error_shapes, modelled_status};
 
 /// The phrase a bullet carries to say the shape is not one the model declares for this
 /// operation but one the handler widens in.
@@ -56,10 +63,19 @@ struct ErrorBullet {
 struct OperationModule {
     /// The file name, e.g. `update_form.rs`.
     file: String,
+    /// The operation it serves, from its own `@op` line.
+    operation: String,
     /// The bullets of its `## Errors` block, empty when it has no such block.
     documented: Vec<ErrorBullet>,
     /// The shapes its `extra_errors = [...]` names, empty when it widens nothing.
     widened: BTreeSet<String>,
+    /// Every comment line of the file, doc and ordinary, joined into one string: the
+    /// prose a reader and an editor of the file meet. Joining is what makes a sentence
+    /// wrapped over several lines one sentence again.
+    prose: String,
+    /// Just the module's opening summary — the doc lines between its `@op` line and its
+    /// first `##` heading — which is the sentence this file's rule is stated in.
+    summary: String,
 }
 
 impl OperationModule {
@@ -91,13 +107,121 @@ fn operation_modules() -> Vec<OperationModule> {
         let source = std::fs::read_to_string(&path)
             .unwrap_or_else(|error| panic!("reading {file}: {error}"));
         modules.push(OperationModule {
+            operation: operation_name(&source)
+                .unwrap_or_else(|| panic!("src/ops/{file} must carry an @op line")),
             file,
             documented: documented_errors(&source),
             widened: widened_errors(&source),
+            prose: comment_prose(&source),
+            summary: summary_prose(&source),
         });
     }
     modules.sort_by(|left, right| left.file.cmp(&right.file));
     modules
+}
+
+/// The operation a module serves, as its own `@op <Operation>` line names it.
+fn operation_name(source: &str) -> Option<String> {
+    source.lines().find_map(|line| {
+        let name = line.strip_prefix("//!")?.trim().strip_prefix("@op ")?.trim();
+        (!name.is_empty()).then(|| name.to_string())
+    })
+}
+
+/// Every comment line of a module — `//!` doc and `//` comment alike — joined with single
+/// spaces, so a claim wrapped over two lines is found as one phrase.
+fn comment_prose(source: &str) -> String {
+    let mut prose = String::new();
+    for line in source.lines() {
+        let line = line.trim_start();
+        let Some(text) = line
+            .strip_prefix("//!")
+            .or_else(|| line.strip_prefix("///"))
+            .or_else(|| line.strip_prefix("//"))
+        else {
+            continue;
+        };
+        if !prose.is_empty() {
+            prose.push(' ');
+        }
+        prose.push_str(text.trim());
+    }
+    prose
+}
+
+/// The module's opening summary: the doc lines after its `@op` line, up to the first
+/// heading of the generated contract that follows it.
+fn summary_prose(source: &str) -> String {
+    let mut summary = String::new();
+    let mut started = false;
+    for line in source.lines() {
+        let Some(doc) = line.strip_prefix("//!") else {
+            continue;
+        };
+        let doc = doc.trim();
+        if doc.starts_with("@op ") {
+            started = true;
+            continue;
+        }
+        if !started {
+            continue;
+        }
+        if doc.starts_with('#') {
+            break;
+        }
+        if !summary.is_empty() {
+            summary.push(' ');
+        }
+        summary.push_str(doc);
+    }
+    summary
+}
+
+/// What can stand immediately before the word to DENY the claim rather than make it,
+/// whether glued to it ("unmodelled `X`", "non-modelled `X`") or as the word before it
+/// ("not modelled `X`"). Only the position immediately before the word counts, so an
+/// unrelated negation earlier in the sentence ("names no theme anywhere … the modelled
+/// `X`") leaves the claim a claim.
+const NEGATIONS: [&str; 5] = ["not", "never", "un", "non", "no"];
+
+/// Whether what was said immediately before the word denies the claim it would otherwise
+/// make. The word is cut off, so the glued spellings arrive here as their own prefix
+/// token: "unmodelled" is read as `un` + the word.
+fn negated(said: &str) -> bool {
+    let prior = said
+        .split_whitespace()
+        .next_back()
+        .unwrap_or_default()
+        .trim_matches(|letter: char| !letter.is_alphanumeric());
+    NEGATIONS
+        .iter()
+        .any(|negation| prior.eq_ignore_ascii_case(negation))
+}
+
+/// The shapes a stretch of prose calls modelled: every backticked name that follows the
+/// word in either spelling, where the word is not negated. A name that is not an error
+/// shape of this service (a trait, a member, an output shape) is not a claim about the
+/// error channel and is left out.
+fn shapes_called_modelled(prose: &str) -> Vec<String> {
+    let mut claimed: Vec<String> = Vec::new();
+    for spelling in ["modelled", "modeled", "Modelled", "Modeled"] {
+        for (at, _) in prose.match_indices(spelling) {
+            if negated(&prose[..at]) {
+                continue;
+            }
+            let Some(rest) = prose[at + spelling.len()..].trim_start().strip_prefix('`') else {
+                continue;
+            };
+            let Some((name, _)) = rest.split_once('`') else {
+                continue;
+            };
+            if modelled_status(name).is_some() && !claimed.iter().any(|held| held == name) {
+                claimed.push(name.to_string());
+            }
+        }
+    }
+    claimed.sort();
+    claimed
 }
 
 /// The bullets of the module doc's `## Errors` section. A bullet starts at `* ` and
@@ -267,6 +391,79 @@ fn every_widened_error_is_stated_in_the_contract_block() {
             );
         }
     }
+}
+
+/// A module's prose calls an error shape modelled only when the model declares that
+/// shape for that operation — its own `errors` list, or the service-wide errors every
+/// operation inherits. Every operation module of the crate is a row and every shape its
+/// prose calls modelled is a case, so the claim is settled by the shipped model rather
+/// than by the file's own other sentences.
+#[test]
+fn prose_calls_modelled_only_the_error_shapes_the_model_declares() {
+    let modules = operation_modules();
+    let mut claims = 0usize;
+    for module in &modules {
+        let declared = declared_error_shapes(&module.operation);
+        for name in shapes_called_modelled(&module.prose) {
+            claims += 1;
+            let case = format!("{} calls {name} modelled", module.file);
+            assert!(
+                declared.contains(&name),
+                "case {case:?}: expected a shape the model declares for {}, which declares \
+                 {declared:?}, got {name:?}",
+                module.operation
+            );
+            // The two sides of the same claim: a shape the file widens in is, by
+            // definition, one the model does not declare for the operation.
+            assert!(
+                !module.widened.contains(&name),
+                "case {case:?}: expected a modelled shape, got one this file widens in \
+                 through extra_errors: {:?}",
+                module.widened
+            );
+        }
+    }
+    assert!(
+        claims >= 15,
+        "the scan must find this service's modelled-error claims, found {claims} over {} \
+         modules",
+        modules.len()
+    );
+}
+
+/// Wherever a module's opening SUMMARY names a shape the file widens in, it says the
+/// shape is widened in — the sentence a reader and an editor meet before any bullet — and
+/// does not call it modelled. A summary that leaves the shape to the `## Errors` block is
+/// no row here; the block is checked above.
+#[test]
+fn a_summary_naming_a_widened_shape_says_it_is_widened_in() {
+    let modules = operation_modules();
+    let mut summarised = 0usize;
+    for module in &modules {
+        for name in &module.widened {
+            if !module.summary.contains(&format!("`{name}`")) {
+                continue;
+            }
+            summarised += 1;
+            let case = format!("{} summarises {name}", module.file);
+            assert!(
+                module.summary.contains(WIDENED_MARK),
+                "case {case:?}: expected the summary to say {WIDENED_MARK:?}, got {:?}",
+                module.summary
+            );
+            assert!(
+                !shapes_called_modelled(&module.summary).contains(name),
+                "case {case:?}: expected the summary not to call the widened shape \
+                 modelled, got {:?}",
+                module.summary
+            );
+        }
+    }
+    assert!(
+        summarised >= 3,
+        "the update modules state their widened refusal in their summary, found \
+         {summarised} summaries that name a widened shape"
+    );
 }
 
 /// A SigV4 credential scope naming this service: it is what routes a request here.

@@ -5,10 +5,11 @@
 //! carries replaces what [`crate::state::StoredForm`] held, every member it leaves out
 //! keeps its stored value, and the returned `Form` is computed from that one record —
 //! so a later `GetForm` reports exactly what this call left behind. An id that names no
-//! form anywhere is refused with the modelled `ResourceNotFoundException` (404) and an
-//! id a DIFFERENT app environment owns with the modelled `InvalidParameterException`
-//! (400), as is a patch whose `sectionalElements` carry a `type`, `level` or
-//! `orientation` outside the values the model documents for them.
+//! form anywhere is refused with `ResourceNotFoundException` (404) — the shape this
+//! operation's own `errors` list omits and which is widened in through `extra_errors`
+//! (see below) — and an id a DIFFERENT app environment owns with the modelled
+//! `InvalidParameterException` (400), as is a patch whose `sectionalElements` carry a
+//! `type`, `level` or `orientation` outside the values the model documents for them.
 //!
 //! ## Shape of an operation
 //!
