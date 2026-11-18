@@ -120,6 +120,25 @@ pub fn invalid_gateway_id_not_found<E>(gateway_id: &str) -> Scaffolded<E> {
     super::id_not_found(INVALID_GATEWAY_ID_NOT_FOUND, "gateway ID", gateway_id)
 }
 
+/// Refuse a ROUTE TARGET that names a VPC endpoint id this account holds no endpoint for:
+/// HTTP 400 [`super::INVALID_VPC_ENDPOINT_ID_NOT_FOUND`], the endpoint's OWN not-found code —
+/// a target is a resource, and an unknown one is refused with that resource's code rather
+/// than with the gateway's.
+///
+/// Worded the way the route operations word an unknown target: the request member's own name
+/// followed by ` ID`, beside [`invalid_gateway_id_not_found`]'s "gateway ID" and
+/// [`invalid_route_table_id_not_found`]'s "routeTable ID". NOT
+/// [`super::invalid_vpc_endpoint_id_not_found`], which is the refusal of the operations that
+/// resolve a `VpcEndpointId` as the SUBJECT of the call and names the resource as
+/// [`super::VPC_ENDPOINT_ID_KIND`] spells it.
+pub fn invalid_vpc_endpoint_route_target_not_found<E>(vpc_endpoint_id: &str) -> Scaffolded<E> {
+    super::id_not_found(
+        super::INVALID_VPC_ENDPOINT_ID_NOT_FOUND,
+        "vpcEndpoint ID",
+        vpc_endpoint_id,
+    )
+}
+
 /// Refuse a create the store has no room for: HTTP 400 [`ROUTE_TABLE_LIMIT_EXCEEDED`], the
 /// answer for an [`ComAmazonawsEc2Amazonec2State::insert_route_table`] that stored nothing.
 pub fn route_table_limit_exceeded<E>(message: impl Into<String>) -> Scaffolded<E> {

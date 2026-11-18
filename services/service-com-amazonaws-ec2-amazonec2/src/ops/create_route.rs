@@ -444,8 +444,13 @@ pub(crate) fn resolve_target<E>(
             Ok(RouteTarget::Gateway(value.to_string()))
         }
         "vpcEndpointId" => {
+            // A target is a RESOURCE, and this member names a VPC ENDPOINT — so an id this
+            // account holds no endpoint for is refused with the ENDPOINT's own not-found code
+            // and the way the route operations word an unknown target
+            // ([`state::invalid_vpc_endpoint_route_target_not_found`]), not with the gateway's
+            // code and noun for a resource the caller never named.
             let Some(endpoint) = store.vpc_endpoints.get(value) else {
-                return Err(state::invalid_gateway_id_not_found(value));
+                return Err(state::invalid_vpc_endpoint_route_target_not_found(value));
             };
             if endpoint.vpc_id.as_deref() != Some(vpc_id) {
                 return Err(belongs_to_another_network(

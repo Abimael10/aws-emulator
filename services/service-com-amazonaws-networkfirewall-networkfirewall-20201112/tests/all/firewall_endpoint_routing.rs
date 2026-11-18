@@ -512,10 +512,24 @@ async fn an_attachment_reports_an_endpoint_only_where_ec2_created_one() {
             let code = ::aws_sdk_ec2::error::ProvideErrorMetadata::code(&refused)
                 .unwrap_or("<no code>")
                 .to_string();
+            // A route target is a RESOURCE, so an id EC2 holds no endpoint for is refused with
+            // the ENDPOINT's own not-found code and sentence rather than the gateway's — the
+            // wording the recorded wire corpus has for a route named at an unheld
+            // `VpcEndpointId` (`ec2-nfwr-traj-route-target-to-firewall-endpoint-mistakes`).
             assert_eq!(
-                code, "InvalidGatewayID.NotFound",
+                code, "InvalidVpcEndpointId.NotFound",
                 "case {name:?}: expected EC2's own refusal for an endpoint it does not hold, \
                  got {code:?}",
+                name = case.name
+            );
+            let message = ::aws_sdk_ec2::error::ProvideErrorMetadata::message(&refused)
+                .unwrap_or("<no message>")
+                .to_string();
+            assert_eq!(
+                message,
+                format!("The vpcEndpoint ID '{endpoint_id}' does not exist"),
+                "case {name:?}: expected the refusal to name the endpoint it holds none of, \
+                 got {message:?}",
                 name = case.name
             );
         }
