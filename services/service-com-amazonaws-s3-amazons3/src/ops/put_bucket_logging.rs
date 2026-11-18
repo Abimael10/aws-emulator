@@ -259,10 +259,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // You can have your logs delivered to any bucket that you own, including the
             // same bucket that is being logged" (`LoggingEnabled$TargetBucket`): a target
             // that is not a bucket of this account's is exactly the condition
-            // `InvalidTargetBucketForLogging` reports — "the target bucket for logging does
-            // not exist, is not owned by you, or does not have the appropriate grants for
-            // the log-delivery group". The code is not a shape in this model, so it goes
-            // out through the unmodelled channel.
+            // `InvalidTargetBucketForLogging` reports, and the sentence it goes out with is
+            // the one S3 words on the wire for that code
+            // ([`crate::state::INVALID_TARGET_BUCKET_FOR_LOGGING_MESSAGE`]) rather than the
+            // error-code list's longer description of the condition. The code is not a shape
+            // in this model, so it goes out through the unmodelled channel.
             let Some(target) = store.bucket(&logging.target_bucket) else {
                 return Err(crate::scaffolded::Scaffolded::unmodeled(
                     crate::state::INVALID_TARGET_BUCKET_FOR_LOGGING_CODE,

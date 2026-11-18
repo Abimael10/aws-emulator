@@ -915,30 +915,62 @@ pub fn tag_set_bytes(tags: &[ResourceTag]) -> usize {
 pub struct TagSetLimits {
     /// The most tags this resource's tag set may carry.
     pub max_tags: usize,
-    /// What the resource is called in a refusal ("bucket", "object").
-    pub resource: &'static str,
+    /// The `<Message>` this resource's tagging path states for a set carrying more tags than
+    /// [`Self::max_tags`].
+    ///
+    /// Part of the limits rather than derived from the resource's noun because the two
+    /// tagging paths word that one refusal differently and neither sentence is a template
+    /// the other fills: a BUCKET tag set past its maximum is refused about the tag COUNT
+    /// ([`TOO_MANY_BUCKET_TAGS_MESSAGE`]), an OBJECT tag set about the TAGS
+    /// ([`TOO_MANY_OBJECT_TAGS_MESSAGE`]).
+    pub too_many_tags_message: &'static str,
     /// The `<Message>` this resource's tagging path states for a key in the namespace AWS
     /// keeps for its own tags — see [`RESERVED_TAG_KEY_PREFIX`].
     ///
-    /// Part of the limits rather than of the cause because the two tagging paths word that
-    /// one refusal differently and neither sentence is interchangeable with the other: a
-    /// BUCKET tag set is refused as a write of a system tag
+    /// Part of the limits for the reason [`Self::too_many_tags_message`] is: a BUCKET tag
+    /// set is refused as a write of a system tag
     /// ([`SYSTEM_TAGS_NOT_BY_REQUESTER_MESSAGE`]), an OBJECT tag set as a key carrying the
     /// reserved prefix ([`RESERVED_TAG_KEY_PREFIX_MESSAGE`]).
     pub reserved_key_prefix_message: &'static str,
 }
 
+/// The `<Message>` S3 sends for a BUCKET tag set carrying more than [`MAX_TAGS_PER_BUCKET`]
+/// tags.
+///
+/// Fixed text stating the published maximum the set was judged against: the count the
+/// request carried is no part of the sentence. The bound it spells is pinned to
+/// [`MAX_TAGS_PER_BUCKET`] by the assertion below, so the published limit and the sentence
+/// that states it cannot drift apart.
+pub const TOO_MANY_BUCKET_TAGS_MESSAGE: &str = "Bucket tag count cannot be greater than 50";
+
+// The sentence states the published maximum, so it is only correct for that maximum.
+const _: () = assert!(
+    MAX_TAGS_PER_BUCKET == 50,
+    "the bucket tag-count sentence spells the published maximum"
+);
+
+/// The `<Message>` S3 sends for an OBJECT tag set carrying more than
+/// [`MAX_TAGS_PER_OBJECT`] tags — the other wording of that one refusal, stated about the
+/// TAGS rather than about their count, and fixed text in the same way.
+pub const TOO_MANY_OBJECT_TAGS_MESSAGE: &str = "Object tags cannot be greater than 10";
+
+// The same pinning as above, for the object tag set's own published maximum.
+const _: () = assert!(
+    MAX_TAGS_PER_OBJECT == 10,
+    "the object tag-count sentence spells the published maximum"
+);
+
 /// The limits a BUCKET's tag set is judged against ([`MAX_TAGS_PER_BUCKET`]).
 pub const BUCKET_TAG_SET_LIMITS: TagSetLimits = TagSetLimits {
     max_tags: MAX_TAGS_PER_BUCKET,
-    resource: "bucket",
+    too_many_tags_message: TOO_MANY_BUCKET_TAGS_MESSAGE,
     reserved_key_prefix_message: SYSTEM_TAGS_NOT_BY_REQUESTER_MESSAGE,
 };
 
 /// The limits an OBJECT's tag set is judged against ([`MAX_TAGS_PER_OBJECT`]).
 pub const OBJECT_TAG_SET_LIMITS: TagSetLimits = TagSetLimits {
     max_tags: MAX_TAGS_PER_OBJECT,
-    resource: "object",
+    too_many_tags_message: TOO_MANY_OBJECT_TAGS_MESSAGE,
     reserved_key_prefix_message: RESERVED_TAG_KEY_PREFIX_MESSAGE,
 };
 
@@ -1001,21 +1033,16 @@ pub struct TagSetRejection {
 impl std::fmt::Display for TagSetRejection {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let TagSetLimits {
-            max_tags,
-            resource,
+            too_many_tags_message,
             reserved_key_prefix_message,
+            ..
         } = self.limits;
         match &self.cause {
-            // The resource's noun capitalised, and the published maximum the set was
-            // judged against: both come from the limits, never from the request — the
-            // count the set carried is not in the sentence.
+            // The sentence this resource's tagging path states for a set past its published
+            // maximum: fixed text naming the bound the set was judged against, never the
+            // count the request carried.
             TagSetRejectionCause::TooManyTags { .. } => {
-                let mut characters = resource.chars();
-                let noun: String = match characters.next() {
-                    Some(first) => first.to_uppercase().chain(characters).collect(),
-                    None => String::new(),
-                };
-                write!(f, "{noun} tags cannot be greater than {max_tags}")
+                write!(f, "{too_many_tags_message}")
             }
             TagSetRejectionCause::EmptyKey | TagSetRejectionCause::KeyTooLong { .. } => {
                 write!(f, "{INVALID_TAG_KEY_MESSAGE}")
@@ -3351,6 +3378,16 @@ pub use crate::ops::types::PROTOCOL_VALUES;
 /// it is refused rather than recorded.
 pub const MAX_CORS_RULES: usize = 100;
 
+/// The `<Message>` S3 sends for a cors configuration carrying more than [`MAX_CORS_RULES`]
+/// rules.
+///
+/// Fixed text stating the PUBLISHED limit the configuration was judged against — the rule
+/// count the document carried is no part of it, and neither is the member path the rules
+/// arrived on.
+pub fn too_many_cors_rules_message() -> String {
+    format!("The number of CORS rules should not exceed allowed limit of {MAX_CORS_RULES} rules.")
+}
+
 /// The longest `CORSRule$ID` a stored rule may carry, in characters.
 ///
 /// That member's own documentation: "Unique identifier for the rule. The value cannot be
@@ -3530,11 +3567,7 @@ impl std::fmt::Display for CorsConfigurationRejection {
                 "CORSConfiguration.CORSRules names no CORSRule; a cors configuration \
                  carries at least one rule"
             ),
-            Self::TooManyRules { count } => write!(
-                f,
-                "CORSConfiguration.CORSRules carries {count} rules, more than the \
-                 {MAX_CORS_RULES} rules one cors configuration may hold"
-            ),
+            Self::TooManyRules { .. } => write!(f, "{}", too_many_cors_rules_message()),
             Self::NoAllowedMethods { rule } => write!(
                 f,
                 "CORSRule {rule}: AllowedMethods names no AllowedMethod; a cors rule \

@@ -18,9 +18,10 @@
 //!   is SSE-KMS under the key the request named.
 //! * The operation models exactly `AccessDenied` (403), `InvalidRequest` (400) and
 //!   `NoSuchKey` (404) (`smithy_query(query="operation",
-//!   operation="UpdateObjectEncryption")`), so a call naming a key the bucket does not hold
-//!   is `NoSuchKey` with S3's fixed `The specified key does not exist.` — whatever else the
-//!   request carries — and never an error class the operation does not model.
+//!   operation="UpdateObjectEncryption")`), so a call naming an object the bucket does not
+//!   hold is `NoSuchKey` with S3's fixed `The specified key does not exist.` — whatever else
+//!   the request carries, and whether or not the address named a version id — and never an
+//!   error class the operation does not model.
 //! * An object S3 Object Lock protects cannot be re-encrypted: "The encryption type for the
 //!   specified object can't be updated because that object is protected by S3 Object Lock"
 //!   (that operation's own list of `AccessDenied` messages).
@@ -93,16 +94,18 @@ const XMLNS: &str = "http://s3.amazonaws.com/doc/2006-03-01/";
 const SSE_KMS: &str = "aws:kms";
 
 /// The `AccessDenied` sentence this operation publishes for a target key that is not the
-/// bucket owner's own, from its own list of them
+/// bucket owner's own: recorded behaviour, the sentence stating the requirement the key has
+/// to meet, which its `@documentation` paraphrases at greater length
 /// (`smithy_query(query="doc",shape="UpdateObjectEncryption")`).
-const FOREIGN_KEY_MESSAGE: &str =
-    "The Amazon Web Services KMS key in the request must be owned by the same account as the \
-     bucket. Modify the request to specify a KMS key from the same account, and then try \
-     again.";
+const FOREIGN_KEY_MESSAGE: &str = "The KMS key must be from the same account as the bucket";
 
 /// The `ObjectEncryption` payload naming `key_arn`, with the S3 Bucket Key setting when the
 /// case carries one.
-fn payload(key_arn: &str, bucket_key: Option<bool>) -> String {
+///
+/// `pub(crate)`, like the dispatcher below it: the suite that pins the published WORDING and
+/// CLASS of this service's refusals ([`super::refusal_messages_published`]) drives this same
+/// subresource rather than standing up a second payload builder.
+pub(crate) fn payload(key_arn: &str, bucket_key: Option<bool>) -> String {
     let bucket_key = bucket_key
         .map(|enabled| format!("<BucketKeyEnabled>{enabled}</BucketKeyEnabled>"))
         .unwrap_or_default();
@@ -114,7 +117,9 @@ fn payload(key_arn: &str, bucket_key: Option<bool>) -> String {
 
 /// `PUT /<bucket>/<key>?encryption` — `UpdateObjectEncryption`, with whatever query the
 /// case carries beside the subresource.
-async fn update_object_encryption(
+///
+/// `pub(crate)` for the reason the payload builder above it is.
+pub(crate) async fn update_object_encryption(
     router: &MultiServiceRouter,
     bucket: &str,
     key: &str,
@@ -278,7 +283,9 @@ async fn an_update_naming_an_address_this_emulator_does_not_hold_is_refused_with
     // Every row names an address the bucket does not hold, differing in HOW: a key that was
     // never written, a key that is a prefix and an extension of the one that was, a key
     // differing only in case, and the held key under a version id the bucket has none of.
-    // The payload is well formed in all of them, so the answer is about the ADDRESS.
+    // The payload is well formed in all of them, so the answer is about the ADDRESS — and
+    // `NoSuchKey` is the one not-found error this operation publishes, so a version id that
+    // names nothing is answered with it too.
     let absent_version = "a".repeat(version_id.chars().count());
     let rows: &[(&str, &str, String, &str)] = &[
         ("a key never written", "absent.bin", String::new(), "NoSuchKey"),
@@ -294,7 +301,7 @@ async fn an_update_naming_an_address_this_emulator_does_not_hold_is_refused_with
             "the held key under a version it has none of",
             held,
             format!("&versionId={absent_version}"),
-            "NoSuchVersion",
+            "NoSuchKey",
         ),
     ];
 

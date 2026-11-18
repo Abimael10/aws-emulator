@@ -653,7 +653,8 @@ fn element_of(member_path_segment: &str) -> String {
 /// `x-amz-object-attributes`, the `encoding-type` the four listings share
 /// ([`crate::state::ENCODING_TYPE_PARAMETER`]), `CreateBucket`'s `x-amz-object-ownership`,
 /// `ListBuckets`'
-/// `max-buckets`, the `id` query parameter the id-addressed bucket configuration operations
+/// `max-buckets`, `ListObjectAnnotations`' `max-annotation-results`, the `id` query parameter
+/// the id-addressed bucket configuration operations
 /// share ([`CONFIGURATION_ID_PARAMETER`]), and `UpdateObjectEncryption`'s `ObjectEncryption`
 /// payload, whose `InvalidRequest` messages that operation's own `@documentation` lists
 /// (`smithy_query(query="doc",shape="UpdateObjectEncryption")`).
@@ -913,6 +914,22 @@ fn published_refusal(violation: &Violation) -> Option<Refused> {
         "transitionDefaultMinimumObjectSize" => (
             crate::state::INVALID_REQUEST_CODE,
             format!("Invalid TransitionDefaultMinimumObjectSize found: {rejected}"),
+        ),
+        // `ListObjectAnnotations`' `max-annotation-results`: the value bounds the page the
+        // listing answers, and the member publishes the range it may be asked for within
+        // (`range {min 1, max 1000}`), so a value outside it bounds no page S3 would serve —
+        // which S3 reports against the published BOUNDS, naming the query parameter the value
+        // arrived on, rather than by quoting the modelled member and the constraint clause
+        // the generic walk builds. The sentence is the one this service states for every
+        // integer argument outside its published range
+        // ([`crate::state::integer_argument_bounds_message`], which the `max-buckets` page
+        // bound is answered through as well), so the two cannot word that refusal two ways.
+        "maxAnnotationResults" => (
+            crate::state::INVALID_ARGUMENT_CODE,
+            crate::state::integer_argument_bounds_message(
+                crate::state::MAX_ANNOTATION_RESULTS_ARGUMENT,
+                &crate::state::MAX_ANNOTATION_RESULTS_BOUNDS,
+            ),
         ),
         _ => return None,
     };

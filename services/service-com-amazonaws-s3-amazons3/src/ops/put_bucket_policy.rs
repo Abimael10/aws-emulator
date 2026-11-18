@@ -270,16 +270,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // A policy that is not a policy document, or one past the published size limit,
         // is a client error whatever the bucket's state, so both are judged before the
-        // store is read — and the size check is what keeps the stored policy bounded.
+        // store is read — and the size check is what keeps the stored policy bounded. The
+        // sentence states the published ceiling and nothing of the request
+        // ([`crate::state::bucket_policy_too_large_message`]); the document is measured as
+        // it arrived, which is the size S3 judges for a document carrying no superfluous
+        // whitespace.
         if input.policy.len() > crate::state::MAX_BUCKET_POLICY_BYTES {
             return Err(crate::scaffolded::Scaffolded::unmodeled(
                 crate::state::MALFORMED_POLICY_CODE,
                 400,
-                format!(
-                    "A bucket policy carries at most {} bytes; the request carries {}",
-                    crate::state::MAX_BUCKET_POLICY_BYTES,
-                    input.policy.len()
-                ),
+                crate::state::bucket_policy_too_large_message(),
             ));
         }
         if !crate::state::is_valid_policy_document(&input.policy) {

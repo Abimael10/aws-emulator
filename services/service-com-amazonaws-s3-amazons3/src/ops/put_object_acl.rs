@@ -166,9 +166,12 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-s3-amazons3.json");
 // The model lists `NoSuchKey` for this operation, and `Bucket` is an @httpLabel too, so a
 // request can name a bucket this emulator does not hold — AWS answers the service-wide
 // `NoSuchBucket` ("The specified bucket does not exist", `httpError 404`) for that. A
-// request naming its ACL in two of the three ways at once is one whose "parameter or
-// header in your request isn't valid", which is `InvalidRequest` (`httpError 400`) — the
-// same two widenings `PutBucketAcl` takes, for the same two causes.
+// request naming its ACL in two HEADER forms at once is one whose "parameter or header in
+// your request isn't valid", which is `InvalidRequest` (`httpError 400`) — worded through
+// the unmodelled channel, because the sentence S3 states for that pair is its own
+// (`crate::scaffolded::Scaffolded::both_acl_forms`), while a BODY beside a header form is
+// the different class `UnexpectedContent` names. The same two widenings `PutBucketAcl`
+// takes, for the same two causes.
 #[smithy_macros::operation_error(
     "com.amazonaws.s3#PutObjectAcl",
     extra_errors = ["NoSuchBucket", "InvalidRequest"]
@@ -545,7 +548,12 @@ fn requested_grants(
         return Err(crate::scaffolded::Scaffolded::both_acl_forms());
     }
     if policy.is_some() && (input.acl.is_some() || headers_name_an_acl) {
-        return Err(PutObjectAclErrorModeled::InvalidRequest(InvalidRequest {}).into());
+        // The ACL is named in the headers AND a payload came with it: "you can choose to set
+        // the ACL on an object using either the request body or the headers" (this
+        // operation's own documentation) is an either/or, so the body is content this call
+        // does not take — which S3 refuses as such rather than as a bad argument
+        // ([`crate::scaffolded::Scaffolded::unexpected_content`]).
+        return Err(crate::scaffolded::Scaffolded::unexpected_content());
     }
 
     if let Some(policy) = policy {

@@ -1941,6 +1941,27 @@ impl<E> Scaffolded<E> {
         )
     }
 
+    /// The refusal every operation that takes an ACL answers a request carrying an
+    /// `AccessControlPolicy` BODY beside an ACL named in its headers with:
+    /// [`crate::state::UNEXPECTED_CONTENT_CODE`] at
+    /// [`crate::state::UNEXPECTED_CONTENT_STATUS`] carrying that code's own fixed sentence.
+    ///
+    /// A DIFFERENT class from [`Self::both_acl_forms`]: naming one ACL in two header forms is
+    /// a bad argument pair, while sending a payload where the headers already name the ACL is
+    /// content the call does not take — "you can choose to set the ACL on an object using
+    /// either the request body or the headers" (`PutObjectAcl`'s own documentation) — and a
+    /// client branching on the code has to be able to tell the two apart.
+    ///
+    /// One place beside [`Self::both_acl_forms`], so the writes that take an ACL cannot
+    /// disagree about either refusal of it.
+    pub fn unexpected_content() -> Self {
+        Self::unmodeled(
+            crate::state::UNEXPECTED_CONTENT_CODE,
+            crate::state::UNEXPECTED_CONTENT_STATUS,
+            crate::state::UNEXPECTED_CONTENT_MESSAGE,
+        )
+    }
+
     /// The refusal every write that carries user-defined metadata answers one whose metadata
     /// is larger than the published ceiling with: [`crate::state::METADATA_TOO_LARGE_CODE`]
     /// at [`crate::state::METADATA_TOO_LARGE_STATUS`] with that code's fixed sentence, plus

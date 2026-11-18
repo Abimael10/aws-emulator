@@ -238,11 +238,9 @@ impl MaxBucketsFault {
             Self::NotAnInteger => {
                 format!("Provided {MAX_BUCKETS_ARGUMENT} not an integer or within integer range")
             }
-            Self::OutsideBounds => format!(
-                "Argument {MAX_BUCKETS_ARGUMENT} must be an integer between {} and {}",
-                MAX_BUCKETS_BOUNDS.start(),
-                MAX_BUCKETS_BOUNDS.end()
-            ),
+            Self::OutsideBounds => {
+                integer_argument_bounds_message(MAX_BUCKETS_ARGUMENT, &MAX_BUCKETS_BOUNDS)
+            }
         }
     }
 }
@@ -272,6 +270,37 @@ pub fn max_buckets_fault(value: &str) -> Option<MaxBucketsFault> {
 /// read as an integer it cannot parse where S3 serves the request.
 pub fn withholds_max_buckets(value: &str) -> bool {
     value.is_empty() || max_buckets_fault(value).is_some()
+}
+
+/// The request field a refused page bound of ANNOTATIONS is reported against — the query
+/// parameter `ListObjectAnnotations` binds it from
+/// (`smithy_query(query="operation",operation="ListObjectAnnotations")` reports
+/// `MaxAnnotationResults: {httpQuery: "max-annotation-results", range {min 1, max 1000}}`).
+pub const MAX_ANNOTATION_RESULTS_ARGUMENT: &str = "max-annotation-results";
+
+/// The bounds a page of annotations may be asked for within: that member's own published
+/// `@range`, the same source — the ceiling being the 1,000 annotations an object may carry
+/// ([`MAX_ANNOTATIONS_PER_OBJECT`]).
+pub const MAX_ANNOTATION_RESULTS_BOUNDS: ::std::ops::RangeInclusive<i32> = 1..=1_000;
+
+/// The `<Message>` S3 sends with [`INVALID_ARGUMENT_CODE`] for an integer ARGUMENT whose
+/// value is outside the range that argument publishes.
+///
+/// ONE sentence for every such argument, stating the WIRE parameter the value arrived on and
+/// the two PUBLISHED bounds and nothing else: not the modelled member the value was bound to
+/// — a caller fixes a query parameter, not a Smithy path — and not the value itself, which
+/// the envelope carries beside the sentence as its `<ArgumentValue>`. Recorded behaviour for
+/// the page bounds this service publishes a range for, [`MAX_BUCKETS_ARGUMENT`] and
+/// [`MAX_ANNOTATION_RESULTS_ARGUMENT`], so the two cannot word that refusal two ways.
+pub fn integer_argument_bounds_message(
+    argument: &str,
+    bounds: &::std::ops::RangeInclusive<i32>,
+) -> String {
+    format!(
+        "Argument {argument} must be an integer between {} and {}",
+        bounds.start(),
+        bounds.end()
+    )
 }
 
 /// The request field a refused page bound of OBJECTS is reported against — the query
@@ -494,6 +523,23 @@ pub const INVALID_CANNED_ACL_MESSAGE: &str = "";
 /// either/or, and a request that does both describes two different ACLs for one resource.
 pub const BOTH_ACL_FORMS_MESSAGE: &str =
     "Specifying both Canned ACLs and Header Grants is not allowed";
+
+/// The code S3 answers a request that carries a BODY where the ACL it names already
+/// arrived in the request's headers: "UnexpectedContent", HTTP 400 (Amazon S3 "Error
+/// responses", list of error codes).
+///
+/// The sibling of [`BOTH_ACL_FORMS_MESSAGE`] and a DIFFERENT class from it: naming one ACL
+/// in two HEADER forms is a bad argument pair, while sending a payload beside a header form
+/// is content the call does not take at all — "you can choose to set the ACL on an object
+/// using either the request body or the headers" (`PutObjectAcl`'s own documentation) — and
+/// a client branching on the code has to be able to tell "you sent a body you should not
+/// have" from any other bad request.
+pub const UNEXPECTED_CONTENT_CODE: &str = "UnexpectedContent";
+/// See [`UNEXPECTED_CONTENT_CODE`] — the fixed text S3 publishes for that code, nothing of
+/// which comes from the request.
+pub const UNEXPECTED_CONTENT_MESSAGE: &str = "This request does not support content";
+/// The HTTP status [`UNEXPECTED_CONTENT_CODE`] is rendered with: 400, from the same list.
+pub const UNEXPECTED_CONTENT_STATUS: u16 = 400;
 
 /// The code S3 answers a write whose user-defined metadata is larger than one request may
 /// carry ([`MAX_OBJECT_METADATA_BYTES`]), with HTTP 400 (Amazon S3 "Error responses", list
@@ -1906,16 +1952,17 @@ pub const REPLICATION_CONFIGURATION_NOT_FOUND_MESSAGE: &str =
 pub const REPLICATION_CONFIGURATION_NOT_FOUND_STATUS: u16 = 404;
 
 /// The code S3 answers a `PutBucketLogging` whose `LoggingEnabled$TargetBucket` is not a
-/// bucket log files can be delivered to with: "InvalidTargetBucketForLogging - The target
-/// bucket for logging does not exist, is not owned by you, or does not have the appropriate
-/// grants for the log-delivery group." (Amazon S3 "Error responses", list of error codes),
-/// with HTTP 400.
+/// bucket log files can be delivered to with: `InvalidTargetBucketForLogging`, HTTP 400
+/// (Amazon S3 "Error responses", list of error codes).
 pub const INVALID_TARGET_BUCKET_FOR_LOGGING_CODE: &str = "InvalidTargetBucketForLogging";
-/// See [`INVALID_TARGET_BUCKET_FOR_LOGGING_CODE`] — the fixed text S3 publishes for that
-/// code, nothing of which comes from the request.
+/// The `<Message>` S3 sends with [`INVALID_TARGET_BUCKET_FOR_LOGGING_CODE`]: fixed text with
+/// no variable part, phrased the way the service words it ON THE WIRE rather than the way
+/// the error-code list DESCRIBES the condition ("the target bucket for logging does not
+/// exist, is not owned by you, or does not have the appropriate grants for the log-delivery
+/// group"), which is a description of the case and not the `<Message>` a client reads — the
+/// same distinction [`REPLICATION_CONFIGURATION_NOT_FOUND_MESSAGE`] keeps.
 pub const INVALID_TARGET_BUCKET_FOR_LOGGING_MESSAGE: &str =
-    "The target bucket for logging does not exist, is not owned by you, or does not have \
-     the appropriate grants for the log-delivery group.";
+    "The target bucket for logging does not exist";
 /// The HTTP status [`INVALID_TARGET_BUCKET_FOR_LOGGING_CODE`] is rendered with: 400, from
 /// the same list.
 pub const INVALID_TARGET_BUCKET_FOR_LOGGING_STATUS: u16 = 400;
@@ -2149,6 +2196,19 @@ pub const MALFORMED_POLICY_MESSAGE: &str =
 /// in the store — once per bucket, up to [`MAX_BUCKETS_PER_ACCOUNT`]. AWS bounds it with
 /// the bucket-policy limit it publishes, 20 KB, and refuses a longer document.
 pub const MAX_BUCKET_POLICY_BYTES: usize = 20 * 1024;
+
+/// The `<Message>` S3 sends with [`MALFORMED_POLICY_CODE`] for a document past
+/// [`MAX_BUCKET_POLICY_BYTES`].
+///
+/// Fixed text stating the PUBLISHED limit the document was judged against and nothing of the
+/// request: the number of bytes this one request carried is not part of the sentence, and
+/// neither is any member path.
+pub fn bucket_policy_too_large_message() -> String {
+    format!(
+        "Normalized policy document exceeds the maximum allowed size of \
+         {MAX_BUCKET_POLICY_BYTES} bytes"
+    )
+}
 
 /// The statements `policy` carries, or `None` when the document is not a JSON object with
 /// a `Statement` of the shape a policy writes it in: a list of statements, or a single

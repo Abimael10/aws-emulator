@@ -900,13 +900,13 @@ async fn a_refused_object_acl_changes_nothing() {
             "a body and a canned ACL together",
             vec![("x-amz-acl", "private".to_string())],
             one_grant_body.clone(),
-            "InvalidRequest",
+            "UnexpectedContent",
         ),
         (
             "a body and a grant header together",
             vec![("x-amz-grant-read", format!("uri={ALL_USERS_GROUP_URI}"))],
             one_grant_body.clone(),
-            "InvalidRequest",
+            "UnexpectedContent",
         ),
         (
             "no canned ACL, no grant header and no body",

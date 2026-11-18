@@ -277,7 +277,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 );
             };
             let Some(object) = bucket.addressed_object(&input.key, version_id) else {
-                return Err(no_such_object(version_id));
+                return Err(no_such_object());
             };
 
             // "The encryption type for the specified object can't be updated because that
@@ -363,7 +363,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 return Err(UpdateObjectEncryptionErrorModeled::NoSuchBucket(NoSuchBucket {}).into())
             }
             Some(crate::state::ObjectEncryptionWrite::NoSuchObject) => {
-                return Err(no_such_object(version_id))
+                return Err(no_such_object())
             }
             // The emulator's own ceilings, not AWS limits (S3 bounds neither the number of
             // objects nor their total size), so no AWS error code describes them: they go
@@ -400,18 +400,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 }
 
 /// The 404 for an address whose bucket this emulator holds but whose object this operation
-/// cannot find: the version the request NAMED is missing (`NoSuchVersion`), or the key has
-/// no current object (`NoSuchKey`, the shape this operation models) — which is also the
-/// case where the key's current version is a delete marker.
-fn no_such_object(version_id: Option<&str>) -> UpdateObjectEncryptionError {
-    match version_id {
-        Some(_) => crate::scaffolded::Scaffolded::unmodeled(
-            crate::state::NO_SUCH_VERSION_CODE,
-            NOT_FOUND_STATUS,
-            crate::state::NO_SUCH_VERSION_MESSAGE,
-        ),
-        None => UpdateObjectEncryptionErrorModeled::NoSuchKey(NoSuchKey {}).into(),
-    }
+/// cannot find.
+///
+/// ONE code for every unresolvable address, named by a version id or not: `NoSuchKey`, "the
+/// specified key does not exist", which is the only not-found error this operation publishes
+/// (`smithy_query(query="operation",operation="UpdateObjectEncryption")` reports
+/// `errors: [AccessDenied, InvalidRequest, NoSuchKey]`, and the model carries no
+/// version-specific shape at all). So a version id the bucket never minted, one whose version
+/// has since been permanently deleted, and a key whose current version is a delete marker are
+/// all this one refusal, rather than a code this operation does not publish.
+fn no_such_object() -> UpdateObjectEncryptionError {
+    UpdateObjectEncryptionErrorModeled::NoSuchKey(NoSuchKey {}).into()
 }
 
 /// An `AccessDenied` (403) carrying `message`.
@@ -442,8 +441,6 @@ const ACCESS_DENIED_CODE: &str = "AccessDenied";
 const ACCESS_DENIED_STATUS: u16 = 403;
 /// See [`ACCESS_DENIED_CODE`].
 const ACCESS_DENIED_MESSAGE: &str = "Access Denied";
-/// The status `NoSuchVersion` is rendered with, the one `NoSuchKey` carries in the model.
-const NOT_FOUND_STATUS: u16 = 404;
 
 /// The `ServerSideEncryption` values a SOURCE object this operation will not re-encrypt is
 /// stored under: dual-layer SSE-KMS, and the customer-key encryption whose value the
@@ -466,16 +463,17 @@ const UNSUPPORTED_SOURCE_MESSAGE: &str =
      type DSSE-KMS or SSE-C. Only source objects encrypted with SSE-S3 or SSE-KMS are \
      supported.";
 
-/// The `AccessDenied` sentence for a target KMS key that is not the bucket owner's own,
-/// verbatim from this operation's own list of them
-/// (`smithy_query(query="doc",shape="UpdateObjectEncryption")`).
+/// The `AccessDenied` sentence for a target KMS key that is not the bucket owner's own.
+///
+/// Recorded behaviour: the wire `<Message>` is this one sentence, stating the requirement the
+/// key has to meet. This operation's `@documentation` lists the same refusal as a longer
+/// paraphrase that also tells the caller what to do about it
+/// (`smithy_query(query="doc",shape="UpdateObjectEncryption")`), which is a description of
+/// the case rather than the sentence a client reads.
 ///
 /// It names no key: the refusal says the key must be the account's own and nothing about
 /// which keys exist, so an unresolvable reference and another account's are answered alike.
-const FOREIGN_KMS_KEY_MESSAGE: &str =
-    "The Amazon Web Services KMS key in the request must be owned by the same account as the \
-     bucket. Modify the request to specify a KMS key from the same account, and then try \
-     again.";
+const FOREIGN_KMS_KEY_MESSAGE: &str = "The KMS key must be from the same account as the bucket";
 
 /// The `AccessDenied` sentence for an object S3 Object Lock protects, from this operation's
 /// own list of them.

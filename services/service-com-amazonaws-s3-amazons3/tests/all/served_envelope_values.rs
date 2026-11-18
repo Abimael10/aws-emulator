@@ -552,7 +552,7 @@ fn refused_tag_rows() -> Vec<RefusedTagRow> {
                 .map(|position| tag(&format!("key-{position}"), "v"))
                 .collect(),
             "BadRequest",
-            format!("Bucket tags cannot be greater than {MAX_TAGS_PER_BUCKET}"),
+            format!("Bucket tag count cannot be greater than {MAX_TAGS_PER_BUCKET}"),
             None,
             None,
         ),

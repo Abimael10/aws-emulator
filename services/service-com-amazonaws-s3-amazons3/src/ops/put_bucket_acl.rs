@@ -160,10 +160,11 @@ impl ::aws_smithy_schema::serde::SerializableStruct for PutBucketAclOutput {
 // operation is empty (`smithy_query(query="operation",operation="PutBucketAcl")` reports
 // `errors: []`), but `Bucket` is an @httpLabel, so a request can name a bucket that does
 // not exist and AWS answers the service-wide `NoSuchBucket` ("The specified bucket does
-// not exist", `httpError 404`); and a request naming its ACL in two ways at once is one
-// whose "parameter or header in your request isn't valid", which is `InvalidRequest`
-// (`httpError 400`). Both shapes are declared by the SERVICE, so `extra_errors` widens
-// the set with them rather than inventing a second rule for either.
+// not exist", `httpError 404`); and a request naming its ACL in two HEADER forms at once is
+// one whose "parameter or header in your request isn't valid", which is `InvalidRequest`
+// (`httpError 400`) — where a BODY beside a header form is the different class
+// `UnexpectedContent` names. Both shapes are declared by the SERVICE, so `extra_errors`
+// widens the set with them rather than inventing a second rule for either.
 #[smithy_macros::operation_error(
     "com.amazonaws.s3#PutBucketAcl",
     extra_errors = ["NoSuchBucket", "InvalidRequest"]
@@ -405,7 +406,12 @@ fn requested_grants(
         return Err(crate::scaffolded::Scaffolded::both_acl_forms());
     }
     if policy.is_some() && (input.acl.is_some() || headers_name_an_acl) {
-        return Err(PutBucketAclErrorModeled::InvalidRequest(InvalidRequest {}).into());
+        // The ACL is named in the headers AND a payload came with it: "you can choose to set
+        // the ACL on a bucket using either the request body or the headers" (this operation's
+        // own documentation) is an either/or, so the body is content this call does not take
+        // — which S3 refuses as such rather than as a bad argument
+        // ([`crate::scaffolded::Scaffolded::unexpected_content`]).
+        return Err(crate::scaffolded::Scaffolded::unexpected_content());
     }
 
     if let Some(policy) = policy {
