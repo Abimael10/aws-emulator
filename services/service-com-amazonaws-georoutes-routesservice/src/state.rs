@@ -406,6 +406,15 @@ impl RoadOrientation {
             Self::Parallel => 0,
         }
     }
+
+    /// The orientation of the roads that CROSS a road running this way: the grid has two
+    /// orientations, and two roads of the same one run parallel and never meet.
+    pub fn crossing(self) -> Self {
+        match self {
+            Self::Meridian => Self::Parallel,
+            Self::Parallel => Self::Meridian,
+        }
+    }
 }
 
 /// Where two roads of the network meet: the point they cross in and the angle between them.
@@ -601,6 +610,12 @@ pub struct PathVertex {
     /// Whether this vertex is itself a point snapped onto the network, as against an
     /// endpoint that inherited its road.
     pub snapped: bool,
+    /// Whether this vertex is a SHAPE POINT of the road travelled — one of the crossings
+    /// that road passes between the places travel joins and leaves it
+    /// ([`road_shape_points`]) — rather than a place the leg itself starts, ends or changes
+    /// road in. It is the shape of a road already being travelled, so it is neither another
+    /// traversal of that road nor a manoeuvre.
+    pub shape_point: bool,
     /// The junction the previous vertex's road and this vertex's road meet in, when the
     /// road changes here and the two roads cross.
     pub junction: Option<Junction>,
@@ -614,6 +629,7 @@ impl PathVertex {
             position,
             road: None,
             snapped: false,
+            shape_point: false,
             junction: None,
         }
     }
@@ -1018,11 +1034,12 @@ impl ComAmazonawsGeoroutesRoutesserviceState {
             let leg = self.leg_between(pair[0], pair[1], mode, objective, variant);
             // The roads the route travelled, counted per stretch travelled on one: an
             // endpoint that inherited the road of its neighbour is the same travel on that
-            // road, not a second traversal of it.
+            // road, not a second traversal of it, and no more is a shape point of the road
+            // the stretch runs along.
             for road in leg
                 .path
                 .iter()
-                .filter(|vertex| vertex.snapped)
+                .filter(|vertex| vertex.snapped && !vertex.shape_point)
                 .filter_map(|vertex| vertex.road.as_ref())
             {
                 uses_controlled_access_highway |= road.class.is_controlled_access();
@@ -1133,9 +1150,25 @@ impl ComAmazonawsGeoroutesRoutesserviceState {
                     position: stretch.from,
                     road: Some(stretch.road.clone()),
                     snapped: true,
+                    shape_point: false,
                     junction,
                 },
             );
+            // The stretch travels ALONG this road, so the geometry follows the road through
+            // the crossings it passes rather than cutting from the place travel joined the
+            // road to the place it leaves it ([`road_shape_points`]).
+            for position in road_shape_points(stretch.road.orientation, stretch.from, stretch.to) {
+                push_vertex(
+                    &mut path,
+                    PathVertex {
+                        position,
+                        road: Some(stretch.road.clone()),
+                        snapped: true,
+                        shape_point: true,
+                        junction: None,
+                    },
+                );
+            }
         }
         if let Some(last) = stretches.last() {
             push_vertex(
@@ -1144,6 +1177,7 @@ impl ComAmazonawsGeoroutesRoutesserviceState {
                     position: last.to,
                     road: Some(last.road.clone()),
                     snapped: true,
+                    shape_point: false,
                     junction: None,
                 },
             );
@@ -1201,6 +1235,9 @@ fn push_vertex(path: &mut Vec<PathVertex>, vertex: PathVertex) {
             if vertex.road.is_some() {
                 last.road = vertex.road;
                 last.snapped |= vertex.snapped;
+                // A place the leg joins or leaves a road is that place however the shape of
+                // the road travelled into it put a vertex there first.
+                last.shape_point &= vertex.shape_point;
                 last.junction = last.junction.or(vertex.junction);
             }
         }
@@ -1509,12 +1546,33 @@ pub fn snap_ambiguity_m(latitude: f64) -> f64 {
 /// * on two roads of the same orientation, which never meet, along the first to the
 ///   nearest road crossing both, along that one, and along the second — the corners are
 ///   junctions of the network, not chosen points.
+///
+/// Every run along a road carries that road's own SHAPE POINTS ([`road_shape_points`]), so
+/// the line follows the road through the crossings it passes rather than running from
+/// corner to corner.
 pub fn road_path_between(from: &SnappedPosition, to: &SnappedPosition) -> Vec<Position> {
     let (start, end) = (from.position, to.position);
     let mut path = vec![start];
-    if !from.road.is_same_road(&to.road) {
+    // Travel along a road running `orientation` as far as `next`: the road's shape points
+    // on the way there, then the place travel leaves it.
+    let travel = |path: &mut Vec<Position>, orientation: RoadOrientation, next: Position| {
+        if let Some(&at) = path.last() {
+            path.extend(road_shape_points(orientation, at, next));
+        }
+        path.push(next);
+    };
+    if from.road.is_same_road(&to.road) {
+        travel(&mut path, from.road.orientation, end);
+    } else {
         match from.road.junction_with(&to.road) {
-            Some(junction) => path.push(round_to_network_precision(junction.position)),
+            Some(junction) => {
+                travel(
+                    &mut path,
+                    from.road.orientation,
+                    round_to_network_precision(junction.position),
+                );
+                travel(&mut path, to.road.orientation, end);
+            }
             None => {
                 // The two roads run parallel. The axis they both run along is where a
                 // crossing road sits at every multiple of the grid spacing, so the one
@@ -1525,14 +1583,72 @@ pub fn road_path_between(from: &SnappedPosition, to: &SnappedPosition) -> Vec<Po
                 leave[axis] = crossing;
                 let mut join = end;
                 join[axis] = crossing;
-                path.push(round_to_network_precision(leave));
-                path.push(round_to_network_precision(join));
+                travel(
+                    &mut path,
+                    from.road.orientation,
+                    round_to_network_precision(leave),
+                );
+                travel(
+                    &mut path,
+                    from.road.orientation.crossing(),
+                    round_to_network_precision(join),
+                );
+                travel(&mut path, to.road.orientation, end);
             }
         }
     }
-    path.push(end);
     path.dedup_by(|a, b| positions_equal(*a, *b));
     path
+}
+
+/// Most shape points a line this service reports carries along ONE road of the network.
+///
+/// A stretch of road passes a crossing every [`ROAD_SPACING_DEG`] along its own axis, and
+/// one long enough to pass more of them than this reports every nth instead — so the
+/// vertices of a reported line are bounded by this network's own rule rather than by how
+/// far a request asked to travel.
+const MAX_SHAPE_POINTS: usize = 32;
+
+/// The SHAPE POINTS of travel along ONE road of the network from `from` to `to`: the places
+/// that road meets the roads crossing it, in travel order, with the two ends themselves
+/// left out.
+///
+/// A line reported along the network is the shape of the roads travelled and not the chord
+/// between the places travel joined and left them: the grid puts a crossing road every
+/// [`ROAD_SPACING_DEG`] along the axis a road runs on, and those crossings are the points
+/// the road is pinned down in, so a client drawing the line draws the road. Nothing here is
+/// chosen — the points are the network's own junctions, thinned to [`MAX_SHAPE_POINTS`]
+/// where a stretch passes more of them than that.
+pub fn road_shape_points(orientation: RoadOrientation, from: Position, to: Position) -> Vec<Position> {
+    let axis = orientation.axis();
+    let (start, end) = (from[axis], to[axis]);
+    let span = end - start;
+    if !span.is_finite() || span.abs() < POSITION_EPSILON {
+        return Vec::new();
+    }
+    // The crossings STRICTLY inside the stretch: the two ends are vertices of the line
+    // already, whether or not a crossing road sits on one of them.
+    let (lo, hi) = if span > 0.0 { (start, end) } else { (end, start) };
+    let (first, last) = (
+        (lo / ROAD_SPACING_DEG).floor() + 1.0,
+        (hi / ROAD_SPACING_DEG).ceil() - 1.0,
+    );
+    if last - first + 1.0 < 1.0 {
+        return Vec::new();
+    }
+    let stride = ((last - first + 1.0) / MAX_SHAPE_POINTS as f64).ceil().max(1.0);
+    let mut points = Vec::new();
+    let mut index = if span > 0.0 { first } else { last };
+    while points.len() < MAX_SHAPE_POINTS && index >= first && index <= last {
+        let fraction = (index * ROAD_SPACING_DEG - start) / span;
+        points.push(round_to_network_precision(interpolate(
+            from,
+            to,
+            fraction.clamp(0.0, 1.0),
+        )));
+        index += if span > 0.0 { stride } else { -stride };
+    }
+    points
 }
 
 /// Whether two positions are the same at the 6-digit precision the geometry carries.

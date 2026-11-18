@@ -225,7 +225,7 @@ pub fn traverse(
         RoadOrientation::Parallel => (&meridians, &parallels),
     };
     let crossing_roads = |index: i64| GridRoad {
-        orientation: crossing_orientation(first.orientation),
+        orientation: first.orientation.crossing(),
         index,
     };
     let along_roads = |index: i64| GridRoad {
@@ -303,14 +303,6 @@ pub fn traverse(
     chosen
         .map(|way| stretches_of(&way, from, to, mode, top_speed_mps))
         .unwrap_or_default()
-}
-
-/// The orientation a road of `orientation` crosses.
-fn crossing_orientation(orientation: RoadOrientation) -> RoadOrientation {
-    match orientation {
-        RoadOrientation::Meridian => RoadOrientation::Parallel,
-        RoadOrientation::Parallel => RoadOrientation::Meridian,
-    }
 }
 
 /// What the objective a request asked for minimizes, out of a way's two costs.

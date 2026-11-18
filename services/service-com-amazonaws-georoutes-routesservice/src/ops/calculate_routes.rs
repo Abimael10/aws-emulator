@@ -95,7 +95,10 @@
 //!
 //! The leg GEOMETRY still begins and ends at the submitted positions, which is where the
 //! traveller is before the route reaches a road: the line runs from the submitted position
-//! onto the network and back off it, and its length is the leg's distance.
+//! onto the network and back off it, and its length is the leg's distance. In between it is
+//! the SHAPE of the roads travelled rather than the corners of the way: each road carries
+//! the crossings it passes as vertices ([`crate::state::road_shape_points`]), so a client
+//! that draws the line drives the road.
 //!
 //! ## Leg summary
 //!

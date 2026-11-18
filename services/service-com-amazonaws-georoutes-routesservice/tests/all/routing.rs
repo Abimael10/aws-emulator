@@ -338,6 +338,186 @@ async fn the_flexible_polyline_of_a_leg_decodes_to_its_simple_line_string() {
     }
 }
 
+/// The widest step a line reported along this network takes between two of its vertices,
+/// in metres, and the vertex it starts at.
+fn widest_step(line: &[[f64; 2]]) -> (f64, usize) {
+    line.windows(2)
+        .enumerate()
+        .map(|(index, pair)| (great_circle_m(pair[0], pair[1]), index))
+        .fold((0.0, 0), |widest, step| if step.0 > widest.0 { step } else { widest })
+}
+
+/// One row of [`a_leg_geometry_follows_the_roads_it_travels_through_their_crossings`]: the
+/// case name, the two positions, the travel mode, the geometry format the request asks the
+/// line back in (none leaves it at the documented default), and the longest step the line
+/// it answers with may take.
+type GeometryShapeCase = (
+    &'static str,
+    [f64; 2],
+    [f64; 2],
+    &'static str,
+    Option<&'static str>,
+    f64,
+);
+
+/// A leg's GEOMETRY is the SHAPE of the roads it travels: the line runs along each road
+/// through the crossings that road passes, so a client drawing it drives the road rather
+/// than cutting from turn to turn. The roads of this network sit one grid spacing apart, so
+/// no step of the line is longer than that spacing — multiplied, on a road long enough that
+/// the vertices reported for it are thinned, by whole multiples of it.
+///
+/// Rows span what the rule generalises over: how far the leg travels (a street hop, a
+/// journey across a town, a journey between towns long enough to thin), which way it runs
+/// (north-south, east-west, both), the hemisphere, the travel mode, and which of the two
+/// geometry formats the request asks the line back in.
+#[tokio::test]
+async fn a_leg_geometry_follows_the_roads_it_travels_through_their_crossings() {
+    let router = routes_service();
+    // The grid's roads are 0.0005 degrees apart, which is at most ~56 m of ground, so a
+    // line that reports every crossing steps no further than that; the last row travels far
+    // enough for the vertices of one road to be thinned, and its bound is that spacing
+    // times the thinning a road of its length takes.
+    let cases: [GeometryShapeCase; 7] = [
+        ("northbound on one street", [-123.1004, 49.2802], [-123.1004, 49.2862], "Car", Some("Simple"), 60.0),
+        ("eastbound on one street", [-123.1004, 49.2802], [-123.0924, 49.2802], "Car", Some("Simple"), 60.0),
+        ("across a town", [-122.3421, 47.6097], [-122.3493, 47.6205], "Car", Some("Simple"), 60.0),
+        ("across a town on foot", [-122.3421, 47.6097], [-122.3493, 47.6205], "Pedestrian", Some("Simple"), 60.0),
+        ("southern hemisphere", [151.2101, -33.8702], [151.2149, -33.8662], "Car", Some("Simple"), 60.0),
+        ("as a flexible polyline", [-122.3421, 47.6097], [-122.3493, 47.6205], "Car", None, 60.0),
+        ("between towns", [-123.1004, 49.2802], [-122.9004, 49.4002], "Car", Some("Simple"), 1200.0),
+    ];
+
+    for (case, origin, destination, travel_mode, format, max_step_m) in cases {
+        let mut body = json!({ "Origin": origin, "Destination": destination, "TravelMode": travel_mode });
+        if let Some(format) = format {
+            body["LegGeometryFormat"] = json!(format);
+        }
+        let (status, answer, _) = post(&router, ROUTES, &body).await;
+        assert_eq!(status, 200, "case {case:?}: expected 200, got {status} with {answer:?}");
+
+        let geometry = &answer["Routes"][0]["Legs"][0]["Geometry"];
+        let line: Vec<[f64; 2]> = match format {
+            Some("Simple") => geometry["LineString"]
+                .as_array()
+                .unwrap_or_else(|| panic!("case {case:?}: expected a LineString, got {geometry:?}"))
+                .iter()
+                .map(|vertex| position(vertex, case))
+                .collect(),
+            _ => decode_flexible_polyline(
+                geometry["Polyline"]
+                    .as_str()
+                    .unwrap_or_else(|| panic!("case {case:?}: expected a Polyline, got {geometry:?}")),
+            )
+            .unwrap_or_else(|| panic!("case {case:?}: the polyline must decode, got {geometry:?}"))
+            .into_iter()
+            .map(|(latitude, longitude)| [longitude, latitude])
+            .collect(),
+        };
+
+        // The line is still the leg's own: it begins at the submitted origin and ends at
+        // the submitted destination, whatever the roads between them do.
+        assert!(
+            line.len() >= 2,
+            "case {case:?}: a leg's geometry is a line, so it carries 2 vertices at least, got {line:?}"
+        );
+        for (which, vertex, expected) in [
+            ("start", line.first().copied(), origin),
+            ("end", line.last().copied(), destination),
+        ] {
+            let vertex = vertex.unwrap_or_else(|| panic!("case {case:?}: the line carries vertices, got {line:?}"));
+            assert!(
+                (vertex[0] - expected[0]).abs() < 1e-5 && (vertex[1] - expected[1]).abs() < 1e-5,
+                "case {case:?}: the line's {which} is the submitted position {expected:?}, got {vertex:?}"
+            );
+        }
+
+        let (widest, at) = widest_step(&line);
+        assert!(
+            widest <= max_step_m,
+            "case {case:?}: the line follows the roads through the crossings they pass, so no step \
+             of it is longer than {max_step_m:.0} m, got {widest:.1} m at vertex {at} of {} vertices",
+            line.len()
+        );
+
+        // Every vertex between the two ends is a point ON a road — a place travel joined or
+        // left one, or a crossing it passed — and one road of this grid runs at a constant
+        // longitude or a constant latitude, so a step between two of them moves in exactly
+        // one coordinate. The first and last step are the hops between a submitted position
+        // and the road it matched onto, which follow no road.
+        for pair in line[1..line.len() - 1].windows(2) {
+            let moved: Vec<usize> = (0..2)
+                .filter(|axis| (pair[0][*axis] - pair[1][*axis]).abs() > 1e-7)
+                .collect();
+            assert_eq!(
+                moved.len(), 1,
+                "case {case:?}: a step along one road moves in one coordinate only, got {pair:?}"
+            );
+        }
+
+        // However far a request asks to travel, the vertices reported for one road are
+        // bounded, so the line a leg carries is bounded too.
+        assert!(
+            line.len() <= 200,
+            "case {case:?}: a leg's line carries a bounded number of vertices, got {}",
+            line.len()
+        );
+    }
+}
+
+/// The same rule on the other line this service reports along the network: a snapped
+/// geometry runs along the roads its trace matched onto, through the crossings those roads
+/// pass, so its steps are of the grid's own spacing and it carries more vertices than the
+/// trace it was computed from.
+///
+/// Rows span the shape of the trace: two points on one road, two on roads that cross, a
+/// longer trace across the grid, and a trace in the southern hemisphere.
+#[tokio::test]
+async fn a_snapped_geometry_follows_the_roads_it_matched_through_their_crossings() {
+    let router = routes_service();
+    let cases: [(&str, Vec<[f64; 2]>, f64); 4] = [
+        ("two points on one street", vec![[-123.1004, 49.2802], [-123.1004, 49.2862]], 60.0),
+        ("two points on crossing streets", vec![[-123.1004, 49.2802], [-123.0954, 49.2852]], 60.0),
+        (
+            "a trace across the grid",
+            vec![[-123.1004, 49.2802], [-123.0974, 49.2822], [-123.0944, 49.2862]],
+            60.0,
+        ),
+        ("southern hemisphere", vec![[151.2101, -33.8702], [151.2149, -33.8662]], 60.0),
+    ];
+
+    for (case, trace, max_step_m) in cases {
+        let body = json!({
+            "TracePoints": trace.iter().map(|point| json!({ "Position": point })).collect::<Vec<Value>>(),
+            "SnapRadius": 300,
+            "SnappedGeometryFormat": "Simple",
+        });
+        let (status, answer, _) = post(&router, SNAP, &body).await;
+        assert_eq!(status, 200, "case {case:?}: expected 200, got {status} with {answer:?}");
+
+        let line: Vec<[f64; 2]> = answer["SnappedGeometry"]["LineString"]
+            .as_array()
+            .unwrap_or_else(|| panic!("case {case:?}: the snapped line string is required, got {answer:?}"))
+            .iter()
+            .map(|vertex| position(vertex, case))
+            .collect();
+
+        let (widest, at) = widest_step(&line);
+        assert!(
+            widest <= max_step_m,
+            "case {case:?}: the snapped line follows the roads through the crossings they pass, so \
+             no step of it is longer than {max_step_m:.0} m, got {widest:.1} m at vertex {at} of {} vertices",
+            line.len()
+        );
+        assert!(
+            line.len() > trace.len(),
+            "case {case:?}: the roads between the matched points are pinned down by the crossings \
+             they pass, so the line carries more vertices than the {} trace points, got {}",
+            trace.len(),
+            line.len()
+        );
+    }
+}
+
 /// One row of [`the_published_flexible_polyline_example_encodes_to_its_published_string`]:
 /// the case name, the precision, the line, and the published encoding where the format
 /// publishes one.
