@@ -319,6 +319,31 @@ impl ComAmazonawsRolesanywhereRolesanywhereState {
         }
     }
 
+    /// Whether `role_arns` is a list the profile `profile_id` may NOT hold, because the
+    /// role ARNs it names would not be unique: a role ARN is claimed by at most one
+    /// profile, so a list that names one ARN twice, or names one that a DIFFERENT stored
+    /// profile already references, is refused.
+    ///
+    /// The addressed profile itself is excluded from the comparison, so re-sending the
+    /// list a profile already holds is not a duplicate of itself; and the comparison is
+    /// against what the other profiles hold NOW, so an ARN a profile released is free for
+    /// another one to claim. The refusal is worded by [`ROLE_ARNS_NOT_UNIQUE_MESSAGE`].
+    pub fn role_arns_not_unique(&self, profile_id: &str, role_arns: &[String]) -> bool {
+        let submitted: BTreeSet<&str> = role_arns.iter().map(String::as_str).collect();
+        if submitted.len() != role_arns.len() {
+            return true;
+        }
+        self.profiles
+            .iter()
+            .filter(|(id, _)| id.as_str() != profile_id)
+            .any(|(_, record)| {
+                record
+                    .role_arns
+                    .iter()
+                    .any(|held| submitted.contains(held.as_str()))
+            })
+    }
+
     /// The tags attached to the resource this ARN names, or `None` when no stored trust
     /// anchor, profile or certificate revocation list carries that ARN.
     ///
@@ -1177,6 +1202,14 @@ pub fn source_rejection(source: &Source) -> Option<SourceRejection> {
         _ => None,
     }
 }
+
+/// The `message` a `roleArns` list whose role ARNs are not unique is refused with: the
+/// fixed wording this service answers a duplicate role ARN with. It names no request
+/// value, no id and no limit, so it is the whole message whatever the list carried. See
+/// [`ComAmazonawsRolesanywhereRolesanywhereState::role_arns_not_unique`] for the rule it
+/// words.
+pub const ROLE_ARNS_NOT_UNIQUE_MESSAGE: &str =
+    "All provided role ARNs should be unique across all Profiles.";
 
 /// The failure a `roleArns` list carries when one of its entries is not an IAM role ARN,
 /// as the `(member, constraint)` pair [`validation_message`] words a refusal from — or

@@ -74,6 +74,11 @@ const MALFORMED_IDS: [&str; 5] = [
 const ROLE_ARN_CONSTRAINT: &str =
     "Member must be an IAM role ARN of the form arn:<partition>:iam::<account>:role/<name>";
 
+/// The fixed wording a `roleArns` list whose role ARNs are not unique is refused with: it
+/// names no submitted value, no identifier and no limit, so it is the whole message
+/// whatever the list carried.
+const ROLE_ARNS_NOT_UNIQUE: &str = "All provided role ARNs should be unique across all Profiles.";
+
 struct Client {
     router: MultiServiceRouter,
 }
@@ -953,4 +958,150 @@ async fn the_create_and_the_update_judge_role_arns_identically() {
         "case \"accepted-by-the-update\": the update must store the list the create stored, \
          got {answer:?}"
     );
+}
+
+/// A role ARN is claimed by at most ONE profile, so an update whose `roleArns` list is not
+/// unique — it names an ARN twice, or names one a DIFFERENT stored profile already
+/// references — is refused with the modelled 400 carrying the fixed wording, and writes
+/// nothing; a list whose ARNs no other profile holds is stored and read back.
+///
+/// The rows span where the offending ARN sits in the list (only, first, middle, last),
+/// how many of its entries offend, the length of the list, whether the duplicate is a
+/// sibling's claim or a repeat within the submitted list, and — on the accepted side — the
+/// empty list, the list the addressed profile itself already holds, and an ARN a sibling
+/// released a moment earlier.
+#[tokio::test]
+async fn update_profile_refuses_role_arns_that_are_not_unique_across_profiles() {
+    let client = Client::new();
+
+    // A sibling holding three role ARNs, so every refusal below is about ARNs some OTHER
+    // profile references.
+    let claimed: Vec<String> = (0..3).map(|i| role_arn(&format!("Claimed{i}"))).collect();
+    let (sibling_id, _) = created(
+        &client,
+        "sibling",
+        json!({"name": "sibling", "roleArns": claimed.clone()}),
+    )
+    .await;
+    let (id, _) = created(
+        &client,
+        "target",
+        json!({"name": "target", "roleArns": [role_arn("Own"), role_arn("AlsoOwn")]}),
+    )
+    .await;
+    let before = client.get_profile(&id).await;
+    ok("before", 200, &before);
+    let before_detail = before.profile("before");
+
+    // A long list of ARNs nothing claims, used to put one offending entry far from both
+    // ends of a list near the published ceiling.
+    let free: Vec<String> = (0..ROLE_ARNS_MAX_LENGTH)
+        .map(|index| role_arn(&format!("Free{index}")))
+        .collect();
+    let mut claimed_in_a_long_list = free.clone();
+    claimed_in_a_long_list[ROLE_ARNS_MAX_LENGTH / 2] = claimed[1].clone();
+
+    let refused: Vec<(&str, Vec<String>)> = vec![
+        ("the-only-entry-is-a-siblings", vec![claimed[0].clone()]),
+        (
+            "the-first-of-several-is-a-siblings",
+            vec![claimed[1].clone(), role_arn("Fresh0")],
+        ),
+        (
+            "the-last-of-several-is-a-siblings",
+            vec![role_arn("Fresh1"), claimed[2].clone()],
+        ),
+        (
+            "the-middle-of-several-is-a-siblings",
+            vec![role_arn("Fresh2"), claimed[0].clone(), role_arn("Fresh3")],
+        ),
+        ("every-entry-is-a-siblings", claimed.clone()),
+        (
+            "a-siblings-entry-in-a-list-at-the-ceiling",
+            claimed_in_a_long_list,
+        ),
+        (
+            "one-fresh-entry-named-twice",
+            vec![role_arn("Twice"), role_arn("Twice")],
+        ),
+        (
+            "an-entry-the-profile-already-holds-named-twice",
+            vec![role_arn("Own"), role_arn("Own")],
+        ),
+        (
+            "a-siblings-entry-beside-one-the-profile-holds",
+            vec![role_arn("Own"), claimed[2].clone()],
+        ),
+    ];
+
+    for (case, role_arns) in refused {
+        let answer = client
+            .update_profile(&id, json!({"roleArns": role_arns.clone()}))
+            .await;
+        assert_eq!(
+            (answer.status, answer.error_code.as_str()),
+            (400, "ValidationException"),
+            "case {case:?}: role ARNs that are not unique must be refused, got {answer:?}"
+        );
+        assert_eq!(
+            answer.message(),
+            Some(ROLE_ARNS_NOT_UNIQUE),
+            "case {case:?}: expected message {ROLE_ARNS_NOT_UNIQUE:?}, got {:?}",
+            answer.message()
+        );
+
+        // Nothing was written: not even the instant of the last update moved.
+        let read = client.get_profile(&id).await;
+        ok(case, 200, &read);
+        assert_eq!(
+            read.profile(case),
+            before_detail,
+            "case {case:?}: a refused update must store nothing, got {read:?}"
+        );
+    }
+
+    // The accepted side of the same rule, in order: the list the addressed profile
+    // ALREADY holds (it is not a duplicate of itself), a shorter list of ARNs nothing
+    // claims, the empty list, and an ARN that became free when the sibling released it.
+    let mut accepted: Vec<(&str, Vec<String>)> = vec![
+        (
+            "the-list-the-profile-already-holds",
+            vec![role_arn("Own"), role_arn("AlsoOwn")],
+        ),
+        (
+            "entries-no-profile-claims",
+            vec![role_arn("Unclaimed0"), role_arn("Unclaimed1")],
+        ),
+        ("the-empty-list", Vec::new()),
+    ];
+
+    // The sibling drops its first ARN, which makes that ARN claimable by the profile under
+    // test: the rule is judged against what the other profiles hold NOW.
+    let released = client
+        .update_profile(
+            &sibling_id,
+            json!({"roleArns": [claimed[1].clone(), claimed[2].clone()]}),
+        )
+        .await;
+    ok("sibling-releases-an-arn", 200, &released);
+    accepted.push(("an-arn-the-sibling-released", vec![claimed[0].clone()]));
+
+    for (case, role_arns) in accepted {
+        let answer = client
+            .update_profile(&id, json!({"roleArns": role_arns.clone()}))
+            .await;
+        ok(case, 200, &answer);
+        assert_eq!(
+            answer.profile(case).get("roleArns"),
+            Some(&json!(role_arns)),
+            "case {case:?}: the update must store {role_arns:?}, got {answer:?}"
+        );
+        let read = client.get_profile(&id).await;
+        ok(case, 200, &read);
+        assert_eq!(
+            read.profile(case).get("roleArns"),
+            Some(&json!(role_arns)),
+            "case {case:?}: a later read must report {role_arns:?}, got {read:?}"
+        );
+    }
 }

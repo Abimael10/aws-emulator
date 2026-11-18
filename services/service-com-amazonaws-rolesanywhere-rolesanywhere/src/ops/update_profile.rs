@@ -13,6 +13,10 @@
 //! An id no stored profile carries is the modelled 404 and writes nothing, and a
 //! `roleArns` list carrying an entry that is not an IAM role ARN is refused with the
 //! same validation error `CreateProfile` refuses one with, before anything is written.
+//! A role ARN is claimed by at most one profile, so a submitted list whose role ARNs are
+//! not unique — one naming an ARN twice, or naming one another stored profile already
+//! references — is refused with the same modelled validation error, and nothing is
+//! written.
 //!
 //! ## Shape of an operation
 //!
@@ -190,6 +194,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let state = crate::state::service_state(&*self.engine)
             .ok_or_else(crate::state::state_unavailable)?;
         let mut store = state.lock();
+
+        // A role ARN is claimed by at most ONE profile, so a submitted list whose role
+        // ARNs are not unique — one that names an ARN twice, or one that names an ARN some
+        // other stored profile already references — is refused rather than written, and
+        // judged against the store before the addressed record is resolved, just as the
+        // shape of the list is. The refusal's wording is fixed: it reports no submitted
+        // value and no identifier.
+        if let Some(role_arns) = input.role_arns.as_deref() {
+            if store.role_arns_not_unique(&input.profile_id, role_arns) {
+                return Err(UpdateProfileErrorModeled::ValidationException(ValidationException {
+                    message: Some(crate::state::ROLE_ARNS_NOT_UNIQUE_MESSAGE.to_string()),
+                })
+                .into());
+            }
+        }
 
         // An id no stored profile carries — never created, or already deleted — is a
         // 404, never an update that lands nowhere. The refusal reports the profile by
