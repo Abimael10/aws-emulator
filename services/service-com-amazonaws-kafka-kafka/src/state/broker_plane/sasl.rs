@@ -2,8 +2,9 @@
 
 //! The SASL exchanges a client completes against a cluster's Apache Kafka endpoint.
 //!
-//! Which mechanisms a cluster offers is its own client-authentication configuration
-//! ([`advertised`]), and each one is answered as its specification defines it:
+//! Which mechanisms a cluster offers is the client authentication it turns on — for its
+//! brokers, or for its multi-VPC connectivity ([`advertised`]) — and each one is
+//! answered as its specification defines it:
 //!
 //! * `SCRAM-SHA-512` is RFC 5802 over SHA-512 — the client proves it holds the
 //!   password without sending it, and the server proves it holds the same one. The
@@ -102,21 +103,29 @@ impl Mechanism {
     }
 }
 
-/// The mechanisms `cluster`'s brokers offer: one per SASL method its client
-/// authentication turns on, in the order MSK's brokers advertise them. The IAM port
-/// offers the Java exchange and the `OAUTHBEARER` one a non-Java client uses, since
-/// both authenticate the same `kafka-cluster:Connect` signature.
+/// The mechanisms `cluster`'s brokers offer: one per SASL method the cluster admits
+/// clients on, in the order MSK's brokers advertise them. The IAM port offers the Java
+/// exchange and the `OAUTHBEARER` one a non-Java client uses, since both authenticate
+/// the same `kafka-cluster:Connect` signature.
+///
+/// A scheme is admitted when the cluster turns it on in EITHER of the two places it can
+/// ([`Cluster::scram_clients_admitted`]): its own client authentication, or that of its
+/// multi-VPC connectivity — because the control plane publishes a bootstrap string for
+/// each of them (`BootstrapBrokerStringSaslScram` for the first,
+/// `BootstrapBrokerStringVpcConnectivitySaslScram` for the second), both naming this
+/// path's socket, and a published endpoint is one whose own SASL exchange reaches an
+/// authentication verdict rather than one that answers no mechanism at all.
 ///
 /// What a given PATH offers is this set narrowed to the path's own mechanisms
-/// ([`super::AccessPath::mechanisms`]), so a cluster whose SASL/SCRAM authentication is
-/// turned off offers none even on the socket that path was opened for.
+/// ([`super::AccessPath::mechanisms`]), so a client that offers SCRAM on the IAM port is
+/// still told that port does not take it.
 #[must_use]
 pub fn advertised(cluster: &Cluster) -> Vec<Mechanism> {
     let mut mechanisms = Vec::new();
-    if cluster.sasl_scram_enabled() {
+    if cluster.scram_clients_admitted() {
         mechanisms.push(Mechanism::ScramSha512);
     }
-    if cluster.sasl_iam_enabled() {
+    if cluster.iam_clients_admitted() {
         mechanisms.push(Mechanism::AwsMskIam);
         mechanisms.push(Mechanism::OAuthBearer);
     }

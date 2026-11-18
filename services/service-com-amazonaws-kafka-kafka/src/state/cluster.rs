@@ -1182,6 +1182,32 @@ impl Cluster {
             .unwrap_or(false)
     }
 
+    /// Whether a SASL/SCRAM client is admitted on this cluster's brokers at all.
+    ///
+    /// A cluster turns a client-authentication scheme on in either of two places —
+    /// its own `ClientAuthentication`, or the `ClientAuthentication` of its
+    /// multi-VPC connectivity — and a scheme turned on in EITHER place is one
+    /// clients authenticate with: the brokers listen for that scheme, and
+    /// `GetBootstrapBrokers` publishes a bootstrap string for it (the cluster-level
+    /// member for the first, the VPC-connectivity member for the second). So this is
+    /// the question every reader that asks "does this cluster accept SCRAM clients"
+    /// asks, rather than either half of it.
+    pub fn scram_clients_admitted(&self) -> bool {
+        self.sasl_scram_enabled() || self.vpc_connectivity_sasl_scram_enabled()
+    }
+
+    /// The same for Amazon MSK's IAM access control. See
+    /// [`Self::scram_clients_admitted`].
+    pub fn iam_clients_admitted(&self) -> bool {
+        self.sasl_iam_enabled() || self.vpc_connectivity_sasl_iam_enabled()
+    }
+
+    /// The same for mutual TLS, where the broker authenticates the client by its
+    /// certificate. See [`Self::scram_clients_admitted`].
+    pub fn tls_clients_admitted(&self) -> bool {
+        self.tls_client_authentication_enabled() || self.vpc_connectivity_tls_enabled()
+    }
+
     /// Whether the cluster is dual-stack, i.e. also reachable over IPv6.
     pub fn dual_stack(&self) -> bool {
         self.broker_node_group_info

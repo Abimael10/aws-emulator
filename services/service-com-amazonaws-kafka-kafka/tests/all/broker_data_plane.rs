@@ -57,9 +57,9 @@ pub(crate) const LOOPBACK: &str = "127.0.0.1";
 pub(crate) const CLIENT_ID: &str = "sim2real-data-plane";
 
 /// The SASL mechanism names a client selects, as Amazon MSK's brokers offer them.
-const SCRAM_SHA_512: &str = "SCRAM-SHA-512";
+pub(crate) const SCRAM_SHA_512: &str = "SCRAM-SHA-512";
 pub(crate) const AWS_MSK_IAM: &str = "AWS_MSK_IAM";
-const OAUTHBEARER: &str = "OAUTHBEARER";
+pub(crate) const OAUTHBEARER: &str = "OAUTHBEARER";
 
 /// The username and password the SASL/SCRAM secret in this suite carries.
 const SCRAM_USER: &str = "scram-user";
@@ -223,7 +223,22 @@ impl Client {
     /// The tokens travel inside `SaslAuthenticate`, which is the framing a handshake at
     /// version 1 selects; [`Client::authenticate_at`] drives the other one.
     pub(crate) async fn authenticate(&mut self, case: &str, mechanism: &str, password: &str) -> i16 {
-        self.authenticate_at(case, mechanism, password, 1).await
+        self.authenticate_as(case, mechanism, SCRAM_USER, password)
+            .await
+    }
+
+    /// The same exchange offered as `user`, which is the SASL/SCRAM user the credential
+    /// belongs to — the name the cluster's associated secrets are searched for. The IAM
+    /// exchanges carry their principal in the signed payload instead, so they ignore it.
+    pub(crate) async fn authenticate_as(
+        &mut self,
+        case: &str,
+        mechanism: &str,
+        user: &str,
+        password: &str,
+    ) -> i16 {
+        self.authenticate_at(case, mechanism, user, password, 1)
+            .await
     }
 
     /// The same exchange, with the tokens in the framing a `SaslHandshake` at
@@ -233,6 +248,7 @@ impl Client {
         &mut self,
         case: &str,
         mechanism: &str,
+        user: &str,
         password: &str,
         handshake_version: i16,
     ) -> i16 {
@@ -298,7 +314,7 @@ impl Client {
                     Err(code) => code,
                 }
             }
-            _ => self.scram(case, password).await,
+            _ => self.scram(case, user, password).await,
         }
     }
 
@@ -358,9 +374,9 @@ impl Client {
 
     /// The SCRAM-SHA-512 exchange of RFC 5802, client side, with each leg sent in this
     /// connection's token framing.
-    async fn scram(&mut self, case: &str, password: &str) -> i16 {
+    async fn scram(&mut self, case: &str, user: &str, password: &str) -> i16 {
         let client_nonce = "fyko+d2lbbFgONRv9qkxdawL";
-        let client_first_bare = format!("n={SCRAM_USER},r={client_nonce}");
+        let client_first_bare = format!("n={user},r={client_nonce}");
         let first = match self
             .sasl_token(case, format!("n,,{client_first_bare}").into_bytes())
             .await
@@ -526,7 +542,7 @@ impl rustls::client::danger::ServerCertVerifier for AcceptTheEmulatorsCertificat
 
 /// Create a topic on `cluster`, with `configs` as the Base64 topic-configuration
 /// string the API takes, and wait out its `CREATING` span.
-async fn given_topic(
+pub(crate) async fn given_topic(
     emulator: &Emulator,
     cluster: &str,
     name: &str,
@@ -2038,7 +2054,9 @@ async fn group_offset(client: &mut Client, case: &str) -> i64 {
 }
 
 /// Epoch milliseconds now, the unit a record's timestamp is in.
-fn epoch_millis() -> i64 {
+/// The current instant in epoch milliseconds, which is the timestamp a producer stamps
+/// a record with.
+pub(crate) fn epoch_millis() -> i64 {
     SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|since| i64::try_from(since.as_millis()).unwrap_or_default())
@@ -3041,6 +3059,19 @@ async fn given_secret_associated(
     name: &str,
     case: &str,
 ) -> String {
+    given_secret_associated_as(emulator, cluster, name, SCRAM_USER, SCRAM_PASSWORD, case).await
+}
+
+/// The same, for the SASL/SCRAM user and password the secret is to carry — so a suite
+/// whose rule is about WHICH credential a cluster holds can associate more than one.
+pub(crate) async fn given_secret_associated_as(
+    emulator: &Emulator,
+    cluster: &str,
+    name: &str,
+    user: &str,
+    password: &str,
+    case: &str,
+) -> String {
     let created = emulator
         .secrets_manager(
             REGION,
@@ -3050,7 +3081,7 @@ async fn given_secret_associated(
                 "ClientRequestToken": format!("00000000-0000-4000-8000-{:012x}", name.len() * 7919),
                 "KmsKeyId": CUSTOMER_KEY_ARN,
                 "SecretString":
-                    format!("{{\"username\":\"{SCRAM_USER}\",\"password\":\"{SCRAM_PASSWORD}\"}}"),
+                    format!("{{\"username\":\"{user}\",\"password\":\"{password}\"}}"),
             }),
         )
         .await;
@@ -3691,7 +3722,7 @@ async fn a_sasl_exchange_is_served_in_the_framing_its_handshake_selects() {
             let mut client = Client::tls(&probe, authority).await;
             client.api_versions(&probe).await;
             let code = client
-                .authenticate_at(&probe, mechanism, credential, handshake_version)
+                .authenticate_at(&probe, mechanism, SCRAM_USER, credential, handshake_version)
                 .await;
             assert_eq!(
                 code, 0,
@@ -3718,7 +3749,7 @@ async fn a_sasl_exchange_is_served_in_the_framing_its_handshake_selects() {
             let mut refused = Client::tls(&probe, authority).await;
             refused.api_versions(&probe).await;
             let code = refused
-                .authenticate_at(&probe, mechanism, "", handshake_version)
+                .authenticate_at(&probe, mechanism, SCRAM_USER, "", handshake_version)
                 .await;
             assert_eq!(
                 code,

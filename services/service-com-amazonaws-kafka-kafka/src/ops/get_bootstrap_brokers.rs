@@ -252,6 +252,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             vpc_tls,
             vpc_scram,
             vpc_iam,
+            scram_admitted,
+            iam_admitted,
         ) = {
             let mut state = state.lock();
             // An ARN this endpoint's region holds no cluster for — absent, or
@@ -324,6 +326,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 cluster.vpc_connectivity_tls_enabled(),
                 cluster.vpc_connectivity_sasl_scram_enabled(),
                 cluster.vpc_connectivity_sasl_iam_enabled(),
+                // Whether the cluster admits clients of each SASL scheme AT ALL,
+                // which is what decides whether its socket is opened at all: the one
+                // definition of that union, shared with the broker plane that offers
+                // the mechanism on it ([`crate::state::broker_plane::sasl`]), so the
+                // socket a member is published at cannot be one whose SASL exchange
+                // offers nothing.
+                cluster.scram_clients_admitted(),
+                cluster.iam_clients_admitted(),
             )
         };
 
@@ -344,8 +354,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             let wanted = match path {
                 state::broker_plane::AccessPath::Plaintext => plaintext_offered && !serverless,
                 state::broker_plane::AccessPath::Tls => (tls_offered || vpc_tls) && !serverless,
-                state::broker_plane::AccessPath::SaslScram => (scram || vpc_scram) && !serverless,
-                state::broker_plane::AccessPath::SaslIam => serverless || iam || vpc_iam,
+                state::broker_plane::AccessPath::SaslScram => scram_admitted && !serverless,
+                state::broker_plane::AccessPath::SaslIam => serverless || iam_admitted,
             };
             if !wanted {
                 announced.push((path, None));

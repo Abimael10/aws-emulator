@@ -129,15 +129,9 @@ pub fn client_subnet_count_matches(cluster: &Cluster, client_subnets: &[String])
 /// refuses such a value as a bad parameter before asking this.
 pub fn client_authentication_enabled(cluster: &Cluster, authentication: &str) -> bool {
     match authentication {
-        AUTHENTICATION_SASL_IAM => {
-            cluster.sasl_iam_enabled() || cluster.vpc_connectivity_sasl_iam_enabled()
-        }
-        AUTHENTICATION_SASL_SCRAM => {
-            cluster.sasl_scram_enabled() || cluster.vpc_connectivity_sasl_scram_enabled()
-        }
-        AUTHENTICATION_TLS => {
-            cluster.tls_client_authentication_enabled() || cluster.vpc_connectivity_tls_enabled()
-        }
+        AUTHENTICATION_SASL_IAM => cluster.iam_clients_admitted(),
+        AUTHENTICATION_SASL_SCRAM => cluster.scram_clients_admitted(),
+        AUTHENTICATION_TLS => cluster.tls_clients_admitted(),
         _ => false,
     }
 }
