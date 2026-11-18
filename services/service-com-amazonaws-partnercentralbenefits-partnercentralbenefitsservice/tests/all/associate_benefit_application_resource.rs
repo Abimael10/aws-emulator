@@ -22,11 +22,19 @@
 //! position), which ARN form and which ARN length the resource has, which identifier form
 //! names the application, which catalog it lives in, and which of the six modelled statuses
 //! it is in.
+//!
+//! The last table states the rule the bound on an application's association list is refused
+//! under: the refusal names an input member of the request as it was SENT — the
+//! `ResourceArn` the request carried the resource on, the one member of the three a caller
+//! can act on — and not the stored list the bound is published on, which is a member of the
+//! create's input and the get's output and of no request this operation serves.
 
 use serde_json::{json, Value};
 use service_com_amazonaws_partnercentralbenefits_partnercentralbenefitsservice::ops::types::BENEFIT_APPLICATION_STATUS_VALUES;
 use service_com_amazonaws_partnercentralbenefits_partnercentralbenefitsservice::state::{
-    MAX_ASSOCIATED_RESOURCES_PER_APPLICATION, SEEDED_CATALOGS, TERMINAL_STATUSES,
+    MAX_ASSOCIATED_RESOURCES_PER_APPLICATION, SEEDED_CATALOGS, STATUS_ACTION_REQUIRED,
+    STATUS_IN_REVIEW, STATUS_PENDING_SUBMISSION, TERMINAL_STATUSES, VALIDATION_CODE_INVALID_VALUE,
+    VALIDATION_REASON_FIELD,
 };
 
 use crate::application_status_gates::reach;
@@ -34,6 +42,8 @@ use crate::benefit_application_lifecycle::{error_code, instant, text, Harness, C
 use crate::disassociate_benefit_application_resource::{
     associated, body, seed, RESOURCE_ARNS, UNKNOWN_APPLICATION,
 };
+use crate::refusal_member_path::walk_spelling;
+use crate::service_error_rules::{assert_validation_invariants, clause, message_of, one};
 
 /// The longest `ResourceArn` the model admits: the member's `@length` is `min: 0, max:
 /// 1600` (`smithy_query(query="operation",operation="AssociateBenefitApplicationResource")`),
@@ -702,6 +712,308 @@ async fn an_associated_resource_matches_the_list_filter() {
         assert!(
             matching(&out),
             "case {case:?}: the application must match the filter {arn:?}, got {out:?}"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The member the association-bound refusal names
+// ---------------------------------------------------------------------------
+
+/// The members this operation BINDS, as the wire spells them
+/// (`smithy_query(query="operation",operation="AssociateBenefitApplicationResource")`:
+/// `Catalog`, `BenefitApplicationIdentifier` and `ResourceArn`, and nothing else).
+///
+/// Written out here rather than read from the service, so a refusal cannot adopt a member
+/// this request has no slot for and still pass.
+const BOUND_MEMBERS: [&str; 3] = ["Catalog", "BenefitApplicationIdentifier", "ResourceArn"];
+
+/// The list the bound is published on, which this operation binds NO member for: it is a
+/// member of `CreateBenefitApplicationInput` and of `GetBenefitApplicationOutput`
+/// (`smithy_query(query="shape",shape="CreateBenefitApplicationInput")`), so no refusal of
+/// this request may name it, in either case the two shapes spell it.
+const UNBOUND_LIST_MEMBER: &str = "AssociatedResources";
+
+/// The requirement the refusal states, written out here rather than read from the service so
+/// the words themselves are under test: what the bound on the stored list requires of the
+/// member this request carries a resource on.
+fn bound_requirement() -> String {
+    format!(
+        "Member must not take the benefit application past \
+         {MAX_ASSOCIATED_RESOURCES_PER_APPLICATION} associated resources"
+    )
+}
+
+/// One ARN of the record a row seeds: a form carrying a region and an account, so a row can
+/// name a resource differing from a stored one only in its region.
+fn stored_arn(tag: &str, slot: usize) -> String {
+    format!("arn:aws:s3:us-west-2:000000000000:accesspoint/{tag}-{slot}")
+}
+
+/// How a record reached the bound.
+enum Filled {
+    /// The create stored every one of its resources.
+    AtCreate,
+    /// The create stored all but this many, and that many associations grew the list the
+    /// rest of the way — so the refused call is refused on a list this operation itself
+    /// filled.
+    GrownByAssociations(usize),
+}
+
+/// One refused association: the record the row seeds, and the request made against it.
+struct BoundRow {
+    case: &'static str,
+    /// What the row's own stored ARNs are named after, so each row's record is distinct.
+    tag: &'static str,
+    catalog: &'static str,
+    filled: Filled,
+    /// The status the record is in when the association is refused. Only a NON-terminal
+    /// one: a terminal record is refused by the status gate above, before the bound.
+    status: &'static str,
+    /// Whether the request names the application by its ARN rather than by its id.
+    by_arn: bool,
+    /// The resource the refused request names, which the record does not already carry.
+    refused_arn: String,
+}
+
+/// An association past the bound is refused about the member the REQUEST carried the
+/// resource on — `ResourceArn`, in the path the centralized constraint walk reports for an
+/// input member — and never about a member this operation binds no slot for.
+///
+/// The rows differ along what the rule generalises over: how the record reached the bound
+/// (filled by the create, grown by associations, and in different proportions), which
+/// catalog it lives in, which non-terminal status it is in, which identifier form names it,
+/// and which ARN form and length the refused resource has — including the longest ARN the
+/// model admits and one differing from a stored resource only in its region.
+#[tokio::test]
+async fn the_association_bound_refusal_names_the_member_the_request_sent() {
+    let harness = Harness::new();
+    let other_catalog = SEEDED_CATALOGS
+        .iter()
+        .copied()
+        .find(|catalog| *catalog != CATALOG)
+        .expect("the service seeds more than one catalog");
+    let requirement = bound_requirement();
+
+    let rows = vec![
+        BoundRow {
+            case: "a record the create filled, refused an ARN with no region or account",
+            tag: "at-create",
+            catalog: CATALOG,
+            filled: Filled::AtCreate,
+            status: STATUS_PENDING_SUBMISSION,
+            by_arn: false,
+            refused_arn: "arn:aws:s3:::assoc-bound-past".to_string(),
+        },
+        BoundRow {
+            case: "a record associations grew to the bound, under review",
+            tag: "grown",
+            catalog: CATALOG,
+            filled: Filled::GrownByAssociations(4),
+            status: STATUS_IN_REVIEW,
+            by_arn: false,
+            refused_arn: RESOURCE_ARNS[1].to_string(),
+        },
+        BoundRow {
+            case: "a record of another catalog, named by its ARN",
+            tag: "other-catalog",
+            catalog: other_catalog,
+            filled: Filled::AtCreate,
+            status: STATUS_PENDING_SUBMISSION,
+            by_arn: true,
+            refused_arn: RESOURCE_ARNS[4].to_string(),
+        },
+        BoundRow {
+            case: "a record awaiting the partner, refused the longest ARN the model admits",
+            tag: "longest",
+            catalog: CATALOG,
+            filled: Filled::GrownByAssociations(MAX_ASSOCIATED_RESOURCES_PER_APPLICATION - 1),
+            status: STATUS_ACTION_REQUIRED,
+            by_arn: true,
+            refused_arn: longest_arn(),
+        },
+        BoundRow {
+            case: "a resource differing from a stored one only in its region",
+            tag: "twin",
+            catalog: CATALOG,
+            filled: Filled::AtCreate,
+            status: STATUS_PENDING_SUBMISSION,
+            by_arn: false,
+            refused_arn: "arn:aws:s3:eu-west-1:000000000000:accesspoint/twin-0".to_string(),
+        },
+    ];
+
+    // The table spans both ways a record reaches the bound, so it cannot shrink to the one
+    // the create produces.
+    for grown in [false, true] {
+        assert!(
+            rows.iter()
+                .any(|row| matches!(row.filled, Filled::GrownByAssociations(_)) == grown),
+            "case \"table\": expected a row whose record was grown by associations: {grown}"
+        );
+    }
+    // And no row may name a status the status gate refuses first, which would never reach
+    // the bound at all.
+    for row in &rows {
+        assert!(
+            !TERMINAL_STATUSES.contains(&row.status),
+            "case {:?}: a terminal status is refused before the bound, got {:?}",
+            row.case,
+            row.status
+        );
+    }
+
+    for (index, row) in rows.iter().enumerate() {
+        let case = row.case;
+        let every_slot: Vec<String> = (0..MAX_ASSOCIATED_RESOURCES_PER_APPLICATION)
+            .map(|slot| stored_arn(row.tag, slot))
+            .collect();
+        let grown = match row.filled {
+            Filled::AtCreate => 0,
+            Filled::GrownByAssociations(grown) => grown,
+        };
+        let at_create: Vec<&str> = every_slot[..every_slot.len() - grown]
+            .iter()
+            .map(String::as_str)
+            .collect();
+        let id = seed(
+            &harness,
+            case,
+            row.catalog,
+            &format!("tok-assoc-bound-member-{index}"),
+            &at_create,
+        )
+        .await;
+        for arn in &every_slot[every_slot.len() - grown..] {
+            harness
+                .ok(
+                    case,
+                    "AssociateBenefitApplicationResource",
+                    &body(row.catalog, &id, arn),
+                )
+                .await;
+        }
+        reach(&harness, case, row.catalog, &id, row.status).await;
+
+        let before = harness.get_in(case, row.catalog, &id).await;
+        assert_eq!(
+            associated(&before).len(),
+            MAX_ASSOCIATED_RESOURCES_PER_APPLICATION,
+            "case {case:?}: expected the record filled to the bound, got {before:?}"
+        );
+        assert!(
+            !associated(&before).contains(&row.refused_arn),
+            "case {case:?}: the refused resource must not be one the record carries, \
+             got {before:?}"
+        );
+
+        let identifier = if row.by_arn {
+            text(case, &before, "Arn")
+        } else {
+            id.clone()
+        };
+        let request = body(row.catalog, &identifier, &row.refused_arn);
+        let (status, out) = harness
+            .call("AssociateBenefitApplicationResource", &request)
+            .await;
+        assert_eq!(
+            status, 400,
+            "case {case:?}: expected 400 past the bound, got {status} {out:?}"
+        );
+        assert_eq!(
+            error_code(&out),
+            "ValidationException",
+            "case {case:?}: expected ValidationException, got {out:?}"
+        );
+
+        // The envelope over the clause for the member the request carried the resource on.
+        let message = message_of(&out)
+            .unwrap_or_else(|| panic!("case {case:?}: the refusal carries no Message: {out:?}"));
+        assert_eq!(
+            message,
+            one(&clause(&walk_spelling("ResourceArn"), &requirement)),
+            "case {case:?}: expected the clause for the resource member, got {message:?}"
+        );
+        assert_validation_invariants(case, &message);
+        assert_eq!(
+            out["Reason"],
+            json!(VALIDATION_REASON_FIELD),
+            "case {case:?}: expected the field-validation reason, got {out:?}"
+        );
+
+        // The one-member field list names the same member, with the same requirement.
+        let fields = out["FieldList"]
+            .as_array()
+            .cloned()
+            .unwrap_or_else(|| panic!("case {case:?}: the refusal carries no FieldList: {out:?}"));
+        assert_eq!(
+            fields.len(),
+            1,
+            "case {case:?}: expected one refused member, got {out:?}"
+        );
+        let named = text(case, &fields[0], "Name");
+        assert_eq!(
+            named,
+            walk_spelling("ResourceArn"),
+            "case {case:?}: expected the resource member to be named, got {out:?}"
+        );
+        assert_eq!(
+            text(case, &fields[0], "Message"),
+            requirement,
+            "case {case:?}: expected the field to state the requirement, got {out:?}"
+        );
+        assert_eq!(
+            fields[0]["Code"],
+            json!(VALIDATION_CODE_INVALID_VALUE),
+            "case {case:?}: expected the invalid-value code, got {out:?}"
+        );
+
+        // The member named is one the REQUEST sent, which is what a caller can correct:
+        // every member of the body, in the walk's spelling, and no other.
+        let sent: Vec<String> = request
+            .as_object()
+            .expect("the request body is an object")
+            .keys()
+            .map(|member| walk_spelling(member))
+            .collect();
+        assert!(
+            sent.contains(&named),
+            "case {case:?}: the refusal names {named:?}, which the request did not send: \
+             {sent:?}"
+        );
+        for member in BOUND_MEMBERS {
+            assert!(
+                sent.contains(&walk_spelling(member)),
+                "case {case:?}: the request must carry every member this operation binds, \
+                 missing {member:?} from {sent:?}"
+            );
+        }
+        // And the list the bound is published on is a member of other shapes only, so
+        // neither half of the refusal may name it.
+        for spelling in [
+            UNBOUND_LIST_MEMBER.to_string(),
+            walk_spelling(UNBOUND_LIST_MEMBER),
+        ] {
+            assert!(
+                !message.contains(&spelling),
+                "case {case:?}: the message names {spelling:?}, which this request has no \
+                 slot for: {message:?}"
+            );
+            assert!(
+                !named.contains(&spelling),
+                "case {case:?}: the field list names {spelling:?}, which this request has no \
+                 slot for: {out:?}"
+            );
+        }
+        // Nothing of the resource that would not fit is echoed, and nothing is persisted.
+        assert!(
+            !message.contains(&row.refused_arn),
+            "case {case:?}: the refusal echoes the rejected ARN, got {message:?}"
+        );
+        let after = harness.get_in(case, row.catalog, &id).await;
+        assert_eq!(
+            after, before,
+            "case {case:?}: a refused association must persist nothing, got {after:?}"
         );
     }
 }

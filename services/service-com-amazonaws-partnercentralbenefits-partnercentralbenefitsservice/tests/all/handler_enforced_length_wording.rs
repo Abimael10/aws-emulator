@@ -16,21 +16,24 @@
 //!
 //! The rows span what the rule generalises over: which end of the bound the request misses
 //! (the minimum, the maximum), what the length counts (the elements of a list, the
-//! characters of a string), which handler enforces it (`AmendBenefitApplication`'s
-//! amendment count and its `NewValue` bounds, `AssociateBenefitApplicationResource`'s
-//! association bound), the distance from the bound (at it, one past it, far past it) and
-//! the character width of the value (ASCII and multi-byte, since a length counts
-//! characters).
+//! characters of a string), which rule of which handler enforces it
+//! (`AmendBenefitApplication`'s amendment count and its `NewValue` bounds), the distance
+//! from the bound (at it, one past it, far past it) and the character width of the value
+//! (ASCII and multi-byte, since a length counts characters).
+//!
+//! `AssociateBenefitApplicationResource`'s bound on an application's association list is
+//! NOT in this class: the bounded list is no member of that request, so its refusal states
+//! what the bound requires of the member the request does carry rather than a length of
+//! that member — see `tests/all/associate_benefit_application_resource.rs`.
 
 use serde_json::{json, Value};
 use service_com_amazonaws_partnercentralbenefits_partnercentralbenefitsservice::state::{
-    MAX_AMENDMENTS_PER_REQUEST, MAX_ASSOCIATED_RESOURCES_PER_APPLICATION, MAX_DETAILS_VALUE_LEN,
-    MIN_AMENDMENTS_PER_REQUEST, VALIDATION_REASON_FIELD,
+    MAX_AMENDMENTS_PER_REQUEST, MAX_DETAILS_VALUE_LEN, MIN_AMENDMENTS_PER_REQUEST,
+    VALIDATION_REASON_FIELD,
 };
 
 use crate::amend_benefit_application::{amend_body, amendment};
 use crate::benefit_application_lifecycle::{error_code, text, Harness, CATALOG};
-use crate::disassociate_benefit_application_resource::{body as association_body, seed as seed_full};
 use crate::service_error_rules::{assert_validation_invariants, clause, message_of, one};
 
 /// The longest value `Name` accepts: the modelled `BenefitApplicationName`
@@ -68,9 +71,6 @@ const LENGTH_PREFIX: &str = "Member must have length ";
 enum Call {
     /// One `AmendBenefitApplication` carrying these amendments.
     Amend(Value),
-    /// One `AssociateBenefitApplicationResource` of this ARN onto the record already
-    /// filled to the store's association bound.
-    Associate(&'static str),
 }
 
 /// One row: the call, the member a refusal must name, and the requirement it must state —
@@ -112,21 +112,6 @@ async fn a_handler_enforced_length_states_one_requirement_at_both_ends() {
         )
         .await;
     let id = text("seed", &subject, "Id");
-
-    // One record whose association list is already at the store's bound, so the next
-    // association is the one past it.
-    let filled: Vec<String> = (0..MAX_ASSOCIATED_RESOURCES_PER_APPLICATION)
-        .map(|slot| format!("arn:aws:s3:::length-wording-{slot}"))
-        .collect();
-    let stored: Vec<&str> = filled.iter().map(String::as_str).collect();
-    let full_id = seed_full(
-        &harness,
-        "a record at the association bound",
-        CATALOG,
-        "tok-length-wording-full",
-        &stored,
-    )
-    .await;
 
     let rows = vec![
         Row {
@@ -210,12 +195,6 @@ async fn a_handler_enforced_length_states_one_requirement_at_both_ends() {
             member: "amendments.1.member.newValue",
             expected: Some(max_length(MAX_DETAILS_VALUE_LEN)),
         },
-        Row {
-            case: "one association past the record's bound".to_string(),
-            call: Call::Associate("arn:aws:s3:::length-wording-past"),
-            member: "associatedResources",
-            expected: Some(max_length(MAX_ASSOCIATED_RESOURCES_PER_APPLICATION)),
-        },
     ];
 
     // The table covers both ends of a bound, so it cannot shrink to the maximum half the
@@ -251,10 +230,6 @@ async fn a_handler_enforced_length_states_one_requirement_at_both_ends() {
                     ),
                 )
             }
-            Call::Associate(arn) => (
-                "AssociateBenefitApplicationResource",
-                association_body(CATALOG, &full_id, arn),
-            ),
         };
 
         let (status, out) = harness.call(operation, &body).await;

@@ -19,7 +19,9 @@
 //! modelled bound on that list
 //! ([`crate::state::MAX_ASSOCIATED_RESOURCES_PER_APPLICATION`], the `@length(max: 10)` the
 //! model gives `AssociatedResources`) is enforced: an association past it is refused with
-//! the modelled `ValidationException`.
+//! the modelled `ValidationException`, naming the `ResourceArn` member the request carried
+//! the resource on — the only member of this request such a refusal can be about, since the
+//! bounded list is a member of the create's input and the get's output and not of this one.
 //!
 //! ## Shape of an operation
 //!
@@ -102,8 +104,6 @@
 #[allow(unused_imports)]
 use super::types::*;
 
-use smithy_server_runtime::ViolationKind;
-
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -141,30 +141,41 @@ impl From<AssociateBenefitApplicationResourceErrorModeled> for AssociateBenefitA
     }
 }
 
-/// The member a refusal of this operation's association bound names: the application's own
-/// `AssociatedResources` list, spelled as the wire spells it, because that is the list the
-/// request would take past its modelled length — the same member a create carrying too
-/// many resources is refused on.
-const ASSOCIATED_RESOURCES_MEMBER: &str = "associatedResources";
+/// The member a refusal of this operation's association bound names, spelled as the wire
+/// spells it: the one member of the three this request carries (`Catalog`,
+/// `BenefitApplicationIdentifier`, `ResourceArn` —
+/// `smithy_query(query="operation",operation="AssociateBenefitApplicationResource")`) that
+/// named the resource which would not fit, and so the one a caller can act on. The stored
+/// list the bound is published on (`AssociatedResources`) is a member of the create's input
+/// and the get's output, NOT of this request, so no refusal of this call can name it.
+const RESOURCE_ARN_MEMBER: &str = "ResourceArn";
+
+/// The requirement the resource this request names failed when the application it would be
+/// linked to already holds [`crate::state::MAX_ASSOCIATED_RESOURCES_PER_APPLICATION`] of
+/// them: the bound is published on the stored list, so what it requires OF THIS MEMBER is
+/// that the resource it names not take that list past it — which a caller acts on by
+/// disassociating a resource the application no longer tracks.
+fn association_bound_requirement() -> String {
+    format!(
+        "Member must not take the benefit application past {} associated resources",
+        crate::state::MAX_ASSOCIATED_RESOURCES_PER_APPLICATION
+    )
+}
 
 /// The refusal an association that would take one application past
 /// [`crate::state::MAX_ASSOCIATED_RESOURCES_PER_APPLICATION`] is answered with: this
-/// service's modelled `ValidationException`, stating the modelled length the stored list
-/// may not exceed. The requirement is worded by the helper the centralized walk words a
-/// length with ([`crate::service::constraint_requirement`]) and the exception is built by
-/// the one construction every member refusal of this crate goes through
-/// ([`crate::state::member_validation_exception`]), so a caller is shown the same
-/// requirement whether the resource that would not fit arrives on a create or on an
-/// association, and NOTHING of the ARN the request carried is echoed.
+/// service's modelled `ValidationException`, naming the input member the request carried the
+/// resource on and the requirement that member failed
+/// ([`association_bound_requirement`]). The exception is built by the one construction every
+/// member refusal of this crate goes through
+/// ([`crate::state::member_validation_exception`]), which spells the member by the path the
+/// centralized constraint walk reports for it, and NOTHING of the ARN the request carried is
+/// echoed.
 fn record_full() -> AssociateBenefitApplicationResourceError {
-    let requirement = crate::service::constraint_requirement(&ViolationKind::MaxLength(
-        crate::state::MAX_ASSOCIATED_RESOURCES_PER_APPLICATION as i64,
-    ))
-    .unwrap_or_default();
     AssociateBenefitApplicationResourceErrorModeled::ValidationException(
         crate::state::member_validation_exception(
-            ASSOCIATED_RESOURCES_MEMBER,
-            &requirement,
+            RESOURCE_ARN_MEMBER,
+            &association_bound_requirement(),
             crate::state::VALIDATION_REASON_FIELD,
         ),
     )
@@ -294,6 +305,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // `MAX_ASSOCIATED_RESOURCES_PER_APPLICATION` resources takes no more, which is
             // also what keeps the stored list inside the length the read reports it with. A
             // request naming one it already carries is unaffected, since it stores nothing.
+            // The refusal is stated about this request's own `ResourceArn` member — see
+            // [`record_full`].
             if application.associated_resources.len()
                 >= crate::state::MAX_ASSOCIATED_RESOURCES_PER_APPLICATION
             {

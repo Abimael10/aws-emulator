@@ -309,10 +309,13 @@ async fn every_member_refusal_is_the_one_construction() {
             case: "an association past the store's bound".to_string(),
             operation: "AssociateBenefitApplicationResource",
             body: association_body(CATALOG, &full_id, "arn:aws:s3:::one-construction-past"),
-            member: "associatedResources".to_string(),
+            // That request binds no `AssociatedResources` member — the bounded list is a
+            // member of the create's input and the get's output — so the refusal is about
+            // the member the request carried the resource on.
+            member: "ResourceArn".to_string(),
             requirement: format!(
-                "Member must have length less than or equal to \
-                 {MAX_ASSOCIATED_RESOURCES_PER_APPLICATION}"
+                "Member must not take the benefit application past \
+                 {MAX_ASSOCIATED_RESOURCES_PER_APPLICATION} associated resources"
             ),
             reason: VALIDATION_REASON_FIELD,
         },

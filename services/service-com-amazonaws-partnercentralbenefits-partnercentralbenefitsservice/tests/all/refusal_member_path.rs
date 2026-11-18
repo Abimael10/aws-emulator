@@ -25,18 +25,23 @@
 //!    modelled `@pattern`, against the status rule the handler enforces).
 //! 2. Every refusal a HANDLER of this service decides about a member: the envelope over the
 //!    clause for that path, and the one-member `FieldList` naming it. The rows cross the
-//!    case the WIRE spells the member in (`NextToken`, `Tags` and
-//!    `BenefitApplicationDetails` in PascalCase; `tags` and `tagKeys` already in
-//!    lowerCamel), the operation deciding the refusal, the kind of rule it enforces (a
-//!    cursor this service never issued, the reserved tag namespace, a document guard, a
-//!    benefit the catalog no longer offers) and the shape of the path (the member alone, and
-//!    a member reached below it inside a collection element).
+//!    case the WIRE spells the member in (`NextToken`, `Tags`,
+//!    `BenefitApplicationDetails` and `ResourceArn` in PascalCase; `tags` and `tagKeys`
+//!    already in lowerCamel), the operation deciding the refusal, the kind of rule it
+//!    enforces (a cursor this service never issued, the reserved tag namespace, a document
+//!    guard, a benefit the catalog no longer offers, the bound on an application's
+//!    association list) and the shape of the path (the member alone, and a member reached
+//!    below it inside a collection element).
 //!
 //! The rule has a corollary, which the last two tables pin: **the member a refusal names is
 //! a member of the request as it was SENT** — an operation can only name an input member it
 //! binds, so where a rule is about state the request reaches INDIRECTLY, the refusal names
-//! the member that state arrived on. `AmendBenefitApplication` is where the two differ:
-//! it binds no `BenefitApplicationDetails`
+//! the member that state arrived on. `AssociateBenefitApplicationResource` is one place the
+//! two differ, and table 2 carries its row: the bound it enforces is published on the stored
+//! `AssociatedResources` list, a member of the create's input and the get's output that this
+//! request binds no slot for, so the refusal names the `ResourceArn` the request carried the
+//! resource on. `AmendBenefitApplication` is the other: it binds no
+//! `BenefitApplicationDetails`
 //! (`smithy_query(query="operation",operation="AmendBenefitApplication")` binds `Catalog`,
 //! `ClientToken`, `Revision`, `Identifier`, `AmendmentReason` and `Amendments`, and nothing
 //! else), and the document is what its amendments PRODUCE, so both rules stated about that
@@ -51,9 +56,9 @@
 use serde_json::{json, Value};
 use service_com_amazonaws_partnercentralbenefits_partnercentralbenefitsservice::state::{
     encode_page_token, ALLOCATION_ID_PREFIX, APPLICATION_ID_PREFIX, BENEFIT_ID_PREFIX, ID_BODY_LEN,
-    MAX_AMENDMENTS_PER_REQUEST, MAX_DETAILS_DEPTH, MAX_DETAILS_MEMBERS, MAX_DETAILS_VALUE_LEN,
-    MAX_FIELD_PATH_LEN, RESERVED_TAG_KEY_PREFIX, VALIDATION_CODE_INVALID_VALUE,
-    VALIDATION_REASON_FIELD,
+    MAX_AMENDMENTS_PER_REQUEST, MAX_ASSOCIATED_RESOURCES_PER_APPLICATION, MAX_DETAILS_DEPTH,
+    MAX_DETAILS_MEMBERS, MAX_DETAILS_VALUE_LEN, MAX_FIELD_PATH_LEN, RESERVED_TAG_KEY_PREFIX,
+    VALIDATION_CODE_INVALID_VALUE, VALIDATION_REASON_FIELD,
 };
 
 use crate::amend_benefit_application::{amend_body, amendment};
@@ -62,6 +67,9 @@ use crate::benefit_catalog_record::{catalog_benefits, declared_fields, UNDECLARE
 use crate::details_document_guard::{
     byte_requirement, flat_object, member_requirement, members_past_the_byte_bound,
     text_spread_over_members, MEMBER_PATH as DETAILS_PATH,
+};
+use crate::disassociate_benefit_application_resource::{
+    body as association_body, seed as seed_with_resources,
 };
 use crate::member_refusal_one_construction::withdrawn_benefit;
 use crate::reserved_tag_keys::{element_requirement, tag_key_path};
@@ -81,7 +89,7 @@ const RESERVED_KEY: &str = "aws:createdBy";
 ///
 /// Written out here rather than read from the service, so a table row cannot adopt a second
 /// spelling of a member and still pass.
-fn walk_spelling(wire_member: &str) -> String {
+pub(crate) fn walk_spelling(wire_member: &str) -> String {
     let mut characters = wire_member.chars();
     match characters.next() {
         Some(first) => first.to_lowercase().chain(characters).collect(),
@@ -284,6 +292,20 @@ async fn an_in_handler_refusal_names_the_walks_path_under_the_envelope() {
     let subject_arn = text("subject", &subject, "Arn");
     let reserved_requirement =
         format!("Member must not use the reserved tag key prefix: {RESERVED_TAG_KEY_PREFIX}");
+    // One record whose association list is already at the bound, so the next association is
+    // the one past it.
+    let filled: Vec<String> = (0..MAX_ASSOCIATED_RESOURCES_PER_APPLICATION)
+        .map(|slot| format!("arn:aws:s3:::member-path-{slot}"))
+        .collect();
+    let stored: Vec<&str> = filled.iter().map(String::as_str).collect();
+    let full_id = seed_with_resources(
+        &harness,
+        "a record at the association bound",
+        CATALOG,
+        "tok-member-path-full",
+        &stored,
+    )
+    .await;
 
     let mut rows: Vec<Row> = Vec::new();
     // A cursor this service never issued, on every paginated listing: the listing that
@@ -371,6 +393,20 @@ async fn an_in_handler_refusal_names_the_walks_path_under_the_envelope() {
             "BenefitIdentifier": withdrawn_id,
             "Name": "member-path",
         }),
+    });
+
+    rows.push(Row {
+        case: "AssociateBenefitApplicationResource: an association past the bound".to_string(),
+        operation: "AssociateBenefitApplicationResource",
+        // That operation binds no member for the list the bound is published on, so the
+        // refusal is about the member the request carried the resource on.
+        wire_member: "ResourceArn",
+        path: "resourceArn".to_string(),
+        requirement: format!(
+            "Member must not take the benefit application past \
+             {MAX_ASSOCIATED_RESOURCES_PER_APPLICATION} associated resources"
+        ),
+        body: association_body(CATALOG, &full_id, "arn:aws:s3:::member-path-past"),
     });
 
     // The table covers a member the wire spells in PascalCase and one it already spells in
