@@ -33,8 +33,8 @@ use service_com_amazonaws_lambda_awsgirapiservice::state::{
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::event_source_mappings::{
-    call, create_function, create_mapping, create_request, created_state_for, get_mapping,
-    router_on, Answer, DYNAMODB_SOURCE, KINESIS_SOURCE, MAPPINGS_URI, QUEUE_SOURCE,
+    await_mapping_state, call, create_function, create_mapping, create_request, created_state_for,
+    get_mapping, router_on, Answer, DYNAMODB_SOURCE, KINESIS_SOURCE, MAPPINGS_URI, QUEUE_SOURCE,
     STATE_CREATING,
 };
 
@@ -434,7 +434,16 @@ async fn an_update_of_a_mapping_that_cannot_take_one_is_refused() {
     let uuid = created
         .string("UUID")
         .unwrap_or_else(|| panic!("the create answers a UUID"));
-    tokio::time::sleep(EVENT_SOURCE_MAPPING_SETTLE_DELAY + SLACK).await;
+    // The settle out of `Creating` is owed by the CLOCK, so the suite waits for the mapping to
+    // REPORT it rather than for a span of its own: what the rows below exercise is the refusal
+    // of a settled mapping.
+    await_mapping_state(
+        &router,
+        "a queue mapping settling out of its create",
+        &uuid,
+        STATE_ENABLED,
+    )
+    .await;
     let before = stored(&engine, &uuid).expect("the mapping is held");
 
     // A UUID nothing is held under, and a re-target onto a function that does not exist.
@@ -507,8 +516,16 @@ async fn an_update_of_a_mapping_that_cannot_take_one_is_refused() {
         "the mapping must report the function it was re-targeted onto, got {after:?}"
     );
 
-    // And a mapping whose deletion is owed is not available to take a change either.
-    tokio::time::sleep(EVENT_SOURCE_MAPPING_SETTLE_DELAY + SLACK).await;
+    // And a mapping whose deletion has been accepted is no longer a mapping to change: the
+    // teardown is under way, so its UUID answers the modelled not-found. The re-target above
+    // has to have settled first, which the mapping itself reports.
+    await_mapping_state(
+        &router,
+        "a re-targeted mapping settling out of its update",
+        &uuid,
+        STATE_ENABLED,
+    )
+    .await;
     let deleted = delete_mapping(&router, &uuid).await;
     assert_eq!(
         deleted.status,
@@ -520,7 +537,7 @@ async fn an_update_of_a_mapping_that_cannot_take_one_is_refused() {
     let while_deleting = update_mapping(&router, &uuid, &json!({ "BatchSize": 3 })).await;
     assert_eq!(
         while_deleting.status,
-        400,
+        404,
         "an update of a mapping being deleted is refused, got {} {}",
         while_deleting.status,
         while_deleting.text()
@@ -528,8 +545,8 @@ async fn an_update_of_a_mapping_that_cannot_take_one_is_refused() {
     assert!(
         while_deleting
             .error_code()
-            .contains("ResourceInUseException"),
-        "expected ResourceInUseException, got {}",
+            .contains("ResourceNotFoundException"),
+        "expected ResourceNotFoundException, got {}",
         while_deleting.error_code()
     );
 }

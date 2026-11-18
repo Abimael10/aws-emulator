@@ -29,3 +29,29 @@ Traces: events__lambda__sqs.cli-delete-event-source-mapping-stops-polling.
 1. Clone the repo and run the behavioral suite.
 2. Re-replay events__lambda__sqs.cli-delete-event-source-mapping-stops-polling (listed under '### events__lambda__sqs').
 3. CreateEventSourceMapping from an SQS queue to a function, wait for Enabled, DeleteEventSourceMapping, then SendMessage and poll both the queue depth and the function's invocation count.
+
+## Resolution
+
+One divergence of this sequence was found and fixed: a call that would CHANGE a mapping
+whose delete has already been accepted answered HTTP 400 `ResourceInUseException` for the
+whole window the removal is owed in, where the recorded run shows HTTP 404
+`ResourceNotFoundException`. A delete the service has accepted leaves no mapping for a
+further call to act on, so `UpdateEventSourceMapping` and a second `DeleteEventSourceMapping`
+now answer the modelled not-found with the service's fixed sentence, while a READ still
+reports the `Deleting` state the teardown is in until the removal the clock owes falls due
+("might not be completely deleted for several seconds"). The `UPDATING` window, which the
+model's own `ResourceInUseException` sentence names, keeps that refusal.
+
+The rest of the sequence is served: `core/router/tests/all/lambda_sqs_mapping_delete_stops_polling_on_an_authenticating_router.rs`
+drives the whole of it on the ASSEMBLED emulator with request authentication ON — two queues,
+a least-privilege execution role, a CloudFormation-archived python relay, the mapping, the
+relayed envelope, the delete, the post-delete refusals, every message sent afterwards staying
+visible on the source across many looks, the removal falling due, and those messages being
+receivable by an ordinary consumer — and completes both of its rows in about twelve seconds,
+so the deletion's effect (polling stopped, the message left in the queue) is observable.
+
+CAVEAT: the replay of `events__lambda__sqs.cli-delete-event-source-mapping-stops-polling`
+still ends in `Check timed out after 60.0s`. No call of the sequence is refused or answered
+wrongly on the emulator as it serves traffic, so the remaining timeout is the check's own
+budget against its CLI-driven sequence rather than a divergence traceable to a served
+response.

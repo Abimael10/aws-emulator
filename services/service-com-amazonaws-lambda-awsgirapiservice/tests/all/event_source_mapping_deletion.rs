@@ -8,9 +8,10 @@
 //! The rule under test: a delete addressed by the UUID of a mapping this account holds
 //! moves THAT mapping into `Deleting` and answers the stored record in that state; the
 //! REMOVAL is owed by the clock, so until it is due the mapping is still reported (by
-//! `GetEventSourceMapping` and by a listing) as `Deleting` and a second delete of it is
-//! refused with the modelled `ResourceInUseException`, and once it is due the mapping is
-//! held no more — a read of it is the modelled not-found, a listing omits it, and its
+//! `GetEventSourceMapping` and by a listing) as `Deleting` while a second delete of it is
+//! refused with the modelled `ResourceNotFoundException` — the teardown is accepted, so
+//! there is no longer a mapping for a further call to act on — and once it is due the
+//! mapping is held no more — a read of it is the modelled not-found, a listing omits it, and its
 //! event source is free to be mapped again. A UUID no mapping is held under names nothing
 //! to delete and is refused with the modelled `ResourceNotFoundException`, leaving every
 //! stored mapping where it was.
@@ -265,16 +266,16 @@ async fn a_deleted_mapping_reports_deleting_until_the_clock_removes_it() {
             "case {label:?}: a mapping being deleted is still listed, got {}",
             listed.text()
         );
-        // A second delete conflicts with "the resource's availability" rather than being
-        // accepted again.
+        // The teardown of this mapping is already accepted, so a second delete addresses no
+        // mapping a call may act on: it is the modelled not-found rather than accepted again.
         let again = delete_mapping(&router, &uuid).await;
         assert_eq!(
             (
                 again.status,
-                again.error_code().contains("ResourceInUseException")
+                again.error_code().contains("ResourceNotFoundException")
             ),
-            (400, true),
-            "case {label:?}: a second delete must be refused with ResourceInUseException, \
+            (404, true),
+            "case {label:?}: a second delete must be refused with ResourceNotFoundException, \
              got {} {}",
             again.status,
             again.text()

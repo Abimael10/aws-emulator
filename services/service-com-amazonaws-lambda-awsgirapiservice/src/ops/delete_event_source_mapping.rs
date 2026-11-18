@@ -6,10 +6,12 @@
 //! and might not be completely deleted for several seconds", so the call persists that
 //! state and answers the record carrying it, and the REMOVAL is owed by the CLOCK (see
 //! [`crate::state::EventSourceMappingRecord::begin_delete`]). A UUID this account holds
-//! no mapping under is the modelled not-found, and a mapping that is not available to be
-//! deleted — one already being deleted, or one still applying an update it accepted — is
-//! refused with the modelled `ResourceInUseException`, whose own documentation names that
-//! second window ("you tried to delete an event source mapping currently UPDATING").
+//! no mapping under is the modelled not-found, and so is one whose deletion was ALREADY
+//! accepted: from that call onwards the mapping is on its way out, which is a mapping no
+//! further call may act on, even while a READ still reports the `Deleting` state the
+//! teardown is in. A mapping that is still applying an update it accepted is refused with
+//! the modelled `ResourceInUseException` instead, whose own documentation names that window
+//! ("you tried to delete an event source mapping currently UPDATING").
 //!
 //! ## Shape of an operation
 //!
@@ -288,20 +290,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         };
 
-        // `ResourceInUseException` is "The operation conflicts with the resource's
-        // availability": a mapping already being deleted is not available to be deleted a
-        // second time, and the removal the first delete started is still owed.
+        // A mapping whose deletion this account has ALREADY accepted is not a mapping to
+        // delete again: the teardown is under way, so the UUID no longer addresses a mapping
+        // a call may act on, and the refusal is the same modelled not-found an unheld UUID
+        // gets. `ResourceInUseException` is not it — "The operation conflicts with the
+        // resource's availability. For example, you tried to update an event source mapping
+        // in the CREATING state, or you tried to delete an event source mapping currently
+        // UPDATING" names the windows a mapping is still THERE for, and a mapping being
+        // deleted is not one of them.
         if record.is_deleting() {
-            return Err(DeleteEventSourceMappingErrorModeled::ResourceInUseException(
-                ResourceInUseException {
-                    r#type: None,
-                    message: Some(format!(
-                        "The event source mapping {} is already being deleted",
-                        record.uuid
-                    )),
-                },
-            )
-            .into());
+            return Err(
+                DeleteEventSourceMappingErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        r#type: None,
+                        message: Some(crate::state::RESOURCE_NOT_FOUND_MESSAGE.to_string()),
+                    },
+                )
+                .into(),
+            );
         }
 
         // And a mapping that is still applying a change it already acknowledged is not

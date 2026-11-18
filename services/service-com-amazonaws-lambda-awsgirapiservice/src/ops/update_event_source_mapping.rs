@@ -59,9 +59,16 @@
 //! For example, you tried to update an event source mapping in the CREATING state, or you
 //! tried to delete an event source mapping currently UPDATING" — so an update that
 //! arrives while the mapping is still settling (whether from its create or from an
-//! earlier update), or while its deletion is still owed, is refused with that modelled
-//! error rather than applied on top. Two concurrent updates of one mapping therefore have
-//! exactly one winner, and the loser is told to retry.
+//! earlier update) is refused with that modelled error rather than applied on top. Two
+//! concurrent updates of one mapping therefore have exactly one winner, and the loser is
+//! told to retry.
+//!
+//! A mapping whose DELETION has already been accepted is a different case: it is not an
+//! unavailable mapping but one on its way out, with nothing left to change, so an update of
+//! it answers the modelled not-found (HTTP 404) that an unheld `UUID` gets — the windows the
+//! sentence above names are the ones a mapping is still THERE for. A READ of it still
+//! reports the `Deleting` state the teardown is in, because "it enters a Deleting state and
+//! might not be completely deleted for several seconds" (`DeleteEventSourceMapping`).
 //!
 //! An update is also what RESUMES polling, or re-targets it onto another queue, so it arms
 //! the mapping's own poller exactly as the create does
@@ -423,10 +430,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     crate::state::RESOURCE_NOT_FOUND_MESSAGE.to_string(),
                 ));
             };
-            // "The operation conflicts with the resource's availability": a mapping that
-            // is still settling, or whose removal is still owed, is not available to take
-            // another change. See the module docs.
-            if record.is_deleting() || record.is_settling() {
+            // A mapping whose deletion this account has ALREADY accepted is on its way out:
+            // there is nothing left to change, so the UUID answers the same modelled
+            // not-found an unheld one does, even while a READ still reports the `Deleting`
+            // state the teardown is in. See the module docs.
+            if record.is_deleting() {
+                return Err(not_found(
+                    crate::state::RESOURCE_NOT_FOUND_MESSAGE.to_string(),
+                ));
+            }
+            // "The operation conflicts with the resource's availability": a mapping that is
+            // still settling — through its create or through an earlier update — is still
+            // there, but not available to take another change. See the module docs.
+            if record.is_settling() {
                 // The refusal is a FIXED sentence: it states that the mapping is in use,
                 // and names neither the mapping nor the state it is settling through.
                 return Err(resource_in_use(
