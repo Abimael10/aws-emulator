@@ -23,7 +23,9 @@
 
 use serde_json::{json, Value};
 
-use crate::detector_lifecycle::{call, enabled_detector, error_code, new_router, Router};
+use crate::detector_lifecycle::{
+    announced_location, call, enabled_detector, error_code, new_router, Router,
+};
 use service_com_amazonaws_guardduty_guarddutyapiservice::state::{
     invalid_parameter_message, IP_SET_LOCATION_MEMBER, THREAT_INTEL_SET_LOCATION_MEMBER,
 };
@@ -222,11 +224,11 @@ fn assert_location_refusal(case: &str, status: u16, body: &Value, member: &str, 
 }
 
 // ---------------------------------------------------------------------------
-// An S3 URL is accepted and read back verbatim.
+// An S3 URL is accepted and the stored object is announced back.
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn every_s3_url_spelling_is_accepted_and_read_back_verbatim() {
+async fn every_s3_url_spelling_is_accepted_and_the_stored_object_is_announced_back() {
     for family in families() {
         for (index, (case, location)) in accepted_locations().into_iter().enumerate() {
             // A router per case: the account's activated-list allowance is a
@@ -263,9 +265,11 @@ async fn every_s3_url_spelling_is_accepted_and_read_back_verbatim() {
                 "case {case:?}: the stored list must read back, got {status} {stored:?}"
             );
             let reported = stored["location"].as_str().unwrap_or_default();
+            let expected = announced_location(&location);
             assert_eq!(
-                reported, location,
-                "case {case:?}: expected the location {location:?} back, got {reported:?}"
+                reported, expected,
+                "case {case:?}: expected the stored list announced as {expected:?}, got \
+                 {reported:?}"
             );
 
             // The same value is accepted by the update that replaces a location.
@@ -400,10 +404,11 @@ async fn an_update_whose_location_is_no_s3_url_is_refused_and_keeps_the_stored_o
                     "case {case:?}: the list must still read back, got {status} {stored:?}"
                 );
                 let reported = stored["location"].as_str().unwrap_or_default();
+                let expected = announced_location(stored_location);
                 assert_eq!(
-                    reported, stored_location,
+                    reported, expected,
                     "case {case:?}: a refused update must keep the stored location \
-                     {stored_location:?}, got {reported:?}"
+                     {stored_location:?}, announced as {expected:?}, got {reported:?}"
                 );
                 let name = stored["name"].as_str().unwrap_or_default();
                 assert_eq!(

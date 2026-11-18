@@ -32,8 +32,8 @@ use service_com_amazonaws_guardduty_guarddutyapiservice::state;
 use service_com_amazonaws_guardduty_guarddutyapiservice::state::SET_ID_NOT_FOUND_MESSAGE;
 
 use crate::detector_lifecycle::{
-    call, call_in, enabled_detector, error_code, error_shape, new_router, Router,
-    ABSENT_DETECTOR_ID,
+    announced_location, call, call_in, enabled_detector, error_code, error_shape, new_router,
+    Router, ABSENT_DETECTOR_ID,
 };
 
 /// The error class every GuardDuty client rejection is named by on the wire.
@@ -249,7 +249,7 @@ async fn a_read_reports_every_member_the_create_stored() {
                 status, 200,
                 "case {case:?}: get-threat-intel-set expected 200, got {status} {got:?}"
             );
-            for member in ["name", "format", "location", "expectedBucketOwner", "tags"] {
+            for member in ["name", "format", "expectedBucketOwner", "tags"] {
                 // A read always reports a tag map, empty when the create named none.
                 let expected = request.get(member).cloned().unwrap_or(if member == "tags" {
                     json!({})
@@ -263,6 +263,16 @@ async fn a_read_reports_every_member_the_create_stored() {
                     got[member]
                 );
             }
+            // `Location` reports the stored list OBJECT announced at the endpoint this
+            // emulator is reached at (the `uploaded_list_location_endpoint` suite owns
+            // that rule).
+            let expected = announced_location(request["location"].as_str().unwrap_or_default());
+            assert_eq!(
+                got["location"],
+                json!(expected),
+                "case {case:?}: expected the stored list announced as {expected:?}, got {:?}",
+                got["location"]
+            );
             // `Activate` is the only input that is not echoed: it decides the status.
             let expected_status = if request["activate"] == json!(true) {
                 ACTIVATING
@@ -435,7 +445,7 @@ async fn activate_decides_the_status_and_the_clock_settles_an_activation() {
         );
         assert_eq!(
             settled["location"].as_str(),
-            Some("s3://threat-lists/status.txt"),
+            Some(announced_location("s3://threat-lists/status.txt").as_str()),
             "case {case:?}: settling must not touch the stored members, got {settled:?}"
         );
     }
@@ -754,7 +764,7 @@ async fn a_create_or_read_against_a_detector_this_region_does_not_hold_is_refuse
     );
     assert_eq!(
         got["location"].as_str(),
-        Some("s3://threat-lists/regional.txt"),
+        Some(announced_location("s3://threat-lists/regional.txt").as_str()),
         "case \"read through its own Region\": got {got:?}"
     );
 }

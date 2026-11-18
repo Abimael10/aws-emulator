@@ -20,8 +20,12 @@
 //!    refused with HTTP 400 under the `InvalidInputException` class and stores
 //!    nothing. The rule is the uploaded-list FAMILY's, so the rows span all four
 //!    families — the IPSet, the threat list and the two entity sets — on the create
-//!    that stores a location, and the stored value reads back verbatim.
-//! 2. A change to a list whose own delete has already been accepted collides with
+//!    that stores a location.
+//! 2. A read-back ANNOUNCES the stored list object at the endpoint this emulator is
+//!    reached at: the same bucket and key the create named, addressed path-style
+//!    beneath the host the read arrived on, so the advertised list is fetchable from
+//!    the emulator rather than from a host it does not serve.
+//! 3. A change to a list whose own delete has already been accepted collides with
 //!    work in flight rather than naming an absent resource, so `UpdateIPSet` and
 //!    `UpdateThreatIntelSet` refuse it under the `InternalServerErrorException` class
 //!    with the 400 of a request the service will not perform, carrying
@@ -35,7 +39,7 @@ use crate::detector_lifecycle::{
     call, call_at, enabled_detector, error_code, error_shape, new_router, Router,
 };
 use service_com_amazonaws_guardduty_guarddutyapiservice::state::{
-    IP_SET_TRANSITION_MILLIS, OPERATION_IN_PROGRESS_MESSAGE, SET_ID_NOT_FOUND_MESSAGE,
+    OPERATION_IN_PROGRESS_MESSAGE, SET_ID_NOT_FOUND_MESSAGE,
 };
 
 /// The error class every client rejection on this service carries in the body's
@@ -107,12 +111,15 @@ fn families() -> Vec<Family> {
     ]
 }
 
-/// One `Location` case: the location a create carries and whether the service may
-/// store it. Every row is sent to each of [`endpoints`].
+/// One `Location` case: the location a create carries, whether the service may store it
+/// and — when it may — the `bucket/key` object that location addresses, which is what a
+/// read-back must announce beneath the emulator's own endpoint. Every row is sent to
+/// each of [`endpoints`].
 struct LocationCase {
     why: &'static str,
     location: String,
     accepted: bool,
+    object: &'static str,
 }
 
 /// The locations, spanning what the rule generalises over: the SPELLING of the S3
@@ -132,61 +139,73 @@ fn location_cases() -> Vec<LocationCase> {
             why: "an s3:// URL",
             location: "s3://my-bucket/lists/trusted.txt".to_string(),
             accepted: true,
+            object: "my-bucket/lists/trusted.txt",
         },
         LocationCase {
             why: "a path-style public S3 endpoint",
             location: "https://s3.eu-west-1.amazonaws.com/my-bucket/lists/trusted.txt".to_string(),
             accepted: true,
+            object: "my-bucket/lists/trusted.txt",
         },
         LocationCase {
             why: "a virtual-hosted-style public S3 endpoint",
             location: "https://my-bucket.s3.us-west-2.amazonaws.com/lists/trusted.txt".to_string(),
             accepted: true,
+            object: "my-bucket/lists/trusted.txt",
         },
         LocationCase {
             why: "an object URL on a loopback endpoint with a port",
             location: format!("https://{LOOPBACK_ENDPOINT}/my-bucket/lists/trusted.txt"),
             accepted: true,
+            object: "my-bucket/lists/trusted.txt",
         },
         LocationCase {
             why: "an object URL on a named endpoint with a port",
             location: format!("https://{NAMED_ENDPOINT}/my-bucket/trusted.txt"),
             accepted: true,
+            object: "my-bucket/trusted.txt",
         },
         LocationCase {
             why: "an object URL on that endpoint with a deep key",
             location: format!("https://{NAMED_ENDPOINT}/my-bucket/lists/2026/03/trusted.txt"),
             accepted: true,
+            object: "my-bucket/lists/2026/03/trusted.txt",
         },
         LocationCase {
             why: "an object URL on an endpoint naming no port",
             location: "https://gd-endpoint.internal/my-bucket/trusted.txt".to_string(),
             accepted: true,
+            object: "my-bucket/trusted.txt",
         },
         LocationCase {
             why: "an object URL over http rather than https",
             location: format!("http://{LOOPBACK_ENDPOINT}/my-bucket/trusted.txt"),
             accepted: true,
+            object: "my-bucket/trusted.txt",
         },
         LocationCase {
             why: "an object URL on an unrelated host",
             location: "https://files.example-corp.com/my-bucket/trusted.txt".to_string(),
             accepted: true,
+            object: "my-bucket/trusted.txt",
         },
         LocationCase {
             why: "an object URL naming only a bucket",
             location: format!("https://{LOOPBACK_ENDPOINT}/my-bucket"),
             accepted: false,
+            object: "",
         },
         LocationCase {
             why: "an object URL with an empty key",
             location: format!("https://{LOOPBACK_ENDPOINT}/my-bucket/"),
             accepted: false,
+            object: "",
         },
         LocationCase {
             why: "a value that is no URL at all",
             location: "this is not a valid s3 uri or arn".to_string(),
             accepted: false,
+            object: "",
         },
     ]
 }
@@ -215,6 +234,29 @@ async fn create_at(
     .await
 }
 
+async fn read_at(
+    router: &Router,
+    endpoint: &str,
+    detector_id: &str,
+    family: &Family,
+    id: &str,
+) -> Value {
+    let (status, body) = call_at(
+        router,
+        endpoint,
+        "GET",
+        &format!("/detector/{detector_id}/{}/{id}", family.segment),
+        None,
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "case {:?}: the stored list must read back, got {status} {body:?}",
+        family.case
+    );
+    body
+}
+
 async fn read(router: &Router, detector_id: &str, family: &Family, id: &str) -> Value {
     let (status, body) = call(
         router,
@@ -229,6 +271,29 @@ async fn read(router: &Router, detector_id: &str, family: &Family, id: &str) -> 
         family.case
     );
     body
+}
+
+/// The base a read-back announces the stored list object beneath, for a read that
+/// arrived at `endpoint`.
+///
+/// A client configured with one local endpoint URL resolves nothing else, so it is
+/// handed back the very address it is already talking to; a caller that resolves AWS's
+/// own hostnames — which every published GuardDuty endpoint is — is handed the address
+/// this process is served at, which for an emulator served on no port at all is the
+/// base the runtime reports for one
+/// ([`smithy_server_runtime::UNSERVED_URL_BASE`]).
+fn announced_base(endpoint: &str) -> String {
+    match endpoint == PUBLIC_ENDPOINT {
+        true => smithy_server_runtime::UNSERVED_URL_BASE.to_string(),
+        false => format!("https://{endpoint}"),
+    }
+}
+
+/// The `Location` a read arriving at `endpoint` must announce for the stored object
+/// `object` (`bucket/key`): that object, addressed path-style beneath the address the
+/// emulator is reached at.
+fn announced_location(endpoint: &str, object: &str) -> String {
+    format!("{}/{object}", announced_base(endpoint))
 }
 
 // ---------------------------------------------------------------------------
@@ -271,15 +336,23 @@ async fn a_location_is_accepted_exactly_when_it_addresses_an_object_at_any_s3_en
                         .as_str()
                         .unwrap_or_else(|| panic!("case {case:?}: expected an id, got {body:?}"))
                         .to_string();
-                    // Stored, and stored VERBATIM: the location a caller gave is the
-                    // one a reader reports.
-                    let stored = read(&router, &detector_id, &family, &id).await;
-                    let reported = stored["location"].as_str().unwrap_or_default();
-                    assert_eq!(
-                        reported, row.location,
-                        "case {case:?}: expected the location {:?} back, got {reported:?}",
-                        row.location
-                    );
+                    // The SAME object, announced at the address the read arrived at:
+                    // the bucket and key the create named, path-style beneath this
+                    // emulator's own endpoint, whichever of them the caller submitted
+                    // its location on. Asserted at every endpoint a read can arrive
+                    // at, so the announced host follows the READ and not the create.
+                    for read_endpoint in endpoints() {
+                        let stored =
+                            read_at(&router, read_endpoint, &detector_id, &family, &id).await;
+                        let reported = stored["location"].as_str().unwrap_or_default();
+                        let expected = announced_location(read_endpoint, row.object);
+                        assert_eq!(
+                            reported, expected,
+                            "case {case:?}: a read at {read_endpoint} must announce the \
+                             stored object at the emulator's own endpoint, expected \
+                             {expected:?}, got {reported:?}"
+                        );
+                    }
                 } else {
                     assert_eq!(
                         status, 400,
@@ -374,7 +447,7 @@ async fn an_update_reads_a_location_by_its_own_syntax_whatever_endpoint_it_arriv
             let kept = read(&router, &detector_id, &family, &id).await;
             assert_eq!(
                 kept["location"].as_str(),
-                Some(stored_location),
+                Some(announced_location(PUBLIC_ENDPOINT, "my-bucket/lists/stored.txt").as_str()),
                 "case {case:?}: a refused update must keep the stored location, got {kept:?}"
             );
 
@@ -396,20 +469,47 @@ async fn an_update_reads_a_location_by_its_own_syntax_whatever_endpoint_it_arriv
             let after = read(&router, &detector_id, &family, &id).await;
             assert_eq!(
                 after["location"].as_str(),
-                Some(object_url.as_str()),
-                "case {case:?}: expected the updated location back, got {after:?}"
+                Some(
+                    announced_location(PUBLIC_ENDPOINT, "other-bucket/lists/new.txt").as_str()
+                ),
+                "case {case:?}: expected the updated object announced back, got {after:?}"
             );
         }
     }
 }
 
 // ---------------------------------------------------------------------------
-// Rule 2: a change to a list whose delete is running collides with that delete.
+// Rule 3: a change to a list whose delete is running collides with that delete.
 // ---------------------------------------------------------------------------
 
-/// Long enough for the clock to owe a deleted list its terminal status.
-fn past_the_deletion() -> std::time::Duration {
-    std::time::Duration::from_millis(IP_SET_TRANSITION_MILLIS as u64 + 250)
+/// How long a poll may wait for the clock to settle a deleted list before the test
+/// gives up. Generous on purpose: the loop ends on the CONDITION it looks for, and this
+/// is only the deadline past which the emulator is considered broken.
+const DELETED_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// How long the poll pauses between two reads; the loop ends on the condition.
+const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(25);
+
+/// Read `path` until the deleted list reports the terminal status the clock owes it, or
+/// fail once [`DELETED_DEADLINE`] has passed.
+async fn poll_until_deleted(router: &Router, path: &str, case: &str) {
+    let deadline = std::time::Instant::now() + DELETED_DEADLINE;
+    loop {
+        let (status, body) = call(router, "GET", path, None).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: the read must be served, got {status} {body:?}"
+        );
+        if body["status"] == json!("DELETED") {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "case {case:?}: the delete never settled within {DELETED_DEADLINE:?}, last read \
+             {body:?}"
+        );
+        tokio::time::sleep(POLL_INTERVAL).await;
+    }
 }
 
 /// The two detector-rooted uploaded lists whose delete RETAINS the record, so the
@@ -467,7 +567,7 @@ async fn an_update_of_a_list_whose_delete_is_running_collides_with_it() {
                     "case {case:?}: the delete expected 200, got {status} {deleted:?}"
                 );
                 if wait {
-                    tokio::time::sleep(past_the_deletion()).await;
+                    poll_until_deleted(&router, &path, &case).await;
                 }
                 let before = call(&router, "GET", &path, None).await.1;
 

@@ -43,7 +43,8 @@ use serde_json::{json, Value};
 
 use crate::client_rejections::{invalid_parameter, not_owned};
 use crate::detector_lifecycle::{
-    call, call_in, enabled_detector, error_code, new_router, Router, ABSENT_DETECTOR_ID,
+    announced_location, call, call_in, enabled_detector, error_code, new_router, Router,
+    ABSENT_DETECTOR_ID,
 };
 use crate::ip_set_lifecycle::past_the_transition;
 use service_com_amazonaws_guardduty_guarddutyapiservice::state::{
@@ -304,7 +305,7 @@ async fn an_update_replaces_only_the_members_it_carries() {
 
         // A member the update carried reports the updated value; one it omitted
         // reports what the create stored.
-        for member in ["name", "location", "expectedBucketOwner"] {
+        for member in ["name", "expectedBucketOwner"] {
             let expected = row
                 .update
                 .get(member)
@@ -326,6 +327,23 @@ async fn an_update_replaces_only_the_members_it_carries() {
                 ),
             }
         }
+
+        // `Location` follows the same rule, reported as the stored list OBJECT
+        // announced at the endpoint this emulator is reached at (the
+        // `uploaded_list_location_endpoint` suite owns that rule).
+        let stored_location = row
+            .update
+            .get("location")
+            .or_else(|| create.get("location"))
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let expected = announced_location(stored_location);
+        assert_eq!(
+            body["location"],
+            json!(expected),
+            "case {case:?}: expected the stored list announced as {expected:?}, got {:?}",
+            body["location"]
+        );
 
         // `Format` is not a member of the update request at all, and `Tags` is not
         // either, so neither can have moved.
@@ -386,6 +404,7 @@ async fn successive_updates_accumulate_on_the_stored_ip_set() {
         let body = read(&router, &detector, &id, case).await;
         let name = body["name"].as_str().unwrap_or_default();
         let location = body["location"].as_str().unwrap_or_default();
+        let expected_location = announced_location(expected_location);
         assert_eq!(
             name, expected_name,
             "case {case:?}: expected the name {expected_name:?}, got {name:?}"
@@ -837,7 +856,7 @@ async fn an_update_touches_only_the_ip_set_it_names() {
     );
     assert_eq!(
         sibling["location"].as_str().unwrap_or_default(),
-        "s3://my-bucket/second.xml",
+        announced_location("s3://my-bucket/second.xml"),
         "case \"the second list\": the sibling's location must not move, got {:?}",
         sibling["location"]
     );

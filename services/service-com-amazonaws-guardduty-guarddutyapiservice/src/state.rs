@@ -17,6 +17,9 @@
 //! child module beside it. Each operation builds its own modelled output in its
 //! own `src/ops/<op>.rs`.
 
+/// Where an uploaded list is ANNOUNCED on a read-back: the address this emulator
+/// serves the stored list object at.
+mod announced_list_location;
 /// The Runtime Monitoring coverage of the account's compute resources, which more than
 /// one operation reports on.
 pub mod coverage;
@@ -33,6 +36,8 @@ mod entity_sets;
 mod features;
 /// Findings, the criteria that select them and the saved finding filter.
 mod findings;
+/// The analysis pass an AI-analyst investigation runs over the account's findings.
+mod investigation_analysis;
 /// AI-analyst investigations.
 mod investigations;
 /// The trusted-IP lists a detector holds.
@@ -58,11 +63,13 @@ mod threat_intel_sets;
 // Every child module's items are part of this module's surface: `crate::state::X`
 // resolves whichever child holds `X`, so an operation names the state it reads
 // without knowing which file it lives in.
+pub use announced_list_location::*;
 pub use custom_detection_rules::*;
 pub use detectors::*;
 pub use entity_sets::*;
 pub use features::*;
 pub use findings::*;
+pub use investigation_analysis::*;
 pub use investigations::*;
 pub use ip_sets::*;
 pub use malware_protection_plan_role::*;

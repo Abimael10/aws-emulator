@@ -52,7 +52,7 @@ use service_com_amazonaws_guardduty_guarddutyapiservice::state::{
 /// owes it. Both are `InvestigationStatus` members
 /// (`smithy_query(shape="InvestigationStatus")`).
 const RUNNING: &str = "RUNNING";
-const FAILED: &str = "FAILED";
+const COMPLETED: &str = "COMPLETED";
 
 /// How long a poll waits for the terminal status the clock owes an investigation
 /// before the test gives up: deliberately generous, since what decides the test is
@@ -263,20 +263,20 @@ async fn an_investigation_settles_only_once_the_clock_owes_it() {
     let settled = settled(&router, &detector_id, &id).await;
     assert_eq!(
         settled["status"],
-        json!(FAILED),
-        "once the clock owes the transition: expected {FAILED}, got {settled:?}"
-    );
-    let reason = settled["error"].as_str().unwrap_or_default();
-    assert!(
-        !reason.is_empty() && reason.len() <= 2048,
-        "a {FAILED} investigation carries the reason it failed, got {settled:?}"
+        json!(COMPLETED),
+        "once the clock owes the transition: expected {COMPLETED}, got {settled:?}"
     );
     assert!(
-        settled["summary"].is_null()
-            && settled["riskLevel"].is_null()
-            && settled["confidence"].is_null(),
-        "no analysis ran, so nothing may report an assessment: got {settled:?}"
+        settled["error"].is_null(),
+        "a {COMPLETED} investigation failed at nothing, so it carries no error, got \
+         {settled:?}"
     );
+    for member in ["summary", "risk", "riskLevel", "confidence"] {
+        assert!(
+            settled[member].as_str().is_some_and(|value| !value.is_empty()),
+            "the ended analysis reports its {member}, got {settled:?}"
+        );
+    }
     let (start, end) = (
         settled["startTime"].as_f64().unwrap_or_default(),
         settled["endTime"].as_f64().unwrap_or_default(),

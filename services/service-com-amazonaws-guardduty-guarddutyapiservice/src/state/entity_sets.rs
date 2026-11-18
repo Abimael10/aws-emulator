@@ -204,6 +204,44 @@ pub fn is_s3_location(location: &str) -> bool {
     }
 }
 
+/// The BUCKET and object KEY an uploaded list's `Location` addresses, or `None` when
+/// the value addresses no S3 object at all — the same reading [`is_s3_location`]
+/// accepts a location by, so the syntax a create is held to and the object a read-back
+/// announces can never disagree about where a list lives.
+///
+/// The three forms are the ones [`is_s3_location`] documents: the `s3://bucket/key`
+/// scheme, where the authority is the bucket and the path the key; a
+/// virtual-hosted-style object URL, where the leading host label is the bucket and the
+/// whole path the key; and any other host read path-style, where the first path segment
+/// is the bucket and the rest the key.
+///
+/// Both are taken from the submitted TEXT rather than from a re-rendered URL, so a key
+/// comes back spelled exactly as the caller wrote it — percent-encoded sequences and
+/// non-ASCII characters included — and nothing is encoded a second time.
+pub fn s3_object_location(location: &str) -> Option<(String, String)> {
+    if !is_s3_location(location) {
+        return None;
+    }
+    let (scheme, rest) = location.split_once("://")?;
+    let (authority, path) = rest.split_once('/')?;
+    let object = |bucket: &str, key: &str| {
+        (!bucket.is_empty() && !key.is_empty()).then(|| (bucket.to_string(), key.to_string()))
+    };
+    if scheme.eq_ignore_ascii_case("s3") {
+        return object(authority, path);
+    }
+    // The host alone decides whether the URL is virtual-hosted style, so any
+    // userinfo and `:port` of the authority are set aside first.
+    let host = authority.rsplit('@').next().unwrap_or(authority);
+    let host = host.split(':').next().unwrap_or(host);
+    match virtual_hosted_bucket(host) {
+        Some(bucket) => object(bucket, path),
+        None => path
+            .split_once('/')
+            .and_then(|(bucket, key)| object(bucket, key)),
+    }
+}
+
 /// The bucket a virtual-hosted-style S3 `host` carries — the labels before its `s3`
 /// label — or `None` when `host` names an S3 endpoint directly (so a URL on it is
 /// path-style) or is no S3 endpoint host at all.

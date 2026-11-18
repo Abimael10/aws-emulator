@@ -6,8 +6,8 @@
 //!
 //! A REPORTING operation: the only thing it writes is the status change the CLOCK
 //! already made due ([`crate::state::InvestigationRecord::settle`]) — together with
-//! the environment that ended pass resolved — which was owed at that instant whether
-//! or not anybody called.
+//! the environment and the analysis conclusions that ended pass resolved — which was
+//! owed at that instant whether or not anybody called.
 //!
 //! This is the ONLY file to touch for this operation.
 //!
@@ -175,7 +175,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(detector) = state.detector_in_mut(&region, &input.detector_id) else {
             return Err(detector_rejection(&input.detector_id));
         };
-        let Some(investigation) = detector.investigations.get_mut(&input.investigation_id) else {
+        // The one write a report may make: the end of the analysis pass, and with it
+        // the conclusions that pass reached, were owed at the same instant whether or
+        // not anybody read ([`crate::state::InvestigationRecord::settle`]).
+        let Some(investigation) = detector.settle_investigation(&input.investigation_id, now) else {
             // An id no create minted: the modelled 404 for this operation, which
             // `CreateInvestigation` does not declare and so cannot answer.
             return Err(GetInvestigationErrorModeled::ResourceNotFoundException(
@@ -186,7 +189,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
-        investigation.settle(now);
+        let analysis = investigation.analysis.as_ref();
 
         Ok(GetInvestigationOutput {
             investigation: Investigation {
@@ -195,9 +198,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 trigger_prompt: investigation.trigger_prompt.clone(),
                 triggered_by: investigation.triggered_by.clone(),
                 // "Metadata about the product and version that produced the
-                // investigation" — nothing produced one, so there is none to
-                // report.
-                metadata: None,
+                // investigation": the product and engine version of the pass that
+                // produced THIS investigation's conclusions, so the member is absent
+                // for as long as no pass has reached any.
+                metadata: investigation.metadata(),
                 // "Details about the cloud environment in which the investigation
                 // was performed"
                 // (`smithy_query(query="doc",shape="Investigation",member="Cloud")`):
@@ -209,19 +213,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // of whatever endpoint the read happened to arrive on rather than
                 // the one the investigation covered.
                 cloud: investigation.cloud_details(),
-                // The assessment members stay absent while no analysis produced
-                // one: see `crate::state::INVESTIGATION_ENGINE_UNAVAILABLE`.
-                risk_level: None,
-                risk: None,
-                confidence: None,
-                summary: None,
+                // The assessment the pass reached over the findings it read
+                // ([`crate::state::InvestigationAnalysis`]), stored on the record
+                // when the pass ended: all four members are in exactly when that
+                // record holds conclusions, and absent while it holds none.
+                risk_level: analysis.map(|analysis| analysis.risk_level.clone()),
+                risk: analysis.map(|analysis| analysis.risk.clone()),
+                confidence: analysis.map(|analysis| analysis.confidence.clone()),
+                summary: analysis.map(|analysis| analysis.summary.clone()),
                 start_time: Some(::aws_smithy_types::DateTime::from_millis(
                     investigation.started_at_millis,
                 )),
                 end_time: investigation
                     .ended_at_millis
                     .map(::aws_smithy_types::DateTime::from_millis),
-                error: investigation.error.clone(),
+                // `Error` carries "details about the error if the investigation
+                // status is FAILED" (`smithy_query(shape="Investigation")`), so it
+                // belongs to an investigation that FAILED. Every investigation this
+                // service accepts runs its pass to a conclusion, so no stored record
+                // is one, and nothing reports an error beside a completed analysis.
+                error: None,
             },
         })
     }

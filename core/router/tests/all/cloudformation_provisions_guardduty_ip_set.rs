@@ -167,7 +167,12 @@ struct Row {
     expected_name: Option<&'static str>,
     /// The `Format` `GetIPSet` must report, which the template declares.
     expected_format: &'static str,
-    /// The `Location` `GetIPSet` must report, which the template declares.
+    /// The `Location` `GetIPSet` must report for the list the template declares: the
+    /// stored list OBJECT announced at the address this emulator is reached at, which for
+    /// a request addressed to a published AWS host is the base an emulator served on no
+    /// port reports ([`smithy_server_runtime::UNSERVED_URL_BASE`]). The template's own URL
+    /// is what the create stored; the read-back announces that object here, so a client
+    /// following it stays inside the emulator.
     expected_location: &'static str,
     /// The `Status` `GetIPSet` must report once the activation span has come due, which the
     /// template's `Activate` decides.
@@ -220,7 +225,7 @@ const ROWS: &[Row] = &[
         },
         expected_name: Some("office-ranges"),
         expected_format: "TXT",
-        expected_location: "https://s3.us-east-1.amazonaws.com/lists/office.txt",
+        expected_location: "https://emulator.invalid/lists/office.txt",
         expected_status: "ACTIVE",
         expected_bucket_owner: None,
         // `TagKey`'s pattern admits no digits (`^(?!aws:)[a-zA-Z+-=._:/]+$`), so the keys here
@@ -257,7 +262,7 @@ const ROWS: &[Row] = &[
         // dash (-), and underscores (_)" (`CreateIPSetRequest$Name`).
         expected_name: Some("dormant list"),
         expected_format: "STIX",
-        expected_location: "s3://threat-lists/dormant.stix",
+        expected_location: "https://emulator.invalid/threat-lists/dormant.stix",
         expected_status: "INACTIVE",
         expected_bucket_owner: None,
         expected_tags: &[],
@@ -306,7 +311,7 @@ const ROWS: &[Row] = &[
         expected_format: "ALIEN_VAULT",
         // The virtual-hosted-style S3 URL form, the third `Location` spelling that service
         // admits beside the path-style and `s3://` ones above.
-        expected_location: "https://partner-lists.s3.eu-west-1.amazonaws.com/ranges",
+        expected_location: "https://emulator.invalid/partner-lists/ranges",
         expected_status: "ACTIVE",
         expected_bucket_owner: Some("000000000000"),
         expected_tags: &[],
@@ -341,7 +346,7 @@ const ROWS: &[Row] = &[
         expected_name: None,
         expected_format: "OTX_CSV",
         // The dashed regional path-style S3 endpoint spelling.
-        expected_location: "https://s3-ap-northeast-1.amazonaws.com/lists/unnamed.csv",
+        expected_location: "https://emulator.invalid/lists/unnamed.csv",
         expected_status: "ACTIVE",
         expected_bucket_owner: None,
         expected_tags: &[],

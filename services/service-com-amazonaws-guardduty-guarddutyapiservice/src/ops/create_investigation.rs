@@ -22,11 +22,10 @@
 //! did, so the detector's own last-updated instant moves to the instant of the create,
 //! the way every other create of a sub-resource the detector holds moves it.
 //!
-//! An accepted investigation starts `RUNNING`. The ANALYSIS itself is produced by Amazon
-//! Bedrock models, which this emulator does not have, so it never synthesises a summary,
-//! risk level or confidence: the run it cannot perform ends in the modelled `FAILED`
-//! status carrying [`crate::state::INVESTIGATION_ENGINE_UNAVAILABLE`] as its `Error`,
-//! once the clock owes that transition.
+//! An accepted investigation starts `RUNNING` and reaches
+//! [`crate::state::INVESTIGATION_COMPLETED`] once the clock owes that transition, which
+//! is when its analysis pass over the detector's findings ends and its conclusions are
+//! stored ([`crate::state::InvestigationAnalysis`]) for `GetInvestigation` to report.
 //!
 //! This is the ONLY file to touch for this operation.
 //!

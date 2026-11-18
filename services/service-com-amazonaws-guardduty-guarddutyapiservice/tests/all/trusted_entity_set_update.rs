@@ -45,7 +45,8 @@
 use serde_json::{json, Value};
 
 use crate::detector_lifecycle::{
-    call, call_in, enabled_detector, error_code, new_router, Router, ABSENT_DETECTOR_ID,
+    announced_location, call, call_in, enabled_detector, error_code, new_router, Router,
+    ABSENT_DETECTOR_ID,
 };
 use crate::entity_set_id_refusal_classes::assert_entity_set_id_constraint_violation;
 use crate::set_delete_terminality::assert_entity_set_absent;
@@ -322,7 +323,7 @@ async fn an_update_replaces_only_the_members_it_carries() {
 
         // A member the update carried reports the updated value; one it omitted
         // reports what the create stored.
-        for member in ["name", "location", "expectedBucketOwner"] {
+        for member in ["name", "expectedBucketOwner"] {
             let expected = row.update.get(member).or_else(|| create.get(member)).cloned();
             match expected {
                 Some(expected) => assert_eq!(
@@ -343,6 +344,23 @@ async fn an_update_replaces_only_the_members_it_carries() {
                 ),
             }
         }
+
+        // `Location` follows the same rule, reported as the stored list OBJECT
+        // announced at the endpoint this emulator is reached at (the
+        // `uploaded_list_location_endpoint` suite owns that rule).
+        let stored_location = row
+            .update
+            .get("location")
+            .or_else(|| create.get("location"))
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let expected = announced_location(stored_location);
+        assert_eq!(
+            got["location"],
+            json!(expected),
+            "case {case:?}: expected the stored list announced as {expected:?}, got {:?}",
+            got["location"]
+        );
 
         // `Format` is not a member of the update request at all, and neither is
         // `Tags`, so neither can have moved.
@@ -444,6 +462,7 @@ async fn successive_updates_accumulate_on_the_stored_set() {
         let got = read(&router, &detector_id, &set_id, case).await;
         let name = got["name"].as_str().unwrap_or_default();
         let location = got["location"].as_str().unwrap_or_default();
+        let expected_location = announced_location(expected_location);
         assert_eq!(
             name, expected_name,
             "case {case:?}: expected the name {expected_name:?}, got {name:?}"

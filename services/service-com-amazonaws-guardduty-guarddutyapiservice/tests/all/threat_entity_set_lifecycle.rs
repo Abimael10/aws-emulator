@@ -36,7 +36,7 @@
 use serde_json::{json, Value};
 
 use crate::detector_lifecycle::{
-    call, enabled_detector, error_code, new_router, Router, ABSENT_DETECTOR_ID,
+    announced_location, call, enabled_detector, error_code, new_router, Router, ABSENT_DETECTOR_ID,
 };
 use crate::entity_set_id_refusal_classes::assert_entity_set_id_constraint_violation;
 use crate::set_delete_terminality::assert_entity_set_absent;
@@ -224,7 +224,7 @@ async fn a_created_threat_entity_set_is_read_back_from_stored_state() {
     for (case, body, set_id) in &minted {
         let got = read(&router, &detector_id, set_id, case).await;
 
-        for member in ["name", "format", "location", "expectedBucketOwner"] {
+        for member in ["name", "format", "expectedBucketOwner"] {
             if let Some(expected) = body.get(member) {
                 assert_eq!(
                     &got[member], expected,
@@ -233,6 +233,16 @@ async fn a_created_threat_entity_set_is_read_back_from_stored_state() {
                 );
             }
         }
+        // `Location` reports the stored list OBJECT announced at the endpoint this
+        // emulator is reached at (the `uploaded_list_location_endpoint` suite owns
+        // that rule).
+        let expected = announced_location(body["location"].as_str().unwrap_or_default());
+        assert_eq!(
+            got["location"],
+            json!(expected),
+            "case {case:?}: expected the stored list announced as {expected:?}, got {:?}",
+            got["location"]
+        );
         let expected_tags = body.get("tags").cloned().unwrap_or_else(|| json!({}));
         assert_eq!(
             got["tags"], expected_tags,
@@ -514,9 +524,11 @@ async fn a_location_is_accepted_exactly_when_it_is_a_valid_s3_url() {
         )
         .await;
         let got = read(&router, &detector_id, &set_id, location).await;
+        let expected = announced_location(location);
         assert_eq!(
-            got["location"], location,
-            "case {location:?}: expected the location stored verbatim, got {:?}",
+            got["location"],
+            json!(expected),
+            "case {location:?}: expected the stored list announced as {expected:?}, got {:?}",
             got["location"]
         );
     }
@@ -563,7 +575,8 @@ async fn a_location_is_accepted_exactly_when_it_is_a_valid_s3_url() {
             .await;
             let got = read(&router, &detector_id, &set_id, &case).await;
             assert_eq!(
-                got["location"], VALID_LOCATIONS[0],
+                got["location"],
+                json!(announced_location(VALID_LOCATIONS[0])),
                 "case {case:?}: the refused create must have persisted nothing, got {got:?}"
             );
         }

@@ -872,11 +872,37 @@ impl Detector {
     /// [`ComAmazonawsGuarddutyGuarddutyapiserviceState::settle_malware_scans`] for
     /// the investigations one detector holds; every move goes through
     /// [`InvestigationRecord::settle`], so a read and a list cannot disagree about
-    /// when an investigation left `RUNNING`.
+    /// when an investigation left `RUNNING` or what its pass concluded.
     pub fn settle_investigations(&mut self, now: i64) {
+        let evidence = self.finding_evidence();
         for investigation in self.investigations.values_mut() {
-            investigation.settle(now);
+            investigation.settle(now, &evidence);
         }
+    }
+
+    /// Apply what the clock owes the ONE investigation `id` names, and report it —
+    /// `None` for an id this detector does not hold, which is the absence a reader
+    /// refuses.
+    ///
+    /// The single-record counterpart of [`Self::settle_investigations`], through the
+    /// same [`InvestigationRecord::settle`], so a read moves exactly the record it
+    /// reports and no other.
+    pub fn settle_investigation(&mut self, id: &str, now: i64) -> Option<&InvestigationRecord> {
+        if !self.investigations.contains_key(id) {
+            return None;
+        }
+        let evidence = self.finding_evidence();
+        if let Some(investigation) = self.investigations.get_mut(id) {
+            investigation.settle(now, &evidence);
+        }
+        self.investigations.get(id)
+    }
+
+    /// This detector's findings as an analysis pass reads them
+    /// ([`FindingEvidence`]) — the evidence every investigation of this detector is
+    /// assessed from.
+    fn finding_evidence(&self) -> Vec<FindingEvidence> {
+        self.findings.values().map(FindingEvidence::of).collect()
     }
 
     /// Every investigation this detector holds, in investigation-id order — the

@@ -41,8 +41,8 @@ use service_com_amazonaws_guardduty_guarddutyapiservice::state;
 use service_com_amazonaws_guardduty_guarddutyapiservice::state::SET_ID_NOT_FOUND_MESSAGE;
 
 use crate::detector_lifecycle::{
-    call, call_in, enabled_detector, error_code, error_shape, new_router, Router,
-    ABSENT_DETECTOR_ID,
+    announced_location, call, call_in, enabled_detector, error_code, error_shape, new_router,
+    Router, ABSENT_DETECTOR_ID,
 };
 
 /// The error class every GuardDuty client rejection is named by on the wire.
@@ -297,7 +297,7 @@ async fn a_delete_settles_any_status_on_deleted() {
             "case {case:?}: reading must not move the status, got {deleted:?} then {again:?}"
         );
         // And the delete touched nothing else the create stored.
-        for member in ["name", "format", "location", "expectedBucketOwner", "tags"] {
+        for member in ["name", "format", "expectedBucketOwner", "tags"] {
             // A read always reports a tag map, empty when the create named none.
             let expected = request.get(member).cloned().unwrap_or(if member == "tags" {
                 json!({})
@@ -310,6 +310,16 @@ async fn a_delete_settles_any_status_on_deleted() {
                 deleted[member]
             );
         }
+        // `Location` survives it too, reported as the stored list OBJECT announced at
+        // the endpoint this emulator is reached at (the
+        // `uploaded_list_location_endpoint` suite owns that rule).
+        let expected = announced_location(request["location"].as_str().unwrap_or_default());
+        assert_eq!(
+            deleted["location"],
+            json!(expected),
+            "case {case:?}: expected the stored list announced as {expected:?}, got {:?}",
+            deleted["location"]
+        );
 
         sleep(past_deletion());
 

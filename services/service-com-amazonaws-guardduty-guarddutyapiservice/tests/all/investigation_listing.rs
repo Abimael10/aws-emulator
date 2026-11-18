@@ -42,13 +42,31 @@ use service_com_amazonaws_guardduty_guarddutyapiservice::state::{
 };
 
 /// The `InvestigationStatus` members a listed investigation can be in here: it starts
-/// `RUNNING` and reaches `FAILED` once the clock owes it, because this emulator runs no
-/// analysis (`smithy_query(shape="InvestigationStatus")`).
+/// `RUNNING` and reaches `COMPLETED` once the clock owes it, which is when its analysis
+/// pass has run (`smithy_query(shape="InvestigationStatus")`).
 const RUNNING: &str = "RUNNING";
-const FAILED: &str = "FAILED";
+const COMPLETED: &str = "COMPLETED";
 
 /// The `OrderBy` members, `ASC | DESC` (`smithy_query(shape="OrderBy")`).
 const ORDERS: [&str; 2] = ["ASC", "DESC"];
+
+/// The `RiskLevel` members in ASCENDING order of risk — the enum is `Info | Low |
+/// Medium | High | Critical` (`smithy_query(shape="RiskLevel")`), a graded scale, so a
+/// sort on the member orders by the grade. Written out here rather than read from the
+/// service, so the test pins the ordering instead of echoing it.
+const RISK_LEVELS_ASCENDING: [&str; 5] = ["Info", "Low", "Medium", "High", "Critical"];
+
+/// The `Confidence` members in ASCENDING order — `Unknown | Low | Medium | High`
+/// (`smithy_query(shape="Confidence")`) — for the same reason.
+const CONFIDENCES_ASCENDING: [&str; 4] = ["Unknown", "Low", "Medium", "High"];
+
+/// Where a reported enum value sits on its scale, and below every member of it when the
+/// summary reports none: an investigation whose pass has concluded nothing has no grade.
+fn rank(scale: &[&str], value: Option<&str>) -> f64 {
+    value
+        .and_then(|value| scale.iter().position(|member| *member == value))
+        .map_or(-1.0, |index| index as f64)
+}
 
 /// How long a poll waits for the terminal status the clock owes an investigation
 /// before the test gives up: deliberately generous, since what decides the test is
@@ -236,24 +254,35 @@ async fn a_list_reports_exactly_the_persisted_investigations() {
             "case {id}: accountId must be the account the read reports, got {summary:?} vs {got:?}"
         );
 
-        // The analysis is what produces an assessment, and this emulator runs none:
-        // those members are ABSENT rather than synthesised.
+        // The assessment is what the analysis pass concludes, so a summary carries it
+        // exactly when the pass has ended — and the members it carries are the ones the
+        // read reports for the same record.
+        let ended = summary["status"] == json!(COMPLETED);
         for member in ["riskLevel", "confidence", "title"] {
-            assert!(
-                summary.get(member).is_none(),
-                "case {id}: {member} must be absent while no analysis produced one, got {summary:?}"
+            assert_eq!(
+                summary.get(member).is_some(),
+                ended,
+                "case {id}: {member} is reported exactly when the pass has concluded, got \
+                 {summary:?}"
+            );
+        }
+        for member in ["riskLevel", "confidence"] {
+            assert_eq!(
+                summary.get(member),
+                got.get(member),
+                "case {id}: summary {member} must match the read, got {summary:?} vs {got:?}"
             );
         }
 
         // A settled investigation reports when it ended; a running one does not.
         let status = summary["status"].as_str().unwrap_or_default();
         assert!(
-            [RUNNING, FAILED].contains(&status),
+            [RUNNING, COMPLETED].contains(&status),
             "case {id}: expected an InvestigationStatus member, got {summary:?}"
         );
         assert_eq!(
             summary.get("endTime").is_some(),
-            status == FAILED,
+            status == COMPLETED,
             "case {id}: endTime is reported exactly when the investigation ended, got {summary:?}"
         );
     }
@@ -278,9 +307,16 @@ fn sort_key(summary: &Value, field: &str) -> (f64, String) {
             0.0,
             summary["status"].as_str().unwrap_or_default().to_string(),
         ),
-        // Both are the ANALYSIS's conclusions, which nothing produced here, so every
-        // record carries the same key and the id tiebreak is the whole order.
-        "RISK_LEVEL" | "CONFIDENCE" => (0.0, String::new()),
+        // Both are the ANALYSIS's conclusions, graded enums a sort orders by the grade
+        // — and an investigation still running has concluded none, so it has no grade.
+        "RISK_LEVEL" => (
+            rank(&RISK_LEVELS_ASCENDING, summary["riskLevel"].as_str()),
+            String::new(),
+        ),
+        "CONFIDENCE" => (
+            rank(&CONFIDENCES_ASCENDING, summary["confidence"].as_str()),
+            String::new(),
+        ),
         other => panic!("sort field {other} has no key in this test"),
     }
 }
@@ -679,7 +715,7 @@ async fn listing_never_moves_an_investigation_early_and_agrees_with_a_read() {
     let settled = listed(&router, &detector_id, json!({})).await;
     assert_eq!(
         settled[0]["status"],
-        json!(FAILED),
+        json!(COMPLETED),
         "after the transition: expected the terminal status, got {settled:?}"
     );
     let got = read(&router, &detector_id, &id).await;

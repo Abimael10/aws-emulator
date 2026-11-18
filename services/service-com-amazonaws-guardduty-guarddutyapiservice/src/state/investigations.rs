@@ -11,9 +11,11 @@ use super::*;
 /// (`smithy_query(shape="InvestigationStatus")`).
 pub const INVESTIGATION_RUNNING: &str = "RUNNING";
 
-/// The `InvestigationStatus` an investigation reaches when its analysis could not
-/// be performed. See [`INVESTIGATION_RUNNING`] for the enum.
-pub const INVESTIGATION_FAILED: &str = "FAILED";
+/// The `InvestigationStatus` an investigation reaches when its analysis pass has
+/// run: the terminal status of an accepted investigation, whose conclusions the
+/// record then carries ([`InvestigationAnalysis`]). See [`INVESTIGATION_RUNNING`]
+/// for the enum.
+pub const INVESTIGATION_COMPLETED: &str = "COMPLETED";
 
 /// How long a created investigation stays [`INVESTIGATION_RUNNING`] before the
 /// clock owes it a terminal status.
@@ -128,15 +130,6 @@ pub struct InvestigationCloud {
     pub account: String,
 }
 
-/// Why an investigation this emulator accepted ends [`INVESTIGATION_FAILED`].
-///
-/// A GuardDuty investigation is produced by Amazon Bedrock models over the
-/// account's findings (`smithy_query(query="doc",shape="CreateInvestigation")`).
-/// This emulator has no such analysis engine, so it does NOT synthesise a summary,
-/// a risk level or a confidence: the run it cannot perform ends in the modelled
-/// failure state, carrying the reason it could not run.
-pub const INVESTIGATION_ENGINE_UNAVAILABLE: &str = "The investigation analysis engine is not available in this emulator, so no investigation summary was produced.";
-
 /// One stored investigation. Timestamps are epoch milliseconds, the single source
 /// for the instants the wire carries.
 #[derive(Debug, Clone)]
@@ -160,9 +153,9 @@ pub struct InvestigationRecord {
     pub terminal_due_millis: i64,
     /// When it reached a terminal status, once it has.
     pub ended_at_millis: Option<i64>,
-    /// `Error`: "Details about the error if the investigation status is FAILED"
-    /// (`smithy_query(shape="Investigation")`).
-    pub error: Option<String>,
+    /// What the analysis pass concluded, once it has run. See
+    /// [`InvestigationAnalysis`], and [`Self::settle`] for when it is computed.
+    pub analysis: Option<InvestigationAnalysis>,
     /// `Cloud`: the environment this investigation's pass covered, once the pass has
     /// ended and resolved it. See [`InvestigationCloud`].
     pub cloud: Option<InvestigationCloud>,
@@ -188,7 +181,8 @@ impl InvestigationRecord {
             started_at_millis: now,
             terminal_due_millis: now.saturating_add(INVESTIGATION_TRANSITION_MILLIS),
             ended_at_millis: None,
-            error: None,
+            // The pass has not run yet, so it has reached no conclusions.
+            analysis: None,
             // The pass has not run yet, so it has resolved no environment: a reader
             // reports no `Cloud` member for an investigation still
             // [`INVESTIGATION_RUNNING`].
@@ -208,18 +202,43 @@ impl InvestigationRecord {
             })
     }
 
-    /// Apply the status change the CLOCK already made due, if any.
+    /// The `Metadata` member a reader reports for this investigation: the product
+    /// and engine version that produced its conclusions, and NOTHING while no pass
+    /// has produced any.
+    pub fn metadata(&self) -> Option<crate::ops::types::InvestigationMetadata> {
+        self.analysis
+            .as_ref()
+            .map(|_| InvestigationAnalysis::metadata())
+    }
+
+    /// Apply the status change the CLOCK already made due, if any, and with it the
+    /// conclusions of the analysis pass that change ends.
     ///
     /// The move out of `RUNNING` was owed at [`Self::terminal_due_millis`] whether
     /// or not anybody called, which is why a reporting operation may apply it. It
     /// is applied exactly once: a terminal investigation never moves again.
-    pub fn settle(&mut self, now: i64) {
+    ///
+    /// `evidence` is the findings the detector holds ([`FindingEvidence`]); the pass
+    /// reads the ones that existed when it ENDED, so the assessment it stores is the
+    /// one the service owed at that instant and does not depend on when a caller
+    /// first asked for it.
+    pub fn settle(&mut self, now: i64, evidence: &[FindingEvidence]) {
         if self.status != INVESTIGATION_RUNNING || now < self.terminal_due_millis {
             return;
         }
-        self.status = INVESTIGATION_FAILED.to_string();
+        let covered: Vec<FindingEvidence> = evidence
+            .iter()
+            .filter(|finding| finding.created_at_millis <= self.terminal_due_millis)
+            .cloned()
+            .collect();
+        let covered = evidence_for_prompt(&self.trigger_prompt, &covered);
+        self.analysis = Some(InvestigationAnalysis::of_evidence(
+            &covered,
+            &self.triggered_by,
+            &self.region,
+        ));
+        self.status = INVESTIGATION_COMPLETED.to_string();
         self.ended_at_millis = Some(self.terminal_due_millis);
-        self.error = Some(INVESTIGATION_ENGINE_UNAVAILABLE.to_string());
         // The pass covered ONE environment — the account the investigation was
         // initiated for, through the Region its endpoint served, both persisted on
         // this record when the create minted it — so that environment is resolved
@@ -263,17 +282,23 @@ pub const INVESTIGATION_DEFAULT_SORT_FIELD: &str = "START_TIME";
 /// Resolve one investigation attribute by its `InvestigationSortField` name, or
 /// `None` when that is not a member of the enum.
 ///
-/// `RISK_LEVEL` and `CONFIDENCE` are produced by the analysis
-/// ([`INVESTIGATION_ENGINE_UNAVAILABLE`]), which this emulator does not run, so
-/// they resolve to the neutral text key rather than to a synthesised assessment:
-/// ordering by an absent value is ordering by the empty string, exactly as
-/// [`malware_scan_attribute`] treats a scan result nothing produced.
+/// `RISK_LEVEL` and `CONFIDENCE` are the analysis's conclusions, so they resolve to
+/// the RANK of the stored member on its own scale ([`risk_level_rank`],
+/// [`confidence_rank`]) rather than to its spelling: ordering by a graded enum is
+/// ordering by the grade, and an investigation whose pass has reached no conclusion
+/// ranks below every one that has.
 pub fn investigation_attribute(investigation: &InvestigationRecord, field: &str) -> Option<Attribute> {
+    let analysis = investigation.analysis.as_ref();
     let value = match field {
         "START_TIME" => Attribute::Number(investigation.started_at_millis as f64),
         "END_TIME" => Attribute::Number(investigation.ended_at_millis.unwrap_or(0) as f64),
         "STATUS" => Attribute::Text(investigation.status.clone()),
-        "RISK_LEVEL" | "CONFIDENCE" => Attribute::Text(String::new()),
+        "RISK_LEVEL" => Attribute::Number(
+            analysis.map_or(UNRANKED, |analysis| risk_level_rank(&analysis.risk_level)),
+        ),
+        "CONFIDENCE" => Attribute::Number(
+            analysis.map_or(UNRANKED, |analysis| confidence_rank(&analysis.confidence)),
+        ),
         _ => return None,
     };
     Some(value)

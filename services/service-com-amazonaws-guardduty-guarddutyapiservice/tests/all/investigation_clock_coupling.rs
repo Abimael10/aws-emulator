@@ -8,12 +8,14 @@
 //! 1. The members that report whether the analysis has ended move TOGETHER. While the
 //!    investigation is `RUNNING` it has not ended, so it reports NEITHER an `EndTime` —
 //!    "the timestamp at which the investigation completed"
-//!    (`smithy_query(query="doc",shape="Investigation",member="EndTime")`) — NOR an
-//!    `Error`, which exists only "if the investigation status is FAILED"
-//!    (`…member="Error"`). Once the clock has ended it, the status is terminal AND the
-//!    end instant is in (at or after `StartTime`) AND the error says why no summary was
-//!    produced. No reader may report one of the three settled and another still running:
-//!    that mix is a body no run of the real service ever produced.
+//!    (`smithy_query(query="doc",shape="Investigation",member="EndTime")`) — NOR any of
+//!    the conclusions a pass produces. Once the clock has ended it, the status is
+//!    terminal AND the end instant is in (at or after `StartTime`) AND the whole
+//!    assessment is in: `Metadata`, `RiskLevel`, `Risk`, `Confidence` and `Summary`. An
+//!    `Error` is reported in neither phase: it carries "details about the error if the
+//!    investigation status is FAILED" (`…member="Error"`), and an analysis that ran to a
+//!    conclusion failed at nothing. No reader may report one of those members settled and
+//!    another still running: that mix is a body no run of the real service ever produced.
 //! 2. Only the CLOCK ends it. Every call a client makes before it looks — reads of the
 //!    investigation, of the detector that holds it, of that detector's investigation
 //!    list — leaves the investigation exactly where the clock had it, so the rows differ
@@ -33,18 +35,21 @@ use serde_json::{json, Value};
 
 use crate::detector_lifecycle::{call_in, new_router, Router};
 use service_com_amazonaws_guardduty_guarddutyapiservice::state::{
-    INVESTIGATION_FAILED, INVESTIGATION_RUNNING, INVESTIGATION_TRANSITION_MILLIS,
+    INVESTIGATION_COMPLETED, INVESTIGATION_RUNNING,
 };
 
-/// The longest an `InvestigationErrorDetails` may be: `len 0..2048`
-/// (`smithy_query(shape="InvestigationErrorDetails")`).
-const MAX_ERROR_LENGTH: usize = 2048;
+/// The longest a `RiskDetails` may be: `len 0..1024`
+/// (`smithy_query(shape="RiskDetails")`).
+const MAX_RISK_LENGTH: usize = 1024;
 
-/// Long enough for the clock to owe the end of the analysis, with margin for a loaded
-/// test machine. Derived from the span the service itself holds, so the two cannot drift.
-fn past_the_analysis() -> Duration {
-    Duration::from_millis(INVESTIGATION_TRANSITION_MILLIS.unsigned_abs() + 400)
-}
+/// How long a poll may wait for the clock to end an analysis before the test gives up.
+/// Generous on purpose: what decides the test is the CONDITION it looks for, never how
+/// fast the host runs.
+const ENDED_DEADLINE: Duration = Duration::from_secs(30);
+
+/// How long the poll pauses between two reads — the gap between attempts only; the loop
+/// ends on the condition.
+const POLL_INTERVAL: Duration = Duration::from_millis(25);
 
 /// Which side of the clock-owed end an investigation is on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -230,23 +235,37 @@ fn phase_of(case: &str, label: &str, investigation: &Value) -> Phase {
          got {investigation}"
     );
     let end = investigation["endTime"].as_f64();
-    let error = investigation["error"].as_str();
+    // `Error` belongs to a FAILED investigation, and an analysis that reached a
+    // conclusion failed at nothing: the member is in no phase of this investigation.
+    assert!(
+        investigation["error"].is_null(),
+        "case {case:?} ({label}): an investigation that did not fail reports no error, got \
+         {investigation}"
+    );
 
     if status == INVESTIGATION_RUNNING {
         assert!(
-            end.is_none() && error.is_none(),
+            end.is_none(),
             "case {case:?} ({label}): an investigation still {INVESTIGATION_RUNNING} has \
-             not ended, so it reports no endTime and no error, got {investigation}"
+             not ended, so it reports no endTime, got {investigation}"
+        );
+        assert!(
+            investigation["summary"].is_null()
+                && investigation["riskLevel"].is_null()
+                && investigation["confidence"].is_null()
+                && investigation["risk"].is_null()
+                && investigation["metadata"].is_null(),
+            "case {case:?} ({label}): the pass has reached no conclusion yet, so none may \
+             be reported, got {investigation}"
         );
         return Phase::Running;
     }
 
-    // The one terminal status an analysis this emulator could not run reaches: there is
-    // no engine to produce a summary, so the run ends in the modelled failure state.
+    // The terminal status an analysis that ran reaches.
     assert_eq!(
-        status, INVESTIGATION_FAILED,
+        status, INVESTIGATION_COMPLETED,
         "case {case:?} ({label}): expected {INVESTIGATION_RUNNING} or \
-         {INVESTIGATION_FAILED}, got {investigation}"
+         {INVESTIGATION_COMPLETED}, got {investigation}"
     );
     let end = end.unwrap_or_else(|| {
         panic!(
@@ -259,24 +278,25 @@ fn phase_of(case: &str, label: &str, investigation: &Value) -> Phase {
         "case {case:?} ({label}): expected an end instant at or after the start {start}, \
          got {end}"
     );
-    let error = error.unwrap_or_else(|| {
-        panic!(
-            "case {case:?} ({label}): a {INVESTIGATION_FAILED} investigation carries the \
-             reason it failed, got {investigation}"
-        )
-    });
+    for member in ["summary", "riskLevel", "confidence", "risk"] {
+        let value = investigation[member].as_str().unwrap_or_default();
+        assert!(
+            !value.is_empty(),
+            "case {case:?} ({label}): an ended analysis reports its {member}, got \
+             {investigation}"
+        );
+    }
+    let risk = investigation["risk"].as_str().unwrap_or_default();
     assert!(
-        !error.is_empty() && error.len() <= MAX_ERROR_LENGTH,
-        "case {case:?} ({label}): expected a reason within the modelled \
-         {MAX_ERROR_LENGTH} characters, got {error:?}"
+        risk.chars().count() <= MAX_RISK_LENGTH,
+        "case {case:?} ({label}): expected a risk within the modelled {MAX_RISK_LENGTH} \
+         characters, got {risk:?}"
     );
     assert!(
-        investigation["summary"].is_null()
-            && investigation["riskLevel"].is_null()
-            && investigation["confidence"].is_null()
-            && investigation["risk"].is_null(),
-        "case {case:?} ({label}): no analysis ran, so no assessment may be reported, got \
-         {investigation}"
+        investigation["metadata"]["product"]["name"].is_string()
+            && investigation["metadata"]["version"].is_string(),
+        "case {case:?} ({label}): an ended analysis reports the product and version that \
+         produced it, got {investigation}"
     );
     Phase::Ended
 }
@@ -345,14 +365,21 @@ async fn an_investigations_reported_end_follows_the_clock_and_no_call_of_the_cli
         }
 
         // Past the span the clock owed the end in: every member that reports it is in.
-        tokio::time::sleep(past_the_analysis()).await;
-        let ended = investigation(&router, region, &detector_id, &id, case).await;
-        assert_eq!(
-            phase_of(case, "past the span", &ended),
-            Phase::Ended,
-            "case {case:?}: past the span the clock owed, the analysis has ended, got \
-             {ended}"
-        );
+        // The poll waits for that CONDITION, so a loaded host takes more attempts rather
+        // than a different outcome.
+        let deadline = std::time::Instant::now() + ENDED_DEADLINE;
+        let ended = loop {
+            let got = investigation(&router, region, &detector_id, &id, case).await;
+            if phase_of(case, "past the span", &got) == Phase::Ended {
+                break got;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "case {case:?}: the analysis never ended within {ENDED_DEADLINE:?}, last \
+                 read {got}"
+            );
+            tokio::time::sleep(POLL_INTERVAL).await;
+        };
         let listed = summary(&router, region, &detector_id, &id, case).await;
         assert_readers_agree(case, "past the span", &ended, &listed);
 

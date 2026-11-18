@@ -40,7 +40,8 @@ use serde_json::{json, Value};
 
 use crate::client_rejections::{invalid_parameter, not_owned};
 use crate::detector_lifecycle::{
-    call, call_in, enabled_detector, error_code, new_router, Router, ABSENT_DETECTOR_ID,
+    announced_location, call, call_in, enabled_detector, error_code, new_router, Router,
+    ABSENT_DETECTOR_ID,
 };
 use service_com_amazonaws_guardduty_guarddutyapiservice::state::{
     DETECTOR_ID_MEMBER, IP_SETS_PER_DETECTOR, IP_SET_ACTIVATING, IP_SET_ACTIVE,
@@ -210,7 +211,7 @@ async fn an_ip_set_read_reports_what_the_create_stored() {
         let id = created(&router, &detector, case, request.clone()).await;
         let body = read(&router, &detector, &id, case).await;
 
-        for member in ["name", "format", "location"] {
+        for member in ["name", "format"] {
             let expected = request[member].as_str().unwrap_or_default();
             let actual = body[member].as_str().unwrap_or_default();
             assert_eq!(
@@ -218,6 +219,16 @@ async fn an_ip_set_read_reports_what_the_create_stored() {
                 "case {case:?}: {member} must round-trip, expected {expected:?}, got {actual:?}"
             );
         }
+
+        // `Location` round-trips as the stored list OBJECT announced at the endpoint
+        // this emulator is reached at, so the advertised list is fetchable from it
+        // (the `uploaded_list_location_endpoint` suite owns that rule).
+        let expected = announced_location(request["location"].as_str().unwrap_or_default());
+        let actual = body["location"].as_str().unwrap_or_default();
+        assert_eq!(
+            actual, expected,
+            "case {case:?}: expected the stored list announced as {expected:?}, got {actual:?}"
+        );
 
         // `Tags` is always reported — empty when nothing tagged the IPSet — so a
         // client iterates it without a null guard.

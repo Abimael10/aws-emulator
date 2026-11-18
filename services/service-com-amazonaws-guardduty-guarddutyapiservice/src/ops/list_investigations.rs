@@ -20,9 +20,9 @@
 //! This is a REPORT: the only write is the status change the CLOCK already owed each
 //! investigation ([`crate::state::InvestigationRecord::settle`]), the same transition
 //! `GetInvestigation` materialises, so a list and a read never disagree. The assessment
-//! members (`RiskLevel`, `Confidence`, `Title`) are produced by the analysis this
-//! emulator does not run ([`crate::state::INVESTIGATION_ENGINE_UNAVAILABLE`]) and stay
-//! absent rather than synthesised.
+//! members (`RiskLevel`, `Confidence`, `Title`) are the conclusions of the pass that
+//! transition ends ([`crate::state::InvestigationAnalysis`]), read off the record and
+//! absent while it has reached none.
 //!
 //! This is the ONLY file to touch for this operation.
 //!
@@ -248,18 +248,19 @@ const INVESTIGATION_SUMMARIES_MAX: usize = 50;
 fn investigation_summary(
     investigation: &crate::state::InvestigationRecord,
 ) -> InvestigationSummary {
+    let analysis = investigation.analysis.as_ref();
     InvestigationSummary {
         investigation_id: Some(investigation.id.clone()),
         status: Some(investigation.status.clone()),
         trigger_prompt: Some(investigation.trigger_prompt.clone()),
-        // `RiskLevel`, `Confidence` and `Title` are the ANALYSIS's conclusions, and
-        // this emulator runs no analysis
-        // ([`crate::state::INVESTIGATION_ENGINE_UNAVAILABLE`]): the members stay
-        // absent rather than carrying an assessment nothing produced.
-        // `GetInvestigation` reports the same investigation the same way.
-        risk_level: None,
-        confidence: None,
-        title: None,
+        // `RiskLevel`, `Confidence` and `Title` are the ANALYSIS's conclusions, read
+        // off the assessment the pass stored on the record
+        // ([`crate::state::InvestigationAnalysis`]) and absent while it has reached
+        // none. `GetInvestigation` reports the same investigation from the same
+        // record, so the two views cannot disagree.
+        risk_level: analysis.map(|analysis| analysis.risk_level.clone()),
+        confidence: analysis.map(|analysis| analysis.confidence.clone()),
+        title: analysis.map(|analysis| analysis.title.clone()),
         // "The Amazon Web Services account ID associated with the investigation"
         // (`smithy_query(shape="InvestigationSummary")`) — the account that initiated
         // it, which is what `Investigation.TriggeredBy` reports.
