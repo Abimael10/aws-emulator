@@ -28,10 +28,11 @@
 //!
 //! The tables span what the rule generalises over rather than the one recorded read: the
 //! form of the secret's name (flat, hierarchical, punctuated) and of its value (a JSON
-//! document, a plain string, a multi-line one), the key the secret is encrypted under (the
-//! service-managed one and a customer managed key KMS holds), the selector form (none, each
-//! reserved staging label, a caller-attached label, a version id), the `WithDecryption`
-//! flag, the single and the batch read, and each way a reference resolves to nothing.
+//! document, a plain string, a multi-line one, and the bytes a `SecretBinary` secret holds),
+//! the key the secret is encrypted under (the service-managed one and a customer managed key
+//! KMS holds), the selector form (none, each reserved staging label, a caller-attached
+//! label, a version id), the `WithDecryption` flag, the single and the batch read, where the
+//! source's labels sit when the read is asked, and each way a reference resolves to nothing.
 
 use std::sync::Arc;
 
@@ -1063,6 +1064,248 @@ async fn the_secrets_manager_permission_decides_the_reference_read() {
             ordinary["Parameter"]["Value"].as_str(),
             Some("ordinary-parameter-value"),
             "case {case:?}: the ordinary parameter's own value is served, got {ordinary}"
+        );
+    }
+}
+
+/// One secret a reference is served a BINARY value from: Secrets Manager holds a value
+/// under `SecretBinary` or under `SecretString`, so the binary member is the other form the
+/// source's value travels in.
+struct BinarySecret {
+    /// What a failing assertion calls this row.
+    case: &'static str,
+    /// The secret's name, which is also the leaf of its reference path.
+    name: &'static str,
+    /// The bytes the create stores, which `AWSPREVIOUS` ends up on.
+    first: &'static [u8],
+    /// The bytes `PutSecretValue` stores, which `AWSCURRENT` ends up on.
+    second: &'static [u8],
+}
+
+/// The binary secrets below span what the value member generalises over: bytes no UTF-8
+/// string could carry, the shortest value the model admits (`SecretBinaryType` is
+/// `length 1..65536`), and bytes that happen to read as text.
+const BINARY_SECRETS: &[BinarySecret] = &[
+    BinarySecret {
+        case: "a DER-shaped blob carrying bytes no UTF-8 string holds",
+        name: "emu/binary/keystore",
+        first: &[0x30, 0x82, 0x00, 0xff, 0xfe, 0x01],
+        second: &[0x30, 0x82, 0x00, 0xfd, 0x02, 0x03, 0x80],
+    },
+    BinarySecret {
+        case: "the shortest value the model admits",
+        name: "binary-one-byte",
+        first: &[0x00],
+        second: &[0x7f, 0x80],
+    },
+    BinarySecret {
+        case: "bytes that happen to read as text",
+        name: "team.binary_secret-1",
+        first: b"binary-first",
+        second: b"binary-second-value",
+    },
+];
+
+/// RULE: a reference serves the value the source holds for the selected version whichever
+/// MEMBER that value travels in, so a secret held as `SecretBinary` is served as the base64
+/// this wire carries it as ("When you retrieve a SecretBinary using the HTTP API … the value
+/// is Base64-encoded", `GetSecretValueResponse$SecretBinary`), and the source's own answer
+/// carries it under `secretBinary` and under no string member at all.
+#[tokio::test]
+async fn a_reference_serves_a_binary_secret_as_the_wire_carries_it() {
+    let router = emulator();
+    for secret in BINARY_SECRETS {
+        let case = secret.case;
+        let created = secrets_ok(
+            &router,
+            "CreateSecret",
+            &json!({
+                "Name": secret.name,
+                "SecretBinary": aws_smithy_types::base64::encode(secret.first),
+                "ClientRequestToken": version_id("binary-first-"),
+            }),
+            case,
+        )
+        .await;
+        let put = secrets_ok(
+            &router,
+            "PutSecretValue",
+            &json!({
+                "SecretId": secret.name,
+                "SecretBinary": aws_smithy_types::base64::encode(secret.second),
+                "ClientRequestToken": version_id("binary-second-"),
+            }),
+            case,
+        )
+        .await;
+        let staged = Staged {
+            path: format!("{REFERENCE_ROOT}/{}", secret.name),
+            arn: text(&created, "ARN", case),
+            first_version: text(&created, "VersionId", case),
+            second_version: text(&put, "VersionId", case),
+        };
+
+        // Each row is one selector form against the version and the bytes it must resolve
+        // to, the same way the string-valued rule is spanned above.
+        let selections: &[(Option<&str>, &[u8], &str)] = &[
+            (None, secret.second, &staged.second_version),
+            (Some(STAGE_CURRENT), secret.second, &staged.second_version),
+            (Some(STAGE_PREVIOUS), secret.first, &staged.first_version),
+            (
+                Some(&staged.first_version),
+                secret.first,
+                &staged.first_version,
+            ),
+        ];
+        for (selector, expected_bytes, expected_version) in selections {
+            let case = format!("{case} selected by {selector:?}");
+            let asked = match selector {
+                Some(selector) => format!("{}:{selector}", staged.path),
+                None => staged.path.clone(),
+            };
+            let expected = aws_smithy_types::base64::encode(expected_bytes);
+            let reported = reference(&router, &asked, true, &case).await;
+            assert_reference_shape(
+                &reported,
+                &staged,
+                &staged.path,
+                selector
+                    .map(|selector| format!(":{selector}"))
+                    .as_deref(),
+                &case,
+            );
+            assert_eq!(
+                reported["Value"].as_str(),
+                Some(expected.as_str()),
+                "case {case:?}: a binary value is served as the base64 this wire carries, \
+                 expected {expected:?}, got {reported}"
+            );
+            let source = source_result(&reported, &case);
+            assert_eq!(
+                source["secretBinary"].as_str(),
+                Some(expected.as_str()),
+                "case {case:?}: the source's answer carries the value under the member that \
+                 holds it, expected {expected:?}, got {source}"
+            );
+            assert!(
+                source.get("secretString").is_none(),
+                "case {case:?}: a binary value travels in no string member, got {source}"
+            );
+            assert_eq!(
+                source["versionId"].as_str(),
+                Some(*expected_version),
+                "case {case:?}: the source's answer names the version it served, got {source}"
+            );
+
+            // The same version read through Secrets Manager's own front door must answer with
+            // exactly what the reference served, so the reference serves nothing the source
+            // does not hold.
+            let direct = secrets_ok(
+                &router,
+                "GetSecretValue",
+                &json!({ "SecretId": secret.name, "VersionId": expected_version }),
+                &case,
+            )
+            .await;
+            assert_eq!(
+                direct["SecretBinary"].as_str(),
+                reported["Value"].as_str(),
+                "case {case:?}: the reference serves what GetSecretValue answers, got \
+                 {direct} against {reported}"
+            );
+            assert!(
+                direct.get("SecretString").is_none_or(Value::is_null),
+                "case {case:?}: the source holds this value as binary only, got {direct}"
+            );
+        }
+    }
+}
+
+/// The value a third version of the secret below stores, so the labels the source keeps have
+/// somewhere to move to.
+const THIRD_VALUE: &str = "token-three";
+
+/// RULE: a reference is resolved against the staging labels the SOURCE holds at the instant
+/// the read is asked, so a version minted after an earlier read moves what the very same
+/// reference serves — Parameter Store caches no resolved value of its own for one.
+#[tokio::test]
+async fn a_reference_follows_the_sources_staging_labels_as_they_move() {
+    let router = emulator();
+    let secret = &SECRETS[1];
+    let staged = stage(&router, secret).await;
+
+    // Read once BEFORE the labels move, so the later answers are a statement about the move
+    // rather than about a reference that never resolved.
+    let before = reference(&router, &staged.path, true, "before the labels move").await;
+    assert_eq!(
+        before["Value"].as_str(),
+        Some(secret.second),
+        "the reference must first serve the current version's value, got {before}"
+    );
+
+    let put = secrets_ok(
+        &router,
+        "PutSecretValue",
+        &json!({
+            "SecretId": secret.name,
+            "SecretString": THIRD_VALUE,
+            "ClientRequestToken": version_id("third-"),
+        }),
+        "a third version",
+    )
+    .await;
+    let third_version = text(&put, "VersionId", "a third version");
+
+    // Each row is one selector, against the value and the version the SOURCE holds for it
+    // once the third version took `AWSCURRENT`: the two labels the service moves itself, the
+    // label the caller pinned (which moves with nothing), and the demoted version's own id.
+    let selections: &[(Option<&str>, &str, &str)] = &[
+        (None, THIRD_VALUE, third_version.as_str()),
+        (Some(STAGE_CURRENT), THIRD_VALUE, third_version.as_str()),
+        (
+            Some(STAGE_PREVIOUS),
+            secret.second,
+            staged.second_version.as_str(),
+        ),
+        (
+            Some(STAGE_CUSTOM),
+            secret.first,
+            staged.first_version.as_str(),
+        ),
+        (
+            Some(staged.first_version.as_str()),
+            secret.first,
+            staged.first_version.as_str(),
+        ),
+    ];
+    for (selector, expected_value, expected_version) in selections {
+        let case = format!("after the move, selected by {selector:?}");
+        let asked = match selector {
+            Some(selector) => format!("{}:{selector}", staged.path),
+            None => staged.path.clone(),
+        };
+        let reported = reference(&router, &asked, true, &case).await;
+        assert_reference_shape(
+            &reported,
+            &staged,
+            &staged.path,
+            selector
+                .map(|selector| format!(":{selector}"))
+                .as_deref(),
+            &case,
+        );
+        assert_eq!(
+            reported["Value"].as_str(),
+            Some(*expected_value),
+            "case {case:?}: the value served is the one that label's version now holds, got \
+             {reported}"
+        );
+        let source = source_result(&reported, &case);
+        assert_eq!(
+            source["versionId"].as_str(),
+            Some(*expected_version),
+            "case {case:?}: the source's answer names the version that label now sits on, \
+             got {source}"
         );
     }
 }
