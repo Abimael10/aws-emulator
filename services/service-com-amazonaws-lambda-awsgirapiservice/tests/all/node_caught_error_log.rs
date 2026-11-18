@@ -35,15 +35,12 @@
 //! ([`crate::invoke_request_id::one_invocation_stream_at_a_time`]).
 
 use serde_json::{json, Value};
-use smithy_server_runtime::MultiServiceRouter;
 
 use crate::invocation_log_delivery::{
-    create_function, emulator, invocation_request, logs, Created, NODE_RUNTIME,
+    create_function, emulator, invocation_request, searched, Created, FUNCTION_ERROR_HEADER,
+    NODE_RUNTIME,
 };
 use crate::node_handler_error_wording::ROLE;
-
-/// The header a function error is signalled in, which a caught error never sets.
-const FUNCTION_ERROR_HEADER: &str = "x-amz-function-error";
 
 /// What every handler below answers once it has caught its own error: its own envelope, which
 /// is the value the invocation has to report as the payload.
@@ -156,27 +153,6 @@ const ROWS: &[Row] = &[
         frame: None,
     },
 ];
-
-/// Every message the group `group` holds, as `FilterLogEvents` reports them — the read a
-/// client that has just invoked the function makes, knowing the group but not the stream.
-async fn searched(router: &MultiServiceRouter, case: &str, group: &str) -> Vec<String> {
-    let answered = logs(
-        router,
-        case,
-        "FilterLogEvents",
-        &json!({ "logGroupName": group }),
-    )
-    .await;
-    answered["events"]
-        .as_array()
-        .map(|found| {
-            found
-                .iter()
-                .map(|event| event["message"].as_str().unwrap_or_default().to_string())
-                .collect()
-        })
-        .unwrap_or_default()
-}
 
 /// A caught error is a successful invocation whose log group holds the runtime's own wording
 /// of what was caught, beside the frame that raised it.

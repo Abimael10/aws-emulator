@@ -215,6 +215,38 @@ pub(crate) async fn events(
         .unwrap_or_default()
 }
 
+/// Every message the group `group` holds, whichever stream carries it, as `FilterLogEvents`
+/// reports them — the read a client that has just invoked the function makes, knowing the group
+/// but not the stream.
+///
+/// `pub(crate)` for the reason [`groups`] is: the suites that read what a run wrote without
+/// naming its stream ([`crate::node_caught_error_log`],
+/// [`crate::invoke_handler_reported_status`]) share this reader rather than keeping a copy each.
+pub(crate) async fn searched(router: &MultiServiceRouter, case: &str, group: &str) -> Vec<String> {
+    let answered = logs(
+        router,
+        case,
+        "FilterLogEvents",
+        &json!({ "logGroupName": group }),
+    )
+    .await;
+    answered["events"]
+        .as_array()
+        .map(|found| {
+            found
+                .iter()
+                .map(|event| event["message"].as_str().unwrap_or_default().to_string())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The header a run that FAILED is signalled on (`Invoke$FunctionError`, `httpHeader:
+/// X-Amz-Function-Error`), which a handler that returned never sets.
+///
+/// `pub(crate)` for the reason [`groups`] is.
+pub(crate) const FUNCTION_ERROR_HEADER: &str = "x-amz-function-error";
+
 /// The whole log of one stream as its text, each line closed by its break — which is the form
 /// the invocation itself reports its log tail in.
 ///
@@ -393,6 +425,18 @@ pub(crate) fn invocation_request(
     name: &str,
     headers: &[(&str, &str)],
 ) -> http::Request<bytes::Bytes> {
+    invocation_request_carrying(name, headers, b"{}")
+}
+
+/// The SAME request carrying `event` as the invocation's PAYLOAD — for a suite whose handler
+/// branches on what it was handed ([`crate::invoke_handler_reported_status`], whose rows are
+/// the values one handler answers different events with), so this target keeps one `Invoke`
+/// request path rather than a second copy of its signing.
+pub(crate) fn invocation_request_carrying(
+    name: &str,
+    headers: &[(&str, &str)],
+    event: &[u8],
+) -> http::Request<bytes::Bytes> {
     let mut builder = http::Request::builder()
         .method("POST")
         .uri(format!("{FUNCTIONS_URI}/{name}/invocations"))
@@ -409,7 +453,7 @@ pub(crate) fn invocation_request(
         builder = builder.header(*header, *value);
     }
     builder
-        .body(bytes::Bytes::from_static(b"{}"))
+        .body(bytes::Bytes::copy_from_slice(event))
         .expect("the test request is well formed")
 }
 
