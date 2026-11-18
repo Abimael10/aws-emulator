@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op StartVpcEndpointServicePrivateDnsVerification
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `StartVpcEndpointServicePrivateDnsVerification`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: begins the verification of the private DNS name assigned to the endpoint
+//! service the request's `ServiceId` resolves, leaving that name in the non-terminal
+//! `pendingVerification` state with its outcome owed to the store's clock, and answers
+//! `ReturnValue=true`. This is the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`StartVpcEndpointServicePrivateDnsVerification::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The service is RESOLVED before `DryRun` is read, as it is for every operation this one
+//! service is the subject of: a dry run naming a `ServiceId` the account holds no service for is
+//! told so rather than that the request would have succeeded.
 //!
 //! ## Shape of an operation
 //!
@@ -137,18 +136,66 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `StartVpcEndpointServicePrivateDnsVerification` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(StartVpcEndpointServicePrivateDnsVerificationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("StartVpcEndpointServicePrivateDnsVerification"))
+        // `ctx` carries request metadata only; this operation reads none of it — the service is
+        // named by id, and this store holds the account's configurations as one set, whichever
+        // regional endpoint the request was signed for. The store is reached through the engine
+        // held on `self`.
+        let _ = ctx;
+        use crate::state;
+
+        // The service id's form first: an id that is not a VPC endpoint service id at all is
+        // refused as malformed, so "not an id of this kind" never reads as "no such service"
+        // and is never answered by the DryRun arm below either — the same order every
+        // operation this one service is the subject of reads its `ServiceId` in.
+        let service_id = input.service_id.as_str();
+        state::require_well_formed_id(
+            state::VPC_ENDPOINT_SERVICE_ID_PREFIX,
+            service_id,
+            state::INVALID_VPC_ENDPOINT_SERVICE_ID_MALFORMED,
+        )?;
+
+        let services = state::require_service_state(&*self.engine)?;
+        let mut store = services.lock();
+        // A verification an earlier call began may already have run, so what this call does to
+        // the name is decided from the state the name ACTUALLY is in.
+        store.materialize_due_transitions();
+
+        // "The ID of the endpoint service" (`ServiceId`): the verification is about that one
+        // service, so an id naming none of the account's own is refused outright rather than
+        // reported as a verification that began on nothing.
+        let Some(configuration) = store.vpc_endpoint_services.get(service_id) else {
+            return Err(state::invalid_vpc_endpoint_service_id_not_found(service_id));
+        };
+        // "Initiates the verification process to prove that the service provider owns the
+        // PRIVATE DNS NAME domain for the endpoint service": a service carrying no private DNS
+        // name has no domain to prove ownership of, so there is no process to begin.
+        if configuration.private_dns_name.is_none() {
+            return Err(state::private_dns_name_not_configured(service_id));
+        }
+
+        // The service has been resolved and every parameter read, and nothing has been written
+        // yet: "If you have the required permissions, the error response is DryRunOperation"
+        // (`DryRun`), so a request that WOULD have worked stops here, and one that would have
+        // been refused was refused above with its own reason.
+        if input.dry_run.unwrap_or(false) {
+            return Err(state::dry_run_operation());
+        }
+
+        // The verification itself: the name goes back to `pendingVerification` and its outcome
+        // falls due on the store's own clock, which is what a later read reports. The store
+        // answers `false` only for a service it holds no private DNS name for, which the two
+        // refusals above have already ruled out.
+        if !store.start_vpc_endpoint_service_private_dns_verification(service_id) {
+            return Err(state::internal_error(
+                "the VPC endpoint service the verification was started for could not be read \
+                 back",
+            ));
+        }
+
+        // "Returns true if the request succeeds; otherwise, it returns an error"
+        // (`ReturnValue`).
+        Ok(StartVpcEndpointServicePrivateDnsVerificationOutput {
+            return_value: Some(true),
+        })
     }
 }

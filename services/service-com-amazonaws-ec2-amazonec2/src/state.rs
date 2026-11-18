@@ -2925,6 +2925,11 @@ mod verified_access_trust_provider_attachments;
 /// module.
 mod verified_access_trust_provider_modifications;
 mod verified_access_endpoint_deletion;
+/// Proving that the owner of an endpoint service owns the private DNS name assigned to it:
+/// the verification a start begins, and the state the clock owes that name once the
+/// verification has run. Everything it declares is re-exported below, so a handler reaches it
+/// as `crate::state::private_dns_name_not_configured` like any primitive of this module.
+mod vpc_endpoint_service_private_dns_verification;
 mod volumes;
 /// Whether the KMS key an encrypted volume is to be created under will produce that
 /// volume's data key, asked of the service that owns the key. Everything it declares is
@@ -2990,6 +2995,7 @@ pub use export_image_tasks::*;
 pub use verified_access_trust_provider_attachments::*;
 pub use verified_access_trust_provider_modifications::*;
 pub use verified_access_endpoint_deletion::*;
+pub use vpc_endpoint_service_private_dns_verification::*;
 pub use images_and_zone_facts::*;
 pub use security_group_rules_and_page_tokens::*;
 pub use resource_dependencies_and_conversion_tasks::*;

@@ -407,7 +407,10 @@ impl ComAmazonawsEc2Amazonec2State {
     /// modification reaching `fulfilled` with the purchases it mints
     /// ([`Self::fulfill_due_reserved_instances_modifications`]), and a purchase whose upfront
     /// payment has settled — or whose queued purchase time has come — reaching `active`
-    /// ([`Self::activate_due_reserved_instances`]).
+    /// ([`Self::activate_due_reserved_instances`]). So is the outcome of the verification a
+    /// `StartVpcEndpointServicePrivateDnsVerification` began, which carries an endpoint
+    /// service's private DNS name out of `pendingVerification`
+    /// ([`Self::materialize_due_private_dns_name_verifications`]).
     pub fn materialize_due_transitions(&mut self) {
         let now = Instant::now();
         // The one clock-owed REMOVAL: a recycled AMI whose retention period has run out was
@@ -1907,6 +1910,11 @@ impl ComAmazonawsEc2Amazonec2State {
                 }
             }
         }
+        // The outcome of a verification a `StartVpcEndpointServicePrivateDnsVerification`
+        // began: the private DNS name of an endpoint service is out of
+        // `pendingVerification` once its instant has passed, whether or not anybody called
+        // again — the same contract, on the same clock, as the moves above.
+        self.materialize_due_private_dns_name_verifications(now);
         // A NAT gateway address an association or an assignment left in a transient
         // `NatGatewayAddressStatus` reaches its terminal status once its instant has
         // passed, whether or not anybody called again — the same contract as the moves

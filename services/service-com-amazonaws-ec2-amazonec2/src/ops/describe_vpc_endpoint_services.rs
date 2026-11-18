@@ -295,7 +295,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .flat_map(|region| state::endpoint_services_in_region(region))
             .collect();
         let state_handle = state::require_service_state(&*self.engine)?;
-        let store = state_handle.lock();
+        let mut store = state_handle.lock();
+        // Every move the clock has already made due, before anything is read: the outcome of a
+        // verification a `StartVpcEndpointServicePrivateDnsVerification` began is one of them,
+        // so the verification state reported for one of the account's own services is the
+        // state it was in at this instant.
+        store.materialize_due_transitions();
         for configuration in store.vpc_endpoint_services.values() {
             let Some(record) = state::account_endpoint_service_record(configuration) else {
                 continue;

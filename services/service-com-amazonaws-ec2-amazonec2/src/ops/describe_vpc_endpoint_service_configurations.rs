@@ -252,7 +252,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let state_handle = state::require_service_state(&*self.engine)?;
-        let store = state_handle.lock();
+        let mut store = state_handle.lock();
+        // Every move the clock has already made due, before anything is read: the outcome of a
+        // verification a `StartVpcEndpointServicePrivateDnsVerification` began is one of them,
+        // so a service whose private DNS name was verified at its own instant is not still
+        // reported as pending here.
+        store.materialize_due_transitions();
 
         // "Describes the VPC endpoint service configurations in your ACCOUNT (your services)":
         // the request carries nothing that names a Region and the operation documents no

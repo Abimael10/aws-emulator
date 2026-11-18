@@ -2943,6 +2943,15 @@ pub struct ComAmazonawsEc2Amazonec2State {
     /// [`Self::vpc_endpoint_client_tokens`] sits beside the endpoint store, because that
     /// store holds the modelled shape itself.
     pub vpc_endpoint_service_client_tokens: HashMap<String, String>,
+    /// When the verification of an endpoint service's private DNS name falls due, by
+    /// `ServiceId` — the verification counterpart of [`Self::vpc_endpoint_moves`], beside
+    /// [`Self::vpc_endpoint_services`] rather than inside it because that store holds the
+    /// modelled [`ServiceConfiguration`] shape itself, which carries no member for a due
+    /// instant. `StartVpcEndpointServicePrivateDnsVerification` leaves the name in the
+    /// non-terminal `pendingVerification` state, so the clock owes it `verified`
+    /// [`TRANSITION_DELAY`] later whether or not anybody calls again; a service nothing has
+    /// started a verification for has no entry here.
+    pub vpc_endpoint_service_private_dns_verified_at: BTreeMap<String, Instant>,
     /// Every connection notification the account holds, by `ConnectionNotificationId`, as
     /// the modelled [`ConnectionNotification`] shape itself — see the module docs. Ordered
     /// by that id, which is the order `DescribeVpcEndpointConnectionNotifications` reports
@@ -3944,6 +3953,7 @@ impl Default for ComAmazonawsEc2Amazonec2State {
             vpc_endpoint_moves: BTreeMap::new(),
             vpc_endpoint_client_tokens: HashMap::new(),
             vpc_endpoint_service_client_tokens: HashMap::new(),
+            vpc_endpoint_service_private_dns_verified_at: BTreeMap::new(),
             vpc_endpoint_connection_notifications: BTreeMap::new(),
             vpc_endpoint_associations: BTreeMap::new(),
             customer_gateways: BTreeMap::new(),

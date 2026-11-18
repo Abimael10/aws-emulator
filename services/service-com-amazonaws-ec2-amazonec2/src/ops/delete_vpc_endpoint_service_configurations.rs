@@ -346,4 +346,7 @@ fn remove_endpoint_service(
     // The one definition of what storing this configuration charged, so the delete gives back
     // exactly that and no path can drift from the create and the modify.
     store.release_stored_bytes(state::vpc_endpoint_service_payload_bytes(&configuration));
+    // A verification the clock still owed this service's private DNS name is owed no longer:
+    // the name went with the service.
+    store.forget_vpc_endpoint_service_private_dns_verification(service_id);
 }

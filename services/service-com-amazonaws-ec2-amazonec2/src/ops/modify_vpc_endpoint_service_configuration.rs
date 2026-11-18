@@ -425,6 +425,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 "the VPC endpoint service configuration being modified could not be read back",
             ));
         };
+        // Whether this call left the service with a DIFFERENT private DNS name than the one it
+        // carried — a name assigned in place of another, or one removed outright.
+        let mut replaced_private_dns_name = false;
         configuration.network_load_balancer_arns = Some(network_load_balancer_arns);
         configuration.gateway_load_balancer_arns = Some(gateway_load_balancer_arns);
         configuration.supported_ip_address_types = Some(supported_ip_address_types);
@@ -450,12 +453,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if removes_private_dns_name {
             configuration.private_dns_name = None;
             configuration.private_dns_name_configuration = None;
+            replaced_private_dns_name = true;
         } else if let Some(name) = assigned_private_dns_name {
             if configuration.private_dns_name.as_deref() != Some(name) {
                 configuration.private_dns_name = Some(name.to_string());
                 configuration.private_dns_name_configuration =
                     Some(state::private_dns_name_verification(service_id, name));
+                replaced_private_dns_name = true;
             }
+        }
+        // A verification still owed to the name this call took away is owed no longer: it
+        // would otherwise report a proof nobody published for the name now assigned.
+        if replaced_private_dns_name {
+            store.forget_vpc_endpoint_service_private_dns_verification(service_id);
         }
         store.release_stored_bytes(refund);
         store.add_stored_bytes(charge);
