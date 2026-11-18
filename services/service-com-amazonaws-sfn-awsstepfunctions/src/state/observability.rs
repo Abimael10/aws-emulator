@@ -23,8 +23,10 @@
 //!     traffic split, and the traffic one version served, visible. An EXPRESS workflow is
 //!     billed per run, so it also publishes the two billed series, whose values are the
 //!     very figures `StartSyncExecution` reports as `billingDetails` — summing a window
-//!     of either series therefore gives the summed billing details of the runs in it, and
-//!     a STANDARD workflow, which is not billed that way, publishes neither;
+//!     of either series therefore gives the summed billing details of the runs in it, at
+//!     the scale that series is reported in ([`BYTES_PER_BILLED_MEGABYTE`]) — beside the
+//!     memory the run actually consumed ([`EXPRESS_MEMORY_METRIC`]), one sample per run;
+//!     a STANDARD workflow, which is not billed that way, publishes none of them;
 //!   * the series of a `Task` state's own WORK are dimensioned on the RESOURCE that work
 //!     was taken on, in the family that kind of resource is counted in ([`WorkSeries`]):
 //!     a state whose `Resource` is the ARN of a Lambda FUNCTION counts each invocation it
@@ -137,8 +139,20 @@ pub const EXECUTION_TIME_METRIC: &str = "ExecutionTime";
 pub const EXPRESS_BILLED_DURATION_METRIC: &str = "ExpressExecutionBilledDuration";
 
 /// The series measuring the memory an EXPRESS run is billed for, which is the
-/// `billedMemoryUsedInMB` of its `billingDetails`.
+/// `billedMemoryUsedInMB` of its `billingDetails` in BYTES
+/// ([`BYTES_PER_BILLED_MEGABYTE`]).
 pub const EXPRESS_BILLED_MEMORY_METRIC: &str = "ExpressExecutionBilledMemory";
+
+/// The series measuring the memory an EXPRESS run actually CONSUMED, in bytes: one
+/// sample per run, beside the increment that run is billed for
+/// ([`EXPRESS_BILLED_MEMORY_METRIC`]).
+///
+/// The pair is the memory counterpart of the duration pair — what the run did
+/// ([`EXECUTION_TIME_METRIC`]) beside what it costs
+/// ([`EXPRESS_BILLED_DURATION_METRIC`]) — so a client can tell a run whose own
+/// consumption is growing from one that has merely crossed into the next billed
+/// increment.
+pub const EXPRESS_MEMORY_METRIC: &str = "ExpressExecutionMemory";
 
 /// The dimension the series of a `Task` state's own work are reported per, for a state
 /// whose `Resource` is the ARN of a LAMBDA FUNCTION: the function that work was taken
@@ -257,8 +271,20 @@ pub const COUNT_UNIT: &str = "Count";
 /// The `StandardUnit` a span of milliseconds carries.
 pub const MILLISECONDS_UNIT: &str = "Milliseconds";
 
-/// The `StandardUnit` an amount of memory in megabytes carries.
-pub const MEGABYTES_UNIT: &str = "Megabytes";
+/// The `StandardUnit` an amount of memory carries: the memory series of an Express run
+/// are reported in BYTES, whatever increment the figure was billed in.
+pub const BYTES_UNIT: &str = "Bytes";
+
+/// The bytes one BILLED megabyte of Express memory is reported as, which is what turns
+/// the `billedMemoryUsedInMB` of a run's `billingDetails` into the value its byte series
+/// carries: a megabyte of billed memory is a million bytes, so summing a window of that
+/// series gives the summed billing details of the runs in it at this scale.
+///
+/// It is the scale of the REPORTED figure and not of the measurement behind it: the
+/// megabytes a run is billed are counted off the bytes it retained in binary megabytes
+/// ([`super::billed_memory_mb`]), and this is what one of those billed megabytes reads
+/// as once it is published as a byte series.
+pub const BYTES_PER_BILLED_MEGABYTE: i64 = 1_000_000;
 
 /// The `StorageResolution` these datapoints are published at, in seconds: regular
 /// resolution, "which CloudWatch stores at 1-minute resolution"
@@ -1113,9 +1139,9 @@ impl ComAmazonawsSfnAwsstepfunctionsState {
     }
 
     /// Queue what the execution `execution_arn` publishes about having reached a
-    /// TERMINAL status: the series for that status, the span it ran for, the billed
-    /// series of an Express run, and the history events its state machine's logging
-    /// configuration delivers.
+    /// TERMINAL status: the series for that status, the span it ran for, the billed and
+    /// consumed-memory series of an Express run, and the history events its state
+    /// machine's logging configuration delivers.
     ///
     /// Called by the one place an owed outcome is materialised (`settle`) and by
     /// [`Self::observe_execution_started`] for a record that arrives terminal, so
@@ -1159,8 +1185,10 @@ impl ComAmazonawsSfnAwsstepfunctionsState {
             // The figures `StartSyncExecution` reports as `billingDetails`, computed
             // from the same place it computes them, so a window summed over either
             // series equals the billing details of the runs in it.
+            let retained = execution.measure();
             let billed_duration = super::billed_duration_millis(execution.start_date, stopped);
-            let billed_memory = super::billed_memory_mb(execution.measure());
+            let billed_memory =
+                super::billed_memory_mb(retained).saturating_mul(BYTES_PER_BILLED_MEGABYTE);
             #[allow(clippy::cast_precision_loss)]
             measured.push((
                 EXPRESS_BILLED_DURATION_METRIC,
@@ -1168,11 +1196,11 @@ impl ComAmazonawsSfnAwsstepfunctionsState {
                 MILLISECONDS_UNIT,
             ));
             #[allow(clippy::cast_precision_loss)]
-            measured.push((
-                EXPRESS_BILLED_MEMORY_METRIC,
-                billed_memory as f64,
-                MEGABYTES_UNIT,
-            ));
+            measured.push((EXPRESS_BILLED_MEMORY_METRIC, billed_memory as f64, BYTES_UNIT));
+            // The memory the run itself retained, which is the figure the billed
+            // increment above was rounded up from, reported in the same bytes.
+            #[allow(clippy::cast_precision_loss)]
+            measured.push((EXPRESS_MEMORY_METRIC, retained as f64, BYTES_UNIT));
         }
         let queued = execution_datapoints(execution, &measured, stopped);
         // The events the state machine's logging configuration delivers, selected by

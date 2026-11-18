@@ -13,8 +13,10 @@
 //!    terminal status it reached, and the span it ran for;
 //! 2. an EXPRESS workflow, which is billed per run, also publishes the two billed
 //!    series, whose values are the figures `StartSyncExecution` reports as
-//!    `billingDetails` — so a window summed over either equals the summed billing
-//!    details of the runs in it — and a STANDARD workflow publishes neither;
+//!    `billingDetails` — the duration in milliseconds and the memory in bytes, so a
+//!    window summed over either equals the summed billing details of the runs in it —
+//!    beside the memory each run consumed, one sample per run, and a STANDARD workflow
+//!    publishes none of the three;
 //! 3. a state machine whose `loggingConfiguration` names a log group delivers its
 //!    executions' history events to that group, with the events selected by `level`
 //!    and the execution data included only where `includeExecutionData` asks for it.
@@ -25,7 +27,7 @@
 //! `OFF`, and a state machine configured with no logging at all).
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use serde_json::{json, Value};
@@ -42,6 +44,10 @@ use crate::state_machine_lifecycle::{
 
 /// A definition that fails at once, so a row can observe a FAILED execution.
 pub(crate) const FAILING_DEFINITION: &str = r#"{"StartAt":"Nope","States":{"Nope":{"Type":"Fail","Error":"Boom","Cause":"the row fails on purpose"}}}"#;
+
+/// A definition that answers its own input, so what a run retains — and so the memory
+/// it consumed — grows with the data it was handed.
+const ECHO_DEFINITION: &str = r#"{"StartAt":"Echo","States":{"Echo":{"Type":"Pass","End":true}}}"#;
 
 /// A definition that waits long enough to still be RUNNING when a stop arrives.
 const WAITING_DEFINITION: &str =
@@ -220,6 +226,35 @@ fn sum(datapoints: &[cloudwatch::StoredDatum]) -> f64 {
     datapoints.iter().map(|datum| datum.sum).sum()
 }
 
+/// How long a poll below waits for an outcome the clock owes: generous beside the span
+/// this service settles one in, because what the test waits for is the CONDITION and
+/// not an elapsed time.
+const TERMINAL_DEADLINE: Duration = Duration::from_secs(120);
+
+/// How long a poll below waits between two looks at the store.
+const POLL_INTERVAL: Duration = Duration::from_millis(250);
+
+/// Poll `DescribeExecution` until `execution` reports a status other than `RUNNING`,
+/// and answer that record — the call that materialises the owed outcome is also the
+/// call that publishes what the execution owes its series. Fails with `case` when
+/// [`TERMINAL_DEADLINE`] passes first.
+async fn poll_until_terminal(observed: &Observed, case: &str, execution: &str) -> Value {
+    let deadline = Instant::now() + TERMINAL_DEADLINE;
+    loop {
+        let described = observed
+            .ok("DescribeExecution", &json!({ "executionArn": execution }))
+            .await;
+        if string(&described, "status") != "RUNNING" {
+            return described;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "case {case:?}: expected the execution to reach a terminal status, got {described:?}"
+        );
+        std::thread::sleep(POLL_INTERVAL);
+    }
+}
+
 /// Every execution is counted in the `AWS/States` series of its state machine: one
 /// datapoint for the start, one under the series of the terminal status it reached, and
 /// the span it ran for.
@@ -282,17 +317,10 @@ async fn an_execution_is_counted_under_its_state_machine() {
                 .ok("StopExecution", &json!({ "executionArn": execution }))
                 .await;
         } else {
-            std::thread::sleep(PAST_THE_EXECUTION_DELAY);
             // The call that materialises the owed outcome is also the call that
-            // publishes what the execution owes the series.
-            let described = observed
-                .ok("DescribeExecution", &json!({ "executionArn": execution }))
-                .await;
-            assert_ne!(
-                string(&described, "status"),
-                "RUNNING",
-                "case {case:?}: the outcome is due by now, got {described:?}"
-            );
+            // publishes what the execution owes the series, so the poll waits for the
+            // status rather than for a span to pass.
+            poll_until_terminal(&observed, case, &execution).await;
         }
 
         for metric in [
@@ -320,11 +348,12 @@ async fn an_execution_is_counted_under_its_state_machine() {
             Some("Milliseconds"),
             "case {case:?}: an execution's duration is a span of milliseconds, got {ran:?}"
         );
-        // A STANDARD workflow is not billed per run, so it publishes neither billed
-        // series.
+        // A STANDARD workflow is not billed per run, so it publishes none of the
+        // Express series.
         for metric in [
             observability::EXPRESS_BILLED_DURATION_METRIC,
             observability::EXPRESS_BILLED_MEMORY_METRIC,
+            observability::EXPRESS_MEMORY_METRIC,
         ] {
             let held = observed.series(metric, &machine);
             assert!(
@@ -335,30 +364,193 @@ async fn an_execution_is_counted_under_its_state_machine() {
     }
 }
 
+/// The bytes one billed megabyte of Express memory is reported as, which is the scale
+/// the byte series carry the `billedMemoryUsedInMB` of a run's `billingDetails` at.
+fn billed_megabytes_in_bytes(megabytes: f64) -> f64 {
+    #[allow(clippy::cast_precision_loss)]
+    let scale = observability::BYTES_PER_BILLED_MEGABYTE as f64;
+    megabytes * scale
+}
+
+/// Every EXPRESS run publishes the three Express series under its state machine's
+/// dimension: the two BILLED series carrying exactly the figures that run reported as
+/// `billingDetails` — the duration in milliseconds, and the memory in bytes at
+/// [`observability::BYTES_PER_BILLED_MEGABYTE`] bytes per billed megabyte — and one
+/// sample of the memory the run actually consumed.
+///
+/// The rows differ along what the rule generalises over: the shape and SIZE of the data
+/// the run retains (no input at all, the empty object, a small object, a large one, a
+/// list) and the outcome the run reaches (succeeded and failed). Each row runs on its
+/// OWN state machine, so the series hold exactly that run's datapoint and the published
+/// value can be compared against the figures that very call reported.
+#[tokio::test]
+async fn an_express_run_publishes_the_three_express_series() {
+    let observed = Observed::new();
+    let wide = json!({ "payload": "x".repeat(100_000) }).to_string();
+    let listed = json!((0..64).collect::<Vec<u32>>()).to_string();
+
+    // (case, the definition the run walks, the `input` it is handed)
+    let rows: Vec<(&str, &str, Option<String>)> = vec![
+        ("a run handed no input at all", HELLO_DEFINITION, None),
+        (
+            "a run handed the empty object",
+            ECHO_DEFINITION,
+            Some("{}".to_string()),
+        ),
+        (
+            "a run handed a small object",
+            ECHO_DEFINITION,
+            Some(json!({ "wait": 2 }).to_string()),
+        ),
+        (
+            "a run handed a large object",
+            ECHO_DEFINITION,
+            Some(wide),
+        ),
+        ("a run handed a list", ECHO_DEFINITION, Some(listed)),
+        (
+            "a run that fails",
+            FAILING_DEFINITION,
+            Some(json!({ "wait": 1 }).to_string()),
+        ),
+    ];
+
+    // (case, the memory the run consumed) of every row, so the samples can be compared
+    // against each other once the rows have run.
+    let mut samples: Vec<(&str, f64)> = Vec::new();
+    for (index, (case, definition, input)) in rows.into_iter().enumerate() {
+        let machine = create(
+            &observed,
+            &format!("express-series-{index}"),
+            definition,
+            "EXPRESS",
+            None,
+        )
+        .await;
+        let mut request = json!({ "stateMachineArn": machine, "name": "run" });
+        if let Some(input) = input {
+            request["input"] = Value::String(input);
+        }
+        let answer = observed.ok("StartSyncExecution", &request).await;
+        let details = answer.get("billingDetails").cloned().unwrap_or_else(|| {
+            panic!("case {case:?}: a synchronous run reports its billing, got {answer:?}")
+        });
+        let reported = |member: &str| {
+            details
+                .get(member)
+                .and_then(Value::as_f64)
+                .unwrap_or_else(|| panic!("case {case:?}: expected {member}, got {details:?}"))
+        };
+        let billed_bytes = billed_megabytes_in_bytes(reported("billedMemoryUsedInMB"));
+
+        // (the series, the value it must carry, the unit it must carry)
+        let expected: Vec<(&str, f64, &str)> = vec![
+            (
+                observability::EXPRESS_BILLED_DURATION_METRIC,
+                reported("billedDurationInMilliseconds"),
+                observability::MILLISECONDS_UNIT,
+            ),
+            (
+                observability::EXPRESS_BILLED_MEMORY_METRIC,
+                billed_bytes,
+                observability::BYTES_UNIT,
+            ),
+        ];
+        for (metric, value, unit) in expected {
+            let held = observed.series(metric, &machine);
+            assert_eq!(
+                held.len(),
+                1,
+                "case {case:?}: expected one {metric} datapoint, got {held:?}"
+            );
+            assert_eq!(
+                held[0].sum, value,
+                "case {case:?}: expected {metric} to carry the reported {value}, got {}",
+                held[0].sum
+            );
+            assert_eq!(
+                held[0].unit.as_deref(),
+                Some(unit),
+                "case {case:?}: expected {metric} in {unit}, got {held:?}"
+            );
+        }
+
+        // The memory the run CONSUMED is its own sample, in the same bytes, and is what
+        // the billed increment above was rounded up from — so it is never more than it.
+        let consumed = observed.series(observability::EXPRESS_MEMORY_METRIC, &machine);
+        assert_eq!(
+            consumed.len(),
+            1,
+            "case {case:?}: expected one sample of the memory the run consumed, got {consumed:?}"
+        );
+        assert_eq!(
+            consumed[0].unit.as_deref(),
+            Some(observability::BYTES_UNIT),
+            "case {case:?}: expected the consumed memory in bytes, got {consumed:?}"
+        );
+        assert!(
+            consumed[0].sum > 0.0 && consumed[0].sum < billed_bytes,
+            "case {case:?}: expected the consumed memory inside the billed {billed_bytes} bytes, \
+             got {}",
+            consumed[0].sum
+        );
+        samples.push((case, consumed[0].sum));
+    }
+
+    // The consumed series is the memory the run itself retained and not a second copy of
+    // the billed increment: the row handed a large object retains the bytes of that
+    // object, so its sample is strictly larger than the row handed the empty one, while
+    // both are billed the same increment.
+    let sample_of = |wanted: &str| {
+        samples
+            .iter()
+            .find(|(case, _)| *case == wanted)
+            .map(|(_, sample)| *sample)
+            .unwrap_or_else(|| panic!("case {wanted:?}: expected a sample, got {samples:?}"))
+    };
+    let empty = sample_of("a run handed the empty object");
+    let large = sample_of("a run handed a large object");
+    assert!(
+        large > empty,
+        "case the consumed memory grows with the data retained: expected the large row's \
+         {large} to exceed the empty row's {empty}"
+    );
+}
+
 /// An EXPRESS workflow's billed series carry exactly the figures its runs report as
-/// `billingDetails`, so the sum over the series equals the summed billing details; its
-/// STANDARD twin, run the same way, publishes neither series.
+/// `billingDetails`, so the sum over the series equals the summed billing details, and
+/// the memory series holds one sample per run; its STANDARD twin, run the same way,
+/// publishes none of the three.
+///
+/// The runs differ along the data each is handed, so the sums are over figures that are
+/// not all the same value.
 #[tokio::test]
 async fn express_billed_series_equal_the_summed_billing_details() {
     let observed = Observed::new();
-    let express = create(&observed, "billed-express", HELLO_DEFINITION, "EXPRESS", None).await;
+    let express = create(&observed, "billed-express", ECHO_DEFINITION, "EXPRESS", None).await;
     let standard = create(
         &observed,
         "billed-standard",
-        HELLO_DEFINITION,
+        ECHO_DEFINITION,
         "STANDARD",
         None,
     )
     .await;
 
-    // Three runs, so the series are a SUM over several datapoints rather than one.
+    // Three runs, so the series are a SUM over several datapoints rather than one, each
+    // handed data of its own size.
+    let inputs = [
+        "{}".to_string(),
+        json!({ "wait": 1 }).to_string(),
+        json!({ "wait": 2, "payload": "y".repeat(10_000) }).to_string(),
+    ];
     let mut billed_duration = 0.0;
-    let mut billed_memory = 0.0;
-    for run in 1..=3 {
+    let mut billed_megabytes = 0.0;
+    for (run, input) in inputs.iter().enumerate() {
         let answer = observed
             .ok(
                 "StartSyncExecution",
-                &json!({ "stateMachineArn": express, "name": format!("run-{run}") }),
+                &json!({ "stateMachineArn": express, "name": format!("run-{run}"), "input": input }),
             )
             .await;
         let details = answer
@@ -369,7 +561,7 @@ async fn express_billed_series_equal_the_summed_billing_details() {
             .get("billedDurationInMilliseconds")
             .and_then(Value::as_f64)
             .unwrap_or_default();
-        billed_memory += details
+        billed_megabytes += details
             .get("billedMemoryUsedInMB")
             .and_then(Value::as_f64)
             .unwrap_or_default();
@@ -380,7 +572,10 @@ async fn express_billed_series_equal_the_summed_billing_details() {
             observability::EXPRESS_BILLED_DURATION_METRIC,
             billed_duration,
         ),
-        (observability::EXPRESS_BILLED_MEMORY_METRIC, billed_memory),
+        (
+            observability::EXPRESS_BILLED_MEMORY_METRIC,
+            billed_megabytes_in_bytes(billed_megabytes),
+        ),
     ] {
         let held = observed.series(metric, &express);
         assert_eq!(
@@ -395,24 +590,47 @@ async fn express_billed_series_equal_the_summed_billing_details() {
             sum(&held)
         );
     }
+    let consumed = observed.series(observability::EXPRESS_MEMORY_METRIC, &express);
+    assert_eq!(
+        consumed.len(),
+        3,
+        "case {}: expected one sample per run, got {consumed:?}",
+        observability::EXPRESS_MEMORY_METRIC
+    );
 
     // The STANDARD twin: run the same definition the same number of times, and no
-    // billed series exists for it at all.
-    for run in 1..=3 {
+    // Express series exists for it at all.
+    for (run, input) in inputs.iter().enumerate() {
         observed
             .ok(
                 "StartExecution",
-                &json!({ "stateMachineArn": standard, "name": format!("run-{run}") }),
+                &json!({ "stateMachineArn": standard, "name": format!("run-{run}"), "input": input }),
             )
             .await;
     }
-    std::thread::sleep(PAST_THE_EXECUTION_DELAY);
-    observed
+    // Each twin run is polled to its own terminal status, so every datapoint the
+    // STANDARD runs owe has been published by the time the series are read.
+    let listed = observed
         .ok("ListExecutions", &json!({ "stateMachineArn": standard }))
         .await;
+    let executions = listed
+        .get("executions")
+        .and_then(Value::as_array)
+        .unwrap_or_else(|| panic!("case the STANDARD twin: expected a listing, got {listed:?}"))
+        .clone();
+    assert_eq!(
+        executions.len(),
+        inputs.len(),
+        "case the STANDARD twin: expected one execution per run, got {executions:?}"
+    );
+    for execution in &executions {
+        let arn = string(execution, "executionArn");
+        poll_until_terminal(&observed, "the STANDARD twin", &arn).await;
+    }
     for metric in [
         observability::EXPRESS_BILLED_DURATION_METRIC,
         observability::EXPRESS_BILLED_MEMORY_METRIC,
+        observability::EXPRESS_MEMORY_METRIC,
     ] {
         let held = observed.series(metric, &standard);
         assert!(
@@ -421,7 +639,7 @@ async fn express_billed_series_equal_the_summed_billing_details() {
         );
     }
     // Both twins are still counted as executions, so the absence above is about the
-    // BILLED series and not about publishing at all.
+    // EXPRESS series and not about publishing at all.
     for machine in [&express, &standard] {
         let started = observed.series(observability::EXECUTIONS_STARTED_METRIC, machine);
         assert_eq!(
