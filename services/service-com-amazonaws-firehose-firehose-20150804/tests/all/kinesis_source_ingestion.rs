@@ -19,6 +19,13 @@
 //! which always addresses one shard — the bytes at the destination carry them in the order the
 //! producer published them, however the sequence is cut into buffers.
 //!
+//! The PRODUCER is paced by the source, not by this suite's own speed: a shard meters writes at
+//! its published rate ("Each shard can support writes up to 1,000 records per second, up to a
+//! maximum data write total of 1 MB per second", Kinesis `PutRecords`) and does not store a
+//! record past it, so a sequence longer than a second of that rate is published by resending
+//! each refused record before the next one — which is what a producer does, and what keeps the
+//! shard's order the producer's order.
+//!
 //! Three services are mounted on ONE shared engine, as the router mounts them, so what is
 //! exercised is the hand-off between them: the Kinesis writes and the Firehose calls as
 //! `POST /` with `X-Amz-Target`, the destination reads as the path-style Amazon S3 requests a
@@ -28,9 +35,12 @@ use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
 use serde_json::json;
+use service_com_amazonaws_kinesis_kinesis_20131202::state::{
+    SHARD_WRITE_BYTES_PER_SECOND, THROUGHPUT_EXCEEDED_ERROR_CODE,
+};
 
 use crate::buffering_hints::SHORT_INTERVAL;
-use crate::delivery_stream_lifecycle::{REGION, ROLE_ARN};
+use crate::delivery_stream_lifecycle::{error_code, REGION, ROLE_ARN};
 use crate::destination_delivery::{base64, carries_time_prefix, offsets, Emulator};
 
 /// The `X-Amz-Target` prefix of the Kinesis Data Streams wire.
@@ -292,7 +302,8 @@ async fn a_source_fed_stream_takes_no_direct_put() {
 const ORDER_DEADLINE: Duration = Duration::from_secs(90);
 
 /// One record-ORDER case: the case shape the consumption rows already describe, plus how the
-/// producer spreads the records over the source's partition keys.
+/// producer spreads the records over the source's partition keys and whether the sequence one
+/// of those keys carries is more than a shard takes in a second.
 struct OrderRow {
     /// The source's shards, the destination member, its `Prefix`, its `BufferingHints` and the
     /// records published — the SAME row type the consumption cases use, so the stream is
@@ -302,6 +313,11 @@ struct OrderRow {
     /// key always addresses ONE shard, so the records carrying it are a subsequence of that
     /// shard's own order.
     partition_keys: usize,
+    /// Whether the records of one partition key carry more bytes than a shard admits in a
+    /// second of its published write rate, so the source paces the producer while it publishes
+    /// them. Checked against that published rate by the case itself, so a row cannot drift
+    /// from what it claims.
+    past_the_rate: bool,
 }
 
 /// The record-order cases.
@@ -333,6 +349,7 @@ fn order_rows() -> Vec<OrderRow> {
                 record_filler: 0,
             },
             partition_keys: 1,
+            past_the_rate: false,
         },
         OrderRow {
             source: SourceRow {
@@ -345,6 +362,7 @@ fn order_rows() -> Vec<OrderRow> {
                 record_filler: 0,
             },
             partition_keys: 1,
+            past_the_rate: false,
         },
         OrderRow {
             source: SourceRow {
@@ -357,6 +375,9 @@ fn order_rows() -> Vec<OrderRow> {
                 record_filler: 400 * 1024,
             },
             partition_keys: 1,
+            // Six ~400 KiB records on one key are more bytes than a shard takes in a second,
+            // so the source paces the producer through this row.
+            past_the_rate: true,
         },
         OrderRow {
             source: SourceRow {
@@ -369,6 +390,7 @@ fn order_rows() -> Vec<OrderRow> {
                 record_filler: 24,
             },
             partition_keys: 4,
+            past_the_rate: false,
         },
     ]
 }
@@ -385,37 +407,80 @@ struct Placement {
 #[tokio::test]
 async fn the_order_a_shard_took_its_records_in_is_the_order_they_are_delivered_in() {
     for (ordinal, row) in order_rows().into_iter().enumerate() {
-        let case = row.source.case;
-        let emulator = Emulator::new();
-        let bucket = format!("record-order-bucket-{ordinal}");
-        let source = format!("record-order-source-{ordinal}");
-        let stream = format!("record-order-stream-{ordinal}");
-        emulator.create_bucket(&bucket).await;
-        let source_arn = create_source_stream(&emulator, &source, row.source.shards).await;
-        create_source_fed_stream(&emulator, &stream, &source_arn, &row.source, &bucket).await;
-
-        // What the producer publishes, in order: the `index`th record on the partition key
-        // `index % partition_keys`, never through a put to Firehose, which a stream fed by a
-        // configured source refuses.
-        let records = row.source.records;
-        let keys: Vec<usize> = (0..records).map(|index| index % row.partition_keys).collect();
-        let payloads: Vec<Vec<u8>> = (0..records)
-            .map(|index| ordered_payload(ordinal, keys[index], index, row.source.record_filler))
-            .collect();
-        for (index, payload) in payloads.iter().enumerate() {
-            put_to_source(&emulator, &source, &partition_key(keys[index]), payload).await;
-        }
-
-        let prefix = row.source.prefix.unwrap_or_default();
-        let bodies =
-            delivered_payloads_within(&emulator, case, &bucket, prefix, &payloads, ORDER_DEADLINE)
-                .await;
-        let placements = placements(case, &bodies, ordinal, &keys);
-        for key in 0..row.partition_keys {
-            let published: Vec<usize> = (0..records).filter(|index| keys[*index] == key).collect();
-            assert_delivered_in_order(case, key, &published, &placements);
-        }
+        a_published_sequence_is_delivered_in_its_shards_order("record-order", ordinal, &row).await;
     }
+}
+
+/// Drive ONE row of a published-sequence table: create the source and the Firehose stream the
+/// row describes, publish its records in order, and require each of them at the destination
+/// exactly once and in its shard's own order.
+///
+/// The one body both tables of this suite run, so the ordering and exactly-once assertions
+/// exist once; `label` names the resources of the table driving it.
+async fn a_published_sequence_is_delivered_in_its_shards_order(
+    label: &str,
+    ordinal: usize,
+    row: &OrderRow,
+) {
+    let case = row.source.case;
+    // What the row claims about the shard's published write rate is read FROM that rate, not
+    // from a number written here: "up to a maximum data write total of 1 MB per second" per
+    // shard (Kinesis `PutRecords`, `SHARD_WRITE_BYTES_PER_SECOND`).
+    #[allow(clippy::cast_precision_loss)]
+    let on_one_key = bytes_of_one_key(row) as f64;
+    assert_eq!(
+        on_one_key > SHARD_WRITE_BYTES_PER_SECOND,
+        row.past_the_rate,
+        "case {case:?}: the row publishes at least {on_one_key} bytes on one key against a \
+         published rate of {SHARD_WRITE_BYTES_PER_SECOND} bytes a second, so past_the_rate must \
+         be {}",
+        on_one_key > SHARD_WRITE_BYTES_PER_SECOND
+    );
+
+    let emulator = Emulator::new();
+    let bucket = format!("{label}-bucket-{ordinal}");
+    let source = format!("{label}-source-{ordinal}");
+    let stream = format!("{label}-stream-{ordinal}");
+    emulator.create_bucket(&bucket).await;
+    let source_arn = create_source_stream(&emulator, &source, row.source.shards).await;
+    create_source_fed_stream(&emulator, &stream, &source_arn, &row.source, &bucket).await;
+
+    // What the producer publishes, in order: the `index`th record on the partition key
+    // `index % partition_keys`, never through a put to Firehose, which a stream fed by a
+    // configured source refuses. A record the shard would not take at its published rate is
+    // resent before the next one is published ([`put_to_source`]).
+    let records = row.source.records;
+    let keys: Vec<usize> = (0..records).map(|index| index % row.partition_keys).collect();
+    let payloads: Vec<Vec<u8>> = (0..records)
+        .map(|index| ordered_payload(ordinal, keys[index], index, row.source.record_filler))
+        .collect();
+    for (index, payload) in payloads.iter().enumerate() {
+        put_to_source(&emulator, &source, &partition_key(keys[index]), payload).await;
+    }
+
+    // Every record the source took is at the destination exactly once — `placements` fails the
+    // case for a record delivered twice — and in its shard's own order, however long the
+    // producer was held at the source's rate.
+    let prefix = row.source.prefix.unwrap_or_default();
+    let bodies =
+        delivered_payloads_within(&emulator, case, &bucket, prefix, &payloads, ORDER_DEADLINE)
+            .await;
+    let placements = placements(case, &bodies, ordinal, &keys);
+    for key in 0..row.partition_keys {
+        let published: Vec<usize> = (0..records).filter(|index| keys[*index] == key).collect();
+        assert_delivered_in_order(case, key, &published, &placements);
+    }
+}
+
+/// At least the bytes the records of ONE partition key of `row` carry — the bytes one shard is
+/// asked to take, since a partition key always addresses one shard.
+///
+/// A lower bound: the rate is charged on "the total size of the partition key and data blob"
+/// (`PutRecords`), and this counts the records alone, so a row this says is past the rate is
+/// past it on its data by itself.
+fn bytes_of_one_key(row: &OrderRow) -> usize {
+    let per_record = ordered_payload(0, 0, 0, row.source.record_filler).len();
+    per_record * row.source.records.div_ceil(row.partition_keys)
 }
 
 /// Where each published record was delivered, by its index in put order.
@@ -493,6 +558,82 @@ fn assert_delivered_in_order(
          run(s)",
         runs.len()
     );
+}
+
+/// The producer-pacing cases, in the suite's own row type.
+///
+/// The rows differ along what the rule generalises over: whether the sequence one partition
+/// key carries stays inside a shard's published write rate or passes it (by three times, by a
+/// sequence of few large records, and on each of two keys at once), the bytes each record
+/// carries, how many records the sequence holds, how many shards and keys it is spread over,
+/// which destination member carries the Amazon S3 location, whether it names a `Prefix`, and
+/// which buffering condition closes the buffers the sequence passes through.
+fn pacing_rows() -> Vec<OrderRow> {
+    vec![
+        OrderRow {
+            source: SourceRow {
+                case: "a sequence inside one shard's published write rate",
+                shards: 1,
+                member: "ExtendedS3DestinationConfiguration",
+                prefix: Some("paced/inside/"),
+                hints: Some((1, 0)),
+                records: 4,
+                record_filler: 64 * 1024,
+            },
+            partition_keys: 1,
+            past_the_rate: false,
+        },
+        OrderRow {
+            source: SourceRow {
+                case: "ten ~300 KiB records on one key, about three times the published rate",
+                shards: 1,
+                member: "S3DestinationConfiguration",
+                prefix: None,
+                hints: Some((1, SHORT_INTERVAL)),
+                records: 10,
+                record_filler: 300 * 1024,
+            },
+            partition_keys: 1,
+            past_the_rate: true,
+        },
+        OrderRow {
+            source: SourceRow {
+                case: "three records of nearly a mebibyte each, past the published rate",
+                shards: 1,
+                member: "ExtendedS3DestinationConfiguration",
+                prefix: Some("paced/large/"),
+                hints: Some((1, 0)),
+                records: 3,
+                record_filler: 900 * 1024,
+            },
+            partition_keys: 1,
+            past_the_rate: true,
+        },
+        OrderRow {
+            source: SourceRow {
+                case: "past the published rate on each of two keys of a two-shard source",
+                shards: 2,
+                member: "ExtendedS3DestinationConfiguration",
+                prefix: Some("paced/fan/"),
+                hints: Some((5, SHORT_INTERVAL)),
+                records: 8,
+                record_filler: 400 * 1024,
+            },
+            partition_keys: 2,
+            past_the_rate: true,
+        },
+    ]
+}
+
+/// The producer-pacing cases, driven through the one body the order table runs: a sequence
+/// longer than a second of the shard's published write rate is published all the same, because
+/// the producer resends what the shard refused, and every record of it is delivered exactly
+/// once in its shard's order.
+#[tokio::test]
+async fn a_producer_paced_by_the_sources_write_rate_still_has_every_record_delivered_in_order() {
+    for (ordinal, row) in pacing_rows().into_iter().enumerate() {
+        a_published_sequence_is_delivered_in_its_shards_order("paced", ordinal, &row).await;
+    }
 }
 
 /// The partition key the `key`th group of a case's records is published under. One key always
@@ -674,34 +815,69 @@ pub(crate) async fn await_active_source_fed_stream(
     }
 }
 
-/// Write one record to the source stream, as a producer does.
+/// How long one record is resent for while its shard is at its published write rate, before
+/// the case fails.
+///
+/// A shard refills a second of its published rate every second, so the few mebibytes a row of
+/// this suite publishes are taken within seconds of the first attempt; this is far wider than
+/// that, so how fast the host serves a put cannot decide a case.
+const PUBLISH_DEADLINE: Duration = Duration::from_secs(60);
+
+/// Write one record to the source stream, as a producer does: published under
+/// `partition_key`, and resent while the shard that key addresses is at its published write
+/// rate, so the record is stored before the producer publishes the next one.
+///
+/// The resend is a POLL LOOP on the shard's own refill, not a wait for the clock: the case
+/// fails only once [`PUBLISH_DEADLINE`] has passed with the record still unstored. Resending
+/// the refused record BEFORE publishing any later one is what keeps the order the shard took
+/// its records in the order the producer published them in — a throttled record is not stored,
+/// so moving on would reorder the sequence.
 pub(crate) async fn put_to_source(
     emulator: &Emulator,
     source: &str,
     partition_key: &str,
     data: &[u8],
 ) {
-    let (status, answered) = emulator
-        .json_rpc(
-            KINESIS_SERVICE,
-            KINESIS_TARGET,
-            "PutRecord",
-            json!({
-                "StreamName": source,
-                "PartitionKey": partition_key,
-                "Data": base64(data),
-            }),
-        )
-        .await;
-    assert_eq!(
-        status, 200,
-        "put to the source stream {source} in {REGION}: got {answered:?}"
-    );
-    assert!(
-        answered["SequenceNumber"].is_string(),
-        "the source stream answers the sequence number it stored the record under, \
-         got {answered:?}"
-    );
+    let deadline = Instant::now() + PUBLISH_DEADLINE;
+    loop {
+        let (status, answered) = emulator
+            .json_rpc(
+                KINESIS_SERVICE,
+                KINESIS_TARGET,
+                "PutRecord",
+                json!({
+                    "StreamName": source,
+                    "PartitionKey": partition_key,
+                    "Data": base64(data),
+                }),
+            )
+            .await;
+        if status == 200 {
+            assert!(
+                answered["SequenceNumber"].is_string(),
+                "the source stream answers the sequence number it stored the record under, \
+                 got {answered:?}"
+            );
+            return;
+        }
+        // The shard the partition key addresses is at its published write rate — "Each shard
+        // can support writes up to 1,000 records per second, up to a maximum data write total
+        // of 1 MB per second" (Kinesis `PutRecords`) — and a record refused that way is NOT
+        // stored, so this is the producer resending exactly it. Any other refusal fails the
+        // case here.
+        assert_eq!(
+            error_code(&answered),
+            THROUGHPUT_EXCEEDED_ERROR_CODE,
+            "put to the source stream {source} in {REGION}: got {status} {answered:?}"
+        );
+        assert!(
+            Instant::now() < deadline,
+            "put to the source stream {source} in {REGION} under the partition key \
+             {partition_key:?}: the shard must take the record once its write rate refills, \
+             got {status} {answered:?}"
+        );
+        tokio::time::sleep(POLL_INTERVAL).await;
+    }
 }
 
 /// Every object under `prefix` of the destination bucket once each of `payloads` is in one of
