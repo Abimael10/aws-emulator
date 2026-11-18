@@ -55,6 +55,11 @@ pub const DEFAULT_TRACKING_SERVER_SIZE: &str = "Small";
 /// value rather than one the request never asked for. `tags` is stored so a later
 /// `ListTags` reports what the create carried; `DescribeMlflowTrackingServer` models no
 /// tag member, so `ListTags` is the one reader that surfaces it.
+///
+/// `grants` holds every presigned-URL grant `CreatePresignedMlflowTrackingServerUrl`
+/// minted for this server, in the crate's one presigned-grant record
+/// ([`PresignedUrlGrant`]), so what a fetch of such a URL authenticates is state this
+/// store holds rather than the shape of the URL.
 #[derive(Debug, Clone)]
 pub struct MlflowTrackingServer {
     pub name: String,
@@ -72,6 +77,7 @@ pub struct MlflowTrackingServer {
     pub creation_time: SystemTime,
     pub last_modified_time: SystemTime,
     pub created_due_at: SystemTime,
+    pub grants: Vec<PresignedUrlGrant>,
 }
 
 impl MlflowTrackingServer {
@@ -101,6 +107,18 @@ impl MlflowTrackingServer {
             TRACKING_SERVER_INACTIVE
         }
     }
+}
+
+/// How this service states that the account holds no MLflow tracking server under the
+/// name a request named: the name RESOLVED TO ITS ARN, quoted, the way
+/// `DescribeMlflowTrackingServer`'s recorded refusal words it.
+///
+/// One function for every operation addressed by `TrackingServerName`, so the read and
+/// the presign cannot drift on how a missing server is worded. The sentence's only
+/// variable part is the ARN the request's name and Region resolve to.
+pub fn missing_tracking_server_message(region: &str, name: &str) -> String {
+    let arn = resource_arn(region, TRACKING_SERVER_KIND, name);
+    format!("Could not find mlflow tracking server \"{arn}\".")
 }
 
 impl ComAmazonawsSagemakerSagemakerState {

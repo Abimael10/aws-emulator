@@ -233,7 +233,9 @@ fn backdate_grants(emulator: &Emulator, prepared: &Prepared, shift: Duration) {
 
 /// The `authToken` a published URL carries, DECODED — the form the grant holds, since the
 /// mint percent-encodes the token into the query.
-fn token_of(url: &str) -> String {
+///
+/// `pub(crate)` so every suite that follows a published URL reads the token one way.
+pub(crate) fn token_of(url: &str) -> String {
     let encoded = url
         .split("authToken=")
         .nth(1)
@@ -246,7 +248,9 @@ fn token_of(url: &str) -> String {
 /// publishes, the reserved `_aws` namespace, this service's plane, the resource, and the
 /// `auth` segment the URL signs in at. Spelled out here rather than taken from the
 /// service, so the suite pins the address instead of echoing it.
-fn expected_prefix(kind: &str, resource: &str) -> String {
+///
+/// `pub(crate)` so every suite that follows a published URL pins the one address form.
+pub(crate) fn expected_prefix(kind: &str, resource: &str) -> String {
     format!(
         "{}/_aws/sagemaker/{kind}/{resource}/auth?authToken=",
         smithy_server_runtime::UNSERVED_URL_BASE

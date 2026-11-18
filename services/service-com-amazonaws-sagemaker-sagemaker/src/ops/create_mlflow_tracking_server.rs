@@ -246,6 +246,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 creation_time: now,
                 last_modified_time: now,
                 created_due_at: now + crate::state::TRACKING_SERVER_CREATED_AFTER,
+                // No presigned URL has been minted for a server this call just
+                // registered; `CreatePresignedMlflowTrackingServerUrl` records its grants
+                // here.
+                grants: Vec::new(),
             },
         );
         drop(store);

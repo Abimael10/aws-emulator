@@ -4,9 +4,10 @@
 //! caller is ADDRESSED, the token it carries, and what a fetch of that address resolves
 //! to.
 //!
-//! Three operations answer a URL whose whole point is that the caller FETCHES it later —
-//! `CreatePresignedNotebookInstanceUrl`, `CreatePartnerAppPresignedUrl` and
-//! `CreatePresignedMlflowAppUrl`. Such a URL has to lead back to THIS emulator: a host of
+//! Four operations answer a URL whose whole point is that the caller FETCHES it later —
+//! `CreatePresignedNotebookInstanceUrl`, `CreatePartnerAppPresignedUrl`,
+//! `CreatePresignedMlflowAppUrl` and `CreatePresignedMlflowTrackingServerUrl`. Such a URL
+//! has to lead back to THIS emulator: a host of
 //! AWS's own (`<name>.notebook.<region>.sagemaker.aws`) resolves to nothing a client of
 //! the emulator can reach, so every flow the operation exists for fails with a name or
 //! network error instead of opening a session. So the address is the endpoint the request
@@ -143,8 +144,8 @@ pub fn mint_session_token(store: &::emulator_server::CredentialStore) -> Option<
 /// without end.
 ///
 /// One function for every resource that publishes a presigned session (a notebook
-/// instance, a partner AI app, an MLflow App), so the three cannot drift on which grants
-/// a resource keeps or on how long a URL stays valid.
+/// instance, a partner AI app, an MLflow App, an MLflow tracking server), so they cannot
+/// drift on which grants a resource keeps or on how long a URL stays valid.
 pub fn record_presigned_grant(
     grants: &mut Vec<PresignedUrlGrant>,
     token: String,
@@ -224,6 +225,16 @@ impl ComAmazonawsSagemakerSagemakerState {
             // managed UI is reached while the app is still coming up — so the session is
             // served for as long as the app is held.
             return Some((app.arn.clone(), &app.grants, true));
+        }
+        if kind == TRACKING_SERVER_KIND {
+            // A tracking server is keyed by its `TrackingServerName`, which is also the
+            // resource field of its ARN, so the address names it directly.
+            let server = self.mlflow_tracking_servers.get(resource)?;
+            // Every status this service moves a tracking server through still holds the
+            // server, and its MLflow UI is reached through the presigned URL while it is
+            // coming up as well, so the session is served for as long as the server is
+            // held.
+            return Some((server.arn.clone(), &server.grants, true));
         }
         None
     }

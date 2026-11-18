@@ -180,14 +180,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
         let Some(server) = store.mlflow_tracking_servers.get_mut(&input.tracking_server_name)
         else {
-            let arn = crate::state::resource_arn(
-                &crate::state::request_region(ctx),
-                crate::state::TRACKING_SERVER_KIND,
-                &input.tracking_server_name,
-            );
+            // The one wording this service has for a tracking server the account does not
+            // hold, shared with every operation addressed by `TrackingServerName`.
             return Err(DescribeMlflowTrackingServerErrorModeled::ResourceNotFound(
                 ResourceNotFound {
-                    message: Some(format!("Could not find mlflow tracking server \"{arn}\".")),
+                    message: Some(crate::state::missing_tracking_server_message(
+                        &crate::state::request_region(ctx),
+                        &input.tracking_server_name,
+                    )),
                 },
             )
             .into());

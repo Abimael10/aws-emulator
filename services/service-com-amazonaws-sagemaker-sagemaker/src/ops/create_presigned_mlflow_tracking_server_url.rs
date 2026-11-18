@@ -1,15 +1,34 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreatePresignedMlflowTrackingServerUrl
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreatePresignedMlflowTrackingServerUrl`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: mints a presigned MLflow UI URL for the tracking server `crate::state`
+//! holds under the requested `TrackingServerName`, and refuses a name the account holds
+//! no server under with the modelled `ResourceNotFound` (HTTP 400), worded the way this
+//! service words a missing tracking server
+//! ([`crate::state::missing_tracking_server_message`]). This is the ONLY file to touch
+//! for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreatePresignedMlflowTrackingServerUrl::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The URL is the address THIS emulator serves the server's MLflow session at
+//! ([`crate::state::presigned_session_url`]): the endpoint the request arrived on, the
+//! STORED server's own name — the resource field of its ARN — and a freshly minted
+//! authorization token. AWS's own managed-UI host resolves to nothing a client of this
+//! emulator can reach, which is why the published address is the emulator's own;
+//! `crate::service::presigned_session` is what serves it.
+//!
+//! The token is NOT constructed in this service: it comes from the emulator's credential
+//! store, the one component that generates secrets, and is removed from that store again
+//! so the emulator accepts no SigV4 credential it just handed out
+//! ([`crate::state::mint_session_token`]).
+//!
+//! `ExpiresInSeconds` and `SessionExpirationDurationInSeconds` are the two windows the
+//! grant this call records on the server carries: the URL stops authenticating once
+//! either has elapsed, which is what the session route enforces. The response carries the
+//! one member the model declares.
+//!
+//! The only other write on the server is the `Creating` -> `Created` transition the clock
+//! already owed ([`crate::state::MlflowTrackingServer::settle_status`]); recording the
+//! grant and minting the credential are the mutations this operation's own contract asks
+//! for ("Returns a presigned URL").
 //!
 //! ## Shape of an operation
 //!
@@ -142,18 +161,97 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreatePresignedMlflowTrackingServerUrl` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreatePresignedMlflowTrackingServerUrlErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreatePresignedMlflowTrackingServerUrl"))
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(|| crate::scaffolded::Scaffolded::validation(crate::state::NO_STATE))?;
+
+        // The two windows a request that names neither carries, which live beside the
+        // grant record they govern in `crate::state`: the window the URL itself stays
+        // valid for and the session it opens once it is followed. A supplied value is
+        // already inside the modelled `@range` (`ExpiresInSeconds` 5..300,
+        // `SessionExpirationDurationInSeconds` 1800..43200), refused before this handler
+        // runs.
+        let expires_in = input
+            .expires_in_seconds
+            .unwrap_or(crate::state::DEFAULT_PRESIGNED_URL_EXPIRES_IN_SECONDS);
+        let session_duration = input
+            .session_expiration_duration_in_seconds
+            .unwrap_or(crate::state::DEFAULT_PRESIGNED_URL_SESSION_SECONDS);
+        let now = ::std::time::SystemTime::now();
+        let region = crate::state::request_region(ctx);
+
+        let mut store = state.lock();
+        // A URL is minted for the server the STORE holds, so a name no server was created
+        // under has nothing to presign: the modelled `ResourceNotFound`, worded the one
+        // way this service words a missing tracking server.
+        let Some(server) = store.mlflow_tracking_servers.get_mut(&input.tracking_server_name)
+        else {
+            return Err(CreatePresignedMlflowTrackingServerUrlErrorModeled::ResourceNotFound(
+                ResourceNotFound {
+                    message: Some(crate::state::missing_tracking_server_message(
+                        &region,
+                        &input.tracking_server_name,
+                    )),
+                },
+            )
+            .into());
+        };
+        // The transition the clock already owed, materialised the way the rest of this
+        // slice materialises it, so the server this URL addresses is not left behind in a
+        // status that fell due before the call. Whether it happened on THIS call does not
+        // change what is recorded below: this call writes a grant either way, so it leaves
+        // the one audit record a state-changing call leaves rather than a second one for
+        // the transition.
+        let _ = server.settle_status(now);
+        // Both read off the STORED server, so the URL and the audit record name the server
+        // that exists rather than the string the request carried.
+        let arn = server.arn.clone();
+        let name = server.name.clone();
+
+        // Nothing in a service constructs a secret itself; see
+        // `crate::state::mint_session_token`. The store's guard is still held, so the
+        // server cannot be released between the lookup above and the credential this call
+        // hands out for it. No secret minted leaves nothing to report and this operation
+        // will not invent one; it models no server fault, so the honest answer is "this
+        // emulator did not serve it".
+        let Some(token) = crate::state::mint_session_token(ctx.credential_store()) else {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(Self::NAME));
+        };
+        // The grant the URL carries is recorded ON the server, through the crate's one
+        // presigned-grant record, so the token the URL names is one this store holds and
+        // the session it opens ends on the clock. That record is also what BOUNDS the
+        // grants one server keeps: `record_presigned_grant` releases every grant whose
+        // session the clock has already ended and keeps at most
+        // `crate::state::GRANT_HISTORY_CAP` of them, so a caller asking for URL after URL
+        // cannot grow this store without end.
+        let grant = crate::state::record_presigned_grant(
+            &mut server.grants,
+            token,
+            now,
+            ::std::time::Duration::from_secs(u64::try_from(expires_in).unwrap_or_default()),
+            session_duration,
+        );
+        // The URL the caller opens later has to lead back to THIS emulator, on the
+        // endpoint the request arrived on: AWS's managed MLflow UI host resolves to
+        // nothing a client of this emulator can reach, so a caller that did what this
+        // operation exists for — fetch the URL to open the MLflow UI — would get a
+        // name-resolution error instead of a session.
+        // `crate::service::presigned_session` serves that address.
+        let authorized_url = crate::state::presigned_session_url(
+            ctx,
+            crate::state::TRACKING_SERVER_KIND,
+            &name,
+            &grant.token,
+            &[],
+        );
+        drop(store);
+
+        // Minting a credential changed state, so the call leaves the audit record a create
+        // leaves — the operation, the server's ARN and the access key id the request
+        // presented, never the token.
+        crate::state::record_state_change(Self::NAME, &arn, ctx);
+        Ok(CreatePresignedMlflowTrackingServerUrlOutput {
+            authorized_url: Some(authorized_url),
+        })
     }
 }
+
