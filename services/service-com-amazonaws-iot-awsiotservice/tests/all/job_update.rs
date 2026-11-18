@@ -21,7 +21,15 @@
 //!   status is set to IN_PROGRESS", so an update of it is carried onto the job's
 //!   executions that no device has started yet;
 //! * a `jobId` no record holds is the modelled `ResourceNotFoundException` (HTTP 404) and
-//!   that refusal writes nothing.
+//!   that refusal writes nothing;
+//! * the SCOPE of each of those writes: an update moves no member of the record it does
+//!   not name — the document and its substitution parameters, the targets, the target
+//!   selection, the status, the instant the job was created and the progress counted from
+//!   its executions all read back as created, whatever the job's form — a timeout it
+//!   names reaches EVERY unstarted execution of THAT job (one per targeted device, a
+//!   thing-group target counting once per member) and no execution of any other job, and
+//!   successive updates ACCUMULATE on the one record rather than resetting it to the
+//!   values the job was created with.
 //!
 //! The table spans what the rules generalise over — whether the job was created with a
 //! description or a timeout, which of the two members the update names, whether it
@@ -45,6 +53,14 @@ const REGION: &str = "us-east-1";
 const JOB_IN_PROGRESS: &str = "IN_PROGRESS";
 /// The `JobStatus` of a job whose rollout was cancelled.
 const JOB_CANCELED: &str = "CANCELED";
+
+/// The members of a reported `Job` an `UpdateJob` call may move: the two the operation
+/// writes (`description` and `timeoutConfig`, from
+/// `timeoutConfig.inProgressTimeoutInMinutes`) and `lastUpdatedAt`, "the time … when the
+/// job was last updated". Every other member is one no update names, which is what
+/// [`Reply::without_the_updatable_members`] compares. Should the operation gain another
+/// member it writes, it belongs here.
+const UPDATABLE_MEMBERS: [&str; 3] = ["description", "timeoutConfig", "lastUpdatedAt"];
 
 /// A SigV4 `Authorization` header whose credential scope names the `iot` signing name:
 /// the scope is how the router picks the claiming service.
@@ -78,6 +94,31 @@ impl Reply {
     /// The `job` member of a `DescribeJob` answer.
     fn job(&self) -> &Value {
         self.body.get("job").unwrap_or(&Value::Null)
+    }
+
+    /// A numeric member — the epoch-second timestamps a job reports, as restJson1
+    /// renders them.
+    fn number(&self, pointer: &str) -> Option<f64> {
+        self.body.pointer(pointer).and_then(Value::as_f64)
+    }
+
+    /// The in-progress timeout the job reports, in minutes.
+    fn reported_timeout_minutes(&self) -> Option<i64> {
+        self.body
+            .pointer("/job/timeoutConfig/inProgressTimeoutInMinutes")
+            .and_then(Value::as_i64)
+    }
+
+    /// The whole answer with [`UPDATABLE_MEMBERS`] removed, so what is left is everything
+    /// an update must NOT have touched.
+    fn without_the_updatable_members(&self) -> Value {
+        let mut reduced = self.body.clone();
+        if let Some(job) = reduced.get_mut("job").and_then(Value::as_object_mut) {
+            for member in UPDATABLE_MEMBERS {
+                job.remove(member);
+            }
+        }
+        reduced
     }
 }
 
@@ -161,6 +202,17 @@ impl Emulator {
 
     async fn describe_job(&self, job_id: &str) -> Reply {
         self.call("GET", &format!("/jobs/{job_id}"), None).await
+    }
+
+    /// The job document as a reader sees it — `before_substitution` selects the document
+    /// as written or the document with the job's parameters resolved.
+    async fn job_document(&self, job_id: &str, before_substitution: bool) -> Reply {
+        self.call(
+            "GET",
+            &format!("/jobs/{job_id}/job-document?beforeSubstitution={before_substitution}"),
+            None,
+        )
+        .await
     }
 
     async fn cancel_job(&self, job_id: &str) -> Reply {
@@ -576,6 +628,488 @@ async fn a_group_targeted_continuous_job_is_updated_then_cancelled() {
             "case {case:?}: expected the updated description on the cancelled job, \
              got {:?}",
             read.job()
+        );
+    }
+}
+
+/// One row of the partial-update table: a job form, and the description the update
+/// writes onto it.
+struct JobForm {
+    case: &'static str,
+    job_id: &'static str,
+    /// The devices the job names directly.
+    things: &'static [&'static str],
+    target_selection: Option<&'static str>,
+    document: Option<&'static str>,
+    document_source: Option<&'static str>,
+    /// `documentParameters`: the values the stored document's placeholders resolve to.
+    parameters: &'static [(&'static str, &'static str)],
+    created_description: Option<&'static str>,
+    created_timeout_minutes: Option<i64>,
+    update_description: &'static str,
+}
+
+/// RULE: `UpdateJob` is a PARTIAL update — a member the request omits names no change —
+/// so an update that names only `description` moves that member and leaves every other
+/// member of the record, in every job form, exactly as the job was created.
+///
+/// The rows span the forms a stored job takes: how many devices it names, whether it
+/// carries a target selection, an inline document, substitution parameters or an S3
+/// document source, and whether it was created with a description or a timeout at all.
+#[tokio::test]
+async fn an_update_moves_only_the_members_it_names() {
+    let emulator = Emulator::new();
+
+    let forms = [
+        JobForm {
+            case: "a snapshot job over three devices, with a document and a timeout",
+            job_id: "scope-snapshot",
+            things: &["scope-a", "scope-b", "scope-c"],
+            target_selection: Some("SNAPSHOT"),
+            document: Some(r#"{"operation":"install"}"#),
+            document_source: None,
+            parameters: &[],
+            created_description: Some("install the new firmware"),
+            created_timeout_minutes: Some(5),
+            update_description: "install the new firmware, phase two",
+        },
+        JobForm {
+            case: "a continuous job whose document carries substitution parameters",
+            job_id: "scope-parameters",
+            things: &["scope-d"],
+            target_selection: Some("CONTINUOUS"),
+            document: Some(r#"{"operation":"${aws:iot:parameter:action}"}"#),
+            document_source: None,
+            parameters: &[("action", "reboot"), ("retries", "2")],
+            created_description: None,
+            created_timeout_minutes: None,
+            update_description: "reboot what the parameters name",
+        },
+        JobForm {
+            case: "a job created from a documentSource",
+            job_id: "scope-document-source",
+            things: &["scope-e", "scope-f"],
+            target_selection: None,
+            document: None,
+            document_source: Some("https://s3.us-east-1.amazonaws.com/updates/payload.json"),
+            parameters: &[],
+            created_description: Some("roll out the payload"),
+            created_timeout_minutes: Some(10_080),
+            update_description: "roll out the payload to the rest of the fleet",
+        },
+    ];
+
+    for form in &forms {
+        let targets: Vec<String> = form.things.iter().map(|thing| thing_arn(thing)).collect();
+        let mut request = json!({ "targets": targets });
+        if let Some(target_selection) = form.target_selection {
+            request["targetSelection"] = json!(target_selection);
+        }
+        if let Some(document) = form.document {
+            request["document"] = json!(document);
+        }
+        if let Some(document_source) = form.document_source {
+            request["documentSource"] = json!(document_source);
+        }
+        if let Some(description) = form.created_description {
+            request["description"] = json!(description);
+        }
+        if let Some(minutes) = form.created_timeout_minutes {
+            request["timeoutConfig"] = json!({ "inProgressTimeoutInMinutes": minutes });
+        }
+        if !form.parameters.is_empty() {
+            request["documentParameters"] = Value::Object(
+                form.parameters
+                    .iter()
+                    .map(|(key, value)| ((*key).to_string(), json!(value)))
+                    .collect(),
+            );
+        }
+        let created = emulator.create_job(form.job_id, &request).await;
+        assert_eq!(
+            created.status, 200,
+            "case {:?}: the job must be creatable, got {} {:?}",
+            form.case, created.status, created.body
+        );
+
+        // The record as created, and both views of its document, are what every
+        // assertion below is made against.
+        let before = emulator.describe_job(form.job_id).await;
+        assert_eq!(
+            before.status, 200,
+            "case {:?}: expected 200 from DescribeJob, got {} {:?}",
+            form.case, before.status, before.body
+        );
+        let created_at = before
+            .number("/job/createdAt")
+            .unwrap_or_else(|| panic!("case {:?}: a job reports when it was created", form.case));
+        assert_eq!(
+            before.number("/job/lastUpdatedAt"),
+            Some(created_at),
+            "case {:?}: nothing has updated the job yet, so it was last written when it \
+             was created, got {:?}",
+            form.case,
+            before.job()
+        );
+        let document_as_written = emulator.job_document(form.job_id, true).await;
+        let document_resolved = emulator.job_document(form.job_id, false).await;
+
+        let updated = emulator
+            .update_job(
+                form.job_id,
+                &json!({ "description": form.update_description }),
+            )
+            .await;
+        assert_eq!(
+            updated.status, 200,
+            "case {:?}: expected 200 from UpdateJob, got {} {:?}",
+            form.case, updated.status, updated.body
+        );
+
+        let after = emulator.describe_job(form.job_id).await;
+        assert_eq!(
+            after.status, 200,
+            "case {:?}: expected 200 from DescribeJob, got {} {:?}",
+            form.case, after.status, after.body
+        );
+        // The member the request named is the member that moved.
+        assert_eq!(
+            after.text("/job/description").as_deref(),
+            Some(form.update_description),
+            "case {:?}: expected the description the update wrote, got {:?}",
+            form.case,
+            after.job()
+        );
+        // The timeout the request did not name is untouched — including on the job that
+        // never had one, which still reports none rather than a default.
+        assert_eq!(
+            after.reported_timeout_minutes(),
+            form.created_timeout_minutes,
+            "case {:?}: an update naming no timeoutConfig leaves the created one, \
+             expected {:?}, got {:?}",
+            form.case,
+            form.created_timeout_minutes,
+            after.job()
+        );
+        // And so is everything else the record carries: the document source, the
+        // targets, the target selection, the parameters, the status and the progress
+        // counted from the job's executions.
+        assert_eq!(
+            after.without_the_updatable_members(),
+            before.without_the_updatable_members(),
+            "case {:?}: a partial update must move no member it does not name, got {:?}",
+            form.case,
+            after.body
+        );
+        // `Job$lastUpdatedAt` is "the time … when the job was last updated": the update
+        // is that write, and it never moves when the job was created.
+        assert_eq!(
+            after.number("/job/createdAt"),
+            Some(created_at),
+            "case {:?}: an update never moves createdAt, got {:?}",
+            form.case,
+            after.job()
+        );
+        let last_updated_at = after.number("/job/lastUpdatedAt").unwrap_or_else(|| {
+            panic!(
+                "case {:?}: an updated job reports when it was last updated",
+                form.case
+            )
+        });
+        assert!(
+            last_updated_at >= created_at,
+            "case {:?}: expected lastUpdatedAt at or after createdAt {created_at}, \
+             got {last_updated_at}",
+            form.case
+        );
+
+        // The document is not a member `UpdateJob` names, so both views of it are still
+        // the ones the create stored.
+        for (view, reference) in [(true, &document_as_written), (false, &document_resolved)] {
+            let read = emulator.job_document(form.job_id, view).await;
+            assert_eq!(
+                (read.status, read.body.clone()),
+                (reference.status, reference.body.clone()),
+                "case {:?}: expected the stored document (beforeSubstitution={view}) to \
+                 survive the update, got {} {:?}",
+                form.case,
+                read.status,
+                read.body
+            );
+        }
+    }
+}
+
+/// RULE: `timeoutConfig.inProgressTimeoutInMinutes` is "the amount of time each device
+/// has to finish its execution of the job", so an update of it reaches every execution of
+/// THAT job that no device has started yet — one per targeted device, a thing-group
+/// target counting once per member — and reaches no execution of any other job, even on a
+/// device the two jobs share.
+#[tokio::test]
+async fn an_updated_timeout_reaches_every_unstarted_execution_of_that_job_alone() {
+    let emulator = Emulator::new();
+
+    // A group with two members, so one target names two devices.
+    assert_eq!(
+        emulator.create_thing_group("timeout-fleet").await.status,
+        200,
+        "the thing group must be creatable"
+    );
+    for member in ["fleet-member-1", "fleet-member-2"] {
+        assert_eq!(
+            emulator.create_thing(member).await.status,
+            200,
+            "the thing {member} must be creatable"
+        );
+        assert_eq!(
+            emulator
+                .add_thing_to_thing_group("timeout-fleet", member)
+                .await
+                .status,
+            200,
+            "the membership of {member} must be writable"
+        );
+    }
+
+    // The job under update: three devices named directly plus the group's two members,
+    // so five executions nobody has started.
+    let direct = ["timeout-device-1", "timeout-device-2", "timeout-device-3"];
+    let carrier_devices: Vec<String> = direct
+        .iter()
+        .map(|thing| (*thing).to_string())
+        .chain(["fleet-member-1".to_string(), "fleet-member-2".to_string()])
+        .collect();
+    let mut carrier_targets: Vec<String> = direct.iter().map(|thing| thing_arn(thing)).collect();
+    carrier_targets.push(thing_group_arn("timeout-fleet"));
+    assert_eq!(
+        emulator
+            .create_job(
+                "timeout-carrier",
+                &json!({
+                    "targets": carrier_targets,
+                    "document": r#"{"operation":"install"}"#,
+                    "timeoutConfig": { "inProgressTimeoutInMinutes": 5 },
+                }),
+            )
+            .await
+            .status,
+        200,
+        "the job under update must be creatable"
+    );
+
+    // Another job over devices the first one also targets: nothing an update of one job
+    // does may reach the other job's executions.
+    let bystander_devices = ["timeout-device-1", "fleet-member-2"];
+    assert_eq!(
+        emulator
+            .create_job(
+                "timeout-bystander",
+                &json!({
+                    "targets": bystander_devices
+                        .iter()
+                        .map(|thing| thing_arn(thing))
+                        .collect::<Vec<String>>(),
+                    "document": r#"{"operation":"reboot"}"#,
+                    "timeoutConfig": { "inProgressTimeoutInMinutes": 60 },
+                }),
+            )
+            .await
+            .status,
+        200,
+        "the other job must be creatable"
+    );
+
+    /// One step of the rollout: what the update names, and what every execution of the
+    /// updated job must then arm its timer from.
+    struct Step {
+        case: &'static str,
+        /// The update's body, or `Value::Null` for the state as created.
+        request: Value,
+        carrier_minutes: Option<i64>,
+    }
+
+    // The in-progress timeout the other job keeps throughout, whatever the updated job
+    // does: its own created value.
+    const BYSTANDER_MINUTES: i64 = 60;
+
+    let steps = [
+        Step {
+            case: "as created, before any update",
+            request: Value::Null,
+            carrier_minutes: Some(5),
+        },
+        Step {
+            case: "the timeout is raised",
+            request: json!({ "timeoutConfig": { "inProgressTimeoutInMinutes": 120 } }),
+            carrier_minutes: Some(120),
+        },
+        Step {
+            case: "the timeout is lowered",
+            request: json!({ "timeoutConfig": { "inProgressTimeoutInMinutes": 1 } }),
+            carrier_minutes: Some(1),
+        },
+        Step {
+            // `timeoutConfig` is a STRUCTURE whose `inProgressTimeoutInMinutes` is
+            // optional, and a partial update that names the structure replaces the
+            // configuration it stands for — so one carrying no deadline leaves the job
+            // stating none, which is the same rule the single-update table above pins.
+            case: "naming timeoutConfig with no deadline clears it on every execution",
+            request: json!({ "timeoutConfig": {} }),
+            carrier_minutes: None,
+        },
+        Step {
+            case: "an update naming only the description re-arms nothing",
+            request: json!({ "description": "the timer is unchanged" }),
+            carrier_minutes: None,
+        },
+    ];
+
+    for step in &steps {
+        if step.request.is_object() {
+            let updated = emulator.update_job("timeout-carrier", &step.request).await;
+            assert_eq!(
+                updated.status, 200,
+                "case {:?}: expected 200 from UpdateJob, got {} {:?}",
+                step.case, updated.status, updated.body
+            );
+        }
+
+        // Every execution of the updated job — one per named device and one per group
+        // member — carries the job's current timeout.
+        for thing_name in &carrier_devices {
+            let stored = emulator.stored_execution_timeout(thing_name, "timeout-carrier");
+            assert_eq!(
+                stored, step.carrier_minutes,
+                "case {:?}: expected {thing_name}'s unstarted execution of \
+                 timeout-carrier to carry {:?}, got {stored:?}",
+                step.case, step.carrier_minutes
+            );
+        }
+        // The job reports the same value its executions were handed.
+        let read = emulator.describe_job("timeout-carrier").await;
+        assert_eq!(
+            read.reported_timeout_minutes(),
+            step.carrier_minutes,
+            "case {:?}: expected DescribeJob to report {:?}, got {:?}",
+            step.case,
+            step.carrier_minutes,
+            read.job()
+        );
+
+        // The other job is untouched, on the devices it shares with the updated one too.
+        for thing_name in bystander_devices {
+            let stored = emulator.stored_execution_timeout(thing_name, "timeout-bystander");
+            assert_eq!(
+                stored,
+                Some(BYSTANDER_MINUTES),
+                "case {:?}: expected {thing_name}'s execution of timeout-bystander to \
+                 keep its own {BYSTANDER_MINUTES}-minute timeout, got {stored:?}",
+                step.case
+            );
+        }
+        let bystander = emulator.describe_job("timeout-bystander").await;
+        assert_eq!(
+            bystander.reported_timeout_minutes(),
+            Some(BYSTANDER_MINUTES),
+            "case {:?}: expected the other job to keep its own timeout, got {:?}",
+            step.case,
+            bystander.job()
+        );
+    }
+}
+
+/// RULE: successive updates ACCUMULATE on the one record — each call writes the members it
+/// names and leaves whatever an earlier call wrote — so the job is never reset to the
+/// values it was created with.
+#[tokio::test]
+async fn successive_updates_accumulate_on_the_record() {
+    let emulator = Emulator::new();
+
+    assert_eq!(
+        emulator
+            .create_job(
+                "update-sequence",
+                &json!({
+                    "targets": [thing_arn("sequence-device")],
+                    "document": r#"{"operation":"install"}"#,
+                    "description": "as created",
+                    "timeoutConfig": { "inProgressTimeoutInMinutes": 5 },
+                }),
+            )
+            .await
+            .status,
+        200,
+        "the job must be creatable"
+    );
+
+    // (case, the update's body, the description every later read must report, the
+    // in-progress timeout it must report)
+    let steps: [(&str, Value, &str, Option<i64>); 6] = [
+        (
+            "the description alone moves",
+            json!({ "description": "step one" }),
+            "step one",
+            Some(5),
+        ),
+        (
+            "the timeout alone moves, keeping the description step one wrote",
+            json!({ "timeoutConfig": { "inProgressTimeoutInMinutes": 15 } }),
+            "step one",
+            Some(15),
+        ),
+        (
+            "both members move at once",
+            json!({
+                "description": "step three",
+                "timeoutConfig": { "inProgressTimeoutInMinutes": 45 },
+            }),
+            "step three",
+            Some(45),
+        ),
+        (
+            "an update naming neither member keeps both",
+            json!({}),
+            "step three",
+            Some(45),
+        ),
+        (
+            "the timeout is cleared, keeping the description",
+            json!({ "timeoutConfig": {} }),
+            "step three",
+            None,
+        ),
+        (
+            "the description moves again, leaving the cleared timeout cleared",
+            json!({ "description": "step six" }),
+            "step six",
+            None,
+        ),
+    ];
+
+    for (case, request, expected_description, expected_minutes) in steps {
+        let updated = emulator.update_job("update-sequence", &request).await;
+        assert_eq!(
+            updated.status, 200,
+            "case {case:?}: expected 200 from UpdateJob, got {} {:?}",
+            updated.status, updated.body
+        );
+
+        let read = emulator.describe_job("update-sequence").await;
+        assert_eq!(
+            (
+                read.text("/job/description").as_deref(),
+                read.reported_timeout_minutes()
+            ),
+            (Some(expected_description), expected_minutes),
+            "case {case:?}: expected the accumulated record ({expected_description:?}, \
+             {expected_minutes:?}), got {:?}",
+            read.job()
+        );
+        let stored = emulator.stored_execution_timeout("sequence-device", "update-sequence");
+        assert_eq!(
+            stored, expected_minutes,
+            "case {case:?}: expected the unstarted execution to carry the job's current \
+             timeout {expected_minutes:?}, got {stored:?}"
         );
     }
 }
