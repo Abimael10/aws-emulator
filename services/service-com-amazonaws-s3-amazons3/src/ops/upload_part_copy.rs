@@ -629,10 +629,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             None => source_object.body.clone(),
             Some(range) => {
                 // "You can copy a range only if the source object is greater than 5 MB"
-                // (same member) — a smaller source is what this operation's own special
+                // (same member) — the published 5 MiB a part of a multipart upload has to
+                // carry ([`crate::state::MIN_MULTIPART_PART_BYTES`]), so a source that
+                // cannot supply one whole part is the source this operation's own special
                 // errors publish `InvalidRequest` for: "the specified copy source is not
-                // supported as a byte-range copy source" (HTTP 400).
-                if source_object.body.len() <= crate::state::MIN_MULTIPART_PART_BYTES {
+                // supported as a byte-range copy source" (HTTP 400). A source holding
+                // exactly that many bytes CAN supply one, so it is a byte-range copy source
+                // like any larger one, and only a SMALLER source is refused.
+                if source_object.body.len() < crate::state::MIN_MULTIPART_PART_BYTES {
                     return Err(crate::scaffolded::Scaffolded::unmodeled(
                         crate::state::INVALID_REQUEST_CODE,
                         crate::state::INVALID_REQUEST_STATUS,
@@ -780,9 +784,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 }
 
 /// The `<Message>` this operation's own special errors publish beside
-/// [`crate::state::INVALID_REQUEST_CODE`] for a ranged copy whose source is too small to copy
-/// a range of: "the specified copy source is not supported as a byte-range copy source",
-/// HTTP 400.
+/// [`crate::state::INVALID_REQUEST_CODE`] for a ranged copy whose source holds fewer bytes
+/// than one whole part: "the specified copy source is not supported as a byte-range copy
+/// source", HTTP 400.
 const UNSUPPORTED_BYTE_RANGE_SOURCE_MESSAGE: &str =
     "The specified copy source is not supported as a byte-range copy source.";
 

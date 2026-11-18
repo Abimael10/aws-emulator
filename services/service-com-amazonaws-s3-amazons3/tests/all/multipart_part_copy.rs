@@ -19,10 +19,11 @@
 //! 2. "The range of bytes to copy from the source object. The range value must use the form
 //!    bytes=first-last, where the first and last are the zero-based byte offsets to copy"
 //!    (`UploadPartCopyRequest$CopySourceRange`), and "you can copy a range only if the source
-//!    object is greater than 5 MB" — so a ranged copy of a large enough source records
-//!    exactly those bytes, and one of a smaller source is the `InvalidRequest` this
-//!    operation's own special errors publish ("the specified copy source is not supported as
-//!    a byte-range copy source").
+//!    object is greater than 5 MB" — the published fewest bytes a part may carry — so a
+//!    source holding at least one whole part serves EVERY range inside it, recording exactly
+//!    those bytes, and only a source too small to supply one whole part is the
+//!    `InvalidRequest` this operation's own special errors publish ("the specified copy
+//!    source is not supported as a byte-range copy source").
 //! 3. A copy this emulator cannot carry out as asked records NOTHING: the upload holds
 //!    exactly the parts it held before, and the caller is told with the code and status S3
 //!    answers — an upload id the store never minted (or one named under another key) with 404
@@ -750,4 +751,169 @@ async fn the_parts_a_copy_recorded_are_the_object_a_completion_assembles() {
         "the assembled object must be gone once deleted, got {}",
         gone.status
     );
+}
+
+/// One row of the byte-range source table: the case name, how many bytes the source object
+/// holds, and whether a ranged copy of it is served.
+struct SourceSizeRow {
+    case: &'static str,
+    source_bytes: usize,
+    served: bool,
+}
+
+/// The `<Message>` S3 answers `InvalidRequest` with for a source that cannot be range-copied.
+const UNSUPPORTED_BYTE_RANGE_SOURCE: &str =
+    "The specified copy source is not supported as a byte-range copy source.";
+
+#[tokio::test]
+async fn a_source_holding_one_whole_part_or_more_serves_every_range_inside_it() {
+    let router = router();
+    let origin = "part-copy-range-bound-origin";
+    let target = "part-copy-range-bound-target";
+    bucket(&router, origin).await;
+    bucket(&router, target).await;
+
+    // The rows differ along the one thing the rule generalises over: how many bytes the SOURCE
+    // holds. The bound is the published fewest a part of a multipart upload may carry
+    // ([`MIN_MULTIPART_PART_BYTES`], the 5 MiB of the Amazon S3 multipart upload limits) — a
+    // source holding that many can supply one whole part out of a range, a smaller one cannot
+    // — so the table takes the bound itself, one byte either side of it, and sizes far below.
+    let rows: Vec<SourceSizeRow> = vec![
+        SourceSizeRow {
+            case: "an empty source",
+            source_bytes: 0,
+            served: false,
+        },
+        SourceSizeRow {
+            case: "a source of a few bytes",
+            source_bytes: 12,
+            served: false,
+        },
+        SourceSizeRow {
+            case: "a source one byte below the bound",
+            source_bytes: MIN_MULTIPART_PART_BYTES - 1,
+            served: false,
+        },
+        SourceSizeRow {
+            case: "a source of exactly the bound",
+            source_bytes: MIN_MULTIPART_PART_BYTES,
+            served: true,
+        },
+        SourceSizeRow {
+            case: "a source one byte past the bound",
+            source_bytes: MIN_MULTIPART_PART_BYTES + 1,
+            served: true,
+        },
+    ];
+
+    for (index, row) in rows.iter().enumerate() {
+        let case = row.case;
+        let source_key = format!("sources/{index}.bin");
+        let payload = seeded_payload(0x00c0_ffee + index as u32, row.source_bytes);
+        let stored = put_object(&router, origin, &source_key, &payload, &[]).await;
+        assert_eq!(
+            stored.status, 200,
+            "case {case:?}: the fixture write must succeed, got {}",
+            stored.status
+        );
+
+        // The ranges each source is asked for: the whole of it (the form a caller re-chunking
+        // an object names, bytes=0-<size-1>), and an interior span of it, so a served row is
+        // served for more than one range and a refused row is refused whatever it names.
+        let ranges: Vec<String> = match row.source_bytes {
+            0 => vec!["bytes=0-0".to_string()],
+            size => {
+                let mut ranges = vec![format!("bytes=0-{}", size - 1)];
+                if size > 2 {
+                    ranges.push(format!("bytes=1-{}", size - 2));
+                }
+                ranges
+            }
+        };
+
+        for (ordinal, range) in ranges.iter().enumerate() {
+            let key = format!("copies/{index}-{ordinal}.bin");
+            let upload_id = initiate(&router, target, &key).await;
+            let copied = upload_part_copy(
+                &router,
+                target,
+                &key,
+                &upload_id,
+                1,
+                &format!("{origin}/{source_key}"),
+                &[("x-amz-copy-source-range", range.as_str())],
+            )
+            .await;
+
+            if !row.served {
+                assert_eq!(
+                    copied.status,
+                    400,
+                    "case {case:?} range {range:?}: expected HTTP 400, got {} with body {:?}",
+                    copied.status,
+                    text(&copied)
+                );
+                assert_eq!(
+                    copied.error_code(),
+                    INVALID_REQUEST_CODE,
+                    "case {case:?} range {range:?}: expected the {INVALID_REQUEST_CODE} code, \
+                     got {:?}",
+                    copied.error_code()
+                );
+                assert_eq!(
+                    copied.error_message(),
+                    UNSUPPORTED_BYTE_RANGE_SOURCE,
+                    "case {case:?} range {range:?}: expected the published sentence for a \
+                     source that cannot be range-copied, got {:?}",
+                    copied.error_message()
+                );
+                let listed = list_parts(&router, target, &key, &upload_id).await;
+                assert_eq!(
+                    reported_parts(&listed),
+                    Vec::new(),
+                    "case {case:?} range {range:?}: a refused copy must record no part, got \
+                     body {:?}",
+                    text(&listed)
+                );
+                continue;
+            }
+
+            assert_eq!(
+                copied.status,
+                200,
+                "case {case:?} range {range:?}: expected HTTP 200, got {} with body {:?}",
+                copied.status,
+                text(&copied)
+            );
+            // The bytes the range names, out of the source this emulator holds — the tag the
+            // answer carries is the tag of exactly those bytes, and the part the upload holds
+            // afterwards reports exactly their count.
+            let (first, last) = range
+                .strip_prefix("bytes=")
+                .and_then(|value| value.split_once('-'))
+                .map(|(first, last)| {
+                    (
+                        first.parse::<usize>().expect("a first offset"),
+                        last.parse::<usize>().expect("a last offset"),
+                    )
+                })
+                .expect("a range of the published form");
+            let expected = &payload[first..=last];
+            let etag = expected_etag(expected);
+            assert_eq!(
+                copied.element("ETag").as_deref(),
+                Some(etag.as_str()),
+                "case {case:?} range {range:?}: expected the tag of the copied bytes, got {:?}",
+                copied.element("ETag")
+            );
+            let listed = list_parts(&router, target, &key, &upload_id).await;
+            assert_eq!(
+                reported_parts(&listed),
+                vec![(1, etag.clone(), i64::try_from(expected.len()).unwrap_or_default())],
+                "case {case:?} range {range:?}: expected exactly the part the copy recorded, \
+                 got body {:?}",
+                text(&listed)
+            );
+        }
+    }
 }
