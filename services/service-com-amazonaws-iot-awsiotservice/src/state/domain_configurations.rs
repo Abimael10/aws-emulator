@@ -114,12 +114,14 @@ pub fn missing_domain_configuration_message(domain_configuration_name: &str) -> 
     )
 }
 
-/// How this service refuses a `serverCertificateArn` that names no certificate.
+/// How this service refuses a certificate ARN — the one a configuration PRESENTS
+/// (`serverCertificateArns`) or the one it proves domain ownership with
+/// (`validationCertificateArn`) — that names no certificate the holder has.
 ///
 /// The fixed text is the class's — a certificate the holder does not have is not a
-/// certificate this service can pass to a device — and the variable part is the ARN
-/// the request named.
-pub fn missing_server_certificate_message(certificate_arn: &str) -> String {
+/// certificate this service can present or validate against — and the variable part is
+/// the ARN the request named.
+pub fn missing_acm_certificate_message(certificate_arn: &str) -> String {
     format!("Certificate {certificate_arn} does not exist.")
 }
 
@@ -136,6 +138,18 @@ pub fn missing_server_certificate_message(certificate_arn: &str) -> String {
 pub const UNVALIDATED_SERVER_CERTIFICATE_MESSAGE: &str =
     "Must provide validation certificate when using server certificates not signed by trusted \
      CA or not within";
+
+/// How this service refuses a configuration whose VALIDATION certificate is itself not
+/// one a public authority signed.
+///
+/// `CreateDomainConfiguration$validationCertificateArn` is "The certificate used to
+/// validate the server certificate and prove domain name ownership. This certificate
+/// must be signed by a public certificate authority", so a validation certificate that
+/// chains to no authority proves no ownership of the domain and cannot stand in for the
+/// trust a device could not establish itself. The sentence is the fixed text AWS states
+/// this refusal with, verbatim: it states the rule and echoes nothing of the request.
+pub const UNTRUSTED_VALIDATION_CERTIFICATE_MESSAGE: &str =
+    "Validation certificate must be signed by trusted CA";
 
 /// Whether a device presented the certificate `certificate_arn` can chain it to a
 /// certificate authority its own trust store holds, as Certificate Manager's own record

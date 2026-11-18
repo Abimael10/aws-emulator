@@ -142,26 +142,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
         let _ = ctx;
 
-        // A name the account holds no configuration under is the modelled
-        // `ResourceNotFoundException` (HTTP 404), which this operation declares — so,
-        // unlike the fleet metric delete, a repeat of this one is refused rather than
-        // reporting a delete of nothing.
-        let removed = state
+        // A delete states the ABSENCE of the named configuration, and the operation
+        // models an empty output: a name the account holds no configuration under is
+        // already in the state the caller asked for, so there is nothing to remove and
+        // nothing to report — the empty success, not a refusal. (A read of the same name
+        // still answers the modelled `ResourceNotFoundException`: a read has a record to
+        // report and none exists.)
+        state
             .lock()
             .domain_configurations
             .remove(&input.domain_configuration_name);
-        if removed.is_none() {
-            return Err(
-                DeleteDomainConfigurationErrorModeled::ResourceNotFoundException(
-                    ResourceNotFoundException {
-                        message: Some(crate::state::missing_domain_configuration_message(
-                            &input.domain_configuration_name,
-                        )),
-                    },
-                )
-                .into(),
-            );
-        }
         Ok(DeleteDomainConfigurationOutput {})
     }
 }

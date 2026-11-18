@@ -25,8 +25,13 @@
 //!   domain of the caller's own that presents no certificate at all, and one whose
 //!   certificate chains to no authority and carries no validation certificate, are each
 //!   refused `InvalidRequestException` (400) and create nothing;
+//! * that `validationCertificateArn` must itself name a certificate a PUBLIC authority
+//!   signed, so one the holder does not have and one the account imported are each
+//!   refused `InvalidRequestException` (400) and create nothing;
 //! * a created configuration is read back member for member, and the name is its
 //!   identity, so a second create under it is a conflict;
+//! * a delete states the configuration's ABSENCE, so a name the account holds none
+//!   under answers the empty 200 and removes nothing else, while a read of it refuses;
 //! * the listing reports every configuration the account holds, filtered by
 //!   `serviceType` when the request names one and paged by `pageSize`.
 
@@ -241,11 +246,12 @@ fn certificate_arn(index: usize) -> String {
     format!("arn:aws:acm:{REGION}:{ACCOUNT_ID}:certificate/cert-{index:06}")
 }
 
-/// The ARN of the publicly signed certificate a configuration proves domain ownership
-/// with — `CreateDomainConfiguration$validationCertificateArn`, which the model binds
-/// to the ACM certificate ARN pattern.
-fn validation_certificate_arn() -> String {
-    certificate_arn(99)
+/// The ARN of a certificate a PUBLIC authority signed, which is what Certificate
+/// Manager ISSUES: the kind
+/// `CreateDomainConfiguration$validationCertificateArn` documents ("This certificate
+/// must be signed by a public certificate authority").
+async fn trusted_validation_certificate(emulator: &Emulator, case: &str) -> String {
+    emulator.request_certificate(case, "example.com").await
 }
 
 /// RULE: a created configuration is read back member for member, and which KIND of
@@ -257,6 +263,7 @@ async fn a_created_domain_configuration_is_read_back_member_for_member() {
     let held = emulator
         .import_certificate("read back", &certificate_pem, &private_key_pem)
         .await;
+    let trusted = trusted_validation_certificate(&emulator, "read back").await;
 
     // The rows span which optional members the request carries, and both kinds of
     // domain: one without a `domainName` (the AWS-managed domain, for which
@@ -288,7 +295,7 @@ async fn a_created_domain_configuration_is_read_back_member_for_member() {
             json!({
                 "domainName": "iot.example.com",
                 "serverCertificateArns": [held.clone()],
-                "validationCertificateArn": validation_certificate_arn(),
+                "validationCertificateArn": trusted.clone(),
                 "applicationProtocol": "SECURE_MQTT",
                 "authenticationType": "AWS_X509",
                 "tlsConfig": { "securityPolicy": "IoTSecurityPolicy_TLS13_1_2_2022_10" },
@@ -421,37 +428,27 @@ async fn a_created_domain_configuration_is_read_back_member_for_member() {
         conflict.text()
     );
 
-    // The delete removes the configuration, and a second delete is the same 404 a read
-    // of a name the account holds nothing under is.
+    // The delete removes the configuration, after which a READ of the name is a 404:
+    // the reader has a record to report and there is none.
     assert_eq!(
         emulator.delete_configuration("managed.config").await.status,
         200,
         "case the delete: expected 200"
     );
-    for (case, reply) in [
-        (
-            "a read of the deleted configuration",
-            emulator.describe_configuration("managed.config").await,
-        ),
-        (
-            "a second delete",
-            emulator.delete_configuration("managed.config").await,
-        ),
-    ] {
-        assert_eq!(
-            reply.status,
-            404,
-            "case {case}: expected 404, got {} body {}",
-            reply.status,
-            reply.text()
-        );
-        assert_eq!(
-            reply.error_code(),
-            "ResourceNotFoundException",
-            "case {case}: got {}",
-            reply.text()
-        );
-    }
+    let read = emulator.describe_configuration("managed.config").await;
+    assert_eq!(
+        read.status,
+        404,
+        "case a read of the deleted configuration: expected 404, got {} body {}",
+        read.status,
+        read.text()
+    );
+    assert_eq!(
+        read.error_code(),
+        "ResourceNotFoundException",
+        "case a read of the deleted configuration: got {}",
+        read.text()
+    );
 }
 
 /// RULE: a `serverCertificateArn` the holder has no certificate for cannot be
@@ -463,6 +460,7 @@ async fn a_certificate_the_holder_does_not_have_is_refused() {
     let held = emulator
         .import_certificate("refusals", &certificate_pem, &private_key_pem)
         .await;
+    let trusted = trusted_validation_certificate(&emulator, "refusals").await;
 
     // The rows span the forms a certificate the holder does not have takes: another
     // account's certificate, another region's, one whose id nothing was recorded
@@ -523,7 +521,7 @@ async fn a_certificate_the_holder_does_not_have_is_refused() {
             &json!({
                 "domainName": "iot.example.com",
                 "serverCertificateArns": [held.clone()],
-                "validationCertificateArn": validation_certificate_arn(),
+                "validationCertificateArn": trusted.clone(),
             }),
         )
         .await;
@@ -643,7 +641,11 @@ async fn an_unchainable_server_certificate_needs_a_validation_certificate() {
             body["serverCertificateArns"] = json!([certificate]);
         }
         if case.validation_certificate {
-            body["validationCertificateArn"] = json!(validation_certificate_arn());
+            // The ownership proof is a certificate a public authority signed, which is
+            // the one Certificate Manager ISSUES: these rows are about the SERVER
+            // certificate's trust, so the validation certificate itself is a trusted one.
+            body["validationCertificateArn"] =
+                json!(trusted_validation_certificate(&emulator, case.label).await);
         }
 
         let name = format!("trust-{index}");
@@ -746,6 +748,7 @@ async fn the_listing_reports_the_configurations_the_account_holds() {
     let held = emulator
         .import_certificate("listing", &certificate_pem, &private_key_pem)
         .await;
+    let trusted = trusted_validation_certificate(&emulator, "listing").await;
 
     // The rows span the service types a configuration may deliver
     // (`smithy_query(query="shape",shape="ServiceType")`: CREDENTIAL_PROVIDER, DATA,
@@ -763,7 +766,7 @@ async fn the_listing_reports_the_configurations_the_account_holds() {
                 "serviceType": "DATA",
                 "domainName": "iot.example.com",
                 "serverCertificateArns": [held.clone()],
-                "validationCertificateArn": validation_certificate_arn(),
+                "validationCertificateArn": trusted.clone(),
             }),
         ),
     ];
@@ -867,4 +870,299 @@ async fn the_listing_reports_the_configurations_the_account_holds() {
             "case pageSize={page_size}: expected every configuration once, got {seen:?}"
         );
     }
+}
+
+/// RULE: the certificate a configuration proves domain ownership with has to be one a
+/// device's own trust store can chain — "This certificate must be signed by a public
+/// certificate authority" (`CreateDomainConfiguration$validationCertificateArn`) — so a
+/// validation certificate the holder does not have, and one no public authority signed,
+/// are each refused with nothing created.
+#[tokio::test]
+async fn a_validation_certificate_must_be_signed_by_a_public_authority() {
+    /// Where the row's `validationCertificateArn` comes from.
+    enum Proof {
+        /// A certificate Certificate Manager ISSUED, which a public authority signed.
+        Issued,
+        /// A certificate the ACCOUNT imported, which no public authority signed.
+        Imported,
+        /// An ARN the holder has no certificate under at all.
+        Unknown(&'static str),
+    }
+    /// What the create answers a row with: a record, or the refusal with this message.
+    enum Expected {
+        Created,
+        Refused(String),
+    }
+    /// The fixed text AWS refuses a validation certificate no public authority signed
+    /// with; it states the rule and echoes nothing of the request.
+    const UNTRUSTED_PROOF: &str = "Validation certificate must be signed by trusted CA";
+
+    // The rows span what the rule generalises over: which kind of certificate the
+    // holder has for the ARN the request names, the forms an ARN it has none under
+    // takes, and whether the configuration names a domain of the caller's own.
+    struct Case {
+        label: &'static str,
+        proof: Proof,
+        domain_name: bool,
+    }
+    let cases = [
+        Case {
+            label: "a validation certificate the holder issued",
+            proof: Proof::Issued,
+            domain_name: true,
+        },
+        Case {
+            label: "a validation certificate the holder issued, on the AWS-managed domain",
+            proof: Proof::Issued,
+            domain_name: false,
+        },
+        Case {
+            label: "a validation certificate the account imported",
+            proof: Proof::Imported,
+            domain_name: true,
+        },
+        Case {
+            label: "a validation certificate the account imported, on the AWS-managed domain",
+            proof: Proof::Imported,
+            domain_name: false,
+        },
+        Case {
+            label: "a validation certificate of another account",
+            proof: Proof::Unknown("arn:aws:acm:eu-central-1:000000000001:certificate/cert-000042"),
+            domain_name: true,
+        },
+        Case {
+            label: "a validation certificate of another region",
+            proof: Proof::Unknown("arn:aws:acm:us-east-1:000000000000:certificate/cert-000042"),
+            domain_name: true,
+        },
+        Case {
+            label: "a validation certificate nothing was recorded under",
+            proof: Proof::Unknown(
+                "arn:aws:acm:eu-central-1:000000000000:certificate/\
+                 00000000-0000-0000-0000-000000000042",
+            ),
+            domain_name: true,
+        },
+    ];
+
+    for (index, case) in cases.iter().enumerate() {
+        let emulator = Emulator::new();
+        // Every row presents a server certificate the holder ISSUED, so what the create
+        // answers is about the validation certificate and not about the one presented.
+        let presented = emulator
+            .request_certificate(case.label, "iot.example.com")
+            .await;
+        let (validation_certificate, expected) = match case.proof {
+            Proof::Issued => (
+                trusted_validation_certificate(&emulator, case.label).await,
+                Expected::Created,
+            ),
+            Proof::Imported => {
+                let (certificate_pem, private_key_pem) = minted_certificate();
+                (
+                    emulator
+                        .import_certificate(case.label, &certificate_pem, &private_key_pem)
+                        .await,
+                    Expected::Refused(UNTRUSTED_PROOF.to_string()),
+                )
+            }
+            Proof::Unknown(arn) => (
+                arn.to_string(),
+                Expected::Refused(format!("Certificate {arn} does not exist.")),
+            ),
+        };
+
+        let mut body = json!({
+            "serverCertificateArns": [presented],
+            "validationCertificateArn": validation_certificate,
+        });
+        if case.domain_name {
+            body["domainName"] = json!("iot.example.com");
+        }
+
+        let name = format!("proof-{index}");
+        let created = emulator.create_configuration(&name, &body).await;
+        let refusal = match expected {
+            Expected::Created => {
+                assert_eq!(
+                    created.status,
+                    200,
+                    "case {}: expected 200, got {} body {}",
+                    case.label,
+                    created.status,
+                    created.text()
+                );
+                let read = emulator.describe_configuration(&name).await;
+                assert_eq!(
+                    read.status,
+                    200,
+                    "case {}: the accepted configuration must read back, got {} body {}",
+                    case.label,
+                    read.status,
+                    read.text()
+                );
+                continue;
+            }
+            Expected::Refused(message) => message,
+        };
+        assert_eq!(
+            created.status,
+            400,
+            "case {}: expected 400, got {} body {}",
+            case.label,
+            created.status,
+            created.text()
+        );
+        assert_eq!(
+            created.error_code(),
+            "InvalidRequestException",
+            "case {}: got {}",
+            case.label,
+            created.text()
+        );
+        assert_eq!(
+            created.error_message(),
+            refusal,
+            "case {}: expected the refusal {refusal:?}, got {:?}",
+            case.label,
+            created.error_message()
+        );
+        // Nothing was written, which is what makes the following read a 404 and keeps
+        // the name out of the account's listing.
+        let described = emulator.describe_configuration(&name).await;
+        assert_eq!(
+            described.status,
+            404,
+            "case {}: a refused create must leave no configuration behind, got {} body {}",
+            case.label,
+            described.status,
+            described.text()
+        );
+        let listed = emulator.list_configurations("").await;
+        assert!(
+            !listed.json()["domainConfigurations"]
+                .as_array()
+                .unwrap_or_else(|| panic!("no domainConfigurations in {}", listed.text()))
+                .iter()
+                .any(|summary| summary["domainConfigurationName"] == json!(name)),
+            "case {}: a refused create must leave the name out of the listing, got {}",
+            case.label,
+            listed.text()
+        );
+    }
+}
+
+/// RULE: a delete states the ABSENCE of the configuration it names, so a name the
+/// account holds none under is already in the asked-for state: the delete answers the
+/// modelled empty success and removes nothing else, while a READ of that name still
+/// refuses.
+#[tokio::test]
+async fn deleting_a_configuration_the_account_does_not_hold_succeeds() {
+    let emulator = Emulator::new();
+    let (certificate_pem, private_key_pem) = minted_certificate();
+    let held = emulator
+        .import_certificate("idempotent delete", &certificate_pem, &private_key_pem)
+        .await;
+
+    // One configuration the account DOES hold, so every row below also shows the delete
+    // of an absent name removes nothing else.
+    assert_eq!(
+        emulator
+            .create_configuration("Kept.config-1", &json!({ "serviceType": "DATA" }))
+            .await
+            .status,
+        200,
+        "case the kept configuration: expected 200"
+    );
+    // ... and one created and then deleted, so a repeat of its delete is one of the rows.
+    assert_eq!(
+        emulator
+            .create_configuration("gone.config", &json!({ "serviceType": "JOBS" }))
+            .await
+            .status,
+        200,
+        "case the configuration to delete: expected 200"
+    );
+    assert_eq!(
+        emulator.delete_configuration("gone.config").await.status,
+        200,
+        "case the first delete: expected 200"
+    );
+    // ... and a name whose create was REFUSED, which is the teardown of a resource AWS
+    // never made: an untrusted server certificate with no ownership proof.
+    let refused = emulator
+        .create_configuration(
+            "never.made",
+            &json!({ "domainName": "iot.example.com", "serverCertificateArns": [held] }),
+        )
+        .await;
+    assert_eq!(
+        refused.status,
+        400,
+        "case the refused create: expected 400, got {} body {}",
+        refused.status,
+        refused.text()
+    );
+
+    // The rows span the forms a name the account holds no configuration under takes: one
+    // never asked for, one deleted already, one whose create was refused, and one
+    // differing from a held name only in case, since the name is the identity byte for
+    // byte.
+    for case in [
+        "never.asked-for",
+        "gone.config",
+        "never.made",
+        "kept.config-1",
+    ] {
+        let deleted = emulator.delete_configuration(case).await;
+        assert_eq!(
+            deleted.status,
+            200,
+            "case {case}: expected the delete of an absent configuration to answer 200, got {} \
+             body {}",
+            deleted.status,
+            deleted.text()
+        );
+        assert_eq!(
+            deleted.json(),
+            json!({}),
+            "case {case}: the delete's output is empty, got {}",
+            deleted.text()
+        );
+        // The READ of the same name keeps refusing: it has a record to report and there
+        // is none.
+        let read = emulator.describe_configuration(case).await;
+        assert_eq!(
+            read.status,
+            404,
+            "case {case}: expected the read of an absent configuration to answer 404, got {} \
+             body {}",
+            read.status,
+            read.text()
+        );
+        assert_eq!(
+            read.error_code(),
+            "ResourceNotFoundException",
+            "case {case}: got {}",
+            read.text()
+        );
+    }
+
+    // The configuration the account holds is untouched by every delete above.
+    let kept = emulator.describe_configuration("Kept.config-1").await;
+    assert_eq!(
+        kept.status,
+        200,
+        "case the kept configuration: a delete of an absent name must remove nothing else, got \
+         {} body {}",
+        kept.status,
+        kept.text()
+    );
+    assert_eq!(
+        kept.json()["domainConfigurationName"],
+        json!("Kept.config-1"),
+        "case the kept configuration: got {}",
+        kept.text()
+    );
 }

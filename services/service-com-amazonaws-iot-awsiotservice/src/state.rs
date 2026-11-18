@@ -3334,9 +3334,9 @@ pub use thing_group_membership::{
 pub mod domain_configurations;
 pub use domain_configurations::{
     acm_certificates, chains_to_a_certificate_authority, domain_configuration_arn,
-    missing_domain_configuration_message, missing_server_certificate_message,
+    missing_acm_certificate_message, missing_domain_configuration_message,
     RegisteredDomainConfiguration, MAX_DOMAIN_CONFIGURATIONS,
-    UNVALIDATED_SERVER_CERTIFICATE_MESSAGE,
+    UNTRUSTED_VALIDATION_CERTIFICATE_MESSAGE, UNVALIDATED_SERVER_CERTIFICATE_MESSAGE,
 };
 
 // What a CERTIFICATE PROVIDER is — the record one holds and which provider holds an

@@ -235,13 +235,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // account's endpoint already serves, whose certificates AWS issues itself.
         let custom_domain = input.domain_name.is_some();
 
-        // The certificate a configuration presents belongs to Certificate Manager, so
-        // whether it exists is the holder's answer and not this service's: it is read
-        // from that service's own record of the account's certificates. A certificate the
-        // holder does not have cannot be passed to a device, so the configuration is
-        // refused — the modelled `InvalidRequestException` (HTTP 400) — and nothing is
-        // written, which is what makes the following `DescribeDomainConfiguration` a 404.
-        if !server_certificate_arns.is_empty() {
+        // Every certificate a configuration names belongs to Certificate Manager, so
+        // whether it exists and WHICH authority signed it are the holder's answers and
+        // not this service's: both are read from that service's own record of the
+        // account's certificates. A certificate the holder does not have cannot be
+        // presented to a device or validated against, so the configuration is refused —
+        // the modelled `InvalidRequestException` (HTTP 400) — and nothing is written,
+        // which is what makes the following `DescribeDomainConfiguration` a 404.
+        if !server_certificate_arns.is_empty() || validation_certificate_arn.is_some() {
             let Some(certificates) = crate::state::acm_certificates(&*self.engine) else {
                 return Err(
                     CreateDomainConfigurationErrorModeled::InternalFailureException(
@@ -255,16 +256,49 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 );
             };
             let held = certificates.lock();
+
+            // The validation certificate is what proves ownership of the domain —
+            // "This certificate must be signed by a public certificate authority"
+            // (`CreateDomainConfiguration$validationCertificateArn`) — so it has to be
+            // one a device's own trust store can chain. One the holder does not have,
+            // and one that chains to no authority, each prove nothing, so the create is
+            // refused before anything is written.
+            if let Some(certificate_arn) = validation_certificate_arn.as_deref() {
+                let Some(proof) = held.certificates.get(certificate_arn.trim()) else {
+                    return Err(
+                        CreateDomainConfigurationErrorModeled::InvalidRequestException(
+                            InvalidRequestException {
+                                message: Some(crate::state::missing_acm_certificate_message(
+                                    certificate_arn,
+                                )),
+                            },
+                        )
+                        .into(),
+                    );
+                };
+                if !crate::state::chains_to_a_certificate_authority(proof) {
+                    return Err(
+                        CreateDomainConfigurationErrorModeled::InvalidRequestException(
+                            InvalidRequestException {
+                                message: Some(
+                                    crate::state::UNTRUSTED_VALIDATION_CERTIFICATE_MESSAGE
+                                        .to_string(),
+                                ),
+                            },
+                        )
+                        .into(),
+                    );
+                }
+            }
+
             for certificate_arn in &server_certificate_arns {
                 let Some(presented) = held.certificates.get(certificate_arn.trim()) else {
                     return Err(
                         CreateDomainConfigurationErrorModeled::InvalidRequestException(
                             InvalidRequestException {
-                                message: Some(
-                                    crate::state::missing_server_certificate_message(
-                                        certificate_arn,
-                                    ),
-                                ),
+                                message: Some(crate::state::missing_acm_certificate_message(
+                                    certificate_arn,
+                                )),
                             },
                         )
                         .into(),
