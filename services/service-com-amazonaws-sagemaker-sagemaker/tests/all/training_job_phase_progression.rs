@@ -42,8 +42,16 @@
 //! values the member's own doc names as its default and its maximum — and how much work the
 //! run does before it reports: the records its channels hold and how many objects they are
 //! spread over.
+//!
+//! Nothing here is asserted on how fast this host ran it. Every claim about a stage's window
+//! is weighed against the schedule the job itself reports in `SecondaryStatusTransitions`:
+//! the stages of the run begin after the instant the caller held the create's answer, each is
+//! in effect for a whole [`PHASE_SPAN`], and every read is held to the stage that schedule
+//! says was due when the read was made ([`each_read_reports_the_stage_that_was_due`]). So a
+//! loaded host that looks later than an idle one observes a later stage, and no claim rests on
+//! a poll landing inside a window the host could step over.
 
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use serde_json::{json, Value};
 
@@ -90,41 +98,183 @@ const IN_PROGRESS_STAGES: [&str; 2] = ["Downloading", "Training"];
 /// gives a job's work, so a loaded host still settles well inside it.
 const SETTLE_DEADLINE: Duration = Duration::from_secs(120);
 
-/// How often a poll looks again. Only the loop's condition decides when it stops.
+/// How often a poll looks again. Only the loop's condition decides when it stops, and the
+/// interval is a fraction of [`PHASE_SPAN`], so a poller looks many times inside every stage
+/// the clock lays out.
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
 
-/// Describe `job` once.
-async fn describe(emulator: &Emulator, job: &str) -> Value {
-    emulator
+/// How long the clock keeps a job in each stage of its work, out of the crate's own state
+/// rather than restated here: every claim below about a stage's window is weighed against the
+/// schedule the emulator actually lays out.
+const PHASE_SPAN: Duration =
+    service_com_amazonaws_sagemaker_sagemaker::state::TRAINING_JOB_PHASE_SPAN;
+
+/// The slack a comparison of two instants allows for carrying them as the epoch seconds a
+/// timestamp travels the wire as: well under a millisecond, and orders below every span
+/// compared against.
+const TIMESTAMP_SLACK: f64 = 0.001;
+
+/// An instant as the epoch seconds the wire carries it in, so an instant the caller held can
+/// be weighed against one a response reports.
+fn epoch_seconds(at: SystemTime) -> f64 {
+    at.duration_since(SystemTime::UNIX_EPOCH)
+        .expect("a host clock at or after the epoch")
+        .as_secs_f64()
+}
+
+/// One read a caller made: the `SecondaryStatus` it reported, and the bracket of instants it
+/// was made inside — what the caller held just before the call, and just after its answer.
+///
+/// The bracket is what makes an observation checkable without depending on how fast this host
+/// ran it: a read whose whole bracket falls inside one stage's window must report THAT stage,
+/// whereas a read the host delayed across a boundary may report either side of it. So a stage
+/// a poller looked inside of is one the poller observed, however long any single call took.
+#[derive(Debug, Clone)]
+struct Read {
+    status: String,
+    before: f64,
+    after: f64,
+}
+
+/// One `SecondaryStatusTransitions` entry as [`history`] reads it: the status, the instant the
+/// job entered it, the instant it left it (`None` while it has not) and the message beside it.
+type Stage = (String, f64, Option<f64>, Option<String>);
+
+/// Describe `job` once, bracketed by the instants the caller held around the call.
+async fn describe(emulator: &Emulator, job: &str) -> (Value, Read) {
+    let before = epoch_seconds(SystemTime::now());
+    let described = emulator
         .sagemaker_ok("DescribeTrainingJob", &json!({ "TrainingJobName": job }))
-        .await
+        .await;
+    let read = Read {
+        status: str_field(&described, "SecondaryStatus"),
+        before,
+        after: epoch_seconds(SystemTime::now()),
+    };
+    (described, read)
 }
 
 /// Poll `DescribeTrainingJob` until `job` reaches a status nothing leaves on its own,
-/// answering that last response and every distinct `SecondaryStatus` observed on the way.
-async fn poll_until_terminal(emulator: &Emulator, job: &str, case: &str) -> (Value, Vec<String>) {
+/// answering that last response and every read made on the way.
+async fn poll_until_terminal(emulator: &Emulator, job: &str, case: &str) -> (Value, Vec<Read>) {
     let deadline = Instant::now() + SETTLE_DEADLINE;
-    let mut observed: Vec<String> = Vec::new();
+    let mut reads: Vec<Read> = Vec::new();
     loop {
-        let described = describe(emulator, job).await;
-        let secondary = str_field(&described, "SecondaryStatus");
-        if observed.last() != Some(&secondary) {
-            observed.push(secondary);
-        }
+        let (described, read) = describe(emulator, job).await;
+        reads.push(read);
         if TERMINAL.contains(&str_field(&described, "TrainingJobStatus").as_str()) {
-            return (described, observed);
+            return (described, reads);
         }
         assert!(
             Instant::now() < deadline,
             "case {case:?}: the job {job} must reach a terminal status, last read {described}, \
-             having been in {observed:?}"
+             having been in {:?}",
+            statuses_observed(&reads)
         );
         tokio::time::sleep(POLL_INTERVAL).await;
     }
 }
 
+/// The distinct `SecondaryStatus` values a sequence of reads reported, in the order they were
+/// reported in.
+fn statuses_observed(reads: &[Read]) -> Vec<String> {
+    let mut seen: Vec<String> = Vec::new();
+    for read in reads {
+        if seen.last() != Some(&read.status) {
+            seen.push(read.status.clone());
+        }
+    }
+    seen
+}
+
+/// Weigh every read against the job's own history: a read made wholly inside one stage's
+/// window reported THAT stage.
+///
+/// This is what makes the stages' observability checkable on any host. A poller that looked
+/// while a stage was in effect reported it — so every stage a read looked inside of is one the
+/// poller observed — and a read a loaded host delayed into the next stage is held to the stage
+/// that was due when it was finally made rather than to the one it would have found on an idle
+/// host. The last entry is open-ended: the job is still in the status it ended in.
+fn each_read_reports_the_stage_that_was_due(
+    transitions: &[Stage],
+    reads: &[Read],
+    settled: &Value,
+    case: &str,
+) {
+    let last = transitions.len().saturating_sub(1);
+    for read in reads {
+        for (index, (status, start, end, _)) in transitions.iter().enumerate() {
+            let left = end.filter(|_| index < last);
+            // Conservatively inside: a bracket that reaches either boundary is one the clock
+            // may have moved the job across, and says nothing about which stage was due.
+            let inside = read.before >= start + TIMESTAMP_SLACK
+                && left.is_none_or(|left| read.after <= left - TIMESTAMP_SLACK);
+            assert!(
+                !inside || read.status == *status,
+                "case {case:?}: a read made inside the {status} stage reported {:?}, \
+                 got {settled}",
+                read.status
+            );
+        }
+    }
+}
+
+/// RULE FOUR, weighed against the job's own history rather than against how fast this host
+/// ran: the stages the run performed are laid out from the instant the run REPORTED — which is
+/// inside the create that accepted the job — so every one of them is still ahead of the instant
+/// the caller held that create's answer, each is in effect for exactly one [`PHASE_SPAN`]
+/// however much work the run did, and one of those windows belongs to a stage of the work in
+/// progress for a poller to observe.
+///
+/// The stage the job was ACCEPTED in is the one exception: it runs from the creation instant
+/// to the first stage of the run, so it lasts a span plus whatever the create spent on the
+/// work before it could report.
+fn stages_are_laid_out_after_the_create_answered(
+    transitions: &[Stage],
+    answered: f64,
+    settled: &Value,
+    case: &str,
+) {
+    let span = PHASE_SPAN.as_secs_f64();
+    let last = transitions.len().saturating_sub(1);
+    for (index, (status, start, end, _)) in transitions.iter().enumerate() {
+        if index > 0 {
+            assert!(
+                *start > answered,
+                "case {case:?}: the {status} stage must still be ahead of the instant the \
+                 create answered, which was {answered}, got {settled}"
+            );
+        }
+        if index < last {
+            let left = end.unwrap_or_else(|| {
+                panic!("case {case:?}: expected the {status} entry to have ended in {settled}")
+            });
+            let held = left - start;
+            assert!(
+                held >= span - TIMESTAMP_SLACK,
+                "case {case:?}: the {status} stage must be in effect for a whole {PHASE_SPAN:?}, \
+                 got {held} seconds of it in {settled}"
+            );
+            assert!(
+                index == 0 || held <= span + TIMESTAMP_SLACK,
+                "case {case:?}: the {status} stage of the run must be in effect for exactly \
+                 {PHASE_SPAN:?}, got {held} seconds of it in {settled}"
+            );
+        }
+    }
+    assert!(
+        transitions
+            .get(1..last)
+            .unwrap_or_default()
+            .iter()
+            .any(|(status, ..)| IN_PROGRESS_STAGES.contains(&status.as_str())),
+        "case {case:?}: expected a whole-span window on one of the stages of the work in \
+         progress {IN_PROGRESS_STAGES:?} for a poller to observe, got {settled}"
+    );
+}
+
 /// The `SecondaryStatusTransitions` a read reports, as (status, start, end, message) rows.
-fn history(described: &Value, case: &str) -> Vec<(String, f64, Option<f64>, Option<String>)> {
+fn history(described: &Value, case: &str) -> Vec<Stage> {
     described
         .get("SecondaryStatusTransitions")
         .and_then(Value::as_array)
@@ -275,21 +425,20 @@ async fn an_accepted_job_advances_through_the_canonical_stages_of_its_work() {
                 .remove("InputDataConfig");
         }
         emulator.sagemaker_ok("CreateTrainingJob", &body).await;
+        // The first instant a caller can hold this create's answer, taken with no await
+        // between it and the answer itself. The job is accepted with no stage of its work
+        // begun and the move out of that is the clock's, so at THIS instant the job is
+        // `InProgress` in the stage it was accepted in — which the job's own history is held
+        // to below, pinning the instant the caller got the answer rather than whenever this
+        // host got round to reading.
+        let answered = epoch_seconds(SystemTime::now());
 
-        // The job is accepted with no stage of its work begun, and the move out of that is
-        // the clock's — so a read straight after the create observes it.
-        let accepted = describe(&emulator, row.job).await;
-        assert_eq!(
-            (
-                str_field(&accepted, "TrainingJobStatus"),
-                str_field(&accepted, "SecondaryStatus"),
-            ),
-            ("InProgress".to_string(), "Starting".to_string()),
-            "case {case:?}: expected the accepted job to be InProgress/Starting, \
-             got {accepted}"
-        );
+        // And the first read a caller can make, weighed against that history like every other.
+        let (_, first) = describe(&emulator, row.job).await;
 
-        let (settled, observed) = poll_until_terminal(&emulator, row.job, case).await;
+        let (settled, mut reads) = poll_until_terminal(&emulator, row.job, case).await;
+        reads.insert(0, first);
+        let observed = statuses_observed(&reads);
         assert_eq!(
             (
                 str_field(&settled, "TrainingJobStatus"),
@@ -304,9 +453,7 @@ async fn an_accepted_job_advances_through_the_canonical_stages_of_its_work() {
             "case {case:?}: expected no FailureReason beside a completed job, got {settled}"
         );
 
-        // Every status a poller saw is in the canonical order, and the stages between the
-        // accepted job and its terminal status are observable: the span the clock gives each
-        // one is many times the interval this loop looks again on.
+        // Every status a poller saw is in the canonical order.
         let mut reached = 0;
         for status in &observed {
             let position = order_of(status, case);
@@ -317,17 +464,15 @@ async fn an_accepted_job_advances_through_the_canonical_stages_of_its_work() {
             );
             reached = position;
         }
-        assert!(
-            observed
-                .iter()
-                .any(|status| ["Downloading", "Training", "Uploading"].contains(&status.as_str())),
-            "case {case:?}: expected a poller to observe a stage of the work in progress, \
-             having been in {observed:?}"
-        );
 
         // The history names every stage the job was in, in the canonical order, each entry
         // beginning where the one before it ended, and the last one ending when the job did.
         let transitions = history(&settled, case);
+        // The stages between the accepted job and its terminal status are observable: each
+        // is in effect for a whole span that begins after this create answered, and every
+        // read this poller made inside one of those windows reported it.
+        stages_are_laid_out_after_the_create_answered(&transitions, answered, &settled, case);
+        each_read_reports_the_stage_that_was_due(&transitions, &reads, &settled, case);
         let expected: Vec<String> = row
             .stages
             .iter()
@@ -473,7 +618,8 @@ async fn a_runtime_cap_the_work_does_not_fit_inside_ends_the_job_at_the_cap() {
         }
         emulator.sagemaker_ok("CreateTrainingJob", &body).await;
 
-        let (settled, observed) = poll_until_terminal(&emulator, job, case).await;
+        let (settled, reads) = poll_until_terminal(&emulator, job, case).await;
+        let observed = statuses_observed(&reads);
         assert_eq!(
             (
                 str_field(&settled, "TrainingJobStatus"),
@@ -487,8 +633,13 @@ async fn a_runtime_cap_the_work_does_not_fit_inside_ends_the_job_at_the_cap() {
             settled.get("FailureReason").is_none(),
             "case {case:?}: a job the cap ended carries no failure reason, got {settled}"
         );
-        let last = history(&settled, case)
-            .pop()
+        let transitions = history(&settled, case);
+        // Whatever the cap did to the schedule, every read this poller made inside one of the
+        // windows the history reports found the status that window names.
+        each_read_reports_the_stage_that_was_due(&transitions, &reads, &settled, case);
+        let last = transitions
+            .last()
+            .cloned()
             .unwrap_or_else(|| panic!("case {case:?}: expected a history entry in {settled}"));
         assert_eq!(
             last.0, secondary,
@@ -526,6 +677,13 @@ async fn a_runtime_cap_the_work_does_not_fit_inside_ends_the_job_at_the_cap() {
 /// finds the job `InProgress` in a pre-upload stage, a poller then observes a stage of its
 /// work in progress, and the history names every stage it was in, however much work the run
 /// the create performed server-side had to do before it could report.
+///
+/// Both of those are weighed against the job's own schedule rather than against this host's
+/// speed: the stages of the run all begin after the instant the caller held the create's
+/// answer and each is in effect for a whole span, so the window the first read lands in is a
+/// pre-upload one and a poller looking again more often than a span looks inside a stage of
+/// the work in progress — and every read made inside one of those windows is held to the
+/// stage that window names.
 ///
 /// The rows differ along how much work that is: one small object, several objects of wider
 /// records under one prefix, two channels addressed differently, and no channel at all.
@@ -634,41 +792,37 @@ async fn the_stages_stay_observable_however_much_work_the_run_did() {
                 .remove("InputDataConfig");
         }
         emulator.sagemaker_ok("CreateTrainingJob", &body).await;
+        // The first instant a caller can hold this create's answer, taken with no await
+        // between it and the answer itself. However much work the run had to do before the
+        // create could answer, the stages of that work are laid out from the instant the run
+        // REPORTED, so at THIS instant the job is `InProgress` in a pre-upload stage and
+        // neither its upload nor its outcome is due — which the job's own history is held to
+        // below, pinning the instant the caller got the answer rather than whenever this host
+        // got round to reading.
+        let answered = epoch_seconds(SystemTime::now());
 
-        // The first read a caller can make: whatever the run had to do before the create could
-        // answer, the job is still running and has not reached the upload.
-        let accepted = describe(&emulator, row.job).await;
-        let first = str_field(&accepted, "SecondaryStatus");
-        assert_eq!(
-            (
-                str_field(&accepted, "TrainingJobStatus"),
-                PRE_UPLOAD.contains(&first.as_str()),
-            ),
-            ("InProgress".to_string(), true),
-            "case {case:?}: expected the first read to find the job InProgress in one of \
-             {PRE_UPLOAD:?}, got {accepted}"
-        );
+        // And the first read a caller can make, weighed against that history like every other.
+        let (_, first) = describe(&emulator, row.job).await;
 
         // Polled to the terminal status, correlating what the job reports with what the output
         // location holds: the artifact belongs to the stage that uploads it, so a poll that
         // reports a pre-upload stage must not find the object there.
         let artifact = artifact_key(&output, row.job);
         let deadline = Instant::now() + SETTLE_DEADLINE;
-        let mut observed: Vec<String> = vec![first];
+        let mut reads: Vec<Read> = vec![first];
         let settled = loop {
-            let described = describe(&emulator, row.job).await;
-            let secondary = str_field(&described, "SecondaryStatus");
-            if observed.last() != Some(&secondary) {
-                observed.push(secondary.clone());
-            }
+            let (described, read) = describe(&emulator, row.job).await;
+            let secondary = read.status.clone();
+            reads.push(read);
             if PRE_UPLOAD.contains(&secondary.as_str())
                 && emulator.object_bytes(BUCKET, &artifact).await.is_some()
             {
                 // The stage may have fallen due between the describe above and the listing, so
                 // the job is read again: an object beside a job a FRESH read still reports in a
                 // pre-upload stage is one that appeared too early.
-                let again = describe(&emulator, row.job).await;
-                let still = str_field(&again, "SecondaryStatus");
+                let (again, read) = describe(&emulator, row.job).await;
+                let still = read.status.clone();
+                reads.push(read);
                 assert!(
                     !PRE_UPLOAD.contains(&still.as_str()),
                     "case {case:?}: the artifact {artifact} appeared while the job was still in \
@@ -681,10 +835,12 @@ async fn the_stages_stay_observable_however_much_work_the_run_did() {
             assert!(
                 Instant::now() < deadline,
                 "case {case:?}: the job must reach a terminal status, last read {described}, \
-                 having been in {observed:?}"
+                 having been in {:?}",
+                statuses_observed(&reads)
             );
             tokio::time::sleep(POLL_INTERVAL).await;
         };
+        let observed = statuses_observed(&reads);
         assert_eq!(
             (
                 str_field(&settled, "TrainingJobStatus"),
@@ -701,16 +857,7 @@ async fn the_stages_stay_observable_however_much_work_the_run_did() {
             "case {case:?}: expected {artifact} to name an object Amazon S3 holds once the job \
              completed, got {settled}"
         );
-        // Every status observed — the first read's included — belongs to this job's own work,
-        // and at least one of them is a stage the RUN performs rather than the one the create
-        // accepted the job in.
-        assert!(
-            observed
-                .iter()
-                .any(|status| IN_PROGRESS_STAGES.contains(&status.as_str())),
-            "case {case:?}: expected a poller to observe a stage of the work in progress, \
-             having been in {observed:?}"
-        );
+        // Every status observed — the first read's included — belongs to this job's own work.
         assert!(
             observed
                 .iter()
@@ -724,6 +871,13 @@ async fn the_stages_stay_observable_however_much_work_the_run_did() {
         // through and the status it ended in, in that order, each beginning after the one
         // before it — and the first of them when the job was created.
         let transitions = history(&settled, case);
+        // However much work the run did, each stage of it is still ahead of the instant this
+        // create answered and is in effect for a whole span, one of them being a stage of the
+        // work in progress — so the first read a caller can make finds a pre-upload stage and
+        // a poller looking again more often than a span observes the work going on. And every
+        // read this poller did make inside one of those windows reported that very stage.
+        stages_are_laid_out_after_the_create_answered(&transitions, answered, &settled, case);
+        each_read_reports_the_stage_that_was_due(&transitions, &reads, &settled, case);
         let expected: Vec<String> = row
             .stages
             .iter()
