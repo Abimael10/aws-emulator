@@ -347,8 +347,8 @@ fn default_policy_document(
 /// that data plane in both addressings below: `execute-api`.
 const EXECUTE_API: &str = "execute-api";
 
-/// The `execute-api` ARN of the API an API Gateway invoke URL addresses, in EITHER
-/// addressing a deployed stage is reached at.
+/// The `execute-api` resource an invoke of the endpoint an API Gateway invoke URL
+/// addresses is authorized against, in EITHER addressing a deployed stage is reached at.
 ///
 /// A stage invoke endpoint names two things the policy resource needs — WHICH api, and
 /// that the address is the `execute-api` data plane — and where it carries them depends
@@ -363,18 +363,24 @@ const EXECUTE_API: &str = "execute-api";
 ///    invoke endpoint exactly as the first is — and the segments are read through the
 ///    shared reading of that namespace, not a second copy of it.
 ///
-/// Either way the resource a policy names for the API is
-/// `arn:aws:execute-api:<region>:<account>:<api-id>/<stage>/*`. The second form carries
-/// no Region, so the API is read as being in `region` — the Region the calling request
-/// was signed for, which is the one the caller's own API Gateway calls were signed for
-/// too. `None` for a URL that is not an invoke endpoint in either form, so nothing is
-/// derived from a URL that names no API.
+/// Either way the resource the invoke is authorized against is the one AWS publishes for
+/// that plane — `arn:aws:execute-api:<region>:<account>:<api-id>/<stage>/<HTTP-METHOD>/
+/// <resource-path>`, built by [`api_arn`] from the REQUEST this service makes to the
+/// endpoint the URL addresses. The second form carries no Region, so the API is read as
+/// being in `region` — the Region the calling request was signed for, which is the one
+/// the caller's own API Gateway calls were signed for too. `None` for a URL that is not
+/// an invoke endpoint in either form, so nothing is derived from a URL that names no API.
 fn execute_api_arn(url: &str, region: &str) -> Option<String> {
     let rest = url
         .strip_prefix("https://")
         .or_else(|| url.strip_prefix("http://"))?;
     let (authority, path) = rest.split_once('/').unwrap_or((rest, ""));
     let host = ::service_common::data_plane_addressing::host_only(authority);
+    // A query string and a fragment address nothing in the resource tree, so neither is
+    // part of the path the request is authorized on.
+    let path = path
+        .split_once(['?', '#'])
+        .map_or(path, |(before, _)| before);
     let mut segments = path.split('/').filter(|segment| !segment.is_empty());
 
     // The host form: the api id is the first label and `execute-api` the second, with
@@ -384,7 +390,7 @@ fn execute_api_arn(url: &str, region: &str) -> Option<String> {
         if labels.next() == Some(EXECUTE_API) {
             let region = labels.next()?;
             let stage = segments.next()?;
-            return Some(api_arn(region, api_id, stage));
+            return Some(api_arn(region, api_id, stage, segments));
         }
     }
 
@@ -397,13 +403,50 @@ fn execute_api_arn(url: &str, region: &str) -> Option<String> {
     }
     let api_id = segments.next()?;
     let stage = segments.next()?;
-    Some(api_arn(region, api_id, stage))
+    Some(api_arn(region, api_id, stage, segments))
 }
 
-/// `arn:aws:execute-api:<region>:<account>:<api-id>/<stage>/*` — the resource an IAM
-/// policy names to allow invoking one stage of one API.
-fn api_arn(region: &str, api_id: &str, stage: &str) -> String {
-    ::engine::emulator_arn(EXECUTE_API, region, &format!("{api_id}/{stage}/*"))
+/// The HTTP method of the authentication request this service makes to an `API_GATEWAY`
+/// identity provider, and so the method the invoke it has to be allowed is performed
+/// with: a custom identity provider's authentication resource is READ — "GET
+/// /servers/{serverId}/users/{username}/config", the API Gateway method request Transfer
+/// Family documents for a custom identity provider.
+const AUTHENTICATION_METHOD: &str = "GET";
+
+/// `arn:aws:execute-api:<region>:<account>:<api-id>/<stage>/<HTTP-METHOD>/<resource-path>`
+/// — the resource an `execute-api` invoke is authorized against, in the form AWS
+/// publishes for that plane: the api, the stage, the METHOD of the request and the
+/// resource path WITHIN the stage. The ARN's own separator before the path is the `/`
+/// after the method, so the path is the stage's remaining segments joined, and is empty
+/// for the stage's root resource.
+///
+/// All four parts are the CONCRETE request this service would make to the endpoint, never
+/// a pattern: this value is what a statement's `Resource` PATTERN is matched against, so a
+/// resource carrying a `*` of its own would be matched as the character `*` and could not
+/// be covered by the grants a caller writes. A wildcard in any part of the GRANT covers
+/// it instead — the whole API (`<api-id>/*`), every stage, method and path of it
+/// (`<api-id>/*/*/*`), every method and path of one stage (`<api-id>/<stage>/*/*`), or the
+/// method and path the request names.
+///
+/// The PATH is the endpoint's own, taken from the `Url` the provider names, and not the
+/// authentication resource the method is named after: that path carries the server and the
+/// user of ONE authentication (`/servers/{serverId}/users/{username}/config`), and this
+/// verification happens before either exists, so there is no concrete request under it to
+/// decide. The endpoint the provider names is the one request this service can state at
+/// all — the stage's root resource for the stage URL a provider usually names, which is
+/// the form AWS writes that resource in (`<api-id>/<stage>/GET/`).
+fn api_arn<'a>(
+    region: &str,
+    api_id: &str,
+    stage: &str,
+    resource_path: impl Iterator<Item = &'a str>,
+) -> String {
+    let path = resource_path.collect::<Vec<&str>>().join("/");
+    ::engine::emulator_arn(
+        EXECUTE_API,
+        region,
+        &format!("{api_id}/{stage}/{AUTHENTICATION_METHOD}/{path}"),
+    )
 }
 
 #[cfg(test)]
@@ -517,22 +560,24 @@ mod tests {
     fn an_invoke_url_resolves_to_the_apis_execute_api_arn() {
         // The rows span both addressings a deployed stage is reached at (the host form
         // AWS publishes and the path form this emulator publishes), the parts each one
-        // carries (api id, Region, stage, a resource path after the stage, a port on the
-        // endpoint), and values that are no invoke endpoint at all. `request_region` is
-        // the Region the calling request was signed for, which only the path form
-        // — carrying none of its own — is read in.
+        // carries (api id, Region, stage, a resource path after the stage, a query that
+        // addresses nothing in the resource tree, a port on the endpoint), and values that
+        // are no invoke endpoint at all. Every resolved resource carries AWS's four parts
+        // — api id, stage, method and resource path, the last empty for the stage's root
+        // resource. `request_region` is the Region the calling request was signed for,
+        // which only the path form — carrying none of its own — is read in.
         let request_region = "us-west-2";
         // (case, url, the execute-api resource it names)
         let rows: &[(&str, &str, Option<&str>)] = &[
             (
                 "the host form AWS publishes",
                 "https://abc123.execute-api.us-east-1.amazonaws.com/prod",
-                Some("arn:aws:execute-api:us-east-1:000000000000:abc123/prod/*"),
+                Some("arn:aws:execute-api:us-east-1:000000000000:abc123/prod/GET/"),
             ),
             (
                 "the host form with a resource path after the stage",
                 "https://abc123.execute-api.eu-west-1.amazonaws.com/test/auth",
-                Some("arn:aws:execute-api:eu-west-1:000000000000:abc123/test/*"),
+                Some("arn:aws:execute-api:eu-west-1:000000000000:abc123/test/GET/auth"),
             ),
             (
                 "the host form naming no stage",
@@ -542,17 +587,30 @@ mod tests {
             (
                 "the path form this emulator publishes, on a loopback endpoint",
                 "https://127.0.0.1:39477/_aws/execute-api/8sh3tqaaaa/sim2real",
-                Some("arn:aws:execute-api:us-west-2:000000000000:8sh3tqaaaa/sim2real/*"),
+                Some("arn:aws:execute-api:us-west-2:000000000000:8sh3tqaaaa/sim2real/GET/"),
             ),
             (
                 "the path form with a resource path after the stage",
                 "https://localhost:9297/_aws/execute-api/8sh3tqaaaa/test/auth",
-                Some("arn:aws:execute-api:us-west-2:000000000000:8sh3tqaaaa/test/*"),
+                Some("arn:aws:execute-api:us-west-2:000000000000:8sh3tqaaaa/test/GET/auth"),
+            ),
+            (
+                "the path form with a deeper resource path after the stage",
+                "https://localhost:9297/_aws/execute-api/8sh3tqaaaa/test/servers/u/config",
+                Some(
+                    "arn:aws:execute-api:us-west-2:000000000000:\
+                     8sh3tqaaaa/test/GET/servers/u/config",
+                ),
+            ),
+            (
+                "a stage URL carrying a query, which addresses no resource",
+                "https://127.0.0.1:9297/_aws/execute-api/8sh3tqaaaa/test?trace=1",
+                Some("arn:aws:execute-api:us-west-2:000000000000:8sh3tqaaaa/test/GET/"),
             ),
             (
                 "the path form over plain HTTP",
                 "http://127.0.0.1:9297/_aws/execute-api/zzz999/prod",
-                Some("arn:aws:execute-api:us-west-2:000000000000:zzz999/prod/*"),
+                Some("arn:aws:execute-api:us-west-2:000000000000:zzz999/prod/GET/"),
             ),
             (
                 "the path form naming no stage",

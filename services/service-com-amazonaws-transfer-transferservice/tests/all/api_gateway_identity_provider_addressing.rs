@@ -3,10 +3,11 @@
 //! End-to-end tests for the ONE precondition an `API_GATEWAY` identity provider is
 //! verified against, over every addressing a deployed API Gateway stage is reached at.
 //!
-//! RULE under test: the invocation-role verification resolves the API the provider's
-//! `Url` names into the `execute-api` resource an IAM policy scopes an invoke to —
-//! `arn:aws:execute-api:<region>:<account>:<api-id>/<stage>/*` — from EITHER addressing
-//! a deployed stage is published at:
+//! RULE under test: the invocation-role verification resolves the endpoint the provider's
+//! `Url` names into the `execute-api` resource an invoke of it is authorized against —
+//! `arn:aws:execute-api:<region>:<account>:<api-id>/<stage>/<HTTP-METHOD>/<resource-path>`,
+//! the four-part form AWS publishes for that plane — from EITHER addressing a deployed
+//! stage is published at:
 //!
 //! * `https://<api-id>.execute-api.<region>.amazonaws.com/<stage>/…`, which carries the
 //!   api id and the Region in the HOST; and
@@ -17,7 +18,11 @@
 //!
 //! So a role scoped to exactly the API the `Url` names verifies, whichever way the URL
 //! names it, and one scoped to another API — or to another Region — does not, with the
-//! modelled `InvalidRequestException` (400) and no server persisted.
+//! modelled `InvalidRequestException` (400) and no server persisted. Because the resource
+//! the decision is taken on is the CONCRETE request this service would make to that
+//! endpoint, every grant whose wildcards cover that request verifies the role — the whole
+//! API, every stage/method/path of it, every method and path of one stage, or the very
+//! method and path — which is the second rule asserted below.
 //!
 //! Every request goes over the real wire path (`POST /` with
 //! `X-Amz-Target: TransferService.<Op>`) through the shared [`crate::harness`].
@@ -156,93 +161,110 @@ fn provider(url: &str, role_arn: &str) -> Value {
     })
 }
 
+/// The role every row's provider names; a fresh emulator per row holds exactly one grant
+/// for it.
+const ROLE_ARN: &str = "arn:aws:iam::000000000000:role/transfer-idp";
+
+/// What ONE row asserts of `CreateServer`, for every table in this suite: a role carrying
+/// exactly that row's grant, the create driven over the wire, and then either the refusal
+/// the rule earns — the modelled `InvalidRequestException` (400), its fixed text followed
+/// by the request's own `Url`, and no server persisted — or the accepted create's round
+/// trip through `DescribeServer`.
+///
+/// The emulator and the `ServerId` are handed back for an accepted row, so a table can go
+/// on to assert what else that server answers.
+async fn create_server_verifies(row: &Row) -> Option<(Emulator, String)> {
+    let emulator = Emulator::new();
+    emulator.seed_role(ROLE_ARN, &allow_invoke(&row.allowed));
+
+    let answer = emulator
+        .call("CreateServer", provider(&row.url, ROLE_ARN))
+        .await;
+
+    if !row.accepted {
+        assert_eq!(
+            answer.status, 400,
+            "case {:?}: expected HTTP 400 for grant {:?}, got {} with body {}",
+            row.case, row.allowed, answer.status, answer.body
+        );
+        assert_eq!(
+            answer.error_code(),
+            "InvalidRequestException",
+            "case {:?}: expected InvalidRequestException for grant {:?}, got body {}",
+            row.case,
+            row.allowed,
+            answer.body
+        );
+        let message = member_of(&answer.body, "Message")
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        assert_eq!(
+            message,
+            format!("Unable to verify access to API {}", row.url),
+            "case {:?}: the refusal must name the API it could not verify",
+            row.case
+        );
+        let listed = emulator.call("ListServers", json!({})).await;
+        let servers = listed
+            .get("Servers")
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        assert!(
+            servers.is_empty(),
+            "case {:?}: a refused create must persist no server, got {}",
+            row.case,
+            listed.body
+        );
+        return None;
+    }
+
+    assert_eq!(
+        answer.status, 200,
+        "case {:?}: expected the create to be served for grant {:?}, got {} with body {}",
+        row.case, row.allowed, answer.status, answer.body
+    );
+    let server_id = answer
+        .get("ServerId")
+        .as_str()
+        .unwrap_or_else(|| panic!("case {:?}: expected a ServerId", row.case))
+        .to_string();
+
+    // The round trip: the server really was persisted as an API_GATEWAY-backed one,
+    // with the provider it was verified for.
+    let described = emulator
+        .call("DescribeServer", json!({"ServerId": &server_id}))
+        .await;
+    assert_eq!(
+        described.status, 200,
+        "case {:?}: expected DescribeServer 200, got {} with body {}",
+        row.case, described.status, described.body
+    );
+    let server = described.get("Server").clone();
+    assert_eq!(
+        member_of(&server, "IdentityProviderType"),
+        &json!("API_GATEWAY"),
+        "case {:?}: expected the stored provider type, got {server}",
+        row.case
+    );
+    let details = member_of(&server, "IdentityProviderDetails").clone();
+    assert_eq!(
+        (
+            member_of(&details, "Url").as_str(),
+            member_of(&details, "InvocationRole").as_str(),
+        ),
+        (Some(row.url.as_str()), Some(ROLE_ARN)),
+        "case {:?}: expected the provider to be reported as configured, got {details}",
+        row.case
+    );
+    Some((emulator, server_id))
+}
+
 #[tokio::test]
 async fn an_api_gateway_provider_verifies_against_the_api_either_invoke_url_form_names() {
     for row in rows() {
-        let emulator = Emulator::new();
-        let role_arn = "arn:aws:iam::000000000000:role/transfer-idp";
-        emulator.seed_role(role_arn, &allow_invoke(&row.allowed));
-
-        let answer = emulator
-            .call("CreateServer", provider(&row.url, role_arn))
-            .await;
-
-        if !row.accepted {
-            assert_eq!(
-                answer.status, 400,
-                "case {:?}: expected HTTP 400, got {} with body {}",
-                row.case, answer.status, answer.body
-            );
-            assert_eq!(
-                answer.error_code(),
-                "InvalidRequestException",
-                "case {:?}: expected InvalidRequestException, got body {}",
-                row.case,
-                answer.body
-            );
-            let message = member_of(&answer.body, "Message")
-                .as_str()
-                .unwrap_or_default()
-                .to_string();
-            assert_eq!(
-                message,
-                format!("Unable to verify access to API {}", row.url),
-                "case {:?}: the refusal must name the API it could not verify",
-                row.case
-            );
-            let listed = emulator.call("ListServers", json!({})).await;
-            let servers = listed
-                .get("Servers")
-                .as_array()
-                .cloned()
-                .unwrap_or_default();
-            assert!(
-                servers.is_empty(),
-                "case {:?}: a refused create must persist no server, got {}",
-                row.case,
-                listed.body
-            );
-            continue;
-        }
-
-        assert_eq!(
-            answer.status, 200,
-            "case {:?}: expected the create to be served, got {} with body {}",
-            row.case, answer.status, answer.body
-        );
-        let server_id = answer
-            .get("ServerId")
-            .as_str()
-            .unwrap_or_else(|| panic!("case {:?}: expected a ServerId", row.case))
-            .to_string();
-
-        // The round trip: the server really was persisted as an API_GATEWAY-backed one,
-        // with the provider it was verified for.
-        let described = emulator
-            .call("DescribeServer", json!({"ServerId": &server_id}))
-            .await;
-        assert_eq!(
-            described.status, 200,
-            "case {:?}: expected DescribeServer 200, got {} with body {}",
-            row.case, described.status, described.body
-        );
-        let server = described.get("Server").clone();
-        assert_eq!(
-            member_of(&server, "IdentityProviderType"),
-            &json!("API_GATEWAY"),
-            "case {:?}: expected the stored provider type, got {server}",
-            row.case
-        );
-        let details = member_of(&server, "IdentityProviderDetails").clone();
-        assert_eq!(
-            (
-                member_of(&details, "Url").as_str(),
-                member_of(&details, "InvocationRole").as_str(),
-            ),
-            (Some(row.url.as_str()), Some(role_arn)),
-            "case {:?}: expected the provider to be reported as configured, got {details}",
-            row.case
-        );
+        create_server_verifies(&row).await;
     }
 }
 
@@ -277,11 +299,10 @@ async fn an_update_verifies_a_provider_on_the_same_reading_of_the_invoke_url() {
 
     for (case, url, allowed, accepted) in cases {
         let emulator = Emulator::new();
-        let role_arn = "arn:aws:iam::000000000000:role/transfer-idp";
-        emulator.seed_role(role_arn, &allow_invoke(&allowed));
+        emulator.seed_role(ROLE_ARN, &allow_invoke(&allowed));
         let server_id = emulator.create_server(json!({})).await;
 
-        let mut request = provider(&url, role_arn);
+        let mut request = provider(&url, ROLE_ARN);
         request["ServerId"] = json!(&server_id);
         let answer = emulator.call("UpdateServer", request).await;
 
@@ -315,6 +336,251 @@ async fn an_update_verifies_a_provider_on_the_same_reading_of_the_invoke_url() {
             assert_eq!(
                 member_of(described.get("Server"), "IdentityProviderType"),
                 &json!("SERVICE_MANAGED"),
+                "case {case:?}: a refused update must leave the stored provider alone, got {}",
+                described.body
+            );
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The GRANT FORMS a caller writes for an API Gateway invoke, against the resource
+// the verification resolves the provider's endpoint to.
+// ---------------------------------------------------------------------------
+
+/// The stage the grant rows' provider URL names, and another stage of the same API.
+const GRANT_STAGE: &str = "test";
+const OTHER_STAGE: &str = "prod";
+
+/// The invoke URL this emulator publishes for a deployed stage of [`API_ID`], on a
+/// loopback endpoint, optionally with a resource path under the stage — the addressing a
+/// client of this emulator is handed.
+fn published_url(resource_path: &str) -> String {
+    format!("https://127.0.0.1:35819/_aws/execute-api/{API_ID}/{GRANT_STAGE}{resource_path}")
+}
+
+/// The invoke URL AWS publishes for the same deployed stage.
+fn aws_url() -> String {
+    format!("https://{API_ID}.execute-api.{REGION}.amazonaws.com/{GRANT_STAGE}")
+}
+
+/// The grant rows, in the same [`Row`] shape the addressing table above uses. The wildcard positions are the parts of the
+/// `<api-id>/<stage>/<HTTP-METHOD>/<resource-path>` resource form AWS publishes for the
+/// `execute-api` plane: the whole API, that form with stage, method and path all
+/// wildcarded (the canonical whole-API grant a caller writes), one stage's methods and
+/// paths, one method's paths, and the exact resource — crossed with the same forms
+/// pointing at another api, stage, Region, method or path.
+fn grant_rows() -> Vec<Row> {
+    vec![
+        Row {
+            case: "every resource of every service",
+            url: published_url(""),
+            allowed: "*".to_string(),
+            accepted: true,
+        },
+        Row {
+            case: "the whole API",
+            url: published_url(""),
+            allowed: execute_api(REGION, &format!("{API_ID}/*")),
+            accepted: true,
+        },
+        Row {
+            case: "stage, method and resource path all wildcarded",
+            url: published_url(""),
+            allowed: execute_api(REGION, &format!("{API_ID}/*/*/*")),
+            accepted: true,
+        },
+        Row {
+            case: "every method and path of exactly the stage the URL names",
+            url: published_url(""),
+            allowed: execute_api(REGION, &format!("{API_ID}/{GRANT_STAGE}/*/*")),
+            accepted: true,
+        },
+        Row {
+            case: "every path of the method the authentication request is made with",
+            url: published_url(""),
+            allowed: execute_api(REGION, &format!("{API_ID}/{GRANT_STAGE}/GET/*")),
+            accepted: true,
+        },
+        Row {
+            case: "exactly the stage's root resource, read with that method",
+            url: published_url(""),
+            allowed: execute_api(REGION, &format!("{API_ID}/{GRANT_STAGE}/GET/")),
+            accepted: true,
+        },
+        Row {
+            case: "exactly the resource path the URL itself names",
+            url: published_url("/auth"),
+            allowed: execute_api(REGION, &format!("{API_ID}/{GRANT_STAGE}/GET/auth")),
+            accepted: true,
+        },
+        Row {
+            case: "a deeper resource path the URL names, with the path wildcarded",
+            url: published_url("/servers/u/config"),
+            allowed: execute_api(REGION, &format!("{API_ID}/{GRANT_STAGE}/GET/servers/*")),
+            accepted: true,
+        },
+        Row {
+            case: "another resource path of the same stage and method",
+            url: published_url("/auth"),
+            allowed: execute_api(REGION, &format!("{API_ID}/{GRANT_STAGE}/GET/elsewhere")),
+            accepted: false,
+        },
+        Row {
+            case: "a method the authentication request is not made with",
+            url: published_url(""),
+            allowed: execute_api(REGION, &format!("{API_ID}/{GRANT_STAGE}/POST/*")),
+            accepted: false,
+        },
+        Row {
+            case: "another stage of the same API",
+            url: published_url(""),
+            allowed: execute_api(REGION, &format!("{API_ID}/{OTHER_STAGE}/*/*")),
+            accepted: false,
+        },
+        Row {
+            case: "another API, with its stage, method and path wildcarded",
+            url: published_url(""),
+            allowed: execute_api(REGION, &format!("{OTHER_API_ID}/*/*/*")),
+            accepted: false,
+        },
+        Row {
+            case: "the same API in another Region",
+            url: published_url(""),
+            allowed: execute_api(OTHER_REGION, &format!("{API_ID}/*/*/*")),
+            accepted: false,
+        },
+        Row {
+            case: "stage, method and path wildcarded, on the URL form AWS publishes",
+            url: aws_url(),
+            allowed: execute_api(REGION, &format!("{API_ID}/*/*/*")),
+            accepted: true,
+        },
+        Row {
+            case: "one stage's methods and paths, on the URL form AWS publishes",
+            url: aws_url(),
+            allowed: execute_api(REGION, &format!("{API_ID}/{GRANT_STAGE}/*/*")),
+            accepted: true,
+        },
+        Row {
+            case: "another stage of the same API, on the URL form AWS publishes",
+            url: aws_url(),
+            allowed: execute_api(REGION, &format!("{API_ID}/{OTHER_STAGE}/*/*")),
+            accepted: false,
+        },
+    ]
+}
+
+/// RULE: the verification is taken on the resource an invoke of the provider's endpoint
+/// is authorized against, so EVERY grant whose wildcards cover that request verifies the
+/// invocation role and `CreateServer` answers a `ServerId`, while a grant that covers
+/// another api, stage, Region, method or resource path is refused with
+/// `InvalidRequestException` (400) and persists no server.
+#[tokio::test]
+async fn an_invocation_role_verifies_on_every_grant_covering_the_endpoints_invoke_resource() {
+    for row in grant_rows() {
+        let Some((emulator, server_id)) = create_server_verifies(&row).await else {
+            continue;
+        };
+
+        // The server an accepted grant minted is one `TestIdentityProvider` reaches: the
+        // operation an API_GATEWAY server exists to exercise is no longer refused in its
+        // setup.
+        let tested = emulator
+            .call(
+                "TestIdentityProvider",
+                json!({"ServerId": &server_id, "UserName": "idp-user"}),
+            )
+            .await;
+        assert_eq!(
+            tested.status, 200,
+            "case {:?}: expected TestIdentityProvider 200 against the created server, \
+             got {} with body {}",
+            row.case, tested.status, tested.body
+        );
+        assert_eq!(
+            tested.get("Url").as_str(),
+            Some(row.url.as_str()),
+            "case {:?}: expected the tested endpoint to be the configured one, got {}",
+            row.case,
+            tested.body
+        );
+    }
+}
+
+/// RULE (the same rule at the other operation that verifies a provider): `UpdateServer`
+/// reads the grant against the same invoke resource, so the forms that verify a create
+/// verify an update, and the ones that do not leave the stored provider alone.
+#[tokio::test]
+async fn an_update_reads_a_grant_against_the_same_invoke_resource() {
+    // (case, the resource the role's grant allows, accepted)
+    let cases: Vec<(&str, String, bool)> = vec![
+        (
+            "stage, method and path wildcarded",
+            execute_api(REGION, &format!("{API_ID}/*/*/*")),
+            true,
+        ),
+        (
+            "every method and path of the stage the URL names",
+            execute_api(REGION, &format!("{API_ID}/{GRANT_STAGE}/*/*")),
+            true,
+        ),
+        (
+            "every path of the method the authentication request is made with",
+            execute_api(REGION, &format!("{API_ID}/{GRANT_STAGE}/GET/*")),
+            true,
+        ),
+        (
+            "a method the authentication request is not made with",
+            execute_api(REGION, &format!("{API_ID}/{GRANT_STAGE}/POST/*")),
+            false,
+        ),
+        (
+            "another API",
+            execute_api(REGION, &format!("{OTHER_API_ID}/*/*/*")),
+            false,
+        ),
+    ];
+
+    for (case, granted, accepted) in cases {
+        let emulator = Emulator::new();
+        emulator.seed_role(ROLE_ARN, &allow_invoke(&granted));
+        let server_id = emulator.create_server(json!({})).await;
+        let url = published_url("");
+
+        let mut request = provider(&url, ROLE_ARN);
+        request["ServerId"] = json!(&server_id);
+        let answer = emulator.call("UpdateServer", request).await;
+
+        let described = emulator
+            .call("DescribeServer", json!({"ServerId": &server_id}))
+            .await;
+        let stored = member_of(described.get("Server"), "IdentityProviderType").clone();
+        if accepted {
+            assert_eq!(
+                answer.status, 200,
+                "case {case:?}: expected the update to be served for grant {granted:?}, \
+                 got {} with body {}",
+                answer.status, answer.body
+            );
+            assert_eq!(
+                stored,
+                json!("API_GATEWAY"),
+                "case {case:?}: the verified provider must be stored, got {}",
+                described.body
+            );
+        } else {
+            assert_eq!(
+                answer.error_code(),
+                "InvalidRequestException",
+                "case {case:?}: expected InvalidRequestException for grant {granted:?}, \
+                 got {} with body {}",
+                answer.status,
+                answer.body
+            );
+            assert_eq!(
+                stored,
+                json!("SERVICE_MANAGED"),
                 "case {case:?}: a refused update must leave the stored provider alone, got {}",
                 described.body
             );
