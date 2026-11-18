@@ -6,7 +6,9 @@
 //! handlers share — the stored-record-to-modelled-shape conversion, the listing
 //! pagination rule, the documented `notifyOnCaseSeverity` consistency rule, the account
 //! a caller-supplied `channelRoleArn` must name together with which refusal that member
-//! draws and in which order its rules are judged, whether a Slack workspace is registered
+//! draws and in which order its rules are judged, the part of a `.`-based `@pattern` the
+//! request boundary's walk cannot apply (`channelName`'s among them),
+//! whether a Slack workspace is registered
 //! to the account, the Slack workspaces the Support Center
 //! console has authorized, the organization membership an
 //! Organizations-scoped call needs, and the wording of the failures
@@ -522,12 +524,21 @@ fn channel_role_account_refusal(role_arn: &str) -> Option<String> {
 /// paragraph separator. A value carrying any of them therefore cannot be matched by a `.`
 /// of such an expression, however many characters it has.
 ///
-/// Stated here because the expression has to be applied by hand (see
-/// [`channel_role_account_refusal`]), and because the engine the framework's centralized
-/// constraint walk compiles a `@pattern` with reads `.` as every character except a line
-/// FEED alone, so the other three would be admitted there whatever the modelled expression
-/// says.
+/// Stated here because such an expression has to be applied by hand (see
+/// [`channel_role_account_refusal`] and [`channel_name_refusal`]), and because the engine
+/// the framework's centralized constraint walk compiles a `@pattern` with reads `.` as
+/// every character except a line FEED alone, so the other three would be admitted there
+/// whatever the modelled expression says.
 const PATTERN_DOT_EXCLUDED_CHARS: [char; 4] = ['\n', '\r', '\u{2028}', '\u{2029}'];
+
+/// Whether `value` carries a character a modelled `@pattern`'s `.` does not match (one of
+/// the [`PATTERN_DOT_EXCLUDED_CHARS`]) — the one test every `.`-based expression this
+/// module applies by hand shares, so no member's rule spells it out again.
+fn carries_pattern_dot_excluded_char(value: &str) -> bool {
+    value
+        .chars()
+        .any(|character| PATTERN_DOT_EXCLUDED_CHARS.contains(&character))
+}
 
 /// Whether `role_name` is what the member's `(.+)` admits after `role/`, with the `$` that
 /// anchors it: at least one character, and every one of them a character that expression's
@@ -537,10 +548,58 @@ const PATTERN_DOT_EXCLUDED_CHARS: [char; 4] = ['\n', '\r', '\u{2028}', '\u{2029}
 /// already pinned is stripped, so a value this rejects is outside the member's declared
 /// `@pattern` and could not be reported back through the same shape.
 fn is_role_name(role_name: &str) -> bool {
-    !role_name.is_empty()
-        && !role_name
-            .chars()
-            .any(|character| PATTERN_DOT_EXCLUDED_CHARS.contains(&character))
+    !role_name.is_empty() && !carries_pattern_dot_excluded_char(role_name)
+}
+
+/// `channelName`'s declared `@pattern`, as the model spells it — ANCHORED, which is the
+/// text a clause reporting it is rendered from
+/// (`smithy_query(query="shape",shape="channelName")`).
+pub const CHANNEL_NAME_PATTERN: &str = "^.+$";
+
+/// The member path a clause about `channelName` names, in the lowerCamel spelling the
+/// validation envelope states a member with.
+const CHANNEL_NAME_PATH: &str = "channelName";
+
+/// Why the `channelName` a write carried is outside that member's declared `@pattern`
+/// ([`CHANNEL_NAME_PATTERN`]), as the message the refusal carries, or `None` when the
+/// value is one the expression admits.
+///
+/// The member's expression is `.`-based, and the framework's centralized constraint walk
+/// cannot apply such an expression in full: it compiles a `@pattern` with an engine whose
+/// `.` excludes a line FEED alone, where the modelled ECMA-262 expression's `.` excludes
+/// every one of the [`PATTERN_DOT_EXCLUDED_CHARS`]. So the part of the expression that walk
+/// admits but the model does not is applied HERE, by both operations that write the member
+/// (`CreateSlackChannelConfiguration` and `UpdateSlackChannelConfiguration`), before the
+/// store is reached: the same shape with the same `@pattern` is an OUTPUT member —
+/// `UpdateSlackChannelConfiguration` answers with `channelName` and
+/// `ListSlackChannelConfigurations` reports it inside every `SlackChannelConfiguration` —
+/// so a value the expression does not admit could not be reported back through the shape it
+/// was stored in. The rest of the expression (its `+`, and the member's `@length` 1..256)
+/// is the walk's, which applies it to every request that carries the member.
+///
+/// The refusal is the one a declared constraint draws, because this IS the member's
+/// declared `@pattern`: the standard validation envelope over one clause naming the
+/// rejected value, the member path and the expression, built by the framework's own
+/// renderer ([`::aws_smithy_schema_server::constraints::envelope`]) from the same
+/// violation the walk raises for a value its own reading of the expression does catch, and
+/// with the `^` / `$` pair this service drops from a reported expression
+/// (`src/service.rs`, `as_stated`) dropped by the same shared rendering. So one request is
+/// refused one way whichever reading of the expression caught it. The value is echoed
+/// through the tree's shared [`::service_common::validation::quoted_echo`], so a
+/// handler-worded clause quotes a value under the same ceiling as one the walk restored.
+pub fn channel_name_refusal(channel_name: &str) -> Option<String> {
+    if !carries_pattern_dot_excluded_char(channel_name) {
+        return None;
+    }
+    let violation = ::aws_smithy_schema_server::constraints::Violation {
+        path: CHANNEL_NAME_PATH.to_string(),
+        kind: ::aws_smithy_schema_server::constraints::ViolationKind::Pattern(
+            ::service_common::validation::unanchored(CHANNEL_NAME_PATTERN),
+        ),
+        value: Some(::service_common::validation::quoted_echo(channel_name).into_owned()),
+        sensitive: false,
+    };
+    ::aws_smithy_schema_server::constraints::envelope(::std::slice::from_ref(&violation))
 }
 
 /// The `AccessDeniedException` message a refused pass-role attempt carries, as AWS words

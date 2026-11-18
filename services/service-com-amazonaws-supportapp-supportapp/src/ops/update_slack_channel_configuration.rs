@@ -13,6 +13,14 @@
 //! omits keeps its current value and is not something the request says, so it is not
 //! constrained. See `crate::state::notification_rule_violation`.
 //!
+//! The `channelName` this request carries declares a `.`-based `@pattern`, which the
+//! request boundary's constraint walk cannot apply in full — see
+//! [`crate::state::channel_name_refusal`], which owns that part of the member's rule for
+//! both operations that write it: a value the modelled expression does not admit is the
+//! modelled `ValidationException` (400) and the stored record is left as it stands, which
+//! is what keeps the `channelName` this operation ANSWERS with inside the same shape's
+//! declared `@pattern`.
+//!
 //! This operation acts on the configuration its `(teamId, channelId)` pair names, so
 //! whether that configuration EXISTS is the first thing settled against the account's
 //! state: a pair this account holds nothing for is the modelled
@@ -218,6 +226,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(
                 UpdateSlackChannelConfigurationErrorModeled::AccessDeniedException(denied).into(),
             );
+        }
+
+        // `channelName`'s declared `@pattern` is `.`-based, and the request boundary's walk
+        // reads a `.` more widely than the modelled expression does, so the part of that
+        // expression the walk admits is applied here, to the value this request CARRIES: an
+        // update naming no channel name leaves the stored one alone, and the record this
+        // update would rewrite is left exactly as it stands when a value is refused. It is a
+        // modelled constraint on the REQUEST, so it is settled before the pass-role step
+        // below and before the store is reached. See
+        // [`crate::state::channel_name_refusal`].
+        if let Some(message) = input
+            .channel_name
+            .as_deref()
+            .and_then(crate::state::channel_name_refusal)
+        {
+            return Err(UpdateSlackChannelConfigurationErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(message),
+                },
+            )
+            .into());
         }
 
         // `channelRoleArn` came off the request boundary with the whole member (see

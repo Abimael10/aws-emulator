@@ -14,6 +14,12 @@
 //! form it has — see [`crate::state::channel_role_arn_refusal`], which owns both of the
 //! member's rules and the order between them.
 //!
+//! The `channelName` this request carries declares a `.`-based `@pattern`, which the
+//! request boundary's constraint walk cannot apply in full — see
+//! [`crate::state::channel_name_refusal`], which owns that part of the member's rule for
+//! both operations that write it: a value the modelled expression does not admit is the
+//! modelled `ValidationException` (400) rather than something stored.
+//!
 //! A channel configuration lives inside a Slack workspace that is registered to the
 //! account, so the request's `teamId` must be in the account's workspace registry
 //! (`state::slack_workspace_configurations`, written by
@@ -201,6 +207,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(
                 CreateSlackChannelConfigurationErrorModeled::AccessDeniedException(denied).into(),
             );
+        }
+
+        // `channelName`'s declared `@pattern` is `.`-based, and the request boundary's walk
+        // reads a `.` more widely than the modelled expression does, so the part of that
+        // expression the walk admits is applied here — before the pass-role step below and
+        // before the store is reached, because it is a modelled constraint on the REQUEST
+        // and so is request validation, settled for the same reason the member's declared
+        // `@length` maximum is. See [`crate::state::channel_name_refusal`].
+        if let Some(message) = input
+            .channel_name
+            .as_deref()
+            .and_then(crate::state::channel_name_refusal)
+        {
+            return Err(CreateSlackChannelConfigurationErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(message),
+                },
+            )
+            .into());
         }
 
         // `channelRoleArn` came off the request boundary with the whole member (see
