@@ -190,6 +190,34 @@ pub fn rollback_disabled(
     disable_rollback.or_else(|| deployment_config.and_then(|config| config.disable_rollback))
 }
 
+/// CloudFormation's refusal for a request whose two rollback switches are set to DIFFERENT
+/// values, which carries no variable part.
+pub const CONFLICTING_DISABLE_ROLLBACK: &str = "Conflicting values for DisableRollback: the \
+     top-level DisableRollback and DeploymentConfig.DisableRollback must not be set to \
+     different values.";
+
+/// `Err` where the request states BOTH rollback switches and states them differently.
+///
+/// The two members say one thing in the same words ([`rollback_disabled`]), so a request
+/// that sets them to different values asks for two incompatible things at once and there is
+/// no reading of the pair that honours it: the operation is refused PRE-FLIGHT, before
+/// anything is written, rather than resolved silently in favour of one of them. A request
+/// that states only one of them, or states both in agreement, has asked for one thing and is
+/// accepted. Shared by every operation whose input carries both members (`CreateStack` and
+/// `UpdateStack`), so neither can come to resolve the pair its own way.
+pub fn validate_rollback_switches(
+    disable_rollback: Option<bool>,
+    deployment_config: Option<&crate::ops::types::DeploymentConfig>,
+) -> Result<(), String> {
+    let configured = deployment_config.and_then(|config| config.disable_rollback);
+    match (disable_rollback, configured) {
+        (Some(top_level), Some(configured)) if top_level != configured => {
+            Err(CONFLICTING_DISABLE_ROLLBACK.to_string())
+        }
+        _ => Ok(()),
+    }
+}
+
 /// [`rollback_disabled`] for the deployment configuration a change set was CREATED with,
 /// which the execution of that change set runs under.
 pub fn stored_rollback_disabled(config: Option<&StoredDeploymentConfig>) -> Option<bool> {

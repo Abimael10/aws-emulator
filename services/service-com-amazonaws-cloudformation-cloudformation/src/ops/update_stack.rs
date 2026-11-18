@@ -577,6 +577,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // (`crate::state::validate_rollback_configuration`).
         crate::state::validate_rollback_configuration(input.rollback_configuration.as_ref())
             .map_err(crate::scaffolded::Scaffolded::validation_error)?;
+        // The same rule a create's rollback switches are held to: the two members say one
+        // thing, so an update that sets them to DIFFERENT values is refused before the stack
+        // is touched rather than run under a rollback setting it never consistently asked
+        // for (`crate::state::validate_rollback_switches`).
+        crate::state::validate_rollback_switches(
+            input.disable_rollback,
+            input.deployment_config.as_ref(),
+        )
+        .map_err(crate::scaffolded::Scaffolded::validation_error)?;
         // The same rule a create's tags are held to: a key in AWS's own reserved namespace
         // is refused before the stack is touched, so an update cannot put a key the service
         // itself owns onto the stack — unless the service that owns the namespace is the one

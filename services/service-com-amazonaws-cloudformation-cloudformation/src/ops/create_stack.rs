@@ -435,6 +435,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 "You cannot specify both OnFailure and DisableRollback",
             ));
         }
+        // The request's two rollback switches say one thing in the same words, so a request
+        // that sets them to DIFFERENT values is refused HERE — before any stack record is
+        // minted — rather than created under a rollback setting it never consistently asked
+        // for (`crate::state::validate_rollback_switches`).
+        crate::state::validate_rollback_switches(
+            input.disable_rollback,
+            input.deployment_config.as_ref(),
+        )
+        .map_err(crate::scaffolded::Scaffolded::validation_error)?;
         // "Specify either AWS::CloudWatch::Alarm or AWS::CloudWatch::CompositeAlarm
         // resource types": a trigger naming anything else is refused HERE, before anything
         // is written, so no stack is created carrying rollback monitoring that could never
