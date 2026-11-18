@@ -19,6 +19,8 @@ use service_com_amazonaws_pipes_pipes::state::{MAX_PIPES, STATE_SETTLE_DELAY};
 use service_com_amazonaws_pipes_pipes::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
 
+use crate::pipe_lifecycle_conflicts::PIPE_RESOURCE_TYPE;
+
 /// The region every request is signed for unless a case says otherwise.
 pub(crate) const REGION: &str = "us-west-2";
 
@@ -958,6 +960,19 @@ async fn create_pipe_stops_at_the_record_cap() {
             (402, "ServiceQuotaExceededException"),
             "case {name:?}: past the cap of {MAX_PIPES} expected 402 \
              ServiceQuotaExceededException, got {refused:?}"
+        );
+        // The quota refusal names the SAME resource type a conflict does — it is the name
+        // of the one resource type this service models, not a value out of the request.
+        assert_eq!(
+            refused.string("resourceType"),
+            PIPE_RESOURCE_TYPE,
+            "case {name:?}: expected resourceType {PIPE_RESOURCE_TYPE:?}, got {refused:?}"
+        );
+        assert_eq!(
+            refused.string("resourceId"),
+            name,
+            "case {name:?}: expected resourceId to name the pipe the request asked for, \
+             got {refused:?}"
         );
         let described = describe(&router, name).await;
         assert_eq!(

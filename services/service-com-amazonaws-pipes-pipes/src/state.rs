@@ -88,8 +88,14 @@ pub mod requested_state {
     pub const DELETED: &str = "DELETED";
 }
 
-/// The `resourceType` this service names in a `ConflictException` / `NotFoundException`.
-pub const PIPE_RESOURCE_TYPE: &str = "pipe";
+/// The `resourceType` every error of this service that carries one names: the pipe
+/// resource, the only resource type this service models.
+///
+/// It is FIXED text — the name of the resource type, not a value out of the request — and
+/// is spelled the way the API names the resource itself, with a leading capital, so the
+/// token is the same whichever error (`ConflictException`, `ServiceQuotaExceededException`)
+/// reports it and whichever operation raised it.
+pub const PIPE_RESOURCE_TYPE: &str = "Pipe";
 
 /// The scheme of the one non-ARN `Source` this service accepts: a self-managed Apache
 /// Kafka cluster. Source: the `^smk://…|arn:…$` alternation of `ArnOrUrl`'s pattern in

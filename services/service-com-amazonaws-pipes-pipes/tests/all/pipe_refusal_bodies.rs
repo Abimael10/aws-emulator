@@ -24,6 +24,7 @@
 use serde_json::{json, Value};
 
 use crate::pipe_lifecycle::{call, create, describe, router, Reply, PAST_SETTLE, REGION};
+use crate::pipe_lifecycle_conflicts::PIPE_RESOURCE_TYPE;
 use crate::pipe_tagging::{encode, pipe_arn};
 use crate::pipe_update::{create_body, update};
 
@@ -538,7 +539,7 @@ async fn a_taken_name_is_reported_by_one_sentence_naming_the_pipe() {
                     refused.string("resourceId"),
                     refused.string("resourceType")
                 ),
-                (name.to_string(), "pipe".to_string()),
+                (name.to_string(), PIPE_RESOURCE_TYPE.to_string()),
                 "case {name:?} / {case}: the conflict must name the resource it is about, \
                  got {refused:?}"
             );
@@ -632,7 +633,7 @@ async fn an_update_during_a_move_in_flight_reports_one_sentence_naming_the_pipe(
                 refused.string("resourceId"),
                 refused.string("resourceType")
             ),
-            (case.to_string(), "pipe".to_string()),
+            (case.to_string(), PIPE_RESOURCE_TYPE.to_string()),
             "case {case:?}: the conflict must name the resource it is about, got {refused:?}"
         );
     }

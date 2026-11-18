@@ -21,10 +21,26 @@ use smithy_server_runtime::MultiServiceRouter;
 use crate::pipe_lifecycle::{
     call, create, describe, minimal_body, router, Reply, PAST_SETTLE, REGION,
 };
+use crate::pipe_update::update;
 
 /// The source and target the fixture pipes name. Nothing here turns on either resource.
 const SOURCE: &str = "arn:aws:sqs:us-west-2:000000000000:orders";
 const TARGET: &str = "arn:aws:lambda:us-west-2:000000000000:function:handler";
+
+/// The role every fixture pipe acts as, the one `minimal_body` carries, so an `UpdatePipe`
+/// that only has to reach the conflict check carries a value the pipe already holds.
+const ROLE: &str = "arn:aws:iam::000000000000:role/pipes-role";
+
+/// The `resourceType` an error of this service that carries one names: the pipe resource,
+/// the only resource type EventBridge Pipes models (`ConflictException.resourceType` is
+/// "The type of resource that caused the exception" in
+/// `smithy-model/com-amazonaws-pipes-pipes.json`). It is the NAME of that resource type —
+/// fixed text, spelled as the API names the resource — and not a value out of the request,
+/// so it is the same token whichever operation was refused and whatever the request said.
+///
+/// `pub(crate)` so the other suites asserting a refusal body read the SAME expectation
+/// rather than spelling the token again.
+pub(crate) const PIPE_RESOURCE_TYPE: &str = "Pipe";
 
 /// How long a wait for the state a move settles into is given before it is a failure.
 const SETTLE_BUDGET: Duration = Duration::from_secs(5);
@@ -183,7 +199,7 @@ async fn a_lifecycle_call_during_a_move_in_flight_is_refused_with_a_conflict() {
                 refused.string("resourceId"),
                 refused.string("resourceType")
             ),
-            (case.to_string(), "pipe".to_string()),
+            (case.to_string(), PIPE_RESOURCE_TYPE.to_string()),
             "case {case:?}: the conflict must name the resource it is about, got {refused:?}"
         );
 
@@ -266,6 +282,142 @@ async fn simultaneous_starts_have_exactly_one_winner() {
             describe(&router, &case).await.string("DesiredState"),
             "RUNNING",
             "case {case:?}: the pipe the race started must be asked to run"
+        );
+    }
+}
+
+/// One row of the resource-type table: which call is refused, and what the pipe is doing
+/// when it arrives.
+struct TypedRefusal {
+    /// The case, which is also the pipe's name.
+    case: &'static str,
+    /// The state the fixture pipe is asked to be in when it is created.
+    desired: &'static str,
+    /// Whether the row waits for the create to land before it drives its own calls.
+    settle_first: bool,
+    /// The call that starts a move in flight, for a row whose conflict is about one.
+    in_flight: Option<&'static str>,
+    /// The call that is refused: `create`, `update`, `start` or `stop`.
+    refused: &'static str,
+}
+
+/// One call of the operation `which` names, on the pipe named `name`.
+async fn operation(router: &MultiServiceRouter, name: &str, which: &str) -> Reply {
+    match which {
+        "create" => create(router, name, minimal_body(SOURCE, TARGET)).await,
+        "update" => update(router, name, json!({"RoleArn": ROLE})).await,
+        suffix => lifecycle(router, name, suffix).await,
+    }
+}
+
+/// RULE: the `resourceType` an error of this service reports is the NAME of the resource
+/// type the service models — fixed text, spelled as the API names the pipe resource — so
+/// every `ConflictException` carries that one token whichever operation raised it and
+/// whatever the request carried, while `resourceId` is the pipe the request named.
+///
+/// The rows differ along the operation refused (`CreatePipe`, `UpdatePipe`, `StartPipe`,
+/// `StopPipe`) and along what the pipe is doing when the call arrives (the create itself
+/// in flight, a start in flight, a stop in flight, a pipe resting) — which is what the
+/// rule generalises over, since none of it may change the token.
+#[tokio::test]
+async fn every_conflict_names_the_pipe_resource_type() {
+    let rows = [
+        TypedRefusal {
+            case: "typecreatecreating",
+            desired: "RUNNING",
+            settle_first: false,
+            in_flight: None,
+            refused: "create",
+        },
+        TypedRefusal {
+            case: "typecreateresting",
+            desired: "STOPPED",
+            settle_first: true,
+            in_flight: None,
+            refused: "create",
+        },
+        TypedRefusal {
+            case: "typeupdatecreating",
+            desired: "RUNNING",
+            settle_first: false,
+            in_flight: None,
+            refused: "update",
+        },
+        TypedRefusal {
+            case: "typeupdatestarting",
+            desired: "STOPPED",
+            settle_first: true,
+            in_flight: Some("start"),
+            refused: "update",
+        },
+        TypedRefusal {
+            case: "typestartcreating",
+            desired: "RUNNING",
+            settle_first: false,
+            in_flight: None,
+            refused: "start",
+        },
+        TypedRefusal {
+            case: "typestartstopping",
+            desired: "RUNNING",
+            settle_first: true,
+            in_flight: Some("stop"),
+            refused: "start",
+        },
+        TypedRefusal {
+            case: "typestopcreating",
+            desired: "RUNNING",
+            settle_first: false,
+            in_flight: None,
+            refused: "stop",
+        },
+        TypedRefusal {
+            case: "typestopstarting",
+            desired: "STOPPED",
+            settle_first: true,
+            in_flight: Some("start"),
+            refused: "stop",
+        },
+    ];
+
+    for row in rows {
+        let case = row.case;
+        let router = router();
+        let mut body = minimal_body(SOURCE, TARGET);
+        body["DesiredState"] = json!(row.desired);
+        let created = create(&router, case, body).await;
+        assert_eq!(
+            created.status, 200,
+            "case {case:?}: the fixture pipe must be created, got {created:?}"
+        );
+        if row.settle_first {
+            tokio::time::sleep(PAST_SETTLE).await;
+        }
+        if let Some(which) = row.in_flight {
+            let accepted = operation(&router, case, which).await;
+            assert_eq!(
+                accepted.status, 200,
+                "case {case:?}: the call that starts the move in flight must be accepted, \
+                 got {accepted:?}"
+            );
+        }
+
+        let refused = operation(&router, case, row.refused).await;
+        assert_eq!(
+            (refused.status, refused.error_code.as_str()),
+            (409, "ConflictException"),
+            "case {case:?}: expected 409 ConflictException, got {refused:?}"
+        );
+        let reported = refused.string("resourceType");
+        assert_eq!(
+            reported, PIPE_RESOURCE_TYPE,
+            "case {case:?}: expected resourceType {PIPE_RESOURCE_TYPE:?}, got {reported:?}"
+        );
+        assert_eq!(
+            refused.string("resourceId"),
+            case,
+            "case {case:?}: expected resourceId to name the pipe the request addressed, \
+             got {refused:?}"
         );
     }
 }
