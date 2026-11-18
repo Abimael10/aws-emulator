@@ -37,11 +37,25 @@
 //! ([`super::api_destination`]): a 2xx is the delivery, a 4xx is the stage REFUSING the event
 //! and is not tried again, and a 5xx or an attempt nothing answered is tried again until one
 //! of the target's two retry bounds is met ([`crate::state::retry_bounds`]), after which the
-//! event goes to the target's dead-letter queue carrying the status the stage answered. The
-//! condition such a dead letter names is the one EventBridge reports for an endpoint that did
-//! not answer the request successfully ([`crate::state::CONNECTION_FAILURE`]) — whatever
-//! status it answered with, because what failed is the delivery to the endpoint and not the
-//! identity it was made under or the existence of the resource.
+//! event goes to the target's dead-letter queue carrying the status the stage answered.
+//!
+//! WHICH condition that dead letter names is read off the ANSWER the request got
+//! ([`answer_condition`]): a `403` is the identity the request was made under not being
+//! permitted to invoke the method, which is [`crate::state::NO_PERMISSIONS`], and every other
+//! unsuccessful answer is the endpoint not serving the request, which is
+//! [`crate::state::CONNECTION_FAILURE`] — the condition an attempt NOTHING answered carries as
+//! well, since such an attempt leaves no status to read one off. The sentence is the same
+//! either way: the status, the request this delivery made, and the service, status, code and
+//! request id of the answer ([`stage_status_failure`]).
+//!
+//! So the grant the target's role lacks is reported as what it DOES to the request. The
+//! documents in force on that role are read before any request is made — the shared decision
+//! [`super::role_refusal`] takes for every target kind — and a role they do not allow
+//! [`INVOKE_ACTION`] on the target's own ARN is reported as the `403` the invoke endpoint
+//! answers such an identity ([`invoke_authorization_refusal`]), rather than as a sentence about
+//! the evaluation this emulator took it from: the answer is what a caller of the dead-letter
+//! queue can observe, and it is the same class of answer whichever document withheld the
+//! grant.
 
 use super::*;
 
@@ -53,6 +67,10 @@ pub(super) const EXECUTE_API_ARN_NAMESPACE: &str = "execute-api";
 /// The IAM action the delivery performs, which the target's role has to be allowed on the
 /// target's own ARN.
 pub(super) const INVOKE_ACTION: &str = "execute-api:Invoke";
+
+/// The status an invoke endpoint answers a request whose identity may not perform
+/// [`INVOKE_ACTION`] on the method it addressed.
+const FORBIDDEN_STATUS: u16 = 403;
 
 /// The content type EventBridge sends a target that takes an HTTP request, which is what
 /// decides WHICH of the method's integration request templates renders the call.
@@ -186,15 +204,7 @@ pub(super) async fn invoke_rest_api_stage(
             "the target ARN names no api, stage and method to make a request to".to_string(),
         );
     };
-    // The target's own parameters, with every value that names a place in the EVENT resolved
-    // against it: the event as published, not the input this delivery reshaped, because a
-    // parameter names a value of the event.
-    let event = ::serde_json::from_str::<::serde_json::Value>(handover.rendered)
-        .unwrap_or(::serde_json::Value::Null);
-    let parameters = target
-        .http_parameters
-        .as_ref()
-        .map(|parameters| crate::state::invocation::resolved_http_parameters(parameters, &event));
+    let parameters = resolved_parameters(handover);
     let bounds = crate::state::retry_bounds::RetryBounds::of(
         target.maximum_retry_attempts,
         target.maximum_event_age_in_seconds,
@@ -205,23 +215,8 @@ pub(super) async fn invoke_rest_api_stage(
         .duration_since(handover.published)
         .unwrap_or_default();
     let transport = callback.http_connector();
-    // WHERE the request goes, built once for every attempt this delivery makes: the stage's
-    // invoke url with the target's path values filling the ARN's wildcards and its
-    // query-string parameters on it.
-    let path_values = parameters
-        .as_ref()
-        .and_then(|parameters| parameters.path_parameter_values.clone())
-        .unwrap_or_default();
-    let query: ::std::collections::BTreeMap<String, String> = parameters
-        .as_ref()
-        .and_then(|parameters| parameters.query_string_parameters.clone())
-        .unwrap_or_default()
-        .into_iter()
-        .collect();
-    let uri = crate::state::invocation::with_query_parameters(
-        &stage.invoke_url(endpoint, &path_values),
-        &query,
-    );
+    // WHERE the request goes, built once for every attempt this delivery makes.
+    let uri = request_uri(endpoint, &stage, parameters.as_ref());
     // What the LAST attempt came to, which is what the dead letter reports.
     let mut last: Option<StageAttempt> = None;
     // How many attempts were made; one more than the retries the bounds are counted in.
@@ -268,7 +263,7 @@ pub(super) async fn invoke_rest_api_stage(
                     exhausted: None,
                 });
                 return crate::state::InvocationOutcome::Failed {
-                    code: crate::state::CONNECTION_FAILURE.to_string(),
+                    code: answer_condition(*status).to_string(),
                     message,
                 };
             }
@@ -296,19 +291,30 @@ pub(super) async fn invoke_rest_api_stage(
             break;
         }
     }
-    let message = match &last {
+    // The condition and the sentence the LAST attempt earns, which is what it was answered
+    // where it was answered at all.
+    let (code, message) = match &last {
         // The stage's own answer, in the words AWS reports a target endpoint's answer with.
-        Some(StageAttempt::Answered { status, request_id }) => {
-            stage_status_failure(&stage, &uri, *status, request_id)
-        }
-        // Nothing answered: what the attempts came to is reported instead.
-        Some(StageAttempt::Unreached(detail)) => stage_failure(&uri, detail, attempted),
+        Some(StageAttempt::Answered { status, request_id }) => (
+            answer_condition(*status),
+            stage_status_failure(&stage, &uri, *status, request_id),
+        ),
+        // Nothing answered: there is no status to read a condition off, so this is the
+        // endpoint not serving the request, and what the attempts came to is reported.
+        Some(StageAttempt::Unreached(detail)) => (
+            crate::state::CONNECTION_FAILURE,
+            stage_failure(&uri, detail, attempted),
+        ),
         // Nothing was attempted at all, which only the request's endpoint-wait budget leaves
         // behind: the loop above attempts before it decides anything else.
-        Some(StageAttempt::Delivered) | None => stage_failure(
-            &uri,
-            "this request reached the time this emulator lets one spend waiting on endpoints",
-            attempted,
+        Some(StageAttempt::Delivered) | None => (
+            crate::state::CONNECTION_FAILURE,
+            stage_failure(
+                &uri,
+                "this request reached the time this emulator lets one spend waiting on \
+                 endpoints",
+                attempted,
+            ),
         ),
     };
     *retries = Some(Retries {
@@ -316,9 +322,95 @@ pub(super) async fn invoke_rest_api_stage(
         exhausted,
     });
     crate::state::InvocationOutcome::Failed {
-        code: crate::state::CONNECTION_FAILURE.to_string(),
+        code: code.to_string(),
         message,
     }
+}
+
+/// The target's own HTTP parameters, with every value that names a place in the EVENT resolved
+/// against it: the event as published, not the input this delivery reshaped, because a
+/// parameter names a value of the event.
+fn resolved_parameters(handover: &Handover<'_>) -> Option<HttpParameters> {
+    let parameters = handover.target.http_parameters.as_ref()?;
+    let event = ::serde_json::from_str::<::serde_json::Value>(handover.rendered)
+        .unwrap_or(::serde_json::Value::Null);
+    Some(crate::state::invocation::resolved_http_parameters(
+        parameters, &event,
+    ))
+}
+
+/// WHERE one delivery's request goes: the stage's invoke url with the target's path values
+/// filling the ARN's wildcards and its query-string parameters on it.
+///
+/// The one address this delivery names — the attempts are made at it, and a delivery refused
+/// before any attempt reports the request it would have made at it
+/// ([`invoke_authorization_refusal`]).
+fn request_uri(endpoint: &str, stage: &Stage, parameters: Option<&HttpParameters>) -> String {
+    let path_values = parameters
+        .and_then(|parameters| parameters.path_parameter_values.clone())
+        .unwrap_or_default();
+    let query: ::std::collections::BTreeMap<String, String> = parameters
+        .and_then(|parameters| parameters.query_string_parameters.clone())
+        .unwrap_or_default()
+        .into_iter()
+        .collect();
+    crate::state::invocation::with_query_parameters(
+        &stage.invoke_url(endpoint, &path_values),
+        &query,
+    )
+}
+
+/// The condition EventBridge names on the dead letter of a delivery the invoke endpoint
+/// answered `status` to.
+///
+/// The ANSWER is what it is read off: `403` is the one status an invoke endpoint answers a
+/// request whose identity may not perform [`INVOKE_ACTION`] on the method it addressed, so
+/// that delivery failed for want of a permission ([`crate::state::NO_PERMISSIONS`]); every
+/// other unsuccessful status is the endpoint not serving the request
+/// ([`crate::state::CONNECTION_FAILURE`]).
+fn answer_condition(status: u16) -> &'static str {
+    match status {
+        FORBIDDEN_STATUS => crate::state::NO_PERMISSIONS,
+        _ => crate::state::CONNECTION_FAILURE,
+    }
+}
+
+/// Why the documents in force on the target's role bar this delivery — worded as the ANSWER
+/// the request such a role makes is given — or `None` when nothing of the kind can be shown.
+///
+/// The decision is the shared one every target kind takes about the call it makes
+/// ([`super::role_refusal`]): the documents in force on the role either allow
+/// [`INVOKE_ACTION`] on the target's own ARN or they do not, and nothing is refused on
+/// evidence this emulator does not have. What is this module's own is the REPORT. An identity
+/// that may not invoke the method is answered [`FORBIDDEN_STATUS`] by the invoke endpoint, so
+/// such a delivery fails the way every answered attempt does: the condition that status
+/// carries ([`answer_condition`]) and the sentence wording it ([`stage_status_failure`]),
+/// naming the request this delivery addressed the stage with. A refusal of the step BEFORE the
+/// request — a role EventBridge cannot assume at all — is reported as itself, because no
+/// request is addressed at all then; so is one for a target ARN that names no request to make.
+pub(super) fn invoke_authorization_refusal(
+    iam: Option<&::engine::ServiceState<crate::state::IamState>>,
+    role_arn: Option<&str>,
+    handover: &Handover<'_>,
+    attempt: &crate::state::DeliveryAttempt<'_>,
+    endpoint: &str,
+) -> Option<(String, String)> {
+    let (code, message) = super::role_refusal(iam, role_arn, handover.rule_arn, attempt)?;
+    if code != crate::state::NO_PERMISSIONS {
+        return Some((code, message));
+    }
+    let Some(stage) = addressed_stage(&handover.target.arn) else {
+        return Some((code, message));
+    };
+    let uri = request_uri(endpoint, &stage, resolved_parameters(handover).as_ref());
+    // The id of the answer: an attempt that was MADE carries the id the endpoint named the
+    // request it answered by ([`RESPONSE_REQUEST_ID`]), and this one carries the id minted for
+    // the answer it stands for, as every refusal this emulator words for an answer does.
+    let request_id = ::service_common::query_error_envelope::new_request_id();
+    Some((
+        answer_condition(FORBIDDEN_STATUS).to_string(),
+        stage_status_failure(&stage, &uri, FORBIDDEN_STATUS, &request_id),
+    ))
 }
 
 /// What ONE attempt at a stage came to.

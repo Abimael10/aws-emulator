@@ -2088,7 +2088,7 @@ pub(crate) async fn deliver(
             // ARN for every kind but one ([`TargetKind::action_resource`]).
             resource: kind.action_resource(handover),
         };
-        match kind.role_bars(stores.iam, role_arn, handover, &attempt) {
+        match kind.role_bars(stores, role_arn, handover, &attempt) {
             Some((code, message)) => crate::state::InvocationOutcome::Failed { code, message },
             // "Input: valid JSON text passed to the target": what a target is
             // handed is a JSON document, so an input this delivery rendered that
@@ -3083,16 +3083,26 @@ impl TargetKind {
     /// The shared decision for every kind AWS invokes under that role
     /// ([`role_refusal`]), which an ECS task run takes with the cluster it places
     /// into published as a condition key
-    /// ([`ecs_task::run_authorization_refusal`]).
+    /// ([`ecs_task::run_authorization_refusal`]) and which an invoke of an API
+    /// Gateway stage REPORTS as the answer the endpoint gives an identity that may
+    /// not invoke it ([`rest_api_stage::invoke_authorization_refusal`]).
     fn role_bars(
         self,
-        iam: Option<&::engine::ServiceState<crate::state::IamState>>,
+        stores: &Stores<'_>,
         role_arn: Option<&str>,
         handover: &Handover<'_>,
         attempt: &crate::state::DeliveryAttempt<'_>,
     ) -> Option<(String, String)> {
+        let iam = stores.iam;
         match self {
             Self::EcsTask => ecs_task::run_authorization_refusal(iam, role_arn, handover, attempt),
+            Self::RestApiStage => rest_api_stage::invoke_authorization_refusal(
+                iam,
+                role_arn,
+                handover,
+                attempt,
+                stores.endpoint,
+            ),
             _ => role_refusal(iam, role_arn, handover.rule_arn, attempt),
         }
     }

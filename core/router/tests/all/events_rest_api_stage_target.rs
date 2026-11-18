@@ -18,11 +18,12 @@
 //! invokes such a target AS THE ROLE it names — "for EC2 instances, Kinesis data streams,
 //! Step Functions state machines and API Gateway APIs, EventBridge relies on IAM roles that
 //! you specify in the `RoleARN` argument in `PutTargets`" — so a role whose policies do not
-//! allow `execute-api:Invoke` on that ARN is a delivery EventBridge withholds, and the event
-//! goes to the target's dead-letter queue carrying `NO_PERMISSIONS`. A stage that ANSWERS and
-//! does not take the event is the other class: a 5xx is retried within the target's
-//! `RetryPolicy` and then dead-lettered with the status the stage answered, while a matched
-//! event the stage served is delivered and dead-letters nothing.
+//! allow `execute-api:Invoke` on that ARN earns the `403` an invoke endpoint answers such an
+//! identity, and the event goes to the target's dead-letter queue carrying `NO_PERMISSIONS`
+//! and that answer's own sentence. A stage that ANSWERS and does not take the event is the
+//! other class: a 5xx is retried within the target's `RetryPolicy` and then dead-lettered
+//! with the status the stage answered, while a matched event the stage served is delivered and
+//! dead-letters nothing.
 //!
 //! Only a cross-service suite can pin this: the rule, its target and the dead letter are
 //! EventBridge's, the stage and its integration are API Gateway's, the role that decides the
@@ -43,7 +44,12 @@ use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
 /// The Region every request below is signed for, and the Region the ARNs name.
-const REGION: &str = "us-west-2";
+///
+/// This suite's harness is the crate's one harness for an EventBridge rule delivering to a
+/// deployed REST API stage: the sibling suite that varies the GRANT on the target's role
+/// (`crate::events_execute_api_target_role_grant`) imports the items marked `pub(crate)` here,
+/// so there is ONE set of setup calls for both and a fix to either covers both.
+pub(crate) const REGION: &str = "us-west-2";
 
 /// The long-term key every emulator publishes, which the setup calls are signed with. The
 /// signature itself is never checked: this router runs with request authentication off, as
@@ -55,38 +61,39 @@ const SOURCE: &str = "sim2real.orders";
 
 /// The `detail-type` the rule matches, exactly as it is written: EventBridge compares it
 /// case-sensitively, which the near-miss row below is the differential for.
-const DETAIL_TYPE: &str = "OrderPlaced";
+pub(crate) const DETAIL_TYPE: &str = "OrderPlaced";
 
 /// The stage the api is deployed to.
-const STAGE: &str = "live";
+pub(crate) const STAGE: &str = "live";
 
 /// The media type the method request declares, which keys its integration request template.
-const JSON: &str = "application/json";
+pub(crate) const JSON: &str = "application/json";
 
 /// The header the target contributes to the request, which the stage records.
-const SOURCE_HEADER: &str = "x-order-src";
+pub(crate) const SOURCE_HEADER: &str = "x-order-src";
 
 /// The principal EventBridge acts as when it writes a dead letter, which the dead-letter
 /// queue's own policy has to admit.
-const EVENTS_PRINCIPAL: &str = "events.amazonaws.com";
+pub(crate) const EVENTS_PRINCIPAL: &str = "events.amazonaws.com";
 
 /// A trust policy that lets EventBridge assume the role it is attached to.
-const EVENTS_TRUST: &str = concat!(
+pub(crate) const EVENTS_TRUST: &str = concat!(
     r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","#,
     r#""Principal":{"Service":"events.amazonaws.com"},"Action":"sts:AssumeRole"}]}"#
 );
 
 /// A trust policy that lets API Gateway assume the role it is attached to, which is what the
 /// stage's own integration is performed under.
-const APIGATEWAY_TRUST: &str = concat!(
+pub(crate) const APIGATEWAY_TRUST: &str = concat!(
     r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","#,
     r#""Principal":{"Service":"apigateway.amazonaws.com"},"Action":"sts:AssumeRole"}]}"#
 );
 
-/// The condition EventBridge names on a dead letter for a delivery it WITHHELD because no
-/// document admits the invocation, spelled here rather than imported from the service so a
-/// wrong value in the service would fail this suite.
-const NO_PERMISSIONS: &str = "NO_PERMISSIONS";
+/// The condition EventBridge names on a dead letter for a delivery the identity it was made
+/// under may not make, which is the `403` an invoke endpoint answers such a request with —
+/// spelled here rather than imported from the service so a wrong value in the service would
+/// fail this suite.
+pub(crate) const NO_PERMISSIONS: &str = "NO_PERMISSIONS";
 
 /// The condition it names for a delivery to an endpoint that did not answer the request
 /// successfully — here the stage's own 5xx answer, which the `ERROR_MESSAGE` beside it
@@ -116,7 +123,7 @@ const SINK_TEMPLATE: &str = concat!(
 );
 
 /// The four services this rule spans, over ONE engine.
-fn emulator() -> MultiServiceRouter {
+pub(crate) fn emulator() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
@@ -176,7 +183,7 @@ async fn rpc(
 }
 
 /// An EventBridge call (`awsJson1_1`, `AWSEvents.<Operation>`) that must answer 200.
-async fn events(router: &MultiServiceRouter, case: &str, operation: &str, body: &Value) -> Value {
+pub(crate) async fn events(router: &MultiServiceRouter, case: &str, operation: &str, body: &Value) -> Value {
     let (status, parsed) = rpc(router, "events", "AWSEvents", "1.1", operation, body).await;
     assert_eq!(
         status, 200,
@@ -187,7 +194,7 @@ async fn events(router: &MultiServiceRouter, case: &str, operation: &str, body: 
 }
 
 /// An Amazon SQS call (`awsJson1_0`, `AmazonSQS.<Operation>`) that must answer 200.
-async fn sqs(router: &MultiServiceRouter, case: &str, operation: &str, body: &Value) -> Value {
+pub(crate) async fn sqs(router: &MultiServiceRouter, case: &str, operation: &str, body: &Value) -> Value {
     let (status, parsed) = rpc(router, "sqs", "AmazonSQS", "1.0", operation, body).await;
     assert_eq!(
         status, 200,
@@ -198,7 +205,7 @@ async fn sqs(router: &MultiServiceRouter, case: &str, operation: &str, body: &Va
 }
 
 /// One IAM awsQuery call that must answer 200, as its body.
-async fn iam(router: &MultiServiceRouter, case: &str, body: String) -> String {
+pub(crate) async fn iam(router: &MultiServiceRouter, case: &str, body: String) -> String {
     let request = http::Request::builder()
         .method("POST")
         .uri("/")
@@ -218,7 +225,7 @@ async fn iam(router: &MultiServiceRouter, case: &str, body: String) -> String {
 }
 
 /// One API Gateway control-plane call that must answer `expected`, as its parsed body.
-async fn apigw(
+pub(crate) async fn apigw(
     router: &MultiServiceRouter,
     case: &str,
     method: &str,
@@ -255,13 +262,14 @@ fn xml_element(body: &str, name: &str) -> Option<String> {
     Some(body[start..end].to_string())
 }
 
-/// One IAM role: created with `trust` as its trust policy and `document` as its one inline
-/// policy, answering its ARN.
-async fn role(
+/// One IAM role: created with `trust` as its trust policy and `document`, when it carries one,
+/// as its one inline policy — answering its ARN. `None` is a role carrying no identity-based
+/// document at all, which the sibling suite's grant table is a row of.
+pub(crate) async fn role(
     router: &MultiServiceRouter,
     name: &str,
     trust: &str,
-    document: &str,
+    document: Option<&str>,
 ) -> String {
     let created = iam(
         router,
@@ -274,6 +282,15 @@ async fn role(
     .await;
     let arn = xml_element(&created, "Arn")
         .unwrap_or_else(|| panic!("setup CreateRole({name}): no <Arn> in {created}"));
+    if let Some(document) = document {
+        granted(router, name, document).await;
+    }
+    arn
+}
+
+/// Write `document` as the role's one inline policy, which is how a grant comes into force on
+/// a role that already exists.
+pub(crate) async fn granted(router: &MultiServiceRouter, name: &str, document: &str) {
     iam(
         router,
         &format!("PutRolePolicy({name})"),
@@ -283,12 +300,11 @@ async fn role(
         ),
     )
     .await;
-    arn
 }
 
 /// One identity-based policy allowing `action` on `resource`, written with none of the
 /// characters a form body treats specially.
-fn policy(action: &str, resource: &str) -> String {
+pub(crate) fn policy(action: &str, resource: &str) -> String {
     format!(
         r#"{{"Version":"2012-10-17","Statement":[{{"Effect":"Allow","Action":"{action}","Resource":"{resource}"}}]}}"#
     )
@@ -296,7 +312,7 @@ fn policy(action: &str, resource: &str) -> String {
 
 /// One queue of this account: its url and the ARN a target names it by, read back from Amazon
 /// SQS rather than built here.
-async fn queue(router: &MultiServiceRouter, case: &str, name: &str) -> (String, String) {
+pub(crate) async fn queue(router: &MultiServiceRouter, case: &str, name: &str) -> (String, String) {
     let created = sqs(router, case, "CreateQueue", &json!({ "QueueName": name })).await;
     let url = created["QueueUrl"]
         .as_str()
@@ -317,7 +333,7 @@ async fn queue(router: &MultiServiceRouter, case: &str, name: &str) -> (String, 
 }
 
 /// One resource of the api under `parent`, answering its id.
-async fn resource(router: &MultiServiceRouter, api: &str, parent: &str, part: &str) -> String {
+pub(crate) async fn resource(router: &MultiServiceRouter, api: &str, parent: &str, part: &str) -> String {
     let created = apigw(
         router,
         &format!("CreateResource({part})"),
@@ -335,7 +351,8 @@ async fn resource(router: &MultiServiceRouter, api: &str, parent: &str, part: &s
 
 /// A `POST /{part}/{{id}}` method whose `AWS` integration sends `SINK_TEMPLATE` to the queue
 /// `uri` names under `credentials`, answering nothing of its own.
-async fn sink_method(
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn sink_method(
     router: &MultiServiceRouter,
     api: &str,
     root: &str,
@@ -408,7 +425,7 @@ const POLL_INTERVAL: Duration = Duration::from_millis(20);
 /// The messages the queue at `url` holds, polled until there are `wanted` of them or
 /// [`POLL_DEADLINE`] passes — so a row asserting an EMPTY queue reads it once the deliveries
 /// that would have filled it have had every chance to.
-async fn messages(
+pub(crate) async fn messages(
     router: &MultiServiceRouter,
     case: &str,
     url: &str,
@@ -442,7 +459,7 @@ async fn messages(
 }
 
 /// The value of the message attribute `name`, or `None` when the message carries none.
-fn attribute(message: &Value, name: &str) -> Option<String> {
+pub(crate) fn attribute(message: &Value, name: &str) -> Option<String> {
     message["MessageAttributes"][name]["StringValue"]
         .as_str()
         .map(str::to_string)
@@ -516,7 +533,7 @@ async fn deployed(router: &MultiServiceRouter) -> Deployed {
         router,
         "rest-stage-sink-sender",
         APIGATEWAY_TRUST,
-        &policy("sqs:SendMessage", &sink_arn),
+        Some(&policy("sqs:SendMessage", &sink_arn)),
     )
     .await;
     // A role the api cannot assume at all, which is what makes the `/boom` integration one
@@ -525,7 +542,7 @@ async fn deployed(router: &MultiServiceRouter) -> Deployed {
         router,
         "rest-stage-unassumable",
         EVENTS_TRUST,
-        &policy("sqs:SendMessage", &sink_arn),
+        Some(&policy("sqs:SendMessage", &sink_arn)),
     )
     .await;
 
@@ -577,13 +594,13 @@ async fn deployed(router: &MultiServiceRouter) -> Deployed {
         router,
         "rest-stage-invoker",
         EVENTS_TRUST,
-        &policy(
+        Some(&policy(
             "execute-api:Invoke",
             &format!(
                 "arn:aws:execute-api:{REGION}:{}:{}/{STAGE}/POST/*",
                 deployed.account, deployed.api
             ),
-        ),
+        )),
     )
     .await;
     // The same grant on ANOTHER api's methods: a role EventBridge can assume that allows no
@@ -592,13 +609,13 @@ async fn deployed(router: &MultiServiceRouter) -> Deployed {
         router,
         "rest-stage-stranger",
         EVENTS_TRUST,
-        &policy(
+        Some(&policy(
             "execute-api:Invoke",
             &format!(
                 "arn:aws:execute-api:{REGION}:{}:zzz9999999/{STAGE}/POST/*",
                 deployed.account
             ),
-        ),
+        )),
     )
     .await;
     Deployed {
@@ -854,8 +871,8 @@ async fn a_delivery_to_a_stage_that_fails_is_dead_lettered_with_what_it_came_to(
             path: "orders/*",
             granted: false,
             code: NO_PERMISSIONS,
-            message: "execute-api:Invoke",
-            names_the_url: false,
+            message: "Got status code \"403\" while trying to invoke \"POST ",
+            names_the_url: true,
             retries: None,
         },
         Failure {
@@ -874,12 +891,14 @@ async fn a_delivery_to_a_stage_that_fails_is_dead_lettered_with_what_it_came_to(
             // A method of this api the deployment holds none of, which the stage answers
             // through the gateway response for a request matching no method: a 4xx is the
             // endpoint REFUSING the event, so it is dead-lettered on the first attempt
-            // without being tried again.
+            // without being tried again. The status that answer carries is the one an invoke
+            // endpoint gives a request it does not admit, so the condition is the one a `403`
+            // names whatever the stage refused it for.
             case: "a stage answering 4xx, which is not retried",
             source: "sim2real.orders.unrouted",
             path: "nowhere/*",
             granted: true,
-            code: CONNECTION_FAILURE,
+            code: NO_PERMISSIONS,
             message: "Got status code \"403\" while trying to invoke \"POST ",
             names_the_url: true,
             retries: None,
