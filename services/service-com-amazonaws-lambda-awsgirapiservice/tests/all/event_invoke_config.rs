@@ -1368,8 +1368,13 @@ fn sentence_rows() -> [SentenceRow; 8] {
             withheld: "Publish",
         },
         SentenceRow {
+            // Punctuation inside the name: the underscore, the hyphen and the dot a
+            // resource name admits. The name does not END in the FIFO suffix, because a
+            // FIFO queue or topic is not an asynchronous-invocation destination at all and
+            // is refused before any write of it is decided on (see
+            // [`crate::event_invoke_config_fifo_destinations`]).
             case: "a topic whose name carries the punctuation a name admits",
-            destination: "arn:aws:sns:ap-southeast-2:000000000000:async_records-v2.fifo",
+            destination: "arn:aws:sns:ap-southeast-2:000000000000:async_records-v2.audit",
             withheld: "Publish",
         },
         SentenceRow {

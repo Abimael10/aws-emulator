@@ -231,6 +231,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             crate::state::ResolveFailure::NotFound(message) => not_found(message),
         })?;
 
+        // An asynchronous-invocation destination is the STANDARD resource of each service
+        // the member enumerates, so a configuration naming a FIFO queue or FIFO topic in
+        // either slot is refused before anything is persisted rather than stored as a
+        // delivery path no record is ever written to.
+        if let Some(message) =
+            crate::state::invalid_destination_config(input.destination_config.as_ref())
+        {
+            return Err(invalid_parameter(message));
+        }
+
         // Lambda delivers an invocation record to a destination ACTING AS the execution
         // role of the function version the configuration belongs to, so a role the policies
         // in force on it do not let make that write names a destination no record could

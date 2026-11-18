@@ -177,6 +177,101 @@ pub(crate) fn named_destination(destination: Option<&str>) -> Option<String> {
         .map(str::to_string)
 }
 
+/// The suffix the NAME of a FIFO resource ends with — the one thing that tells a FIFO
+/// queue's or FIFO topic's ARN from a standard one's, because Amazon SQS and Amazon SNS
+/// both require it of every FIFO queue's and FIFO topic's name.
+const FIFO_RESOURCE_SUFFIX: &str = ".fifo";
+
+/// The ARN vendor fields of the destination services whose resources come in a FIFO variant
+/// beside their standard one, as [`service_common::arn::vendor`] reads one.
+///
+/// Of the destination kinds `FunctionEventInvokeConfig$DestinationConfig` documents, exactly
+/// these two are documented as the STANDARD resource of their service — "Queue - The ARN of
+/// a standard SQS queue", "Topic - The ARN of a standard SNS topic" — and they are also the
+/// only two whose service HAS a FIFO resource at all, so a destination of any other kind has
+/// no FIFO variant to be refused for.
+const FIFO_CAPABLE_DESTINATION_VENDORS: &[&str] = &["sqs", "sns"];
+
+/// How a member holding nothing is written inside the rendering of a `DestinationConfig`
+/// ([`rendered_destination_config`]).
+const NULL_RENDERING: &str = "null";
+
+/// Whether `destination` names a FIFO resource of a service that has one: its NAME — the
+/// whole resource field of a queue's or a topic's ARN — ending in
+/// [`FIFO_RESOURCE_SUFFIX`] is what says so.
+#[must_use]
+pub fn names_fifo_destination(destination: &str) -> bool {
+    ::service_common::arn::parse(destination).is_some_and(|arn| {
+        FIFO_CAPABLE_DESTINATION_VENDORS.contains(&arn.vendor)
+            && arn.resource.ends_with(FIFO_RESOURCE_SUFFIX)
+    })
+}
+
+/// The sentence a request whose `DestinationConfig` names a destination an asynchronous
+/// invocation's record cannot be delivered to is refused with — and `None` when every
+/// destination it names is one that can be, which includes a configuration naming none.
+///
+/// An asynchronous-invocation destination is a resource Lambda writes ONE record to per
+/// event, with no ordering and no deduplication to honour, so the kinds it may be is the
+/// STANDARD resource of each service the member enumerates ("Queue - The ARN of a standard
+/// SQS queue", "Topic - The ARN of a standard SNS topic"): a FIFO queue or FIFO topic in
+/// either slot is a destination no record is ever delivered to, so the pair is refused by
+/// the call that CONFIGURES it, before anything is persisted, rather than stored as a
+/// delivery path that silently drops every record.
+///
+/// The sentence renders the `DestinationConfig` the request carried WHOLE
+/// ([`rendered_destination_config`]) rather than the one slot at fault, because what is
+/// invalid is the configuration asked for: an operator reads both slots back to see which
+/// pair was refused.
+///
+/// A READ of the request: it decides, and changes nothing.
+#[must_use]
+pub fn invalid_destination_config(
+    destination_config: Option<&DestinationConfig>,
+) -> Option<String> {
+    let config = destination_config?;
+    // The destinations the request STATES, in the one reading of a `DestinationConfig` this
+    // crate has — which holds the empty string the member's pattern admits as no destination
+    // at all, so taking a destination away is not judged as a destination of anything.
+    requested_destinations(Some(config))
+        .iter()
+        .any(|destination| names_fifo_destination(destination))
+        .then(|| {
+            format!(
+                "The provided destination config {} is invalid.",
+                rendered_destination_config(config)
+            )
+        })
+}
+
+/// The `DestinationConfig` of a request as the refusal above quotes it: the structure's own
+/// name, then each of its two slots in the order the shape declares them, with a slot the
+/// request did not state written as holding nothing.
+///
+/// A slot the request DID state is written as its own structure carrying the one
+/// `Destination` member it has, so a slot stated with no destination at all is told apart
+/// from a slot that was not stated.
+fn rendered_destination_config(config: &DestinationConfig) -> String {
+    let on_success = config.on_success.as_ref().map_or_else(
+        || NULL_RENDERING.to_string(),
+        |slot| rendered_slot("OnSuccess", slot.destination.as_deref()),
+    );
+    let on_failure = config.on_failure.as_ref().map_or_else(
+        || NULL_RENDERING.to_string(),
+        |slot| rendered_slot("OnFailure", slot.destination.as_deref()),
+    );
+    format!("DestinationConfig(onSuccess={on_success}, onFailure={on_failure})")
+}
+
+/// ONE slot of a rendered `DestinationConfig`: the slot structure's name and the
+/// `Destination` it carries, as the request carried it.
+fn rendered_slot(slot: &str, destination: Option<&str>) -> String {
+    format!(
+        "{slot}(destination={})",
+        destination.unwrap_or(NULL_RENDERING)
+    )
+}
+
 /// Every destination a request's `DestinationConfig` names, on-success first.
 #[must_use]
 pub fn requested_destinations(destination_config: Option<&DestinationConfig>) -> Vec<String> {
@@ -356,6 +451,163 @@ mod tests {
                 expected,
                 "case {case:?}: expected {expected:?}, got {held:?}"
             );
+        }
+    }
+
+    /// A destination is a FIFO one exactly when it names a resource of a service that HAS
+    /// a FIFO variant and its name carries the FIFO suffix; every other value — a standard
+    /// resource of those services, a resource of a service with no FIFO variant, a name
+    /// carrying the suffix somewhere other than its end, a value that is no ARN — is not.
+    #[test]
+    fn a_fifo_destination_is_a_queue_or_topic_whose_name_carries_the_suffix() {
+        // (case, the destination, whether it names a FIFO resource)
+        let rows: [(&str, &str, bool); 10] = [
+            (
+                "a FIFO queue",
+                "arn:aws:sqs:us-east-1:000000000000:records.fifo",
+                true,
+            ),
+            (
+                "a FIFO topic",
+                "arn:aws:sns:eu-west-1:000000000000:records.fifo",
+                true,
+            ),
+            (
+                "a FIFO queue of a partition of its own",
+                "arn:aws-us-gov:sqs:us-gov-west-1:000000000000:records.fifo",
+                true,
+            ),
+            (
+                "a standard queue",
+                "arn:aws:sqs:us-east-1:000000000000:records",
+                false,
+            ),
+            (
+                "a standard topic",
+                "arn:aws:sns:us-east-1:000000000000:records",
+                false,
+            ),
+            (
+                "a queue whose name carries the suffix in the middle",
+                "arn:aws:sqs:us-east-1:000000000000:records.fifo.audit",
+                false,
+            ),
+            (
+                "an event bus, of a service with no FIFO resource",
+                "arn:aws:events:us-east-1:000000000000:event-bus/records.fifo",
+                false,
+            ),
+            (
+                "a Lambda function, of a service with no FIFO resource",
+                "arn:aws:lambda:us-east-1:000000000000:function:records",
+                false,
+            ),
+            ("a bucket, of a service with no FIFO resource", "arn:aws:s3:::records.fifo", false),
+            ("a name that is no ARN at all", "records.fifo", false),
+        ];
+        for (case, destination, expected) in rows {
+            let decided = names_fifo_destination(destination);
+            assert_eq!(
+                decided, expected,
+                "case {case:?}: expected names_fifo_destination({destination:?}) to be \
+                 {expected:?}, got {decided:?}"
+            );
+        }
+    }
+
+    /// The refusal renders the configuration the request carried WHOLE: both slots, in the
+    /// order the shape declares them, a slot the request did not state as holding nothing,
+    /// and a stated slot as its own structure carrying the destination it carried.
+    #[test]
+    fn the_refusal_renders_the_requested_destination_config() {
+        const FIFO: &str = "arn:aws:sqs:us-east-1:000000000000:records.fifo";
+        const QUEUE: &str = "arn:aws:sqs:us-east-1:000000000000:records";
+        const FIFO_TOPIC: &str = "arn:aws:sns:us-east-1:000000000000:records.fifo";
+
+        // (case, the configuration, the rendering the refusal carries, or none for an
+        // accepted configuration)
+        let rows: [(&str, Option<DestinationConfig>, Option<&str>); 8] = [
+            ("no configuration at all", None, None),
+            (
+                "a configuration stating neither slot",
+                Some(DestinationConfig {
+                    on_success: None,
+                    on_failure: None,
+                }),
+                None,
+            ),
+            (
+                "a standard queue on failure",
+                Some(config(None, Some(Some(QUEUE)))),
+                None,
+            ),
+            (
+                "a FIFO queue on failure, with no on-success slot",
+                Some(config(None, Some(Some(FIFO)))),
+                Some(
+                    "DestinationConfig(onSuccess=null, \
+                     onFailure=OnFailure(destination=arn:aws:sqs:us-east-1:000000000000:records.fifo))",
+                ),
+            ),
+            (
+                "a FIFO topic on success, beside a standard queue on failure",
+                Some(config(Some(Some(FIFO_TOPIC)), Some(Some(QUEUE)))),
+                Some(
+                    "DestinationConfig(onSuccess=OnSuccess(destination=arn:aws:sns:us-east-1:000000000000:records.fifo), \
+                     onFailure=OnFailure(destination=arn:aws:sqs:us-east-1:000000000000:records))",
+                ),
+            ),
+            (
+                "a FIFO queue on failure, beside an on-success slot stating no destination",
+                Some(config(Some(None), Some(Some(FIFO)))),
+                Some(
+                    "DestinationConfig(onSuccess=OnSuccess(destination=null), \
+                     onFailure=OnFailure(destination=arn:aws:sqs:us-east-1:000000000000:records.fifo))",
+                ),
+            ),
+            (
+                "a FIFO queue on failure, beside an on-success slot cleared with the empty \
+                 destination",
+                Some(config(Some(Some("")), Some(Some(FIFO)))),
+                Some(
+                    "DestinationConfig(onSuccess=OnSuccess(destination=), \
+                     onFailure=OnFailure(destination=arn:aws:sqs:us-east-1:000000000000:records.fifo))",
+                ),
+            ),
+            (
+                "a FIFO queue in both slots",
+                Some(config(Some(Some(FIFO)), Some(Some(FIFO)))),
+                Some(
+                    "DestinationConfig(onSuccess=OnSuccess(destination=arn:aws:sqs:us-east-1:000000000000:records.fifo), \
+                     onFailure=OnFailure(destination=arn:aws:sqs:us-east-1:000000000000:records.fifo))",
+                ),
+            ),
+        ];
+
+        for (case, configuration, rendering) in rows {
+            let message = invalid_destination_config(configuration.as_ref());
+            let expected = rendering
+                .map(|rendering| format!("The provided destination config {rendering} is invalid."));
+            assert_eq!(
+                message, expected,
+                "case {case:?}: expected {expected:?}, got {message:?}"
+            );
+        }
+    }
+
+    /// A `DestinationConfig` stating each slot as given: `None` for a slot the request does
+    /// not state at all, `Some(None)` for a slot stated with no `Destination` member.
+    fn config(
+        on_success: Option<Option<&str>>,
+        on_failure: Option<Option<&str>>,
+    ) -> DestinationConfig {
+        DestinationConfig {
+            on_success: on_success.map(|destination| OnSuccess {
+                destination: destination.map(str::to_string),
+            }),
+            on_failure: on_failure.map(|destination| OnFailure {
+                destination: destination.map(str::to_string),
+            }),
         }
     }
 

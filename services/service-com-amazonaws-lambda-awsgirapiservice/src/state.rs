@@ -365,8 +365,9 @@ pub use layer_authorization::{authorize_layer_access, GET_LAYER_VERSION_ACTION};
 /// hang off the function record this module holds.
 pub mod event_invoke_config;
 pub use event_invoke_config::{
-    configured_function_arn, no_event_invoke_config_message, requested_destinations,
-    unwritable_destination, EventInvokeConfigRecord,
+    configured_function_arn, invalid_destination_config, names_fifo_destination,
+    no_event_invoke_config_message, requested_destinations, unwritable_destination,
+    EventInvokeConfigRecord,
 };
 
 /// A function's DEAD-LETTER TARGET is a destination of that same kind — the one a failed

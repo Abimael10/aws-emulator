@@ -229,9 +229,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )));
         }
 
-        // The same gate the put passes through, on the destinations THIS request names: a
-        // role that may not write one of them names a destination no invocation record
-        // could ever reach, so the configuration is left exactly as it stands.
+        // The same gates the put passes through, on the destinations THIS request names: a
+        // FIFO queue or FIFO topic is not one of the kinds an asynchronous invocation's
+        // record is delivered to, and a role that may not write a destination names one no
+        // record could ever reach — so in both cases the configuration is left exactly as it
+        // stands.
+        if let Some(message) =
+            crate::state::invalid_destination_config(input.destination_config.as_ref())
+        {
+            return Err(invalid_parameter(message));
+        }
         let Some(role) = record.config_of(&qualifier).map(|config| config.role.clone()) else {
             return Err(service_error(
                 "Lambda resolved the function without a configuration to read its execution \
