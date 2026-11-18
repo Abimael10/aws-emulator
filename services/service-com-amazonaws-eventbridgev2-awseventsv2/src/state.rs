@@ -12,13 +12,15 @@
 //! here so every handler reaches one store: [`event_sources`] holds the
 //! EventSource registry and [`subscribers`] the subscriber registry, whose
 //! deliveries are made by [`subscriber_delivery`], and [`resource_policies`]
-//! holds the named policies attached to a bus. [`pagination`] is the one
-//! reading of the page size and the page token every List operation shares, and
-//! the `tags` module resolves one taggable ARN against all three registries,
-//! because tagging spans them.
+//! holds the named policies attached to a bus. [`publishing`] is what the two
+//! publish operations share about an entry they are about to store.
+//! [`pagination`] is the one reading of the page size and the page token every
+//! List operation shares, and the `tags` module resolves one taggable ARN
+//! against all three registries, because tagging spans them.
 
 mod event_sources;
 mod pagination;
+mod publishing;
 mod resource_policies;
 pub mod subscriber_delivery;
 mod subscribers;
@@ -26,6 +28,7 @@ mod tags;
 
 pub use event_sources::*;
 pub use pagination::*;
+pub use publishing::*;
 pub use resource_policies::*;
 pub use subscribers::*;
 
@@ -168,18 +171,18 @@ impl BusLifecycleState {
     }
 }
 
-/// One event accepted by `PutEvents`, kept in publication order on its bus so a
-/// later reader or subscriber slice can consume the log.
+/// One event accepted by a publish — `PutEvents` or `PutRawEvents` — kept in
+/// publication order on its bus so a later reader or subscriber slice can
+/// consume the log.
 #[derive(Debug, Clone)]
 pub struct StoredEvent {
     /// The service-assigned `EventId` reported back for this entry.
     pub event_id: String,
     /// Position of this event in its bus's log, reported as `SequenceNumber`.
     pub sequence_number: u64,
-    pub source: String,
-    pub detail_type: String,
-    pub detail: Option<String>,
-    pub resources: Vec<String>,
+    /// What this event carries, in the form the publish that accepted it sent
+    /// it.
+    pub payload: EventPayload,
     /// When the event occurred: the entry's `Time` when it carried one, else
     /// the instant the service received it.
     pub time: SystemTime,
@@ -192,6 +195,76 @@ pub struct StoredEvent {
     /// `CONTENT_BASED`, otherwise the caller's own `DeduplicationId`.
     pub deduplication_key: Option<String>,
     pub event_group_id: Option<String>,
+}
+
+impl StoredEvent {
+    /// What this event carries when a `PutEvents` entry published it, or `None`
+    /// for one a raw publish did.
+    ///
+    /// The ONE place that reads the structured half of [`EventPayload`] out of
+    /// a stored event, so a reader cannot take a raw event for a structured one
+    /// by reaching for a member it does not have.
+    pub fn structured(&self) -> Option<&StructuredPayload> {
+        match &self.payload {
+            EventPayload::Structured(structured) => Some(structured),
+            EventPayload::Raw(_) => None,
+        }
+    }
+
+    /// What this event carries when a `PutRawEvents` entry published it, or
+    /// `None` for one `PutEvents` did.
+    pub fn raw(&self) -> Option<&RawPayload> {
+        match &self.payload {
+            EventPayload::Raw(raw) => Some(raw),
+            EventPayload::Structured(_) => None,
+        }
+    }
+}
+
+/// What one stored event CARRIES, in the form the publish that accepted it
+/// sent it.
+///
+/// This service publishes an event in two forms and a subscriber reads the same
+/// three parts out of either: `PutEvents` describes the event with a `Source`, a
+/// `DetailType`, `Resources` and a JSON `Detail`, while `PutRawEvents`
+/// "publishes pre-shaped events" — the bytes themselves, the `ContentType`
+/// naming their form, and the metadata the publisher defined. The two forms are
+/// one enum rather than one struct with the other form's members left empty, so
+/// no reader can take a raw event for a structured one.
+#[derive(Debug, Clone)]
+pub enum EventPayload {
+    /// A `PutEvents` entry.
+    Structured(StructuredPayload),
+    /// A `PutRawEvents` entry.
+    Raw(RawPayload),
+}
+
+/// What a `PutEvents` entry carries: the members its publisher described the
+/// event with, kept as sent.
+#[derive(Debug, Clone)]
+pub struct StructuredPayload {
+    pub source: String,
+    pub detail_type: String,
+    /// The entry's `Detail` — "the event payload, as a valid JSON string" — or
+    /// `None` for an entry that published none.
+    pub detail: Option<String>,
+    /// The ARNs of the resources the event concerns, as the entry listed them.
+    pub resources: Vec<String>,
+}
+
+/// What a `PutRawEvents` entry carries: "pre-shaped" bytes, the content type
+/// naming their form, and the metadata the publisher defined.
+#[derive(Debug, Clone)]
+pub struct RawPayload {
+    /// The entry's `Data` — "the event data as a base64-encoded blob. Supports
+    /// binary formats." — held as the BYTES it decoded to, which is what the
+    /// publisher sent.
+    pub data: Vec<u8>,
+    /// The entry's `ContentType`: "content type of the event data".
+    pub content_type: String,
+    /// The entry's own `Metadata` — "metadata key-value pairs you define" — in
+    /// key order, because a map carries no order on the wire.
+    pub metadata: BTreeMap<String, String>,
 }
 
 /// A stored event bus. Every member of `CreateEventBusResponse`,

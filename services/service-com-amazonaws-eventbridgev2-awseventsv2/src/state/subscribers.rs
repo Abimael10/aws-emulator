@@ -91,9 +91,10 @@ pub const FILTER_SCOPE_METADATA: &str = "METADATA";
 pub const FILTER_SCOPE_SYSTEM_METADATA: &str = "SYSTEM_METADATA";
 
 /// `TransformerType::RAW` — the target is handed the event itself, untouched by
-/// any transformation: the envelope EventBridge writes around a published
-/// detail ([`DeliveredEvent::envelope`]), which is also what a subscriber that
-/// configures no transformer hands it. An entry of
+/// any transformation ([`DeliveredEvent::untransformed`]): the envelope
+/// EventBridge writes around a structured entry's detail, or a raw entry's
+/// pre-shaped payload as its publisher sent it. It is also what a subscriber
+/// that configures no transformer hands its target. An entry of
 /// [`crate::ops::types::TRANSFORMER_TYPE_VALUES`].
 pub const TRANSFORMER_TYPE_RAW: &str = "RAW";
 
@@ -142,18 +143,6 @@ const ENVELOPE_RESOURCES: &str = "resources";
 /// publishing entry's `Detail` as a document.
 const ENVELOPE_DETAIL: &str = "detail";
 
-/// The member of a delivered event that carries the service-assigned `EventId`
-/// `PutEvents` reported for it.
-pub const DELIVERED_EVENT_ID: &str = "EventId";
-
-/// The member of a delivered event that carries the `SequenceNumber`
-/// `PutEvents` reported for it.
-pub const DELIVERED_SEQUENCE_NUMBER: &str = "SequenceNumber";
-
-/// The member of a delivered event that carries the ARN of the bus it was
-/// published to.
-pub const DELIVERED_EVENT_BUS_ARN: &str = "EventBusArn";
-
 /// The member of a delivered event that carries the event's payload — the
 /// `DATA` a filter of that scope is matched against.
 pub const DELIVERED_DATA: &str = "Data";
@@ -165,6 +154,36 @@ pub const DELIVERED_METADATA: &str = "Metadata";
 /// The member of a delivered event that carries the event's system metadata —
 /// the `SYSTEM_METADATA` a filter of that scope is matched against.
 pub const DELIVERED_SYSTEM_METADATA: &str = "SystemMetadata";
+
+/// The prefix the SERVICE's own system-metadata members carry, which is
+/// reserved: `EventMetadataKey` admits any key but a publisher's own members
+/// live in `Metadata`, so a member the service stamps onto an event's system
+/// metadata is namespaced and cannot collide with one a publisher sent.
+pub const SYSTEM_METADATA_PREFIX: &str = "aws:";
+
+/// The system-metadata member carrying the `EventId` the publish reported for
+/// this event — the event's identity, as a delivered event carries it.
+pub const SYSTEM_EVENT_ID: &str = "aws:EventId";
+
+/// The system-metadata member carrying the `SequenceNumber` the publish
+/// reported for this event — its position on its bus's log.
+pub const SYSTEM_SEQUENCE_NUMBER: &str = "aws:SequenceNumber";
+
+/// The system-metadata member saying whether this delivery is of an event
+/// published while the subscriber was watching, or of its bus's retained
+/// backlog ([`DELIVERY_TYPE_LIVE`] / [`DELIVERY_TYPE_REPLAY`]).
+pub const SYSTEM_DELIVERY_TYPE: &str = "aws:DeliveryType";
+
+/// The [`SYSTEM_DELIVERY_TYPE`] of a delivery the bus owed as it accepted the
+/// event: the subscriber already existed when the event was received.
+pub const DELIVERY_TYPE_LIVE: &str = "LIVE";
+
+/// The [`SYSTEM_DELIVERY_TYPE`] of a delivery out of the bus's RETAINED log: an
+/// event the bus had already received when the subscriber was created, which a
+/// subscriber reads by starting at a point in time rather than at the end of
+/// the log. A consumer that must not act twice on an event it has seen tells
+/// the two apart by this member.
+pub const DELIVERY_TYPE_REPLAY: &str = "REPLAY";
 
 /// Customer-controlled run state of a stored subscriber, as the
 /// `SubscriberState` enum words it on the wire.
@@ -280,6 +299,22 @@ impl Subscriber {
             .as_ref()
             .and_then(super::from_date_time)
     }
+
+    /// Whether delivering `stored` to this subscriber is LIVE or a REPLAY.
+    ///
+    /// A subscriber is owed the part of its bus's log its `StartingPosition`
+    /// puts it at ([`starting_sequence_number`]), so an event the bus had
+    /// already RECEIVED when the subscriber was created is one out of the
+    /// retained log rather than one the bus owed as it arrived — which is what
+    /// makes that delivery a replay. Everything received while the subscriber
+    /// existed is live, whatever position it started from.
+    pub fn delivery_type(&self, stored: &StoredEvent) -> &'static str {
+        if stored.received_at < self.creation_time {
+            DELIVERY_TYPE_REPLAY
+        } else {
+            DELIVERY_TYPE_LIVE
+        }
+    }
 }
 
 /// The position on `bus`'s log a subscriber created with this starting position
@@ -365,9 +400,9 @@ pub fn new_subscriber_id(seed: u64, now: SystemTime) -> String {
 /// filtering and delivery.
 #[derive(Debug, Clone)]
 pub struct DeliveredEvent {
-    /// The `EventId` `PutEvents` reported for this event.
+    /// The `EventId` the publish reported for this event.
     pub event_id: String,
-    /// The `SequenceNumber` `PutEvents` reported for this event.
+    /// The `SequenceNumber` the publish reported for this event.
     pub sequence_number: u64,
     /// The bus this event was published to.
     pub event_bus_arn: String,
@@ -375,18 +410,14 @@ pub struct DeliveredEvent {
     pub account_id: String,
     /// The region that bus lives in.
     pub region: String,
-    /// The publisher's `Source` for this event.
-    pub source: String,
-    /// The publisher's `DetailType` for this event.
-    pub detail_type: String,
-    /// When the event occurred, as an envelope carries it: the publishing
-    /// entry's `Time`, or the instant the service received the event when the
-    /// entry carried none.
-    pub time: String,
-    /// The ARNs of the resources the event concerns, as the publishing entry
-    /// listed them.
-    pub resources: Vec<String>,
-    /// The event's payload: its `Detail` as a document.
+    /// This event as the service represents it with NO transformation applied,
+    /// as the text a target is handed: for a structured event the envelope this
+    /// service writes around a published payload, and for a raw one the
+    /// pre-shaped payload as its publisher sent it
+    /// ([`crate::state::RawPayload::untransformed_text`]).
+    pub untransformed: String,
+    /// The event's payload: the `DATA` a filter of that scope is matched
+    /// against.
     pub data: ::serde_json::Value,
     /// The metadata the publisher sent with the event.
     pub metadata: ::serde_json::Value,
@@ -394,44 +425,42 @@ pub struct DeliveredEvent {
     pub system_metadata: ::serde_json::Value,
 }
 
-/// Render a stored event as its bus's subscribers see it.
+/// Render a stored event as THIS subscriber sees it — the account and region
+/// are the BUS's, since a subscriber lives in the account and region of the bus
+/// it was created on, and whether the delivery is a replay is decided by where
+/// the event sits relative to the subscriber's own creation
+/// ([`Subscriber::delivery_type`]).
 ///
-/// `Detail` is parsed as a document, because a `DATA`-scoped filter reaches INTO
-/// it and a target is handed it as a document rather than as a quoted string. An
-/// entry that carried no `Detail`, or one whose text is not a document, has an
-/// empty object for its data — the same value a `DATA` clause finds nothing in.
-pub fn delivered_event(
-    event_bus_arn: &str,
-    account_id: &str,
-    region: &str,
-    stored: &StoredEvent,
-) -> DeliveredEvent {
-    let time = to_event_time(stored.time);
-    let resources: Vec<::serde_json::Value> = stored
-        .resources
-        .iter()
-        .map(|resource| ::serde_json::Value::String(resource.clone()))
-        .collect();
-
-    let mut metadata = ::serde_json::Map::new();
-    metadata.insert(
-        SOURCE_METADATA.to_string(),
-        ::serde_json::Value::String(stored.source.clone()),
-    );
-    metadata.insert(
-        DETAIL_TYPE_METADATA.to_string(),
-        ::serde_json::Value::String(stored.detail_type.clone()),
-    );
-    metadata.insert(
-        RESOURCES_METADATA.to_string(),
-        ::serde_json::Value::Array(resources),
-    );
-    metadata.insert(
-        TIME_METADATA.to_string(),
-        ::serde_json::Value::String(time.clone()),
-    );
-
+/// A structured entry's `Detail` is parsed as a document, because a
+/// `DATA`-scoped filter reaches INTO it and a target is handed it as a document
+/// rather than as a quoted string; an entry that carried no `Detail`, or one
+/// whose text is not a document, has an empty object for its data — the same
+/// value a `DATA` clause finds nothing in. A raw entry's parts are read by the
+/// payload itself ([`crate::state::RawPayload`]), which is what knows whether
+/// its bytes are text this service reads or binary it does not.
+pub fn delivered_event(subscriber: &Subscriber, stored: &StoredEvent) -> DeliveredEvent {
+    let account_id = subscriber.account_id.as_str();
+    let region = subscriber.region.as_str();
+    // The system metadata both forms carry: the members
+    // `PutEventsSystemMetadata` and `PutRawEventsSystemMetadata` share, beside
+    // the service's OWN, which travel under the reserved `aws:` prefix so no
+    // publisher-defined member can collide with one.
     let mut system_metadata = ::serde_json::Map::new();
+    system_metadata.insert(
+        SYSTEM_EVENT_ID.to_string(),
+        ::serde_json::Value::String(stored.event_id.clone()),
+    );
+    // `SequenceNumber` is a string on the wire
+    // (`PutEventsResultEntry$SequenceNumber`), so it travels as the same text
+    // the publisher was told.
+    system_metadata.insert(
+        SYSTEM_SEQUENCE_NUMBER.to_string(),
+        ::serde_json::Value::String(stored.sequence_number.to_string()),
+    );
+    system_metadata.insert(
+        SYSTEM_DELIVERY_TYPE.to_string(),
+        ::serde_json::Value::String(subscriber.delivery_type(stored).to_string()),
+    );
     if let Some(group) = &stored.event_group_id {
         system_metadata.insert(
             EVENT_GROUP_ID_METADATA.to_string(),
@@ -445,24 +474,151 @@ pub fn delivered_event(
         );
     }
 
+    let (untransformed, data, metadata) = match &stored.payload {
+        crate::state::EventPayload::Structured(structured) => {
+            let time = to_event_time(stored.time);
+            let data = structured
+                .detail
+                .as_deref()
+                .and_then(|detail| crate::state::json_document(detail.as_bytes()))
+                .unwrap_or_else(|| ::serde_json::Value::Object(::serde_json::Map::new()));
+            let envelope = structured_envelope(
+                &stored.event_id,
+                account_id,
+                region,
+                structured,
+                &time,
+                &data,
+            );
+            (
+                envelope.to_string(),
+                data,
+                structured_metadata(structured, &time),
+            )
+        }
+        crate::state::EventPayload::Raw(raw) => {
+            // "Content type of the event data" is the event's own system
+            // metadata, so a `SYSTEM_METADATA` filter is matched against it and
+            // a delivery that carries the metadata envelope carries it.
+            system_metadata.insert(
+                CONTENT_TYPE_METADATA.to_string(),
+                ::serde_json::Value::String(raw.content_type.clone()),
+            );
+            (
+                raw.untransformed_text(),
+                raw.data_value(),
+                raw.metadata_document(),
+            )
+        }
+    };
+
     DeliveredEvent {
         event_id: stored.event_id.clone(),
         sequence_number: stored.sequence_number,
-        event_bus_arn: event_bus_arn.to_string(),
+        event_bus_arn: subscriber.event_bus_arn.clone(),
         account_id: account_id.to_string(),
         region: region.to_string(),
-        source: stored.source.clone(),
-        detail_type: stored.detail_type.clone(),
-        time,
-        resources: stored.resources.clone(),
-        data: stored
-            .detail
-            .as_deref()
-            .and_then(|detail| ::serde_json::from_str(detail).ok())
-            .unwrap_or_else(|| ::serde_json::Value::Object(::serde_json::Map::new())),
-        metadata: ::serde_json::Value::Object(metadata),
+        untransformed,
+        data,
+        metadata,
         system_metadata: ::serde_json::Value::Object(system_metadata),
     }
+}
+
+/// The metadata of a structured event: the members its publisher described the
+/// event with beside its `Detail`, which are what a `METADATA`-scoped filter of
+/// such an event is matched against.
+fn structured_metadata(
+    structured: &crate::state::StructuredPayload,
+    time: &str,
+) -> ::serde_json::Value {
+    let mut metadata = ::serde_json::Map::new();
+    metadata.insert(
+        SOURCE_METADATA.to_string(),
+        ::serde_json::Value::String(structured.source.clone()),
+    );
+    metadata.insert(
+        DETAIL_TYPE_METADATA.to_string(),
+        ::serde_json::Value::String(structured.detail_type.clone()),
+    );
+    metadata.insert(
+        RESOURCES_METADATA.to_string(),
+        ::serde_json::Value::Array(
+            structured
+                .resources
+                .iter()
+                .map(|resource| ::serde_json::Value::String(resource.clone()))
+                .collect(),
+        ),
+    );
+    metadata.insert(
+        TIME_METADATA.to_string(),
+        ::serde_json::Value::String(time.to_string()),
+    );
+    ::serde_json::Value::Object(metadata)
+}
+
+/// A structured event as EventBridge represents it on the wire: the envelope the
+/// service writes around a published payload.
+///
+/// The envelope is the event ITSELF rather than one shape of a delivery, so
+/// every member of it is the event's own: the envelope's `version` is the one
+/// version an envelope is written at, its `id` is the `EventId` the publish
+/// reported for the event, its `source`, `detail-type`, `resources` and `detail`
+/// are what the publishing entry carried, its `time` is when the event occurred
+/// ("Defaults to the time the service receives the event when omitted" —
+/// `PutEventsRequestEntry$Time`), and its `account` and `region` are the bus's.
+/// An entry that listed no resources carries an empty list, because an event
+/// always concerns a (possibly empty) set of them.
+fn structured_envelope(
+    event_id: &str,
+    account_id: &str,
+    region: &str,
+    structured: &crate::state::StructuredPayload,
+    time: &str,
+    data: &::serde_json::Value,
+) -> ::serde_json::Value {
+    let mut envelope = ::serde_json::Map::new();
+    envelope.insert(
+        ENVELOPE_VERSION.to_string(),
+        ::serde_json::Value::String(ENVELOPE_VERSION_VALUE.to_string()),
+    );
+    envelope.insert(
+        ENVELOPE_ID.to_string(),
+        ::serde_json::Value::String(event_id.to_string()),
+    );
+    envelope.insert(
+        ENVELOPE_DETAIL_TYPE.to_string(),
+        ::serde_json::Value::String(structured.detail_type.clone()),
+    );
+    envelope.insert(
+        ENVELOPE_SOURCE.to_string(),
+        ::serde_json::Value::String(structured.source.clone()),
+    );
+    envelope.insert(
+        ENVELOPE_ACCOUNT.to_string(),
+        ::serde_json::Value::String(account_id.to_string()),
+    );
+    envelope.insert(
+        ENVELOPE_TIME.to_string(),
+        ::serde_json::Value::String(time.to_string()),
+    );
+    envelope.insert(
+        ENVELOPE_REGION.to_string(),
+        ::serde_json::Value::String(region.to_string()),
+    );
+    envelope.insert(
+        ENVELOPE_RESOURCES.to_string(),
+        ::serde_json::Value::Array(
+            structured
+                .resources
+                .iter()
+                .map(|resource| ::serde_json::Value::String(resource.clone()))
+                .collect(),
+        ),
+    );
+    envelope.insert(ENVELOPE_DETAIL.to_string(), data.clone());
+    ::serde_json::Value::Object(envelope)
 }
 
 /// The metadata member carrying a structured entry's `Source`.
@@ -478,12 +634,16 @@ const RESOURCES_METADATA: &str = "Resources";
 const TIME_METADATA: &str = "Time";
 
 /// The system-metadata member carrying an entry's `EventGroupId`, as
-/// `PutEventsSystemMetadata` names it.
+/// `PutEventsSystemMetadata` and `PutRawEventsSystemMetadata` both name it.
 const EVENT_GROUP_ID_METADATA: &str = "EventGroupId";
 
 /// The system-metadata member carrying an entry's `DeduplicationId`, as
-/// `PutEventsSystemMetadata` names it.
+/// `PutEventsSystemMetadata` and `PutRawEventsSystemMetadata` both name it.
 const DEDUPLICATION_ID_METADATA: &str = "DeduplicationId";
+
+/// The system-metadata member carrying a raw entry's `ContentType`, as
+/// `PutRawEventsSystemMetadata` names it.
+const CONTENT_TYPE_METADATA: &str = "ContentType";
 
 impl DeliveredEvent {
     /// The part of this event a filter of `scope` is matched against, or `None`
@@ -498,83 +658,18 @@ impl DeliveredEvent {
         }
     }
 
-    /// This event as EventBridge represents it on the wire: the envelope the
-    /// service writes around a published payload.
+    /// This event inside the METADATA ENVELOPE a `WITH_METADATA` transformer
+    /// names — "deliver the event with metadata envelope" — which is the three
+    /// parts this service models an event as: the publisher's metadata, the
+    /// event's system metadata and its payload.
     ///
-    /// The envelope is the event ITSELF rather than one shape of a delivery, so
-    /// every member of it is the event's own: the envelope's `version` is the
-    /// one version an envelope is written at, its `id` is the `EventId`
-    /// `PutEvents` reported for the event, its `source`, `detail-type`,
-    /// `resources` and `detail` are what the publishing entry carried, its
-    /// `time` is when the event occurred ("Defaults to the time the service
-    /// receives the event when omitted" — `PutEventsRequestEntry$Time`), and
-    /// its `account` and `region` are the bus's. An entry that listed no
-    /// resources carries an empty list, because an event always concerns a
-    /// (possibly empty) set of them.
-    pub fn envelope(&self) -> ::serde_json::Value {
-        let mut envelope = ::serde_json::Map::new();
-        envelope.insert(
-            ENVELOPE_VERSION.to_string(),
-            ::serde_json::Value::String(ENVELOPE_VERSION_VALUE.to_string()),
-        );
-        envelope.insert(
-            ENVELOPE_ID.to_string(),
-            ::serde_json::Value::String(self.event_id.clone()),
-        );
-        envelope.insert(
-            ENVELOPE_DETAIL_TYPE.to_string(),
-            ::serde_json::Value::String(self.detail_type.clone()),
-        );
-        envelope.insert(
-            ENVELOPE_SOURCE.to_string(),
-            ::serde_json::Value::String(self.source.clone()),
-        );
-        envelope.insert(
-            ENVELOPE_ACCOUNT.to_string(),
-            ::serde_json::Value::String(self.account_id.clone()),
-        );
-        envelope.insert(
-            ENVELOPE_TIME.to_string(),
-            ::serde_json::Value::String(self.time.clone()),
-        );
-        envelope.insert(
-            ENVELOPE_REGION.to_string(),
-            ::serde_json::Value::String(self.region.clone()),
-        );
-        envelope.insert(
-            ENVELOPE_RESOURCES.to_string(),
-            ::serde_json::Value::Array(
-                self.resources
-                    .iter()
-                    .map(|resource| ::serde_json::Value::String(resource.clone()))
-                    .collect(),
-            ),
-        );
-        envelope.insert(ENVELOPE_DETAIL.to_string(), self.data.clone());
-        ::serde_json::Value::Object(envelope)
-    }
-
-    /// This event inside this service's OWN metadata envelope — the shape a
-    /// `WITH_METADATA` transformer names: its identity and its position on its
-    /// bus's log, the publisher's metadata, its system metadata and its
-    /// payload, which are the three parts this service models an event as.
+    /// The envelope carries those three and nothing else: a `WITH_METADATA`
+    /// delivery recorded against the real service holds exactly `Data`,
+    /// `Metadata` and `SystemMetadata`, so the event's own identity travels in
+    /// the system metadata the publisher sent rather than as members beside
+    /// them.
     pub fn document(&self) -> ::serde_json::Value {
         let mut document = ::serde_json::Map::new();
-        document.insert(
-            DELIVERED_EVENT_ID.to_string(),
-            ::serde_json::Value::String(self.event_id.clone()),
-        );
-        // `SequenceNumber` is a string on the wire
-        // (`PutEventsResultEntry$SequenceNumber`), so it travels as the same
-        // text the publisher was told.
-        document.insert(
-            DELIVERED_SEQUENCE_NUMBER.to_string(),
-            ::serde_json::Value::String(self.sequence_number.to_string()),
-        );
-        document.insert(
-            DELIVERED_EVENT_BUS_ARN.to_string(),
-            ::serde_json::Value::String(self.event_bus_arn.clone()),
-        );
         document.insert(DELIVERED_METADATA.to_string(), self.metadata.clone());
         document.insert(
             DELIVERED_SYSTEM_METADATA.to_string(),
@@ -677,24 +772,23 @@ pub fn filter_configuration_fault(configuration: &FilterConfiguration) -> Option
 /// did not produce.
 ///
 /// `Transformer$Type` names the shape of that text. `RAW` — "Deliver the raw
-/// event payload" — hands the target the event UNTRANSFORMED, which is the
-/// envelope this service writes around a published payload
-/// ([`DeliveredEvent::envelope`]) rather than the payload stripped out of it;
-/// that is also what a subscriber configuring no transformer hands its target,
-/// since a subscriber that asked for no transformation gets none.
-/// `WITH_METADATA` hands it the event inside this service's own metadata
+/// event payload" — hands the target the event UNTRANSFORMED
+/// ([`DeliveredEvent::untransformed`]): the envelope this service writes around
+/// a structured entry's payload, and a raw entry's pre-shaped payload as its
+/// publisher sent it. That is also what a subscriber configuring no transformer
+/// hands its target, since a subscriber that asked for no transformation gets
+/// none. `WITH_METADATA` hands it the event inside this service's own metadata
 /// envelope ([`DeliveredEvent::document`]), which carries the event's position
-/// on its bus's log and its system metadata beside the parts the envelope
-/// already names. `JSONATA` names a transformation computed by an expression;
-/// this slice performs none, so a subscriber configuring it delivers nothing
-/// here.
+/// on its bus's log and its system metadata beside the parts the event already
+/// names. `JSONATA` names a transformation computed by an expression; this slice
+/// performs none, so a subscriber configuring it delivers nothing here.
 pub fn delivered_body(subscriber: &Subscriber, event: &DeliveredEvent) -> Option<String> {
     let transformer_type = subscriber
         .transformer
         .as_ref()
         .and_then(|transformer| transformer.r#type.as_deref());
     match transformer_type {
-        None | Some(TRANSFORMER_TYPE_RAW) => Some(event.envelope().to_string()),
+        None | Some(TRANSFORMER_TYPE_RAW) => Some(event.untransformed.clone()),
         Some(TRANSFORMER_TYPE_WITH_METADATA) => Some(event.document().to_string()),
         Some(_) => None,
     }

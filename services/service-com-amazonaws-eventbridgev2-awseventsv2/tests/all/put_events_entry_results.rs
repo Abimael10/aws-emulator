@@ -1,9 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! What one `PutEvents` batch answers per entry, and how every bus-addressed
+//! What one publish batch answers per entry, and how every bus-addressed
 //! operation reports a bus that is not there.
 //!
-//! Two rules, each driven over a table rather than over one recorded request:
+//! Two rules, each driven over a table rather than over one recorded request,
+//! and the first over BOTH publish operations — `PutEvents`, whose entries
+//! carry a JSON `Detail`, and `PutRawEvents`, whose entries carry pre-shaped
+//! bytes and the `ContentType` that says what they are:
 //!
 //! * every request entry is read against the constraints its own members
 //!   document BEFORE the event is stored, and an entry that breaks one is
@@ -30,11 +33,14 @@ use eventsv2::ops::create_subscriber::{CreateSubscriber, CreateSubscriberErrorMo
 use eventsv2::ops::delete_event_bus::{DeleteEventBus, DeleteEventBusErrorModeled};
 use eventsv2::ops::describe_event_bus::{DescribeEventBus, DescribeEventBusErrorModeled};
 use eventsv2::ops::put_events::{PutEvents, PutEventsErrorModeled};
+use eventsv2::ops::put_raw_events::{PutRawEvents, PutRawEventsErrorModeled};
 use eventsv2::ops::types::{
     AwsServiceEventsSourceConfiguration, CreateEventBusInput, CreateEventSourceInput,
-    CreateSubscriberInput, DeleteEventBusInput, DescribeEventBusInput, DescribeEventBusOutput,
-    EventSourceConfiguration, InvokeConfiguration, PutEventsInput, PutEventsOutput,
-    PutEventsRequestEntry, PutEventsResultEntry,
+    CreateSubscriberInput, DeduplicationConfiguration, DeleteEventBusInput, DescribeEventBusInput,
+    DescribeEventBusOutput, EventSourceConfiguration, InvokeConfiguration, PutEventsInput,
+    PutEventsOutput, PutEventsRequestEntry, PutEventsResultEntry, PutRawEventsInput,
+    PutRawEventsOutput, PutRawEventsRequestEntry, PutRawEventsResultEntry,
+    PutRawEventsSystemMetadata, SchemaRegistryConfiguration,
 };
 use eventsv2::scaffolded::Scaffolded;
 use service_com_amazonaws_eventbridgev2_awseventsv2 as eventsv2;
@@ -117,6 +123,15 @@ impl Harness {
         input: PutEventsInput,
     ) -> Result<PutEventsOutput, eventsv2::ops::put_events::PutEventsError> {
         PutEvents::new(Arc::clone(&self.engine))
+            .handle(input, &self.ctx())
+            .await
+    }
+
+    async fn put_raw_events(
+        &self,
+        input: PutRawEventsInput,
+    ) -> Result<PutRawEventsOutput, eventsv2::ops::put_raw_events::PutRawEventsError> {
+        PutRawEvents::new(Arc::clone(&self.engine))
             .handle(input, &self.ctx())
             .await
     }
@@ -345,9 +360,45 @@ fn is_hyphenated_uuid(value: &str) -> bool {
             .all(|group| group.chars().all(|c| matches!(c, '0'..='9' | 'a'..='f')))
 }
 
+/// One answered result entry, read out of EITHER publish operation's result
+/// shape: `PutEventsResultEntry` and `PutRawEventsResultEntry` carry the same
+/// five members, so one set of assertions serves both.
+#[derive(Debug)]
+struct Answered {
+    event_id: Option<String>,
+    sequence_number: Option<String>,
+    success_code: Option<String>,
+    error_code: Option<String>,
+    error_message: Option<String>,
+}
+
+impl From<&PutEventsResultEntry> for Answered {
+    fn from(entry: &PutEventsResultEntry) -> Self {
+        Self {
+            event_id: entry.event_id.clone(),
+            sequence_number: entry.sequence_number.clone(),
+            success_code: entry.success_code.clone(),
+            error_code: entry.error_code.clone(),
+            error_message: entry.error_message.clone(),
+        }
+    }
+}
+
+impl From<&PutRawEventsResultEntry> for Answered {
+    fn from(entry: &PutRawEventsResultEntry) -> Self {
+        Self {
+            event_id: entry.event_id.clone(),
+            sequence_number: entry.sequence_number.clone(),
+            success_code: entry.success_code.clone(),
+            error_code: entry.error_code.clone(),
+            error_message: entry.error_message.clone(),
+        }
+    }
+}
+
 /// Assert one answered result against what its row owes, whatever position of
 /// whatever batch it came back in.
-fn assert_result(case: &str, expected: Expected, answered: &PutEventsResultEntry) {
+fn assert_result(case: &str, expected: Expected, answered: &Answered) {
     match expected {
         Expected::Published => {
             let event_id = answered.event_id.as_deref().unwrap_or_else(|| {
@@ -432,7 +483,7 @@ async fn each_entry_is_answered_in_its_own_position_and_counted() {
         answered.len()
     );
     for (position, (case, _, _, expected)) in rows.iter().enumerate() {
-        assert_result(case, *expected, &answered[position]);
+        assert_result(case, *expected, &Answered::from(&answered[position]));
     }
     let refused = rows
         .iter()
@@ -471,7 +522,8 @@ async fn each_entry_is_answered_in_its_own_position_and_counted() {
         let stored: Vec<(String, Option<String>)> = bus
             .events
             .iter()
-            .map(|event| (event.source.clone(), event.detail.clone()))
+            .filter_map(|event| event.structured())
+            .map(|structured| (structured.source.clone(), structured.detail.clone()))
             .collect();
         assert_eq!(
             stored, published,
@@ -497,11 +549,640 @@ async fn each_entry_is_answered_in_its_own_position_and_counted() {
             1,
             "case {case:?}: one result per request entry, got {answered:?}"
         );
-        assert_result(case, expected, &answered[0]);
+        assert_result(case, expected, &Answered::from(&answered[0]));
         assert_eq!(
             answer.failed_entry_count,
             i32::from(expected != Expected::Published),
             "case {case:?}: FailedEntryCount must agree with the single result, got {answer:?}"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Rule 1 again, for the RAW publish
+// ---------------------------------------------------------------------------
+
+/// The refusal of a raw entry whose `Data` is not the form its own
+/// `ContentType` declares.
+const MALFORMED_DATA: Expected = Expected::Refused {
+    error_code: "MalformedData",
+    error_message: "Data is not valid JSON",
+};
+
+/// One row per raw entry the class spans: the `ContentType` the entry declares,
+/// the `Data` it carries, and what the service owes for it.
+struct RawRow {
+    case: &'static str,
+    content_type: &'static str,
+    data: &'static [u8],
+    expected: Expected,
+}
+
+/// The refusal of an open-format entry a request named no schema registry for.
+/// The message names the content type that needs one, so each row states its
+/// own.
+const fn needs_registry(content_type: &'static str, message: &'static str) -> RawRow {
+    RawRow {
+        case: content_type,
+        content_type,
+        // Bytes of an encoded record, which no reader of this service parses:
+        // the entry is refused for the registry its format needs, whatever the
+        // bytes are.
+        data: &[0x4F, 0x62, 0x6A, 0x01],
+        expected: Expected::Refused {
+            error_code: "ValidationError",
+            error_message: message,
+        },
+    }
+}
+
+/// The rows of the raw table: they differ along the CONTENT TYPE the entry
+/// declares (the JSON media type, a `+json` structured-syntax suffix, a media
+/// type carrying parameters, binary, text that is neither, and both open
+/// formats) and along the FORM and SIZE of the bytes it carries.
+///
+/// The content types come from `PutRawEventsSystemMetadata$ContentType`'s own
+/// documentation ("Content type of the event data (e.g.,
+/// \"application/cloudevents+json\")") and from `SchemaRegistryConfiguration`'s
+/// ("settings used to encode open-format (Avro/Protobuf) events"), which is what
+/// makes Avro and Protobuf the formats that need a registry.
+fn raw_rows() -> Vec<RawRow> {
+    vec![
+        RawRow {
+            case: "a JSON object under the JSON media type",
+            content_type: "application/json",
+            data: br#"{"orderId":"A-1","total":42}"#,
+            expected: Expected::Published,
+        },
+        RawRow {
+            case: "a JSON array, which is a JSON document too",
+            content_type: "application/json",
+            data: b"[1,2,3]",
+            expected: Expected::Published,
+        },
+        RawRow {
+            case: "a CloudEvents document under the +json suffix",
+            content_type: "application/cloudevents+json",
+            data: br#"{"specversion":"1.0","type":"com.example.order"}"#,
+            expected: Expected::Published,
+        },
+        RawRow {
+            case: "a JSON media type carrying parameters",
+            content_type: "application/json; charset=utf-8",
+            data: br#"{"a":1}"#,
+            expected: Expected::Published,
+        },
+        RawRow {
+            case: "the JSON encoding of an open format, which needs no registry",
+            content_type: "application/avro+json",
+            data: br#"{"name":"A-1"}"#,
+            expected: Expected::Published,
+        },
+        RawRow {
+            case: "a subtype that merely contains an open format's name",
+            content_type: "application/vnd.avrolike+json",
+            data: br#"{"name":"A-1"}"#,
+            expected: Expected::Published,
+        },
+        RawRow {
+            case: "bytes that are no text, under the binary media type",
+            content_type: "application/octet-stream",
+            data: &[0x00, 0x01, 0xFE, 0xFF],
+            expected: Expected::Published,
+        },
+        RawRow {
+            case: "no bytes at all, under the binary media type",
+            content_type: "application/octet-stream",
+            data: b"",
+            expected: Expected::Published,
+        },
+        RawRow {
+            case: "text of a media type this service does not read",
+            content_type: "application/xml",
+            data: b"<order><id>A-1</id></order>",
+            expected: Expected::Published,
+        },
+        RawRow {
+            case: "a truncated document under the JSON media type",
+            content_type: "application/json",
+            data: br#"{"a":1"#,
+            expected: MALFORMED_DATA,
+        },
+        RawRow {
+            case: "two documents in one payload",
+            content_type: "application/json",
+            data: b"{} {}",
+            expected: MALFORMED_DATA,
+        },
+        RawRow {
+            case: "bytes that are no UTF-8 text, under the JSON media type",
+            content_type: "application/json",
+            data: &[0xFF, 0xFE, 0x00],
+            expected: MALFORMED_DATA,
+        },
+        RawRow {
+            case: "no bytes at all, under the JSON media type",
+            content_type: "application/json",
+            data: b"",
+            expected: MALFORMED_DATA,
+        },
+        RawRow {
+            case: "text that is no document, under the +json suffix",
+            content_type: "application/cloudevents+json",
+            data: b"not json",
+            expected: MALFORMED_DATA,
+        },
+        needs_registry(
+            "application/avro",
+            "SchemaRegistryConfiguration is required for an entry whose ContentType is \
+             application/avro",
+        ),
+        needs_registry(
+            "application/vnd.apache.avro+binary",
+            "SchemaRegistryConfiguration is required for an entry whose ContentType is \
+             application/vnd.apache.avro+binary",
+        ),
+        needs_registry(
+            "application/x-protobuf",
+            "SchemaRegistryConfiguration is required for an entry whose ContentType is \
+             application/x-protobuf",
+        ),
+    ]
+}
+
+/// One raw request entry carrying `content_type` and `data`, and one metadata
+/// pair so the publisher's own metadata travels with every row.
+fn raw_entry(content_type: &str, data: &[u8]) -> PutRawEventsRequestEntry {
+    PutRawEventsRequestEntry {
+        data: data.to_vec(),
+        metadata: Some(
+            [("tenant".to_string(), "acme".to_string())]
+                .into_iter()
+                .collect(),
+        ),
+        system_metadata: PutRawEventsSystemMetadata {
+            content_type: content_type.to_string(),
+            ..Default::default()
+        },
+    }
+}
+
+/// RULE: each `PutRawEvents` entry is read against the form its own
+/// `ContentType` declares, and against the schema registry that format needs,
+/// BEFORE the event is stored; an entry that breaks one of those is refused in
+/// its own position with that class's `ErrorCode` and `ErrorMessage` and none of
+/// the success half, an accepted entry carries a hyphenated-UUID `EventId`, and
+/// `FailedEntryCount` is the number of refused entries — whatever the mix of
+/// entries in the batch.
+#[tokio::test]
+async fn each_raw_entry_is_answered_in_its_own_position_and_counted() {
+    let harness = Harness::new();
+    let rows = raw_rows();
+
+    // Every row at once, so the positional alignment and the count are read off
+    // ONE mixed batch.
+    let batched = harness.active_bus("raw-batched-bus").await;
+    let answer = harness
+        .put_raw_events(PutRawEventsInput {
+            event_bus_arn: batched.clone(),
+            entries: rows
+                .iter()
+                .map(|row| raw_entry(row.content_type, row.data))
+                .collect(),
+            ..Default::default()
+        })
+        .await
+        .expect("case \"mixed raw batch\": PutRawEvents answers 200 whatever its entries carry");
+    let answered = answer.entries.clone().unwrap_or_default();
+    assert_eq!(
+        answered.len(),
+        rows.len(),
+        "case \"mixed raw batch\": one result per request entry, got {answered:?}"
+    );
+    for (position, row) in rows.iter().enumerate() {
+        assert_result(row.case, row.expected, &Answered::from(&answered[position]));
+    }
+    let refused = rows
+        .iter()
+        .filter(|row| row.expected != Expected::Published)
+        .count();
+    assert_eq!(
+        usize::try_from(answer.failed_entry_count).unwrap_or(usize::MAX),
+        refused,
+        "case \"mixed raw batch\": FailedEntryCount must count the refused entries, got {}",
+        answer.failed_entry_count
+    );
+
+    // A refused entry is not stored: the log holds exactly the accepted entries'
+    // bytes and content types, in request order, as they were sent.
+    let accepted: Vec<(String, Vec<u8>)> = rows
+        .iter()
+        .filter(|row| row.expected == Expected::Published)
+        .map(|row| (row.content_type.to_string(), row.data.to_vec()))
+        .collect();
+    {
+        let store = harness.store();
+        let state = store.lock();
+        let bus = state
+            .event_buses
+            .get(&batched)
+            .expect("the bus is in the store");
+        let stored: Vec<(String, Vec<u8>)> = bus
+            .events
+            .iter()
+            .filter_map(|event| event.raw())
+            .map(|raw| (raw.content_type.clone(), raw.data.clone()))
+            .collect();
+        assert_eq!(
+            stored, accepted,
+            "case \"mixed raw batch\": the log must hold exactly the accepted entries as sent, \
+             got {stored:?}"
+        );
+        // And the publisher's own metadata is stored with each of them.
+        for event in bus.events.iter().filter_map(|event| event.raw()) {
+            assert_eq!(
+                event.metadata.get("tenant").map(String::as_str),
+                Some("acme"),
+                "case \"mixed raw batch\": the publisher's Metadata must be stored, got {:?}",
+                event.metadata
+            );
+        }
+    }
+
+    // The same rows one entry at a time, so neither the position nor the count
+    // depends on what else the batch carried.
+    let single = harness.active_bus("raw-single-entry-bus").await;
+    for row in raw_rows() {
+        let answer = harness
+            .put_raw_events(PutRawEventsInput {
+                event_bus_arn: single.clone(),
+                entries: vec![raw_entry(row.content_type, row.data)],
+                ..Default::default()
+            })
+            .await
+            .unwrap_or_else(|e| {
+                panic!("case {:?}: PutRawEvents must answer 200, got {e:?}", row.case)
+            });
+        let answered = answer.entries.clone().unwrap_or_default();
+        assert_eq!(
+            answered.len(),
+            1,
+            "case {:?}: one result per request entry, got {answered:?}",
+            row.case
+        );
+        assert_result(row.case, row.expected, &Answered::from(&answered[0]));
+        assert_eq!(
+            answer.failed_entry_count,
+            i32::from(row.expected != Expected::Published),
+            "case {:?}: FailedEntryCount must agree with the single result, got {answer:?}",
+            row.case
+        );
+    }
+}
+
+/// RULE: a `SchemaRegistryConfiguration` is read only for the entries that need
+/// one — "required for open-format entries; ignored for JSON entries" — and a
+/// batch this service cannot encode against the registry it names leaves the
+/// log exactly as it was, rather than half published.
+#[tokio::test]
+async fn a_schema_registry_is_read_only_for_the_entries_that_need_one() {
+    let harness = Harness::new();
+    let bus = harness.active_bus("registry-bus").await;
+    let registry = SchemaRegistryConfiguration {
+        registry_uri: format!("arn:aws:glue:{REGION}:{ACCOUNT}:registry/orders"),
+        confluent_public_registry_configuration: None,
+    };
+
+    // A batch of JSON entries ignores the registry it names: the entries are
+    // published and the log holds them.
+    let answer = harness
+        .put_raw_events(PutRawEventsInput {
+            event_bus_arn: bus.clone(),
+            entries: vec![
+                raw_entry("application/json", br#"{"a":1}"#),
+                raw_entry("application/cloudevents+json", br#"{"specversion":"1.0"}"#),
+            ],
+            schema_registry_configuration: Some(registry.clone()),
+            ..Default::default()
+        })
+        .await
+        .expect("case \"json entries\": a registry is ignored for JSON entries");
+    assert_eq!(
+        answer.failed_entry_count, 0,
+        "case \"json entries\": every JSON entry must be accepted, got {answer:?}"
+    );
+
+    let stored_before = harness
+        .store()
+        .lock()
+        .event_buses
+        .get(&bus)
+        .map_or(0, |held| held.events.len());
+    assert_eq!(
+        stored_before, 2,
+        "case \"json entries\": the log must hold both published entries, got {stored_before}"
+    );
+
+    // An open-format entry needs that registry READ, and this emulator reaches
+    // no registry outside itself: the modelled 400 is answered for the whole
+    // batch and nothing of it is stored.
+    let error = harness
+        .put_raw_events(PutRawEventsInput {
+            event_bus_arn: bus.clone(),
+            entries: vec![
+                raw_entry("application/json", br#"{"a":2}"#),
+                raw_entry("application/avro", &[0x4F, 0x62, 0x6A, 0x01]),
+            ],
+            schema_registry_configuration: Some(registry.clone()),
+            ..Default::default()
+        })
+        .await
+        .expect_err("case \"open format\": an entry needing the registry must be refused");
+    assert_eq!(
+        (error.shape_name(), error.http_status()),
+        ("SchemaRegistryUnavailableException", 400),
+        "case \"open format\": expected the modelled registry failure, got {error:?}"
+    );
+    let message = match error {
+        Scaffolded::Modeled(PutRawEventsErrorModeled::SchemaRegistryUnavailableException(
+            unavailable,
+        )) => unavailable.message.unwrap_or_default(),
+        other => panic!("case \"open format\": PutRawEvents answered {other:?}"),
+    };
+    assert!(
+        message.contains(&registry.registry_uri),
+        "case \"open format\": the refusal must name the registry it could not reach, got \
+         {message:?}"
+    );
+
+    let stored_after = harness
+        .store()
+        .lock()
+        .event_buses
+        .get(&bus)
+        .map_or(0, |held| held.events.len());
+    assert_eq!(
+        stored_after, stored_before,
+        "case \"open format\": a refused batch must store nothing, got {stored_after}"
+    );
+}
+
+/// One row of the raw deduplication table: what the batch asks for and what the
+/// second publish of each pair owes.
+struct DeduplicationRow {
+    case: &'static str,
+    /// Whether the request asks for `CONTENT_BASED` deduplication.
+    content_based: bool,
+    /// The first entry: content type, data, metadata pair, deduplication token.
+    first: RawEntrySpec,
+    /// The second entry, published in a second request.
+    second: RawEntrySpec,
+    /// Whether the second publish must be reported DEDUPLICATED against the
+    /// first rather than published again.
+    deduplicated: bool,
+}
+
+/// What one raw entry of the deduplication table carries.
+struct RawEntrySpec {
+    content_type: &'static str,
+    data: &'static [u8],
+    metadata: &'static [(&'static str, &'static str)],
+    deduplication_id: Option<&'static str>,
+}
+
+/// RULE: an entry whose deduplication key is already on the bus is reported
+/// DEDUPLICATED against the event that first carried it and is not stored a
+/// second time; the key is a digest of the event CONTENT under `CONTENT_BASED`
+/// and the caller's own `DeduplicationId` otherwise.
+///
+/// The rows differ along which key the request deduplicates by and along what
+/// the second entry changes: nothing, the bytes, the publisher's metadata, the
+/// content type, or the token.
+#[tokio::test]
+async fn a_raw_entry_already_on_the_bus_is_deduplicated_rather_than_republished() {
+    const PAYLOAD: &[u8] = br#"{"orderId":"A-1"}"#;
+    const OTHER_PAYLOAD: &[u8] = br#"{"orderId":"A-2"}"#;
+    const ONE_TENANT: &[(&str, &str)] = &[("tenant", "acme")];
+    const OTHER_TENANT: &[(&str, &str)] = &[("tenant", "globex")];
+
+    let rows = [
+        DeduplicationRow {
+            case: "content-based: the same bytes, content type and metadata",
+            content_based: true,
+            first: RawEntrySpec {
+                content_type: "application/json",
+                data: PAYLOAD,
+                metadata: ONE_TENANT,
+                deduplication_id: None,
+            },
+            second: RawEntrySpec {
+                content_type: "application/json",
+                data: PAYLOAD,
+                metadata: ONE_TENANT,
+                deduplication_id: None,
+            },
+            deduplicated: true,
+        },
+        DeduplicationRow {
+            case: "content-based: different bytes",
+            content_based: true,
+            first: RawEntrySpec {
+                content_type: "application/json",
+                data: PAYLOAD,
+                metadata: ONE_TENANT,
+                deduplication_id: None,
+            },
+            second: RawEntrySpec {
+                content_type: "application/json",
+                data: OTHER_PAYLOAD,
+                metadata: ONE_TENANT,
+                deduplication_id: None,
+            },
+            deduplicated: false,
+        },
+        DeduplicationRow {
+            case: "content-based: the same bytes under different metadata",
+            content_based: true,
+            first: RawEntrySpec {
+                content_type: "application/json",
+                data: PAYLOAD,
+                metadata: ONE_TENANT,
+                deduplication_id: None,
+            },
+            second: RawEntrySpec {
+                content_type: "application/json",
+                data: PAYLOAD,
+                metadata: OTHER_TENANT,
+                deduplication_id: None,
+            },
+            deduplicated: false,
+        },
+        DeduplicationRow {
+            case: "content-based: the same bytes under a different content type",
+            content_based: true,
+            first: RawEntrySpec {
+                content_type: "application/json",
+                data: PAYLOAD,
+                metadata: ONE_TENANT,
+                deduplication_id: None,
+            },
+            second: RawEntrySpec {
+                content_type: "application/octet-stream",
+                data: PAYLOAD,
+                metadata: ONE_TENANT,
+                deduplication_id: None,
+            },
+            deduplicated: false,
+        },
+        DeduplicationRow {
+            case: "a caller token repeated, with different bytes",
+            content_based: false,
+            first: RawEntrySpec {
+                content_type: "application/json",
+                data: PAYLOAD,
+                metadata: ONE_TENANT,
+                deduplication_id: Some("token-1"),
+            },
+            second: RawEntrySpec {
+                content_type: "application/json",
+                data: OTHER_PAYLOAD,
+                metadata: ONE_TENANT,
+                deduplication_id: Some("token-1"),
+            },
+            deduplicated: true,
+        },
+        DeduplicationRow {
+            case: "a fresh caller token, with the same bytes",
+            content_based: false,
+            first: RawEntrySpec {
+                content_type: "application/json",
+                data: PAYLOAD,
+                metadata: ONE_TENANT,
+                deduplication_id: Some("token-1"),
+            },
+            second: RawEntrySpec {
+                content_type: "application/json",
+                data: PAYLOAD,
+                metadata: ONE_TENANT,
+                deduplication_id: Some("token-2"),
+            },
+            deduplicated: false,
+        },
+        DeduplicationRow {
+            case: "no deduplication asked for at all: the same bytes twice",
+            content_based: false,
+            first: RawEntrySpec {
+                content_type: "application/json",
+                data: PAYLOAD,
+                metadata: ONE_TENANT,
+                deduplication_id: None,
+            },
+            second: RawEntrySpec {
+                content_type: "application/json",
+                data: PAYLOAD,
+                metadata: ONE_TENANT,
+                deduplication_id: None,
+            },
+            deduplicated: false,
+        },
+    ];
+
+    let harness = Harness::new();
+    for (index, row) in rows.iter().enumerate() {
+        let case = row.case;
+        // Its own bus per row, because a deduplication index belongs to the bus
+        // the entries were published to.
+        let bus = harness.active_bus(&format!("dedup-bus-{index}")).await;
+        let configuration = row.content_based.then(|| DeduplicationConfiguration {
+            deduplication_type: "CONTENT_BASED".to_string(),
+        });
+
+        let mut reported = Vec::new();
+        for spec in [&row.first, &row.second] {
+            let answer = harness
+                .put_raw_events(PutRawEventsInput {
+                    event_bus_arn: bus.clone(),
+                    entries: vec![PutRawEventsRequestEntry {
+                        data: spec.data.to_vec(),
+                        metadata: Some(
+                            spec.metadata
+                                .iter()
+                                .map(|(name, value)| ((*name).to_string(), (*value).to_string()))
+                                .collect(),
+                        ),
+                        system_metadata: PutRawEventsSystemMetadata {
+                            content_type: spec.content_type.to_string(),
+                            deduplication_id: spec.deduplication_id.map(str::to_string),
+                            event_group_id: None,
+                        },
+                    }],
+                    deduplication_configuration: configuration.clone(),
+                    ..Default::default()
+                })
+                .await
+                .unwrap_or_else(|e| panic!("case {case:?}: PutRawEvents must answer 200, got {e:?}"));
+            assert_eq!(
+                answer.failed_entry_count, 0,
+                "case {case:?}: a well-formed entry must be accepted, got {answer:?}"
+            );
+            let entry = answer
+                .entries
+                .clone()
+                .unwrap_or_default()
+                .into_iter()
+                .next()
+                .unwrap_or_else(|| panic!("case {case:?}: PutRawEvents reported no entry"));
+            reported.push(entry);
+        }
+
+        let expected_code = if row.deduplicated {
+            "DEDUPLICATED"
+        } else {
+            "PUBLISHED"
+        };
+        assert_eq!(
+            reported[1].success_code.as_deref(),
+            Some(expected_code),
+            "case {case:?}: expected SuccessCode {expected_code:?} for the second publish, got {:?}",
+            reported[1]
+        );
+        if row.deduplicated {
+            // A deduplicated entry is reported against the event that first
+            // carried the key, so it names that event's identity and position.
+            assert_eq!(
+                (
+                    reported[1].event_id.as_deref(),
+                    reported[1].sequence_number.as_deref()
+                ),
+                (
+                    reported[0].event_id.as_deref(),
+                    reported[0].sequence_number.as_deref()
+                ),
+                "case {case:?}: a deduplicated entry must name the first event, got {:?}",
+                reported[1]
+            );
+        } else {
+            assert_ne!(
+                reported[1].event_id.as_deref(),
+                reported[0].event_id.as_deref(),
+                "case {case:?}: a published entry must carry its own EventId, got {:?}",
+                reported[1]
+            );
+        }
+
+        // And the log holds one event per PUBLISHED entry and no more.
+        let expected_stored = if row.deduplicated { 1 } else { 2 };
+        let stored = {
+            let store = harness.store();
+            let state = store.lock();
+            state
+                .event_buses
+                .get(&bus)
+                .map_or(0, |stored_bus| stored_bus.events.len())
+        };
+        assert_eq!(
+            stored, expected_stored,
+            "case {case:?}: expected {expected_stored} stored event(s), got {stored}"
         );
     }
 }
@@ -545,6 +1226,26 @@ async fn not_found_messages(harness: &Harness, case: &str, arn: &str) -> Vec<(&'
                 not_found.message.unwrap_or_default()
             }
             other => panic!("case {case:?}: PutEvents answered {other:?}"),
+        },
+    ));
+
+    let error = harness
+        .put_raw_events(PutRawEventsInput {
+            event_bus_arn: arn.to_string(),
+            entries: vec![raw_entry("application/json", b"{}")],
+            ..Default::default()
+        })
+        .await
+        .err()
+        .unwrap_or_else(|| panic!("case {case:?}: PutRawEvents must be refused"));
+    assert_not_found(case, "PutRawEvents", &error);
+    messages.push((
+        "PutRawEvents",
+        match error {
+            Scaffolded::Modeled(PutRawEventsErrorModeled::ResourceNotFoundException(
+                not_found,
+            )) => not_found.message.unwrap_or_default(),
+            other => panic!("case {case:?}: PutRawEvents answered {other:?}"),
         },
     ));
 

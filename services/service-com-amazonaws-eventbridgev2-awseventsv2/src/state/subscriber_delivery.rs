@@ -60,15 +60,7 @@ pub async fn deliver_due(
         let subscriber = &owed.subscriber;
         let mut bodies = Vec::new();
         for stored in &owed.events {
-            let event = delivered_event(
-                // The envelope's `account` and `region` are the BUS's — a
-                // subscriber lives in the account and region of the bus it was
-                // created on, which is what it holds.
-                &subscriber.event_bus_arn,
-                &subscriber.account_id,
-                &subscriber.region,
-                stored,
-            );
+            let event = delivered_event(subscriber, stored);
             if !filters_match(subscriber.filter_configuration.as_ref(), &event, &mut budget) {
                 continue;
             }

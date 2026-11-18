@@ -1917,7 +1917,8 @@ async fn the_stored_event_log_stays_within_retention_and_the_cap() {
         let detail_types: Vec<&str> = bus
             .events
             .iter()
-            .map(|stored| stored.detail_type.as_str())
+            .filter_map(|stored| stored.structured())
+            .map(|structured| structured.detail_type.as_str())
             .collect();
         assert_eq!(
             detail_types,

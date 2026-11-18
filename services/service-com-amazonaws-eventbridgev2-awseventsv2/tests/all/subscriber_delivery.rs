@@ -40,10 +40,12 @@ use eventsv2::ops::create_subscriber::CreateSubscriber;
 use eventsv2::ops::describe_event_bus::DescribeEventBus;
 use eventsv2::ops::describe_subscriber::DescribeSubscriber;
 use eventsv2::ops::put_events::PutEvents;
+use eventsv2::ops::put_raw_events::PutRawEvents;
 use eventsv2::ops::types::{
     CreateEventBusInput, CreateSubscriberInput, DescribeEventBusInput, DescribeSubscriberInput,
     Filter, FilterConfiguration, InvokeConfiguration, PointInTimeConfiguration, PutEventsInput,
-    PutEventsOutput, PutEventsRequestEntry, PutEventsSystemMetadata, Transformer,
+    PutEventsOutput, PutEventsRequestEntry, PutEventsSystemMetadata, PutRawEventsInput,
+    PutRawEventsOutput, PutRawEventsRequestEntry, PutRawEventsSystemMetadata, Transformer,
 };
 
 /// The account segment every emulated ARN carries.
@@ -354,18 +356,42 @@ async fn queue_depth(router: &MultiServiceRouter, case: &str, queue_url: &str) -
 }
 
 /// The bodies of the messages the queue at `queue_url` holds, polled until
-/// `expected` of them have been read or the deadline passes.
-///
-/// Each message is asserted to carry the members a received message carries —
-/// `MessageId`, `ReceiptHandle`, `MD5OfBody` and `Body` — and is deleted, so a
-/// later read of the same queue reports what is left rather than what this read
-/// took.
+/// `expected` of them have been read or the deadline passes, each read as the
+/// document it is.
 async fn received_bodies(
     router: &MultiServiceRouter,
     case: &str,
     queue_url: &str,
     expected: usize,
 ) -> Vec<Value> {
+    received_texts(router, case, queue_url, expected)
+        .await
+        .into_iter()
+        .map(|body| {
+            serde_json::from_str(&body).unwrap_or_else(|error| {
+                panic!("case {case:?}: the delivered body {body:?} is no document: {error}")
+            })
+        })
+        .collect()
+}
+
+/// The bodies of the messages the queue at `queue_url` holds, as the TEXT they
+/// were delivered as, polled until `expected` of them have been read or the
+/// deadline passes.
+///
+/// Text rather than a document, because a delivery is a string: a raw event
+/// whose data is binary is delivered as base64 text, which is no document.
+///
+/// Each message is asserted to carry the members a received message carries —
+/// `MessageId`, `ReceiptHandle`, `MD5OfBody` and `Body` — and is deleted, so a
+/// later read of the same queue reports what is left rather than what this read
+/// took.
+async fn received_texts(
+    router: &MultiServiceRouter,
+    case: &str,
+    queue_url: &str,
+    expected: usize,
+) -> Vec<String> {
     let deadline = Instant::now() + PATIENCE;
     let mut bodies = Vec::new();
     loop {
@@ -384,9 +410,7 @@ async fn received_bodies(
                 );
             }
             let body = message["Body"].as_str().unwrap_or_default();
-            bodies.push(serde_json::from_str(body).unwrap_or_else(|error| {
-                panic!("case {case:?}: the delivered body {body:?} is no document: {error}")
-            }));
+            bodies.push(body.to_string());
             sqs_ok(
                 router,
                 "DeleteMessage",
@@ -611,15 +635,34 @@ async fn an_event_reaches_the_subscribers_whose_filters_select_it() {
             == Some(eventsv2::state::TRANSFORMER_TYPE_WITH_METADATA);
         for body in &bodies {
             if with_metadata {
-                // This service's own metadata envelope around the event.
+                // The metadata envelope: the three parts this service models an
+                // event as, and nothing beside them — the event's own identity
+                // travels inside its system metadata.
+                let mut members: Vec<&str> = body
+                    .as_object()
+                    .unwrap_or_else(|| panic!("case {case:?}: the delivered body {body} is no \
+                                               object"))
+                    .keys()
+                    .map(String::as_str)
+                    .collect();
+                members.sort_unstable();
                 assert_eq!(
-                    body["EventBusArn"].as_str(),
-                    Some(bus_arn.as_str()),
-                    "case {case:?}: a delivery must name the bus it was published to, got {body}"
+                    members,
+                    vec!["Data", "Metadata", "SystemMetadata"],
+                    "case {case:?}: expected the metadata envelope's members, got {body}"
                 );
                 assert!(
-                    body["EventId"].is_string() && body["SequenceNumber"].is_string(),
-                    "case {case:?}: a delivery must carry the event's identity, got {body}"
+                    body["SystemMetadata"][eventsv2::state::SYSTEM_EVENT_ID].is_string()
+                        && body["SystemMetadata"][eventsv2::state::SYSTEM_SEQUENCE_NUMBER]
+                            .is_string(),
+                    "case {case:?}: a delivery must carry the event's identity in its system \
+                     metadata, got {body}"
+                );
+                assert_eq!(
+                    body["SystemMetadata"][eventsv2::state::SYSTEM_DELIVERY_TYPE].as_str(),
+                    Some(eventsv2::state::DELIVERY_TYPE_LIVE),
+                    "case {case:?}: an event published while the subscriber was watching is a \
+                     live delivery, got {body}"
                 );
                 assert!(
                     body["Metadata"]["Source"].is_string()
@@ -1349,6 +1392,415 @@ async fn a_target_this_emulator_cannot_reach_withholds_only_its_own_delivery() {
             depth, 1,
             "case {case:?}: the reachable subscriber must still be delivered its event, got depth \
              {depth}"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The same rule for a RAW publish: pre-shaped events
+// ---------------------------------------------------------------------------
+
+/// The three raw entries every row of the raw table publishes, as
+/// `(content type, data, metadata, event group)`.
+///
+/// They differ along the CONTENT TYPE the entry declares — the JSON media type,
+/// a `+json` structured-syntax suffix (the example
+/// `PutRawEventsSystemMetadata$ContentType`'s own documentation gives) and the
+/// binary one — along the FORM of the bytes, and along the metadata the
+/// publisher defined, which is what the rows below filter and read on.
+type RawEntry = (
+    &'static str,
+    &'static [u8],
+    &'static [(&'static str, &'static str)],
+    Option<&'static str>,
+);
+
+/// The bytes of the binary entry: no UTF-8 text, so this service reads them as
+/// nothing but bytes.
+const BINARY_DATA: &[u8] = &[0x00, 0x01, 0xFE, 0xFF, b'r', b'a', b'w'];
+
+/// [`BINARY_DATA`] as the base64 text `Data`'s own documentation names it in
+/// ("the event data as a base64-encoded blob"), written out rather than
+/// re-encoded here, so the delivery is compared against the encoding and not
+/// against the emulator's own call.
+const BINARY_DATA_BASE64: &str = "AAH+/3Jhdw==";
+
+/// The raw entries one publish of the table carries.
+fn raw_entries() -> [RawEntry; 3] {
+    [
+        (
+            "application/json",
+            br#"{"orderId":"A-1","tenant":"acme"}"#,
+            &[("tenant", "acme"), ("channel", "web")],
+            Some("group-1"),
+        ),
+        (
+            "application/cloudevents+json",
+            br#"{"specversion":"1.0","type":"com.example.order","data":{"orderId":"B-2"}}"#,
+            &[("tenant", "globex")],
+            None,
+        ),
+        (
+            "application/octet-stream",
+            BINARY_DATA,
+            &[("tenant", "acme")],
+            None,
+        ),
+    ]
+}
+
+/// Publish the table's raw entries onto `event_bus_arn`, requiring every one of
+/// them to be accepted, and hand back what `PutRawEvents` reported.
+async fn publish_raw(
+    router: &MultiServiceRouter,
+    case: &str,
+    event_bus_arn: &str,
+) -> PutRawEventsOutput {
+    let entries = raw_entries()
+        .into_iter()
+        .map(
+            |(content_type, data, metadata, group)| PutRawEventsRequestEntry {
+                data: data.to_vec(),
+                metadata: Some(
+                    metadata
+                        .iter()
+                        .map(|(name, value)| ((*name).to_string(), (*value).to_string()))
+                        .collect(),
+                ),
+                system_metadata: PutRawEventsSystemMetadata {
+                    content_type: content_type.to_string(),
+                    deduplication_id: None,
+                    event_group_id: group.map(str::to_string),
+                },
+            },
+        )
+        .collect();
+    let answer = eventsv2_ok::<PutRawEvents<InMemoryEngine>>(
+        router,
+        &PutRawEventsInput {
+            event_bus_arn: event_bus_arn.to_string(),
+            entries,
+            ..Default::default()
+        },
+        case,
+    )
+    .await;
+    assert_eq!(
+        answer.failed_entry_count, 0,
+        "case {case:?}: every raw entry must be accepted, got {answer:?}"
+    );
+    answer
+}
+
+/// What the target of a subscriber asking for no transformation is handed for
+/// the raw entry at `position`: the payload AS SENT when its content type
+/// declares text this service reads, and the base64 of the bytes as sent
+/// otherwise.
+fn expected_untransformed(position: usize) -> String {
+    let (content_type, data, _, _) = raw_entries()[position];
+    if content_type == "application/octet-stream" {
+        BINARY_DATA_BASE64.to_string()
+    } else {
+        String::from_utf8(data.to_vec()).expect("the text entries of the table are UTF-8")
+    }
+}
+
+/// What the target of a `WITH_METADATA` subscriber is handed for the raw entry
+/// at `position`: the metadata envelope, which carries the publisher's
+/// metadata, the event's system metadata and its payload, and nothing else.
+fn expected_with_metadata(position: usize, event_id: &str, sequence_number: &str) -> Value {
+    let (content_type, data, metadata, group) = raw_entries()[position];
+    let mut system = serde_json::Map::new();
+    system.insert("ContentType".to_string(), json!(content_type));
+    if let Some(group) = group {
+        system.insert("EventGroupId".to_string(), json!(group));
+    }
+    // The service's own system metadata, which travels under the reserved
+    // prefix; every value is a string.
+    system.insert(
+        eventsv2::state::SYSTEM_EVENT_ID.to_string(),
+        json!(event_id),
+    );
+    system.insert(
+        eventsv2::state::SYSTEM_SEQUENCE_NUMBER.to_string(),
+        json!(sequence_number),
+    );
+    system.insert(
+        eventsv2::state::SYSTEM_DELIVERY_TYPE.to_string(),
+        json!(eventsv2::state::DELIVERY_TYPE_LIVE),
+    );
+    let data = if content_type == "application/octet-stream" {
+        json!(BINARY_DATA_BASE64)
+    } else {
+        serde_json::from_slice(data).expect("the text entries of the table are documents")
+    };
+    json!({
+        "Metadata": metadata
+            .iter()
+            .map(|(name, value)| ((*name).to_string(), json!(value)))
+            .collect::<serde_json::Map<String, Value>>(),
+        "SystemMetadata": system,
+        "Data": data,
+    })
+}
+
+/// One row of the raw table: the case, the subscriber's filters and
+/// transformer, and WHICH of the three published entries its target must
+/// receive.
+struct RawRow {
+    case: &'static str,
+    filters: Option<FilterConfiguration>,
+    transformer: Option<&'static str>,
+    delivered: Vec<usize>,
+}
+
+/// RULE: a raw event a bus accepts is delivered to each subscriber of that bus
+/// every one of whose filters matches it in the scope that filter names —
+/// `DATA` the payload the entry's `ContentType` declares, `METADATA` the
+/// metadata the publisher defined, `SYSTEM_METADATA` the event's system
+/// metadata, the content type included — carrying the event in the shape the
+/// subscriber's `Transformer` names: the payload as sent (bytes as base64) with
+/// no transformation, and the metadata envelope under `WITH_METADATA`.
+///
+/// Every row publishes the SAME three entries ([`raw_entries`]) and states
+/// which of them its subscriber is owed, so the rows differ only along the
+/// subscriber: along the scope a filter reads, whether its pattern matches, how
+/// many filters it ANDs, and the transformer.
+#[tokio::test]
+async fn a_raw_event_reaches_the_subscribers_whose_filters_select_it() {
+    let rows = vec![
+        RawRow {
+            case: "no filter configuration and no transformer",
+            filters: None,
+            transformer: None,
+            delivered: vec![0, 1, 2],
+        },
+        RawRow {
+            case: "a RAW transformer, which hands the target the payload as sent",
+            filters: None,
+            transformer: Some(eventsv2::state::TRANSFORMER_TYPE_RAW),
+            delivered: vec![0, 1, 2],
+        },
+        RawRow {
+            case: "a WITH_METADATA transformer, which wraps the event in the metadata envelope",
+            filters: None,
+            transformer: Some(eventsv2::state::TRANSFORMER_TYPE_WITH_METADATA),
+            delivered: vec![0, 1, 2],
+        },
+        RawRow {
+            case: "a SYSTEM_METADATA filter on the JSON content type",
+            filters: Some(filters(vec![filter(
+                r#"{"ContentType":["application/json"]}"#,
+                eventsv2::state::FILTER_SCOPE_SYSTEM_METADATA,
+            )])),
+            transformer: None,
+            delivered: vec![0],
+        },
+        RawRow {
+            case: "a SYSTEM_METADATA filter on the CloudEvents content type",
+            filters: Some(filters(vec![filter(
+                r#"{"ContentType":["application/cloudevents+json"]}"#,
+                eventsv2::state::FILTER_SCOPE_SYSTEM_METADATA,
+            )])),
+            transformer: None,
+            delivered: vec![1],
+        },
+        RawRow {
+            case: "a SYSTEM_METADATA filter on the binary content type",
+            filters: Some(filters(vec![filter(
+                r#"{"ContentType":["application/octet-stream"]}"#,
+                eventsv2::state::FILTER_SCOPE_SYSTEM_METADATA,
+            )])),
+            transformer: None,
+            delivered: vec![2],
+        },
+        RawRow {
+            case: "a SYSTEM_METADATA filter on the event group",
+            filters: Some(filters(vec![filter(
+                r#"{"EventGroupId":["group-1"]}"#,
+                eventsv2::state::FILTER_SCOPE_SYSTEM_METADATA,
+            )])),
+            transformer: None,
+            delivered: vec![0],
+        },
+        RawRow {
+            case: "a METADATA filter on a key the publisher defined",
+            filters: Some(filters(vec![filter(
+                r#"{"tenant":["acme"]}"#,
+                eventsv2::state::FILTER_SCOPE_METADATA,
+            )])),
+            transformer: None,
+            delivered: vec![0, 2],
+        },
+        RawRow {
+            case: "a DATA filter reaching into the payload the content type declares",
+            filters: Some(filters(vec![filter(
+                r#"{"orderId":["A-1"]}"#,
+                eventsv2::state::FILTER_SCOPE_DATA,
+            )])),
+            transformer: None,
+            delivered: vec![0],
+        },
+        RawRow {
+            case: "two filters across scopes, both matching one entry",
+            filters: Some(filters(vec![
+                filter(
+                    r#"{"tenant":["acme"]}"#,
+                    eventsv2::state::FILTER_SCOPE_METADATA,
+                ),
+                filter(
+                    r#"{"ContentType":["application/octet-stream"]}"#,
+                    eventsv2::state::FILTER_SCOPE_SYSTEM_METADATA,
+                ),
+            ])),
+            transformer: None,
+            delivered: vec![2],
+        },
+        RawRow {
+            case: "two filters across scopes that no one entry satisfies together",
+            filters: Some(filters(vec![
+                filter(
+                    r#"{"tenant":["globex"]}"#,
+                    eventsv2::state::FILTER_SCOPE_METADATA,
+                ),
+                filter(
+                    r#"{"ContentType":["application/octet-stream"]}"#,
+                    eventsv2::state::FILTER_SCOPE_SYSTEM_METADATA,
+                ),
+            ])),
+            transformer: None,
+            delivered: vec![],
+        },
+        RawRow {
+            case: "a DATA filter no payload matches",
+            filters: Some(filters(vec![filter(
+                r#"{"orderId":["Z-9"]}"#,
+                eventsv2::state::FILTER_SCOPE_DATA,
+            )])),
+            transformer: None,
+            delivered: vec![],
+        },
+    ];
+
+    // ONE bus and ONE publish for every row: each row's subscriber is created
+    // before the publish, so each is owed exactly what its own filters select
+    // out of the same three events.
+    let router = emulator();
+    let bus_arn = given_active_bus(&router, "raw delivery", "raw-bus").await;
+    let mut queues = Vec::new();
+    for (index, row) in rows.iter().enumerate() {
+        let (queue_url, queue_arn) =
+            given_queue(&router, row.case, &format!("raw-target-{index}")).await;
+        given_subscriber(
+            &router,
+            row.case,
+            &format!("raw-subscriber-{index}"),
+            &bus_arn,
+            &queue_arn,
+            Requested {
+                filters: row.filters.clone(),
+                transformer: row.transformer.map(|value| Transformer {
+                    r#type: Some(value.to_string()),
+                    jsonata_configuration: None,
+                }),
+                ..Default::default()
+            },
+        )
+        .await;
+        queues.push(queue_url);
+    }
+
+    let reported = publish_raw(&router, "raw delivery", &bus_arn).await;
+    let answered = reported.entries.clone().unwrap_or_default();
+    assert_eq!(
+        answered.len(),
+        raw_entries().len(),
+        "case \"raw delivery\": one result per request entry, got {answered:?}"
+    );
+
+    for (row, queue_url) in rows.iter().zip(queues) {
+        let case = row.case;
+        let depth = queue_depth(&router, case, &queue_url).await;
+        assert_eq!(
+            depth,
+            row.delivered.len() as u64,
+            "case {case:?}: expected {} message(s) on the target queue, got {depth}",
+            row.delivered.len()
+        );
+        let mut delivered = received_texts(&router, case, &queue_url, row.delivered.len()).await;
+        delivered.sort();
+
+        if row.transformer == Some(eventsv2::state::TRANSFORMER_TYPE_WITH_METADATA) {
+            // The metadata envelope is a DOCUMENT, so it is compared as one:
+            // the member order a JSON object is serialized in is no part of
+            // what the target is handed. Each delivery is paired with the entry
+            // it carries by the event id its system metadata names.
+            let mut seen: Vec<String> = Vec::new();
+            for text in &delivered {
+                let body: Value = serde_json::from_str(text).unwrap_or_else(|error| {
+                    panic!("case {case:?}: the delivered body {text:?} is no document: {error}")
+                });
+                let event_id = body["SystemMetadata"][eventsv2::state::SYSTEM_EVENT_ID]
+                    .as_str()
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "case {case:?}: a delivery must name the event in its system \
+                             metadata, got {body}"
+                        )
+                    })
+                    .to_string();
+                let position = answered
+                    .iter()
+                    .position(|result| result.event_id.as_deref() == Some(event_id.as_str()))
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "case {case:?}: the delivered event {event_id:?} is none of the \
+                             published entries {answered:?}"
+                        )
+                    });
+                let sequence_number = answered[position]
+                    .sequence_number
+                    .clone()
+                    .unwrap_or_else(|| {
+                        panic!("case {case:?}: PutRawEvents reported no SequenceNumber")
+                    });
+                let expected = expected_with_metadata(position, &event_id, &sequence_number);
+                assert_eq!(
+                    body, expected,
+                    "case {case:?}: expected the delivery {expected}, got {body}"
+                );
+                seen.push(event_id);
+            }
+            seen.sort();
+            let mut owed: Vec<String> = row
+                .delivered
+                .iter()
+                .map(|position| {
+                    answered[*position]
+                        .event_id
+                        .clone()
+                        .unwrap_or_else(|| panic!("case {case:?}: PutRawEvents reported no EventId"))
+                })
+                .collect();
+            owed.sort();
+            assert_eq!(
+                seen, owed,
+                "case {case:?}: expected the events {owed:?} to be delivered, got {seen:?}"
+            );
+            continue;
+        }
+
+        // An untransformed delivery is TEXT: the payload exactly as it was
+        // sent, or the base64 of the bytes as they were sent.
+        let mut expected: Vec<String> = row
+            .delivered
+            .iter()
+            .map(|position| expected_untransformed(*position))
+            .collect();
+        expected.sort();
+        assert_eq!(
+            delivered, expected,
+            "case {case:?}: expected the deliveries {expected:?}, got {delivered:?}"
         );
     }
 }

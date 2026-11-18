@@ -249,7 +249,7 @@ fn publish(
         // is what makes `FailedEntryCount` a count rather than a constant.
         if entry.source.starts_with(RESERVED_SOURCE_PREFIX) {
             entries.push(refused(
-                VALIDATION_ERROR,
+                crate::state::VALIDATION_ERROR,
                 // The prefix names itself in the message, so the sentence and
                 // the value it is about cannot drift apart.
                 &format!("Source must not start with the reserved prefix {RESERVED_SOURCE_PREFIX}"),
@@ -282,7 +282,9 @@ fn publish(
         let deduplication_key = if content_based {
             Some(content_deduplication_key(entry))
         } else {
-            deduplication_id.as_deref().map(token_deduplication_key)
+            deduplication_id
+                .as_deref()
+                .map(crate::state::token_deduplication_key)
         };
         let duplicate_of = deduplication_key
             .as_deref()
@@ -309,7 +311,7 @@ fn publish(
                 Some(time) => time,
                 None => {
                     entries.push(refused(
-                        VALIDATION_ERROR,
+                        crate::state::VALIDATION_ERROR,
                         "Time is outside the range of representable instants",
                     ));
                     continue;
@@ -320,10 +322,12 @@ fn publish(
         let stored = crate::state::StoredEvent {
             event_id: crate::state::new_event_id(id_seed, now),
             sequence_number: bus.next_sequence_number,
-            source: entry.source.clone(),
-            detail_type: entry.detail_type.clone(),
-            detail: entry.detail.clone(),
-            resources: entry.resources.clone().unwrap_or_default(),
+            payload: crate::state::EventPayload::Structured(crate::state::StructuredPayload {
+                source: entry.source.clone(),
+                detail_type: entry.detail_type.clone(),
+                detail: entry.detail.clone(),
+                resources: entry.resources.clone().unwrap_or_default(),
+            }),
             time,
             received_at: now,
             deduplication_id: deduplication_id.clone(),
@@ -379,17 +383,6 @@ const PUBLISHED: &str = "PUBLISHED";
 /// not re-published". The other entry of [`SUCCESS_CODE_VALUES`].
 const DEDUPLICATED: &str = "DEDUPLICATED";
 
-/// The `ErrorCode` an entry refused for the VALUE of one of its members
-/// carries — `ErrorCode` is documented as "Error code identifying why a publish
-/// batch entry failed", and this is the code the service identifies a failed
-/// value constraint by.
-///
-/// `PutEventsResultEntry$ErrorCode` is a free-form string in the model (no enum
-/// enumerates the per-entry codes), so each code is named once here rather than
-/// written at every refusal, which is what keeps the refusal paths of one class
-/// reporting the same code.
-const VALIDATION_ERROR: &str = "ValidationError";
-
 /// The `ErrorCode` of the one entry-error class that is about the FORM of the
 /// payload rather than a value constraint: a `Detail` that is not the "valid
 /// JSON string" its member documents.
@@ -403,14 +396,16 @@ const MALFORMED_DETAIL_MESSAGE: &str = "Detail is not valid JSON";
 /// Whether `detail` is the payload `EventDetail` documents: a JSON document,
 /// and an OBJECT.
 ///
-/// An object because that is what an event payload IS here: a subscriber's
+/// The document is read by the ONE reading of a published payload both publish
+/// operations share ([`crate::state::json_document`]), so what counts as JSON
+/// cannot drift between them; the OBJECT is this member's own additional
+/// constraint, because that is what an event payload IS here: a subscriber's
 /// `DATA`-scoped filter clause names members INSIDE the payload, and a target is
 /// handed it as a document rather than as a quoted value
 /// (`crate::state::delivered_event`), so a bare scalar or a list is not a
 /// payload a subscriber could read or filter on.
 fn is_json_payload(detail: &str) -> bool {
-    ::serde_json::from_str::<::serde_json::Value>(detail)
-        .is_ok_and(|document| document.is_object())
+    crate::state::json_document(detail.as_bytes()).is_some_and(|document| document.is_object())
 }
 
 /// The result of an entry the service refuses: the error half of
@@ -427,21 +422,10 @@ fn refused(error_code: &str, error_message: &str) -> PutEventsResultEntry {
     }
 }
 
-/// The deduplication key of an entry the caller deduplicates with its own
-/// token: the token itself, in its own namespace so no caller-chosen value can
-/// be mistaken for a content key.
-fn token_deduplication_key(deduplication_id: &str) -> String {
-    format!("id:{deduplication_id}")
-}
-
 /// The deduplication key of an entry under `CONTENT_BASED`: "a hash of the
-/// event content", per `DeduplicationType`'s documentation.
-///
-/// A SHA-256 digest, so the index that holds these keys is FIXED-WIDTH whatever
-/// the size of the event: it costs one 32-byte digest per deduplicated event
-/// rather than a second copy of the payload, and a lookup is a compare of two
-/// short strings. The index is pruned with the log, so it stays bounded by
-/// [`crate::state::MAX_STORED_EVENTS_PER_BUS`].
+/// event content", per `DeduplicationType`'s documentation, taken by the one
+/// digest both publish operations key an entry with
+/// ([`crate::state::ContentDigest`]).
 ///
 /// The content is the event the bus stores and delivers — `Source`,
 /// `DetailType`, `Detail` and `Resources`. `Time` is deliberately not part of
@@ -449,41 +433,19 @@ fn token_deduplication_key(deduplication_id: &str) -> String {
 /// so hashing it would give every entry of an omitted-`Time` batch a distinct
 /// digest and deduplicate nothing. Nor is `SystemMetadata`, which carries the
 /// caller's own deduplication token — the alternative this mode replaces.
-///
-/// Each field is absorbed length-prefixed, and an absent one is absorbed as a
-/// distinct marker, so no two different entries can frame to the same bytes.
 fn content_deduplication_key(entry: &PutEventsRequestEntry) -> String {
-    use sha2::Digest;
-
-    let mut hasher = sha2::Sha256::new();
-    absorb(&mut hasher, Some(entry.source.as_str()));
-    absorb(&mut hasher, Some(entry.detail_type.as_str()));
-    absorb(&mut hasher, entry.detail.as_deref());
+    let mut digest = crate::state::ContentDigest::new();
+    digest.absorb_text(Some(entry.source.as_str()));
+    digest.absorb_text(Some(entry.detail_type.as_str()));
+    digest.absorb_text(entry.detail.as_deref());
     // `Resources` is a list on the wire, so its length and order are part of
     // the content.
     let resources = entry.resources.as_deref().unwrap_or_default();
-    hasher.update(u64::try_from(resources.len()).unwrap_or(u64::MAX).to_be_bytes());
+    digest.absorb_count(resources.len());
     for resource in resources {
-        absorb(&mut hasher, Some(resource.as_str()));
+        digest.absorb_text(Some(resource.as_str()));
     }
-    format!("sha256:{}", hex::encode(hasher.finalize()))
-}
-
-/// Absorb one optional field into `hasher`, framed so the digest cannot confuse
-/// two different field splits: a present value contributes a presence marker,
-/// its byte length and its bytes; an absent one contributes only its own
-/// marker.
-fn absorb(hasher: &mut sha2::Sha256, field: Option<&str>) {
-    use sha2::Digest;
-
-    match field {
-        None => hasher.update([0u8]),
-        Some(value) => {
-            hasher.update([1u8]);
-            hasher.update(u64::try_from(value.len()).unwrap_or(u64::MAX).to_be_bytes());
-            hasher.update(value.as_bytes());
-        }
-    }
+    digest.key()
 }
 
 #[cfg(test)]

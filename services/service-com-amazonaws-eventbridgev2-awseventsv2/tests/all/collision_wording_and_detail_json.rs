@@ -184,9 +184,12 @@ impl Harness {
                 bus.events
                     .iter()
                     .map(|stored| {
+                        let structured = stored.structured().unwrap_or_else(|| {
+                            panic!("every event this suite publishes is a PutEvents entry")
+                        });
                         (
-                            stored.detail_type.clone(),
-                            stored.detail.clone(),
+                            structured.detail_type.clone(),
+                            structured.detail.clone(),
                             stored.sequence_number,
                         )
                     })

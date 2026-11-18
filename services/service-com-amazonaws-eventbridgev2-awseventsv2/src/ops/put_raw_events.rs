@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PutRawEvents
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PutRawEvents`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PutRawEvents::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: appends each accepted entry of a raw batch to the target bus's
+//! event log — the bytes as sent, the content type naming their form and the
+//! metadata the publisher defined — and delivers it to every subscriber of that
+//! bus the entry is owed to. An entry whose data is not the form its own
+//! `ContentType` declares, or whose format needs a schema registry the request
+//! named none for, is refused in its own position instead and counted in
+//! `FailedEntryCount`.
 //!
 //! ## Shape of an operation
 //!
@@ -94,9 +92,16 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-eventbridgev2-awsevents
 // here — hence the `PutRawEventsError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.eventbridgev2#PutRawEvents")]
+#[smithy_macros::operation_error(
+    "com.amazonaws.eventbridgev2#PutRawEvents",
+    // `InternalException` is a COMMON error of this service rather than one
+    // listed on this operation, and it is the modelled answer for a store this
+    // process cannot reach at all.
+    extra_errors = ["InternalException"]
+)]
 #[derive(Debug)]
 pub enum PutRawEventsErrorModeled {
+    InternalException(InternalException),
     InvalidStateException(InvalidStateException),
     ResourceNotFoundException(ResourceNotFoundException),
     SchemaRegistryUnavailableException(SchemaRegistryUnavailableException),
@@ -153,18 +158,345 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PutRawEvents` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PutRawEventsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PutRawEvents"))
+        let Some(store) = crate::state::service_state(&*self.engine) else {
+            return Err(PutRawEventsErrorModeled::InternalException(InternalException {
+                message: Some("the event bus store is unavailable on this engine".to_string()),
+            })
+            .into());
+        };
+        let now = ::std::time::SystemTime::now();
+
+        // The store's lock is taken for the publish alone and released with
+        // this statement, because the deliveries that follow are calls into
+        // other services of this same emulator, which reach those services'
+        // own stores.
+        let published = publish(&mut store.lock(), &input, now)?;
+
+        // The deliveries this publish has just made due: a subscriber on this
+        // bus is owed each accepted event its filters select, which is what
+        // makes an event observable to the client that is watching the
+        // subscriber's TARGET rather than this bus.
+        crate::state::subscriber_delivery::deliver_due(ctx.callback(), &published.due).await;
+
+        // Counted from the results just built, never assumed.
+        let failed_entry_count = published
+            .entries
+            .iter()
+            .filter(|entry| entry.error_code.is_some())
+            .count();
+
+        Ok(PutRawEventsOutput {
+            failed_entry_count: i32::try_from(failed_entry_count).unwrap_or(i32::MAX),
+            entries: Some(published.entries),
+        })
+    }
+}
+
+/// What one raw publish leaves behind: the per-entry results the response
+/// carries, and what each subscriber of the bus is owed now that the log has
+/// grown.
+struct Published {
+    entries: Vec<PutRawEventsResultEntry>,
+    due: Vec<crate::state::DueDelivery>,
+}
+
+/// Append this request's entries to the log of the bus it addresses, and report
+/// what the publish came to.
+///
+/// SYNCHRONOUS, and handed the store rather than the engine, because it runs
+/// under the store's lock from end to end: a publish is one atomic step, so an
+/// entry's sequence number and the deduplication index are decided without
+/// another request interleaving. The deliveries it makes due are made by the
+/// caller, with the lock released.
+fn publish(
+    state: &mut crate::state::ComAmazonawsEventbridgev2Awseventsv2State,
+    input: &PutRawEventsInput,
+    now: ::std::time::SystemTime,
+) -> Result<Published, PutRawEventsError> {
+    state.settle_lifecycles(now);
+
+    // What this batch deduplicates by, per `DeduplicationType`'s own
+    // documentation: "How duplicate events are detected: by a hash of the
+    // event content (CONTENT_BASED). To deduplicate by a caller-supplied
+    // token instead, omit DeduplicationConfiguration and set DeduplicationId
+    // on each entry." Either way the key is looked up on the bus, and an
+    // entry whose key is already on the log is reported DEDUPLICATED against
+    // the event that first carried it rather than published a second time.
+    let content_based = input
+        .deduplication_configuration
+        .as_ref()
+        .is_some_and(|config| config.deduplication_type == CONTENT_BASED_DEDUPLICATION);
+
+    let Some(bus) = state.bus(&input.event_bus_arn) else {
+        return Err(PutRawEventsErrorModeled::ResourceNotFoundException(
+            crate::state::event_bus_not_found(&input.event_bus_arn),
+        )
+        .into());
+    };
+    if !bus.accepts_events() {
+        return Err(PutRawEventsErrorModeled::InvalidStateException(InvalidStateException {
+            message: Some(format!(
+                "event bus {} is in state {} and cannot accept events",
+                bus.arn,
+                bus.state.wire_value()
+            )),
+        })
+        .into());
+    }
+
+    // An open-format entry is encoded against the registry the request names,
+    // which is READ over the network from the account that owns it — "the
+    // registry is read with the caller's credentials" — and this emulator
+    // reaches no registry outside itself. That is the one thing
+    // `SchemaRegistryUnavailableException` states ("The configured schema
+    // registry could not be reached. Retry the request."), and it is decided
+    // BEFORE anything is stored, so a batch this service cannot encode leaves
+    // the log as it was rather than half published.
+    if let Some(configuration) = input.schema_registry_configuration.as_ref() {
+        if input
+            .entries
+            .iter()
+            .any(|entry| {
+                crate::state::is_open_format_content_type(&entry.system_metadata.content_type)
+            })
+        {
+            return Err(PutRawEventsErrorModeled::SchemaRegistryUnavailableException(
+                SchemaRegistryUnavailableException {
+                    message: Some(format!(
+                        "The configured schema registry {} could not be reached",
+                        configuration.registry_uri
+                    )),
+                },
+            )
+            .into());
+        }
+    }
+
+    // One identifier seed per request entry, reserved from the STORE's own
+    // counter now that the publish will go ahead, so an `EventId` is unique
+    // across every bus this emulator holds and not just within one log, and
+    // a refused call hands out none.
+    let id_seeds: Vec<u64> = (0..input.entries.len())
+        .map(|_| state.next_id_seed())
+        .collect();
+    // Written through the registry again rather than through the reference
+    // read above, because the entries are appended to the bus: nothing has
+    // touched the store under this lock, so a bus that has gone missing here
+    // is reported as the bus that is not there rather than unwinding.
+    let Some(bus) = state.event_buses.get_mut(&input.event_bus_arn) else {
+        return Err(PutRawEventsErrorModeled::ResourceNotFoundException(
+            crate::state::event_bus_not_found(&input.event_bus_arn),
+        )
+        .into());
+    };
+
+    let mut entries = Vec::with_capacity(input.entries.len());
+    for (entry, id_seed) in input.entries.iter().zip(id_seeds) {
+        let content_type = entry.system_metadata.content_type.as_str();
+
+        // `SchemaRegistryConfiguration` is "required for open-format entries;
+        // ignored for JSON entries", so an entry in one of those formats
+        // cannot be published by a request that names no registry to encode it
+        // against. It is refused in its OWN position: the rest of the batch is
+        // publishable without a registry.
+        if crate::state::is_open_format_content_type(content_type) {
+            entries.push(refused(
+                crate::state::VALIDATION_ERROR,
+                &format!(
+                    "{SCHEMA_REGISTRY_MEMBER} is required for an entry whose ContentType is \
+                     {content_type}"
+                ),
+            ));
+            continue;
+        }
+
+        // The data is read against the form its own `ContentType` declares
+        // BEFORE the event is stored, so an entry whose bytes are not that
+        // form is refused in its own position rather than admitted to the log
+        // and later delivered as a document no subscriber can read. Data of
+        // any other content type is binary this service does not interpret,
+        // and carries no such constraint.
+        if crate::state::is_json_content_type(content_type)
+            && !crate::state::is_json_document(&entry.data)
+        {
+            entries.push(refused(MALFORMED_DATA, MALFORMED_DATA_MESSAGE));
+            continue;
+        }
+
+        // The caller-supplied token is kept on the stored event whether or
+        // not this batch deduplicates by it, because it is what the client
+        // sent; the KEY the log is indexed under is the one the request's
+        // `DeduplicationConfiguration` selects.
+        let deduplication_id = entry.system_metadata.deduplication_id.clone();
+        let deduplication_key = if content_based {
+            Some(content_deduplication_key(entry))
+        } else {
+            deduplication_id
+                .as_deref()
+                .map(crate::state::token_deduplication_key)
+        };
+        let duplicate_of = deduplication_key
+            .as_deref()
+            .and_then(|key| bus.deduplicated_events.get(key).cloned());
+        if let Some((event_id, sequence_number)) = duplicate_of {
+            entries.push(PutRawEventsResultEntry {
+                event_id: Some(event_id),
+                sequence_number: Some(sequence_number.to_string()),
+                success_code: Some(DEDUPLICATED.to_string()),
+                error_code: None,
+                error_message: None,
+            });
+            continue;
+        }
+
+        let stored = crate::state::StoredEvent {
+            event_id: crate::state::new_event_id(id_seed, now),
+            sequence_number: bus.next_sequence_number,
+            payload: crate::state::EventPayload::Raw(crate::state::RawPayload {
+                data: entry.data.clone(),
+                content_type: entry.system_metadata.content_type.clone(),
+                metadata: entry
+                    .metadata
+                    .iter()
+                    .flatten()
+                    .map(|(name, value)| (name.clone(), value.clone()))
+                    .collect(),
+            }),
+            // A raw entry states no time of its own — `PutRawEventsRequestEntry`
+            // models none — so the event occurred when the service received it.
+            time: now,
+            received_at: now,
+            deduplication_id,
+            deduplication_key: deduplication_key.clone(),
+            event_group_id: entry.system_metadata.event_group_id.clone(),
+        };
+        bus.next_sequence_number = bus.next_sequence_number.saturating_add(1);
+        entries.push(PutRawEventsResultEntry {
+            event_id: Some(stored.event_id.clone()),
+            sequence_number: Some(stored.sequence_number.to_string()),
+            success_code: Some(PUBLISHED.to_string()),
+            error_code: None,
+            error_message: None,
+        });
+        if let Some(key) = deduplication_key {
+            bus.deduplicated_events
+                .insert(key, (stored.event_id.clone(), stored.sequence_number));
+        }
+        bus.events.push(stored);
+    }
+
+    // The emulator's own memory bound on the stored log, and on the
+    // deduplication index with it.
+    bus.trim_to_capacity();
+
+    Ok(Published {
+        entries,
+        // Taken from the store under this same lock, so the position each
+        // subscriber delivers from advances exactly once per event however
+        // many publishes are in flight.
+        due: state.take_due_deliveries(&input.event_bus_arn),
+    })
+}
+
+/// The one `DeduplicationType` the model declares, per
+/// `smithy_query(query="shape",shape="DeduplicationType")`.
+const CONTENT_BASED_DEDUPLICATION: &str = "CONTENT_BASED";
+
+/// `SuccessCode::PUBLISHED` — "the event was published to the message store".
+/// One of the two entries of the generated [`SUCCESS_CODE_VALUES`].
+const PUBLISHED: &str = "PUBLISHED";
+
+/// `SuccessCode::DEDUPLICATED` — "the event was identified as a duplicate and was
+/// not re-published". The other entry of [`SUCCESS_CODE_VALUES`].
+const DEDUPLICATED: &str = "DEDUPLICATED";
+
+/// The input member an open-format entry needs, as a refusal names it.
+const SCHEMA_REGISTRY_MEMBER: &str = "SchemaRegistryConfiguration";
+
+/// The `ErrorCode` of the entry-error class that is about the FORM of the
+/// payload rather than a value constraint: `Data` that is not the form the
+/// entry's own `ContentType` declares.
+///
+/// It names the MEMBER that is wrong, which is how this service identifies that
+/// class on the structured publish too (`MalformedDetail`, for a `Detail` that
+/// is not the "valid JSON string" `EventDetail` documents).
+const MALFORMED_DATA: &str = "MalformedData";
+
+/// The `ErrorMessage` that goes with [`MALFORMED_DATA`]: the member that is
+/// wrong and the form it had to take, worded as the same class words it for
+/// `Detail` ("Detail is not valid JSON"). Fixed text — nothing of the refused
+/// payload is interpolated into it, which keeps the `@sensitive` `Data` out of
+/// the response.
+const MALFORMED_DATA_MESSAGE: &str = "Data is not valid JSON";
+
+/// The result of an entry the service refuses: the error half of
+/// `PutRawEventsResultEntry` filled in at that entry's own position, and the
+/// success half left empty — a refused entry has no `EventId`, no
+/// `SequenceNumber` and no `SuccessCode`, and is what `FailedEntryCount` counts.
+fn refused(error_code: &str, error_message: &str) -> PutRawEventsResultEntry {
+    PutRawEventsResultEntry {
+        event_id: None,
+        sequence_number: None,
+        success_code: None,
+        error_code: Some(error_code.to_string()),
+        error_message: Some(error_message.to_string()),
+    }
+}
+
+/// The deduplication key of a raw entry under `CONTENT_BASED`: "a hash of the
+/// event content", per `DeduplicationType`'s documentation, taken by the one
+/// digest both publish operations key an entry with
+/// ([`crate::state::ContentDigest`]).
+///
+/// The content is the event the bus stores and delivers — the entry's `Data`,
+/// the `ContentType` that says what those bytes are, and the `Metadata` the
+/// publisher defined. `SystemMetadata` is not part of it: it carries the
+/// caller's own deduplication token, the alternative this mode replaces.
+///
+/// The metadata is absorbed in key order, because a map carries no order on the
+/// wire: two entries whose metadata differs only in the order it was sent in
+/// are the same event content.
+fn content_deduplication_key(entry: &PutRawEventsRequestEntry) -> String {
+    let mut digest = crate::state::ContentDigest::new();
+    digest.absorb_text(Some(entry.system_metadata.content_type.as_str()));
+    digest.absorb_bytes(Some(entry.data.as_slice()));
+    let mut metadata: Vec<(&str, &str)> = entry
+        .metadata
+        .iter()
+        .flatten()
+        .map(|(name, value)| (name.as_str(), value.as_str()))
+        .collect();
+    metadata.sort_unstable();
+    digest.absorb_count(metadata.len());
+    for (name, value) in metadata {
+        digest.absorb_text(Some(name));
+        digest.absorb_text(Some(value));
+    }
+    digest.key()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{CONTENT_BASED_DEDUPLICATION, DEDUPLICATED, PUBLISHED};
+    use crate::ops::types::{DEDUPLICATION_TYPE_VALUES, SUCCESS_CODE_VALUES};
+
+    /// Every value this handler puts on the wire is a value the model declares,
+    /// so the constants above cannot drift from the generated enums.
+    #[test]
+    fn the_reported_codes_are_modelled_enum_values() {
+        for (case, value, declared) in [
+            ("SuccessCode::PUBLISHED", PUBLISHED, SUCCESS_CODE_VALUES),
+            ("SuccessCode::DEDUPLICATED", DEDUPLICATED, SUCCESS_CODE_VALUES),
+            (
+                "DeduplicationType::CONTENT_BASED",
+                CONTENT_BASED_DEDUPLICATION,
+                DEDUPLICATION_TYPE_VALUES,
+            ),
+        ] {
+            assert!(
+                declared.contains(&value),
+                "case {case:?}: {value:?} is not one of the modelled values {declared:?}"
+            );
+        }
     }
 }
