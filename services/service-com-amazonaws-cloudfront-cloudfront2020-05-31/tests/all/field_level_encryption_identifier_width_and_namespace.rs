@@ -1,18 +1,19 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! The WIDTH and the NAMESPACE LETTER of a field-level encryption path identifier change
-//! NOTHING about how the service answers an identifier it cannot resolve, end to end over
-//! HTTP.
+//! The WIDTH and the NAMESPACE LETTER of a field-level encryption path identifier decide
+//! WHICH of the one not-found code's two sentences an unresolvable identifier is answered
+//! with, end to end over HTTP.
 //!
-//! The rule under test: an operation addressed by a field-level encryption identifier answers
-//! its one modelled not-found code (404) and that code's own sentence ("The specified field
-//! level encryption config/profile does not exist.") for every identifier it cannot resolve —
-//! whatever width, namespace letter or alphabet the value carries. These operations model no
-//! argument error to report an unreadable identifier under
+//! The rule under test: an operation addressed by a field-level encryption identifier judges
+//! the value against the namespace CloudFront issues THAT record's identifiers in — the
+//! record's own namespace letter followed by a body of the width it issues one at — before it
+//! resolves it. An identifier of that namespace the store holds no record for is the record
+//! reported ABSENT ("The specified field level encryption config/profile does not exist.");
+//! every other value is the identifier the service reports it cannot READ ("Id format is
+//! invalid"). Both sentences travel under the kind's one modelled not-found code and its 404
 //! (`smithy_query(query="operation",operation="GetFieldLevelEncryption,GetFieldLevelEncryptionConfig,GetFieldLevelEncryptionProfile,GetFieldLevelEncryptionProfileConfig")`
-//! reports the kind's not-found error and `AccessDenied` and nothing else), and these members
-//! are plain `string`, with no `@pattern` and no `@length`, so no form is refused on its own
-//! account.
+//! reports the kind's not-found error and `AccessDenied` and nothing else), so the MESSAGE is
+//! all that tells the two conditions apart.
 //!
 //! The rows therefore vary what the rule generalises over:
 //!
@@ -47,6 +48,10 @@ use crate::field_level_encryption_profile_lifecycle::{
 /// taken from the crate, so a reworded refusal fails this suite.
 const NO_SUCH_CONFIG: &str = "The specified field level encryption config does not exist.";
 const NO_SUCH_PROFILE: &str = "The specified field level encryption profile does not exist.";
+
+/// The sentence every one of these operations answers a value that is no identifier of the
+/// record's own namespace, naming the member that carried it.
+pub(crate) const UNREADABLE_IDENTIFIER: &str = "Id format is invalid";
 
 /// The caller references the two seeded resources are held under.
 const CONFIG_REFERENCE: &str = "fle-id-width-config";
@@ -277,9 +282,13 @@ fn never_minted_body(width: usize) -> String {
 
 /// Every identifier of the CloudFront identifier alphabet this suite submits where an
 /// identifier of `kind` belongs: the addressed kind's own namespace letter and one no kind of
-/// this service issues an identifier under, each at every width in [`widths`]. None of them is
-/// an identifier the store holds, so every one is the absent resource.
-fn identifiers_of_every_width_and_namespace(kind: Kind, seeded: &Seeded) -> Vec<(String, String)> {
+/// this service issues an identifier under, each at every width in [`widths`]. The third
+/// column is the sentence the value earns — the ABSENT record for the one row written in the
+/// kind's own namespace at the width it issues, and the UNREADABLE identifier for every other.
+fn identifiers_of_every_width_and_namespace(
+    kind: Kind,
+    seeded: &Seeded,
+) -> Vec<(String, String, String)> {
     let minted = seeded.minted(kind);
     let namespace = minted.chars().next().unwrap_or(UNMINTED_NAMESPACE);
     let minted_width = minted.len() - 1;
@@ -292,9 +301,15 @@ fn identifiers_of_every_width_and_namespace(kind: Kind, seeded: &Seeded) -> Vec<
                 id, minted,
                 "case the generated identifier {id:?}: it must not be the one the store holds"
             );
+            let expected = if letter == namespace && width == minted_width {
+                kind.absent().to_string()
+            } else {
+                UNREADABLE_IDENTIFIER.to_string()
+            };
             rows.push((
                 format!("the namespace letter {letter} with a body of {width} characters"),
                 id,
+                expected,
             ));
         }
     }
@@ -353,22 +368,23 @@ fn unreadable_identifiers(kind: Kind, seeded: &Seeded, public_key: &str) -> Vec<
     ]
 }
 
-/// The WIDTH and the NAMESPACE LETTER an identifier carries change nothing: an identifier the
-/// store holds no resource for is the ABSENT resource at every width and under every letter,
-/// through every operation addressed by one.
+/// The WIDTH and the NAMESPACE LETTER an identifier carries decide the sentence: the one
+/// written in the addressed kind's own namespace at the width this service issues is the ABSENT
+/// record, and every other width and letter is the identifier reported UNREADABLE, through
+/// every operation addressed by one.
 #[tokio::test]
-async fn an_identifier_of_any_width_and_namespace_is_the_absent_resource() {
+async fn the_identifier_s_width_and_namespace_decide_which_sentence_it_earns() {
     let router = emulator();
     let seeded = seed(&router).await;
 
     for kind in [Kind::Config, Kind::Profile] {
-        for (case, id) in identifiers_of_every_width_and_namespace(kind, &seeded) {
+        for (case, id, expected) in identifiers_of_every_width_and_namespace(kind, &seeded) {
             for (operation, answer) in address(&router, kind, &id, &seeded).await {
                 assert_refusal(
                     &answer,
                     &format!("{operation} with {case} ({id:?})"),
                     kind.code(),
-                    kind.absent(),
+                    &expected,
                 );
             }
         }
@@ -388,10 +404,10 @@ async fn an_identifier_of_any_width_and_namespace_is_the_absent_resource() {
 }
 
 /// A value that is not an identifier of the addressed kind at all — another kind's minted
-/// identifier, or a value outside the identifier form — is the ABSENT resource too, by every
-/// operation addressed by one.
+/// identifier, or a value outside the identifier form — is the identifier reported UNREADABLE,
+/// by every operation addressed by one.
 #[tokio::test]
-async fn a_value_that_is_no_identifier_of_the_kind_is_the_absent_resource() {
+async fn a_value_that_is_no_identifier_of_the_kind_is_reported_unreadable() {
     let router = emulator();
     let seeded = seed(&router).await;
     let public_key = upload_key(&router, 1).await;
@@ -403,7 +419,7 @@ async fn a_value_that_is_no_identifier_of_the_kind_is_the_absent_resource() {
                     &answer,
                     &format!("{operation} with {case} ({id:?})"),
                     kind.code(),
-                    kind.absent(),
+                    UNREADABLE_IDENTIFIER,
                 );
             }
         }

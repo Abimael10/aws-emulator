@@ -321,13 +321,30 @@ async fn the_config_read_refuses_an_id_no_control_holds() {
             "case {case}: expected NoSuchOriginAccessControl for {candidate:?}, got {}",
             answer.raw
         );
+        let expected = sentence_for(&candidate);
         assert_eq!(
             answer.root().find_text("Message"),
-            Some(NO_SUCH_ORIGIN_ACCESS_CONTROL_MESSAGE),
-            "case {case}: expected the service's \"no such\" sentence for {candidate:?}, got {}",
+            Some(expected),
+            "case {case}: expected the sentence {expected:?} for {candidate:?}, got {}",
             answer.raw
         );
     }
 
     assert_config_read(&router, &id, &etag, &present, "after the refusals").await;
+}
+
+/// The sentence this read answers an `Id` it cannot resolve: the absent-control sentence for a
+/// value written in the alphabet CloudFront issues an entity identifier in (a decimal digit or
+/// an uppercase ASCII letter), and the unreadable-identifier sentence for every other value,
+/// which was never an identifier this service issued.
+fn sentence_for(id: &str) -> &'static str {
+    if !id.is_empty()
+        && id
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || byte.is_ascii_uppercase())
+    {
+        NO_SUCH_ORIGIN_ACCESS_CONTROL_MESSAGE
+    } else {
+        "Id format is invalid"
+    }
 }

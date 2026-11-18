@@ -53,7 +53,7 @@ use smithy_server_runtime::MultiServiceRouter;
 use crate::distribution_lifecycle::{call, emulator, is_version_token, Answer, API_VERSION};
 use crate::field_level_encryption_profile_lifecycle::{
     create_profile, get_profile, get_profile_config, is_profile_id, is_wire_timestamp, table,
-    upload_key, upload_keys, Entity, Profile,
+    upload_key, upload_keys, Entity, Profile, UNREADABLE_PROFILE_ID_MESSAGE,
 };
 
 // ---------------------------------------------------------------------------
@@ -729,12 +729,12 @@ async fn an_id_no_profile_holds_is_refused() {
         (
             "the existing id in lower case",
             id.to_lowercase(),
-            NO_SUCH_FIELD_LEVEL_ENCRYPTION_PROFILE_MESSAGE,
+            UNREADABLE_PROFILE_ID_MESSAGE,
         ),
         (
             "a token of no profile id's shape",
             "not-a-profile".to_string(),
-            NO_SUCH_FIELD_LEVEL_ENCRYPTION_PROFILE_MESSAGE,
+            UNREADABLE_PROFILE_ID_MESSAGE,
         ),
     ];
 

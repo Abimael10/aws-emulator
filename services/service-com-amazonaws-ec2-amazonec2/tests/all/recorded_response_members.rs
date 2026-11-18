@@ -1081,13 +1081,14 @@ fn reported_destination_options(case: &str, body: &str) -> Option<DestinationOpt
     ))
 }
 
-/// RULE 8: a flow log that publishes to Amazon S3 reports its destination options, each
-/// member at the value in force for it — the value the create asked for, or the default
-/// `DestinationOptionsRequest` documents for the member ("The default is plain-text" for
-/// `$FileFormat`, "The default is false" for `$HiveCompatiblePartitions` and
-/// `$PerHourPartition`) — and a flow log of any other destination type reports none at all:
-/// the options describe the OBJECTS an Amazon S3 delivery writes, so they are that
-/// destination's shape, which is also why a request naming them for another type is refused.
+/// RULE 8: a flow log reports its destination options exactly when the create ASKED for
+/// them, each member at the value in force for it — the value the create asked for, or the
+/// default `DestinationOptionsRequest` documents for the member ("The default is plain-text"
+/// for `$FileFormat`, "The default is false" for `$HiveCompatiblePartitions` and
+/// `$PerHourPartition`) — and reports none at all when the create named none: the options
+/// describe the OBJECTS an Amazon S3 delivery writes, which is also why a request naming
+/// them for another destination type is refused, so a flow log of any other type reports
+/// none.
 ///
 /// The rows differ in WHICH options the create named — none at all (twice: once for a
 /// destination type that takes no options at all), one of the three, all three, and all
@@ -1123,11 +1124,7 @@ async fn a_flow_log_carries_the_destination_options_of_the_destination_it_publis
         (
             "an S3 destination naming no options",
             s3_flow_log_params(&vpc_id, "none", &[]),
-            Some((
-                Some(PLAIN_TEXT.to_string()),
-                Some(FALSE.to_string()),
-                Some(FALSE.to_string()),
-            )),
+            None,
         ),
         (
             "an S3 destination naming the file format alone",

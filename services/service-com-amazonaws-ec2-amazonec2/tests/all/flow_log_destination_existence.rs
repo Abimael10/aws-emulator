@@ -573,27 +573,35 @@ async fn a_create_resolves_its_destination_against_the_service_that_owns_it() {
 }
 
 /// One row of the destination-options table: the case, the options the request carries, and
-/// the `(fileFormat, hiveCompatiblePartitions, perHourPartition)` the flow log then reports.
-type OptionsRow = (&'static str, Vec<(&'static str, &'static str)>, [&'static str; 3]);
+/// the `(fileFormat, hiveCompatiblePartitions, perHourPartition)` the flow log then reports
+/// — `None` where it reports no `destinationOptions` element at all.
+type OptionsRow = (
+    &'static str,
+    Vec<(&'static str, &'static str)>,
+    Option<[&'static str; 3]>,
+);
 
 fn options_rows() -> Vec<OptionsRow> {
     vec![
         (
             "no destination options at all",
             vec![],
-            // "The default is plain-text" (`DestinationOptionsRequest$FileFormat`), "The
-            // default is false" (`$HiveCompatiblePartitions`, `$PerHourPartition`).
-            ["plain-text", "false", "false"],
+            // A create that named no options is reported none: the member states the layout
+            // the create CONFIGURED, and this one configured none.
+            None,
         ),
         (
             "a file format alone",
             vec![("DestinationOptions.FileFormat", "parquet")],
-            ["parquet", "false", "false"],
+            // "The default is plain-text" (`DestinationOptionsRequest$FileFormat`), "The
+            // default is false" (`$HiveCompatiblePartitions`, `$PerHourPartition`) — the
+            // members the create left out of the options it DID name.
+            Some(["parquet", "false", "false"]),
         ),
         (
             "Hive-compatible prefixes alone",
             vec![("DestinationOptions.HiveCompatiblePartitions", "true")],
-            ["plain-text", "true", "false"],
+            Some(["plain-text", "true", "false"]),
         ),
         (
             "every member spelled out",
@@ -602,7 +610,7 @@ fn options_rows() -> Vec<OptionsRow> {
                 ("DestinationOptions.HiveCompatiblePartitions", "true"),
                 ("DestinationOptions.PerHourPartition", "true"),
             ],
-            ["parquet", "true", "true"],
+            Some(["parquet", "true", "true"]),
         ),
     ]
 }
@@ -634,7 +642,7 @@ async fn an_s3_flow_log_reports_the_destination_options_in_force() {
             emulator.reported_destination_options(case, &vpc_id).await;
         assert_eq!(
             reported,
-            Some(expected.map(String::from)),
+            expected.map(|values| values.map(String::from)),
             "case {case:?}: expected the (fileFormat, hiveCompatiblePartitions, \
              perHourPartition) in force, got {reported:?} in {described}"
         );

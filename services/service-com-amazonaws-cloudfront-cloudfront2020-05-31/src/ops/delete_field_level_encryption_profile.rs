@@ -175,18 +175,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // profile is decided against the store as it stands at this instant.
         store.settle(::std::time::SystemTime::now());
 
-        // "Request the ID of the profile you want to delete from CloudFront": an `Id` the
-        // store holds no profile under is the absent profile, whatever shape the value takes —
-        // this operation models no argument error to report an identifier under
-        // ([`crate::state::no_such_field_level_encryption_profile`]). Nothing is removed and
-        // the delete says so rather than reporting a removal it never performed.
+        // "Request the ID of the profile you want to delete from CloudFront": whether the
+        // value could be an identifier of THIS resource kind decides which of the one code's
+        // two sentences the refusal carries
+        // ([`crate::state::unresolved_field_level_encryption_profile`]).
+        // Nothing is removed and the delete says so rather than reporting a removal it never
+        // performed.
         let Some(current_etag) = store
             .field_level_encryption_profile(&input.id)
             .map(|stored| stored.etag.clone())
         else {
             return Err(
                 DeleteFieldLevelEncryptionProfileErrorModeled::NoSuchFieldLevelEncryptionProfile(
-                    crate::state::no_such_field_level_encryption_profile(),
+                    crate::state::unresolved_field_level_encryption_profile(&input.id),
                 )
                 .into(),
             );

@@ -143,14 +143,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let _ = ctx;
         let store = state.lock();
 
-        // "Get the ID for the field-level encryption profile information": the id resolves a
-        // stored profile, and when nothing answers to it the one not-found code this
-        // operation models reports the absent profile — whatever shape the value takes, since
-        // the operation models no argument error to report an identifier under.
+        // "Get the ID for the field-level encryption profile information": whether the value
+        // could be an identifier of THIS resource kind is decided before the profile is
+        // resolved — a value outside the namespace CloudFront issues this record's identifiers
+        // in is the identifier it reports it cannot read, and an identifier of that namespace
+        // the store holds no profile under is the profile that is absent
+        // ([`crate::state::unresolved_field_level_encryption_profile`]).
         let Some(stored) = store.field_level_encryption_profile(&input.id) else {
             return Err(
                 GetFieldLevelEncryptionProfileErrorModeled::NoSuchFieldLevelEncryptionProfile(
-                    crate::state::no_such_field_level_encryption_profile(),
+                    crate::state::unresolved_field_level_encryption_profile(&input.id),
                 )
                 .into(),
             );

@@ -474,11 +474,18 @@ async fn an_id_no_control_holds_is_refused() {
     let (id, etag) = create(&router, &rows[0]).await;
 
     // Ids no control holds: one of the shape this service mints, one of another entity
-    // family's shape, and one that is no entity id at all.
-    for (case, missing) in [
-        ("minted-shape", "E1A2B3C4D5E6F7"),
-        ("another-family", "cg_1A2B3C4D5E6F7"),
-        ("not-an-id", "no-such-control"),
+    // family's shape, and one that is no entity id at all. The third column is the sentence
+    // the value earns — the absent control for a value written in the identifier alphabet
+    // CloudFront issues an entity id in, and the unreadable identifier for a value of a form
+    // this service never issued.
+    for (case, missing, expected) in [
+        (
+            "minted-shape",
+            "E1A2B3C4D5E6F7",
+            NO_SUCH_ORIGIN_ACCESS_CONTROL_MESSAGE,
+        ),
+        ("another-family", "cg_1A2B3C4D5E6F7", "Id format is invalid"),
+        ("not-an-id", "no-such-control", "Id format is invalid"),
     ] {
         for (version_case, if_match) in [
             ("no-if-match", None),
@@ -500,11 +507,8 @@ async fn an_id_no_control_holds_is_refused() {
                 answer.raw
             );
             assert!(
-                answer
-                    .raw
-                    .contains(NO_SUCH_ORIGIN_ACCESS_CONTROL_MESSAGE),
-                "case {case}/{version_case}: expected the refusal to state \
-                 {NO_SUCH_ORIGIN_ACCESS_CONTROL_MESSAGE:?}, got {}",
+                answer.raw.contains(expected),
+                "case {case}/{version_case}: expected the refusal to state {expected:?}, got {}",
                 answer.raw
             );
         }

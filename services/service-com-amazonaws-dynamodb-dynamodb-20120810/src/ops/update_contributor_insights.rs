@@ -232,12 +232,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // one and of the table where it named none.
         let has_sort_key = table.resource_declares_sort_key(index_name);
         let insights = table.contributor_insights_mut(index_name).map_err(lift)?;
-        // A `DISABLE` turns insights OFF, and the statuses it can be performed from are the
-        // ones the refusal names: the resource's insights have to be on. One addressed while
-        // the enable that was accepted for it is still in flight, and one that is already
-        // off, are both refused rather than applied
+        // A `DISABLE` applies to the resource's key access insights CONFIGURATION, which an
+        // accepted `ENABLE` writes and a disable does not clear: so it is served for every
+        // resource an enable has configured — while that enable's move to `ENABLED` is still
+        // owed as well as after it — and refused for one no enable has ever named, which
+        // carries no configuration for the action to turn off
         // ([`crate::state::contributor_insights_not_disableable`]).
-        if !enable && !insights.disableable(now) {
+        if !enable && !insights.disableable() {
             return Err(lift(crate::state::contributor_insights_not_disableable()));
         }
         insights.apply(enable, input.contributor_insights_mode.as_deref(), now);

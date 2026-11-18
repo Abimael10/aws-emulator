@@ -196,13 +196,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The control being updated is looked up first: every refusal below is about the
         // record this id names, and nothing is minted for an id the store does not hold.
+        // Whether the `Id` could be an identifier of THIS resource kind decides which of the
+        // one code's two sentences the refusal carries
+        // ([`crate::state::ComAmazonawsCloudfrontCloudfront20200531State::unresolved_origin_access_control`]).
         let Some(current_etag) = store
             .origin_access_control(&input.id)
             .map(|stored| stored.etag.clone())
         else {
             return Err(
                 UpdateOriginAccessControlErrorModeled::NoSuchOriginAccessControl(
-                    crate::state::no_such_origin_access_control(),
+                    store.unresolved_origin_access_control(&input.id),
                 )
                 .into(),
             );
@@ -259,7 +262,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // Defensive: the id was confirmed present above under this same lock, so the write
-        // cannot miss. The `None` arm is the modelled 404 rather than a panic.
+        // cannot miss. The `None` arm is the modelled 404 rather than a panic, and the id
+        // addressed a control a moment ago, so it carries the absent-control sentence.
         let Some(stored) = store.apply_origin_access_control_config(&input.id, config) else {
             return Err(
                 UpdateOriginAccessControlErrorModeled::NoSuchOriginAccessControl(

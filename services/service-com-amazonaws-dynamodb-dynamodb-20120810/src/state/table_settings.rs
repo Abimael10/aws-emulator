@@ -560,23 +560,29 @@ impl ContributorInsights {
         }
     }
 
-    /// Whether a `DISABLE` may be performed on this setting at `now`.
+    /// Whether a `DISABLE` may be performed on this setting.
     ///
-    /// The action is performed from a STATUS, and the statuses it requires are the two the
-    /// refusal names: `ENABLED` and `FAILED` ([`contributor_insights_not_disableable`]). So
-    /// the question is the status this setting reports at `now` ([`Self::status`]) and not
-    /// whether an enable once configured the resource:
+    /// The one condition the recorded refusals distinguish is whether this resource's key
+    /// access insights have ever been CONFIGURED: a `DISABLE` addressed to a resource no
+    /// enable has ever named is refused — "ContributorInsights Status must be ENABLED or
+    /// FAILED to perform DISABLE operation" ([`contributor_insights_not_disableable`]), there
+    /// being no configuration for the action to turn off — while one addressed to a resource
+    /// an enable HAS configured is served.
     ///
-    /// * `ENABLED` — the insights are on, and the disable turns them off;
-    /// * `ENABLING` — the enable that was accepted is still in flight, so the action it
-    ///   would undo has not finished; a client that serialises its control-plane calls by
-    ///   catching this refusal is what the transient status is for;
-    /// * `DISABLED` — there is nothing on to turn off, both for a resource an earlier
-    ///   disable turned off and for one no enable has ever configured;
-    /// * `FAILED` — never reported by this store, so no setting is ever disableable through
-    ///   that half of the requirement ([`CONTRIBUTOR_INSIGHTS_ENABLING`]).
-    pub fn disableable(&self, now: SystemTime) -> bool {
-        self.status(now) == CONTRIBUTOR_INSIGHTS_ENABLED
+    /// That is narrower than the sentence the refusal carries, and the recording is what
+    /// settles it: one fixture issues two disables against the same table, the first before
+    /// any enable (refused) and a later one AFTER an accepted disable had already turned the
+    /// insights off (served, answering the settled status and the mode still in force). So the
+    /// action is admitted by the CONFIGURATION rather than by the status the setting reports at
+    /// the call instant — gating on the status serves neither of those two answers, and gating
+    /// on the last accepted action serves only the first.
+    ///
+    /// The configuration is what [`Self::mode`] reports, which an enable sets and a disable
+    /// deliberately does not clear, so it is the record of ever having been configured.
+    /// `FAILED` is never reported by this store, so the other half of the requirement the
+    /// refusal names is never what admits a disable here.
+    pub fn disableable(&self) -> bool {
+        self.mode.is_some()
     }
 
     /// "Timestamp of the last time the status was changed"

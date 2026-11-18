@@ -63,6 +63,11 @@ const CALLER_REFERENCE_ALREADY_EXISTS_MESSAGE: &str =
     "The caller reference that you are using to create a field level encryption profile is \
      associated with another field level encryption profile in your account.";
 
+/// The sentence a read of this surface answers a value that is no identifier of the profile's
+/// own namespace: the identifier the service reports it cannot read, naming the member that
+/// carried it.
+pub(crate) const UNREADABLE_PROFILE_ID_MESSAGE: &str = "Id format is invalid";
+
 // ---------------------------------------------------------------------------
 // Calling the profile surface
 // ---------------------------------------------------------------------------
@@ -968,14 +973,8 @@ async fn an_id_no_profile_holds_is_refused_by_both_readers() {
             "P280MFCLSYOCVU",
             NO_SUCH_FIELD_LEVEL_ENCRYPTION_PROFILE_MESSAGE,
         ),
-        (
-            "EDFDVBD6EXAMPLE",
-            NO_SUCH_FIELD_LEVEL_ENCRYPTION_PROFILE_MESSAGE,
-        ),
-        (
-            "not-a-profile-id",
-            NO_SUCH_FIELD_LEVEL_ENCRYPTION_PROFILE_MESSAGE,
-        ),
+        ("EDFDVBD6EXAMPLE", UNREADABLE_PROFILE_ID_MESSAGE),
+        ("not-a-profile-id", UNREADABLE_PROFILE_ID_MESSAGE),
     ] {
         for (reader, answer) in [
             ("GetFieldLevelEncryptionProfile", get_profile(&router, case).await),

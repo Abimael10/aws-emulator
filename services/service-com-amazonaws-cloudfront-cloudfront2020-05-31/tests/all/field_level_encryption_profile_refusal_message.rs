@@ -47,6 +47,7 @@ use crate::field_level_encryption_config_lifecycle::{
 };
 use crate::field_level_encryption_profile_lifecycle::{
     create_profile, get_profile, get_profile_config, is_profile_id, upload_key, Entity, Profile,
+    UNREADABLE_PROFILE_ID_MESSAGE,
 };
 
 /// The sentences CloudFront sends on the wire for these refusals, spelled out here rather than
@@ -196,9 +197,10 @@ fn assert_refusal(answer: &Answer, case: &str, status: u16, code: &str, message:
 // ---------------------------------------------------------------------------
 
 /// Every path that reports a field-level encryption profile id as naming nothing answers
-/// `NoSuchFieldLevelEncryptionProfile` with the one absent-profile wire sentence — whether the
-/// id travels in the PATH (both readers of the profile, its update and its delete) or in a
-/// submitted DOCUMENT as a mapping's `ProfileId`, and whatever shape the id takes.
+/// `NoSuchFieldLevelEncryptionProfile`, with the absent-profile wire sentence where the id is
+/// one of the profile namespace and the unreadable-identifier sentence where it is not — while
+/// an id that travels in a submitted DOCUMENT as a mapping's `ProfileId` addresses nothing, so
+/// it reports the absent profile whatever shape it takes.
 #[tokio::test]
 async fn every_path_that_reports_a_missing_profile_sends_the_wire_sentence() {
     let router = emulator();
@@ -236,17 +238,17 @@ async fn every_path_that_reports_a_missing_profile_sends_the_wire_sentence() {
         (
             "a stored id in lower case",
             known.to_lowercase(),
-            NO_SUCH_PROFILE_MESSAGE,
+            UNREADABLE_PROFILE_ID_MESSAGE,
         ),
         (
             "a token that is no profile id",
             "not-a-profile-id".to_string(),
-            NO_SUCH_PROFILE_MESSAGE,
+            UNREADABLE_PROFILE_ID_MESSAGE,
         ),
         (
             "the caller reference rather than the id",
             "fle-profile-message-known".to_string(),
-            NO_SUCH_PROFILE_MESSAGE,
+            UNREADABLE_PROFILE_ID_MESSAGE,
         ),
     ];
 
@@ -336,11 +338,11 @@ async fn every_path_that_reports_a_missing_profile_sends_the_wire_sentence() {
     );
 }
 
-/// A READ of a profile answers its one not-found code and ONE sentence for every `Id` it
-/// cannot resolve: a minted id of ANOTHER resource kind of this service, a value of no minted
-/// id's alphabet or width, a name, a caller reference and a well-formed profile id nothing
-/// answers to all report the profile that is absent, because the read models no argument error
-/// to report an identifier under.
+/// A READ of a profile answers its one not-found code for every `Id` it cannot resolve, and
+/// the identifier's own NAMESPACE decides the sentence: a well-formed profile id nothing
+/// answers to reports the profile that is ABSENT, while a minted id of ANOTHER resource kind of
+/// this service, a value of no minted id's alphabet or width, a name and a caller reference are
+/// each the identifier reported UNREADABLE.
 ///
 /// The rows span the shapes an `Id` takes outside a profile id's: the namespaces of this
 /// service a profile id's is disjoint from, taking two of them from ids this emulator really
@@ -366,22 +368,22 @@ async fn a_profile_read_answers_one_sentence_for_every_id_it_cannot_resolve() {
         (
             "the sibling configuration's own id",
             config_id.clone(),
-            NO_SUCH_PROFILE_MESSAGE,
+            UNREADABLE_PROFILE_ID_MESSAGE,
         ),
         (
             "a public key id this service minted",
             key.clone(),
-            NO_SUCH_PROFILE_MESSAGE,
+            UNREADABLE_PROFILE_ID_MESSAGE,
         ),
         (
             "a distribution id's namespace",
             "E1234567890ABC".to_string(),
-            NO_SUCH_PROFILE_MESSAGE,
+            UNREADABLE_PROFILE_ID_MESSAGE,
         ),
         (
             "a UUID, the namespace the policy kinds are keyed by",
             "00000000-0000-0000-0000-000000000000".to_string(),
-            NO_SUCH_PROFILE_MESSAGE,
+            UNREADABLE_PROFILE_ID_MESSAGE,
         ),
         (
             "a profile id never minted",
@@ -391,17 +393,17 @@ async fn a_profile_read_answers_one_sentence_for_every_id_it_cannot_resolve() {
         (
             "the stored id in lower case",
             known.to_lowercase(),
-            NO_SUCH_PROFILE_MESSAGE,
+            UNREADABLE_PROFILE_ID_MESSAGE,
         ),
         (
             "a bare word",
             "not-a-profile-id".to_string(),
-            NO_SUCH_PROFILE_MESSAGE,
+            UNREADABLE_PROFILE_ID_MESSAGE,
         ),
         (
             "the profile's caller reference rather than its id",
             "fle-profile-kinds-known".to_string(),
-            NO_SUCH_PROFILE_MESSAGE,
+            UNREADABLE_PROFILE_ID_MESSAGE,
         ),
     ];
 

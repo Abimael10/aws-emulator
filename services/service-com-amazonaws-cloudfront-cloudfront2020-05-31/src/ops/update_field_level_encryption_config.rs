@@ -223,16 +223,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         store.settle(now);
 
         // The configuration being updated is looked up first: every refusal below is about the
-        // record this id names, and nothing is written for an id the store does not hold. An
-        // `Id` the store holds no configuration under is the absent configuration, whatever
-        // shape the value takes ([`crate::state::no_such_field_level_encryption_config`]).
+        // record this id names, and nothing is written for an id the store does not hold.
+        // Whether the `Id` could be an identifier of THIS resource kind decides which of the
+        // one code's two sentences the refusal carries
+        // ([`crate::state::unresolved_field_level_encryption_config`]).
         let Some(current) = store
             .field_level_encryption_config(&input.id)
             .map(|stored| (stored.etag.clone(), stored.config.caller_reference.clone()))
         else {
             return Err(
                 UpdateFieldLevelEncryptionConfigErrorModeled::NoSuchFieldLevelEncryptionConfig(
-                    crate::state::no_such_field_level_encryption_config(),
+                    crate::state::unresolved_field_level_encryption_config(&input.id),
                 )
                 .into(),
             );
@@ -382,7 +383,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // Defensive: the id was confirmed present above under this same lock, so the write
-        // cannot miss. The `None` arm is the modelled 404 rather than a panic.
+        // cannot miss. The `None` arm is the modelled 404 rather than a panic, and the id
+        // addressed a configuration a moment ago, so it carries the absent-record sentence.
         let Some(stored) = store.apply_field_level_encryption_config(&input.id, config, now) else {
             return Err(
                 UpdateFieldLevelEncryptionConfigErrorModeled::NoSuchFieldLevelEncryptionConfig(

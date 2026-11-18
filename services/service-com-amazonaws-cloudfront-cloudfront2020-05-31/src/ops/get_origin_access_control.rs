@@ -143,11 +143,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(stored) = store.origin_access_control(&input.id) else {
             return Err(
                 GetOriginAccessControlErrorModeled::NoSuchOriginAccessControl(
-                    // ONE sentence for the condition, as the control's other readers and its
-                    // mutations answer it: this operation models this one not-found code and
-                    // no argument error, and an id this account holds no control under is the
-                    // absent control whatever shape the value takes.
-                    crate::state::no_such_origin_access_control(),
+                    // Whether the `Id` could be an identifier of THIS resource kind is
+                    // decided before the control is resolved: a value this account holds as a
+                    // resource of another kind of the `E`-form family was issued for THAT
+                    // kind, so it is the identifier this operation reports it cannot read, and
+                    // every other unresolved value is the control that is absent
+                    // ([`crate::state::ComAmazonawsCloudfrontCloudfront20200531State::unresolved_origin_access_control`]).
+                    store.unresolved_origin_access_control(&input.id),
                 )
                 .into(),
             );

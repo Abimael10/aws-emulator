@@ -130,6 +130,9 @@ ipnet = "2"
 emulator-core-build-support = { workspace = true }
 
 [dev-dependencies]
+# Declares one suite module per `tests/all/<name>.rs`, so this crate's single integration-test
+# target needs no hand-written list of them.
+automod = { workspace = true }
 sha2 = { workspace = true }
 hex = { workspace = true }
 # The Kinesis data stream the real-time log suite creates and polls, mounted on the same

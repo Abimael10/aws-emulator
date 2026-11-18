@@ -66,6 +66,11 @@ const URL_ENCODED: &str = "URLEncoded";
 /// The sentences CloudFront sends on the wire for these refusals, spelled out here rather
 /// than taken from the crate, so a reworded refusal fails this suite.
 const NO_SUCH_CONFIG_MESSAGE: &str = "The specified field level encryption config does not exist.";
+
+/// The sentence a read of this surface answers a value that is no identifier of the addressed
+/// record's own namespace: the identifier the service reports it cannot read, naming the
+/// member that carried it.
+pub(crate) const UNREADABLE_ID_MESSAGE: &str = "Id format is invalid";
 const NO_SUCH_PROFILE_MESSAGE: &str = "The specified field level encryption profile does not exist.";
 const QUERY_ARG_PROFILE_EMPTY: &str =
     "The query arg profile in field level encryption config cannot be empty when content \
@@ -1297,9 +1302,9 @@ async fn an_id_no_configuration_holds_is_refused_by_the_reader() {
     // earning the one sentence this read answers an id it cannot resolve with.
     for (case, expected) in [
         ("C3V3PVOY5NSBVE", NO_SUCH_CONFIG_MESSAGE),
-        ("EDFDVBD6EXAMPLE", NO_SUCH_CONFIG_MESSAGE),
-        (profile.as_str(), NO_SUCH_CONFIG_MESSAGE),
-        ("not-a-configuration-id", NO_SUCH_CONFIG_MESSAGE),
+        ("EDFDVBD6EXAMPLE", UNREADABLE_ID_MESSAGE),
+        (profile.as_str(), UNREADABLE_ID_MESSAGE),
+        ("not-a-configuration-id", UNREADABLE_ID_MESSAGE),
     ] {
         let answer = get_config(&router, case).await;
         assert_eq!(
@@ -1462,11 +1467,11 @@ async fn an_id_no_configuration_holds_is_refused_by_the_configuration_reader() {
     let mangled: String = mangled.into_iter().collect();
     for (case, expected) in [
         ("C3V3PVOY5NSBVE", NO_SUCH_CONFIG_MESSAGE),
-        ("EDFDVBD6EXAMPLE", NO_SUCH_CONFIG_MESSAGE),
-        (profile.as_str(), NO_SUCH_CONFIG_MESSAGE),
+        ("EDFDVBD6EXAMPLE", UNREADABLE_ID_MESSAGE),
+        (profile.as_str(), UNREADABLE_ID_MESSAGE),
         (mangled.as_str(), NO_SUCH_CONFIG_MESSAGE),
-        ("not-a-configuration-id", NO_SUCH_CONFIG_MESSAGE),
-        ("0", NO_SUCH_CONFIG_MESSAGE),
+        ("not-a-configuration-id", UNREADABLE_ID_MESSAGE),
+        ("0", UNREADABLE_ID_MESSAGE),
     ] {
         let answer = get_config_document(&router, case).await;
         assert_eq!(

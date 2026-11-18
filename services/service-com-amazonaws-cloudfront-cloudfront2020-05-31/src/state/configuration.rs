@@ -3373,6 +3373,47 @@ pub fn no_such_field_level_encryption_profile() -> crate::ops::types::NoSuchFiel
 pub const NO_SUCH_FIELD_LEVEL_ENCRYPTION_PROFILE_MESSAGE: &str =
     "The specified field level encryption profile does not exist.";
 
+/// The modelled `NoSuchFieldLevelEncryptionProfile` (HTTP 404) an operation ADDRESSED by a
+/// field-level encryption profile `Id` in its path answers an `Id` it cannot resolve.
+///
+/// The SAME split [`unresolved_public_key_id`] makes for another resource of this service,
+/// over this kind's own predicate ([`is_field_level_encryption_profile_id`]): these operations
+/// model this one not-found code, so one code and one status cover two conditions and the
+/// MESSAGE is what tells them apart, decided from the value alone and therefore before the
+/// store is consulted. Only a value written the way CloudFront writes a profile identifier —
+/// the profile namespace letter followed by an identifier body of the width it issues one at —
+/// is an identifier the service READS, so the store holding no profile under it is the
+/// absent-profile sentence; every other value — another resource kind's identifier, this
+/// namespace at a width CloudFront issues none at, a lower-cased identifier, a UUID, a caller
+/// reference, a word — is the identifier the service reports it cannot read
+/// ([`id_format_invalid_message`]).
+///
+/// Only an identifier that ADDRESSES the operation is judged this way: a profile id borne by a
+/// submitted CONFIGURATION (a query-arg or content-type mapping's `ProfileId`) addresses
+/// nothing, so it is resolved against the store alone and reports the absent profile whatever
+/// its shape ([`no_such_field_level_encryption_profile`]).
+///
+/// The WIDTH is part of the namespace here, and that is recorded rather than assumed: these
+/// routes' recorded refusals answer the unreadable-identifier sentence for a value that is not
+/// in the form this surface's identifiers take and the absent-record sentence for one that is,
+/// so the form the records are issued in — the namespace letter and the body width — is what
+/// the sentence turns on. That is why this surface reads more of the value than the routes
+/// whose kind is told apart by the store instead
+/// ([`ComAmazonawsCloudfrontCloudfront20200531State::unresolved_origin_access_control`] reads
+/// the alphabet alone), and the same principle is what [`unresolved_public_key_id`] applies to
+/// the public keys.
+pub fn unresolved_field_level_encryption_profile(
+    id: &str,
+) -> crate::ops::types::NoSuchFieldLevelEncryptionProfile {
+    if is_field_level_encryption_profile_id(id) {
+        no_such_field_level_encryption_profile()
+    } else {
+        crate::ops::types::NoSuchFieldLevelEncryptionProfile {
+            message: Some(id_format_invalid_message(ADDRESSED_BY_ID)),
+        }
+    }
+}
+
 /// The modelled `FieldLevelEncryptionProfileInUse` (HTTP 409) for a delete of a profile a
 /// stored field-level encryption configuration still names.
 ///
@@ -3484,6 +3525,22 @@ pub fn no_such_field_level_encryption_config() -> crate::ops::types::NoSuchField
 /// wire wording is what a client reads.
 pub const NO_SUCH_FIELD_LEVEL_ENCRYPTION_CONFIG_MESSAGE: &str =
     "The specified field level encryption config does not exist.";
+
+/// The modelled `NoSuchFieldLevelEncryptionConfig` (HTTP 404) an operation ADDRESSED by a
+/// field-level encryption configuration `Id` in its path answers an `Id` it cannot resolve —
+/// the split [`unresolved_field_level_encryption_profile`] makes, over this kind's own
+/// predicate ([`is_field_level_encryption_config_id`]).
+pub fn unresolved_field_level_encryption_config(
+    id: &str,
+) -> crate::ops::types::NoSuchFieldLevelEncryptionConfig {
+    if is_field_level_encryption_config_id(id) {
+        no_such_field_level_encryption_config()
+    } else {
+        crate::ops::types::NoSuchFieldLevelEncryptionConfig {
+            message: Some(id_format_invalid_message(ADDRESSED_BY_ID)),
+        }
+    }
+}
 
 /// The modelled `FieldLevelEncryptionConfigInUse` (HTTP 409) for a delete of a configuration
 /// a cache behaviour still names.

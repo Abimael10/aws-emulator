@@ -4,10 +4,10 @@
 //! resources' LIFECYCLE, end to end over HTTP.
 //!
 //! The rule under test is the one `field_level_encryption_identifier_width_and_namespace.rs`
-//! states over generated identifiers: an operation addressed by a field-level encryption
-//! identifier answers its one modelled not-found code (404) and the ABSENT resource ("The
-//! specified field level encryption config/profile does not exist.") for every identifier it
-//! cannot resolve.
+//! states over generated identifiers, on the half of it this suite reaches: an operation
+//! addressed by a field-level encryption identifier answers its one modelled not-found code
+//! (404) and the ABSENT resource ("The specified field level encryption config/profile does not
+//! exist.") for an identifier of the record's OWN namespace that it cannot resolve.
 //!
 //! This suite reads that sentence back on the identifiers this emulator really ISSUED, after
 //! their resources are gone: a client holding an identifier for a resource the account no

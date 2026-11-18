@@ -445,12 +445,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         )?;
 
         // "The destination options" (`$DestinationOptions`), as the response shape reports
-        // them. Each member the request left out is at the default its own documentation gives
-        // it — "The default is plain-text" (`DestinationOptionsRequest$FileFormat`), "The
-        // default is false" (`$HiveCompatiblePartitions`, `$PerHourPartition`) — which
-        // [`state::ComAmazonawsEc2Amazonec2State::insert_flow_log`] applies to every flow log
-        // it stores, so a request that carried none is reported the options in force all the
-        // same.
+        // them, and reported exactly when the request ASKED for them: each member this request
+        // left out of the options it named is filled in HERE, at the default that member's own
+        // documentation gives it — "The default is plain-text"
+        // (`DestinationOptionsRequest$FileFormat`), "The default is false"
+        // (`$HiveCompatiblePartitions`, `$PerHourPartition`) — and a request that named no
+        // options at all leaves the member unset, so the flow log reports the delivery layout it
+        // was configured with rather than one it never asked for.
         let destination_options = input.destination_options.as_ref().map(|options| {
             DestinationOptionsResponse {
                 file_format: Some(

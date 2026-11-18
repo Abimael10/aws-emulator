@@ -47,6 +47,8 @@ use crate::field_level_encryption_profile_lifecycle::store_profile;
 /// The sentences CloudFront sends on the wire for these refusals, spelled out here rather
 /// than taken from the crate, so a reworded refusal fails this suite.
 const NO_SUCH_CONFIG_MESSAGE: &str = "The specified field level encryption config does not exist.";
+/// The sentence a value that is no identifier of the configuration's own namespace earns.
+const UNREADABLE_ID_MESSAGE: &str = "Id format is invalid";
 const CONFIG_IN_USE_MESSAGE: &str =
     "The field level encryption config is currently associated with a cache behavior. Please \
      disassociate the config before deleting.";
@@ -514,9 +516,9 @@ async fn a_configuration_a_cache_behaviour_names_cannot_be_deleted() {
 
 /// An id the store holds no field-level encryption configuration for is
 /// `NoSuchFieldLevelEncryptionConfig`, whatever shape the id takes — never a 204, which would
-/// claim something was removed — and ONE sentence says so: this operation models no argument
-/// error, so an id it cannot resolve is the absent configuration however the value is
-/// written.
+/// claim something was removed — and the identifier's own NAMESPACE decides which of that
+/// code's two sentences says so: the absent configuration for an id of the configuration
+/// namespace, and the unreadable identifier for every other value.
 #[tokio::test]
 async fn an_id_no_configuration_holds_is_refused() {
     let router = emulator();
@@ -545,17 +547,17 @@ async fn an_id_no_configuration_holds_is_refused() {
         (
             "a known id in lower case",
             known.to_lowercase(),
-            NO_SUCH_CONFIG_MESSAGE,
+            UNREADABLE_ID_MESSAGE,
         ),
         (
             "a token that is no configuration id",
             "not-a-config-id".to_string(),
-            NO_SUCH_CONFIG_MESSAGE,
+            UNREADABLE_ID_MESSAGE,
         ),
         (
             "the caller reference rather than the id",
             "fle-config-the-only-one".to_string(),
-            NO_SUCH_CONFIG_MESSAGE,
+            UNREADABLE_ID_MESSAGE,
         ),
     ];
 

@@ -6,12 +6,18 @@
 //! An identifier CloudFront issues names the kind of resource it was issued for: an
 //! identifier of one kind is never an identifier of another, so an operation addressed by one
 //! decides whether the value it was handed could be an identifier of ITS resource kind before
-//! it goes near the store. The decision has two halves, and this module holds the half the
-//! predicates in [`super::identity`] cannot make on their own:
+//! it goes near the store. The decision has two halves, and HOW MUCH of each half a route
+//! makes is that resource kind's own recorded contract:
 //!
-//! * the FORM — the namespace letter, the body alphabet and the body width CloudFront issues
-//!   that kind's identifiers in — which is a property of the value alone
-//!   ([`super::is_distribution_id`] and its neighbours);
+//! * the FORM — how much of the way CloudFront writes that kind's identifiers a route reads of
+//!   the value, which is a property of the value alone. The two field-level encryption records
+//!   read their identifier against their OWN namespace, so a value outside it is an identifier
+//!   those routes cannot read ([`super::unresolved_field_level_encryption_config`]); the
+//!   origin access control reads only the ALPHABET CloudFront issues an identifier in
+//!   ([`is_entity_identifier`]), its recorded refusals answering the absent control for a value
+//!   of that alphabet whatever letter it opens with and however wide it is; the distribution
+//!   reads the whole form its ids are minted in ([`super::is_distribution_id`] and its
+//!   neighbours);
 //! * which KIND an identifier belongs to, for the family CloudFront draws from ONE form. A
 //!   distribution, a streaming distribution, an origin access identity and an origin access
 //!   control all carry an `E` followed by an identifier body of the same width and alphabet,
@@ -22,22 +28,38 @@
 //!   issued it.
 //!
 //! A value that fails either half is an identifier the service cannot READ, which is a
-//! different answer from a resource that is absent ([`super::id_format_invalid_message`]), and
-//! a per-operation one: whether an operation reads its identifier's kind before resolving it
-//! is that operation's own recorded contract, so the refusals below are reached from the
-//! handlers that record it rather than applied to every operation of a resource kind.
+//! different answer from a resource that is absent ([`super::id_format_invalid_message`]):
+//! the operation's own not-found code and status, carrying that sentence instead of the
+//! absent-resource one.
 //!
 //! The same split, for the kinds whose identifier form IS decided by the value alone, is made
 //! by the free functions beside the refusals they answer with:
-//! [`super::unresolved_key_group_id`] and [`super::unresolved_public_key_id`]. Those need no
-//! store, which is the one reason the one below is a method.
+//! [`super::unresolved_key_group_id`], [`super::unresolved_public_key_id`] and the two
+//! field-level encryption records' ([`super::unresolved_field_level_encryption_config`],
+//! [`super::unresolved_field_level_encryption_profile`]). Those need no store, which is the one
+//! reason the ones below are methods.
 //!
 //! Nothing here echoes the submitted value: both sentences are fixed text.
 
 use super::*;
 
-/// The resource kinds whose identifiers CloudFront draws from ONE form (`E` followed by an
-/// identifier body), and which are therefore told apart by the store rather than by the value.
+/// Whether `value` could be an identifier CloudFront ISSUED for an entity of this service: a
+/// non-empty run of the one alphabet it writes them in (a decimal digit or an uppercase ASCII
+/// letter).
+///
+/// This is all the FORM an origin access control route reads. The member is a plain `string`
+/// in the model — no `@pattern`, no `@length` — and its recorded refusals answer the absent
+/// control for a value of this alphabet whatever letter it opens with and however wide it is,
+/// so the namespace letter and the width this emulator happens to MINT are no part of the
+/// decision; a value outside the alphabet was never an identifier this service issued, and is
+/// the identifier it reports it cannot read.
+pub fn is_entity_identifier(value: &str) -> bool {
+    !value.is_empty() && value.bytes().all(is_token_byte)
+}
+
+/// The resource kinds whose identifiers CloudFront draws from ONE namespace it shares with
+/// others — an `E` followed by an identifier body — and which are therefore told apart by the
+/// store rather than by the value.
 ///
 /// Every variant is a kind this service MINTS an `E`-form identifier for
 /// (`allocate_distribution_id`, `allocate_streaming_distribution_id`,
@@ -71,9 +93,9 @@ impl ComAmazonawsCloudfrontCloudfront20200531State {
         }
     }
 
-    /// Whether `id` could ADDRESS a resource of `kind`: it is written the way CloudFront
-    /// writes that family's identifiers, and this account holds no resource of ANOTHER kind of
-    /// the family under it.
+    /// Whether `id` could ADDRESS a resource of `kind`: it is written in a form CloudFront
+    /// writes an identifier of that kind in ([`in_readable_form`]), and this account holds no
+    /// resource of ANOTHER kind of the shared-form family under it.
     ///
     /// An identifier of the right form that nothing answers to could address one — the
     /// resource it names is simply not there — so this answers `true` for it, which is what
@@ -106,10 +128,32 @@ impl ComAmazonawsCloudfrontCloudfront20200531State {
             }
         }
     }
+
+    /// The modelled `NoSuchOriginAccessControl` an operation ADDRESSED by an origin access
+    /// control `Id` answers an identifier it could not resolve.
+    ///
+    /// The FORM this route reads is the ALPHABET alone ([`is_entity_identifier`]), and the KIND
+    /// is read from the store: a value this account holds as another kind of the `E`-form
+    /// family was issued for THAT kind, and a value outside the alphabet was never an
+    /// identifier this service issued — each is an identifier this operation cannot read, while
+    /// every other value it cannot resolve is the control that is absent, whatever letter it
+    /// opens with and however wide it is.
+    pub fn unresolved_origin_access_control(&self, id: &str) -> NoSuchOriginAccessControl {
+        let addresses_a_control = is_entity_identifier(id)
+            && self
+                .entity_kind(id)
+                .is_none_or(|held| held == EntityKind::OriginAccessControl);
+        if addresses_a_control {
+            no_such_origin_access_control()
+        } else {
+            NoSuchOriginAccessControl {
+                message: Some(id_format_invalid_message(ADDRESSED_BY_ID)),
+            }
+        }
+    }
 }
 
 /// The model's name for the member every operation of the `E`-form family addresses its
 /// resource by, except the ones that address a resource held UNDER a distribution
 /// (`CreateInvalidation$DistributionId`).
 pub const ADDRESSED_BY_ID: &str = "Id";
-

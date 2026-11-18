@@ -42,7 +42,7 @@ use crate::field_level_encryption_config_lifecycle::{
 };
 use crate::field_level_encryption_profile_lifecycle::{
     create_profile, get_profile, get_profile_config, is_profile_id, table, upload_keys, Entity,
-    Profile,
+    Profile, UNREADABLE_PROFILE_ID_MESSAGE,
 };
 
 /// The sentences CloudFront sends for these refusals, spelled out here rather than taken from
@@ -637,17 +637,17 @@ async fn an_id_no_profile_holds_is_refused() {
         (
             "a known id in lower case",
             known.to_lowercase(),
-            NO_SUCH_PROFILE_MESSAGE,
+            UNREADABLE_PROFILE_ID_MESSAGE,
         ),
         (
             "a token that is no profile id",
             "not-a-profile-id".to_string(),
-            NO_SUCH_PROFILE_MESSAGE,
+            UNREADABLE_PROFILE_ID_MESSAGE,
         ),
         (
             "the caller reference rather than the id",
             "fle-profile-the-only-one".to_string(),
-            NO_SUCH_PROFILE_MESSAGE,
+            UNREADABLE_PROFILE_ID_MESSAGE,
         ),
     ];
 

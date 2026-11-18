@@ -495,13 +495,23 @@ async fn create_persists_the_configuration_every_read_then_reports() {
         .first()
         .map(|(_, id)| id.clone())
         .unwrap_or_else(|| panic!("the table must create at least one control"));
-    for id in [
-        "E1AAAAAAAAAAAA",
-        "not-an-id",
-        "0",
-        &distribution_id.to_lowercase(),
-        "W1AAAAAAAAAAAA",
-        "00000000-0000-0000-0000-000000000000",
+    // Each row is an id no control holds, with the sentence it earns: the absent control for a
+    // value written in the alphabet CloudFront issues an entity identifier in, and the
+    // unreadable identifier for a value of a form this service never issued.
+    const UNREADABLE_CONTROL_ID_MESSAGE: &str = "Id format is invalid";
+    for (id, expected) in [
+        ("E1AAAAAAAAAAAA", NO_SUCH_CONTROL_MESSAGE),
+        ("not-an-id", UNREADABLE_CONTROL_ID_MESSAGE),
+        ("0", NO_SUCH_CONTROL_MESSAGE),
+        (
+            distribution_id.to_lowercase().as_str(),
+            UNREADABLE_CONTROL_ID_MESSAGE,
+        ),
+        ("W1AAAAAAAAAAAA", NO_SUCH_CONTROL_MESSAGE),
+        (
+            "00000000-0000-0000-0000-000000000000",
+            UNREADABLE_CONTROL_ID_MESSAGE,
+        ),
     ] {
         let missing = get_control(&router, id).await;
         assert_eq!(
@@ -517,8 +527,8 @@ async fn create_persists_the_configuration_every_read_then_reports() {
         );
         assert_eq!(
             missing.root().find_text("Message"),
-            Some(NO_SUCH_CONTROL_MESSAGE),
-            "case {id}: expected the absent-control sentence, got {}",
+            Some(expected),
+            "case {id}: expected the sentence {expected:?}, got {}",
             missing.raw
         );
     }
