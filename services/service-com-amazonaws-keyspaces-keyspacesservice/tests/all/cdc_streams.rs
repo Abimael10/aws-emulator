@@ -882,10 +882,36 @@ async fn a_deleted_table_takes_its_cdc_stream_with_it() {
                 .await,
         );
     }
-    tokio::time::sleep(settle_wait()).await;
-    let dropped_arn = reported_cdc(&emulator.get_table("dropped", keyspace, "dropped").await)
-        .2
-        .expect("the dropped table's stream ARN");
+    // What this case needs is not a span of wall clock but a CONDITION: both tables out
+    // of their transient status, so `DeleteTable` is accepted and the stream each table
+    // reports is the one the reads below must find. So it looks again until that holds,
+    // the way this crate's other suites wait (`tests/all/auto_scaling_propagation.rs`),
+    // under a deadline far past every transition this emulator gives a table.
+    let dropped_arn = {
+        /// How long the wait may take at most, with generous room for a loaded machine.
+        const WITHIN: Duration = Duration::from_secs(30);
+
+        let deadline = std::time::Instant::now() + WITHIN;
+        loop {
+            let kept = emulator.get_table("kept", keyspace, "kept").await;
+            let dropped = emulator.get_table("dropped", keyspace, "dropped").await;
+            let settled = |table: &Value| {
+                table["status"] == json!("ACTIVE")
+                    && reported_cdc(table).0.as_deref() == Some(keyspaces::CDC_STATUS_ENABLED)
+            };
+            if settled(&kept) && settled(&dropped) {
+                break reported_cdc(&dropped)
+                    .2
+                    .expect("the dropped table's stream ARN");
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "case delete_table: both tables must settle with their stream, last saw \
+                 {kept} and {dropped}"
+            );
+            tokio::task::yield_now().await;
+        }
+    };
 
     assert_ok(
         "delete_table",
@@ -908,7 +934,9 @@ async fn a_deleted_table_takes_its_cdc_stream_with_it() {
         emulator
             .streams("GetStream", json!({"streamArn": dropped_arn}))
             .await,
-        404,
+        // The streams service answers every client fault of its awsJson1_0 wire at 400,
+        // naming the class in the body, exactly as Keyspaces itself does.
+        400,
         "ResourceNotFoundException",
     );
     // The other table's stream is untouched.

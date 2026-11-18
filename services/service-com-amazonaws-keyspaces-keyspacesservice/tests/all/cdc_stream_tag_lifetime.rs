@@ -166,7 +166,9 @@ async fn assert_nothing_answers(emulator: &Cdc, case: &str, stream_arn: &str) {
         emulator
             .streams("GetStream", json!({"streamArn": stream_arn}))
             .await,
-        404,
+        // The streams service answers every client fault of its awsJson1_0 wire at 400,
+        // naming the class in the body, exactly as Keyspaces itself does below.
+        400,
         "ResourceNotFoundException",
     );
     assert_failure(

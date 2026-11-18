@@ -47,12 +47,20 @@
 //!   error of this model, so every operation has to be able to answer it.
 //! * [`refusals`] — the fixed WORDS this service states each class of refusal with, held
 //!   in one place so two handlers cannot word one class differently.
+//! * [`unreadable_values`] — the request-DESERIALIZATION layer `override_operation` runs
+//!   ahead of dispatch: a value the modelled member it is bound to cannot be read from is a
+//!   protocol-level serialization failure, not one of this service's modelled refusals.
+//! * [`wire_status`] — the HTTP status this service puts a modelled error on the wire at.
 
 /// The per-request IAM decision every operation of this service takes before it reads the
 /// stream store.
 pub mod authorization;
 /// The fixed text this service words each class of refusal with.
 pub mod refusals;
+/// The refusal of a value no modelled member can be read from.
+mod unreadable_values;
+/// The status a modelled error of this service is served at.
+pub mod wire_status;
 
 use smithy_server_runtime::{
     http, ErasedOperation, Refusal, Refused, Service,
@@ -119,11 +127,15 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         &self,
         req: &aws_smithy_runtime_api::http::Request,
     ) -> Option<&dyn ErasedOperation> {
-        // Return `Some(op)` to serve a request the model's routing key cannot name
-        // correctly; `None` (the default) lets the generated routing table resolve
-        // it. `req` is the whole request, so a decision that depends on the body —
-        // the `Action` form field on a query protocol, say — is reachable here.
-        let _ = req;
+        // A value whose JSON class the modelled type of its member cannot be read from
+        // never becomes a value at all, so no operation can answer it with one of its own
+        // modelled errors: it is the protocol's serialization failure, a different error
+        // class and a different remediation for the caller ([`unreadable_values`]). This
+        // seam is the one place a service has before dispatch, so the decision is taken
+        // here; every other request resolves through the generated routing table.
+        if unreadable_values::refuses(self.definition(), req) {
+            return Some(&unreadable_values::UNREADABLE_VALUES);
+        }
         None
     }
 

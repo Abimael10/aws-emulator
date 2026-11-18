@@ -265,7 +265,7 @@ async fn a_stream_is_visible_only_to_its_own_region() {
         let status = response.status().as_u16();
         let body = String::from_utf8_lossy(response.body()).to_string();
         assert_eq!(
-            status, 404,
+            status, 400,
             "case {other_region} reads {region}'s stream: it must not exist there, got \
              {status} {body}"
         );

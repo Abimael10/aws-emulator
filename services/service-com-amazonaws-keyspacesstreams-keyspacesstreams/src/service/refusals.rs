@@ -31,3 +31,18 @@ pub const INVALID_PARAMETER_VALUES: &str = "One or more parameter values were in
 /// client-side format failure rather than a missing resource — an iterator this service
 /// could have issued and that has since lapsed is `ExpiredIterator` instead.
 pub const INVALID_SHARD_ITERATOR: &str = "Invalid ShardIterator";
+
+/// `ValidationException` with `errorCode` `InvalidFormat`: the `streamArn` presented is not
+/// an ARN naming a stream of an Amazon Keyspaces table, so it names no stream this service
+/// could ever hold. A permanent client-side format failure, which is a different answer
+/// from [`RESOURCE_NOT_FOUND`]: that one is about a well-formed name nothing is stored
+/// under, and only this one tells the caller to fix the value rather than create the stream.
+pub const INVALID_STREAM_ARN: &str = "Invalid stream ARN.";
+
+/// `ValidationException`: the `nextToken` presented is not one this service can resume the
+/// query with — it issued no such token, or issued it for another query. Which it was is not
+/// disclosed, and the token is not echoed: a pagination token is opaque, so the only thing a
+/// caller can do with either answer is start the enumeration again. A token this service DID
+/// issue and that has since lapsed is `ExpiredNextToken`, which is the signal to re-read
+/// from the start rather than a permanent format failure.
+pub const INVALID_NEXT_TOKEN: &str = "Invalid nextToken.";

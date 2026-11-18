@@ -393,6 +393,63 @@ fn epoch_millis(at: SystemTime) -> u128 {
         .as_millis()
 }
 
+/// The ARN vendor every Amazon Keyspaces resource is named under — the model's
+/// `aws.api#service$arnNamespace`. A stream belongs to a Keyspaces table, so its ARN
+/// carries this vendor and not the service's own endpoint prefix.
+pub const STREAM_ARN_VENDOR: &str = "cassandra";
+
+/// The segments a stream's ARN names it by:
+/// `/keyspace/<keyspace>/table/<table>/stream/<label>` — the keyspace that holds the table,
+/// the table the stream follows, and the label that identifies which of that table's streams
+/// it is. [`stream_resource_path`] writes one and [`names_a_stream`] reads one, so the
+/// minting side and the reading side cannot disagree about the form.
+const KEYSPACE_SEGMENT: &str = "keyspace";
+/// See [`KEYSPACE_SEGMENT`].
+const TABLE_SEGMENT: &str = "table";
+/// See [`KEYSPACE_SEGMENT`].
+const STREAM_SEGMENT: &str = "stream";
+
+/// The resource portion of the ARN Amazon Keyspaces gives a table's stream.
+fn stream_resource_path(keyspace_name: &str, table_name: &str, stream_label: &str) -> String {
+    format!(
+        "/{KEYSPACE_SEGMENT}/{keyspace_name}/{TABLE_SEGMENT}/{table_name}/{STREAM_SEGMENT}/{stream_label}"
+    )
+}
+
+/// Whether `value` is syntactically the ARN of a Keyspaces table's stream: a well-formed
+/// ARN, in the Keyspaces vendor's namespace, whose resource names a keyspace, a table of it
+/// and a stream of that table.
+///
+/// This is a question about the VALUE, not about what this store holds: an ARN that passes
+/// here may still name no stream (which is a not-found), and one that fails here can never
+/// name a stream at all, however the store changes — which is why the two are different
+/// answers to the caller. The region and the account are deliberately not checked: those
+/// fields say WHERE a stream lives, so a stream of another region or account is one this
+/// request cannot see rather than a value the caller mis-spelled.
+#[must_use]
+pub fn names_a_stream(value: &str) -> bool {
+    let Some(arn) = ::service_common::arn::parse(value) else {
+        return false;
+    };
+    if arn.vendor != STREAM_ARN_VENDOR {
+        return false;
+    }
+    // Keyspaces writes this resource with a leading `/`; the segments after it are what
+    // name the stream, so the separator itself carries no information.
+    let path = arn.resource.strip_prefix('/').unwrap_or(arn.resource);
+    let segments: Vec<&str> = path.split('/').collect();
+    matches!(
+        segments.as_slice(),
+        [keyspace_segment, keyspace_name, table_segment, table_name, stream_segment, stream_label]
+            if *keyspace_segment == KEYSPACE_SEGMENT
+                && *table_segment == TABLE_SEGMENT
+                && *stream_segment == STREAM_SEGMENT
+                && !keyspace_name.is_empty()
+                && !table_name.is_empty()
+                && !stream_label.is_empty()
+    )
+}
+
 /// Per-service state for com-amazonaws-keyspacesstreams-keyspacesstreams. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsKeyspacesstreamsKeyspacesstreamsState {
@@ -454,9 +511,9 @@ impl ComAmazonawsKeyspacesstreamsKeyspacesstreamsState {
             // The resource path Amazon Keyspaces gives a table's stream:
             // `/keyspace/<keyspace>/table/<table>/stream/<label>`.
             let stream_arn = ::engine::emulator_arn(
-                "cassandra",
+                STREAM_ARN_VENDOR,
                 region,
-                &format!("/keyspace/{keyspace_name}/table/{table_name}/stream/{stream_label}"),
+                &stream_resource_path(keyspace_name, table_name, &stream_label),
             );
             if !self.streams.contains_key(&stream_arn) {
                 break (stream_label, stream_arn);

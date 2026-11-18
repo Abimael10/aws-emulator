@@ -302,7 +302,7 @@ fn invalid_shard_iterator() -> GetRecordsError {
     )
 }
 
-/// The modelled 404 for a stream or shard this service no longer holds.
+/// The modelled refusal of a stream or shard this service no longer holds.
 fn not_found() -> GetRecordsError {
     GetRecordsErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
         message: Some(crate::service::refusals::RESOURCE_NOT_FOUND.to_string()),

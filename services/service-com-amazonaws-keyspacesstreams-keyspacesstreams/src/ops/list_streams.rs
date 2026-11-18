@@ -219,22 +219,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut state = store.lock();
         let resume_after = match state.resolve_page_token(input.next_token.as_deref(), &scope) {
             Ok(resume_after) => resume_after,
-            Err(PageTokenError::NotIssued) => {
-                return Err(validation(
-                    "nextToken is not a pagination token this service issued",
-                    "InvalidFormat",
-                ))
+            Err(PageTokenError::NotIssued | PageTokenError::WrongQuery) => {
+                return Err(invalid_next_token())
             }
             Err(PageTokenError::Expired) => {
                 return Err(validation(
                     "nextToken is no longer valid; start the enumeration again",
                     "ExpiredNextToken",
-                ))
-            }
-            Err(PageTokenError::WrongQuery) => {
-                return Err(validation(
-                    "nextToken was issued for a different keyspaceName/tableName filter",
-                    "InvalidFormat",
                 ))
             }
         };
@@ -313,6 +304,11 @@ fn page_size(max_results: Option<i32>) -> usize {
         .unwrap_or(DEFAULT_MAX_RESULTS)
         .clamp(1, DEFAULT_MAX_RESULTS);
     usize::try_from(requested).unwrap_or(1)
+}
+
+/// The modelled 400 for a `nextToken` this operation cannot resume the query with.
+fn invalid_next_token() -> ListStreamsError {
+    validation(crate::service::refusals::INVALID_NEXT_TOKEN, "InvalidFormat")
 }
 
 /// The modelled 400 for a request whose parameter values this operation does not accept.

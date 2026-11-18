@@ -6,14 +6,26 @@
 //!
 //! THE RULES UNDER TEST, one per class of refusal:
 //!
+//! * a value whose JSON class the modelled member it is bound to cannot be read from never
+//!   becomes a value at all — HTTP 400 `SerializationException`, whose capital-`Message`
+//!   names the class sent and the modelled type it could not be read as — while a value
+//!   that WAS read and then broke a modelled rule is a `ValidationException` instead;
 //! * a `shardIterator` this service did not issue names no position to read from, so it is
 //!   an input-FORMAT failure — HTTP 400 `ValidationException` with `errorCode`
 //!   `InvalidFormat` — and never the resource-missing bucket;
+//! * a `streamArn` that is not an ARN naming a stream of a Keyspaces table is the same
+//!   input-FORMAT failure, with Amazon Keyspaces's fixed invalid-ARN sentence;
+//! * a `nextToken` this service cannot resume a query with is that failure too, with the
+//!   fixed invalid-token sentence;
 //! * a stream or shard this service holds no record of is `ResourceNotFoundException` with
 //!   Amazon Keyspaces's fixed not-found sentence;
 //! * a parameter value, or a combination of them, the operation does not accept is
 //!   `ValidationException` with Amazon Keyspaces's fixed invalid-parameter sentence, which
 //!   the `errorCode` member classifies.
+//!
+//! Every one of them is answered at this service's one client-fault status, HTTP 400: the
+//! CLASS travels in the body (`__type`, and `ValidationException`'s `errorCode`), never in
+//! the status line.
 //!
 //! Each sentence is FIXED text: it names no member, no value and no identifier of the
 //! request, so the tables below assert that nothing of the request — a keyspace or table
@@ -39,6 +51,16 @@ const INVALID_PARAMETER_VALUES: &str = "One or more parameter values were invali
 
 /// Amazon Keyspaces's fixed sentence for a `shardIterator` it did not issue.
 const INVALID_SHARD_ITERATOR: &str = "Invalid ShardIterator";
+
+/// Amazon Keyspaces's fixed sentence for a `streamArn` that is not a stream's ARN.
+const INVALID_STREAM_ARN: &str = "Invalid stream ARN.";
+
+/// Amazon Keyspaces's fixed sentence for a `nextToken` it cannot resume a query with.
+const INVALID_NEXT_TOKEN: &str = "Invalid nextToken.";
+
+/// The status every client fault of this service is answered at: the class of the failure
+/// travels in the body, not in the status line.
+const CLIENT_FAULT_STATUS: u16 = 400;
 
 /// The Region the seeded streams belong to; the calls below are unsigned, so they name
 /// none and every stream is visible to them.
@@ -158,7 +180,7 @@ impl Expected {
     /// The input-format refusal of a `shardIterator` this service did not issue.
     fn invalid_shard_iterator() -> Self {
         Self {
-            status: 400,
+            status: CLIENT_FAULT_STATUS,
             code: "ValidationException",
             error_code: Some("InvalidFormat"),
             message: INVALID_SHARD_ITERATOR,
@@ -168,10 +190,30 @@ impl Expected {
     /// The refusal of a resource this service holds no record of.
     fn not_found() -> Self {
         Self {
-            status: 404,
+            status: CLIENT_FAULT_STATUS,
             code: "ResourceNotFoundException",
             error_code: None,
             message: RESOURCE_NOT_FOUND,
+        }
+    }
+
+    /// The input-format refusal of a `streamArn` that is not a stream's ARN.
+    fn invalid_stream_arn() -> Self {
+        Self {
+            status: CLIENT_FAULT_STATUS,
+            code: "ValidationException",
+            error_code: Some("InvalidFormat"),
+            message: INVALID_STREAM_ARN,
+        }
+    }
+
+    /// The input-format refusal of a `nextToken` no query of this service can resume.
+    fn invalid_next_token() -> Self {
+        Self {
+            status: CLIENT_FAULT_STATUS,
+            code: "ValidationException",
+            error_code: Some("InvalidFormat"),
+            message: INVALID_NEXT_TOKEN,
         }
     }
 
@@ -179,7 +221,7 @@ impl Expected {
     /// `ValidationExceptionType` it carries.
     fn invalid_parameters(error_code: &'static str) -> Self {
         Self {
-            status: 400,
+            status: CLIENT_FAULT_STATUS,
             code: "ValidationException",
             error_code: Some(error_code),
             message: INVALID_PARAMETER_VALUES,
@@ -518,4 +560,340 @@ async fn a_parameter_value_the_operation_does_not_accept_is_the_fixed_invalid_pa
             "case {case:?}: an acceptable value must be served, got {status} {body}"
         );
     }
+}
+
+/// RULE: a value whose JSON class the modelled member it is bound to cannot be read from
+/// never becomes a value, so it is refused at the deserialization layer with
+/// `SerializationException` — whose capital-`Message` names the class sent and the modelled
+/// type it could not be read as — while a value that WAS read and then broke a modelled
+/// rule is a `ValidationException` instead.
+#[tokio::test]
+async fn a_value_no_modelled_member_can_be_read_from_is_a_serialization_failure() {
+    let (engine, router) = emulator();
+    let seeded = given_stream(&engine, "shop", "orders");
+
+    // The rows span the JSON classes a caller can put in a member's place against the
+    // modelled types this service's four inputs declare — an integer member, a string
+    // member and a structure member — with at least one row on every operation.
+    // (case, operation, request, the sentence the refusal states)
+    let cases: Vec<(&str, &str, Value, &str)> = vec![
+        (
+            "GetRecords maxResults as text",
+            "GetRecords",
+            json!({ "shardIterator": seeded.iterator, "maxResults": "100" }),
+            "STRING_VALUE cannot be converted to Integer",
+        ),
+        (
+            "GetRecords maxResults as a flag",
+            "GetRecords",
+            json!({ "shardIterator": seeded.iterator, "maxResults": true }),
+            "BOOLEAN_VALUE cannot be converted to Integer",
+        ),
+        (
+            "GetRecords maxResults as a list",
+            "GetRecords",
+            json!({ "shardIterator": seeded.iterator, "maxResults": [100] }),
+            "ARRAY_VALUE cannot be converted to Integer",
+        ),
+        (
+            "GetRecords maxResults as a fraction",
+            "GetRecords",
+            json!({ "shardIterator": seeded.iterator, "maxResults": 1.5 }),
+            "NUMBER_VALUE cannot be converted to Integer",
+        ),
+        (
+            "GetRecords shardIterator as a number",
+            "GetRecords",
+            json!({ "shardIterator": 7 }),
+            "NUMBER_VALUE cannot be converted to String",
+        ),
+        (
+            "GetStream shardFilter as text",
+            "GetStream",
+            json!({ "streamArn": seeded.stream_arn, "shardFilter": "CHILD_SHARDS" }),
+            "STRING_VALUE cannot be converted to Structure",
+        ),
+        (
+            "GetShardIterator shardId as a list",
+            "GetShardIterator",
+            json!({
+                "streamArn": seeded.stream_arn,
+                "shardId": [seeded.shard_id],
+                "shardIteratorType": "LATEST",
+            }),
+            "ARRAY_VALUE cannot be converted to String",
+        ),
+        (
+            "ListStreams keyspaceName as an object",
+            "ListStreams",
+            json!({ "keyspaceName": { "name": "shop" } }),
+            "OBJECT_VALUE cannot be converted to String",
+        ),
+    ];
+
+    for (case, operation, request, sentence) in cases {
+        let (status, body) = call(&router, operation, &request).await;
+        assert_eq!(
+            status, CLIENT_FAULT_STATUS,
+            "case {case}: expected HTTP {CLIENT_FAULT_STATUS}, got {status} {body}"
+        );
+        assert_eq!(
+            body["__type"], "SerializationException",
+            "case {case}: a value that never became a value is the protocol's failure, got \
+             {body}"
+        );
+        assert_eq!(
+            body["Message"].as_str(),
+            Some(sentence),
+            "case {case}: expected the sentence {sentence:?} under the capital-Message member, \
+             got {body}"
+        );
+    }
+
+    // A value of the class the member IS read from is served — so the rule refuses the
+    // value, not the member.
+    for (case, request) in [
+        (
+            "maxResults as a number",
+            json!({ "shardIterator": seeded.iterator, "maxResults": 100 }),
+        ),
+        (
+            "maxResults absent",
+            json!({ "shardIterator": seeded.iterator }),
+        ),
+    ] {
+        let (status, body) = call(&router, "GetRecords", &request).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: a readable value must be served, got {status} {body}"
+        );
+    }
+
+    // A value that WAS read and then broke the modelled `@range` is the other class: it
+    // carries no capital-`Message`, because the request never failed to deserialize.
+    let (status, body) = call(
+        &router,
+        "GetRecords",
+        &json!({ "shardIterator": seeded.iterator, "maxResults": 0 }),
+    )
+    .await;
+    assert_eq!(
+        status, CLIENT_FAULT_STATUS,
+        "case \"maxResults below the modelled range\": expected HTTP {CLIENT_FAULT_STATUS}, got \
+         {status} {body}"
+    );
+    assert_ne!(
+        body["__type"], "SerializationException",
+        "case \"maxResults below the modelled range\": a value that was read is a constraint \
+         refusal, got {body}"
+    );
+    assert!(
+        body.get("Message").is_none(),
+        "case \"maxResults below the modelled range\": only a serialization refusal carries the \
+         capital-Message member, got {body}"
+    );
+}
+
+/// RULE: a `streamArn` that is not an ARN naming a stream of an Amazon Keyspaces table is
+/// an input-FORMAT failure — 400 `ValidationException`, `errorCode` `InvalidFormat`, with
+/// Amazon Keyspaces's fixed invalid-ARN sentence — whichever operation carries it, while a
+/// well-formed ARN nothing is stored under is the not-found class instead.
+#[tokio::test]
+async fn a_stream_arn_that_names_no_stream_is_an_input_format_failure() {
+    let (engine, router) = emulator();
+    let seeded = given_stream(&engine, "shop", "orders");
+    let values = request_values(&seeded, "shop", "orders");
+
+    // The class spans every way a value inside `StreamArn`'s length bound (37..1024) can
+    // fail to name a stream: text that is no ARN at all, an ARN of another vendor, a
+    // Keyspaces ARN that stops short of a stream, one whose path segments are misspelled,
+    // one missing ARN fields, one with an empty stream label, and this stream's own ARN
+    // with the vendor swapped.
+    let malformed: Vec<(&str, String)> = vec![
+        (
+            "arbitrary text the length bound admits",
+            format!("not-an-arn-{}", "x".repeat(40)),
+        ),
+        (
+            "another vendor's stream ARN",
+            format!(
+                "arn:aws:dynamodb:{REGION}:000000000000:table/orders/stream/2026-10-30T07:59:02.000"
+            ),
+        ),
+        (
+            "a Keyspaces table ARN, naming no stream",
+            ::engine::emulator_arn("cassandra", REGION, "/keyspace/shop/table/orders"),
+        ),
+        (
+            "a Keyspaces ARN whose path segments are misspelled",
+            ::engine::emulator_arn(
+                "cassandra",
+                REGION,
+                "/keyspaces/shop/tables/orders/streams/2026-10-30T07:59:02.000",
+            ),
+        ),
+        (
+            "an ARN with fields missing",
+            format!("arn:aws:cassandra:{REGION}:000000000000"),
+        ),
+        (
+            "a stream ARN with an empty label",
+            ::engine::emulator_arn("cassandra", REGION, "/keyspace/shop/table/orders/stream/"),
+        ),
+        (
+            "this stream's ARN with the vendor swapped",
+            seeded.stream_arn.replace(":cassandra:", ":cassandra-streams:"),
+        ),
+    ];
+
+    for (case, stream_arn) in malformed {
+        assert!(
+            stream_arn.len() >= 37,
+            "case {case}: the value must clear StreamArn's 37-character minimum so the \
+             operation answers it, got {} characters",
+            stream_arn.len()
+        );
+        for (operation, request) in [
+            ("GetStream", json!({ "streamArn": stream_arn })),
+            (
+                "GetShardIterator",
+                json!({
+                    "streamArn": stream_arn,
+                    "shardId": seeded.shard_id,
+                    "shardIteratorType": "TRIM_HORIZON",
+                }),
+            ),
+        ] {
+            let (status, body) = call(&router, operation, &request).await;
+            assert_refusal(
+                &format!("{operation} with {case}"),
+                status,
+                &body,
+                Expected::invalid_stream_arn(),
+                &values,
+            );
+        }
+    }
+
+    // A well-formed stream ARN nothing is stored under is the OTHER class: the value is
+    // one this service could have issued, so the caller is told the resource is missing
+    // rather than that the ARN is wrong.
+    let absent = ::engine::emulator_arn(
+        "cassandra",
+        REGION,
+        "/keyspace/shop/table/absent/stream/2026-10-30T07:59:02.000",
+    );
+    let (status, body) = call(&router, "GetStream", &json!({ "streamArn": absent })).await;
+    assert_refusal(
+        "GetStream with a well-formed ARN of a stream nothing created",
+        status,
+        &body,
+        Expected::not_found(),
+        &values,
+    );
+
+    // The stream's real ARN is still served by both operations, so the rule refuses the
+    // value and not the operation.
+    for (case, operation, request) in [
+        (
+            "GetStream with this stream's ARN",
+            "GetStream",
+            json!({ "streamArn": seeded.stream_arn }),
+        ),
+        (
+            "GetShardIterator with this stream's ARN",
+            "GetShardIterator",
+            json!({
+                "streamArn": seeded.stream_arn,
+                "shardId": seeded.shard_id,
+                "shardIteratorType": "TRIM_HORIZON",
+            }),
+        ),
+    ] {
+        let (status, body) = call(&router, operation, &request).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: this stream's ARN must be served, got {status} {body}"
+        );
+    }
+}
+
+/// RULE: a `nextToken` this service cannot resume the query with — one it never issued, or
+/// one it issued for another query — is an input-FORMAT failure with Amazon Keyspaces's
+/// fixed invalid-token sentence, on every paginated operation, while the token it issued
+/// for THIS query still resumes it.
+#[tokio::test]
+async fn a_next_token_no_query_can_resume_is_an_input_format_failure() {
+    let (engine, router) = emulator();
+    let seeded = given_stream(&engine, "shop", "orders");
+    given_stream(&engine, "shop", "invoices");
+    let values = request_values(&seeded, "shop", "orders");
+
+    // A token this service really issued, for the unfiltered enumeration: two streams are
+    // seeded, so a page of one leaves a continuation.
+    let (status, page) = call(&router, "ListStreams", &json!({ "maxResults": 1 })).await;
+    assert_eq!(
+        status, 200,
+        "the first page must be served, got {status} {page}"
+    );
+    let issued = page["nextToken"]
+        .as_str()
+        .unwrap_or_else(|| panic!("a partial enumeration carries a nextToken, got {page}"))
+        .to_string();
+
+    // The class spans the ways a token cannot resume a query: the shortest and the longest
+    // value `StreamArnToken`'s 80..3000 bound admits, a value shaped like this service's
+    // own tokens that was never minted, and a token this service DID issue presented to
+    // another query.
+    let unresumable: Vec<(&str, String)> = vec![
+        ("the shortest value the model admits", "z".repeat(80)),
+        ("the longest value the model admits", "z".repeat(3000)),
+        (
+            "this service's own token shape, never minted",
+            format!("ksstreams-page-{}", "0".repeat(80)),
+        ),
+        ("a token issued for another query", issued.clone()),
+    ];
+
+    for (case, next_token) in unresumable {
+        for (operation, request) in [
+            (
+                "ListStreams",
+                json!({ "keyspaceName": "shop", "maxResults": 1, "nextToken": next_token }),
+            ),
+            (
+                "GetStream",
+                json!({ "streamArn": seeded.stream_arn, "nextToken": next_token }),
+            ),
+        ] {
+            let (status, body) = call(&router, operation, &request).await;
+            assert_refusal(
+                &format!("{operation} with {case}"),
+                status,
+                &body,
+                Expected::invalid_next_token(),
+                &values,
+            );
+        }
+    }
+
+    // The token this service issued for THIS query still resumes it, so the rule refuses
+    // the token and not pagination.
+    let (status, resumed) = call(
+        &router,
+        "ListStreams",
+        &json!({ "maxResults": 1, "nextToken": issued }),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "case \"the token this query issued\": it must resume the enumeration, got {status} \
+         {resumed}"
+    );
+    assert_eq!(
+        resumed["streams"].as_array().map(Vec::len),
+        Some(1),
+        "case \"the token this query issued\": the next page carries the next stream, got \
+         {resumed}"
+    );
 }

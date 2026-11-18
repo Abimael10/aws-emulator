@@ -221,6 +221,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         crate::service::authorization::authorize(&*self.engine, ctx, Self::NAME, &input.stream_arn)
             .map_err(GetStreamErrorModeled::AccessDeniedException)?;
 
+        // A `streamArn` that is not an ARN naming a stream of a Keyspaces table names no
+        // stream this service could ever hold, whatever its store comes to contain: an
+        // input-FORMAT failure, read off the value before any lookup, rather than a
+        // resource that happens to be missing.
+        if !crate::state::names_a_stream(&input.stream_arn) {
+            return Err(invalid_stream_arn());
+        }
+
         let scope = PageScope::Shards {
             region: region.clone(),
             stream_arn: input.stream_arn.clone(),
@@ -237,22 +245,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let resume_after = match state.resolve_page_token(input.next_token.as_deref(), &scope) {
             Ok(resume_after) => resume_after,
-            Err(PageTokenError::NotIssued) => {
-                return Err(validation(
-                    "nextToken is not a pagination token this service issued",
-                    "InvalidFormat",
-                ))
+            Err(PageTokenError::NotIssued | PageTokenError::WrongQuery) => {
+                return Err(invalid_next_token())
             }
             Err(PageTokenError::Expired) => {
                 return Err(validation(
                     "nextToken is no longer valid; start the enumeration again",
                     "ExpiredNextToken",
-                ))
-            }
-            Err(PageTokenError::WrongQuery) => {
-                return Err(validation(
-                    "nextToken was issued for a different streamArn/shardFilter query",
-                    "InvalidFormat",
                 ))
             }
         };
@@ -382,12 +381,22 @@ fn page_size(max_results: Option<i32>) -> usize {
     usize::try_from(requested).unwrap_or(1)
 }
 
-/// The modelled 404 for a stream or shard this service holds no record of.
+/// The modelled refusal of a stream or shard this service holds no record of.
 fn not_found() -> GetStreamError {
     GetStreamErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
         message: Some(crate::service::refusals::RESOURCE_NOT_FOUND.to_string()),
     })
     .into()
+}
+
+/// The modelled 400 for a `streamArn` that is not an ARN naming a stream.
+fn invalid_stream_arn() -> GetStreamError {
+    validation(crate::service::refusals::INVALID_STREAM_ARN, "InvalidFormat")
+}
+
+/// The modelled 400 for a `nextToken` this operation cannot resume the query with.
+fn invalid_next_token() -> GetStreamError {
+    validation(crate::service::refusals::INVALID_NEXT_TOKEN, "InvalidFormat")
 }
 
 /// The modelled 400 for a request whose parameter values this operation does not accept.

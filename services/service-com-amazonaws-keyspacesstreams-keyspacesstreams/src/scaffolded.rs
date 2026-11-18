@@ -282,10 +282,15 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
     ///
     /// Keep it 501 and not a 5xx server fault: SDK retry classifiers treat those as
     /// retryable, so a client would retry an operation that can never succeed.
+    ///
+    /// A MODELED error takes the status this service serves that class at, which is the
+    /// status its shape declares unless this service is known to answer it differently —
+    /// see [`crate::service::wire_status`], where that one decision lives for all four
+    /// operations.
     fn http_status(&self) -> u16 {
         match self {
             Self::NotImplemented(_) => 501,
-            Self::Modeled(e) => e.http_status(),
+            Self::Modeled(e) => crate::service::wire_status::wire_status(e.http_status()),
             Self::ValidationException(_) => 400,
         }
     }

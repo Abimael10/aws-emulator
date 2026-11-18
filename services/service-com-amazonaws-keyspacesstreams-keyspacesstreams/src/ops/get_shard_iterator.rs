@@ -198,6 +198,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         crate::service::authorization::authorize(&*self.engine, ctx, Self::NAME, &input.stream_arn)
             .map_err(GetShardIteratorErrorModeled::AccessDeniedException)?;
 
+        // A `streamArn` that is not an ARN naming a stream of a Keyspaces table names no
+        // stream this service could ever hold, whatever its store comes to contain: an
+        // input-FORMAT failure, read off the value before any lookup, rather than a
+        // resource that happens to be missing.
+        if !crate::state::names_a_stream(&input.stream_arn) {
+            return Err(invalid_stream_arn());
+        }
+
         let mut state = store.lock();
         let Some(stream) = state.stream_in(region.as_deref(), &input.stream_arn) else {
             return Err(not_found());
@@ -262,12 +270,17 @@ fn resolve_position(
     }
 }
 
-/// The modelled 404 for a stream or shard this service holds no record of.
+/// The modelled refusal of a stream or shard this service holds no record of.
 fn not_found() -> GetShardIteratorError {
     GetShardIteratorErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
         message: Some(crate::service::refusals::RESOURCE_NOT_FOUND.to_string()),
     })
     .into()
+}
+
+/// The modelled 400 for a `streamArn` that is not an ARN naming a stream.
+fn invalid_stream_arn() -> GetShardIteratorError {
+    validation(crate::service::refusals::INVALID_STREAM_ARN, "InvalidFormat")
 }
 
 /// The modelled 400 for a request whose parameter values this operation does not accept,

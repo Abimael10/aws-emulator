@@ -796,9 +796,10 @@ async fn get_stream_pages_shards_and_selects_children() {
     );
 }
 
-/// RULE: a request naming something this service does not hold is refused with the
-/// modelled 404, and one this service cannot satisfy with the modelled 400 — never
-/// with a success and never with the scaffold's 501.
+/// RULE: a request naming something this service does not hold, and one this service
+/// cannot satisfy, are both refused with the modelled error of their class at this
+/// service's client-fault status (400) — never with a success and never with the scaffold's
+/// 501.
 #[tokio::test]
 async fn refusals_use_the_modelled_errors() {
     let (engine, router) = emulator();
@@ -839,7 +840,7 @@ async fn refusals_use_the_modelled_errors() {
         (
             "GetStream",
             json!({ "streamArn": absent_arn }),
-            404,
+            400,
             "ResourceNotFoundException",
             None,
         ),
@@ -850,7 +851,7 @@ async fn refusals_use_the_modelled_errors() {
                 "shardId": shard_id,
                 "shardIteratorType": "TRIM_HORIZON",
             }),
-            404,
+            400,
             "ResourceNotFoundException",
             None,
         ),
@@ -861,7 +862,7 @@ async fn refusals_use_the_modelled_errors() {
                 "shardId": absent_shard,
                 "shardIteratorType": "LATEST",
             }),
-            404,
+            400,
             "ResourceNotFoundException",
             None,
         ),
@@ -959,7 +960,7 @@ async fn refusals_use_the_modelled_errors() {
                 "streamArn": stream_arn,
                 "shardFilter": { "type": "CHILD_SHARDS", "shardId": absent_shard },
             }),
-            404,
+            400,
             "ResourceNotFoundException",
             None,
         ),

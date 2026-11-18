@@ -9,9 +9,10 @@
 //! included — evaluates the identity-based IAM policies in force on the principal its
 //! credentials name, against `cassandra:<OperationName>` on the stream the request
 //! addresses, BEFORE it serves anything out of the stream store. A request no statement
-//! allows (IAM's default deny), or one an explicit `Deny` covers, is answered HTTP 403
-//! `AccessDeniedException` and carries no change record, while a request a matching
-//! `Allow` covers reaches the operation's own answer.
+//! allows (IAM's default deny), or one an explicit `Deny` covers, is answered
+//! `AccessDeniedException` at this service's client-fault status (HTTP 400, as every client
+//! fault of its RPC wire is — the CLASS is in the body) and carries no change record, while
+//! a request a matching `Allow` covers reaches the operation's own answer.
 //!
 //! The user, its policies and its access key live in the IAM store of the SAME shared
 //! engine — the store that service's own handlers write — so the documents under test are
@@ -38,6 +39,10 @@ use smithy_server_runtime::MultiServiceRouter;
 
 /// The Region every call below is signed for, and the Region the seeded stream belongs to.
 const REGION: &str = "us-east-1";
+
+/// The status every client fault of this service's RPC wire travels at: the class of the
+/// failure is named in the body, not by the status line.
+const CLIENT_FAULT_STATUS: u16 = 400;
 
 /// This service's IAM action prefix, which is its `arnNamespace` and its signing name
 /// (`smithy_query(query="service_info")`).
@@ -106,7 +111,7 @@ impl Answer {
 
     /// Whether this answer is the modelled authorization refusal.
     fn refused(&self) -> bool {
-        self.status == 403 && self.error_code() == "AccessDeniedException"
+        self.status == CLIENT_FAULT_STATUS && self.error_code() == "AccessDeniedException"
     }
 }
 
@@ -401,9 +406,10 @@ fn documents_in_force(
 }
 
 /// THE RULE: every operation is judged against its OWN `cassandra:<OperationName>` action
-/// on the stream the request addresses, before it serves anything; a refusal is HTTP 403
-/// `AccessDeniedException` naming the principal, the action, the resource and which of
-/// IAM's rules refused it, and an allowed call reaches the operation's own answer.
+/// on the stream the request addresses, before it serves anything; a refusal is
+/// `AccessDeniedException` at this service's client-fault status, naming the principal, the
+/// action, the resource and which of IAM's rules refused it, and an allowed call reaches
+/// the operation's own answer.
 #[tokio::test]
 async fn every_operation_is_authorized_against_its_own_action() {
     for operation in OPERATIONS {
@@ -435,7 +441,8 @@ async fn every_operation_is_authorized_against_its_own_action() {
                 Some(refusal) => {
                     assert!(
                         answer.refused(),
-                        "case {case:?}: expected HTTP 403 AccessDeniedException, got {} {:?}",
+                        "case {case:?}: expected HTTP {CLIENT_FAULT_STATUS} \
+                         AccessDeniedException, got {} {:?}",
                         answer.status,
                         answer.body
                     );
@@ -502,7 +509,8 @@ async fn granting_the_action_serves_the_very_request_that_was_refused() {
     let refused = call_as(&router, USER_KEY_ID, "GetRecords", &request).await;
     assert!(
         refused.refused(),
-        "case \"GetRecords not granted\": expected HTTP 403 AccessDeniedException, got {} {:?}",
+        "case \"GetRecords not granted\": expected HTTP {CLIENT_FAULT_STATUS} \
+         AccessDeniedException, got {} {:?}",
         refused.status,
         refused.body
     );
