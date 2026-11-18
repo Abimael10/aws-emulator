@@ -32,6 +32,7 @@ pub mod duplicate_identity;
 pub mod domain_name_transport;
 pub mod ec2_subnets;
 pub mod integration_response_key;
+pub mod integration_subtype;
 pub mod invoke_transport;
 pub mod jwt_issuer;
 pub mod listener_registry;
@@ -2228,6 +2229,11 @@ pub fn validate_integration(
     }
     Ok(())
 }
+
+/// The rule a FIRST-CLASS SUBTYPE integration's own parameters are held to, re-exported so a
+/// handler reaches it the way it reaches everything else in this module — which subtypes are
+/// first-class and which arguments each one requires live in [`integration_subtype`].
+pub use integration_subtype::validate_subtype_request_parameters;
 
 /// `Ok(())`, or why this `IntegrationUri` does not name what an integration of this
 /// `IntegrationType` invokes — the message for the operation's `BadRequestException`.

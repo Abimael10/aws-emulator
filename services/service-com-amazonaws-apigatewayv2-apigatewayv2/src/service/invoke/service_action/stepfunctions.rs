@@ -1,16 +1,19 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! The `StepFunctions-StartExecution` and `StepFunctions-StartSyncExecution` actions: the
-//! workflow run a route starts.
+//! The `StepFunctions-StartExecution`, `StepFunctions-StartSyncExecution` and
+//! `StepFunctions-StopExecution` actions: the workflow run a route starts, and the one it
+//! stops.
 //!
 //! The parameters of each are the members of that operation's own input
-//! (`smithy_query(query="operation", operation="StartExecution,StartSyncExecution")` on the
-//! Step Functions model), which is what the action takes: `stateMachineArn` is the one member
-//! either marks required ([`START_EXECUTION_REQUIRED_PARAMETERS`]), so an integration mapping
-//! nothing for it names no run at all and the request is answered as an integration that
-//! produced no response — never as an execution nothing started — while a request that carries
-//! no value for the expression the integration maps onto it is a bad request, which is the
-//! parent module's own rule for every action's required parameters.
+//! (`smithy_query(query="operation", operation="StartExecution,StartSyncExecution,
+//! StopExecution")` on the Step Functions model), which is what the action takes:
+//! `stateMachineArn` is the one member either start marks required
+//! ([`START_EXECUTION_REQUIRED_PARAMETERS`]) and `executionArn` the one the stop marks
+//! ([`STOP_EXECUTION_REQUIRED_PARAMETERS`]), so an integration mapping nothing for it names
+//! no run at all and the request is answered as an integration that produced no response —
+//! never as an execution nothing started or stopped — while a request that carries no value
+//! for the expression the integration maps onto it is a bad request, which is the parent
+//! module's own rule for every action's required parameters.
 //!
 //! `IncludedData`, which only the synchronous input declares, is NOT among them: an
 //! integration mapping it is reported rather than started without it ([`Mapped::beyond`]).
@@ -51,9 +54,15 @@ use super::credentials::SigningIdentity;
 use super::parameters::Mapped;
 use super::{Performed, Unperformed};
 
-/// The `IntegrationSubtype` that names each of these actions.
-pub const START_EXECUTION_SUBTYPE: &str = "StepFunctions-StartExecution";
-pub const START_SYNC_EXECUTION_SUBTYPE: &str = "StepFunctions-StartSyncExecution";
+/// The `IntegrationSubtype` that names each of these actions, taken from the catalog that
+/// states which subtypes are first-class (`crate::state::integration_subtype`), so the value
+/// the control plane admits and the one this data plane performs are one constant.
+pub const START_EXECUTION_SUBTYPE: &str =
+    crate::state::integration_subtype::STEP_FUNCTIONS_START_EXECUTION.name;
+pub const START_SYNC_EXECUTION_SUBTYPE: &str =
+    crate::state::integration_subtype::STEP_FUNCTIONS_START_SYNC_EXECUTION.name;
+pub const STOP_EXECUTION_SUBTYPE: &str =
+    crate::state::integration_subtype::STEP_FUNCTIONS_STOP_EXECUTION.name;
 
 /// Every parameter an integration may map onto a start: the members of `StartExecutionInput`,
 /// which `StartSyncExecutionInput` declares as well.
@@ -63,11 +72,24 @@ pub const START_EXECUTION_PARAMETERS: &[&str] = &["Input", "Name", "StateMachine
 /// left out).
 pub const START_SYNC_EXECUTION_PARAMETERS: &[&str] = START_EXECUTION_PARAMETERS;
 
-/// The parameters a start must carry a value for: the one member either input marks required.
-pub const START_EXECUTION_REQUIRED_PARAMETERS: &[&str] = &["StateMachineArn"];
+/// The parameters a start must carry a value for: the one member either input marks required,
+/// which is the argument the control plane already holds an integration of either subtype to
+/// (`crate::state::integration_subtype`).
+pub const START_EXECUTION_REQUIRED_PARAMETERS: &[&str] =
+    crate::state::integration_subtype::STEP_FUNCTIONS_START_EXECUTION.required_parameters;
 
 /// The same for the synchronous start.
 pub const START_SYNC_EXECUTION_REQUIRED_PARAMETERS: &[&str] = START_EXECUTION_REQUIRED_PARAMETERS;
+
+/// Every parameter an integration may map onto a stop: the members of `StopExecutionInput` —
+/// the run to stop, and the error and cause the stop records on it.
+pub const STOP_EXECUTION_PARAMETERS: &[&str] = &["Cause", "Error", "ExecutionArn"];
+
+/// The parameters a stop must carry a value for: the one member that input marks required,
+/// which is the argument the control plane already holds an integration of this subtype to
+/// (`crate::state::integration_subtype`).
+pub const STOP_EXECUTION_REQUIRED_PARAMETERS: &[&str] =
+    crate::state::integration_subtype::STEP_FUNCTIONS_STOP_EXECUTION.required_parameters;
 
 /// The `arnNamespace` Step Functions publishes its endpoint and signs under, which is the
 /// endpoint label the in-process client is addressed at.
@@ -76,9 +98,12 @@ const STATES_ENDPOINT: &str = "states";
 /// The members of the mapping each action reads, spelled as the integration's
 /// `RequestParameters` spell them.
 const STATE_MACHINE_ARN: &str = "StateMachineArn";
+const EXECUTION_ARN: &str = "ExecutionArn";
 const NAME: &str = "Name";
 const INPUT: &str = "Input";
 const TRACE_HEADER: &str = "TraceHeader";
+const ERROR: &str = "Error";
+const CAUSE: &str = "Cause";
 
 /// The state machine the mapping names, or the reason there is no start to make.
 ///
@@ -88,6 +113,16 @@ fn state_machine_arn<'m>(mapped: &'m Mapped, subtype: &str) -> Result<&'m str, U
     mapped.get(STATE_MACHINE_ARN).ok_or_else(|| {
         Unperformed::NotPerformed(format!(
             "the integration maps no {STATE_MACHINE_ARN}, which {subtype} requires"
+        ))
+    })
+}
+
+/// The execution the mapping names, read the same way: an integration mapping nothing for the
+/// one member the stop marks required names no run to stop.
+fn execution_arn<'m>(mapped: &'m Mapped, subtype: &str) -> Result<&'m str, Unperformed> {
+    mapped.get(EXECUTION_ARN).ok_or_else(|| {
+        Unperformed::NotPerformed(format!(
+            "the integration maps no {EXECUTION_ARN}, which {subtype} requires"
         ))
     })
 }
@@ -249,6 +284,43 @@ pub async fn start_sync_execution(
     Ok(Performed::json(&Value::Object(answer)))
 }
 
+/// Stop the mapped execution, and answer the document Step Functions returned.
+pub async fn stop_execution(
+    ctx: &OperationContext<'_>,
+    region: &str,
+    identity: Option<&SigningIdentity>,
+    mapped: &Mapped,
+) -> Result<Performed, Unperformed> {
+    let execution_arn = execution_arn(mapped, STOP_EXECUTION_SUBTYPE)?;
+    let client = action_client!(
+        aws_sdk_sfn,
+        ctx.callback(),
+        STATES_ENDPOINT,
+        region,
+        identity
+    );
+    let mut call = client.stop_execution().execution_arn(execution_arn);
+    if let Some(error) = mapped.get(ERROR) {
+        call = call.error(error);
+    }
+    if let Some(cause) = mapped.get(CAUSE) {
+        call = call.cause(cause);
+    }
+    let stopped = call
+        .send()
+        .await
+        .map_err(|error| super::unperformed(STOP_EXECUTION_SUBTYPE, &error))?;
+    // The one member `StopExecutionOutput` declares, which it marks required.
+    let mut answer = Map::new();
+    required_instant(
+        &mut answer,
+        "stopDate",
+        stopped.stop_date(),
+        STOP_EXECUTION_SUBTYPE,
+    )?;
+    Ok(Performed::json(&Value::Object(answer)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -289,6 +361,18 @@ mod tests {
     fn a_mapping_naming_no_state_machine_names_no_run() {
         let unmapped = Mapped::default();
         let reported = state_machine_arn(&unmapped, START_EXECUTION_SUBTYPE);
+        let case = "nothing mapped for the required member";
+        assert!(
+            matches!(reported, Err(Unperformed::NotPerformed(_))),
+            "case {case:?}: expected no run to be named, got {reported:?}"
+        );
+    }
+
+    /// RULE: the same holds for the stop, whose required member names the run to stop.
+    #[test]
+    fn a_mapping_naming_no_execution_names_no_run_to_stop() {
+        let unmapped = Mapped::default();
+        let reported = execution_arn(&unmapped, STOP_EXECUTION_SUBTYPE);
         let case = "nothing mapped for the required member";
         assert!(
             matches!(reported, Err(Unperformed::NotPerformed(_))),

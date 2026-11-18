@@ -647,7 +647,13 @@ fn uri_rows() -> Vec<UriRow> {
             request: json!({
                 "integrationType": "AWS_PROXY",
                 "integrationSubtype": "SQS-SendMessage",
-                "payloadFormatVersion": "1.0"
+                "payloadFormatVersion": "1.0",
+                // The arguments that action requires, which a first-class subtype
+                // integration is written only with.
+                "requestParameters": {
+                    "QueueUrl": "$request.header.queue",
+                    "MessageBody": "$request.body.message"
+                }
             }),
             accepted: true,
         },
@@ -816,7 +822,13 @@ async fn an_http_api_integration_with_no_payload_format_version_is_refused_with_
             "AWS_PROXY naming a service action through its subtype",
             json!({
                 "integrationType": "AWS_PROXY",
-                "integrationSubtype": "SQS-SendMessage"
+                "integrationSubtype": "SQS-SendMessage",
+                // The arguments that action requires, which a first-class subtype
+                // integration is written only with.
+                "requestParameters": {
+                    "QueueUrl": "$request.header.queue",
+                    "MessageBody": "$request.body.message"
+                }
             }),
         ),
     ];

@@ -296,7 +296,15 @@ async fn an_unsupported_payload_format_version_is_refused_naming_the_version_and
             case: "an AWS_PROXY naming a service action, not a function",
             protocol_type: "HTTP",
             integration_type: "AWS_PROXY",
-            extra: json!({ "integrationSubtype": "SQS-SendMessage" }),
+            extra: json!({
+                "integrationSubtype": "SQS-SendMessage",
+                // The arguments that action requires, which a first-class subtype
+                // integration is written only with.
+                "requestParameters": {
+                    "QueueUrl": "$request.header.queue",
+                    "MessageBody": "$request.body.message"
+                }
+            }),
             version: "2.0",
         },
         PayloadRow {

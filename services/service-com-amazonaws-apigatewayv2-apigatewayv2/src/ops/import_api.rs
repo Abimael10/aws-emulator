@@ -1410,6 +1410,15 @@ fn read_integration(extension: &Node) -> Result<ImportedIntegration, String> {
         &request_parameters,
         &response_parameters,
     )?;
+    // And the same rule for a FIRST-CLASS SUBTYPE's own parameters: a definition naming a
+    // subtype whose action it supplies no required argument of is refused here exactly as
+    // `CreateIntegration` refuses it, through the gate they share
+    // (`crate::state::integration_subtype`), so an imported integration cannot be a record a
+    // caller could not have created.
+    crate::state::validate_subtype_request_parameters(
+        integration_subtype.as_deref(),
+        &request_parameters,
+    )?;
 
     Ok(ImportedIntegration {
         integration_type,

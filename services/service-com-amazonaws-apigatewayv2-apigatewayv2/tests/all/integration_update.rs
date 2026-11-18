@@ -268,7 +268,13 @@ async fn a_patch_whose_merged_integration_breaks_a_rule_is_refused_and_changes_n
             "integrationType": "AWS_PROXY",
             "integrationSubtype": "SQS-SendMessage",
             "payloadFormatVersion": "1.0",
-            "credentialsArn": "arn:aws:iam::000000000000:role/apigw"
+            "credentialsArn": "arn:aws:iam::000000000000:role/apigw",
+            // The arguments that action requires, which a first-class subtype integration
+            // is written only with.
+            "requestParameters": {
+                "QueueUrl": "$request.header.queue",
+                "MessageBody": "$request.body.message"
+            }
         }),
     )
     .await;

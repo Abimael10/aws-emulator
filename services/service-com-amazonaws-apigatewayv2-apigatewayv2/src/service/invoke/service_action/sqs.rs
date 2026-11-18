@@ -50,8 +50,10 @@ use super::credentials::SigningIdentity;
 use super::parameters::Mapped;
 use super::{Performed, Unperformed};
 
-/// The `IntegrationSubtype` that names this action.
-pub const SEND_MESSAGE_SUBTYPE: &str = "SQS-SendMessage";
+/// The `IntegrationSubtype` that names this action, taken from the catalog that states which
+/// subtypes are first-class (`crate::state::integration_subtype`), so the value the control
+/// plane admits and the one this data plane performs are one constant.
+pub const SEND_MESSAGE_SUBTYPE: &str = crate::state::integration_subtype::SQS_SEND_MESSAGE.name;
 
 /// Every parameter an integration may map onto the send: the members of
 /// `SendMessageRequest` this emulator carries into the call.
@@ -68,8 +70,10 @@ pub const SEND_MESSAGE_PARAMETERS: &[&str] = &[
 ];
 
 /// The parameters the send must carry a value for: the members `SendMessageRequest` marks
-/// required.
-pub const SEND_MESSAGE_REQUIRED_PARAMETERS: &[&str] = &["MessageBody", "QueueUrl"];
+/// required, which are the arguments the control plane already holds an integration of this
+/// subtype to (`crate::state::integration_subtype`).
+pub const SEND_MESSAGE_REQUIRED_PARAMETERS: &[&str] =
+    crate::state::integration_subtype::SQS_SEND_MESSAGE.required_parameters;
 
 /// The `arnNamespace` Amazon SQS publishes its endpoint and signs under, which is the
 /// endpoint label the in-process client is addressed at.

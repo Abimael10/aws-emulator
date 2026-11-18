@@ -18,16 +18,29 @@
 //! * **A template selection expression may only name variables the service evaluates**:
 //!   an unescaped `$` begins a variable reference, so the literal selection key
 //!   `$default` has to be written escaped (`\$default`).
+//! * **A first-class subtype integration is written only with the arguments its action
+//!   requires.** An `IntegrationSubtype` "Specifies the AWS service action to invoke"
+//!   (`CreateIntegration$IntegrationSubtype`) and the integration's `RequestParameters` are
+//!   that action's own arguments, so a mapping that does not define every argument the
+//!   action requires configures a call that could never be made and is refused at the write
+//!   — on the create and on the update alike — naming the subtype and its whole required
+//!   set.
 //!
 //! The rows span what each rule generalises over: the integration type, whether the
 //! request carries a subtype, a URI, or both, the parent api's protocol, the payload
-//! format version (each published value, one outside them), and the form of the
+//! format version (each published value, one outside them), the form of the
 //! selection expression (a bare variable, a braced one, an escaped literal, a plain
-//! literal, a variable the service does not define). The recorded case that filed the
-//! issue — an `SQS-SendMessage` subtype integration with no URI — is ONE row of the
+//! literal, a variable the service does not define), and — for the last rule — every
+//! first-class subtype, each one of its required parameters left out, the value forms that
+//! define nothing, and the values that have no required set at all. The recorded case that
+//! filed the issue — an `SQS-SendMessage` subtype integration with no URI — is ONE row of the
 //! first table.
 
-use serde_json::{json, Value};
+use serde_json::{json, Map, Value};
+use service_com_amazonaws_apigatewayv2_apigatewayv2::state::integration_subtype::{
+    first_class_subtype, unmapped_required_parameters_message, FirstClassSubtype,
+    FIRST_CLASS_SUBTYPES, STEP_FUNCTIONS_START_EXECUTION, STEP_FUNCTIONS_STOP_EXECUTION,
+};
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::api_lifecycle::{as_str, call, emulator, error_code};
@@ -43,6 +56,30 @@ const SERVICE_ACTION_SUBTYPES: &[&str] = &[
     "StepFunctions-StartSyncExecution",
     "SQS-ReceiveMessage",
 ];
+
+/// A `RequestParameters` map built from `(parameter, value)` pairs.
+fn mapping(entries: &[(&str, &str)]) -> Value {
+    let object: Map<String, Value> = entries
+        .iter()
+        .map(|(parameter, value)| ((*parameter).to_string(), json!(*value)))
+        .collect();
+    Value::Object(object)
+}
+
+/// A mapping defining every argument `subtype`'s action requires, which is what the service
+/// holds a first-class subtype integration to: the parameters come from the catalog that
+/// states them, so a row configures the subtype it names rather than some other one's
+/// arguments.
+fn required_mapping(subtype: &str) -> Value {
+    let required = first_class_subtype(subtype).map_or(&[] as &[&str], |known| {
+        known.required_parameters
+    });
+    let entries: Vec<(&str, &str)> = required
+        .iter()
+        .map(|parameter| (*parameter, "$request.body.value"))
+        .collect();
+    mapping(&entries)
+}
 
 fn http_api(name: &str) -> Value {
     json!({ "name": name, "protocolType": "HTTP" })
@@ -114,8 +151,9 @@ fn uri_rows() -> Vec<UriRow> {
     let mut rows = Vec::new();
 
     // Every first-class service integration: AWS_PROXY plus a subtype, credentials and
-    // request parameters, and NO IntegrationUri.
+    // the request parameters that subtype's action requires, and NO IntegrationUri.
     for subtype in SERVICE_ACTION_SUBTYPES {
+        let parameters = required_mapping(subtype);
         rows.push(UriRow {
             case: format!("AWS_PROXY with the {subtype} subtype and no IntegrationUri"),
             http: true,
@@ -124,10 +162,7 @@ fn uri_rows() -> Vec<UriRow> {
                 "integrationSubtype": subtype,
                 "payloadFormatVersion": "1.0",
                 "credentialsArn": "arn:aws:iam::000000000000:role/apigw",
-                "requestParameters": {
-                    "QueueUrl": "$request.header.queue",
-                    "MessageBody": "$request.body.message"
-                }
+                "requestParameters": parameters,
             }),
             expect_members: vec![
                 ("integrationType", json!("AWS_PROXY")),
@@ -136,13 +171,7 @@ fn uri_rows() -> Vec<UriRow> {
                     "credentialsArn",
                     json!("arn:aws:iam::000000000000:role/apigw"),
                 ),
-                (
-                    "requestParameters",
-                    json!({
-                        "QueueUrl": "$request.header.queue",
-                        "MessageBody": "$request.body.message"
-                    }),
-                ),
+                ("requestParameters", parameters),
             ],
             expect_refused: false,
         });
@@ -156,7 +185,8 @@ fn uri_rows() -> Vec<UriRow> {
             "integrationSubtype": "SQS-SendMessage",
             "integrationUri": "arn:aws:sqs:eu-west-1:000000000000:a-queue",
             "payloadFormatVersion": "1.0",
-            "credentialsArn": "arn:aws:iam::000000000000:role/apigw"
+            "credentialsArn": "arn:aws:iam::000000000000:role/apigw",
+            "requestParameters": required_mapping("SQS-SendMessage"),
         }),
         expect_members: vec![
             ("integrationSubtype", json!("SQS-SendMessage")),
@@ -173,7 +203,8 @@ fn uri_rows() -> Vec<UriRow> {
         request: json!({
             "integrationType": "AWS_PROXY",
             "integrationSubtype": "EventBridge-PutEvents",
-            "payloadFormatVersion": "1.0"
+            "payloadFormatVersion": "1.0",
+            "requestParameters": required_mapping("EventBridge-PutEvents"),
         }),
         expect_members: vec![("integrationSubtype", json!("EventBridge-PutEvents"))],
         expect_refused: false,
@@ -343,7 +374,8 @@ fn payload_rows() -> Vec<PayloadRow> {
                 "integrationType": "AWS_PROXY",
                 "integrationSubtype": "SQS-SendMessage",
                 "payloadFormatVersion": version,
-                "credentialsArn": "arn:aws:iam::000000000000:role/apigw"
+                "credentialsArn": "arn:aws:iam::000000000000:role/apigw",
+                "requestParameters": required_mapping("SQS-SendMessage"),
             }),
             accepted,
         });
@@ -474,5 +506,391 @@ async fn a_template_selection_expression_may_only_name_variables_the_service_eva
                 "case {case:?}: a refused create must store no integration"
             );
         }
+    }
+}
+
+/// One integration, as its reader reports it.
+async fn get_integration(
+    emulator: &MultiServiceRouter,
+    api_id: &str,
+    integration_id: &str,
+) -> (u16, Value) {
+    call(
+        emulator,
+        "GET",
+        &format!("/v2/apis/{api_id}/integrations/{integration_id}"),
+        None,
+    )
+    .await
+}
+
+/// Send one UpdateIntegration and answer `(status, body)`.
+async fn update_integration(
+    emulator: &MultiServiceRouter,
+    api_id: &str,
+    integration_id: &str,
+    patch: &Value,
+) -> (u16, Value) {
+    call(
+        emulator,
+        "PATCH",
+        &format!("/v2/apis/{api_id}/integrations/{integration_id}"),
+        Some(patch.clone()),
+    )
+    .await
+}
+
+/// The create a subtype row sends: the subtype, configured with `request_parameters`.
+fn subtype_integration(subtype: &str, request_parameters: Value) -> Value {
+    json!({
+        "integrationType": "AWS_PROXY",
+        "integrationSubtype": subtype,
+        "payloadFormatVersion": "1.0",
+        "credentialsArn": "arn:aws:iam::000000000000:role/apigw",
+        "requestParameters": request_parameters,
+    })
+}
+
+/// Assert one refusal of a write: the status, the modelled error and the exact sentence.
+fn assert_refused(case: &str, expected_message: &str, status: u16, body: &Value) {
+    assert_eq!(
+        status, 400,
+        "case {case:?}: expected 400 from the write, got {status} {body}"
+    );
+    assert_eq!(
+        error_code(body),
+        "BadRequestException",
+        "case {case:?}: expected BadRequestException, got {body}"
+    );
+    assert_eq!(
+        as_str(body, "message"),
+        expected_message,
+        "case {case:?}: wrong refusal sentence, got {body}"
+    );
+}
+
+#[tokio::test]
+async fn a_subtype_integration_is_created_only_with_the_parameters_its_action_requires() {
+    let emulator = emulator();
+
+    // The refusal is API Gateway's own sentence, pinned here once per shape of the bracketed
+    // list — one required parameter and several — so its wording is asserted and not merely
+    // agreed between the handler and this test.
+    assert_eq!(
+        unmapped_required_parameters_message(
+            STEP_FUNCTIONS_STOP_EXECUTION.name,
+            STEP_FUNCTIONS_STOP_EXECUTION.required_parameters,
+        ),
+        "Operation: StepFunctions-StopExecution requires enabling passthrough, or defining \
+         all of the following parameters in the parameter mapping: [ExecutionArn]",
+        "the refusal must be worded as API Gateway words it"
+    );
+    assert_eq!(
+        unmapped_required_parameters_message("SQS-SendMessage", &["MessageBody", "QueueUrl"]),
+        "Operation: SQS-SendMessage requires enabling passthrough, or defining all of the \
+         following parameters in the parameter mapping: [MessageBody, QueueUrl]",
+        "a required set of more than one must be listed comma-separated inside the brackets"
+    );
+
+    for (index, subtype) in FIRST_CLASS_SUBTYPES.iter().enumerate() {
+        let expected =
+            unmapped_required_parameters_message(subtype.name, subtype.required_parameters);
+        let complete = required_mapping(subtype.name);
+
+        // Every required parameter defined: created, and reported back by the reader.
+        let case = format!("{} with every required parameter", subtype.name);
+        let api_id = create_api(
+            &emulator,
+            &case,
+            &http_api(&format!("subtype-complete-{index}")),
+        )
+        .await;
+        let (status, created) = create_integration(
+            &emulator,
+            &api_id,
+            &subtype_integration(subtype.name, complete.clone()),
+        )
+        .await;
+        assert_eq!(
+            status, 201,
+            "case {case:?}: expected 201 from CreateIntegration, got {status} {created}"
+        );
+        let integration_id = as_str(&created, "integrationId");
+        let (status, fetched) = get_integration(&emulator, &api_id, &integration_id).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected 200 from GetIntegration, got {status} {fetched}"
+        );
+        assert_eq!(
+            fetched["requestParameters"], complete,
+            "case {case:?}: expected the stored mapping to be the one sent, got {fetched}"
+        );
+        assert_eq!(
+            as_str(&fetched, "integrationSubtype"),
+            subtype.name,
+            "case {case:?}: expected the stored subtype, got {fetched}"
+        );
+
+        // Each ONE of them left out, and then all of them: refused, and nothing stored.
+        let mut incomplete: Vec<(String, Value)> = Vec::new();
+        for dropped in subtype.required_parameters {
+            let mut entries: Vec<(&str, &str)> = subtype
+                .required_parameters
+                .iter()
+                .filter(|parameter| *parameter != dropped)
+                .map(|parameter| (*parameter, "$request.body.value"))
+                .collect();
+            // An optional argument of the same action in its place, so the refusal is about
+            // the required parameter and not about a mapping that defines nothing at all.
+            entries.push(("Region", "eu-west-1"));
+            incomplete.push((
+                format!("{} without {dropped}", subtype.name),
+                mapping(&entries),
+            ));
+        }
+        incomplete.push((
+            format!("{} with an empty RequestParameters", subtype.name),
+            json!({}),
+        ));
+        for (refused, (case, parameters)) in incomplete.into_iter().enumerate() {
+            let api_id = create_api(
+                &emulator,
+                &case,
+                &http_api(&format!("subtype-refused-{index}-{refused}")),
+            )
+            .await;
+            let (status, body) = create_integration(
+                &emulator,
+                &api_id,
+                &subtype_integration(subtype.name, parameters),
+            )
+            .await;
+            assert_refused(&case, &expected, status, &body);
+            assert_eq!(
+                integration_count(&emulator, &api_id).await,
+                0,
+                "case {case:?}: a refused CreateIntegration must store no integration"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_required_parameter_is_defined_only_by_a_value_under_its_own_name() {
+    /// One row: the case, the mapping it sends for the one parameter the action requires,
+    /// and whether the write takes it.
+    struct ValueRow<'r> {
+        case: &'static str,
+        entries: Vec<(&'r str, &'static str)>,
+        accepted: bool,
+    }
+    let emulator = emulator();
+    let subtype = &STEP_FUNCTIONS_STOP_EXECUTION;
+    let parameter = subtype.required_parameters[0];
+    let lowered = parameter.to_lowercase();
+    let expected = unmapped_required_parameters_message(subtype.name, subtype.required_parameters);
+
+    // Rows differ along the VALUE and the SPELLING the mapping carries for the one parameter
+    // the action requires.
+    let rows = [
+        ValueRow {
+            case: "a mapping expression over the request",
+            entries: vec![(parameter, "$request.body.arn")],
+            accepted: true,
+        },
+        ValueRow {
+            case: "a static value",
+            entries: vec![(parameter, "a-static-value")],
+            accepted: true,
+        },
+        ValueRow {
+            case: "an empty value",
+            entries: vec![(parameter, "")],
+            accepted: false,
+        },
+        ValueRow {
+            case: "a blank value",
+            entries: vec![(parameter, "   ")],
+            accepted: false,
+        },
+        ValueRow {
+            case: "another casing of the parameter's name",
+            entries: vec![(lowered.as_str(), "$request.body.arn")],
+            accepted: false,
+        },
+        ValueRow {
+            case: "an optional parameter of the same action only",
+            entries: vec![("Cause", "stopped-by-the-route")],
+            accepted: false,
+        },
+    ];
+    for (index, row) in rows.iter().enumerate() {
+        let case = row.case;
+        let api_id = create_api(&emulator, case, &http_api(&format!("subtype-value-{index}"))).await;
+        let (status, body) = create_integration(
+            &emulator,
+            &api_id,
+            &subtype_integration(subtype.name, mapping(&row.entries)),
+        )
+        .await;
+        if row.accepted {
+            assert_eq!(
+                status, 201,
+                "case {case:?}: expected 201 from CreateIntegration, got {status} {body}"
+            );
+        } else {
+            assert_refused(case, &expected, status, &body);
+            assert_eq!(
+                integration_count(&emulator, &api_id).await,
+                0,
+                "case {case:?}: a refused CreateIntegration must store no integration"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn an_update_cannot_leave_a_subtype_integration_without_its_required_parameters() {
+    let emulator = emulator();
+    let api_id = create_api(
+        &emulator,
+        "the patched api",
+        &http_api("subtype-patched"),
+    )
+    .await;
+
+    // The integration the patches below are made against: a start of a workflow, complete.
+    let start = &STEP_FUNCTIONS_START_EXECUTION;
+    let stored_mapping = required_mapping(start.name);
+    let (status, created) = create_integration(
+        &emulator,
+        &api_id,
+        &subtype_integration(start.name, stored_mapping.clone()),
+    )
+    .await;
+    assert_eq!(
+        status, 201,
+        "expected 201 from CreateIntegration, got {status} {created}"
+    );
+    let integration_id = as_str(&created, "integrationId");
+
+    // A Lambda proxy integration, which names no subtype at all, so a patch can be shown to
+    // be refused for TAKING ON a subtype as well as for dropping one of its parameters. Its
+    // payload format version is the one every integration type supports, so the refusal
+    // below is about the subtype's parameters and not about the version.
+    let (status, proxy) = create_integration(
+        &emulator,
+        &api_id,
+        &json!({
+            "integrationType": "AWS_PROXY",
+            "integrationUri": "arn:aws:lambda:eu-west-1:000000000000:function:handler",
+            "payloadFormatVersion": "1.0"
+        }),
+    )
+    .await;
+    assert_eq!(
+        status, 201,
+        "expected 201 from CreateIntegration for the proxy, got {status} {proxy}"
+    );
+    let proxy_id = as_str(&proxy, "integrationId");
+
+    // Rows differ along WHICH record is patched and HOW the patch would leave it
+    // unconfigured: the mapping replaced by one without the required parameter, replaced by
+    // an empty map, and a subtype taken on by an integration whose mapping defines none of
+    // its arguments.
+    struct PatchRow<'r> {
+        case: &'static str,
+        /// The integration the patch is sent for.
+        patched: &'r str,
+        patch: Value,
+        /// The subtype the merged record would name, whose required set the refusal states.
+        subtype: &'static FirstClassSubtype,
+    }
+    let rows = [
+        PatchRow {
+            case: "a mapping patched to drop the parameter the action requires",
+            patched: integration_id.as_str(),
+            patch: json!({ "requestParameters": { "Name": "$request.body.name" } }),
+            subtype: start,
+        },
+        PatchRow {
+            case: "a mapping patched to an empty map",
+            patched: integration_id.as_str(),
+            patch: json!({ "requestParameters": {} }),
+            subtype: start,
+        },
+        PatchRow {
+            case: "a subtype taken on by an integration that maps none of its arguments",
+            patched: proxy_id.as_str(),
+            patch: json!({ "integrationSubtype": STEP_FUNCTIONS_STOP_EXECUTION.name }),
+            subtype: &STEP_FUNCTIONS_STOP_EXECUTION,
+        },
+    ];
+    for row in &rows {
+        let case = row.case;
+        let (_, before) = get_integration(&emulator, &api_id, row.patched).await;
+        let expected = unmapped_required_parameters_message(
+            row.subtype.name,
+            row.subtype.required_parameters,
+        );
+        let (status, body) = update_integration(&emulator, &api_id, row.patched, &row.patch).await;
+        assert_refused(case, &expected, status, &body);
+        let (_, after) = get_integration(&emulator, &api_id, row.patched).await;
+        assert_eq!(
+            after, before,
+            "case {case:?}: a refused UpdateIntegration must leave the record as it was"
+        );
+    }
+
+    // A patch that keeps every required parameter defined is applied, so the refusals above
+    // are about the required set and not about patching a subtype integration at all.
+    let mut replacement = stored_mapping.clone();
+    replacement
+        .as_object_mut()
+        .expect("the mapping of the stored integration is an object")
+        .insert("Name".to_string(), json!("$request.body.name"));
+    let (status, patched) = update_integration(
+        &emulator,
+        &api_id,
+        &integration_id,
+        &json!({ "requestParameters": replacement.clone() }),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "expected 200 from UpdateIntegration for a complete mapping, got {status} {patched}"
+    );
+    assert_eq!(
+        patched["requestParameters"], replacement,
+        "expected the patched mapping to be the one sent, got {patched}"
+    );
+}
+
+#[tokio::test]
+async fn an_integration_naming_no_first_class_subtype_is_created_as_it_came() {
+    let emulator = emulator();
+
+    // A value this service states no required set for carries no requirement: the rows
+    // differ along the VALUE of the member — a subtype of a service with no catalogued
+    // action, another casing of a catalogued one, and a value naming no action at all.
+    let rows: &[&str] = &["S3-PutObject", "sqs-sendmessage", "not-an-action"];
+    for (index, subtype) in rows.iter().enumerate() {
+        let api_id = create_api(
+            &emulator,
+            subtype,
+            &http_api(&format!("subtype-unknown-{index}")),
+        )
+        .await;
+        let (status, created) =
+            create_integration(&emulator, &api_id, &subtype_integration(subtype, json!({}))).await;
+        assert_eq!(
+            status, 201,
+            "case {subtype:?}: expected 201 from CreateIntegration, got {status} {created}"
+        );
+        assert_eq!(
+            as_str(&created, "integrationSubtype"),
+            *subtype,
+            "case {subtype:?}: expected the subtype to be stored as it came, got {created}"
+        );
     }
 }

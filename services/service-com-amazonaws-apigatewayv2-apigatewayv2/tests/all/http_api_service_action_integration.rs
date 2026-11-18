@@ -900,9 +900,11 @@ async fn a_subtype_route_performs_the_action_as_the_role_its_credentials_arn_nam
 /// nothing made.
 #[tokio::test]
 async fn the_action_a_subtype_route_performs_is_the_one_its_subtype_names() {
-    // Rows differ along the SUBTYPE and the mapping: the send another service owns, the same
-    // send missing a parameter the action requires, one mapping a parameter this emulator
-    // does not carry into the action, and a subtype it performs no action for.
+    // Rows differ along the SUBTYPE and the mapping: the send another service owns, one
+    // mapping a parameter this emulator does not carry into the action, and a subtype it
+    // performs no action for. A mapping that defines NO value at all for a parameter the
+    // action requires is not among them: such an integration is refused at the write, where
+    // `tests/all/integration_validation.rs` asserts it, so no route can carry one.
     //
     // The mapping is a function of the queue's url, which only exists once the queue does.
     type Parameters = fn(&str) -> Value;
@@ -912,12 +914,6 @@ async fn the_action_a_subtype_route_performs_is_the_one_its_subtype_names() {
             "SQS-SendMessage",
             |url| json!({ "QueueUrl": url, "MessageBody": "$request.body.note" }),
             Some("placed"),
-        ),
-        (
-            "the same send missing the body the action requires",
-            "SQS-SendMessage",
-            |url| json!({ "QueueUrl": url }),
-            None,
         ),
         (
             "a send mapping a parameter this emulator does not carry",

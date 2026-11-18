@@ -426,7 +426,13 @@ async fn the_other_two_mapping_languages_carry_the_same_key_untouched() {
             "integrationSubtype": "SQS-SendMessage",
             "payloadFormatVersion": "1.0",
             "credentialsArn": "arn:aws:iam::000000000000:role/apigw",
-            "requestParameters": { "QueueUrl": "$request.header.queue", key: "'a-value'" }
+            "requestParameters": {
+                "QueueUrl": "$request.header.queue",
+                // The other argument the action requires, so the integration is one this
+                // service writes at all.
+                "MessageBody": "$request.body.message",
+                key: "'a-value'"
+            }
         }),
     )
     .await;

@@ -1138,12 +1138,22 @@ async fn an_imported_service_action_integration_needs_no_uri() {
     // The same rule `CreateIntegration` applies: an integration carrying an
     // `IntegrationSubtype` names the AWS service action it invokes there, so it needs no
     // `uri`. One row per subtype, so the rule is asserted over the class and not over
-    // one service.
+    // one service. Each row defines the arguments its own action requires — the other rule
+    // the write holds a first-class subtype integration to — read off the catalog that
+    // states them rather than written out per row.
     for subtype in [
         "SQS-SendMessage",
         "EventBridge-PutEvents",
         "StepFunctions-StartExecution",
     ] {
+        let request_parameters: serde_json::Map<String, Value> =
+            service_com_amazonaws_apigatewayv2_apigatewayv2::state::integration_subtype::
+                first_class_subtype(subtype)
+                    .map(|known| known.required_parameters)
+                    .unwrap_or_default()
+                    .iter()
+                    .map(|parameter| ((*parameter).to_string(), json!("$request.body.value")))
+                    .collect();
         let definition = json!({
             "openapi": "3.0.1",
             "info": { "title": format!("subtype-{subtype}") },
@@ -1155,7 +1165,7 @@ async fn an_imported_service_action_integration_needs_no_uri() {
                             "integrationSubtype": subtype,
                             "payloadFormatVersion": "1.0",
                             "credentials": "arn:aws:iam::000000000000:role/apigw",
-                            "requestParameters": { "MessageBody": "$request.body.message" }
+                            "requestParameters": Value::Object(request_parameters)
                         }
                     }
                 }

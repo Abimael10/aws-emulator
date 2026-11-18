@@ -479,6 +479,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         {
             return Err(bad_request(&message));
         }
+        // And the rule the SUBTYPE's own parameters are held to: a first-class subtype names
+        // ONE action, and an action cannot be called without the arguments it requires, so an
+        // integration whose mapping defines them is created and one that leaves any of them
+        // out is refused rather than stored as a configuration no request could be served
+        // through (see `crate::state::integration_subtype`).
+        if let Err(message) = crate::state::validate_subtype_request_parameters(
+            input.integration_subtype.as_deref(),
+            &request_parameters,
+        ) {
+            return Err(bad_request(&message));
+        }
 
         // Bound the growth a caller drives: AWS's published quota is 300 integrations per
         // API, and `TooManyRequestsException` is the modelled error for "a limit has been

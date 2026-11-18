@@ -1,12 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! An HTTP api route whose integration is a FIRST-CLASS STEP FUNCTIONS ACTION — `AWS_PROXY`
-//! naming the `StepFunctions-StartExecution` or `StepFunctions-StartSyncExecution`
-//! `IntegrationSubtype` — performed end to end: this service, Step Functions, IAM and the
-//! token service on ONE engine, with the run read back where a client reads it.
+//! naming the `StepFunctions-StartExecution`, `StepFunctions-StartSyncExecution` or
+//! `StepFunctions-StopExecution` `IntegrationSubtype` — performed end to end: this service,
+//! Step Functions, IAM and the token service on ONE engine, with the run read back where a
+//! client reads it.
 //!
 //! The RULE every table below is one slice of: **an HTTP api route whose integration names a
-//! Step Functions start subtype starts that workflow on every matching request, with each of
+//! Step Functions subtype performs that action on every matching request, with each of
 //! the action's parameters taken from the integration's `RequestParameters` — one mapping
 //! expression over the request, the invocation's context or the stage's variables, or a static
 //! value — issued as a session of the role its `CredentialsArn` names, so Step Functions
@@ -51,15 +52,17 @@ const STATES_PRINCIPAL: &str = "states.amazonaws.com";
 /// `CredentialsArn` role as.
 const GATEWAY_PRINCIPAL: &str = "apigateway.amazonaws.com";
 
-/// The two `IntegrationSubtype` values under test, exactly as `Integration$IntegrationSubtype`
-/// spells the action each names.
+/// The three `IntegrationSubtype` values under test, exactly as
+/// `Integration$IntegrationSubtype` spells the action each names.
 const START_EXECUTION: &str = "StepFunctions-StartExecution";
 const START_SYNC_EXECUTION: &str = "StepFunctions-StartSyncExecution";
+const STOP_EXECUTION: &str = "StepFunctions-StopExecution";
 
 /// The IAM actions a statement on an integration role names for them
 /// (`<arnNamespace>:<OperationName>`).
 const START_EXECUTION_ACTION: &str = "states:StartExecution";
 const START_SYNC_EXECUTION_ACTION: &str = "states:StartSyncExecution";
+const STOP_EXECUTION_ACTION: &str = "states:StopExecution";
 
 /// A definition whose single `Pass` state passes its input straight through, so the output of
 /// a run is the input it ran on.
@@ -123,6 +126,15 @@ const POLL_INTERVAL: Duration = Duration::from_millis(20);
 
 /// The status Step Functions reports for a run that has not finished.
 const RUNNING: &str = "RUNNING";
+
+/// The status it reports for a run a `StopExecution` ended.
+const ABORTED: &str = "ABORTED";
+
+/// A definition whose `Wait` state holds a run far longer than any test takes, so a run of it
+/// is still `RUNNING` when a route is asked to stop it.
+const HOLD_DEFINITION: &str = r#"{"StartAt":"Hold","States":{
+    "Hold":{"Type":"Wait","Seconds":600,"Next":"Done"},
+    "Done":{"Type":"Pass","End":true}}}"#;
 
 /// This service, Step Functions, IAM and the token service over ONE shared engine, as
 /// `core/router/src/lib.rs` mounts them: the action an integration performs is dispatched back
@@ -936,8 +948,10 @@ async fn a_mapping_the_action_cannot_be_called_with_starts_nothing() {
         expected: &'static str,
     }
     // Rows differ along WHAT is wrong: the required parameter mapped to an expression the
-    // request does not carry, nothing mapped for it at all, a parameter outside the action,
-    // and a synchronous start of a workflow type that action does not serve.
+    // request does not carry, a parameter outside the action, and a synchronous start of a
+    // workflow type that action does not serve. A mapping that defines NO value at all for
+    // the required parameter is not among them: such an integration is refused at the write,
+    // where `tests/all/integration_validation.rs` asserts it, so no route can carry one.
     let rows: &[Row] = &[
         Row {
             case: "an expression the request carries no value for",
@@ -947,15 +961,6 @@ async fn a_mapping_the_action_cannot_be_called_with_starts_nothing() {
             headers: &[],
             status: BAD_REQUEST,
             expected: BAD_REQUEST_MESSAGE,
-        },
-        Row {
-            case: "nothing mapped for the required parameter",
-            subtype: START_EXECUTION,
-            kind: "STANDARD",
-            parameters: |_machine| json!({ "Name": "unnamed-run" }),
-            headers: &[],
-            status: INTEGRATION_FAULT,
-            expected: INTEGRATION_FAULT_MESSAGE,
         },
         Row {
             case: "a parameter this emulator does not carry into the action",
@@ -1132,5 +1137,186 @@ async fn a_mapped_region_is_the_region_the_action_is_called_in() {
             named.ends_with(EXECUTION_DOES_NOT_EXIST),
             "case {case:?}: expected {EXECUTION_DOES_NOT_EXIST}, got {described}"
         );
+    }
+}
+
+/// RULE: a route whose integration names `StepFunctions-StopExecution` stops the execution its
+/// `RequestParameters` map — with the error and cause that mapping names recorded on the run —
+/// and answers that action's own document (`stopDate`); and a role that does not hold
+/// `states:StopExecution` stops nothing, the caller being told Step Functions' own refusal.
+#[tokio::test]
+async fn a_stop_execution_subtype_route_stops_the_run_its_request_parameters_map() {
+    /// One case: where the mapping takes each parameter from, the request made to the route,
+    /// and what the run must look like afterwards.
+    struct Row {
+        case: &'static str,
+        /// The parameters the integration maps, as a function of the running execution's ARN.
+        parameters: fn(&str) -> Value,
+        path: &'static str,
+        headers: &'static [(&'static str, &'static str)],
+        /// Whether the integration's role may stop an execution.
+        granted: bool,
+        /// The `error` and `cause` the stopped run must then report, when the mapping named
+        /// them.
+        recorded: Option<(&'static str, &'static str)>,
+    }
+    // Rows differ along WHERE the mapping takes the run and the stop's own members from — a
+    // static value, a query-string parameter, a header beside static values — and along
+    // whether the role holds the action at all.
+    let rows: &[Row] = &[
+        Row {
+            case: "the run named by a static value",
+            parameters: |execution| json!({ "ExecutionArn": execution }),
+            path: "/stop",
+            headers: &[],
+            granted: true,
+            recorded: None,
+        },
+        Row {
+            case: "the run named by a query-string parameter",
+            parameters: |_execution| json!({ "ExecutionArn": "$request.querystring.exec" }),
+            path: "/stop?exec=",
+            headers: &[],
+            granted: true,
+            recorded: None,
+        },
+        Row {
+            case: "an error and a cause mapped beside the run",
+            parameters: |execution| {
+                json!({
+                    "ExecutionArn": execution,
+                    "Error": "$request.header.x-error",
+                    "Cause": "the client asked for it",
+                })
+            },
+            path: "/stop",
+            headers: &[("x-error", "ClientAborted")],
+            granted: true,
+            recorded: Some(("ClientAborted", "the client asked for it")),
+        },
+        Row {
+            case: "a role that does not hold the action",
+            parameters: |execution| json!({ "ExecutionArn": execution }),
+            path: "/stop",
+            headers: &[],
+            granted: false,
+            recorded: None,
+        },
+    ];
+    for row in rows {
+        let case = row.case;
+        let emulator = Emulator::new();
+        let machine_arn = emulator
+            .state_machine(case, "orders", "STANDARD", HOLD_DEFINITION)
+            .await;
+        // The run the route is asked to stop, started where a client starts one, so what the
+        // stop acts on is a run Step Functions itself holds.
+        let started = emulator
+            .sfn_ok(
+                case,
+                "StartExecution",
+                &json!({
+                    "stateMachineArn": machine_arn,
+                    "name": "held-run",
+                    "input": r#"{"n":1}"#,
+                }),
+            )
+            .await;
+        let execution_arn = started["executionArn"]
+            .as_str()
+            .unwrap_or_else(|| panic!("case {case:?}: no executionArn in {started}"))
+            .to_string();
+        let role = emulator
+            .role(
+                case,
+                "apigateway-stops-runs",
+                GATEWAY_PRINCIPAL,
+                Some(grant(if row.granted {
+                    STOP_EXECUTION_ACTION
+                } else {
+                    START_EXECUTION_ACTION
+                })),
+            )
+            .await;
+        let integration =
+            subtype_integration(STOP_EXECUTION, Some(&role), (row.parameters)(&execution_arn));
+        let host = emulator.api(case, &[("POST /stop", integration)]).await;
+        // The query-string row names the run in the request itself, which is what its mapping
+        // expression selects.
+        let path = if row.path.ends_with('=') {
+            format!("{}{}", row.path, form_encode(&execution_arn))
+        } else {
+            row.path.to_string()
+        };
+        let (status, media_type, answered) = emulator
+            .invoke(&host, &path, row.headers, r#"{"n":1}"#)
+            .await;
+
+        if !row.granted {
+            // Step Functions' OWN refusal, relayed, and the run is left as it was.
+            assert_eq!(
+                status, CLIENT_REFUSAL,
+                "case {case:?}: expected the service's own status, got {status} with {answered}"
+            );
+            let named = answered[SHAPE_MEMBER].as_str().unwrap_or_default();
+            assert!(
+                named.ends_with(ACCESS_DENIED),
+                "case {case:?}: expected the service's own {ACCESS_DENIED}, got {answered}"
+            );
+            let described = emulator
+                .sfn_ok(
+                    case,
+                    "DescribeExecution",
+                    &json!({ "executionArn": execution_arn }),
+                )
+                .await;
+            assert_eq!(
+                described["status"],
+                json!(RUNNING),
+                "case {case:?}: expected the run to be untouched, got {described}"
+            );
+            continue;
+        }
+
+        assert_eq!(
+            status, PERFORMED,
+            "case {case:?}: expected the action's own answer, got {status} with {answered}"
+        );
+        assert_eq!(
+            media_type, JSON_MEDIA_TYPE,
+            "case {case:?}: expected {JSON_MEDIA_TYPE:?}, got {media_type:?} for {answered}"
+        );
+        // The document `StopExecutionOutput` declares: the instant the run was stopped at,
+        // as this wire states a timestamp.
+        assert!(
+            answered["stopDate"].is_number(),
+            "case {case:?}: expected the stopDate the action answered, got {answered}"
+        );
+        let settled = emulator.settled(case, &execution_arn).await;
+        assert_eq!(
+            settled["status"],
+            json!(ABORTED),
+            "case {case:?}: expected the run to have been stopped, got {settled}"
+        );
+        match row.recorded {
+            Some((error, cause)) => {
+                assert_eq!(
+                    settled["error"],
+                    json!(error),
+                    "case {case:?}: expected the mapped error on the run, got {settled}"
+                );
+                assert_eq!(
+                    settled["cause"],
+                    json!(cause),
+                    "case {case:?}: expected the mapped cause on the run, got {settled}"
+                );
+            }
+            None => {
+                assert!(
+                    settled.get("error").is_none() && settled.get("cause").is_none(),
+                    "case {case:?}: a stop that mapped neither must record neither, got {settled}"
+                );
+            }
+        }
     }
 }

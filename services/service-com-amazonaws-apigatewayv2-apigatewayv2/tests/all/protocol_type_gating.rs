@@ -202,7 +202,13 @@ fn rows() -> Vec<Row> {
                 "integrationType": "AWS_PROXY",
                 "integrationUri": "arn:aws:lambda:eu-west-1:000000000000:function:handler",
                 "payloadFormatVersion": "1.0",
-                "integrationSubtype": "SQS-SendMessage"
+                "integrationSubtype": "SQS-SendMessage",
+                // The arguments that action requires: a first-class subtype integration is
+                // written only with them, whatever the protocol half of the clause decides.
+                "requestParameters": {
+                    "QueueUrl": "$request.header.queue",
+                    "MessageBody": "$request.body.message"
+                }
             }),
             supported_by: HTTP_PROTOCOL_TYPE,
             read_back: ReadBack::Collection,

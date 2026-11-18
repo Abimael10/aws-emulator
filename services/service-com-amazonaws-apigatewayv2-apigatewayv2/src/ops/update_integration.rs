@@ -520,6 +520,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(bad_request(&message));
         }
 
+        // And to the same rule for the SUBTYPE the merged record would name: an integration
+        // that takes on a first-class subtype, or that patches away a parameter its action
+        // requires, is refused here exactly as the create refuses it, through the gate they
+        // share (`crate::state::integration_subtype`).
+        if let Err(message) = crate::state::validate_subtype_request_parameters(
+            updated.integration_subtype.as_deref(),
+            &updated.request_parameters,
+        ) {
+            return Err(bad_request(&message));
+        }
+
         // Read the response back out of the STORE, so what the caller gets is what a
         // later GetIntegration will report. The integration exists (checked above), so
         // this replaces its record rather than minting a second one, and its

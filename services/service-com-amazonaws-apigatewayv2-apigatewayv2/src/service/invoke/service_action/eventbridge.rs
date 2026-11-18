@@ -20,8 +20,11 @@ use super::credentials::SigningIdentity;
 use super::parameters::Mapped;
 use super::{Performed, Unperformed};
 
-/// The `IntegrationSubtype` that names this action.
-pub const PUT_EVENTS_SUBTYPE: &str = "EventBridge-PutEvents";
+/// The `IntegrationSubtype` that names this action, taken from the catalog that states which
+/// subtypes are first-class (`crate::state::integration_subtype`), so the value the control
+/// plane admits and the one this data plane performs are one constant.
+pub const PUT_EVENTS_SUBTYPE: &str =
+    crate::state::integration_subtype::EVENT_BRIDGE_PUT_EVENTS.name;
 
 /// Every parameter an integration may map onto the event: the members of
 /// `PutEventsRequestEntry`. A member the integration maps nothing for is left off the entry,
@@ -38,7 +41,11 @@ pub const PUT_EVENTS_PARAMETERS: &[&str] = &[
 
 /// The parameters the publication must carry a value for: NONE, because
 /// `PutEventsRequestEntry` marks no member required — an entry stating only some of them is
-/// an entry EventBridge itself decides about.
+/// an entry EventBridge itself decides about. It is a narrower set than the arguments the
+/// control plane holds an integration of this subtype to
+/// (`crate::state::integration_subtype`), which is the CONFIGURATION question rather than
+/// this one: whatever the mapping defines, a request that resolved a value for fewer members
+/// still states the entry those values make.
 pub const PUT_EVENTS_REQUIRED_PARAMETERS: &[&str] = &[];
 
 /// The `arnNamespace` EventBridge publishes its endpoint and signs under, which is the

@@ -364,6 +364,8 @@ enum Action {
     /// `StepFunctions-StartSyncExecution`: start one synchronously and answer what it came
     /// to.
     StepFunctionsStartSyncExecution,
+    /// `StepFunctions-StopExecution`: stop the execution it names.
+    StepFunctionsStopExecution,
 }
 
 impl Action {
@@ -379,6 +381,7 @@ impl Action {
             stepfunctions::START_SYNC_EXECUTION_SUBTYPE => {
                 Some(Self::StepFunctionsStartSyncExecution)
             }
+            stepfunctions::STOP_EXECUTION_SUBTYPE => Some(Self::StepFunctionsStopExecution),
             _ => None,
         }
     }
@@ -393,6 +396,7 @@ impl Action {
             Self::StepFunctionsStartSyncExecution => {
                 stepfunctions::START_SYNC_EXECUTION_PARAMETERS
             }
+            Self::StepFunctionsStopExecution => stepfunctions::STOP_EXECUTION_PARAMETERS,
         }
     }
 
@@ -407,6 +411,9 @@ impl Action {
             }
             Self::StepFunctionsStartSyncExecution => {
                 stepfunctions::START_SYNC_EXECUTION_REQUIRED_PARAMETERS
+            }
+            Self::StepFunctionsStopExecution => {
+                stepfunctions::STOP_EXECUTION_REQUIRED_PARAMETERS
             }
         }
     }
@@ -430,6 +437,9 @@ impl Action {
             }
             Self::StepFunctionsStartSyncExecution => {
                 stepfunctions::start_sync_execution(ctx, region, identity, mapped).await
+            }
+            Self::StepFunctionsStopExecution => {
+                stepfunctions::stop_execution(ctx, region, identity, mapped).await
             }
         }
     }
@@ -508,6 +518,11 @@ mod tests {
                 "the synchronous Step Functions start",
                 stepfunctions::START_SYNC_EXECUTION_SUBTYPE,
                 Some("StateMachineArn"),
+            ),
+            (
+                "the Step Functions stop",
+                stepfunctions::STOP_EXECUTION_SUBTYPE,
+                Some("ExecutionArn"),
             ),
             ("a case-folded spelling", "eventbridge-putevents", None),
             ("an action this emulator does not perform", "SQS-PurgeQueue", None),

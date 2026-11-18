@@ -182,7 +182,8 @@ fn integration_rows() -> Vec<IntegrationRow> {
                 "integrationType": "AWS_PROXY",
                 "integrationSubtype": "SQS-SendMessage",
                 "payloadFormatVersion": "1.0",
-                "requestParameters": { "QueueUrl": "$request.header.queue" }
+                "requestParameters": { "QueueUrl": "$request.header.queue",
+                                       "MessageBody": "$request.body.message" }
             }),
             expected: vec![
                 // A subtype names the action itself, so this invokes no function and the
