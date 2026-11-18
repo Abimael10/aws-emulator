@@ -11658,6 +11658,7 @@ dependencies = [
  "md-5 0.10.6",
  "pkcs1",
  "serde_json",
+ "service-com-amazonaws-cloudtraildata-cloudtraildataservice",
  "service-com-amazonaws-cloudwatchlogs-logs-20140328",
  "service-com-amazonaws-cognitoidentity-awscognitoidentityservice",
  "service-com-amazonaws-iam-awsidentitymanagementv20100508",

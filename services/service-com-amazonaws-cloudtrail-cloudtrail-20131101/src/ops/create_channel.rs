@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateChannel
-//! Creates a CloudTrail Lake channel in the shared channel registry (`crate::state`)
-//! and reports it back.
+//! Creates a CloudTrail Lake channel in the shared channel registry (`crate::state`),
+//! registers it with the data plane that ingests events onto it
+//! (`crate::state::channels::register_channel_in_data_plane`), and reports it back.
 //!
 //! ## Shape of an operation
 //!
@@ -307,7 +308,33 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             tags: (!record.tags.is_empty()).then(|| record.tags.clone()),
         };
 
-        store.channels.insert(record.key(), record);
+        let key = record.key();
+        let channel_arn = record.channel_arn.clone();
+        let source = record.source.clone();
+        store.channels.insert(key.clone(), record);
+        // The data plane's registry is written with this store's lock RELEASED (see
+        // `channels::register_channel_in_data_plane`).
+        drop(store);
+
+        // A channel exists to ingest events onto, so the call that mints it is also what
+        // makes it present in the data plane that serves `PutAuditEvents` — otherwise
+        // this response would hand back the ARN of a channel the documented ingestion
+        // pipeline could never deliver to. A registry that cannot be written leaves NO
+        // channel behind: the record just inserted is released and the request refused,
+        // rather than reporting a channel only half of the service holds.
+        if !channels::register_channel_in_data_plane(&*self.engine, &channel_arn, &source) {
+            state.lock().channels.remove(&key);
+            return Err(CreateChannelErrorModeled::UnsupportedOperationException(
+                UnsupportedOperationException {
+                    message: Some(
+                        "CreateChannel needs the CloudTrail Lake channel registry events are \
+                         ingested onto, which this engine does not carry"
+                            .to_string(),
+                    ),
+                },
+            )
+            .into());
+        }
         Ok(output)
     }
 }

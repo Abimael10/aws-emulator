@@ -383,6 +383,57 @@ pub fn channel_arn(region: &str, channel_id: &str) -> String {
     )
 }
 
+/// Give the channel's DATA PLANE — the `cloudtrail-data` service, whose `PutAuditEvents`
+/// is what a custom source ingests events onto a channel with — the channel this control
+/// plane just minted, reporting whether that registry holds it once this returns.
+///
+/// A channel is a resource of THIS service: `CreateChannel` is the only call that mints
+/// one and `DeleteChannel` the only one that retires it. The data plane serves the same
+/// channel and keeps its own per-channel state (the ingest log), so the call that mints
+/// the channel is what makes it present there, in the SAME request — there is no
+/// propagation a caller could have to wait for, and a channel this registry holds is one
+/// `PutAuditEvents` can ingest onto. [`deregister_channel_in_data_plane`] is the
+/// companion for the call that retires it.
+///
+/// `false` when that registry could not be written (the engine is not the shared
+/// in-memory one, or the ARN is not a channel ARN): the caller then reports no channel at
+/// all rather than one the data plane would refuse.
+///
+/// LOCK ORDER: the data plane takes only ITS own store's lock inside this call, so this
+/// must be called with NO guard of this service's store held — which keeps the
+/// cross-service write one-directional and a lock cycle between the two stores
+/// unreachable.
+pub fn register_channel_in_data_plane<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    channel_arn: &str,
+    source: &str,
+) -> bool {
+    ::service_com_amazonaws_cloudtraildata_cloudtraildataservice::state::register_channel(
+        engine,
+        channel_arn,
+        source,
+    )
+}
+
+/// Take the channel back out of that data plane's registry, so a channel this control
+/// plane no longer holds can no longer be ingested onto.
+///
+/// `Some(_)` once that registry has been written (whether or not it held the channel),
+/// and `None` when it could not be written at all — which the caller answers with its own
+/// modelled server error rather than reporting a channel deleted while its data plane
+/// still ingests onto it.
+///
+/// LOCK ORDER: as [`register_channel_in_data_plane`].
+pub fn deregister_channel_in_data_plane<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    channel_arn: &str,
+) -> Option<bool> {
+    ::service_com_amazonaws_cloudtraildata_cloudtraildataservice::state::deregister_channel(
+        engine,
+        channel_arn,
+    )
+}
+
 /// Whether `value` has the shape of an id CloudTrail minted: the modelled `UUID`
 /// (`com.amazonaws.cloudtrail#UUID`, `@length 36` of `^[a-f0-9\-]+$` in `8-4-4-4-12`
 /// groups), which is the `<uuid>` of `DeleteChannelRequest$Channel` ("The ARN or the

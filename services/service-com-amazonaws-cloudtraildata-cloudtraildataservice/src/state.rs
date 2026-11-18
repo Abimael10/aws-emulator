@@ -4,10 +4,12 @@
 //!
 //! CloudTrail Lake channels are created by the *CloudTrail* control plane
 //! (`CreateChannel`), which is a different service crate, so the registry lives here as
-//! shared, seedable state keyed by channel ARN: whoever registers a channel (the
-//! CloudTrail crate once its `CreateChannel` is implemented, or a test) calls
-//! [`ComAmazonawsCloudtraildataCloudtraildataserviceState::register_channel`] on this
-//! service's store in the SHARED engine, and `PutAuditEvents` ingests into it.
+//! shared, seedable state keyed by channel ARN: the call that mints a channel registers
+//! it here in the same request through [`register_channel`], the call that deletes one
+//! takes it back out through [`deregister_channel`], and `PutAuditEvents` ingests into
+//! it. A test that needs a channel without driving the control plane registers one the
+//! same way, or writes
+//! [`ComAmazonawsCloudtraildataCloudtraildataserviceState::register_channel`] directly.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -356,6 +358,91 @@ impl ComAmazonawsCloudtraildataCloudtraildataserviceState {
         };
         self.channels.get_mut(&key)
     }
+
+    /// Take the channel `reference` names back out of the registry, returning the
+    /// registration it held, if any — the effect retiring the channel has on this
+    /// registry, and the companion of [`Self::register_channel`].
+    pub fn remove_channel(&mut self, reference: &ChannelRef) -> Option<Channel> {
+        let key = match reference {
+            ChannelRef::Arn(arn) => arn.arn.clone(),
+            ChannelRef::Id(id) => self.arn_for_channel_id(id)?.to_string(),
+        };
+        self.channels.remove(&key)
+    }
+}
+
+/// Give this service's channel registry the channel the CloudTrail control plane just
+/// created, reporting whether the registry holds that channel once this returns.
+///
+/// The CHANNEL RESOURCE is the control plane's: `cloudtrail:CreateChannel` is the only
+/// call that mints a channel ARN and `cloudtrail:DeleteChannel` the only one that retires
+/// it, so it is those calls — in the SAME request that mints or retires the channel —
+/// which make the channel present here, through this function and
+/// [`deregister_channel`]. A caller that just created a channel can therefore ingest onto
+/// it with no propagation step to wait for, and one whose channel was deleted cannot. The
+/// registration carries what this service's own checks need beyond the ARN: the owner
+/// account (read off the ARN, so it can never disagree with it) and the channel's event
+/// `source`.
+///
+/// Idempotent: an ARN this registry already holds keeps its registration AND its ingest
+/// log, so registering twice never drops events this service accepted.
+///
+/// The registry's SIZE is bounded by the control plane that writes it: it mints at most
+/// its own channel quota of channels, each registers once here, and
+/// [`deregister_channel`] releases the registration when the channel is retired — so no
+/// sequence of calls grows this map past that quota. What each channel then RETAINS is
+/// bounded by [`MAX_RETAINED_EVENTS_PER_CHANNEL`] / [`MAX_RETAINED_BYTES_PER_CHANNEL`].
+///
+/// `false` when `arn` is not a channel ARN, or when this store cannot be reached at all
+/// (the engine is not the shared in-memory one) — never a silent success: a caller that
+/// could not register the channel answers with its own modelled error rather than
+/// reporting a channel the data plane cannot ingest onto.
+///
+/// LOCK ORDER: this takes THIS store's lock, holds no other while it does, and hands back
+/// an owned value rather than a guard — so a caller asks it with NO guard of its own store
+/// held, which keeps the cross-service write one-directional and a lock cycle between the
+/// two stores unreachable.
+pub fn register_channel<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    arn: &str,
+    source: &str,
+) -> bool {
+    let Some(parsed) = parse_channel_arn(arn) else {
+        return false;
+    };
+    let Some(state) = service_state(engine) else {
+        return false;
+    };
+    let reference = ChannelRef::Arn(parsed);
+    let mut store = state.lock();
+    if store.channel(&reference).is_some() {
+        return true;
+    }
+    let Some(channel) = Channel::from_arn(arn, source) else {
+        return false;
+    };
+    store.register_channel(channel);
+    true
+}
+
+/// Take the channel `arn` back out of this service's registry — the effect
+/// `cloudtrail:DeleteChannel` has on the data plane — so a channel the control plane no
+/// longer holds can no longer be ingested onto.
+///
+/// `Some(true)` when a registration was removed, `Some(false)` when this registry held
+/// none under that ARN, and `None` when the ARN is not a channel ARN or this store could
+/// not be reached at all: a registry this emulator cannot write answers the question not
+/// at all, and is never a reason to report the channel as retired here.
+///
+/// LOCK ORDER: as [`register_channel`].
+pub fn deregister_channel<Eng: Send + Sync + 'static>(engine: &Eng, arn: &str) -> Option<bool> {
+    let parsed = parse_channel_arn(arn)?;
+    let state = service_state(engine)?;
+    let removed = state
+        .lock()
+        .remove_channel(&ChannelRef::Arn(parsed))
+        .is_some();
+    Some(removed)
 }
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.

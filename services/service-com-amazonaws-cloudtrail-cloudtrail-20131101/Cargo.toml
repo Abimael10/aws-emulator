@@ -91,6 +91,11 @@ md-5 = "0.10"
 # Derives the bits of the per-Region, per-period digest-signing keys `ListPublicKeys`
 # reports, so the same Region and period always answer the same key.
 sha2 = { workspace = true }
+# The CloudTrail Lake DATA PLANE's channel registry, which `PutAuditEvents` ingests onto:
+# this control plane owns the channel resource, so `CreateChannel` registers the channel
+# it mints there and `DeleteChannel` takes it back out, in the same request
+# (`state::channels`). No cycle: that crate does not depend on this one.
+service-com-amazonaws-cloudtraildata-cloudtraildataservice = { workspace = true }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

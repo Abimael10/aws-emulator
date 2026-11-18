@@ -215,12 +215,35 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // identifier naming another account addresses no record here, so it is absent
         // too.
         let released = match address {
-            crate::state::channels::ChannelAddress::Key(key) => {
-                store.channels.remove(&key).is_some()
-            }
-            crate::state::channels::ChannelAddress::AnotherAccount => false,
+            crate::state::channels::ChannelAddress::Key(key) => store.channels.remove(&key),
+            crate::state::channels::ChannelAddress::AnotherAccount => None,
         };
-        if released {
+        // The data plane's registry is written with this store's lock RELEASED (see
+        // `channels::deregister_channel_in_data_plane`).
+        drop(store);
+        if let Some(released) = released {
+            // The channel is retired, so the data plane that ingests onto it must no
+            // longer hold it either: a registry that cannot be written leaves the
+            // channel where it was and the request is refused, rather than reporting a
+            // channel deleted while `PutAuditEvents` still accepts events onto it.
+            if crate::state::channels::deregister_channel_in_data_plane(
+                &*self.engine,
+                &released.channel_arn,
+            )
+            .is_none()
+            {
+                state.lock().channels.insert(released.key(), released);
+                return Err(DeleteChannelErrorModeled::UnsupportedOperationException(
+                    UnsupportedOperationException {
+                        message: Some(
+                            "DeleteChannel needs the CloudTrail Lake channel registry events \
+                             are ingested onto, which this engine does not carry"
+                                .to_string(),
+                        ),
+                    },
+                )
+                .into());
+            }
             return Ok(DeleteChannelOutput {});
         }
         Err(channel_not_found(&input.channel, &region))
