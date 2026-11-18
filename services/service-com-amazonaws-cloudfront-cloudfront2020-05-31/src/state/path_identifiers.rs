@@ -11,11 +11,13 @@
 //!
 //! * the FORM — how much of the way CloudFront writes that kind's identifiers a route reads of
 //!   the value, which is a property of the value alone. The two field-level encryption records
-//!   and the origin access control read only the ALPHABET CloudFront issues an identifier in
-//!   ([`is_entity_identifier`]), their recorded refusals answering the absent record for a
-//!   value of that alphabet whatever letter it opens with and however wide it is
-//!   ([`super::unresolved_field_level_encryption_config`]); the distribution reads the whole
-//!   form its ids are minted in ([`super::is_distribution_id`] and its neighbours);
+//!   read only the ALPHABET CloudFront issues an identifier in ([`is_entity_identifier`]),
+//!   their recorded refusals answering the absent record for a value of that alphabet whatever
+//!   letter it opens with and however wide it is
+//!   ([`super::unresolved_field_level_encryption_config`]); the origin access control reads
+//!   NONE of the form, its recorded refusals answering the absent control for a value written
+//!   in no alphabet CloudFront mints an identifier in; the distribution reads the whole form
+//!   its ids are minted in ([`super::is_distribution_id`] and its neighbours);
 //! * which KIND an identifier belongs to, for the family CloudFront draws from ONE form. A
 //!   distribution, a streaming distribution, an origin access identity and an origin access
 //!   control all carry an `E` followed by an identifier body of the same width and alphabet,
@@ -45,10 +47,12 @@ use super::*;
 /// non-empty run of the one alphabet it writes them in (a decimal digit or an uppercase ASCII
 /// letter).
 ///
-/// This is all the FORM an origin access control route reads. The member is a plain `string`
-/// in the model — no `@pattern`, no `@length` — and its recorded refusals answer the absent
-/// control for a value of this alphabet whatever letter it opens with and however wide it is,
-/// so the namespace letter and the width this emulator happens to MINT are no part of the
+/// This is all the FORM the two field-level encryption records' routes read
+/// ([`super::unresolved_field_level_encryption_config`],
+/// [`super::unresolved_field_level_encryption_profile`]). Their `Id` member is a plain `string`
+/// in the model — no `@pattern`, no `@length` — and their recorded refusals answer the absent
+/// record for a value of this alphabet whatever letter it opens with and however wide it is, so
+/// the namespace letter and the width this emulator happens to MINT are no part of the
 /// decision; a value outside the alphabet was never an identifier this service issued, and is
 /// the identifier it reports it cannot read.
 pub fn is_entity_identifier(value: &str) -> bool {
@@ -130,17 +134,17 @@ impl ComAmazonawsCloudfrontCloudfront20200531State {
     /// The modelled `NoSuchOriginAccessControl` an operation ADDRESSED by an origin access
     /// control `Id` answers an identifier it could not resolve.
     ///
-    /// The FORM this route reads is the ALPHABET alone ([`is_entity_identifier`]), and the KIND
-    /// is read from the store: a value this account holds as another kind of the `E`-form
-    /// family was issued for THAT kind, and a value outside the alphabet was never an
-    /// identifier this service issued — each is an identifier this operation cannot read, while
-    /// every other value it cannot resolve is the control that is absent, whatever letter it
-    /// opens with and however wide it is.
+    /// This route reads NO form of the value: the `Id` is a plain `string` in the model, and the
+    /// recorded refusal of a control the account does not hold answers the ABSENT-control
+    /// sentence for an identifier written in no alphabet CloudFront mints one in, so the
+    /// alphabet, the namespace letter and the width are no part of the decision. The only thing
+    /// read is the KIND, out of the store: a value this account holds as another kind of the
+    /// `E`-form family was issued for THAT kind and is the identifier this operation reports it
+    /// cannot read, while every other value it cannot resolve is the control that is absent.
     pub fn unresolved_origin_access_control(&self, id: &str) -> NoSuchOriginAccessControl {
-        let addresses_a_control = is_entity_identifier(id)
-            && self
-                .entity_kind(id)
-                .is_none_or(|held| held == EntityKind::OriginAccessControl);
+        let addresses_a_control = self
+            .entity_kind(id)
+            .is_none_or(|held| held == EntityKind::OriginAccessControl);
         if addresses_a_control {
             no_such_origin_access_control()
         } else {

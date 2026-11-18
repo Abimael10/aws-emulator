@@ -5,15 +5,17 @@
 //!
 //! Two rules, each held over the class it covers rather than over one recorded call:
 //!
-//! 1. **A stack whose last operation FAILED and was left standing has not finished applying
-//!    the tag set in force to its resources, so a change set over it plans that application
-//!    onto every taggable resource it holds** — one `Modify` with `Replacement=False` and
-//!    `Scope=["Tags"]` each, even where the submitted revision restates the very set in force.
-//!    A stack's tags are the tags of its resources ("CloudFormation also propagates these tags
-//!    to resources in the stack"), so the application is outstanding work exactly as the
-//!    resource changes that operation could not carry through are; a stack whose last operation
-//!    COMPLETED carries the set on every resource it holds, so there a revision restating it
-//!    plans nothing.
+//! 1. **A stack that has still to apply the tag set in force to its resources is planned that
+//!    application onto every taggable resource it holds** — one `Modify` with
+//!    `Replacement=False` and `Scope=["Tags"]` each, even where the submitted revision restates
+//!    the very set in force. A stack's tags are the tags of its resources ("CloudFormation also
+//!    propagates these tags to resources in the stack"), so the application is outstanding work
+//!    exactly as the resource changes a parked operation could not carry through are — and WHICH
+//!    operation put the set in force is what decides whether anything is owing: a stack parked
+//!    by a failed CREATE has had nothing applied, while one parked by a failed UPDATE that left
+//!    the tags alone had them applied by the operation before it, which completed. A stack whose
+//!    last operation COMPLETED carries the set on every resource it holds, so there too a
+//!    revision restating it plans nothing.
 //! 2. **`PolicyAction` is "the action that will be taken on the physical resource when the
 //!    change set is executed", so a change on a logical id the stack holds NO physical resource
 //!    for reports none.** The create of such a resource was refused, so nothing was ever made
@@ -554,11 +556,15 @@ async fn a_change_set_plans_the_outstanding_tag_application_and_acts_only_on_res
     }
 }
 
-/// RULE 1, the other half: the tag application the plan reports is reported for a stack parked
-/// by a failed UPDATE too — the status is what says the application is outstanding, not which
-/// operation left it so.
+/// RULE 1, the other half: WHICH operation left the application outstanding is what decides a
+/// parked stack's tag plan, not the status alone. A stack parked by a failed UPDATE that left
+/// the tags alone had the set in force applied by the operation BEFORE it, which completed, so
+/// the correcting revision restating that set plans no tag change at all — the recorded change
+/// set of the last stable revision of such a stack proposes nothing. An update that CHANGED
+/// the tags and then failed is the other way round: its own set was never applied, so the
+/// application is outstanding and the plan carries it.
 #[tokio::test]
-async fn a_stack_parked_by_a_failed_update_is_planned_the_same_tag_application() {
+async fn a_stack_parked_by_a_failed_update_is_planned_the_application_that_update_left_owing() {
     let router = build_router();
     let case = "a stack parked by a failed update";
     let stack = "parked-by-an-update";
@@ -578,7 +584,8 @@ async fn a_stack_parked_by_a_failed_update_is_planned_the_same_tag_application()
     );
 
     // ...then an update that cannot be carried through, with its failed state kept: the second
-    // parameter is pointed at the name the good one already carries.
+    // parameter is pointed at the name the good one already carries. It restates the tags in
+    // force, so it leaves no tag application owing.
     let change_set = create_change_set(
         &router,
         case,
@@ -595,8 +602,8 @@ async fn a_stack_parked_by_a_failed_update_is_planned_the_same_tag_application()
         "case {case:?}: expected the failed update to park the stack, got {settled:?}"
     );
 
-    // The correcting revision restates the very tags in force, and the plan still carries the
-    // application the parked operation never finished.
+    // The correcting revision restates the very tags in force, which the operation before the
+    // failed update had already applied: the plan carries no tag change.
     let change_set = create_change_set(
         &router,
         case,
@@ -605,6 +612,30 @@ async fn a_stack_parked_by_a_failed_update_is_planned_the_same_tag_application()
         "UPDATE",
         &corrected_template(stack),
         &[ESTATE_TAG],
+    )
+    .await;
+    let described = settled_change_set(&router, case, stack, &change_set).await;
+    let reported = reported_changes(&described);
+    let tagged: Vec<&ReportedChange> = reported
+        .iter()
+        .filter(|change| change.scope == vec!["Tags".to_string()])
+        .collect();
+    assert!(
+        tagged.is_empty(),
+        "case {case:?}: expected no tag change for a set the completed operation applied, got \
+         {reported:?}"
+    );
+
+    // ...and a revision that states the tags DIFFERENTLY asks for the application on every
+    // taggable resource the stack holds, parked or not.
+    let change_set = create_change_set(
+        &router,
+        case,
+        stack,
+        "retagging",
+        "UPDATE",
+        &corrected_template(stack),
+        &[ESTATE_TAG, SECOND_TAG],
     )
     .await;
     let described = settled_change_set(&router, case, stack, &change_set).await;

@@ -495,22 +495,20 @@ async fn create_persists_the_configuration_every_read_then_reports() {
         .first()
         .map(|(_, id)| id.clone())
         .unwrap_or_else(|| panic!("the table must create at least one control"));
-    // Each row is an id no control holds, with the sentence it earns: the absent control for a
-    // value written in the alphabet CloudFront issues an entity identifier in, and the
-    // unreadable identifier for a value of a form this service never issued.
-    const UNREADABLE_CONTROL_ID_MESSAGE: &str = "Id format is invalid";
+    // Each row is an id no control holds: every one earns the absent-control sentence, the FORM
+    // of the value being no part of the decision.
     for (id, expected) in [
         ("E1AAAAAAAAAAAA", NO_SUCH_CONTROL_MESSAGE),
-        ("not-an-id", UNREADABLE_CONTROL_ID_MESSAGE),
+        ("not-an-id", NO_SUCH_CONTROL_MESSAGE),
         ("0", NO_SUCH_CONTROL_MESSAGE),
         (
             distribution_id.to_lowercase().as_str(),
-            UNREADABLE_CONTROL_ID_MESSAGE,
+            NO_SUCH_CONTROL_MESSAGE,
         ),
         ("W1AAAAAAAAAAAA", NO_SUCH_CONTROL_MESSAGE),
         (
             "00000000-0000-0000-0000-000000000000",
-            UNREADABLE_CONTROL_ID_MESSAGE,
+            NO_SUCH_CONTROL_MESSAGE,
         ),
     ] {
         let missing = get_control(&router, id).await;

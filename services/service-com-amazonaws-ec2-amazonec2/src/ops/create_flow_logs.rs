@@ -445,27 +445,36 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         )?;
 
         // "The destination options" (`$DestinationOptions`), as the response shape reports
-        // them, and reported exactly when the request ASKED for them: each member this request
-        // left out of the options it named is filled in HERE, at the default that member's own
-        // documentation gives it — "The default is plain-text"
-        // (`DestinationOptionsRequest$FileFormat`), "The default is false"
-        // (`$HiveCompatiblePartitions`, `$PerHourPartition`) — and a request that named no
-        // options at all leaves the member unset, so the flow log reports the delivery layout it
-        // was configured with rather than one it never asked for.
-        let destination_options = input.destination_options.as_ref().map(|options| {
-            DestinationOptionsResponse {
-                file_format: Some(
-                    options
-                        .file_format
-                        .clone()
-                        .unwrap_or_else(|| state::DEFAULT_FLOW_LOG_FILE_FORMAT.to_string()),
-                ),
-                hive_compatible_partitions: Some(
-                    options.hive_compatible_partitions.unwrap_or(false),
-                ),
-                per_hour_partition: Some(options.per_hour_partition.unwrap_or(false)),
-            }
-        });
+        // them. They describe the OBJECTS an Amazon S3 delivery writes, so a flow log
+        // delivering to Amazon S3 HAS a layout whether or not the request spelled it out: every
+        // member is reported at the value in force — the request's, or that member's own
+        // documented default where the request named none ("The default is plain-text",
+        // `DestinationOptionsRequest$FileFormat`; "The default is false",
+        // `$HiveCompatiblePartitions`, `$PerHourPartition`). Only the destination types that
+        // take no such options at all (refused above) leave the member unset, having no object
+        // layout to report.
+        let destination_options = (log_destination_type == state::LOG_DESTINATION_TYPE_S3).then(
+            || {
+                let asked = input.destination_options.as_ref();
+                DestinationOptionsResponse {
+                    file_format: Some(
+                        asked
+                            .and_then(|options| options.file_format.clone())
+                            .unwrap_or_else(|| state::DEFAULT_FLOW_LOG_FILE_FORMAT.to_string()),
+                    ),
+                    hive_compatible_partitions: Some(
+                        asked
+                            .and_then(|options| options.hive_compatible_partitions)
+                            .unwrap_or(false),
+                    ),
+                    per_hour_partition: Some(
+                        asked
+                            .and_then(|options| options.per_hour_partition)
+                            .unwrap_or(false),
+                    ),
+                }
+            },
+        );
 
         // "The tag configuration associated with the Flow Logs Amazon EC2 Tags feature
         // fields in your custom log format" (`$TagFieldSpecifications`), carried over to

@@ -15,7 +15,7 @@
 //! so a request naming both, or neither, describes no cluster and is a
 //! `BadRequestException` — two DIFFERENT ones: naming neither is a refusal of the
 //! cluster-type parameter the request left unset, while naming both is a refusal of
-//! the BODY itself, which names no member.
+//! the SELECTION, which names no member.
 //!
 //! A provisioned body also names the broker software its cluster would run, so
 //! its `KafkaVersion` is admitted against the catalog this service publishes
@@ -133,18 +133,19 @@ const CLUSTER_TYPE_MEMBER: &str = "clusterType";
 const NO_CLUSTER_TYPE_MESSAGE: &str =
     "You must specify a cluster type, either provisioned or serverless.";
 
-/// What MSK answers a create whose body does not describe ONE cluster: the one
-/// body-level sentence it refuses a request body it will not read as a create with,
-/// which names no member and nothing of the request.
+/// What MSK answers a create whose body names BOTH cluster types: one fixed sentence,
+/// stating that only one of the two kinds may be asked for and naming nothing of the
+/// request.
 ///
 /// A body naming BOTH cluster types describes two different clusters, so there is no
 /// member a caller could repair on its own — either of them is a cluster MSK would
-/// make — and the refusal is taken on the BODY: it carries this sentence and no
-/// `invalidParameter` ([`invalid_request_body`]), where a create naming NEITHER blames
+/// make — and the refusal names no `invalidParameter`
+/// ([`one_cluster_type_only`]), where a create naming NEITHER blames
 /// the cluster-type parameter the request left unset ([`NO_CLUSTER_TYPE_MESSAGE`]). The
 /// two answers differ in both message and `invalidParameter`, so a client can tell the
 /// two input errors apart.
-const INVALID_REQUEST_BODY_MESSAGE: &str = "Invalid request body";
+const ONE_CLUSTER_TYPE_MESSAGE: &str =
+    "You can specify only one cluster type, either provisioned or serverless.";
 
 /// The member a serverless body carries its VPC configurations — and so the
 /// subnets each one is reached through — in, as the wire spells it.
@@ -251,10 +252,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             (Some(request), None) => ClusterBody::Provisioned(Box::new(request)),
             (None, Some(request)) => ClusterBody::Serverless(request),
             // A body naming BOTH kinds asks for two clusters at once, which is no
-            // create MSK can read: it refuses the BODY, in the one sentence it
-            // words a request body it will not read and with no member named
-            // ([`invalid_request_body`]).
-            (Some(_), Some(_)) => return Err(invalid_request_body()),
+            // create MSK can read: it refuses the SELECTION, in the one sentence it
+            // words a body that asks for more than one cluster type and with no member
+            // named ([`one_cluster_type_only`]).
+            (Some(_), Some(_)) => return Err(one_cluster_type_only()),
             // A body naming NEITHER kind names no cluster type at all, and either
             // member would have named one, so the refusal blames the abstract
             // parameter MSK names rather than one of the two alternatives.
@@ -612,14 +613,14 @@ fn bad_request(parameter: &str, message: String) -> CreateClusterV2Error {
 }
 
 /// Refuse a create whose body names BOTH cluster types: the modeled
-/// `BadRequestException` carrying MSK's one body-level sentence
-/// ([`INVALID_REQUEST_BODY_MESSAGE`]) and NO `invalidParameter`, because the decision is
-/// taken on the BODY the request carried rather than on one member a caller could repair
-/// on its own.
-fn invalid_request_body() -> CreateClusterV2Error {
+/// `BadRequestException` carrying MSK's one sentence for a body that asks for more than one
+/// cluster type ([`ONE_CLUSTER_TYPE_MESSAGE`]) and NO `invalidParameter`, because the
+/// decision is taken on the SELECTION the request carried rather than on one member a caller
+/// could repair on its own.
+fn one_cluster_type_only() -> CreateClusterV2Error {
     CreateClusterV2ErrorModeled::BadRequestException(BadRequestException {
         invalid_parameter: None,
-        message: Some(INVALID_REQUEST_BODY_MESSAGE.to_string()),
+        message: Some(ONE_CLUSTER_TYPE_MESSAGE.to_string()),
     })
     .into()
 }

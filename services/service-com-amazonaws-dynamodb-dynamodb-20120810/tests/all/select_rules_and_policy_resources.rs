@@ -887,7 +887,8 @@ async fn a_schema_defect_is_worded_over_the_request_and_the_tables_own_schema() 
         ),
         (
             // Every definition is used, so the key with nothing declared for it is the
-            // only fact there is to state, and the sentence interpolates nothing.
+            // only fact there is to state — over the two lists the caller has to
+            // reconcile, neither in the order the request stated it.
             "a table key attribute with no definition",
             json!({
                 "TableName": "UndefinedTableKey",
@@ -896,7 +897,9 @@ async fn a_schema_defect_is_worded_over_the_request_and_the_tables_own_schema() 
                               {"AttributeName": "sk", "KeyType": "RANGE"}],
                 "AttributeDefinitions": [{"AttributeName": "pk", "AttributeType": "S"}],
             }),
-            "Invalid KeySchema: Some index key attribute have no definition".to_string(),
+            "One or more parameter values were invalid: Some index key attributes are not \
+             defined in AttributeDefinitions. Keys: [sk, pk], AttributeDefinitions: [pk]"
+                .to_string(),
         ),
         (
             // The sets differ BOTH ways round — a key with no definition beside a
@@ -912,7 +915,10 @@ async fn a_schema_defect_is_worded_over_the_request_and_the_tables_own_schema() 
                 "AttributeDefinitions": [{"AttributeName": "EXTRA", "AttributeType": "S"},
                                          {"AttributeName": "PK", "AttributeType": "S"}],
             }),
-            "Invalid KeySchema: Some index key attribute have no definition".to_string(),
+            "One or more parameter values were invalid: Some index key attributes are not \
+             defined in AttributeDefinitions. Keys: [SK, PK], AttributeDefinitions: \
+             [EXTRA, PK]"
+                .to_string(),
         ),
         (
             // Neither list is reported in the order the request stated it: both are

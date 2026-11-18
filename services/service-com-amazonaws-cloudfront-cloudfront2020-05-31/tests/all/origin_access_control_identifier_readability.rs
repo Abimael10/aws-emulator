@@ -13,23 +13,22 @@
 //!
 //! * a value this account holds as a resource of ANOTHER kind of the one identifier form
 //!   CloudFront draws a distribution, a streaming distribution, an origin access identity and
-//!   an origin access control from was issued for THAT kind, and a value written in no
-//!   identifier alphabet this service issues one in was never an identifier at all — each is
-//!   the identifier the service reports it cannot read, "Id format is invalid";
+//!   an origin access control from was issued for THAT kind — that is the identifier the
+//!   service reports it cannot read, "Id format is invalid";
 //! * every OTHER value the store holds no control under is the control reported ABSENT — "The
-//!   specified origin access control does not exist." — whatever letter it opens with and
-//!   however wide it is, the namespace letter and the minted width being no part of the
-//!   decision.
+//!   specified origin access control does not exist." — whatever the value's FORM: the
+//!   alphabet, the namespace letter and the minted width are no part of the decision, so a
+//!   lower-cased identifier, a UUID, a bare word and a domain name all read that sentence.
 //!
 //! The rows span what the rule generalises over: the unreadable rows carry the minted
 //! identifiers of TWO other kinds of that form (a distribution's and an origin access
-//! identity's) and five values that break the identifier alphabet in different ways (a minted
-//! identifier in lower case, a UUID, a bare word, a caller reference, a domain name), and the
-//! absent rows vary the form of a value nothing answers to — the control's own identifier with
-//! a character changed, an identifier of the form that was never minted, a public key
-//! identifier (a kind outside that form), bodies wider and narrower than the one this service
-//! issues, an unminted namespace letter and a body of digits alone. Every row is driven through
-//! all four operations, and the live resources are read back afterwards to show the refusals
+//! identity's), and the absent rows vary the form of a value nothing answers to — the control's
+//! own identifier with a character changed, an identifier of the form that was never minted, a
+//! public key identifier (a kind outside that form), bodies wider and narrower than the one
+//! this service issues, an unminted namespace letter, a body of digits alone, and five values
+//! written in no alphabet CloudFront mints an identifier in (a minted identifier in lower case,
+//! a UUID, a bare word, a caller reference, a domain name). Every row is driven through all
+//! four operations, and the live resources are read back afterwards to show the refusals
 //! touched nothing.
 //!
 //! The wire harness and the create helpers are the crate's own.
@@ -272,8 +271,9 @@ fn no_resource_answers_to(live: &Live) -> Vec<(String, String)> {
     ]
 }
 
-/// The values that are written in no identifier alphabet CloudFront issues one in, which this
-/// route therefore cannot read at all: the rows vary HOW the alphabet is broken.
+/// The values that are written in no identifier alphabet CloudFront issues one in. The form is
+/// no part of this route's decision, so each of them is the control reported ABSENT: the rows
+/// vary HOW the alphabet is broken.
 fn outside_the_identifier_alphabet(live: &Live) -> Vec<(String, String)> {
     vec![
         (
@@ -319,8 +319,11 @@ async fn an_identifier_issued_for_another_kind_of_the_shared_form_is_reported_un
     );
 }
 
+/// RULE: the form of an id is no part of the decision — a value written in no alphabet
+/// CloudFront mints an identifier in reads the absent-control sentence like any other id the
+/// store holds no control under.
 #[tokio::test]
-async fn a_value_this_service_issues_no_identifier_in_is_reported_unreadable() {
+async fn a_value_this_service_issues_no_identifier_in_is_the_absent_control() {
     let router = emulator();
     let live = live(&router).await;
 
@@ -332,7 +335,7 @@ async fn a_value_this_service_issues_no_identifier_in_is_reported_unreadable() {
             assert_refusal(
                 &answer,
                 &format!("{op:?} with {case} ({id:?})"),
-                UNREADABLE_IDENTIFIER,
+                NO_SUCH_CONTROL,
             );
         }
     }

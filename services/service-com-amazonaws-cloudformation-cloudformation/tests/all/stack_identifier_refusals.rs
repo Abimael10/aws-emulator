@@ -7,7 +7,8 @@
 //!
 //! 1. A stack identifier a request carries is checked against CloudFormation's own
 //!    constraints for it — at least one character, and the name-or-ARN expression, which the
-//!    WHOLE of the value has to be rather than merely carry — BEFORE
+//!    WHOLE of the value has to be rather than merely carry, unless the value is the bare
+//!    unique id the service mints for a stack — BEFORE
 //!    the stack is resolved, and a value that breaks them is refused with the aggregated
 //!    `<n> validation errors detected: …` envelope naming the member path the operation
 //!    states, one clause per constraint broken, rather than with a stack-not-found message.
@@ -25,10 +26,11 @@
 //! values that are no name at all — digits, hyphens, punctuation and spaces alone, and
 //! combinations of them — and values only PART of which is a name run: a character a stack
 //! name may not carry (an underscore, a dot, a space), a leading character it may not begin
-//! with, and the digit-led form a stack's unique id takes) crossed with
+//! with, and hexadecimal runs that are not the width or the grouping of a minted unique id)
+//! crossed with
 //! every operation whose identifier member this service checks itself; the admitted side over
-//! the values the check admits that no stack carries — names, a stack ARN and the letter-led
-//! form a stack's unique id takes, which is pinned on its own by
+//! the values the check admits that no stack carries — names, a stack ARN and the unique id a
+//! stack id ends in, whichever hexadecimal character it begins with, pinned on its own by
 //! `stack_unique_id_identifiers.rs`; the
 //! absent-member side over four operations and three different required members; and the
 //! physical-id side over a live stack, the same stack once deleted, and an id nothing ever
@@ -190,11 +192,12 @@ const IDENTIFIER_ROWS: &[IdentifierRow] = &[
     },
 ];
 
-/// The identifiers the expression does not describe the whole of: an empty value, values that
-/// are no name at all (digits, hyphens, punctuation and spaces alone or together), and values
-/// only PART of which is a name run — one carrying a character a stack name may not hold, one
-/// led by a character a stack name may not begin with, and the digit-led form a stack's unique
-/// id takes.
+/// The identifiers the expression does not describe the whole of, and which are not a minted
+/// unique id either: an empty value, values that are no name at all (digits, hyphens,
+/// punctuation and spaces alone or together), and values only PART of which is a name run — one
+/// carrying a character a stack name may not hold, one led by a character a stack name may not
+/// begin with, and hexadecimal runs that are not the width or the grouping of a minted unique
+/// id.
 const MALFORMED: &[(&str, &str)] = &[
     ("an empty identifier", ""),
     ("digits alone", "1234567890"),
@@ -210,19 +213,19 @@ const MALFORMED: &[(&str, &str)] = &[
     ("a name starting with a digit", "9identifier"),
     ("a name starting with a hyphen", "-identifier"),
     (
-        "the digit-led unique id a stack id ends in",
-        "0e81d159-090a-7b61-9856-04d0999cb465",
+        "a hexadecimal run one character short of a unique id",
+        "0e81d159-090a-7b61-9856-04d0999cb46",
     ),
     (
-        "a digit-led unique id with no groups at all",
-        "0e81d159090a7b61985604d0999cb465",
+        "a unique id's digits grouped somewhere else",
+        "0e81d1-59090a-7b61-9856-04d0999cb465",
     ),
 ];
 
 /// Identifiers the check DOES admit — so each one reaches the lookup — that no stack of the
 /// Region carries: names nothing created in the forms the expression's name alternative
-/// admits, and the letter-led form a stack's unique id takes, which the whole of the name
-/// alternative describes.
+/// admits, and the unique id a stack id ends in, whichever hexadecimal character it begins
+/// with, which `stack_unique_id_identifiers.rs` pins on its own.
 const ADMITTED_BUT_ABSENT: &[(&str, &str)] = &[
     ("a name nothing created", "identifier-absent"),
     ("a one-character name", "z"),
@@ -238,6 +241,14 @@ const ADMITTED_BUT_ABSENT: &[(&str, &str)] = &[
     (
         "a letter-led unique id with no groups at all",
         "ae81d159090a7b61985604d0999cb465",
+    ),
+    (
+        "the digit-led unique id a stack id ends in",
+        "0e81d159-090a-7b61-9856-04d0999cb465",
+    ),
+    (
+        "a digit-led unique id with no groups at all",
+        "0e81d159090a7b61985604d0999cb465",
     ),
 ];
 

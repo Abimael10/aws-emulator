@@ -586,9 +586,9 @@ fn options_rows() -> Vec<OptionsRow> {
         (
             "no destination options at all",
             vec![],
-            // A create that named no options is reported none: the member states the layout
-            // the create CONFIGURED, and this one configured none.
-            None,
+            // An Amazon S3 delivery HAS an object layout whether or not the create spelled
+            // it out, so every member is reported at its own documented default.
+            Some(["plain-text", "false", "false"]),
         ),
         (
             "a file format alone",

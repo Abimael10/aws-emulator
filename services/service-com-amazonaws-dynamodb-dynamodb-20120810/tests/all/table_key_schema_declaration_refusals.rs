@@ -15,8 +15,9 @@
 //!    plays is read: a schema naming an attribute `AttributeDefinitions` does not declare
 //!    is refused for the missing definition whatever its key types say, and whatever else
 //!    the declaration carries — a definition no key schema uses does not change the
-//!    sentence. A schema whose elements are all declared is then held to the roles, which
-//!    is the refusal that names the element;
+//!    sentence, which reports the whole key schema beside every declared attribute name. A
+//!    schema whose elements are all declared is then held to the roles, which is the refusal
+//!    that names the element;
 //! 3. an INDEX key schema of the kind that admits SEVERAL keys of a role — a global
 //!    secondary index, with "up to 4 partition keys and up to 4 sort keys"
 //!    (`CreateTable$GlobalSecondaryIndexes`) — that carries more of a role than it admits
@@ -48,8 +49,16 @@ type Elements<'e> = &'e [(&'e str, &'e str)];
 type OverLengthRow<'r> = (&'r str, &'r str, Elements<'r>);
 
 /// One row of the definition table: the case, the table it names, the schema it sends, the
-/// attributes the request declares, and the sentence that request earns.
-type DefinitionRow<'r> = (&'r str, &'r str, Elements<'r>, &'r [&'r str], &'r str);
+/// attributes the request declares, and the sentence that request earns — `None` where the
+/// sentence is the one rendered over both lists ([`assert_undefined_keys`]), whose order is a
+/// property of the NAMES rather than of the request.
+type DefinitionRow<'r> = (
+    &'r str,
+    &'r str,
+    Elements<'r>,
+    &'r [&'r str],
+    Option<&'r str>,
+);
 
 /// One `KeySchemaElement` body.
 fn element(name: &str, key_type: &str) -> Value {
@@ -103,8 +112,47 @@ fn over_length(key_schema: &[(&str, &str)]) -> String {
     )
 }
 
-/// AWS's fixed sentence for a key element the request declares no definition for.
-const KEY_WITHOUT_DEFINITION: &str = "Invalid KeySchema: Some index key attribute have no definition";
+/// AWS's sentence for a key element the request declares no definition for, up to the two
+/// bracketed lists that follow it: the whole key schema at fault, then every declared
+/// attribute name.
+const UNDEFINED_KEY_PREFIX: &str =
+    "One or more parameter values were invalid: Some index key attributes are not defined in \
+     AttributeDefinitions. Keys: [";
+
+/// Assert `said` is that sentence, over exactly the key schema's attribute names and exactly
+/// the declared ones. The ORDER each list is rendered in is a property of the names, pinned
+/// where that rendering is pinned ([`super::key_schema_and_vector_parameter_refusals`]), so
+/// this compares the two lists as sets.
+fn assert_undefined_keys(case: &str, said: &str, key_schema: Elements<'_>, declared: &[&str]) {
+    assert!(
+        said.starts_with(UNDEFINED_KEY_PREFIX),
+        "case {case:?}: expected the parameter-value template, got {said:?}"
+    );
+    let bracketed = |at: usize| -> Vec<String> {
+        said.split('[')
+            .nth(at + 1)
+            .and_then(|rest| rest.split(']').next())
+            .unwrap_or_default()
+            .split(", ")
+            .filter(|name| !name.is_empty())
+            .map(|name| name.to_string())
+            .collect()
+    };
+    let sorted = |mut names: Vec<String>| {
+        names.sort();
+        names
+    };
+    let expected_keys: Vec<String> = attributes(key_schema)
+        .iter()
+        .map(|name| (*name).to_string())
+        .collect();
+    let expected_declared: Vec<String> = declared.iter().map(|name| (*name).to_string()).collect();
+    assert_eq!(
+        (sorted(bracketed(0)), sorted(bracketed(1))),
+        (sorted(expected_keys), sorted(expected_declared)),
+        "case {case:?}: expected the whole key schema beside every declared name, got {said:?}"
+    );
+}
 
 /// Drive `CreateTable` with `body` and answer the (status, error code, message) triple a
 /// refusal is read as.
@@ -216,28 +264,28 @@ async fn a_key_element_with_no_definition_is_refused_before_the_role_it_claims_i
             "KeyRoleDefinedFirst",
             &[("pk", "HASH"), ("sk", "RANGE")],
             &["pk"],
-            KEY_WITHOUT_DEFINITION,
+            None,
         ),
         (
             "a second element claiming the partition role, with no definition",
             "KeyRoleSecondHash",
             &[("pk", "HASH"), ("other", "HASH")],
             &["pk"],
-            KEY_WITHOUT_DEFINITION,
+            None,
         ),
         (
             "the same, with a definition no key schema uses declared beside it",
             "KeyRoleSecondHashAndExtra",
             &[("pk", "HASH"), ("other", "HASH")],
             &["pk", "unused"],
-            KEY_WITHOUT_DEFINITION,
+            None,
         ),
         (
             "the FIRST element claiming the sort role, with no definition",
             "KeyRoleFirstRange",
             &[("only", "RANGE")],
             &[],
-            KEY_WITHOUT_DEFINITION,
+            None,
         ),
         (
             // Every element is declared, so what is left to read is the ROLE each one
@@ -246,21 +294,24 @@ async fn a_key_element_with_no_definition_is_refused_before_the_role_it_claims_i
             "KeyRoleSecondHashDeclared",
             &[("pk", "HASH"), ("other", "HASH")],
             &["pk", "other"],
-            "Invalid KeySchema: The second KeySchemaElement is not a RANGE key type",
+            Some("Invalid KeySchema: The second KeySchemaElement is not a RANGE key type"),
         ),
     ];
 
     for (case, table, key_schema, definitions, expected) in rows {
-        let answered = refusal(&router, create_body(table, key_schema, definitions)).await;
+        let (status, code, said) = refusal(&router, create_body(table, key_schema, definitions)).await;
         assert_eq!(
-            answered,
-            (
-                400,
-                "ValidationException".to_string(),
-                expected.to_string()
-            ),
-            "case {case:?}: expected {expected:?}, got {answered:?}"
+            (status, code.as_str()),
+            (400, "ValidationException"),
+            "case {case:?}: expected a 400 ValidationException, got {status} {code} {said:?}"
         );
+        match expected {
+            Some(sentence) => assert_eq!(
+                said, sentence,
+                "case {case:?}: expected {sentence:?}, got {said:?}"
+            ),
+            None => assert_undefined_keys(case, &said, key_schema, definitions),
+        }
         assert!(
             !listed(&router, table).await,
             "case {case:?}: a refused create stores no table under {table:?}"

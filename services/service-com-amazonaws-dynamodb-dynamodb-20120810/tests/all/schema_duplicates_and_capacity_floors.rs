@@ -263,9 +263,8 @@ async fn a_key_schema_naming_one_attribute_twice_is_refused_in_one_wording() {
 
     // A schema that repeats an attribute NOTHING DECLARES is refused for the missing
     // definition: the repeat is settled only once every element has its definition. One
-    // row per schema kind, since each states the missing definition in its own wording —
-    // the table's fixed sentence while every definition declared is used, and the index's
-    // two lists.
+    // row per schema kind, and both state the missing definition in the same wording — the
+    // two lists, the key schema's names (each once) beside the declared ones.
     let (status, body) = call(
         &router,
         "CreateTable",
@@ -279,7 +278,8 @@ async fn a_key_schema_naming_one_attribute_twice_is_refused_in_one_wording() {
     .await;
     assert_eq!(
         refusal("a repeated table key attribute with no definition", status, &body),
-        KEY_WITHOUT_DEFINITION,
+        "One or more parameter values were invalid: Some index key attributes are not defined in \
+         AttributeDefinitions. Keys: [id], AttributeDefinitions: []",
         "case \"a repeated table key attribute with no definition\": expected the missing \
          definition to be refused first, got {body}"
     );

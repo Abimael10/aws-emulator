@@ -474,18 +474,24 @@ async fn an_id_no_control_holds_is_refused() {
     let (id, etag) = create(&router, &rows[0]).await;
 
     // Ids no control holds: one of the shape this service mints, one of another entity
-    // family's shape, and one that is no entity id at all. The third column is the sentence
-    // the value earns — the absent control for a value written in the identifier alphabet
-    // CloudFront issues an entity id in, and the unreadable identifier for a value of a form
-    // this service never issued.
+    // family's shape, and one that is no entity id at all. Each earns the absent-control
+    // sentence: the FORM of an id this route cannot resolve is no part of the decision.
     for (case, missing, expected) in [
         (
             "minted-shape",
             "E1A2B3C4D5E6F7",
             NO_SUCH_ORIGIN_ACCESS_CONTROL_MESSAGE,
         ),
-        ("another-family", "cg_1A2B3C4D5E6F7", "Id format is invalid"),
-        ("not-an-id", "no-such-control", "Id format is invalid"),
+        (
+            "another-family",
+            "cg_1A2B3C4D5E6F7",
+            NO_SUCH_ORIGIN_ACCESS_CONTROL_MESSAGE,
+        ),
+        (
+            "not-an-id",
+            "no-such-control",
+            NO_SUCH_ORIGIN_ACCESS_CONTROL_MESSAGE,
+        ),
     ] {
         for (version_case, if_match) in [
             ("no-if-match", None),

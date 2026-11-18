@@ -3058,6 +3058,33 @@ impl StoredStack {
         }
     }
 
+    /// Whether the stack's own TAG SET has still to be applied to the resources it holds.
+    ///
+    /// A stack's tags are the tags of its resources — "CloudFormation also propagates these
+    /// tags to resources in the stack" — so the set in force is on every resource once the
+    /// operation that put it in force has COMPLETED. An operation that failed and was left
+    /// standing ([`super::status_preserved_a_failure`]) did not complete, so where that
+    /// operation is also the one that put the set in force, the application is outstanding work
+    /// exactly as the resource changes it could not carry through are, and a change set over
+    /// the stack plans it ([`super::change_plan::tag_changes`]).
+    ///
+    /// Which operation put the set in force is what [`Self::previous_configuration`] answers: a
+    /// stack parked by a failed UPDATE holds the revision that update replaced, so a set that
+    /// revision already carried was applied by the operation BEFORE it, which completed — the
+    /// recorded change set of the last stable revision of such a stack proposes nothing at all,
+    /// tags included. A stack parked by a failed CREATE holds no previous revision, nothing
+    /// having completed on it: the set in force is the failed create's own, so nothing has
+    /// applied it.
+    pub fn tag_application_outstanding(&self) -> bool {
+        if !super::status_preserved_a_failure(&self.status) {
+            return false;
+        }
+        match &self.previous_configuration {
+            Some(previous) => !super::same_tags(&previous.tags, &self.tags),
+            None => true,
+        }
+    }
+
     /// The rollback this stack owes the owning services right now, taken for the caller
     /// that is about to perform it.
     pub fn take_owed_rollback(&mut self) -> Option<OwedRollback> {

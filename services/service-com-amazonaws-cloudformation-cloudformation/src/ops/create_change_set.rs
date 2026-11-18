@@ -895,6 +895,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .and_then(|stack_id| store.resolve(&region, stack_id))
             .map(|stack| stack.tags.clone())
             .unwrap_or_default();
+        // ...and whether the stack has still to APPLY that set to its resources, which a
+        // revision restating it then asks for
+        // ([`crate::state::StoredStack::tag_application_outstanding`]).
+        let tag_application_outstanding = target_stack_id
+            .as_deref()
+            .and_then(|stack_id| store.resolve(&region, stack_id))
+            .is_some_and(|stack| stack.tag_application_outstanding());
         // "Whether to reuse the template that's associated with the stack to create the
         // change set." Either way the body and its processed stage travel together, which
         // `zip` is what expresses: a submitted body ALWAYS has the stage computed for it
@@ -1121,17 +1128,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // What the stack's own tag set adds to that plan: the stack's tags are the tags of
         // the resources it manages, so applying a set the stack's resources do not already
         // carry changes every resource the stack holds under the `Tags` attribute — which a
-        // revision stating them differently asks for, and so does one restating the set in
-        // force on a stack whose last operation left the application of it outstanding
-        // ([`crate::state::change_plan::tag_changes`]). An IMPORT change set adopts exactly
-        // the resources it names and plans nothing else.
+        // revision stating them differently asks for, and so does one restating a set the
+        // stack has still to apply ([`crate::state::change_plan::tag_changes`]). An IMPORT
+        // change set adopts exactly the resources it names and plans nothing else.
         if !imports_resources {
             crate::state::change_plan::tag_changes(
                 &mut changes,
                 &previous_tags,
                 &tags,
                 &deployed,
-                &previous_status,
+                tag_application_outstanding,
             );
         }
 

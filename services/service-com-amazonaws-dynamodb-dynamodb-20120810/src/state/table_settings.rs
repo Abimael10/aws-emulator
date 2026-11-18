@@ -560,29 +560,30 @@ impl ContributorInsights {
         }
     }
 
-    /// Whether a `DISABLE` may be performed on this setting.
+    /// Whether a `DISABLE` may be performed on this setting at `now`.
     ///
-    /// The one condition the recorded refusals distinguish is whether this resource's key
-    /// access insights have ever been CONFIGURED: a `DISABLE` addressed to a resource no
-    /// enable has ever named is refused — "ContributorInsights Status must be ENABLED or
-    /// FAILED to perform DISABLE operation" ([`contributor_insights_not_disableable`]), there
-    /// being no configuration for the action to turn off — while one addressed to a resource
-    /// an enable HAS configured is served.
+    /// The action is admitted only from a status it can be performed FROM, which the refusal
+    /// itself names: a resource whose key access insights are still being turned on reports the
+    /// transient `ENABLING`, and a `DISABLE` issued then is refused — "ContributorInsights
+    /// Status must be ENABLED or FAILED to perform DISABLE operation"
+    /// ([`contributor_insights_not_disableable`]) — because the rules the action deletes are
+    /// not in place yet. So is a `DISABLE` addressed to a resource no enable has ever named,
+    /// which carries no CONFIGURATION for the action to turn off at all.
     ///
-    /// That is narrower than the sentence the refusal carries, and the recording is what
-    /// settles it: one fixture issues two disables against the same table, the first before
-    /// any enable (refused) and a later one AFTER an accepted disable had already turned the
-    /// insights off (served, answering the settled status and the mode still in force). So the
-    /// action is admitted by the CONFIGURATION rather than by the status the setting reports at
-    /// the call instant — gating on the status serves neither of those two answers, and gating
-    /// on the last accepted action serves only the first.
+    /// What the configuration admits is wider than the status alone: one recorded fixture
+    /// issues two disables against the same table, the first before any enable (refused) and a
+    /// later one AFTER an accepted disable had already turned the insights off — served,
+    /// answering the settled status and the mode still in force. So a resource an enable has
+    /// configured and whose move out of `ENABLING` the clock has already made is disableable
+    /// whether the last accepted action was the enable or a disable, and only the in-flight
+    /// enable and the never-configured resource are refused.
     ///
     /// The configuration is what [`Self::mode`] reports, which an enable sets and a disable
     /// deliberately does not clear, so it is the record of ever having been configured.
     /// `FAILED` is never reported by this store, so the other half of the requirement the
     /// refusal names is never what admits a disable here.
-    pub fn disableable(&self) -> bool {
-        self.mode.is_some()
+    pub fn disableable(&self, now: SystemTime) -> bool {
+        self.mode.is_some() && self.status(now) != CONTRIBUTOR_INSIGHTS_ENABLING
     }
 
     /// "Timestamp of the last time the status was changed"

@@ -5,7 +5,8 @@
 //!
 //! The rule under test: a `CreateClusterV2` body that names BOTH cluster types describes two
 //! different clusters, so it is no create Amazon MSK can read at all — it is refused on the
-//! BODY, with HTTP 400 `BadRequestException`, MSK's one fixed body-level sentence and NO
+//! SELECTION, with HTTP 400 `BadRequestException`, MSK's one fixed sentence for asking for
+//! more than one cluster type and NO
 //! `invalidParameter`, because no single member is at fault. That decision is taken on the
 //! body alone, so it comes BEFORE every decision taken on a member's value or on the
 //! registry: a body naming both kinds reads the same sentence whether one of the blocks
@@ -30,10 +31,11 @@ use serde_json::{json, Value};
 use crate::kafka_harness::{assert_name_already_exists, Emulator, Reply};
 use crate::refusal_wording::PARAMETERS_NOT_VALID;
 
-/// MSK's fixed sentence for a request body it will not read as a create, written out here
-/// rather than read from the service's own constant, so the wording is pinned by this suite
-/// instead of by the code under test.
-const INVALID_REQUEST_BODY_MESSAGE: &str = "Invalid request body";
+/// MSK's fixed sentence for a create that asks for more than one cluster type, written out
+/// here rather than read from the service's own constant, so the wording is pinned by this
+/// suite instead of by the code under test.
+const ONE_CLUSTER_TYPE_MESSAGE: &str =
+    "You can specify only one cluster type, either provisioned or serverless.";
 
 /// MSK's fixed sentence for a create that names NO cluster type, and the parameter it blames.
 const NO_CLUSTER_TYPE_MESSAGE: &str =
@@ -111,19 +113,19 @@ fn both_kinds_outside_a_modelled_bound(name: &str) -> Value {
     })
 }
 
-/// Assert `reply` is the body-level refusal: the fixed sentence and no member named.
+/// Assert `reply` is the selection refusal: the fixed sentence and no member named.
 fn assert_invalid_request_body(reply: &Reply, case: &str) {
     assert_eq!(
         (reply.status, reply.error_code(), reply.error_message()),
-        (400, "BadRequestException", INVALID_REQUEST_BODY_MESSAGE),
-        "case {case}: expected a 400 BadRequestException {INVALID_REQUEST_BODY_MESSAGE:?}, got \
+        (400, "BadRequestException", ONE_CLUSTER_TYPE_MESSAGE),
+        "case {case}: expected a 400 BadRequestException {ONE_CLUSTER_TYPE_MESSAGE:?}, got \
          {} {}",
         reply.status,
         reply.body
     );
     assert!(
         reply.at("/invalidParameter").is_null(),
-        "case {case}: expected the body refusal to name no member, got {}",
+        "case {case}: expected the selection refusal to name no member, got {}",
         reply.body
     );
 }
@@ -149,10 +151,10 @@ async fn listed_names(emulator: &Emulator) -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// RULE: a body naming both cluster types is refused on the BODY, whatever the two blocks say
-/// — and the two neighbouring classes keep their own answers.
+/// RULE: a body naming both cluster types is refused on the SELECTION, whatever the two blocks
+/// say — and the two neighbouring classes keep their own answers.
 #[tokio::test]
-async fn a_body_naming_both_cluster_types_is_refused_on_the_body() {
+async fn a_body_naming_both_cluster_types_is_refused_on_the_selection() {
     let emulator = Emulator::new();
 
     for (case, body) in both_cluster_type_rows("both-kinds-free") {
@@ -180,7 +182,7 @@ async fn a_body_naming_both_cluster_types_is_refused_on_the_body() {
         reply.body
     );
     assert_ne!(
-        NO_CLUSTER_TYPE_MESSAGE, INVALID_REQUEST_BODY_MESSAGE,
+        NO_CLUSTER_TYPE_MESSAGE, ONE_CLUSTER_TYPE_MESSAGE,
         "the two ways of getting the cluster type wrong must read different sentences"
     );
 
@@ -227,7 +229,7 @@ async fn a_body_naming_both_cluster_types_is_refused_on_the_body() {
     }
 }
 
-/// RULE, the ORDER: the body-level refusal is taken on the body alone, so it answers a body
+/// RULE, the ORDER: the selection refusal is taken on the body alone, so it answers a body
 /// naming both kinds even when the name is one the account already holds — a conflict the
 /// SAME name earns as soon as the body names one kind, which is what shows the decision was
 /// reached first.
@@ -257,7 +259,8 @@ async fn the_body_refusal_precedes_the_registry() {
         &existing,
     );
 
-    // Both kinds under that same taken name: the body decides, before the registry is asked.
+    // Both kinds under that same taken name: the selection decides, before the registry is
+    // asked.
     for (case, body) in both_cluster_type_rows(taken) {
         let reply = emulator.create_cluster_v2(body).await;
         assert_invalid_request_body(&reply, case);

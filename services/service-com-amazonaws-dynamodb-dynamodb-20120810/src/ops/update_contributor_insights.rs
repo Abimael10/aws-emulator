@@ -18,7 +18,7 @@
 //! Insights can only be turned off for a resource whose insights are ON: the status a
 //! `DISABLE` is performed from has to be `ENABLED` (or `FAILED`, which this store never
 //! reports), so a `DISABLE` issued while an accepted `ENABLE` is still `ENABLING` — and one
-//! against a resource that is already `DISABLED` — is refused with the 400
+//! against a resource no enable has ever configured — is refused with the 400
 //! `ValidationException` stating the statuses that action requires, and writes nothing.
 //!
 //! A table name that resolves to no stored table, and an `IndexName` the stored table
@@ -234,11 +234,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let insights = table.contributor_insights_mut(index_name).map_err(lift)?;
         // A `DISABLE` applies to the resource's key access insights CONFIGURATION, which an
         // accepted `ENABLE` writes and a disable does not clear: so it is served for every
-        // resource an enable has configured — while that enable's move to `ENABLED` is still
-        // owed as well as after it — and refused for one no enable has ever named, which
-        // carries no configuration for the action to turn off
+        // resource an enable has configured once that enable's move to `ENABLED` has fallen
+        // due — before it, the resource reports the transient `ENABLING` and the action has no
+        // status it can be performed from — and refused for one no enable has ever named,
+        // which carries no configuration for the action to turn off
         // ([`crate::state::contributor_insights_not_disableable`]).
-        if !enable && !insights.disableable() {
+        if !enable && !insights.disableable(now) {
             return Err(lift(crate::state::contributor_insights_not_disableable()));
         }
         insights.apply(enable, input.contributor_insights_mode.as_deref(), now);

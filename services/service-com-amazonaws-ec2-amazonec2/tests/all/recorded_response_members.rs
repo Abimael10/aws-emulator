@@ -1081,12 +1081,13 @@ fn reported_destination_options(case: &str, body: &str) -> Option<DestinationOpt
     ))
 }
 
-/// RULE 8: a flow log reports its destination options exactly when the create ASKED for
-/// them, each member at the value in force for it — the value the create asked for, or the
+/// RULE 8: a flow log that delivers to Amazon S3 reports its destination options whether or
+/// not the create asked for them, each member at the value in force for it — the value the
+/// create asked for, or the
 /// default `DestinationOptionsRequest` documents for the member ("The default is plain-text"
 /// for `$FileFormat`, "The default is false" for `$HiveCompatiblePartitions` and
-/// `$PerHourPartition`) — and reports none at all when the create named none: the options
-/// describe the OBJECTS an Amazon S3 delivery writes, which is also why a request naming
+/// `$PerHourPartition`). The options describe the OBJECTS an Amazon S3 delivery writes, which
+/// is also why a request naming
 /// them for another destination type is refused, so a flow log of any other type reports
 /// none.
 ///
@@ -1122,9 +1123,15 @@ async fn a_flow_log_carries_the_destination_options_of_the_destination_it_publis
             None,
         ),
         (
+            // An S3 destination that names no options still HAS an object layout: every
+            // member is reported at its own documented default.
             "an S3 destination naming no options",
             s3_flow_log_params(&vpc_id, "none", &[]),
-            None,
+            Some((
+                Some(PLAIN_TEXT.to_string()),
+                Some(FALSE.to_string()),
+                Some(FALSE.to_string()),
+            )),
         ),
         (
             "an S3 destination naming the file format alone",

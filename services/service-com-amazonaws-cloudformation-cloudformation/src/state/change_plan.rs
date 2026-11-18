@@ -1393,21 +1393,20 @@ const TAGS_ATTRIBUTE: &str = "Tags";
 /// applying it to every resource the stack holds, under the `Tags` attribute rather than
 /// under `Properties`.
 ///
-/// There is work to plan whenever the submitted revision would apply a set the stack's
-/// resources do not already carry, which is either of two cases:
+/// There is work to plan where the submitted revision states the tags DIFFERENTLY from the
+/// ones in force — the resources carry the set in force, so a revision restating it plans
+/// nothing — and where the APPLICATION of the set in force is still outstanding
+/// ([`super::stack::StoredStack::tag_application_outstanding`]), which is `outstanding` here:
+/// a stack parked by an operation that failed and was left standing never finished applying
+/// the set that operation put in force, so even a revision restating it asks for that
+/// application. A revision with no tags at all has nothing to apply, so even there it plans
+/// nothing.
 ///
-/// * the revision states the tags DIFFERENTLY from the ones in force, so the resources carry
-///   the old set; or
-/// * the stack's last operation FAILED and was left standing
-///   ([`super::status_preserved_a_failure`]), so that operation never finished applying the
-///   set in force and the application is still outstanding — the same reason such a stack's
-///   resources are compared against the configuration they CARRY rather than the one its
-///   template declares ([`carried_configurations`]), and the reason resubmitting the revision
-///   in force on it is a retry rather than a no-op. A revision with no tags at all has
-///   nothing to apply, so even there it plans nothing.
-///
-/// A stack whose last operation COMPLETED carries the set in force on every resource it
-/// holds, so a revision restating it plans nothing here.
+/// A stack whose last operation COMPLETED carries the set in force on every resource it holds,
+/// and so does a stack parked by a failed update that left the tags alone — the operation
+/// before it applied them — so a revision restating the set plans nothing on either. (A
+/// resource whose PROPERTIES a parked operation could not carry through is the other half of
+/// the comparison, and that one is read off the live resource: [`carried_configurations`].)
 ///
 /// One `Modify` per resource the stack HOLDS whose tags CloudFormation really keeps and the
 /// plan does not already take away or bring into being: a resource the plan removes is gone
@@ -1429,16 +1428,16 @@ const TAGS_ATTRIBUTE: &str = "Tags";
 /// itself that states them, which is what `DirectModification` is.
 ///
 /// `in_force` is the stack's tag set, `submitted` the one the revision would put in force and
-/// `status` the status the stack's last operation left it in.
+/// `outstanding` whether the stack has still to apply the set in force to its resources.
 pub fn tag_changes(
     changes: &mut Vec<StoredResourceChange>,
     in_force: &[super::StoredTag],
     submitted: &[super::StoredTag],
     deployed: &[DeployedResource],
-    status: &str,
+    outstanding: bool,
 ) {
-    let outstanding = super::status_preserved_a_failure(status) && !submitted.is_empty();
-    if super::same_tags(in_force, submitted) && !outstanding {
+    let asks_for_an_application = outstanding && !submitted.is_empty();
+    if super::same_tags(in_force, submitted) && !asks_for_an_application {
         return;
     }
     let detail = StoredChangeDetail {

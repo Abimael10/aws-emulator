@@ -485,6 +485,50 @@ async fn the_figures_of_a_number_are_read_as_one_word() {
     }
 }
 
+/// The TOKENS a page carries are read character for character, at every size a document is
+/// set at.
+///
+/// A token is a run of capitals and figures with no word in it, so nothing but the ink names
+/// each character: the classes that share a letterform are what it is drawn from — `B` beside
+/// `8`, `5` beside `S`, `0` beside `O` and `Q`, `1` beside `I`, `2` beside `Z`, `U` beside
+/// `V` — and a reading that takes one for the other is a misread character rather than a
+/// different word. The rows span the sizes a page is set at, which is what the recogniser
+/// holds its templates at: a size between two held rasters is matched against glyphs whose
+/// stroke weight and counters are a size away from the page's own.
+///
+/// What is asserted is the CHARACTERS, so the line's own spaces are left out of the
+/// comparison: where a page breaks a line into words is [`the_figures_of_a_number_are_read_as_one_word`]'s
+/// rule, not this one.
+#[tokio::test]
+async fn a_page_of_tokens_is_read_character_for_character() {
+    let router = harness();
+    // Each token draws from the classes that share a letterform, so no row is read by
+    // elimination from the shapes around it.
+    let tokens = ["EZUB9FL5", "7XUBY3LV", "B8S5OQ01", "MWK4GTD2"];
+    for token in tokens {
+        for size in [18.0f32, 24.0, 28.0, 32.0] {
+            let case = format!("{token} at {size} pixels");
+            let line = format!("TOKEN {token}");
+            let page = outline_page(&[&line], ttf_noto_sans::REGULAR, size, dark_on_light());
+            let blocks = read_page(&router, &case, &page, ImageFormat::Png).await;
+            let read: String = texts_of(&blocks, "LINE")
+                .join("")
+                .chars()
+                .filter(|character| !character.is_whitespace())
+                .collect();
+            let drawn: String = line
+                .chars()
+                .filter(|character| !character.is_whitespace())
+                .collect();
+            assert_eq!(
+                read, drawn,
+                "case {case:?}: the characters drawn must be the characters read, got {:?}",
+                texts_of(&blocks, "LINE")
+            );
+        }
+    }
+}
+
 /// The analysis path reads the same page the same way: the words a number is read as are
 /// the words every read path over that document reports.
 #[tokio::test]

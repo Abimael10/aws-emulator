@@ -11,9 +11,9 @@
 //!    an element: an index key may carry several partition keys, so no single position is
 //!    the one at fault;
 //! 2. a TABLE's own key schema naming an attribute `AttributeDefinitions` does not declare
-//!    is refused with its own fixed sentence, which interpolates nothing — and reads the
-//!    same whatever else the declaration carries, including a definition no key schema
-//!    uses;
+//!    is refused with the SAME parameter-value sentence a secondary index's is — the whole
+//!    key schema beside the declared attribute names — and reads the same whatever else the
+//!    declaration carries, including a definition no key schema uses;
 //! 3. an INDEX key schema naming one is refused with the parameter-value sentence that
 //!    carries the index's whole key schema beside the declared attribute names — and
 //!    NEITHER list is in the order the request stated it, so the same names declared in
@@ -67,9 +67,12 @@ use crate::emulator::{call, describe_when_active, emulator, error_code, message,
 const HASH_AFTER_RANGE: &str = "One or more parameter values were invalid: All HASH key attributes \
                                 must precede RANGE key attributes in the KeySchema";
 
-/// The fixed sentence a TABLE's own key schema earns when an element of it has no
-/// `AttributeDefinitions` entry.
-const UNDEFINED_TABLE_KEY: &str = "Invalid KeySchema: Some index key attribute have no definition";
+/// The fixed TEXT of the sentence a key schema earns when an element of it has no
+/// `AttributeDefinitions` entry — the table's own key schema and a secondary index's alike —
+/// up to the two bracketed lists that follow it.
+const UNDEFINED_KEY_PREFIX: &str =
+    "One or more parameter values were invalid: Some index key attributes are not defined in \
+     AttributeDefinitions. Keys: [";
 
 /// The fixed sentence a `Dimensions` outside the published range earns.
 const DIMENSION_RANGE: &str =
@@ -229,10 +232,11 @@ async fn a_partition_key_after_a_sort_key_is_refused_with_the_order_rule() {
     }
 }
 
-/// Rule 2: a TABLE key attribute with no definition earns the fixed sentence, whatever
-/// else the declaration carries — a definition no key schema uses does not change it.
+/// Rule 2: a TABLE key attribute with no definition earns the same parameter-value sentence a
+/// secondary index's does — the whole key schema beside every declared definition — whatever
+/// else the declaration carries.
 #[tokio::test]
-async fn a_table_key_with_no_definition_earns_its_own_fixed_sentence() {
+async fn a_table_key_with_no_definition_reports_both_lists() {
     let router = emulator();
 
     // Rows differ along WHICH element has no definition, the number of definitions the
@@ -291,11 +295,39 @@ async fn a_table_key_with_no_definition_earns_its_own_fixed_sentence() {
             }]);
         }
         let (status, body) = call(&router, "CreateTable", request).await;
-        assert_eq!(
-            refusal(case, status, &body),
-            UNDEFINED_TABLE_KEY,
-            "case {case:?}: expected the table key schema's own fixed sentence, got {body}"
+        let said = refusal(case, status, &body);
+        assert!(
+            said.starts_with(UNDEFINED_KEY_PREFIX),
+            "case {case:?}: expected the parameter-value template, got {said:?}"
         );
+        // Both lists carry exactly the names the request declared, whatever order they are
+        // reported in: the whole table key schema, and every declared definition.
+        let (keys_reported, definitions_reported) = reported_lists(&said);
+        let mut sorted_keys = keys_reported.clone();
+        sorted_keys.sort();
+        let mut expected_keys = named(key_schema);
+        expected_keys.sort();
+        let mut sorted_definitions = definitions_reported.clone();
+        sorted_definitions.sort();
+        let mut expected_definitions: Vec<String> =
+            declared.iter().map(|name| (*name).to_string()).collect();
+        expected_definitions.sort();
+        assert_eq!(
+            (sorted_keys, sorted_definitions),
+            (expected_keys, expected_definitions),
+            "case {case:?}: expected the table's whole key schema beside every declared name, \
+             got {said:?}"
+        );
+        if *case == "an undefined key beside a definition nothing uses" {
+            // The recorded order for these names: neither list follows the request.
+            assert_eq!(
+                said,
+                "One or more parameter values were invalid: Some index key attributes are not \
+                 defined in AttributeDefinitions. Keys: [SK, PK], AttributeDefinitions: \
+                 [EXTRA, PK]",
+                "case {case:?}: expected the recorded order, got {said:?}"
+            );
+        }
         let (status, listed) = call(&router, "ListTables", json!({})).await;
         assert_eq!(status, 200, "case {case:?}: ListTables answered {listed}");
         assert!(

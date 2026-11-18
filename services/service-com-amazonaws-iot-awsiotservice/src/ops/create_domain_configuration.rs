@@ -257,6 +257,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             };
             let held = certificates.lock();
 
+            // The certificates the configuration PRESENTS are resolved first: they are what
+            // the configuration is about — "The ARNs of the certificates that AWS IoT passes
+            // to the device during the TLS handshake" — and the validation certificate is the
+            // proof that stands behind them. So a request naming a certificate the holder does
+            // not have is told about the presented certificate even when the proof it carries
+            // is not resolvable either.
+            for certificate_arn in &server_certificate_arns {
+                if !held.certificates.contains_key(certificate_arn.trim()) {
+                    return Err(
+                        CreateDomainConfigurationErrorModeled::InvalidRequestException(
+                            InvalidRequestException {
+                                message: Some(crate::state::missing_acm_certificate_message(
+                                    certificate_arn,
+                                )),
+                            },
+                        )
+                        .into(),
+                    );
+                }
+            }
+
             // The validation certificate is what proves ownership of the domain —
             // "This certificate must be signed by a public certificate authority"
             // (`CreateDomainConfiguration$validationCertificateArn`) — so it has to be
@@ -292,17 +313,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
 
             for certificate_arn in &server_certificate_arns {
+                // Every presented certificate resolved above, so this reads the holder's
+                // record for it.
                 let Some(presented) = held.certificates.get(certificate_arn.trim()) else {
-                    return Err(
-                        CreateDomainConfigurationErrorModeled::InvalidRequestException(
-                            InvalidRequestException {
-                                message: Some(crate::state::missing_acm_certificate_message(
-                                    certificate_arn,
-                                )),
-                            },
-                        )
-                        .into(),
-                    );
+                    continue;
                 };
                 // A device dialling the caller's OWN domain is presented this
                 // certificate and has to establish trust in it: a certificate that chains

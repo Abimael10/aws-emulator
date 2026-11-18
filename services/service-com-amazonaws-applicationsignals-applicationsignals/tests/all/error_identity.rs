@@ -218,7 +218,7 @@ async fn a_repeated_create_conflicts_and_identifies_the_stored_slo() {
                 "case {name:?}/{index}: expected a ConflictException, got {error}"
             );
             let message = error["Message"].as_str().unwrap_or_default();
-            assert_name_already_taken(&format!("{name:?}/{index}"), &stored_arn, message);
+            assert_name_already_taken(&format!("{name:?}/{index}"), message);
         }
 
         // The ARN the winning create returned addresses the record the store really holds: a
@@ -321,8 +321,8 @@ async fn a_conflict_sentence_does_not_depend_on_the_refused_request() {
                  {error}"
             );
             let message = error["Message"].as_str().unwrap_or_default();
-            assert_name_already_taken(&label, &stored_arn, message);
-            // The sentence names the STORED record, so no region this request happened to be
+            assert_name_already_taken(&label, message);
+            // The sentence names no identifier, so no region this request happened to be
             // signed in reaches it.
             if region != REGION {
                 assert!(

@@ -144,18 +144,37 @@ const FACES: &[(FontWeight, RasterHeight)] = &[
 /// `m` — so its letterforms are not the monospaced families' letterforms squeezed into one
 /// cell: in a monospaced cut the narrow letters grow serifs and the wide ones lose their
 /// shoulders, which is exactly the ink a comparison against a monospaced template alone
-/// reads as another character. The REGULAR cut is held at the small, middling and large
-/// rasters a document's own text is set at, because what anti-aliasing and hinting do to an
-/// outline a dozen pixels tall is part of that glyph's shape at that size; the BOLD cut is
-/// held at the small and middling ones, where its heavier stroke fills a glyph's counters
-/// and changes its shape, and not at the large raster, where a bold outline's own shape is
-/// what the regular templates at that size already carry.
+/// reads as another character.
+///
+/// The REGULAR cut is held at a LADDER of rasters across the range a document's own text is
+/// set at, rather than at a few points of it: what anti-aliasing and hinting do to an outline
+/// is part of that glyph's shape AT THAT SIZE, so a page set between two held rasters is
+/// matched against templates whose counters and stroke weights are a size away from its own —
+/// which is what turns a `5` into an `S` and a `B` into an `8`, and what lets the thin middle
+/// of a `W` break into two `V`s. The step is about a sixth of the size, which is as close as
+/// two rasters of one outline are distinguishable at all. The BOLD cut is held at the rasters
+/// where its heavier stroke fills a glyph's counters and changes its shape, which is the small
+/// and middling ones, more coarsely: a bold outline at a large raster is the shape the regular
+/// templates at that size already carry.
 const OUTLINE_FACES: &[(&[u8], f32)] = &[
     (ttf_noto_sans::REGULAR, 12.0),
+    (ttf_noto_sans::REGULAR, 14.0),
+    (ttf_noto_sans::REGULAR, 16.0),
     (ttf_noto_sans::REGULAR, 18.0),
+    (ttf_noto_sans::REGULAR, 20.0),
+    (ttf_noto_sans::REGULAR, 22.0),
+    (ttf_noto_sans::REGULAR, 24.0),
+    (ttf_noto_sans::REGULAR, 26.0),
     (ttf_noto_sans::REGULAR, 28.0),
+    (ttf_noto_sans::REGULAR, 32.0),
+    (ttf_noto_sans::REGULAR, 36.0),
+    (ttf_noto_sans::REGULAR, 42.0),
+    (ttf_noto_sans::REGULAR, 48.0),
     (ttf_noto_sans::BOLD, 12.0),
-    (ttf_noto_sans::BOLD, 18.0),
+    (ttf_noto_sans::BOLD, 16.0),
+    (ttf_noto_sans::BOLD, 20.0),
+    (ttf_noto_sans::BOLD, 24.0),
+    (ttf_noto_sans::BOLD, 32.0),
 ];
 
 /// The X11 fixed bitmap faces the bank's third family is taken from: small, middling and

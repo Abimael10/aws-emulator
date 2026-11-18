@@ -6,7 +6,7 @@
 //! The rule under test: a create carries EXACTLY ONE of the two alternative cluster-type
 //! bodies, and each way of failing that has its own fixed answer — a create naming NEITHER is
 //! refused about the `clusterType` parameter the request left unset, a create naming BOTH is
-//! refused for the BODY it carries, with no member named, because either block alone
+//! refused for the SELECTION it carries, with no member named, because either block alone
 //! would have been a cluster MSK makes. Neither registers anything.
 //!
 //! Where [`super::create_and_update_input_gates`] pins the WORDING, this suite pins that each
@@ -28,9 +28,10 @@ use crate::kafka_harness::{Emulator, Reply};
 const NO_CLUSTER_TYPE_MESSAGE: &str =
     "You must specify a cluster type, either provisioned or serverless.";
 
-/// What MSK answers a create whose body names BOTH cluster types: the body-level sentence it
-/// refuses a request body it will not read as a create with.
-const INVALID_REQUEST_BODY_MESSAGE: &str = "Invalid request body";
+/// What MSK answers a create whose body names BOTH cluster types: the sentence it refuses a
+/// selection of more than one cluster type with.
+const ONE_CLUSTER_TYPE_MESSAGE: &str =
+    "You can specify only one cluster type, either provisioned or serverless.";
 
 /// A `provisioned` block asking for `brokers` brokers.
 fn provisioned(brokers: u64) -> Value {
@@ -136,7 +137,7 @@ async fn each_failed_cluster_type_choice_reads_its_own_one_refusal() {
     let both_types = (
         400u16,
         "BadRequestException".to_string(),
-        INVALID_REQUEST_BODY_MESSAGE.to_string(),
+        ONE_CLUSTER_TYPE_MESSAGE.to_string(),
         None,
     );
     assert_ne!(
@@ -160,7 +161,7 @@ async fn each_failed_cluster_type_choice_reads_its_own_one_refusal() {
         assert_eq!(
             answered(&reply),
             both_types,
-            "case a body naming both cluster types, {case}: expected the body refusal, got \
+            "case a body naming both cluster types, {case}: expected the selection refusal, got \
              {} {}",
             reply.status,
             reply.body

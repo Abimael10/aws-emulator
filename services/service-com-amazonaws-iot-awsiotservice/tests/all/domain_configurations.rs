@@ -452,7 +452,9 @@ async fn a_created_domain_configuration_is_read_back_member_for_member() {
 }
 
 /// RULE: a `serverCertificateArn` the holder has no certificate for cannot be
-/// presented to a device, so the create is refused and nothing is written.
+/// presented to a device, so the create is refused and nothing is written — and the
+/// refusal names the PRESENTED certificate whether or not the configuration also carries a
+/// proof the holder cannot resolve.
 #[tokio::test]
 async fn a_certificate_the_holder_does_not_have_is_refused() {
     let emulator = Emulator::new();
@@ -508,6 +510,46 @@ async fn a_certificate_the_holder_does_not_have_is_refused() {
             404,
             "case {certificate}: a refused create must leave no configuration behind, got {} \
              body {}",
+            described.status,
+            described.text()
+        );
+    }
+
+    // The same values, now sent with a `validationCertificateArn` the holder has no
+    // certificate under either: the refusal is about the certificate the configuration
+    // PRESENTS, which is what the configuration is about, so the proof it carries does not
+    // change which certificate is named.
+    let unresolvable_proof =
+        format!("arn:aws:acm:{REGION}:{ACCOUNT_ID}:certificate/11111111-1111-1111-1111-111111111111");
+    for (index, certificate) in unknown.iter().enumerate() {
+        let name = format!("refused-with-proof-{index}");
+        let refused = emulator
+            .create_configuration(
+                &name,
+                &json!({
+                    "domainName": "iot.example.com",
+                    "serverCertificateArns": [certificate],
+                    "validationCertificateArn": unresolvable_proof.clone(),
+                }),
+            )
+            .await;
+        assert_eq!(
+            (refused.status, refused.error_code(), refused.error_message()),
+            (
+                400,
+                "InvalidRequestException".to_string(),
+                format!("Certificate {certificate} does not exist.")
+            ),
+            "case {certificate} beside an unresolvable proof: the refusal must name the \
+             presented certificate, got {}",
+            refused.text()
+        );
+        let described = emulator.describe_configuration(&name).await;
+        assert_eq!(
+            described.status,
+            404,
+            "case {certificate} beside an unresolvable proof: a refused create must leave no \
+             configuration behind, got {} body {}",
             described.status,
             described.text()
         );
