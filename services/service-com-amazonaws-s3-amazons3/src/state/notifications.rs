@@ -71,6 +71,17 @@
 //! destination cannot be reached is worth seeing — and a destination whose owning service
 //! could not be ASKED about the grant at all is published to, since nothing judged it.
 //!
+//! Best effort is AT LEAST ONCE, not AT MOST ONCE: an object event notification is designed to
+//! be delivered at least once, so a destination that could not take the publication YET — one
+//! that is throttling the call, one whose own provisioning has not finished, one that faulted
+//! serving it — does not consume the event. Such a delivery is attempted AGAIN until the
+//! destination takes it or the publication's own re-attempt budget is spent
+//! ([`attempt_again`]), so a
+//! client that configures a destination and writes an object in the same breath still has its
+//! event delivered. A refusal that is the destination's FINAL answer — it does not exist, or its
+//! policies withhold the publication — is not re-attempted, because nothing about it would
+//! change.
+//!
 //! Nothing here opens a socket or leaves the host: every destination is reached through
 //! the in-process callback ([`smithy_server_runtime::OperationContext::callback`]), the
 //! way any emulated service reaches another, so this crate names no other service crate.
@@ -779,11 +790,34 @@ pub const MAX_IN_FLIGHT_DELIVERY_TASKS: usize = 32;
 /// How long one request's whole fan-out may take before it is abandoned.
 ///
 /// An EMULATOR ceiling as well: the transport is in-process, so a delivery waits only on
-/// another handler of this same emulator, and the clients below disable retries and the
-/// SDK's own timeouts (there is nothing to retry or to watch for a stalled stream behind
-/// an in-process transport). This is what keeps a task that is waiting on a slow handler
-/// from holding its permit for the life of the process.
+/// another handler of this same emulator, and the clients below disable the SDK's own retries
+/// and timeouts (there is no call the transport could fail to carry behind an in-process
+/// callback, and no stalled stream to watch; what IS repeated is a call a destination
+/// ANSWERED — [`DELIVERY_ATTEMPT_WINDOW`]). This is what keeps a task that is waiting on a
+/// slow handler from holding its permit for the life of the process.
 pub const DELIVERY_DEADLINE: ::std::time::Duration = ::std::time::Duration::from_secs(30);
+
+/// How long the re-attempts of ONE FAN-OUT may take together while its destinations answer that
+/// they cannot take the publication yet, and how long this waits between two attempts.
+///
+/// An object event notification is designed to be delivered AT LEAST ONCE, so a destination that
+/// is momentarily unable to take a publication must not consume the event ([`attempt_again`] is
+/// which refusals those are). Both spans are EMULATOR-CHOSEN, like [`DELIVERY_DEADLINE`] beside
+/// them: the window is well past the span a destination service of this emulator reports a
+/// resource as still coming up for, and the interval is short enough that a destination which
+/// becomes ready takes the event straight away. The window is the WHOLE fan-out's and is well
+/// under [`DELIVERY_DEADLINE`], so no destination's waiting can cost the deliveries behind it
+/// theirs, and the deadline goes on bounding the fan-out whatever it is waiting for.
+///
+/// This is not the SDK retry the clients below disable: that one would repeat a call the
+/// transport could not carry, of which there are none behind an in-process callback. This one
+/// repeats a call the destination's own service ANSWERED, with a refusal saying the publication
+/// can be taken later.
+pub const DELIVERY_ATTEMPT_WINDOW: ::std::time::Duration = ::std::time::Duration::from_secs(10);
+
+/// See [`DELIVERY_ATTEMPT_WINDOW`].
+pub const DELIVERY_ATTEMPT_INTERVAL: ::std::time::Duration =
+    ::std::time::Duration::from_millis(100);
 
 /// How many delivery tasks are in flight right now; see [`MAX_IN_FLIGHT_DELIVERY_TASKS`].
 static IN_FLIGHT_DELIVERY_TASKS: ::std::sync::atomic::AtomicUsize =
@@ -831,8 +865,9 @@ impl Drop for DeliveryPermit {
 /// depends on it.
 ///
 /// What bounds the task: it carries at most [`MAX_DELIVERIES_PER_REQUEST`] deliveries,
-/// at most [`MAX_IN_FLIGHT_DELIVERY_TASKS`] of them run at once, each delivery is a fixed
-/// handful of awaits with no retry loop behind it — the grant is asked of each DISTINCT
+/// at most [`MAX_IN_FLIGHT_DELIVERY_TASKS`] of them run at once, the re-attempts a
+/// destination that cannot take its publication yet earns are bounded by the ONE budget the
+/// whole fan-out shares ([`DELIVERY_ATTEMPT_WINDOW`]) — the grant is asked of each DISTINCT
 /// destination once ([`delivery_admitted`]), so the reads are bounded by the destination
 /// count and not by the event count — and the whole fan-out is abandoned after
 /// [`DELIVERY_DEADLINE`] — so one request's deliveries cannot outlive that deadline, hold
@@ -879,11 +914,83 @@ pub fn publish(ctx: &smithy_server_runtime::OperationContext<'_>, pending: Pendi
     });
 }
 
+/// The statuses that say a destination could not take the publication YET, rather than that it
+/// will not take it at all: it is throttling the publication, it reports a conflict with the
+/// state the destination is in right now — which is what a service answers for a resource whose
+/// own provisioning has not finished — or it faulted serving the call.
+///
+/// The fault class is NAMED rather than taken as every status at or above 500, because one of
+/// those is not a fault at all: `501` is what this emulator answers for an operation a
+/// destination's service does not implement, which is as final an answer as a refusal can be.
+/// Every status outside this set is the destination's final answer about this publication.
+const RETRYABLE_STATUSES: &[u16] = &[
+    // 429 Too Many Requests — the destination is throttling the publication.
+    429,
+    // 409 Conflict — the destination cannot take it in the state it is in right now.
+    409,
+    // The faults a server reports for a call it could not carry out: Internal Server Error, Bad
+    // Gateway, Service Unavailable, Gateway Timeout.
+    500, 502, 503, 504,
+];
+
+/// Whether the delivery `error` refused is one to attempt AGAIN.
+///
+/// It is, when the service that OWNS the destination answered ([`refused_by_its_service`] — a
+/// call nothing judged is not the destination declining anything) and what it answered says the
+/// publication can be taken later rather than not at all ([`RETRYABLE_STATUSES`]). An event
+/// notification is designed to be delivered at least once, so those are the refusals a
+/// publication outlives; every other one ends it.
+fn attempt_again<E>(
+    error: &::aws_smithy_runtime_api::client::result::SdkError<
+        E,
+        ::aws_smithy_runtime_api::client::orchestrator::HttpResponse,
+    >,
+) -> bool
+where
+    E: ::aws_smithy_types::error::metadata::ProvideErrorMetadata,
+{
+    if !refused_by_its_service(error) {
+        return false;
+    }
+    error
+        .raw_response()
+        .is_some_and(|answered| RETRYABLE_STATUSES.contains(&answered.status().as_u16()))
+}
+
+/// Make one delivery, and keep making it while its destination answers that it cannot take the
+/// publication yet ([`attempt_again`]) and the fan-out's own re-attempt budget
+/// (`attempts_until`, [`DELIVERY_ATTEMPT_WINDOW`] from the start of the fan-out) is not spent.
+///
+/// The budget is the WHOLE fan-out's rather than each delivery's, so one unready destination
+/// cannot spend the time the deliveries behind it need: a publication to several of them owes
+/// [`DELIVERY_ATTEMPT_WINDOW`] of waiting between them all, well inside the
+/// [`DELIVERY_DEADLINE`] the fan-out is abandoned at.
+///
+/// `$call` is the whole SDK call and is EVALUATED PER ATTEMPT, so each attempt is a fresh
+/// request to the destination — which is what lets a destination that has become ready in the
+/// meantime take the event — rather than a replay of one answer.
+macro_rules! attempted {
+    ($attempts_until:expr, $call:expr) => {{
+        loop {
+            match $call {
+                Ok(answered) => break Ok(answered),
+                Err(error) => {
+                    if !attempt_again(&error) || ::std::time::Instant::now() >= $attempts_until {
+                        break Err(error);
+                    }
+                    ::tokio::time::sleep(DELIVERY_ATTEMPT_INTERVAL).await;
+                }
+            }
+        }
+    }};
+}
+
 /// Make the deliveries `pending` owes.
 ///
-/// Every one is BEST EFFORT: a failure is logged and nothing is retried, because the
-/// operation that produced the event has already been accepted and S3 answers it whether
-/// or not a consumer is reachable.
+/// Every one is BEST EFFORT: the operation that produced the event has already been accepted
+/// and S3 answers it whether or not a consumer is reachable. Best effort is AT LEAST ONCE
+/// though, so a delivery a destination could not take YET is attempted again ([`attempted`]),
+/// and only a failure the destination will not take at all is logged and let go.
 ///
 /// And every one is AUTHORIZED FIRST, against the destination's OWN resource policy: the
 /// publication is a call Amazon S3 makes as its own service principal acting for the
@@ -899,6 +1006,9 @@ pub async fn deliver(callback: &::smithy_server_runtime::EmbeddedEmulator, pendi
         return;
     }
     let mut clients = Clients::default();
+    // The re-attempt budget this whole fan-out shares ([`attempted`]): one destination that
+    // cannot take its publication yet never spends the time the deliveries behind it need.
+    let attempts_until = ::std::time::Instant::now() + DELIVERY_ATTEMPT_WINDOW;
     // What each DESTINATION answered about the grant, so a fan-out carrying many events to
     // one destination asks its service once: the deliveries of one request are made at one
     // instant, so the answer cannot differ between them, and this bounds the reads by the
@@ -924,14 +1034,17 @@ pub async fn deliver(callback: &::smithy_server_runtime::EmbeddedEmulator, pendi
                     .detail(detail)
                     .resources(resource)
                     .build();
-                let answer = clients
-                    .event_bridge(callback, &region)
-                    .put_events()
-                    .entries(entry)
-                    .send()
-                    .await;
+                let bus = clients.event_bridge(callback, &region).clone();
+                let answer = attempted!(
+                    attempts_until,
+                    bus.put_events().entries(entry.clone()).send().await
+                );
                 match answer {
                     Ok(output) if output.failed_entry_count() == 0 => {}
+                    // The bus TOOK the publication and judged this entry: a failed entry is
+                    // EventBridge's verdict on what the entry says, which is its final answer
+                    // about this event rather than a condition that passes, so it is reported
+                    // and not attempted again.
                     Ok(output) => ::tracing::warn!(
                         detail_type,
                         failed_entry_count = output.failed_entry_count(),
@@ -948,25 +1061,31 @@ pub async fn deliver(callback: &::smithy_server_runtime::EmbeddedEmulator, pendi
                 arn: _,
                 body,
             } => {
-                let answer = clients
-                    .sqs(callback, &region)
-                    .send_message()
-                    .queue_url(&url)
-                    .message_body(body)
-                    .send()
-                    .await;
+                let queue = clients.sqs(callback, &region).clone();
+                let answer = attempted!(
+                    attempts_until,
+                    queue
+                        .send_message()
+                        .queue_url(&url)
+                        .message_body(body.as_str())
+                        .send()
+                        .await
+                );
                 if let Err(error) = answer {
                     report(DELIVERY_NOT_MADE, QUEUE_DESTINATION, &url, &error);
                 }
             }
             Delivery::Topic { region, arn, body } => {
-                let answer = clients
-                    .sns(callback, &region)
-                    .publish()
-                    .topic_arn(&arn)
-                    .message(body)
-                    .send()
-                    .await;
+                let topic = clients.sns(callback, &region).clone();
+                let answer = attempted!(
+                    attempts_until,
+                    topic
+                        .publish()
+                        .topic_arn(&arn)
+                        .message(body.as_str())
+                        .send()
+                        .await
+                );
                 if let Err(error) = answer {
                     report(DELIVERY_NOT_MADE, TOPIC_DESTINATION, &arn, &error);
                 }
@@ -979,15 +1098,23 @@ pub async fn deliver(callback: &::smithy_server_runtime::EmbeddedEmulator, pendi
                 // S3 invokes a function destination ASYNCHRONOUSLY: the write does not
                 // wait for the handler's answer, and "a success response (202 Accepted)
                 // indicates that the request is queued for invocation"
-                // (`Invoke$InvocationType`'s `Event` value).
-                let answer = clients
-                    .lambda(callback, &region)
-                    .invoke()
-                    .function_name(&arn)
-                    .invocation_type(::aws_sdk_lambda::types::InvocationType::Event)
-                    .payload(::aws_sdk_lambda::primitives::Blob::new(payload.into_bytes()))
-                    .send()
-                    .await;
+                // (`Invoke$InvocationType`'s `Event` value). A function that is throttled, or
+                // that Lambda is still provisioning — "during this time, you can't invoke or
+                // modify the function" (`CreateFunction`) — cannot take the invocation yet, so
+                // that answer is one this delivery outlives rather than loses the event to.
+                let function = clients.lambda(callback, &region).clone();
+                let answer = attempted!(
+                    attempts_until,
+                    function
+                        .invoke()
+                        .function_name(&arn)
+                        .invocation_type(::aws_sdk_lambda::types::InvocationType::Event)
+                        .payload(::aws_sdk_lambda::primitives::Blob::new(
+                            payload.clone().into_bytes()
+                        ))
+                        .send()
+                        .await
+                );
                 if let Err(error) = answer {
                     report(DELIVERY_NOT_MADE, FUNCTION_DESTINATION, &arn, &error);
                 }
@@ -1828,8 +1955,10 @@ struct Clients {
 ///
 /// The transport is in-process, so each client disables what a network client needs and
 /// this one cannot have: retries, timeouts, stalled-stream protection and identity
-/// caching each need a sleep implementation the callback transport is not given, and
-/// there is nothing to retry behind it anyway.
+/// caching each need a sleep implementation the callback transport is not given, and no
+/// call behind it can fail to be carried. A call the destination's own service ANSWERED
+/// with a refusal the publication outlives is repeated by the emitter instead, where the
+/// bound on the repeating is the fan-out's own ([`attempt_again`]).
 macro_rules! callback_client {
     ($field:ident, $sdk:ident, $endpoint:literal) => {
         fn $field(
@@ -1873,6 +2002,37 @@ impl Clients {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Which refusals a publication OUTLIVES, by the status the destination's own service
+    /// answered with: one row per status the rule names as "not yet", one per neighbouring
+    /// status that is a final answer — among them the `501` an emulated service answers for an
+    /// operation it does not implement, which is why the fault class is named rather than taken
+    /// as every status at or above 500.
+    #[test]
+    fn a_publication_outlives_only_the_refusals_that_can_pass() {
+        let rows: &[(u16, bool)] = &[
+            (409, true),
+            (429, true),
+            (500, true),
+            (502, true),
+            (503, true),
+            (504, true),
+            (400, false),
+            (403, false),
+            (404, false),
+            (501, false),
+            (505, false),
+            (200, false),
+        ];
+        for (status, outlived) in rows {
+            assert_eq!(
+                RETRYABLE_STATUSES.contains(status),
+                *outlived,
+                "case {status}: expected a publication to {} this answer",
+                if *outlived { "outlive" } else { "end on" }
+            );
+        }
+    }
 
     /// Every event value this emitter publishes is one of the model's own `Event`
     /// values, so a configuration can actually name it.

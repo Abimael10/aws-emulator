@@ -36,3 +36,25 @@ Actual: "Error: Check timed out after 60.0s" — the function is never invoked a
 4. s3:PutBucketNotificationConfiguration with LambdaFunctionConfigurations=[{LambdaFunctionArn:<fn arn>, Events:["s3:ObjectCreated:*"]}].
 5. s3:PutObject(Bucket=<bucket>, Key="incoming/sample.txt", Body=...).
 6. s3:GetObject / ListObjectsV2 for "processed/sample.txt" in a loop — expected: present within seconds. Observed: never appears; the check is killed at the 60 s harness cap.
+
+## What was fixed, and what is still open
+
+One defect of the dispatch path this report names was found, fixed and pinned: an object event's
+delivery was made ONCE and the event was dropped on any failure, so a destination that could not
+take the publication yet — a function Lambda was still provisioning, one being throttled, one that
+faulted — consumed the event for good. A client that configured a bucket and wrote into it without
+waiting for the function therefore lost every event, with every API call answering success. An
+object event notification is delivered at least once, so such a delivery is now attempted again
+until the destination takes it or the publication's own bounded budget is spent, while a refusal
+that is the destination's final answer still ends it
+(`services/service-com-amazonaws-s3-amazons3/src/state/notifications.rs`, pinned by
+`core/router/tests/all/s3_notification_delivery_outlives_an_unready_destination.rs`).
+
+STILL OPEN: the recorded check above is NOT demonstrated passing — its replay still reports
+"Check timed out after 60.0s". The pipeline it describes works end to end in process, on the
+emulator's own started binary with request authentication and TLS, in two Regions, with the
+function created directly from a .zip as well as by a stack, with an inline role policy and with
+an attached managed policy, at the function's default `Timeout`, after prior handler runs in the
+same process, and with the handler writing its marker back into the same unfiltered bucket — so
+what the recording does between its grant and its poll that this emulator still answers
+differently has not been identified. Whoever picks this up next should start there.

@@ -154,7 +154,12 @@ fn logged_record(bucket: &str, key: &str) -> String {
 
 /// The emulator as it is ASSEMBLED, on one engine: the handler's SDK call is dispatched back
 /// into this same router, so the bucket it writes is the bucket this suite reads.
-fn build_router() -> MultiServiceRouter {
+///
+/// `pub(crate)` here and below because the sibling suite
+/// [`crate::s3_notification_delivery_outlives_an_unready_destination`] drives the same wiring
+/// on the same assembled router: one harness for both, so neither can drift from the way a
+/// client reaches this emulator.
+pub(crate) fn build_router() -> MultiServiceRouter {
     let engine: std::sync::Arc<engine::InMemoryEngine> =
         std::sync::Arc::new(engine::InMemoryEngine::new());
     let mut router = aws_emulator_router::build_router(engine);
@@ -164,7 +169,7 @@ fn build_router() -> MultiServiceRouter {
 
 /// A SigV4 `Authorization` header whose credential scope names `service`, which is what routes
 /// the request. The signature is never checked: request authentication is off.
-fn authorization(service: &str) -> String {
+pub(crate) fn authorization(service: &str) -> String {
     format!(
         "AWS4-HMAC-SHA256 Credential=AKIDTEST/20260101/{REGION}/{service}/aws4_request, \
          SignedHeaders=host, Signature=not-verified"
@@ -172,7 +177,7 @@ fn authorization(service: &str) -> String {
 }
 
 /// One awsQuery call of `service`, answered with the HTTP status and the XML body.
-async fn query(
+pub(crate) async fn query(
     router: &MultiServiceRouter,
     service: &str,
     version: &str,
@@ -200,13 +205,18 @@ async fn query(
 }
 
 /// One response of S3's REST surface: the status and the body as text.
-struct Answer {
-    status: u16,
-    body: String,
+pub(crate) struct Answer {
+    pub(crate) status: u16,
+    pub(crate) body: String,
 }
 
 /// Dispatch one request against S3's REST surface, path-style.
-async fn s3(router: &MultiServiceRouter, method: &str, path: &str, body: &str) -> Answer {
+pub(crate) async fn s3(
+    router: &MultiServiceRouter,
+    method: &str,
+    path: &str,
+    body: &str,
+) -> Answer {
     let host = format!("s3.{REGION}.amazonaws.com");
     let request = http::Request::builder()
         .method(method)
@@ -224,7 +234,7 @@ async fn s3(router: &MultiServiceRouter, method: &str, path: &str, body: &str) -
 }
 
 /// `PUT /<bucket>` — `CreateBucket`.
-async fn create_bucket(router: &MultiServiceRouter, case: &str, bucket: &str) {
+pub(crate) async fn create_bucket(router: &MultiServiceRouter, case: &str, bucket: &str) {
     let answer = s3(router, "PUT", &format!("/{bucket}"), "").await;
     assert_eq!(
         answer.status, 200,
