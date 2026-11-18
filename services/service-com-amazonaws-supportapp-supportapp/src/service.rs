@@ -62,31 +62,20 @@ const VALIDATION_EXCEPTION: &str = "ValidationException";
 /// clause already says the whole member must satisfy it, so the anchors would only
 /// restate the sentence. Every other clause, and the value the clause echoes, is the
 /// framework's unchanged.
+///
+/// The anchor strip itself is the shared rendering `service_common::validation`
+/// owns — the same module this crate already states a quoted value through — so the
+/// rule lives in one place for every service that words a `@pattern` this way: the
+/// `^` / `$` pair a model writes to demand a whole-string match is dropped, and an
+/// expression that carries only one of them, or whose trailing `$` is escaped and so
+/// is a literal dollar, is stated as the model spells it.
 fn as_stated(violation: &Violation) -> Violation {
     match &violation.kind {
         ViolationKind::Pattern(pattern) => Violation {
-            kind: ViolationKind::Pattern(unanchored(pattern).to_string()),
+            kind: ViolationKind::Pattern(::service_common::validation::unanchored(pattern)),
             ..violation.clone()
         },
         _ => violation.clone(),
-    }
-}
-
-/// `pattern` without a leading `^` or a trailing `$`. A trailing `$` escaped by a
-/// backslash is a literal dollar sign in the expression, not the end anchor, so it
-/// stays — and so does a `$` whose backslash is itself escaped.
-fn unanchored(pattern: &str) -> &str {
-    let body = pattern.strip_prefix('^').unwrap_or(pattern);
-    match body.strip_suffix('$') {
-        Some(stripped) => {
-            let backslashes = stripped.len() - stripped.trim_end_matches('\\').len();
-            if backslashes % 2 == 0 {
-                stripped
-            } else {
-                body
-            }
-        }
-        None => body,
     }
 }
 

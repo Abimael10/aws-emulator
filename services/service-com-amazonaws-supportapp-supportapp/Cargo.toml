@@ -41,6 +41,9 @@ service-com-amazonaws-iam-awsidentitymanagementv20100508 = { workspace = true }
 emulator-core-build-support = { workspace = true }
 
 [dev-dependencies]
+# Declares one module per `tests/all/<name>.rs`, so a suite is picked up by existing
+# rather than by a hand-kept list in the test target's root.
+automod = { workspace = true }
 sha2 = { workspace = true }
 # Builds the opaque-looking pagination tokens the listing tests send back: neither
 # listing returns one, so every form of them has to be refused.

@@ -97,7 +97,10 @@ pub(crate) fn not_found(team_id: &str, channel_id: &str) -> String {
 }
 
 /// The single-violation validation envelope for a `@pattern` violation.
-fn pattern_refusal(value: &str, member: &str, pattern: &str) -> String {
+///
+/// `pub(crate)` so the sibling suites in this test target state the same envelope
+/// instead of each spelling it out.
+pub(crate) fn pattern_refusal(value: &str, member: &str, pattern: &str) -> String {
     format!(
         "1 validation error detected: Value '{value}' at '{member}' failed to satisfy constraint: \
          Member must satisfy regular expression pattern: {pattern}"
@@ -213,7 +216,10 @@ fn assert_validation_envelope(case: &str, message: &str) {
 
 /// A create body every row starts from: valid in every member, so only what a row
 /// changes is refused.
-fn valid_create() -> Value {
+///
+/// `pub(crate)` so the sibling suites in this test target start from the same valid
+/// body instead of each spelling one out.
+pub(crate) fn valid_create() -> Value {
     json!({
         "teamId": "T012ABCDEFG",
         "channelId": "C01234A5BCD",
