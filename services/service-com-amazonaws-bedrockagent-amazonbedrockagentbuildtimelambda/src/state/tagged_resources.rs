@@ -202,15 +202,16 @@ impl ComAmazonawsBedrockagentAmazonbedrockagentbuildtimelambdaState {
                 .get(knowledge_base_id)
                 .map(|record| &record.tags),
             TaggableResource::Flow(flow_id) => self.flows.get(flow_id).map(|record| &record.tags),
+            TaggableResource::Prompt(prompt_id) => {
+                self.prompts.get(prompt_id).map(|record| &record.tags)
+            }
             TaggableResource::FlowAlias(flow_id, alias_id) => self
                 .flow_aliases
                 .get(&(flow_id.clone(), alias_id.clone()))
                 .map(|record| &record.tags),
-            // An agent ALIAS, a prompt and a retrieval instruction are not stored by any
-            // operation of this emulator yet: there is no record to read tags off.
-            TaggableResource::AgentAlias(_, _)
-            | TaggableResource::Prompt(_)
-            | TaggableResource::RetrievalInstruction(_) => None,
+            // An agent ALIAS and a retrieval instruction are not stored by any operation
+            // of this emulator yet: there is no record to read tags off.
+            TaggableResource::AgentAlias(_, _) | TaggableResource::RetrievalInstruction(_) => None,
         }
     }
 
@@ -233,13 +234,15 @@ impl ComAmazonawsBedrockagentAmazonbedrockagentbuildtimelambdaState {
             TaggableResource::Flow(flow_id) => {
                 self.flows.get_mut(flow_id).map(|record| &mut record.tags)
             }
+            TaggableResource::Prompt(prompt_id) => self
+                .prompts
+                .get_mut(prompt_id)
+                .map(|record| &mut record.tags),
             TaggableResource::FlowAlias(flow_id, alias_id) => self
                 .flow_aliases
                 .get_mut(&(flow_id.clone(), alias_id.clone()))
                 .map(|record| &mut record.tags),
-            TaggableResource::AgentAlias(_, _)
-            | TaggableResource::Prompt(_)
-            | TaggableResource::RetrievalInstruction(_) => None,
+            TaggableResource::AgentAlias(_, _) | TaggableResource::RetrievalInstruction(_) => None,
         }
     }
 }

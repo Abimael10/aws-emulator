@@ -131,6 +131,14 @@
 //! one rule that resolves an alias's routing target against the versions its
 //! flow holds.
 //!
+//! The prompt library (`CreatePrompt`, `GetPrompt`) is backed by the
+//! [`prompts`](ComAmazonawsBedrockagentAmazonbedrockagentbuildtimelambdaState::prompts)
+//! map and lives in the `prompts` module beside this one, together with its
+//! record -> wire projections ([`PromptRecord::to_create_output`] /
+//! [`PromptRecord::to_get_output`]) and the one resolution of a
+//! `PromptIdentifier`. A prompt's working draft IS the stored record, the way a
+//! flow's DRAFT version is the stored flow.
+//!
 //! Whether a NEW agent may be minted at all is the one thing about the agent
 //! surface that is not a property of a record in the
 //! [`agents`](ComAmazonawsBedrockagentAmazonbedrockagentbuildtimelambdaState::agents)
@@ -193,6 +201,10 @@ mod knowledge_base_names;
 /// a policy at all.
 mod resource_policies;
 
+/// The prompt-library slice of this state: the records `CreatePrompt` stores and
+/// `GetPrompt` reports, their projections, and the resolution of a prompt identifier.
+mod prompts;
+
 /// WHICH values this service's front door states that an enumerated type admits, and
 /// in which order — the one listing both the request boundary's refusals and a
 /// handler-stated discriminator clause are built from.
@@ -206,6 +218,7 @@ pub use ingestion_job_listing::*;
 pub use ingestion_record::*;
 pub use knowledge_base_names::*;
 pub use opensearch_serverless_store::*;
+pub use prompts::*;
 pub use published_enum_value_sets::*;
 pub use pushed_documents::*;
 pub use resource_policies::*;
@@ -244,10 +257,12 @@ use crate::ops::types::{
 /// credential-scope region. Matches the `agentArn` pattern's `[a-z0-9-]{1,20}`.
 pub const DEFAULT_REGION: &str = "us-east-1";
 
-/// The only agent version `CreateAgent` mints, and the only flow version
-/// `CreateFlow` mints: both the `Agent$agentVersion` and the `DraftVersion`
-/// shapes are modelled `pattern ^DRAFT$`, so a stored agent or flow has no other
-/// version.
+/// The only agent version `CreateAgent` mints, the only flow version `CreateFlow`
+/// mints and the only prompt version `CreatePrompt` mints: both the
+/// `Agent$agentVersion` and the `DraftVersion` shapes are modelled
+/// `pattern ^DRAFT$`, and `CreatePrompt$version` is documented "When you create a
+/// prompt, the version created is the DRAFT version", so a stored agent, flow or
+/// prompt has no other version until something cuts one.
 pub const DRAFT_VERSION: &str = "DRAFT";
 
 /// `CreateAgent`'s default when the request omits `idleSessionTTLInSeconds`
@@ -2870,6 +2885,12 @@ pub struct ComAmazonawsBedrockagentAmazonbedrockagentbuildtimelambdaState {
     /// source already holds, so the ingestion checks
     /// [`Self::document_token_count`] against that bound before it writes.
     pub document_client_tokens: HashMap<(String, String, String), Vec<DocumentKey>>,
+    /// Every prompt that exists, keyed by its 10-character `promptId`. The prompt's
+    /// working draft IS this record, so no copy of the DRAFT version sits beside it.
+    pub prompts: HashMap<String, PromptRecord>,
+    /// `clientToken` -> `promptId`, so a retried `CreatePrompt` carrying the same
+    /// `@idempotencyToken` returns the prompt it already created.
+    pub prompt_client_tokens: HashMap<String, String>,
     /// Feeds id minting; never returned to a caller.
     id_sequence: u64,
 }

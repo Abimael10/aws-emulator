@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreatePrompt
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreatePrompt`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreatePrompt::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Mints a prompt and STORES it in [`crate::state`]: the response is projected from
+//! the stored record, so a following `GetPrompt` reports the same prompt.
 //!
 //! ## Shape of an operation
 //!
@@ -188,18 +182,104 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreatePrompt` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreatePromptErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreatePromptErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the bedrock-agent store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+
+        let region = crate::state::request_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
+        let mut state = state.lock();
+        state.materialise_due_transitions(now);
+
+        // `clientToken` is an @idempotencyToken: a repeat of the same request returns
+        // the prompt it already created rather than minting a second one.
+        if let Some(existing) = input
+            .client_token
+            .as_deref()
+            .and_then(|token| state.prompt_client_tokens.get(token))
+            .and_then(|prompt_id| state.prompts.get(prompt_id))
+        {
+            return Ok(existing.to_create_output());
+        }
+
+        // The store is bounded: past its quota a create is refused rather than adding
+        // another record, and `ServiceQuotaExceededException` is the modelled refusal
+        // for exactly that. Checked AFTER the idempotency replay above, so a retry of
+        // an accepted create is still served.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreatePrompt"))
+        // No name check: `PromptName` carries no uniqueness constraint in the model
+        // (only its pattern), and a prompt's identity is the minted `promptId` its ARN
+        // carries — so two prompts may share a name and the modelled
+        // `ConflictException` is not owed here.
+        if state.prompts.len() >= crate::state::PROMPT_QUOTA {
+            return Err(CreatePromptErrorModeled::ServiceQuotaExceededException(
+                ServiceQuotaExceededException {
+                    message: Some(format!(
+                        "this account already holds the maximum of {} prompts",
+                        crate::state::PROMPT_QUOTA
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // `defaultVariant` is documented "This value must match the name field in the
+        // relevant PromptVariant object", so a default variant naming none of the
+        // variants the request carries is a bad request rather than a prompt to store.
+        if !crate::state::default_variant_names_a_variant(
+            input.default_variant.as_deref(),
+            input.variants.as_deref(),
+        ) {
+            return Err(CreatePromptErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(crate::state::default_variant_pattern_message(
+                        input.default_variant.as_deref().unwrap_or_default(),
+                    )),
+                    field_list: None,
+                },
+            )
+            .into());
+        }
+
+        let Some(prompt_id) = state.mint_prompt_id(now) else {
+            return Err(CreatePromptErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("could not mint an unused promptId".to_string()),
+                },
+            )
+            .into());
+        };
+
+        let record = crate::state::PromptRecord {
+            arn: ::engine::emulator_arn("bedrock", &region, &format!("prompt/{prompt_id}")),
+            prompt_id: prompt_id.clone(),
+            name: input.name,
+            // This operation's own contract: "When you create a prompt, the version
+            // created is the DRAFT version."
+            version: crate::state::DRAFT_VERSION.to_string(),
+            description: input.description,
+            customer_encryption_key_arn: input.customer_encryption_key_arn,
+            default_variant: input.default_variant,
+            // Stored as the request left it: an absent `variants` and an empty one are
+            // different values of the member, and a read reports back whichever was
+            // written.
+            variants: input.variants,
+            tags: input.tags.unwrap_or_default(),
+            created_at: now,
+            updated_at: now,
+        };
+
+        let output = record.to_create_output();
+        if let Some(token) = input.client_token {
+            state.prompt_client_tokens.insert(token, prompt_id.clone());
+        }
+        state.prompts.insert(prompt_id, record);
+
+        Ok(output)
     }
 }

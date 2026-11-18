@@ -23,7 +23,16 @@ pub struct CreatePromptInput {
     pub tags: Option<std::collections::HashMap<String, String>>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.bedrockagent#CreatePromptResponse")]
+/// `CreatePromptResponse`. Its schema and codec come from
+/// [`bedrock_agent_schema_and_codec!`] rather than
+/// `#[smithy_macros::smithy(shape = ...)]` because `createdAt` and `updatedAt` target
+/// `DateTimestamp`, which carries `@timestampFormat("date-time")`
+/// (`smithy_query(query="shape", shape="CreatePromptResponse")`), and the derive does not
+/// put that trait on a member schema — see `types/date_time_wire.rs` for that whole
+/// story.
+///
+/// The member list below is the model's, member for member: same shape ids, same wire
+/// names, same order, same shape types.
 #[derive(Debug, Clone)]
 pub struct CreatePromptOutput {
     pub name: String,
@@ -37,4 +46,43 @@ pub struct CreatePromptOutput {
     pub created_at: ::aws_smithy_types::DateTime,
     pub updated_at: ::aws_smithy_types::DateTime,
 }
+
+bedrock_agent_schema_and_codec!(
+    CreatePromptOutput,
+    CREATE_PROMPT_OUTPUT_SCHEMA,
+    "com.amazonaws.bedrockagent#CreatePromptResponse",
+    "com.amazonaws.bedrockagent",
+    "CreatePromptResponse",
+    (M_NAME, name, "name", 0, req, string),
+    (M_DESCRIPTION, description, "description", 1, opt, string),
+    (
+        M_CUSTOMER_ENCRYPTION_KEY_ARN,
+        customer_encryption_key_arn,
+        "customerEncryptionKeyArn",
+        2,
+        opt,
+        string
+    ),
+    (
+        M_DEFAULT_VARIANT,
+        default_variant,
+        "defaultVariant",
+        3,
+        opt,
+        string
+    ),
+    (
+        M_VARIANTS,
+        variants,
+        "variants",
+        4,
+        opt,
+        list_of_struct(PromptVariant)
+    ),
+    (M_ID, id, "id", 5, req, string),
+    (M_ARN, arn, "arn", 6, req, string),
+    (M_VERSION, version, "version", 7, req, string),
+    (M_CREATED_AT, created_at, "createdAt", 8, req, date_time),
+    (M_UPDATED_AT, updated_at, "updatedAt", 9, req, date_time),
+);
 

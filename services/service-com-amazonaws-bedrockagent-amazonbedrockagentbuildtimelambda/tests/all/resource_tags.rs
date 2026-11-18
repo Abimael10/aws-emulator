@@ -15,9 +15,10 @@
 //! tags changes nothing a later caller sees.
 //!
 //! The rows span what the rule generalises over: the resource KIND the ARN names (a
-//! knowledge base, a flow, a flow alias — each keyed differently in the store, the alias by
-//! a PAIR of identifiers), how many tags the record holds (none, one, several), the ARN
-//! fields' partition, and every way a value can fall outside the published syntax.
+//! knowledge base, a flow, a flow alias, a prompt — each keyed differently in the store,
+//! the alias by a PAIR of identifiers), how many tags the record holds (none, one,
+//! several), the ARN fields' partition, and every way a value can fall outside the
+//! published syntax.
 //!
 //! Every assertion goes through the router, so it exercises the real wire path — the claim
 //! on the `tags` path space among it, which is what decides that a knowledge base's ARN is
@@ -345,6 +346,42 @@ impl Emulator {
         );
         created.string(&["arn"])
     }
+
+    /// Create one prompt carrying `tags` and report its ARN.
+    async fn prompt(&self, case: &str, name: &str, tags: &BTreeMap<String, String>) -> String {
+        let mut request = json!({
+            "name": name,
+            "defaultVariant": "summary",
+            "variants": [{
+                "name": "summary",
+                "templateType": "TEXT",
+                "templateConfiguration": { "text": { "text": "Summarise {{input}}" } },
+            }],
+        });
+        if !tags.is_empty() {
+            request["tags"] = json!(tags);
+        }
+        let created = self.call("POST", "/prompts/", Some(request)).await;
+        assert_eq!(
+            created.status, 201,
+            "case {case}: expected CreatePrompt -> 201, got {created:?}"
+        );
+        created.string(&["arn"])
+    }
+
+    /// `GetPrompt` on any `PromptIdentifier` form: the prompt's OWN read, which is what
+    /// the tags a tagging call reports have to be a projection of.
+    async fn get_prompt(&self, identifier: &str, included_data: Option<&str>) -> Answer {
+        let query = included_data
+            .map(|value| format!("?includedData={value}"))
+            .unwrap_or_default();
+        self.call(
+            "GET",
+            &format!("/prompts/{}/{query}", label(identifier)),
+            None,
+        )
+        .await
+    }
 }
 
 /// A passthrough flow definition: an `Input` node wired straight to an `Output` node.
@@ -428,6 +465,20 @@ async fn the_tags_reported_are_the_ones_the_resource_was_created_with() {
             .await,
         one_tag(),
     ));
+    rows.push((
+        "a prompt, whose ARN the tagging surface addresses by its own id",
+        emulator
+            .prompt("a prompt with stack tags", "tags-prompt", &stack_tags())
+            .await,
+        stack_tags(),
+    ));
+    rows.push((
+        "a prompt carrying none",
+        emulator
+            .prompt("a prompt with no tags", "tags-prompt-none", &BTreeMap::new())
+            .await,
+        BTreeMap::new(),
+    ));
 
     for (case, resource_arn, expected) in &rows {
         let listed = emulator.list_tags(resource_arn).await;
@@ -477,6 +528,9 @@ async fn tags_a_caller_sets_are_read_back_and_the_keys_it_removes_are_gone() {
             &stack_tags(),
         )
         .await;
+    let prompt = emulator
+        .prompt("a prompt to tag", "tags-write-prompt", &one_tag())
+        .await;
 
     for (case, resource_arn, held) in [
         (
@@ -489,6 +543,11 @@ async fn tags_a_caller_sets_are_read_back_and_the_keys_it_removes_are_gone() {
             "a flow alias holding the tags a stack propagated",
             alias,
             stack_tags(),
+        ),
+        (
+            "a prompt already holding the key the write re-values",
+            prompt,
+            one_tag(),
         ),
     ] {
         // The merge: the key the resource already holds takes the request's value, a new
@@ -614,7 +673,7 @@ async fn an_arn_naming_nothing_stored_is_a_missing_resource() {
         .await;
 
     // Rows: an identifier of the right form no record holds, for each resource type the
-    // published syntax admits — including the three kinds no operation of this emulator
+    // published syntax admits — including the two kinds no operation of this emulator
     // stores yet, which hold no record either.
     let rows: Vec<(&str, String)> = vec![
         (
@@ -747,6 +806,132 @@ async fn an_arn_outside_the_published_syntax_is_a_bad_request() {
             message.contains(resource_arn.as_str()),
             "case {case} ({resource_arn}): expected the refusal to echo the submitted value, \
              got {message:?}"
+        );
+    }
+}
+
+/// A prompt's tags are a projection of the record the prompt's OWN read reports:
+/// `CreatePrompt` stores the prompt, `GetPrompt` reports that same record back through
+/// either `PromptIdentifier` form, and a tagging write changes the tags on it and nothing
+/// else about it.
+#[tokio::test]
+async fn a_prompt_reads_back_the_record_its_tags_are_read_off() {
+    let emulator = Emulator::new();
+
+    // Rows: how many tags the create stored — several, one, none — so each row differs in
+    // what the tagging surface has to report for the prompt it made.
+    for (case, name, stored) in [
+        (
+            "a prompt carrying the tags a stack propagated",
+            "read-back-prompt",
+            stack_tags(),
+        ),
+        ("a prompt carrying one tag", "read-back-prompt-one", one_tag()),
+        (
+            "a prompt carrying none",
+            "read-back-prompt-none",
+            BTreeMap::new(),
+        ),
+    ] {
+        let prompt_arn = emulator.prompt(case, name, &stored).await;
+        let prompt_id = prompt_arn
+            .rsplit('/')
+            .next()
+            .unwrap_or_else(|| panic!("case {case}: expected an id in {prompt_arn}"))
+            .to_string();
+        assert_eq!(
+            prompt_arn,
+            format!("arn:aws:bedrock:{REGION}:{ACCOUNT}:prompt/{prompt_id}"),
+            "case {case}: the prompt ARN is built from the request's Region, the account \
+             and the minted id"
+        );
+
+        // The prompt's own read reports the record the create stored, through either
+        // identifier form.
+        for (form, identifier) in [
+            ("bare promptId", prompt_id.clone()),
+            ("prompt ARN", prompt_arn.clone()),
+        ] {
+            let fetched = emulator.get_prompt(&identifier, None).await;
+            assert_eq!(
+                fetched.status, 200,
+                "case {case} ({form}): expected GetPrompt -> 200, got {fetched:?}"
+            );
+            assert_eq!(
+                fetched.string(&["name"]),
+                name,
+                "case {case} ({form}): expected the stored name, got {fetched:?}"
+            );
+            assert_eq!(
+                fetched.string(&["arn"]),
+                prompt_arn,
+                "case {case} ({form}): both forms name the same prompt"
+            );
+            assert_eq!(
+                fetched.string(&["version"]),
+                "DRAFT",
+                "case {case} ({form}): a newly created prompt has only the DRAFT version"
+            );
+            assert_eq!(
+                fetched.string(&["defaultVariant"]),
+                "summary",
+                "case {case} ({form}): expected the stored defaultVariant, got {fetched:?}"
+            );
+            let variants = fetched
+                .member(&["variants"])
+                .as_array()
+                .cloned()
+                .unwrap_or_default();
+            assert_eq!(
+                variants.len(),
+                1,
+                "case {case} ({form}): expected the one stored variant, got {fetched:?}"
+            );
+            assert_eq!(
+                variants[0]["templateConfiguration"]["text"]["text"],
+                json!("Summarise {{input}}"),
+                "case {case} ({form}): expected the stored template, got {variants:?}"
+            );
+        }
+
+        // The tagging surface reads those tags off that same record.
+        let listed = emulator.list_tags(&prompt_arn).await;
+        assert_eq!(
+            listed.status, 200,
+            "case {case}: expected ListTagsForResource -> 200, got {listed:?}"
+        );
+        assert_eq!(
+            listed.tags(case),
+            stored,
+            "case {case}: expected the tags the create stored, got {listed:?}"
+        );
+
+        // A tagging write touches the tags and nothing else: the prompt's own read
+        // reports exactly what it did before.
+        let before = emulator.get_prompt(&prompt_id, None).await;
+        let written: BTreeMap<String, String> =
+            [("owner".to_string(), "platform".to_string())]
+                .into_iter()
+                .collect();
+        let tagged = emulator.tag(&prompt_arn, &written).await;
+        assert_eq!(
+            tagged.status, 200,
+            "case {case}: expected TagResource -> 200, got {tagged:?}"
+        );
+        let mut expected = stored.clone();
+        expected.extend(written);
+        let listed = emulator.list_tags(&prompt_arn).await;
+        assert_eq!(
+            listed.tags(case),
+            expected,
+            "case {case}: expected the merge of the stored tags and the written one, got \
+             {listed:?}"
+        );
+        let after = emulator.get_prompt(&prompt_id, None).await;
+        assert_eq!(
+            after.body, before.body,
+            "case {case}: a tagging write must leave the rest of the prompt as it stood, \
+             got {after:?}"
         );
     }
 }
