@@ -198,5 +198,5 @@ pub fn resource_policy_not_found_message(operation: &str) -> String {
 /// plane's resource-policy sentence rather than [`resource_not_found_message`], which
 /// the operations addressed by a `knowledgeBaseId` answer.
 pub fn policied_knowledge_base_not_found_message(knowledge_base_id: &str) -> String {
-    format!("KnowledgeBase with id {knowledge_base_id} is not found.")
+    identified_resource_not_found_message("KnowledgeBase", knowledge_base_id)
 }

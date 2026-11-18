@@ -170,10 +170,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(record) = state.remove_agent(&input.agent_id) else {
             return Err(DeleteAgentErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: Some(format!(
-                        "could not find agent with id {}",
-                        input.agent_id
-                    )),
+                    message: Some(crate::state::agent_not_found_message(&input.agent_id)),
                 },
             )
             .into());

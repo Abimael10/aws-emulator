@@ -333,6 +333,14 @@ impl AgentStatus {
     }
 }
 
+/// The `ResourceNotFoundException` message an agent operation answers when the
+/// agent the request addresses by its `agentId` is not stored: the id the request
+/// carried is the one variable part, worded through the one helper that states this
+/// error class ([`identified_resource_not_found_message`]).
+pub fn agent_not_found_message(agent_id: &str) -> String {
+    identified_resource_not_found_message("Agent", agent_id)
+}
+
 /// One stored agent: the single source of truth for every agent operation.
 #[derive(Debug, Clone)]
 pub struct AgentRecord {
@@ -784,6 +792,19 @@ pub fn resource_not_found_message(operation: &str, resource_type: &str) -> Strin
 /// flow the request names is not stored.
 pub fn flow_not_found_message(operation: &str) -> String {
     resource_not_found_message(operation, "Flow")
+}
+
+/// The `ResourceNotFoundException` message an operation answers for a resource it
+/// addresses by that resource's OWN identifier and cannot resolve.
+///
+/// The sentence has two variable parts and is fixed text otherwise: `resource_type`,
+/// the type of the resource that could not be resolved, spelled as the model spells
+/// the shape, and `resource_id`, the identifier the request carried for it. The
+/// identifiers of the resources ENCLOSING it are no part of the sentence, however
+/// many of them the request had to carry to address it. Stated once here so the
+/// operations of this plane cannot come to word the same refusal differently.
+pub fn identified_resource_not_found_message(resource_type: &str, resource_id: &str) -> String {
+    format!("{resource_type} with id {resource_id} is not found.")
 }
 
 /// The version number a modelled `NumericalVersion` token counts, or `None`
@@ -1333,7 +1354,7 @@ impl KnowledgeBasePageCursor {
 /// when the knowledge base the request names is not stored: the id the request
 /// carried fills the one variable part.
 pub fn knowledge_base_not_found_message(knowledge_base_id: &str) -> String {
-    format!("KnowledgeBase with id {knowledge_base_id} is not found.")
+    identified_resource_not_found_message("KnowledgeBase", knowledge_base_id)
 }
 
 /// The most data sources one knowledge base holds; past it `CreateDataSource`
@@ -2039,7 +2060,7 @@ impl DataSourceRecord {
 /// fills the one variable part, and the enclosing knowledge base is not part of
 /// the sentence.
 pub fn data_source_not_found_message(data_source_id: &str) -> String {
-    format!("DataSource with id {data_source_id} is not found.")
+    identified_resource_not_found_message("DataSource", data_source_id)
 }
 
 /// The `ResourceNotFoundException` message `DeleteDataSource` answers when the
@@ -2154,20 +2175,14 @@ impl IngestionJobStatus {
 }
 
 /// The `ResourceNotFoundException` message an ingestion-job operation answers when
-/// the triple the request addresses resolves to no stored job: a job is identified
-/// by the knowledge base and data source it ran for as well as by its own id, so
-/// the refusal names all three — each taken from the request — and the rest is
-/// fixed text. Stated here rather than in a handler so the operations that address
-/// one job cannot come to word the same refusal differently.
-pub fn ingestion_job_not_found_message(
-    ingestion_job_id: &str,
-    data_source_id: &str,
-    knowledge_base_id: &str,
-) -> String {
-    format!(
-        "could not find ingestion job with identifier {ingestion_job_id} for data source \
-         {data_source_id} in knowledge base {knowledge_base_id}"
-    )
+/// the triple the request addresses resolves to no stored job.
+///
+/// A job is addressed by the knowledge base and data source it ran for as well as by
+/// its own id, but the resource that could not be resolved is the JOB — so the
+/// refusal names the job's own id and nothing else, through the one helper that
+/// words this error class ([`identified_resource_not_found_message`]).
+pub fn ingestion_job_not_found_message(ingestion_job_id: &str) -> String {
+    identified_resource_not_found_message("IngestionJob", ingestion_job_id)
 }
 
 /// The `ValidationException` message `StopIngestionJob` answers for a job whose

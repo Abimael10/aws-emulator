@@ -217,8 +217,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 ResourceNotFoundException {
                     message: Some(crate::state::ingestion_job_not_found_message(
                         &input.ingestion_job_id,
-                        &input.data_source_id,
-                        &input.knowledge_base_id,
                     )),
                 },
             )
