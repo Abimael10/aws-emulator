@@ -112,6 +112,13 @@ pub(super) fn naming_rules(resource_type: &str) -> Option<NameRules> {
         // model), which a generated name is already inside — letters, digits and the hyphen
         // are all admitted — but may be longer than.
         crate::state::provisioning::iot_authorizer::IOT_AUTHORIZER => rules(128, Characters::AsGenerated),
+        // The same service's `CreateTopicRule.ruleName`: `RuleName`,
+        // `@length(min: 1, max: 128)` with pattern `^[a-zA-Z0-9_]+$` (AWS IoT's own Smithy
+        // model), which admits letters, digits and the UNDERSCORE and no hyphen at all — so a
+        // generated name's separators are what one breaks, beside the bound.
+        crate::state::provisioning::iot_topic_rule::IOT_TOPIC_RULE => {
+            rules(128, Characters::AlphanumericUnderscore)
+        }
         // Amazon CloudWatch `PutMetricAlarm.AlarmName` / `PutCompositeAlarm.AlarmName`:
         // `AlarmName`, `@length(min: 1, max: 255)` (CloudWatch's own Smithy model).
         "AWS::CloudWatch::Alarm"
@@ -538,6 +545,23 @@ pub(super) fn shortened_to(stack_name: &str, logical_id: &str, room: usize) -> (
 pub(super) fn within(name: String, characters: Characters) -> String {
     match characters {
         Characters::AsGenerated => name,
+        Characters::AlphanumericUnderscore => {
+            // Letters, digits and the underscore, with every character outside the set —
+            // the two hyphens that join a generated name's segments among them — replaced
+            // by an underscore, which is in it, rather than dropped, so two names that
+            // differ only in such a character cannot become one. A RUN of them becomes ONE
+            // underscore, and the edges are trimmed, so the name carries no leading or
+            // trailing separator either.
+            let mut within_the_set = String::with_capacity(name.len());
+            for character in name.chars() {
+                if character.is_ascii_alphanumeric() {
+                    within_the_set.push(character);
+                } else if !within_the_set.ends_with('_') {
+                    within_the_set.push('_');
+                }
+            }
+            within_the_set.trim_matches('_').to_string()
+        }
         Characters::LowercaseAlphanumeric => {
             // Lower case, with every character outside the set replaced by a hyphen —
             // which is in it — rather than dropped, so two names that differ only in such
@@ -791,6 +815,13 @@ pub(super) fn declared_name_property(resource_type: &str) -> Option<&'static str
         // nor `Name` finds it, and the type publishes no name property at all.
         crate::state::template::SERVICEDISCOVERY_INSTANCE => {
             Some(crate::state::template::SERVICEDISCOVERY_INSTANCE_ID_PROPERTY)
+        }
+        // AWS IoT's `CreateTopicRule` takes a `ruleName` — "Ref returns the rule name" — so
+        // the type publishes `RuleName`; the type's last segment is `TopicRule`, so neither
+        // `TopicRuleName` nor `Name` finds it. That name is what the rule is CREATED under and
+        // the identifier every call on one takes, so it is the physical id.
+        crate::state::provisioning::iot_topic_rule::IOT_TOPIC_RULE => {
+            Some(crate::state::provisioning::iot_topic_rule::RULE_NAME)
         }
         // Amazon SES's `CreateReceiptRuleSet` takes a `RuleSetName` — "Ref returns the rule
         // set name" — so the type publishes `RuleSetName`; the type's last segment is

@@ -40,7 +40,9 @@ use std::collections::BTreeMap;
 
 use serde_json::{Map, Value};
 
-use super::{call_json_rpc, Created, Readiness, Refusal, Removal, AWS_JSON_1_0};
+use super::{
+    call_json_rpc, lower_camel, upper_camel, Created, Readiness, Refusal, Removal, AWS_JSON_1_0,
+};
 use crate::state::StoredResource;
 
 /// The resource type this module provisions.
@@ -590,16 +592,6 @@ fn tag_list(tags: &[(String, String)]) -> Value {
     )
 }
 
-/// `name` with its initial letter lower-cased, which is how Step Functions spells the member
-/// a property of this type names (`LoggingConfiguration` against `loggingConfiguration`).
-fn lower_camel(name: &str) -> String {
-    let mut characters = name.chars();
-    match characters.next() {
-        Some(first) => first.to_lowercase().chain(characters).collect(),
-        None => String::new(),
-    }
-}
-
 /// One configuration property with every member name inside it in lower camel case, which is
 /// how this service spells the very same members the property names in upper camel case
 /// (`Destinations: [{CloudWatchLogsLogGroup: {LogGroupArn}}]` is `destinations:
@@ -637,16 +629,6 @@ fn lower_camel_members(value: &Value, depth: usize) -> Result<Value, Refusal> {
             Ok(Value::Array(converted))
         }
         other => Ok(other.clone()),
-    }
-}
-
-/// `name` with its initial letter upper-cased, which is how this type's properties spell the
-/// member Step Functions answers for in lower camel case — the inverse of [`lower_camel`].
-fn upper_camel(name: &str) -> String {
-    let mut characters = name.chars();
-    match characters.next() {
-        Some(first) => first.to_uppercase().chain(characters).collect(),
-        None => String::new(),
     }
 }
 

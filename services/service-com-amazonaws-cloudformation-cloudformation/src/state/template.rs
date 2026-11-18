@@ -2914,6 +2914,11 @@ enum Characters {
     /// alphanumeric at each end and between separators) and an Amazon RDS identifier
     /// (lowercase, no trailing hyphen, no two consecutive hyphens).
     LowercaseAlphanumeric,
+    /// Letters, digits and the UNDERSCORE, with no separator at either edge: an AWS IoT topic
+    /// rule name (`RuleName`'s pattern, `^[a-zA-Z0-9_]+$` in AWS IoT's own model, which admits
+    /// no hyphen — so the separators a generated name joins its segments with are outside the
+    /// set).
+    AlphanumericUnderscore,
 }
 
 /// The resource types this emulator IMPLEMENTS: the ones [`return_values`] below carries

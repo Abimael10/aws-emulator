@@ -287,6 +287,9 @@ mod iam_policy;
 /// `AWS::IoT::Authorizer`: the custom authorizer a stack declares, created in AWS IoT
 /// itself ([`iot_authorizer`]).
 pub(super) mod iot_authorizer;
+/// `AWS::IoT::TopicRule`: the topic rule a stack declares, created in AWS IoT itself
+/// ([`iot_topic_rule`]).
+pub(super) mod iot_topic_rule;
 mod lambda_alias;
 mod lambda_event_invoke_config;
 mod lambda_event_source_mapping;
@@ -414,6 +417,36 @@ pub(super) fn applicable_tags(propagated: &[(String, String)]) -> Vec<(String, S
         .filter(|(key, _)| !is_reserved_tag_key(key))
         .cloned()
         .collect()
+}
+
+/// `name` with its initial character LOWER-cased, which is the one rule that turns a resource
+/// type's property name into the API member it is (`LoggingConfiguration` ->
+/// `loggingConfiguration`, `FunctionArn` -> `functionArn`, `DynamoDBv2` -> `dynamoDBv2`).
+///
+/// A CloudFormation resource type's properties are the API members of the resource it wraps with
+/// their initial upper-cased, so the two halves of that rule are the whole of the mapping for a
+/// type whose API takes its own members as the declaration spells them. They live here, ONCE,
+/// because every per-type arm that maps a declaration this way needs them and a second copy can
+/// case one name differently: `iot_topic_rule` and `step_functions_state_machine` take them from
+/// here, and the copies in `ecs_task_definition` and `appsync_resources` are to be migrated onto
+/// them, each in the change that owns its type.
+pub(super) fn lower_camel(name: &str) -> String {
+    let mut characters = name.chars();
+    match characters.next() {
+        Some(first) => first.to_lowercase().chain(characters).collect(),
+        None => String::new(),
+    }
+}
+
+/// `name` with its initial character UPPER-cased — the inverse of [`lower_camel`], which is how
+/// an answer an owning service gave in its own member names reads back in the type's property
+/// vocabulary.
+pub(super) fn upper_camel(name: &str) -> String {
+    let mut characters = name.chars();
+    match characters.next() {
+        Some(first) => first.to_uppercase().chain(characters).collect(),
+        None => String::new(),
+    }
 }
 
 /// The tags a declared resource's owning service will STORE, for a service that admits the
@@ -1120,6 +1153,8 @@ pub(super) enum Owner {
     LogsResource(logs_resources::Kind),
     /// `AWS::IoT::Authorizer`, whose arms are [`iot_authorizer`]'s.
     IotAuthorizer,
+    /// `AWS::IoT::TopicRule`, whose arms are [`iot_topic_rule`]'s.
+    IotTopicRule,
     /// One of the Amazon EC2 VPC-network types [`ec2_vpc_network`] creates: the route table,
     /// the subnet association that puts a subnet on one, the VPC endpoint reached through it,
     /// the internet and virtual private gateways, the attachment that puts one of those on a
@@ -1245,6 +1280,9 @@ pub(super) fn owner_for(resource_type: &str) -> Option<Owner> {
     }
     if resource_type == iot_authorizer::IOT_AUTHORIZER {
         return Some(Owner::IotAuthorizer);
+    }
+    if resource_type == iot_topic_rule::IOT_TOPIC_RULE {
+        return Some(Owner::IotTopicRule);
     }
     if let Some(kind) = ec2_vpc_network::kind_of(resource_type) {
         return Some(Owner::Ec2VpcNetwork(kind));

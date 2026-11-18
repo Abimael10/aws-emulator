@@ -31,7 +31,7 @@ use ::sqlparser::keywords::Keyword;
 use ::sqlparser::parser::Parser;
 use ::sqlparser::tokenizer::{Token, Tokenizer};
 
-use super::rule_expression::{evaluate, Evaluated};
+use super::rule_expression::{evaluate, Evaluated, Message};
 
 /// The relation name the topic filter's place is read as, so the rest of the statement parses
 /// as SQL ([`parsed_statement`]).
@@ -49,7 +49,8 @@ pub enum Selected {
     Undecided,
 }
 
-/// What the rule whose statement is `sql` selects out of the message `payload`.
+/// What the rule whose statement is `sql` selects out of the message `payload` published to
+/// `topic`.
 ///
 /// * `SELECT *` hands over the message AS PUBLISHED — the whole payload, byte for byte, the
 ///   one reading that is faithful for a payload that is not a JSON document either;
@@ -58,7 +59,10 @@ pub enum Selected {
 ///   an attribute the message does not carry left out;
 /// * a `WHERE` condition decides selection with SQL's three-valued logic: a condition that is
 ///   unknown for the message selects nothing, as it does in SQL.
-pub fn selected_message(sql: &str, payload: &[u8]) -> Selected {
+///
+/// `topic` is what the statement's `topic()` function reports
+/// ([`super::rule_expression`]), in the select clause and in the condition alike.
+pub fn selected_message(sql: &str, topic: &str, payload: &[u8]) -> Selected {
     let Some(parsed) = parsed_statement(sql) else {
         return Selected::Undecided;
     };
@@ -70,7 +74,7 @@ pub fn selected_message(sql: &str, payload: &[u8]) -> Selected {
         let Some(document) = document.as_ref() else {
             return Selected::Undecided;
         };
-        match evaluate(condition, document, 0) {
+        match evaluate(condition, Message { topic, document }, 0) {
             Evaluated::Known(Value::Bool(true)) => {}
             Evaluated::Known(Value::Bool(false)) | Evaluated::Known(Value::Null) => {
                 return Selected::NotSelected
@@ -104,7 +108,7 @@ pub fn selected_message(sql: &str, payload: &[u8]) -> Selected {
                 return Selected::Undecided
             }
         };
-        match evaluate(expression, document, 0) {
+        match evaluate(expression, Message { topic, document }, 0) {
             Evaluated::Known(value) => {
                 selected.insert(name, value);
             }
@@ -202,13 +206,16 @@ fn standard_statement(characters: &[char], topic: &super::SelectedTopic) -> Opti
 }
 
 /// The name a selected expression carrying no alias is reported under: the last segment of the
-/// attribute path it names, so `SELECT state.reported.temp` selects `temp`. `None` for an
-/// expression that names no path — one this engine would have to name itself.
+/// attribute path it names, so `SELECT state.reported.temp` selects `temp`, and the function's
+/// own name for a CALL, so `SELECT topic()` selects `topic` — which is the name the AWS IoT SQL
+/// reference gives each. `None` for an expression that names neither — one this engine would
+/// have to name itself.
 fn selected_name(expression: &Expr) -> Option<String> {
     match expression {
         Expr::Identifier(identifier) => Some(identifier.value.clone()),
         Expr::CompoundIdentifier(identifiers) => identifiers.last().map(|last| last.value.clone()),
         Expr::Nested(inner) => selected_name(inner),
+        Expr::Function(function) => Some(function.name.to_string()),
         _ => None,
     }
 }
@@ -375,5 +382,187 @@ fn parser_rejection(reported: &str) -> SqlRejection {
             column,
         },
         _ => SqlRejection::Unreadable,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// What a row expects of the statement it names.
+    #[derive(Debug)]
+    enum Expected {
+        /// The document the statement selects, compared as a DOCUMENT: a projection's members
+        /// are a set, and the order a JSON object writes them in carries no meaning.
+        Document(Value),
+        /// The payload as published, byte for byte.
+        WholePayload,
+        /// The statement's condition does not hold for the message.
+        NotSelected,
+        /// A statement this engine does not evaluate, so no action is performed for it.
+        Undecided,
+    }
+
+    /// What `sql` selects out of `payload` published to `topic`, as a row states it.
+    fn selected(sql: &str, topic: &str, payload: &str) -> Selected {
+        selected_message(sql, topic, payload.as_bytes())
+    }
+
+    /// The topic every row publishes to unless it is ABOUT a deeper one.
+    const TOPIC: &str = "sensors/room-1/temp";
+
+    /// The message every row publishes unless it names its own.
+    const MESSAGE: &str = r#"{"temperature":20,"humidity":55,"extra":"dropped"}"#;
+
+    #[test]
+    fn a_statement_selects_the_document_it_names_out_of_the_message_and_the_topic() {
+        // The rows differ along what the select clause names and what the condition decides:
+        // the wildcard, the `topic()` builtin called with no argument and with each segment's
+        // number (including one past the topic's last), an alias and the name an unaliased
+        // expression takes, arithmetic over integers and arithmetic that is not whole, a path
+        // the message does not carry, a condition that holds and one that does not, and a
+        // function of the AWS IoT SQL library this engine does not compute.
+        let rows: &[(&str, &str, &str, &str, Expected)] = &[
+            (
+                "the wildcard, which is the message as published",
+                "SELECT * FROM 'sensors/room-1/temp'",
+                TOPIC,
+                MESSAGE,
+                Expected::WholePayload,
+            ),
+            (
+                "topic() with no argument, which is the whole topic",
+                "SELECT topic() AS sourceTopic FROM 'sensors/room-1/temp'",
+                TOPIC,
+                MESSAGE,
+                Expected::Document(::serde_json::json!({ "sourceTopic": TOPIC })),
+            ),
+            (
+                "topic() unaliased, which takes the function's own name",
+                "SELECT topic() FROM 'sensors/room-1/temp'",
+                TOPIC,
+                MESSAGE,
+                Expected::Document(::serde_json::json!({ "topic": TOPIC })),
+            ),
+            (
+                "topic(1), the first segment",
+                "SELECT topic(1) AS level FROM 'sensors/room-1/temp'",
+                TOPIC,
+                MESSAGE,
+                Expected::Document(::serde_json::json!({ "level": "sensors" })),
+            ),
+            (
+                "topic(2), the segment between the separators",
+                "SELECT topic(2) AS level FROM 'sensors/room-1/temp'",
+                TOPIC,
+                MESSAGE,
+                Expected::Document(::serde_json::json!({ "level": "room-1" })),
+            ),
+            (
+                "topic(3), the last segment",
+                "SELECT topic(3) AS level FROM 'sensors/room-1/temp'",
+                TOPIC,
+                MESSAGE,
+                Expected::Document(::serde_json::json!({ "level": "temp" })),
+            ),
+            (
+                "topic(4), one past the last segment, which names none",
+                "SELECT topic(4) AS level FROM 'sensors/room-1/temp'",
+                TOPIC,
+                MESSAGE,
+                Expected::Document(::serde_json::json!({})),
+            ),
+            (
+                "topic() over a one-level topic",
+                "SELECT topic() AS sourceTopic, topic(1) AS level FROM 'readings'",
+                "readings",
+                MESSAGE,
+                Expected::Document(
+                    ::serde_json::json!({ "sourceTopic": "readings", "level": "readings" }),
+                ),
+            ),
+            (
+                "arithmetic over the message's integers, which is itself whole",
+                "SELECT temperature * 9 / 5 + 32 AS temperatureF, humidity AS humidityPct, \
+                 topic() AS sourceTopic FROM 'sensors/room-1/temp'",
+                TOPIC,
+                MESSAGE,
+                Expected::Document(::serde_json::json!({
+                    "temperatureF": 68,
+                    "humidityPct": 55,
+                    "sourceTopic": TOPIC,
+                })),
+            ),
+            (
+                "arithmetic over integers whose result is not whole",
+                "SELECT temperature / 8 AS eighth FROM 'sensors/room-1/temp'",
+                TOPIC,
+                MESSAGE,
+                Expected::Document(::serde_json::json!({ "eighth": 2.5 })),
+            ),
+            (
+                "an attribute the message does not carry, which is left out",
+                "SELECT temperature AS t, pressure AS p FROM 'sensors/room-1/temp'",
+                TOPIC,
+                MESSAGE,
+                Expected::Document(::serde_json::json!({ "t": 20 })),
+            ),
+            (
+                "a condition that holds for the message",
+                "SELECT temperature AS t FROM 'sensors/room-1/temp' WHERE temperature > 10",
+                TOPIC,
+                MESSAGE,
+                Expected::Document(::serde_json::json!({ "t": 20 })),
+            ),
+            (
+                "a condition that does not hold for the message",
+                "SELECT temperature AS t FROM 'sensors/room-1/temp' WHERE temperature > 100",
+                TOPIC,
+                MESSAGE,
+                Expected::NotSelected,
+            ),
+            (
+                "a condition over topic() that holds",
+                "SELECT * FROM 'sensors/room-1/temp' WHERE topic(2) = 'room-1'",
+                TOPIC,
+                MESSAGE,
+                Expected::WholePayload,
+            ),
+            (
+                "a condition over topic() that does not hold",
+                "SELECT * FROM 'sensors/room-1/temp' WHERE topic(2) = 'room-2'",
+                TOPIC,
+                MESSAGE,
+                Expected::NotSelected,
+            ),
+            (
+                "a function of the library this engine does not compute",
+                "SELECT get_thing_shadow('a') AS shadow FROM 'sensors/room-1/temp'",
+                TOPIC,
+                MESSAGE,
+                Expected::Undecided,
+            ),
+        ];
+        for (case, sql, topic, payload, expected) in rows {
+            let actual = selected(sql, topic, payload);
+            match (expected, &actual) {
+                (Expected::WholePayload, Selected::Message(message)) => assert_eq!(
+                    message.as_slice(),
+                    payload.as_bytes(),
+                    "case {case:?}: expected the payload as published, got {:?}",
+                    String::from_utf8_lossy(message)
+                ),
+                (Expected::Document(document), Selected::Message(message)) => {
+                    let read: Value = ::serde_json::from_slice(message).unwrap_or(Value::Null);
+                    assert_eq!(
+                        &read, document,
+                        "case {case:?}: expected {document}, got {read}"
+                    );
+                }
+                (Expected::NotSelected, Selected::NotSelected)
+                | (Expected::Undecided, Selected::Undecided) => {}
+                _ => panic!("case {case:?}: expected {expected:?}, got {actual:?}"),
+            }
+        }
     }
 }

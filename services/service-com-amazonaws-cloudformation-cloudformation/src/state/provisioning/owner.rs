@@ -83,6 +83,12 @@ impl Owner {
             Self::IotAuthorizer => {
                 iot_authorizer::create(ctx, region, resource, propagated).await
             }
+            // A topic rule IS taggable: `TagResource` addresses one by the ARN its create
+            // minted, so it carries the tags CloudFormation gives the resource beside its own
+            // ([`iot_topic_rule::create`]).
+            Self::IotTopicRule => {
+                iot_topic_rule::create(ctx, region, resource, propagated).await
+            }
             Self::Ec2VpcNetwork(kind) => {
                 ec2_vpc_network::create(ctx, region, kind, resource, propagated).await
             }
@@ -278,6 +284,9 @@ impl Owner {
             // declaration asked for.
             Self::LogsResource(_) => Ok(logs_resources::ready()),
             Self::IotAuthorizer => Ok(iot_authorizer::ready()),
+            // A rule is LIVE the moment `CreateTopicRule` answers
+            // ([`iot_topic_rule::ready`]).
+            Self::IotTopicRule => Ok(iot_topic_rule::ready()),
             // A distribution and an origin access control each EXIST from the moment their
             // create answers ([`cloudfront_resources::ready`]).
             Self::CloudFrontResource(_) => Ok(cloudfront_resources::ready()),
@@ -427,6 +436,9 @@ impl Owner {
             // authorizer's `Arn` is the one its create answered with. So there is nothing
             // left to read once any of them is up.
             Self::LogsResource(_) | Self::IotAuthorizer => Ok(BTreeMap::new()),
+            // A topic rule's `Arn` is the one its create read back from the service that
+            // minted it, so there is nothing left to read once the rule is up.
+            Self::IotTopicRule => Ok(BTreeMap::new()),
             // A distribution's id and domain name, and an origin access control's id, are the
             // ones their own creates answered with, so there is nothing left to read once
             // either resource is up.
@@ -581,6 +593,9 @@ impl Owner {
             // deleted in.
             Self::LogsResource(_) => Ok(logs_resources::removal()),
             Self::IotAuthorizer => Ok(iot_authorizer::removal()),
+            // `DeleteTopicRule` takes the rule away as it answers too
+            // ([`iot_topic_rule::removal`]).
+            Self::IotTopicRule => Ok(iot_topic_rule::removal()),
             // An origin access control is gone as its delete answers; a DISTRIBUTION has to
             // be disabled and its disabled configuration has to reach the edge locations
             // first, which this arm waits out ([`cloudfront_resources::removal`]).
@@ -752,6 +767,12 @@ impl Owner {
             Self::IotAuthorizer => {
                 iot_authorizer::update(ctx, region, resource, declared).await
             }
+            // `ReplaceTopicRule` writes the WHOLE payload of the rule it addresses by name, so
+            // a changed declaration is applied by replacing it and the rule keeps its identity
+            // and its ARN ([`iot_topic_rule::update`]).
+            Self::IotTopicRule => iot_topic_rule::update(ctx, region, resource, declared)
+                .await
+                .map(Some),
             // Both CloudFront types are changed by that service's own update, which takes the
             // whole configuration and the version the caller read, so the resource keeps the
             // id its create minted ([`cloudfront_resources::update`]).
@@ -919,6 +940,10 @@ impl Owner {
             // log group and of an authorizer that already exist are reconciled by no arm here
             // yet ([`Provisioner::retag`]'s own default), so nothing is asked about them.
             Self::LogsResource(_) | Self::IotAuthorizer => Ok(()),
+            // The tags of a topic rule that already exists are reconciled by its own update,
+            // which re-applies the declaration's whole tag set through `TagResource`
+            // ([`iot_topic_rule::update`]), so nothing is asked about them here.
+            Self::IotTopicRule => Ok(()),
             // An origin access control is not taggable at all, and the tags of a distribution
             // that already exists are reconciled by no arm here yet
             // ([`Provisioner::retag`]'s own default), so nothing is asked about them.
@@ -1052,6 +1077,8 @@ impl Owner {
                 logs_resources::delete(ctx, region, kind, resource).await
             }
             Self::IotAuthorizer => iot_authorizer::delete(ctx, region, resource).await,
+            // AWS IoT takes no snapshot of a topic rule on the way out either.
+            Self::IotTopicRule => iot_topic_rule::delete(ctx, region, resource).await,
             // CloudFront takes no snapshot of a distribution or an origin access control on
             // the way out: there is no such call, so a `Snapshot` deletion policy on either
             // deletes the resource with no snapshot invented for it. A distribution is
@@ -1239,6 +1266,9 @@ impl Owner {
             Self::IotAuthorizer => {
                 iot_authorizer::actual_configuration(ctx, region, resource).await?
             }
+            Self::IotTopicRule => {
+                iot_topic_rule::actual_configuration(ctx, region, resource).await?
+            }
             // Neither CloudFront type reports a configuration of its own to compare yet: this
             // arm reads nothing back for drift detection, so neither one's configuration is
             // guessed at.
@@ -1367,7 +1397,9 @@ impl Owner {
             // wording is applied where the refusal is READ — at the call, which is where the
             // type whose provider made it is known ([`logs_resources::provider_exception`]) —
             // so nothing of it is added a second time here.
-            Self::LogsResource(_) | Self::IotAuthorizer => message.to_string(),
+            Self::LogsResource(_) | Self::IotAuthorizer | Self::IotTopicRule => {
+                message.to_string()
+            }
             // Amazon CloudFront's does the same.
             Self::CloudFrontResource(_) => message.to_string(),
             // Amazon ECS's does the same.

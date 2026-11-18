@@ -364,7 +364,7 @@ fn seconds(document: &Map<String, Value>, member: &str) -> Result<Option<i32>, S
 }
 
 /// The ARN namespace, and the endpoint prefix, of AWS Lambda.
-const LAMBDA_ARN_NAMESPACE: &str = "lambda";
+pub(crate) const LAMBDA_ARN_NAMESPACE: &str = "lambda";
 
 /// The longest this service waits for an authorizer's function to answer.
 ///
@@ -450,15 +450,31 @@ fn reported_error(payload: Option<&::aws_sdk_lambda::primitives::Blob>) -> Optio
     Some(parsed.get("errorMessage")?.as_str()?.to_string())
 }
 
-/// Lambda's client for `region`, over the in-process callback into this same emulator:
-/// an authorizer's function is one this emulator holds, so the invocation never leaves
-/// the process.
+/// This crate's ONE construction of the in-process AWS Lambda client, addressed to `region`, so
+/// no two places in it configure that hop differently.
 ///
-/// The transport is in-process, so this disables what a network client needs and this
-/// one cannot have: retries, timeouts, stalled-stream protection and identity caching
-/// each need a sleep implementation the callback transport is not given, and there is
-/// nothing to retry behind it anyway.
-fn lambda_client(
+/// Both halves of this service that reach a function build it here: `TestInvokeAuthorizer`,
+/// which RUNS the authorizer's own function, and the rules engine's `lambda` topic-rule action
+/// ([`super::rules_engine::lambda_action`]), which invokes the function a rule names and reads
+/// that function's resource policy. It lives beside the first of those rather than in
+/// [`::service_common`] because that crate declares no Lambda SDK dependency; the copies of this
+/// builder in other service crates are to be migrated onto one shared construction there, each
+/// in the change that owns its service, exactly as `::service_common::kinesis_client` records
+/// for the Kinesis client.
+///
+/// The transport is the emulator's own in-process callback
+/// ([`smithy_server_runtime::OperationContext::callback`]), so a function this client addresses
+/// is one this emulator holds: no socket is opened, no name is resolved, and nothing outside
+/// this process is reachable from it. The endpoint URL is addressing for that transport rather
+/// than a host this process connects to, and it is built from the Region alone — no part of a
+/// caller's request is a destination. The credentials are the callback's own: a caller's
+/// `Authorization` header is never forwarded.
+///
+/// Being in-process, it disables what a network client needs and this one cannot have: retries,
+/// timeouts, stalled-stream protection and identity caching each need a sleep implementation the
+/// callback transport is not given, and there is nothing to retry behind it anyway. A deadline
+/// on one call is the caller's to apply.
+pub(crate) fn lambda_client(
     ctx: &::smithy_server_runtime::OperationContext<'_>,
     region: &str,
 ) -> ::aws_sdk_lambda::Client {
