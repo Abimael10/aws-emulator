@@ -23,6 +23,13 @@
 //! iteration — which is also a task state nested inside another state's processor), and
 //! the form of the `Resource` (a function ARN against the optimized `lambda:invoke`
 //! integration on the very same function).
+//!
+//! The second suite below reads those same families where a client reads them — through
+//! CloudWatch's own `GetMetricStatistics` — over a window in which the invocations of ONE
+//! function closed DIFFERENTLY, so what is asserted is that summing a count series gives
+//! the number of invocations that closed that way and summing the start series gives the
+//! number taken, however the window's invocations were split between outcomes. Its rows
+//! differ along how many invocations the window holds and how they are split.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -221,50 +228,20 @@ impl Metered {
 
     /// Create `definition` as a state machine, run one execution of it over `input`, and
     /// answer `(the state machine's ARN, the execution once it has left RUNNING)`.
-    async fn ran(&self, case: &str, name: &str, definition: &Value, input: &Value) -> (String, Value) {
-        let created = self
-            .sfn(
-                case,
-                "CreateStateMachine",
-                &json!({
-                    "name": name,
-                    "definition": definition.to_string(),
-                    "roleArn": ROLE_ARN,
-                }),
-            )
-            .await;
-        let machine = string(&created, "stateMachineArn");
-        let started = self
-            .sfn(
-                case,
-                "StartExecution",
-                &json!({
-                    "stateMachineArn": machine,
-                    "name": "only",
-                    "input": input.to_string(),
-                }),
-            )
-            .await;
-        let execution = string(&started, "executionArn");
-        let began = Instant::now();
-        loop {
-            let described = self
-                .sfn(
-                    case,
-                    "DescribeExecution",
-                    &json!({ "executionArn": execution }),
-                )
-                .await;
-            if described.get("status").and_then(Value::as_str) != Some("RUNNING") {
-                return (machine, described);
-            }
-            assert!(
-                began.elapsed() < TERMINAL_PATIENCE,
-                "case {case:?}: expected a terminal status within {TERMINAL_PATIENCE:?}, last \
-                 saw {described}"
-            );
-            std::thread::sleep(POLL_INTERVAL);
-        }
+    ///
+    /// The create and the run are the two helpers a row driving SEVERAL executions of one
+    /// state machine uses on their own ([`Self::machine_with`], [`Self::ran_named`]), so
+    /// the terminal-status wait exists once.
+    async fn ran(
+        &self,
+        case: &str,
+        name: &str,
+        definition: &Value,
+        input: &Value,
+    ) -> (String, Value) {
+        let machine = self.machine_with(case, name, definition).await;
+        let described = self.ran_named(case, &machine, "only", input).await;
+        (machine, described)
     }
 
     /// The datapoints the series `metric` holds for the dimension set `dimensions`, read
@@ -624,5 +601,474 @@ async fn a_function_arn_task_is_counted_per_function() {
             1.0,
             "case {case:?}: expected the one execution to be counted, got {started:?}"
         );
+    }
+}
+
+// What follows reads the SAME families over the wire, through CloudWatch's own
+// `GetMetricStatistics`, over a window holding invocations of one function that closed
+// differently.
+
+/// The namespace these series belong to, the names the AWS Step Functions metric
+/// reference gives the per-function counts, the per-execution counts and the run span,
+/// the two dimensions they are reported under, and the units they are published in.
+/// Written as literals here rather than read from the crate under test, so a series
+/// published under a name no AWS reader would ask for fails here.
+const STATES_NAMESPACE: &str = "AWS/States";
+/// See [`STATES_NAMESPACE`].
+const LAMBDA_FUNCTION_ARN_DIMENSION: &str = "LambdaFunctionArn";
+/// See [`STATES_NAMESPACE`].
+const STATE_MACHINE_ARN_DIMENSION: &str = "StateMachineArn";
+/// See [`STATES_NAMESPACE`].
+const SCHEDULED_SERIES: &str = "LambdaFunctionsScheduled";
+/// See [`STATES_NAMESPACE`].
+const STARTED_SERIES: &str = "LambdaFunctionsStarted";
+/// See [`STATES_NAMESPACE`].
+const SUCCEEDED_SERIES: &str = "LambdaFunctionsSucceeded";
+/// See [`STATES_NAMESPACE`].
+const FAILED_SERIES: &str = "LambdaFunctionsFailed";
+/// See [`STATES_NAMESPACE`].
+const TIMED_OUT_SERIES: &str = "LambdaFunctionsTimedOut";
+/// See [`STATES_NAMESPACE`].
+const RUN_TIME_SERIES: &str = "LambdaFunctionRunTime";
+/// See [`STATES_NAMESPACE`].
+const EXECUTIONS_STARTED_SERIES: &str = "ExecutionsStarted";
+/// See [`STATES_NAMESPACE`].
+const EXECUTIONS_SUCCEEDED_SERIES: &str = "ExecutionsSucceeded";
+/// See [`STATES_NAMESPACE`].
+const EXECUTIONS_FAILED_SERIES: &str = "ExecutionsFailed";
+/// See [`STATES_NAMESPACE`].
+const COUNT_UNIT: &str = "Count";
+/// See [`STATES_NAMESPACE`].
+const MILLISECONDS_UNIT: &str = "Milliseconds";
+
+/// The `X-Amz-Target` prefix of CloudWatch's `awsJson1_0` wire protocol, and the signing
+/// name that routes a request to it.
+const CLOUDWATCH_TARGET_PREFIX: &str = "GraniteServiceVersion20100801";
+/// See [`CLOUDWATCH_TARGET_PREFIX`].
+const CLOUDWATCH_SIGNING_NAME: &str = "monitoring";
+
+/// The `Period`, in seconds, every read below uses: the one-minute granularity these
+/// series are stored at.
+const PERIOD_SECS: i64 = 60;
+
+/// How far either side of now a read's window reaches, in seconds — wide enough that
+/// every minute a row published in is inside it however the row straddles a minute
+/// boundary.
+const WINDOW_SECS: f64 = 600.0;
+
+/// The mode an invocation that must RETURN is asked for, and the one an invocation that
+/// must ERROR is: the two the one [`HANDLER_SOURCE`] branches on.
+const RETURNS: &str = "ok";
+/// See [`RETURNS`].
+const ERRORS: &str = "boom";
+
+/// How long a row looks for the window to hold every invocation it took. Generous on
+/// purpose: the wait is for that CONDITION rather than for a span, and nothing here is
+/// asserted about how fast the host runs.
+const READ_PATIENCE: Duration = Duration::from_secs(60);
+
+impl Metered {
+    /// One CloudWatch call, requiring a 200.
+    async fn cloudwatch(&self, case: &str, operation: &str, body: &Value) -> Value {
+        let request = http::Request::builder()
+            .method("POST")
+            .uri("/")
+            .header(
+                "host",
+                format!("{CLOUDWATCH_SIGNING_NAME}.{REGION}.amazonaws.com"),
+            )
+            .header("content-type", "application/x-amz-json-1.0")
+            .header(
+                "x-amz-target",
+                format!("{CLOUDWATCH_TARGET_PREFIX}.{operation}"),
+            )
+            .header(
+                "authorization",
+                Self::authorization(CLOUDWATCH_SIGNING_NAME),
+            )
+            .body(Bytes::from(body.to_string()))
+            .expect("a well-formed request");
+        let response = self.router.dispatch(request).await;
+        let status = response.status().as_u16();
+        let answered = parsed(response.into_body());
+        assert_eq!(
+            status, 200,
+            "case {case:?}: {operation} must answer 200, got {status} with {answered}"
+        );
+        answered
+    }
+
+    /// The datapoints the series `metric` of [`STATES_NAMESPACE`] reports over the window
+    /// for the dimension set `dimensions`, each carrying `statistics`. A series with no
+    /// datapoint at all answers an empty list, which is what "the series stayed empty"
+    /// reads as.
+    async fn read(
+        &self,
+        case: &str,
+        metric: &str,
+        dimensions: &Value,
+        statistics: &[&str],
+    ) -> Vec<Value> {
+        let now = now_secs();
+        let answered = self
+            .cloudwatch(
+                case,
+                "GetMetricStatistics",
+                &json!({
+                    "Namespace": STATES_NAMESPACE,
+                    "MetricName": metric,
+                    "Dimensions": dimensions,
+                    "StartTime": now - WINDOW_SECS,
+                    "EndTime": now + WINDOW_SECS,
+                    "Period": PERIOD_SECS,
+                    "Statistics": statistics,
+                }),
+            )
+            .await;
+        answered["Datapoints"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// The SUM the series reports over the window — the magnitude a client charting or
+    /// alarming on it reads. A series with no datapoint sums to zero.
+    async fn summed(&self, case: &str, metric: &str, dimensions: &Value) -> f64 {
+        self.read(case, metric, dimensions, &["Sum"])
+            .await
+            .iter()
+            .filter_map(|point| point["Sum"].as_f64())
+            .sum()
+    }
+
+    /// How many observations the series holds over the window, summed across its
+    /// datapoints: one per invocation for a span series.
+    async fn sampled(&self, case: &str, metric: &str, dimensions: &Value) -> f64 {
+        self.read(case, metric, dimensions, &["SampleCount"])
+            .await
+            .iter()
+            .filter_map(|point| point["SampleCount"].as_f64())
+            .sum()
+    }
+
+    /// Every reading the split below is asserted against, as `(what it is, the magnitude
+    /// read)`: each one holds the number of invocations the row took once every
+    /// observation of its executions has been handed over, whatever each invocation's
+    /// outcome was — so a row waits for all of them rather than for the earliest.
+    async fn settled(
+        &self,
+        case: &str,
+        function_arn: &str,
+        machine_arn: &str,
+    ) -> Vec<(&'static str, f64)> {
+        let function = function_arn_dimensions(function_arn);
+        let machine = machine_arn_dimensions(machine_arn);
+        let mut closed = 0.0;
+        for metric in [SUCCEEDED_SERIES, FAILED_SERIES, TIMED_OUT_SERIES] {
+            closed += self.summed(case, metric, &function).await;
+        }
+        let mut executions_closed = 0.0;
+        for metric in [EXECUTIONS_SUCCEEDED_SERIES, EXECUTIONS_FAILED_SERIES] {
+            executions_closed += self.summed(case, metric, &machine).await;
+        }
+        vec![
+            (
+                SCHEDULED_SERIES,
+                self.summed(case, SCHEDULED_SERIES, &function).await,
+            ),
+            (
+                STARTED_SERIES,
+                self.summed(case, STARTED_SERIES, &function).await,
+            ),
+            ("the invocation outcome series", closed),
+            (
+                RUN_TIME_SERIES,
+                self.sampled(case, RUN_TIME_SERIES, &function).await,
+            ),
+            (
+                EXECUTIONS_STARTED_SERIES,
+                self.summed(case, EXECUTIONS_STARTED_SERIES, &machine).await,
+            ),
+            ("the execution outcome series", executions_closed),
+        ]
+    }
+
+    /// Create `definition` as a state machine; answers its ARN.
+    async fn machine_with(&self, case: &str, name: &str, definition: &Value) -> String {
+        let created = self
+            .sfn(
+                case,
+                "CreateStateMachine",
+                &json!({
+                    "name": name,
+                    "definition": definition.to_string(),
+                    "roleArn": ROLE_ARN,
+                }),
+            )
+            .await;
+        string(&created, "stateMachineArn")
+    }
+
+    /// Start one execution of `machine` named `name` with `input`, and report it once it
+    /// has left `RUNNING`.
+    async fn ran_named(&self, case: &str, machine: &str, name: &str, input: &Value) -> Value {
+        let started = self
+            .sfn(
+                case,
+                "StartExecution",
+                &json!({
+                    "stateMachineArn": machine,
+                    "name": name,
+                    "input": input.to_string(),
+                }),
+            )
+            .await;
+        let execution = string(&started, "executionArn");
+        let began = Instant::now();
+        loop {
+            let described = self
+                .sfn(
+                    case,
+                    "DescribeExecution",
+                    &json!({ "executionArn": execution }),
+                )
+                .await;
+            if described.get("status").and_then(Value::as_str) != Some("RUNNING") {
+                return described;
+            }
+            assert!(
+                began.elapsed() < TERMINAL_PATIENCE,
+                "case {case:?}: expected a terminal status within {TERMINAL_PATIENCE:?}, last \
+                 saw {described}"
+            );
+            std::thread::sleep(POLL_INTERVAL);
+        }
+    }
+}
+
+/// Now, in whole epoch seconds, which is how an `awsJson` request carries an instant.
+fn now_secs() -> f64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("now is after the epoch")
+        .as_secs_f64()
+        .trunc()
+}
+
+/// The dimension set of a series reported per invoked FUNCTION, as a request carries it.
+fn function_arn_dimensions(function_arn: &str) -> Value {
+    json!([{ "Name": LAMBDA_FUNCTION_ARN_DIMENSION, "Value": function_arn }])
+}
+
+/// The dimension set of a series reported per STATE MACHINE.
+fn machine_arn_dimensions(machine_arn: &str) -> Value {
+    json!([{ "Name": STATE_MACHINE_ARN_DIMENSION, "Value": machine_arn }])
+}
+
+/// Whether two magnitudes read off a series are the same count.
+fn same(read: f64, expected: f64) -> bool {
+    (read - expected).abs() < f64::EPSILON
+}
+
+/// One row of the read below: the modes the row's executions are started with, in order —
+/// one invocation each, closing as the mode asks.
+struct Split {
+    case: &'static str,
+    modes: &'static [&'static str],
+}
+
+fn splits() -> Vec<Split> {
+    vec![
+        Split {
+            case: "one invocation returns and one errors",
+            modes: &[RETURNS, ERRORS],
+        },
+        Split {
+            case: "one invocation errors and one returns, the other way round",
+            modes: &[ERRORS, RETURNS],
+        },
+        Split {
+            case: "two of three invocations return and one errors",
+            modes: &[RETURNS, ERRORS, RETURNS],
+        },
+        Split {
+            case: "both invocations error",
+            modes: &[ERRORS, ERRORS],
+        },
+        Split {
+            case: "the one invocation returns",
+            modes: &[RETURNS],
+        },
+    ]
+}
+
+/// Read through CloudWatch's own `GetMetricStatistics`, each count series of the
+/// per-function family reports the invocations of that function that closed ITS way and
+/// the handover and start series report every invocation taken, however a window's
+/// invocations were split between outcomes — while the execution counters report the same
+/// split under the state machine's own dimension, and neither family exists under the
+/// other's.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_windows_invocations_are_counted_in_the_series_of_each_outcome() {
+    let metered = Metered::new();
+
+    for (index, split) in splits().into_iter().enumerate() {
+        let Split { case, modes } = split;
+        // One function and one state machine per row, so each row's series are its own.
+        let name = format!("split-{index}");
+        let function = metered.given_function(&name).await;
+        let machine = metered
+            .machine_with(case, &name, &direct(&function))
+            .await;
+
+        for (run, mode) in modes.iter().enumerate() {
+            let described = metered
+                .ran_named(
+                    case,
+                    &machine,
+                    &format!("run-{run}"),
+                    &json!({ "mode": mode, "echo": run + 1 }),
+                )
+                .await;
+            let expected = if *mode == ERRORS {
+                "FAILED"
+            } else {
+                "SUCCEEDED"
+            };
+            assert_eq!(
+                described.get("status").and_then(Value::as_str),
+                Some(expected),
+                "case {case:?}: expected run {run} in mode {mode:?} to end {expected}, got \
+                 {described}"
+            );
+        }
+
+        #[allow(clippy::cast_precision_loss)]
+        let taken = modes.len() as f64;
+        #[allow(clippy::cast_precision_loss)]
+        let returned = modes.iter().filter(|mode| **mode == RETURNS).count() as f64;
+        let errored = taken - returned;
+
+        // An observation is readable once the work that closed it has been handed over, so
+        // the row waits for every reading the assertions below depend on to hold the
+        // invocations it took — the handover, the start, the outcome and the span series of
+        // the function, and the execution counters of the state machine — before reading
+        // the split. The wait is for that CONDITION, not for a span.
+        let began = Instant::now();
+        loop {
+            let settled = metered.settled(case, &function, &machine).await;
+            if settled.iter().all(|(_, read)| same(*read, taken)) {
+                break;
+            }
+            assert!(
+                began.elapsed() < READ_PATIENCE,
+                "case {case:?}: expected every series of {function} and {machine} to hold the \
+                 {taken} invocation(s) within {READ_PATIENCE:?}, last read {settled:?}"
+            );
+            std::thread::sleep(POLL_INTERVAL);
+        }
+
+        // The split itself: every invocation in the handover and start series, and each
+        // one in the series of the outcome it reached alone.
+        for (metric, expected) in [
+            (SCHEDULED_SERIES, taken),
+            (STARTED_SERIES, taken),
+            (SUCCEEDED_SERIES, returned),
+            (FAILED_SERIES, errored),
+            (TIMED_OUT_SERIES, 0.0),
+        ] {
+            let read = metered
+                .summed(case, metric, &function_arn_dimensions(&function))
+                .await;
+            assert!(
+                same(read, expected),
+                "case {case:?}: expected {metric} of {function} to count {expected}, got {read}"
+            );
+            for point in &metered
+                .read(case, metric, &function_arn_dimensions(&function), &["Sum"])
+                .await
+            {
+                assert_eq!(
+                    point["Unit"].as_str(),
+                    Some(COUNT_UNIT),
+                    "case {case:?}: {metric} is a count, got {point}"
+                );
+            }
+        }
+
+        // The run span is sampled once per invocation that closed, whichever series it
+        // closed in, and is published as a span of milliseconds.
+        let samples = metered
+            .sampled(case, RUN_TIME_SERIES, &function_arn_dimensions(&function))
+            .await;
+        assert!(
+            same(samples, taken),
+            "case {case:?}: expected {taken} {RUN_TIME_SERIES} sample(s) of {function}, got \
+             {samples}"
+        );
+        for point in &metered
+            .read(
+                case,
+                RUN_TIME_SERIES,
+                &function_arn_dimensions(&function),
+                &["SampleCount"],
+            )
+            .await
+        {
+            assert_eq!(
+                point["Unit"].as_str(),
+                Some(MILLISECONDS_UNIT),
+                "case {case:?}: {RUN_TIME_SERIES} is a span of milliseconds, got {point}"
+            );
+        }
+
+        // The execution counters carry the same split under the state machine's own
+        // dimension: every run started, and each run in the series of the outcome IT
+        // reached.
+        for (metric, expected) in [
+            (EXECUTIONS_STARTED_SERIES, taken),
+            (EXECUTIONS_SUCCEEDED_SERIES, returned),
+            (EXECUTIONS_FAILED_SERIES, errored),
+        ] {
+            let read = metered
+                .summed(case, metric, &machine_arn_dimensions(&machine))
+                .await;
+            assert!(
+                same(read, expected),
+                "case {case:?}: expected {metric} of {machine} to count {expected}, got {read}"
+            );
+        }
+
+        // And the two families never cross: no per-function series exists under the state
+        // machine's dimension, and no execution counter under the function's.
+        for metric in [
+            SCHEDULED_SERIES,
+            STARTED_SERIES,
+            SUCCEEDED_SERIES,
+            FAILED_SERIES,
+            RUN_TIME_SERIES,
+        ] {
+            let read = metered
+                .read(case, metric, &machine_arn_dimensions(&machine), &["Sum"])
+                .await;
+            assert!(
+                read.is_empty(),
+                "case {case:?}: {metric} belongs to the function's dimension alone, got {read:?}"
+            );
+        }
+        for metric in [
+            EXECUTIONS_STARTED_SERIES,
+            EXECUTIONS_SUCCEEDED_SERIES,
+            EXECUTIONS_FAILED_SERIES,
+        ] {
+            let read = metered
+                .read(case, metric, &function_arn_dimensions(&function), &["Sum"])
+                .await;
+            assert!(
+                read.is_empty(),
+                "case {case:?}: {metric} belongs to the state machine's dimension alone, got \
+                 {read:?}"
+            );
+        }
     }
 }
