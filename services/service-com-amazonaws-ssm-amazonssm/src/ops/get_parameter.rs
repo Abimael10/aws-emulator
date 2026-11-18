@@ -25,15 +25,18 @@
 //!
 //! ## Who may read it
 //!
-//! AWS decides a signed call against the calling principal's identity-based policies before
-//! the service resolves what the request names, so a caller whose policies do not allow
-//! `ssm:GetParameter` on the parameter the request addresses is refused
-//! `AccessDeniedException` (HTTP 400) carrying IAM's own sentence — before the store is read,
-//! so the refusal says nothing about whether that parameter exists. The decision is the
-//! shared one every operation of this service takes
-//! ([`crate::state::identity_authorization`]); the caller this emulator cannot bound (the
-//! account's own published credential, a principal holding a grant it cannot read) is allowed,
-//! as that module records.
+//! AWS decides a signed call against the documents in force before the service resolves what
+//! the request names, so a caller nothing allows to perform `ssm:GetParameter` on the
+//! parameter the request addresses is refused `AccessDeniedException` (HTTP 400) carrying
+//! IAM's own sentence — before the store is read, so the refusal says nothing about whether
+//! that parameter exists. Both kinds of document in force take part, the way AWS evaluates
+//! them together: the calling principal's identity-based policies, and the RESOURCE POLICY
+//! the addressed parameter itself carries ([`crate::state::resource_policies`], what
+//! `PutResourcePolicy` attached) — an explicit deny in either refuses the read whatever grants
+//! it, and a grant in either serves it. The decision is the shared one every operation of this
+//! service takes ([`crate::state::identity_authorization`]); the caller that gate cannot bound
+//! (the account's own published credential, a principal holding a grant it cannot read) is
+//! allowed unless a document it CAN read denies the read, as that module records.
 //!
 //! ## Parameters nobody created
 //!
@@ -285,11 +288,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(not_found().into());
         }
 
-        // AWS decides a signed call against the calling principal's identity-based policies
-        // before the service resolves what the request names, so a caller holding no grant
-        // for this action on this parameter is refused rather than served — and rather than
-        // told whether the parameter exists
-        // ([`crate::state::identity_authorization`]). Asked with no store guard held.
+        // AWS decides a signed call against the documents in force — the calling principal's
+        // identity-based policies and the addressed parameter's own resource policy — before
+        // the service resolves what the request names, so a caller holding no grant for this
+        // action on this parameter is refused rather than served, and rather than told
+        // whether the parameter exists ([`crate::state::identity_authorization`]). Asked with
+        // no store guard held.
         if let Some(message) = crate::state::identity_authorization::parameter_refusal(
             &*self.engine,
             ctx,

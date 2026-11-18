@@ -256,10 +256,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(not_found().into());
         }
 
-        // AWS decides a signed call against the calling principal's identity-based policies
-        // before the service resolves what the request names, so a caller holding no grant
-        // for this action on this parameter is refused rather than served its history — and
-        // rather than told whether the parameter exists
+        // AWS decides a signed call against the documents in force — the calling principal's
+        // identity-based policies and the addressed parameter's own resource policy — before
+        // the service resolves what the request names, so a caller holding no grant for this
+        // action on this parameter is refused rather than served its history, and rather than
+        // told whether the parameter exists
         // ([`crate::state::identity_authorization`]).
         if let Some(message) = crate::state::identity_authorization::parameter_refusal(
             &*self.engine,
