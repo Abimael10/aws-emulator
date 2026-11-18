@@ -37,6 +37,8 @@ hex = { workspace = true }
 emulator-core-build-support = { workspace = true }
 
 [dev-dependencies]
+# `tests/all/main.rs` declares one module per `tests/all/<name>.rs` through `automod::dir!`.
+automod = { workspace = true }
 # `time` for a test that waits out a clock-owed transition without blocking the runtime.
 tokio = { workspace = true, features = ["time"] }
 

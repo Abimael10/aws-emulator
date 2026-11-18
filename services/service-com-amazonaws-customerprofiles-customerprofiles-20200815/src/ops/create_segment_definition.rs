@@ -1,15 +1,21 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateSegmentDefinition
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateSegmentDefinition`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Defines a segment under its domain: it persists the criteria and labels the request
+//! carries, mints the definition's ARN once, and answers from the record it stored, so a
+//! later `GetSegmentDefinition` reports the same definition.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateSegmentDefinition::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! `SegmentDefinitionName` is the definition's identity within the domain (it is the
+//! operation's `@httpLabel`), so this is a CREATE and not a replace: the name is looked
+//! up and inserted under ONE hold of the store lock, so of any number of concurrent
+//! creates of one name exactly one is admitted and every other is refused
+//! `BadRequestException` (400) without touching what the winner stored. Refusing leaves
+//! the stored definition exactly as it was, which is what makes repeating the call have
+//! the same effect on state as making it once.
+//!
+//! A definition is created from ONE kind of criteria: the segment-group structure, or a
+//! SQL query (`GetSegmentDefinitionResponse$SegmentType`). A request carrying both, or
+//! neither, describes no segment and is refused `BadRequestException` (400).
 //!
 //! ## Shape of an operation
 //!
@@ -166,18 +172,130 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateSegmentDefinition` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateSegmentDefinitionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateSegmentDefinition"))
+        // A definition is built from one kind of criteria, so the pair of criteria
+        // members is checked before anything is read from the store.
+        if let Some(message) = criteria_violation(
+            input.segment_groups.as_ref(),
+            input.segment_sql_query.as_deref(),
+        ) {
+            return Err(bad_request(message));
+        }
+        // A tag key is the one half of a tag map the boundary's constraint walk does not
+        // validate, so the model's own bounds on it are applied here.
+        if let Some(message) = crate::state::first_tag_key_violation("Tags", input.tags.as_ref()) {
+            return Err(bad_request(message));
+        }
+
+        let region = crate::state::request_region(ctx);
+        let state = crate::state::service_state(&*self.engine).ok_or_else(unavailable)?;
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        let domain = store
+            .domains
+            .get_mut(&input.domain_name)
+            .ok_or_else(|| not_found(crate::state::domain_not_found(&input.domain_name)))?;
+
+        // The name identifies the definition within the domain, so a name the domain
+        // already holds is a conflict and never an overwrite. The lookup and the insert
+        // below happen under this one hold of the store lock, which is what makes the
+        // check-and-insert atomic: a concurrent create of the same name either finds
+        // nothing and wins, or finds the winner's record and is refused here.
+        if domain
+            .segment_definitions
+            .contains_key(&input.segment_definition_name)
+        {
+            return Err(bad_request(crate::state::segment_definition_exists(
+                &input.segment_definition_name,
+            )));
+        }
+        if domain.segment_definitions.len() >= crate::state::MAX_SEGMENT_DEFINITIONS_PER_DOMAIN {
+            return Err(bad_request(format!(
+                "The maximum number of segment definitions for domain {} has been reached: {}",
+                input.domain_name,
+                crate::state::MAX_SEGMENT_DEFINITIONS_PER_DOMAIN
+            )));
+        }
+
+        let stored = crate::state::StoredSegmentDefinition {
+            arn: crate::state::segment_definition_arn(
+                &region,
+                &input.domain_name,
+                &input.segment_definition_name,
+            ),
+            name: input.segment_definition_name,
+            display_name: input.display_name,
+            description: input.description,
+            segment_groups: input.segment_groups,
+            segment_sql_query: input.segment_sql_query,
+            segment_sort: input.segment_sort,
+            tags: input.tags,
+            created_at: now,
+        };
+
+        // The response is the record that was just stored, so it is the same definition
+        // the readers serve: every member is reported exactly as it was persisted, the
+        // tag map included, so a definition created with no tags reports none.
+        let output = CreateSegmentDefinitionOutput {
+            segment_definition_name: stored.name.clone(),
+            segment_definition_arn: Some(stored.arn.clone()),
+            display_name: Some(stored.display_name.clone()),
+            description: stored.description.clone(),
+            created_at: Some(crate::state::to_date_time(stored.created_at)),
+            tags: stored.tags.clone(),
+        };
+
+        domain
+            .segment_definitions
+            .insert(stored.name.clone(), stored);
+        Ok(output)
     }
+}
+
+/// Why the criteria the request carries describe no segment, or `None` when they describe
+/// one.
+///
+/// `GetSegmentDefinitionResponse$SegmentType` states the two kinds of definition the
+/// service holds — one built from the segment-group structure, one built from a SQL query
+/// — so a definition has EXACTLY ONE kind of criteria: a request carrying both says two
+/// things about what the segment is, and one carrying neither says nothing about it.
+///
+/// The sentences name the members a caller has to fix, since the model leaves both
+/// optional and the boundary's constraint walk therefore admits either combination.
+fn criteria_violation(
+    segment_groups: Option<&SegmentGroup>,
+    segment_sql_query: Option<&str>,
+) -> Option<String> {
+    match (segment_groups.is_some(), segment_sql_query.is_some()) {
+        (true, true) => {
+            Some("SegmentGroups and SegmentSqlQuery cannot both be provided".to_string())
+        }
+        (false, false) => {
+            Some("Either SegmentGroups or SegmentSqlQuery must be provided".to_string())
+        }
+        _ => None,
+    }
+}
+
+/// The request is invalid — HTTP 400, the error code a client branches on to learn that
+/// the segment it asked for cannot be defined as asked.
+fn bad_request(message: String) -> CreateSegmentDefinitionError {
+    CreateSegmentDefinitionErrorModeled::BadRequestException(BadRequestException {
+        message: Some(message),
+    })
+    .into()
+}
+
+/// A domain the request names is not stored.
+fn not_found(message: String) -> CreateSegmentDefinitionError {
+    CreateSegmentDefinitionErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(message),
+    })
+    .into()
+}
+
+/// The store is unreachable — a server fault, not a bad request.
+fn unavailable() -> CreateSegmentDefinitionError {
+    CreateSegmentDefinitionErrorModeled::InternalServerException(crate::state::store_unavailable())
+        .into()
 }

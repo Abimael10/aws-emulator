@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetSegmentDefinition
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetSegmentDefinition`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Reports one segment definition of a domain, exactly as `CreateSegmentDefinition`
+//! stored it: a reporting operation, so it writes nothing.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetSegmentDefinition::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! `SegmentType` is the one member not held in the record: it says which kind of criteria
+//! the definition was created with, so it is resolved from the stored criteria on every
+//! read ([`crate::state::StoredSegmentDefinition::segment_type`]).
 //!
 //! ## Shape of an operation
 //!
@@ -162,18 +159,51 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetSegmentDefinition` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetSegmentDefinitionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetSegmentDefinition"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(unavailable)?;
+
+        let store = state.lock();
+        let domain = store
+            .domains
+            .get(&input.domain_name)
+            .ok_or_else(|| not_found(crate::state::domain_not_found(&input.domain_name)))?;
+        let stored = domain
+            .segment_definitions
+            .get(&input.segment_definition_name)
+            .ok_or_else(|| {
+                not_found(crate::state::segment_definition_not_found(
+                    &input.segment_definition_name,
+                ))
+            })?;
+
+        // Everything but `SegmentType` is reported exactly as the create stored it,
+        // through the same projection the create answers with; that one member says which
+        // kind of criteria the definition carries, so it follows from the record.
+        Ok(GetSegmentDefinitionOutput {
+            segment_definition_name: Some(stored.name.clone()),
+            segment_definition_arn: stored.arn.clone(),
+            display_name: Some(stored.display_name.clone()),
+            description: stored.description.clone(),
+            segment_groups: stored.segment_groups.clone(),
+            segment_sql_query: stored.segment_sql_query.clone(),
+            segment_sort: stored.segment_sort.clone(),
+            segment_type: Some(stored.segment_type()),
+            created_at: Some(crate::state::to_date_time(stored.created_at)),
+            tags: stored.tags.clone(),
+        })
     }
+}
+
+/// A domain, or a segment definition in it, the request names is not stored.
+fn not_found(message: String) -> GetSegmentDefinitionError {
+    GetSegmentDefinitionErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(message),
+    })
+    .into()
+}
+
+/// The store is unreachable — a server fault, not a bad request.
+fn unavailable() -> GetSegmentDefinitionError {
+    GetSegmentDefinitionErrorModeled::InternalServerException(crate::state::store_unavailable())
+        .into()
 }

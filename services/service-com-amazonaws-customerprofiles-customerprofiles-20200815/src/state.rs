@@ -31,6 +31,16 @@ pub mod tagged_resources;
 /// profile, written by the operations that take those actions.
 pub mod profile_history;
 
+/// The segment definitions a domain holds, and the sentences the operations addressing
+/// one word their refusals with.
+pub mod segment_definitions;
+
+pub use segment_definitions::{
+    segment_definition_arn, segment_definition_exists, segment_definition_not_found,
+    StoredSegmentDefinition, MAX_SEGMENT_DEFINITIONS_PER_DOMAIN, SEGMENT_TYPE_CLASSIC,
+    SEGMENT_TYPE_ENHANCED,
+};
+
 pub use profile_history::{
     new_history_record_id, ProfileAction, StoredProfileHistoryRecord, ACTION_ADDED_PROFILE_KEY,
     ACTION_CREATED, ACTION_DELETED_BY_CUSTOMER, ACTION_DELETED_BY_MERGE, ACTION_EXPIRED,
@@ -421,6 +431,11 @@ pub struct Domain {
     /// calculated-attribute operation), so the (domain, name) pair identifies exactly
     /// one definition. A `BTreeMap`, so a listing walks them in one stable order.
     pub calculated_attributes: BTreeMap<String, StoredCalculatedAttribute>,
+    /// The domain's segment definitions, keyed by `SegmentDefinitionName` — the name is
+    /// the definition's identity within the domain (`@httpLabel` on every
+    /// segment-definition operation), so the (domain, name) pair identifies exactly one
+    /// definition. A `BTreeMap`, so a listing walks them in one stable order.
+    pub segment_definitions: BTreeMap<String, StoredSegmentDefinition>,
     /// The domain's recommender schemas, keyed by `RecommenderSchemaName` — the name is
     /// the schema's identity within the domain (`@httpLabel` on every recommender-schema
     /// operation), so the (domain, name) pair identifies exactly one schema. A
@@ -845,6 +860,7 @@ impl Domain {
             profile_objects: BTreeMap::new(),
             upload_jobs: BTreeMap::new(),
             calculated_attributes: BTreeMap::new(),
+            segment_definitions: BTreeMap::new(),
             recommender_schemas: BTreeMap::new(),
             key_index: HashMap::new(),
             profile_keys: BTreeMap::new(),
