@@ -15,8 +15,10 @@
 //!
 //! 1. a resource policy document that is not a policy document in JSON format — one
 //!    fixed sentence, which draws nothing from the request;
-//! 2. the per-account/Region investigation-group quota — one fixed sentence, which
-//!    draws nothing from the request and nothing from the cap the emulator enforces;
+//! 2. a create this service will not mint another investigation group for — one fixed
+//!    sentence, which draws nothing from the request and nothing from any cap the
+//!    emulator enforces, whichever guard refused the create: the published
+//!    per-account/Region quota, or the emulator's own cross-region store guard;
 //! 3. a cross-account `sourceRoleArn` that does not name an account other than the
 //!    investigation account — fixed text around two variable parts: the account the
 //!    investigation group belongs to, and the ARN the request sent, spelled as it sent
@@ -29,6 +31,7 @@
 use std::sync::Arc;
 
 use serde_json::{json, Value};
+use service_com_amazonaws_aiops_aiops::state::MAX_INVESTIGATION_GROUPS;
 use smithy_server_runtime::MultiServiceRouter;
 
 /// The canonical emulator account (`engine::EMULATOR_ACCOUNT_ID`): the account an
@@ -389,6 +392,94 @@ async fn a_quota_refusal_carries_one_fixed_sentence() {
             );
         }
     }
+}
+
+/// The SAME sentence words the refusal whichever guard stopped the create: the store is
+/// also finite across Regions, and the cross-region guard that keeps it so is this
+/// emulator's own resource bound, so its number must stay off the wire and the two
+/// guards must not hand a client two grammars for one error class on one operation.
+///
+/// The store is filled one group per Region (that being the AWS quota), so a create
+/// signing for a Region that holds nothing at all can only be stopped by the store-wide
+/// guard. Rows differ along the Region signed for — each holds nothing — and along what
+/// the refused create asked for; the last pair of rows asserts the WHOLE refusal payload
+/// is one and the same from both guards, not merely the same sentence.
+#[tokio::test]
+async fn every_quota_refusal_of_a_create_carries_that_same_fixed_sentence() {
+    let router = emulator();
+
+    for n in 0..MAX_INVESTIGATION_GROUPS {
+        create_ok(&router, &region(n), &minimal(&format!("filler-{n:04}"))).await;
+    }
+
+    let rows: Vec<(&str, Value)> = vec![
+        ("the bare member set", minimal("one-too-many")),
+        (
+            "a fuller member set",
+            json!({
+                "name": "one-too-many-plus",
+                "roleArn": ROLE_ARN,
+                "retentionInDays": 7,
+                "isCloudTrailEventHistoryEnabled": true,
+                "tags": { "Team": "ops" },
+                "crossAccountConfigurations": [
+                    { "sourceRoleArn": format!("arn:aws:iam::{FOREIGN_ACCOUNT}:role/Reader") }
+                ],
+            }),
+        ),
+    ];
+
+    for (index, (why, body)) in rows.iter().enumerate() {
+        // A Region holding nothing: only the store-wide guard can refuse this create.
+        let fresh = region(MAX_INVESTIGATION_GROUPS + index);
+        let case = format!("{fresh}: a create past the store guard with {why}");
+        let (status, answer) = create(&router, &fresh, body).await;
+        assert_eq!(
+            error_code(&answer),
+            QUOTA_EXCEEDED,
+            "case {case:?}: expected {QUOTA_EXCEEDED}, got {answer:?}"
+        );
+        assert_sentence(&case, CANNOT_CREATE_ANOTHER_GROUP, status, 402, &answer);
+        let reported = message(&answer);
+        assert!(
+            !reported.chars().any(char::is_numeric),
+            "case {case:?}: the sentence states no count and no cap, got {reported:?}"
+        );
+        assert!(
+            !reported.contains(&MAX_INVESTIGATION_GROUPS.to_string())
+                && !reported.contains(fresh.as_str()),
+            "case {case:?}: the sentence states nothing the emulator chose and nothing the \
+             request sent, got {reported:?}"
+        );
+    }
+
+    // One error class answers ONE payload: the same request refused by the per-Region
+    // quota and by the store guard is answered identically, message, resource type and
+    // service code alike.
+    let body = minimal("either-guard");
+    let full_region = region(0);
+    let (by_quota_status, by_quota) = create(&router, &full_region, &body).await;
+    let empty_region = region(MAX_INVESTIGATION_GROUPS + rows.len());
+    let (by_guard_status, by_guard) = create(&router, &empty_region, &body).await;
+    assert_sentence(
+        &format!("{full_region}: the per-Region quota"),
+        CANNOT_CREATE_ANOTHER_GROUP,
+        by_quota_status,
+        402,
+        &by_quota,
+    );
+    assert_sentence(
+        &format!("{empty_region}: the store guard"),
+        CANNOT_CREATE_ANOTHER_GROUP,
+        by_guard_status,
+        402,
+        &by_guard,
+    );
+    assert_eq!(
+        by_quota, by_guard,
+        "case \"one request, either guard\": expected one identical refusal payload, got \
+         {by_quota:?} from the per-Region quota and {by_guard:?} from the store guard"
+    );
 }
 
 /// A `sourceRoleArn` that does not name an account other than the investigation account

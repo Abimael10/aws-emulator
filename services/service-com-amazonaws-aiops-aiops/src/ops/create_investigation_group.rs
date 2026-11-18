@@ -9,7 +9,10 @@
 //! [`crate::state::MAX_INVESTIGATION_GROUPS_PER_REGION`] group in the Region the
 //! request is signed for, so a create attempted while that Region already holds one
 //! is refused with the modelled `ServiceQuotaExceededException` (402) under the same
-//! lock the insert takes.
+//! lock the insert takes. The emulator's own cross-region store guard
+//! ([`crate::state::MAX_INVESTIGATION_GROUPS`]) refuses a create with that SAME one
+//! sentence ([`crate::state::group_quota_exceeded`]), so no cap this emulator chose is
+//! ever spelled on the wire.
 //!
 //! The `tags` map is a tag write, so the tagging frontend's own 400
 //! `BadRequestException` refuses a key in the reserved
@@ -345,23 +348,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // Creating an investigation group is a one-time setup task per Region: an
         // account holds at most one there, and a create attempted while that one
-        // exists is refused rather than minting a second record.
+        // exists is refused rather than minting a second record. The store is finite
+        // across regions too, so a create that would take it past the emulator's own
+        // cross-region guard is refused rather than growing it. Both guards answer the
+        // operation's ONE quota refusal, worded by
+        // `crate::state::group_quota_exceeded`, so neither cap's number reaches the
+        // wire and a client reads one grammar whichever guard stopped the create.
         if store.group_count_in_region(&region) >= crate::state::MAX_INVESTIGATION_GROUPS_PER_REGION
+            || store.investigation_groups.len() >= crate::state::MAX_INVESTIGATION_GROUPS
         {
             return Err(
                 CreateInvestigationGroupErrorModeled::ServiceQuotaExceededException(
-                    crate::state::region_quota_exceeded(),
-                )
-                .into(),
-            );
-        }
-
-        // The store is finite across regions too: a create that would take it past its
-        // own cap is refused rather than growing it.
-        if store.investigation_groups.len() >= crate::state::MAX_INVESTIGATION_GROUPS {
-            return Err(
-                CreateInvestigationGroupErrorModeled::ServiceQuotaExceededException(
-                    crate::state::store_capacity_exceeded(),
+                    crate::state::group_quota_exceeded(),
                 )
                 .into(),
             );

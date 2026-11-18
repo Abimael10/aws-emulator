@@ -116,7 +116,7 @@ pub const DEFAULT_CLOUD_TRAIL_EVENT_HISTORY_ENABLED: bool = true;
 /// An AWS quota, from `CreateInvestigationGroup`'s own documentation: "Currently, you
 /// can have one investigation group in each Region in your account." A create in a
 /// Region that already holds this many is refused with the modelled
-/// `ServiceQuotaExceededException` ([`region_quota_exceeded`]).
+/// `ServiceQuotaExceededException` ([`group_quota_exceeded`]).
 pub const MAX_INVESTIGATION_GROUPS_PER_REGION: usize = 1;
 
 /// The most investigation groups this emulator will hold ACROSS every Region.
@@ -126,7 +126,8 @@ pub const MAX_INVESTIGATION_GROUPS_PER_REGION: usize = 1;
 /// for is caller-supplied text, so an unbounded number of regions could each hold
 /// their one group. This cap is what keeps the store finite in that direction; a
 /// create that would exceed it is refused with the modelled
-/// `ServiceQuotaExceededException` too ([`store_capacity_exceeded`]).
+/// `ServiceQuotaExceededException` too, worded exactly as the per-Region quota words
+/// that error class ([`group_quota_exceeded`]), so this number never reaches a client.
 pub const MAX_INVESTIGATION_GROUPS: usize = 500;
 
 /// The most tags one group may carry.
@@ -408,7 +409,7 @@ impl ComAmazonawsAiopsAiopsState {
 // grammar above and is not always value-free: what each sentence states, fixed text
 // and variable parts alike, is recorded per error class on the helper that owns it
 // ([`ROLE_NOT_ASSUMABLE`], [`INVALID_POLICY_DOCUMENT`],
-// [`source_role_arn_in_investigation_account`], [`region_quota_exceeded`]). Where
+// [`source_role_arn_in_investigation_account`], [`group_quota_exceeded`]). Where
 // that sentence draws a value from the request, it is the value the request sent,
 // spelled as it sent it.
 //
@@ -1751,46 +1752,36 @@ pub fn arn_account_id(arn: &str) -> Option<&str> {
     (!account.is_empty()).then_some(account)
 }
 
-/// The `ServiceQuotaExceededException` every quota refusal of this service is built
-/// through: the quota that was exceeded, stated in `message`, and the resource type
-/// and service it belongs to.
+/// The ONE `ServiceQuotaExceededException` a `CreateInvestigationGroup` this service
+/// will not mint another investigation group for is refused with — whichever guard
+/// stopped it: the Region the request is signed for already holds this account's group
+/// ([`MAX_INVESTIGATION_GROUPS_PER_REGION`]), or the store has reached its cross-region
+/// resource guard ([`MAX_INVESTIGATION_GROUPS`]).
 ///
-/// `resourceId` and `quotaCode` stay unset: neither is a value this emulator knows,
-/// and the resource the refused create would have minted has no id.
-fn quota_exceeded(message: String) -> ServiceQuotaExceededException {
+/// One function because the operation has ONE sentence for this error class, so a
+/// client keying off the 402 reads one grammar whatever stopped the create. The quota
+/// is published on the operation itself: "Currently, you can have one investigation
+/// group in each Region in your account." The MESSAGE, though, states none of that:
+/// recorded behavior is the fixed sentence [`CANNOT_CREATE_ANOTHER_GROUP`], which names
+/// no count, no Region and nothing the request carried — so neither cap this emulator
+/// enforces appears in it and the wording cannot become a function of emulator
+/// configuration.
+///
+/// `resourceType` and `serviceCode` name the resource and the service the refusal
+/// belongs to. `resourceId` and `quotaCode` stay unset: neither is a value this
+/// emulator knows, and the resource the refused create would have minted has no id.
+pub fn group_quota_exceeded() -> ServiceQuotaExceededException {
     ServiceQuotaExceededException {
-        message: Some(message),
+        message: Some(CANNOT_CREATE_ANOTHER_GROUP.to_string()),
         resource_type: Some(INVESTIGATION_GROUP_RESOURCE.to_string()),
         service_code: Some(ARN_SERVICE.to_string()),
         ..Default::default()
     }
 }
 
-/// The 402 a `CreateInvestigationGroup` is refused with when the Region it is signed
-/// for already holds this account's one investigation group.
-///
-/// The quota is published on the operation itself: "Currently, you can have one
-/// investigation group in each Region in your account." The MESSAGE, though, states
-/// none of that: recorded behavior is the fixed sentence
-/// [`CANNOT_CREATE_ANOTHER_GROUP`], which names no count, no Region and nothing the
-/// request carried — so the cap this emulator enforces
-/// ([`MAX_INVESTIGATION_GROUPS_PER_REGION`]) stays out of it and the wording cannot
-/// become a function of emulator configuration.
-pub fn region_quota_exceeded() -> ServiceQuotaExceededException {
-    quota_exceeded(CANNOT_CREATE_ANOTHER_GROUP.to_string())
-}
-
-/// The sentence a create refused by the per-account/Region investigation-group quota
-/// carries, as the service words that error class: entirely fixed text.
+/// The sentence a create refused by the investigation-group quota carries, as the
+/// service words that error class: entirely fixed text.
 pub const CANNOT_CREATE_ANOTHER_GROUP: &str = "Cannot create another investigation group.";
-
-/// The 402 a create is refused with when the store has reached its cross-region
-/// resource guard, [`MAX_INVESTIGATION_GROUPS`].
-pub fn store_capacity_exceeded() -> ServiceQuotaExceededException {
-    quota_exceeded(format!(
-        "this account already holds the maximum of {MAX_INVESTIGATION_GROUPS} investigation groups"
-    ))
-}
 
 /// Whether `text` has the shape of an investigation-group id.
 ///
