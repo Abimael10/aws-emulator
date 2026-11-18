@@ -2569,18 +2569,28 @@ pub fn firewall_rule_priority_in_use(firewall_rule_group_id: &str) -> Validation
 /// ([`RSLVR_CODE_FIREWALL_RULE_GROUP_HAS_RULE`]): it names the rule group from
 /// the request and tells the caller to delete the rule first. The second
 /// sentence carries the extra space the service writes between the two, as
-/// [`association_priority_in_use`]'s does.
-pub fn firewall_rule_group_has_rule(firewall_rule_group_id: &str) -> ConflictException {
+/// [`association_priority_in_use`]'s does, and the body closes with the trace
+/// clause of the request ([`traced_message`]) — the same close the OTHER
+/// conflict this one operation answers carries
+/// ([`firewall_rule_group_associated_conflict`]), because the clause belongs to
+/// the exception body and not to the fault it reports.
+pub fn firewall_rule_group_has_rule(
+    firewall_rule_group_id: &str,
+    trace_root: &str,
+) -> ConflictException {
     ConflictException {
-        message: Some(rslvr_message_sentences(
-            RSLVR_CODE_FIREWALL_RULE_GROUP_HAS_RULE,
-            &[
-                &format!(
-                    "The DNS Firewall rule group has an associated rule: \
-                     \"{firewall_rule_group_id}\""
-                ),
-                " Delete the rule and try again later",
-            ],
+        message: Some(traced_message(
+            rslvr_message_sentences(
+                RSLVR_CODE_FIREWALL_RULE_GROUP_HAS_RULE,
+                &[
+                    &format!(
+                        "The DNS Firewall rule group has an associated rule: \
+                         \"{firewall_rule_group_id}\""
+                    ),
+                    " Delete the rule and try again later",
+                ],
+            ),
+            trace_root,
         )),
     }
 }

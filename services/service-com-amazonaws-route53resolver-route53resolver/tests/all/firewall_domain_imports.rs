@@ -37,7 +37,9 @@ use service_com_amazonaws_route53resolver_route53resolver::state::{
 use service_com_amazonaws_s3_amazons3::state::{service_state as s3_state, Object};
 use smithy_server_runtime::MultiServiceRouter;
 
-use super::harness::{call, call_in_region, error_type, ok, string_member, REGION};
+use super::harness::{
+    call, call_in_region, error_type, ok, string_member, traced_message, REGION,
+};
 
 /// The bucket every case below stores its domain file in, held by the account
 /// in [`REGION`] — "the file must be in an S3 bucket that's in the same Region
@@ -816,8 +818,17 @@ async fn a_rule_group_and_the_lists_its_rules_referenced_can_be_torn_down() {
                 error_type(&refusal).contains("ConflictException"),
                 "case {case:?}: the refusal must name ConflictException, got {refusal}"
             );
+            let message = string_member(&refusal, "Message");
+            // The refusal closes with the trace clause of the request, which
+            // carries the trace of THIS call, so what is compared is the
+            // sentence stated before it.
+            let (stated, _) = traced_message(&message).unwrap_or_else(|| {
+                panic!(
+                    "case {case:?}: the refusal must close with its trace clause, got {message:?}"
+                )
+            });
             assert_eq!(
-                string_member(&refusal, "Message"),
+                stated,
                 format!(
                     "[RSLVR-02103] The DNS Firewall rule group has an associated rule: \
                      \"{group}\".  Delete the rule and try again later."

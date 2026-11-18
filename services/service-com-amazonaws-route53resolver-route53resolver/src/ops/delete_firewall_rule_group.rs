@@ -204,7 +204,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .is_some_and(|record| !record.rules.is_empty());
         if holds_rules {
             return Err(DeleteFirewallRuleGroupErrorModeled::ConflictException(
-                crate::state::firewall_rule_group_has_rule(&input.firewall_rule_group_id),
+                crate::state::firewall_rule_group_has_rule(
+                    &input.firewall_rule_group_id,
+                    &trace_root,
+                ),
             )
             .into());
         }

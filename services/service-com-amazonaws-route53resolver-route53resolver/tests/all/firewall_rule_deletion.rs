@@ -212,7 +212,10 @@ fn rule_not_found_message(group_id: &str, member: &str, match_source_id: &str) -
 /// The message Route 53 Resolver answers when the rule group a delete names
 /// still holds a rule: the service error code for that fault, the sentence
 /// naming the group the request addressed, and the sentence telling the caller
-/// what to do first — the rules go before the group they are in.
+/// what to do first — the rules go before the group they are in. The trace
+/// clause the service closes this refusal with is not part of this either: it
+/// carries the trace of the request, so what is compared is the sentence before
+/// it ([`stated_sentence`]).
 fn rule_group_has_rule_message(group_id: &str) -> String {
     format!(
         r#"[{RSLVR_CODE_FIREWALL_RULE_GROUP_HAS_RULE}] The DNS Firewall rule group has an associated rule: "{group_id}".  Delete the rule and try again later."#
@@ -969,7 +972,7 @@ async fn the_documented_teardown_order_runs_to_completion() {
                 error_type(&refusal).contains("ConflictException"),
                 "case {case:?}: expected ConflictException, got {refusal}"
             );
-            let message = refusal_message(&refusal);
+            let message = stated_sentence(case, &refusal_message(&refusal));
             assert_eq!(
                 message,
                 rule_group_has_rule_message(&group),

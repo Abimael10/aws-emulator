@@ -10,9 +10,10 @@
 //!   not deleted — the delete is refused `ConflictException` with the service's
 //!   coded sentence for that fault, naming the referencing resource, the
 //!   referenced one is left exactly as it was, and the very same delete is
-//!   served once the reference is gone. The two references are a `FirewallRule`
-//!   matching against a `FirewallDomainList`, and a
-//!   `FirewallRuleGroupAssociation` holding a `FirewallRuleGroup` on a VPC;
+//!   served once the reference is gone. The three references are a
+//!   `FirewallRule` matching against a `FirewallDomainList`, a
+//!   `FirewallRuleGroupAssociation` holding a `FirewallRuleGroup` on a VPC, and
+//!   a `FirewallRule` held inside the `FirewallRuleGroup` it filters with;
 //! * `DisassociateFirewallRuleGroup` removes the association the store holds
 //!   whatever lifecycle step it stands in — removal is not a change a caller has
 //!   to wait for — and only mutation protection refuses it. The removed
@@ -34,8 +35,8 @@ use serde_json::{json, Value};
 use service_com_amazonaws_route53resolver_route53resolver::state::FIREWALL_RULE_GROUP_ASSOCIATION_STATUS_DELETING;
 
 use super::harness::{
-    call, call_tracing, emulator, error_type, ok, settled_association, string_member,
-    traced_message, tracing_chain, Emulator,
+    call, call_tracing, emulator, error_type, ok, settled_association, settled_rule_group,
+    string_member, traced_message, tracing_chain, Emulator,
 };
 
 /// Create one rule group and answer the id Route 53 Resolver minted for it.
@@ -687,4 +688,221 @@ async fn only_mutation_protection_refuses_a_removal() {
         FIREWALL_RULE_GROUP_ASSOCIATION_STATUS_DELETING,
         "the removal the protection refused must be served once it is lifted, got {removed}"
     );
+}
+
+/// One tracing header a request may carry, and the `Root` the refusal it gets
+/// back has to be reported under.
+struct Tracing {
+    case: &'static str,
+    /// The `X-Amzn-Trace-Id` the request carries, or `None` for a caller that
+    /// sends none.
+    header: Option<String>,
+    /// The `Root` the clause has to carry, or `None` where the caller named no
+    /// trace and the service mints one for the request.
+    expected_root: Option<String>,
+}
+
+/// The tracing headers the rows below span: a root with the sampling decision, a
+/// root inside a longer chain naming a parent span, and a caller that sends no
+/// tracing header at all and so has the trace of its request minted for it.
+fn tracings() -> Vec<Tracing> {
+    let (plain_header, plain_root) = tracing_chain(400);
+    let (_, chained_root) = tracing_chain(401);
+    vec![
+        Tracing {
+            case: "a root and the sampling decision",
+            header: Some(plain_header),
+            expected_root: Some(plain_root),
+        },
+        Tracing {
+            case: "a root inside a chain naming a parent span",
+            header: Some(format!(
+                "Root={chained_root};Parent=53995c3f42cd8ad8;Sampled=1"
+            )),
+            expected_root: Some(chained_root),
+        },
+        Tracing {
+            case: "no tracing header at all",
+            header: None,
+            expected_root: None,
+        },
+    ]
+}
+
+/// Assert one refusal reporting a resource the caller cannot address: HTTP 400,
+/// `ResourceNotFoundException`, the coded sentence naming the id the request
+/// stated, and the trace clause of the request.
+fn assert_missing(
+    case: &str,
+    status: u16,
+    parsed: &Value,
+    resource_id: &str,
+    expected_root: Option<&str>,
+) {
+    assert_eq!(
+        status, 400,
+        "case {case:?}: the call must be refused with HTTP 400, got {status}: {parsed}"
+    );
+    assert!(
+        error_type(parsed).contains("ResourceNotFoundException"),
+        "case {case:?}: the refusal must name ResourceNotFoundException, got {parsed}"
+    );
+    let expected = format!("[RSLVR-02025] Can’t find the resource with ID \"{resource_id}\".");
+    let message = string_member(parsed, "Message");
+    let (stated, trace) = traced_message(&message).unwrap_or_else(|| {
+        panic!("case {case:?}: the refusal must close with its trace clause, got {message:?}")
+    });
+    assert_eq!(
+        stated, expected,
+        "case {case:?}: expected the sentence {expected:?}, got {message:?}"
+    );
+    if let Some(root) = expected_root {
+        assert_eq!(
+            trace, root,
+            "case {case:?}: the clause must carry the Root the request named, got {message:?}"
+        );
+        assert_eq!(
+            message,
+            format!("{expected} Trace Id: \"{root}\""),
+            "case {case:?}: the whole message must be the sentence closed by the request's trace \
+             clause, got {message:?}"
+        );
+    }
+}
+
+/// A rule group that still holds a rule is not deleted: the delete is refused
+/// with the coded sentence naming the group, the group keeps the rule it holds,
+/// and the very same delete is served once the rule is gone — after which every
+/// read of that id reports it missing.
+///
+/// Each refusal, whichever fault it reports, closes its coded sentence with the
+/// trace clause of the request, so the rows differ along the tracing header the
+/// REQUEST carries ([`tracings`]): where the caller pins a `Root` the whole
+/// message is compared byte for byte, and where it sends no header the clause
+/// still has to carry a trace the service minted for the request.
+#[tokio::test]
+async fn a_rule_group_that_still_holds_a_rule_cannot_be_deleted() {
+    let router = emulator();
+
+    for (
+        index,
+        Tracing {
+            case,
+            header,
+            expected_root,
+        },
+    ) in tracings().into_iter().enumerate()
+    {
+        let group = rule_group(&router, &format!("holds-a-rule-{index}")).await;
+        let list = domain_list(
+            &router,
+            &format!("holds-a-rule-{index}"),
+            "held.example.com",
+        )
+        .await;
+        ok(
+            &router,
+            "CreateFirewallRule",
+            json!({
+                "CreatorRequestId": format!("holds-a-rule-{index}"),
+                "FirewallRuleGroupId": group,
+                "FirewallDomainListId": list,
+                "Name": format!("holds-a-rule-{index}"),
+                "Priority": 100,
+                "Action": "ALERT",
+            }),
+        )
+        .await;
+        // The change the rule write put in flight is not what refuses the
+        // delete, so the row waits for the group to settle before asking.
+        settled_rule_group(&router, &group, case).await;
+
+        let expected = format!(
+            "[RSLVR-02103] The DNS Firewall rule group has an associated rule: \
+             \"{group}\".  Delete the rule and try again later."
+        );
+        let (status, parsed) = call_tracing(
+            &router,
+            "DeleteFirewallRuleGroup",
+            json!({ "FirewallRuleGroupId": group }),
+            header.as_deref(),
+        )
+        .await;
+        assert_conflict(case, status, &parsed, &expected, expected_root.as_deref());
+        if let Some(root) = &expected_root {
+            let message = string_member(&parsed, "Message");
+            assert_eq!(
+                message,
+                format!("{expected} Trace Id: \"{root}\""),
+                "case {case:?}: the whole message must be the sentence closed by the request's \
+                 trace clause, got {message:?}"
+            );
+        }
+
+        // The refusal wrote nothing: the group is still there, still holding
+        // the rule the delete was refused for.
+        let read = ok(
+            &router,
+            "GetFirewallRuleGroup",
+            json!({ "FirewallRuleGroupId": group }),
+        )
+        .await;
+        assert_eq!(
+            read.get("FirewallRuleGroup")
+                .and_then(|group| group.get("RuleCount"))
+                .and_then(Value::as_i64),
+            Some(1),
+            "case {case:?}: the refused delete must leave the group and its rule, got {read}"
+        );
+
+        // The rule goes first, and then the very same delete is served.
+        ok(
+            &router,
+            "DeleteFirewallRule",
+            json!({ "FirewallRuleGroupId": group, "FirewallDomainListId": list }),
+        )
+        .await;
+        settled_rule_group(&router, &group, case).await;
+        let deleted = ok(
+            &router,
+            "DeleteFirewallRuleGroup",
+            json!({ "FirewallRuleGroupId": group }),
+        )
+        .await;
+        assert_eq!(
+            string_member(
+                deleted
+                    .get("FirewallRuleGroup")
+                    .unwrap_or_else(|| panic!("case {case:?}: the delete answers the group")),
+                "Id"
+            ),
+            group,
+            "case {case:?}: a group holding no rule must be deletable, got {deleted}"
+        );
+
+        // And the id the delete released resolves to nothing, reported with the
+        // trace clause of whichever request asks next.
+        for operation in ["GetFirewallRuleGroup", "DeleteFirewallRuleGroup"] {
+            let (status, parsed) = call_tracing(
+                &router,
+                operation,
+                json!({ "FirewallRuleGroupId": group }),
+                header.as_deref(),
+            )
+            .await;
+            assert_missing(
+                &format!("{case}, on {operation}"),
+                status,
+                &parsed,
+                &group,
+                expected_root.as_deref(),
+            );
+            assert_eq!(
+                string_member(&parsed, "ResourceType"),
+                "FirewallRuleGroup",
+                "case {case:?}: {operation} must name the resource type it could not find, got \
+                 {parsed}"
+            );
+        }
+    }
 }
