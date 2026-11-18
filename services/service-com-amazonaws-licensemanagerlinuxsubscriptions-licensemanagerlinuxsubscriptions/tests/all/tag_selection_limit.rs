@@ -35,7 +35,7 @@ use serde_json::{json, Map, Value};
 
 use crate::harness::{
     harness, provider_arn_for, register, reported_tags_of, seed_provider, stored_provider_count,
-    tag, untag, Harness, Reply, ACCOUNT, RED_HAT,
+    tag, untag, Harness, Reply, ACCOUNT, RED_HAT, UNMODELLED_CODE,
 };
 
 /// The most tags one request may select: the `@length` maximum the model gives every
@@ -52,10 +52,6 @@ const TAG_LIMIT: (u16, &str, &str) = (
     "BadRequestException",
     "The resultant tag set must not have more than 50 user tags.",
 );
-
-/// The code the surface must NOT answer on this path: `UntagResource` models no
-/// `ValidationException`, so a client branching on its modelled errors cannot see it.
-const UNMODELLED_CODE: &str = "ValidationException";
 
 /// The prefix of every generated key, so an assertion can check that the refusal echoes
 /// none of the selection — each member one travels in is `@sensitive`.
@@ -182,20 +178,12 @@ impl Selection {
 
 /// Assert `reply` is the surface's size refusal, and that it states nothing of the
 /// request beyond the limit.
+///
+/// The refusal itself — status, wire code, sentence, and that the code the operation does
+/// not model is absent — is read off the reply through the crate's one refusal assertion;
+/// what this suite adds is that the refusal echoes none of the selection it refused.
 fn assert_tag_limit(reply: &Reply, case: &str) {
-    let (status, code, message) = TAG_LIMIT;
-    reply.error(case, status, code);
-    assert_eq!(
-        reply.message(),
-        message,
-        "case {case:?}: expected the limit stated as {message:?}, got {:?}",
-        reply.message()
-    );
-    let answered = reply.error_type.clone().unwrap_or_default();
-    assert!(
-        !answered.contains(UNMODELLED_CODE),
-        "case {case:?}: the tag surface must not answer {UNMODELLED_CODE}, got {answered:?}"
-    );
+    reply.refused_not_naming(case, TAG_LIMIT, UNMODELLED_CODE);
     assert!(
         !reply.message().contains(KEY_PREFIX),
         "case {case:?}: the refusal must echo none of the selection, got {:?}",

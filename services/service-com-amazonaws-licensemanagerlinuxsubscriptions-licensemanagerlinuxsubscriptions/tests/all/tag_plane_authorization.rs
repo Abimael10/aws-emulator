@@ -163,19 +163,6 @@ async fn every_tag_call(h: &Harness, arn: &str) -> Vec<(String, Reply)> {
     answered
 }
 
-/// Assert `reply` is the refusal `expected` states: its HTTP status, its wire error code and
-/// its message.
-fn assert_refused(reply: &Reply, case: &str, expected: (u16, &str, &str)) {
-    let (status, code, message) = expected;
-    reply.error(case, status, code);
-    assert_eq!(
-        reply.message(),
-        message,
-        "case {case:?}: expected message {message:?}, got {:?}",
-        reply.message()
-    );
-}
-
 /// The tag set the live resource is expected to carry: exactly what it was seeded with.
 fn stored_set() -> BTreeMap<String, String> {
     STORED
@@ -258,7 +245,7 @@ async fn the_same_arn_shapes_in_the_callers_account_keep_the_surfaces_not_found(
         }
         for (call, reply) in every_tag_call(&h, &arn).await {
             let case = format!("{call} on {shape} in the caller's account");
-            assert_refused(&reply, &case, NOT_FOUND);
+            reply.refused(&case, NOT_FOUND);
         }
     }
 
@@ -303,7 +290,7 @@ async fn a_write_with_an_empty_tags_map_is_refused_before_the_resource_is_resolv
         for attempt in 0..2 {
             let case = format!("TagResource with an empty tags map on {label}, attempt {attempt}");
             let reply = tag(&h, arn, &empty).await;
-            assert_refused(&reply, &case, EMPTY_TAGS);
+            reply.refused(&case, EMPTY_TAGS);
             assert!(
                 !reply.message().contains(arn),
                 "case {case:?}: the refusal states the condition and nothing of the request, \

@@ -46,6 +46,7 @@ use crate::harness::{
     deregister, get_provider, harness, list_tags, provider_arn_for, reported_tags, seed_provider,
     stored_provider_count, tag, Harness, Reply, ACCOUNT, RED_HAT, REGION, SIGNING_NAME,
 };
+
 use service_com_amazonaws_licensemanagerlinuxsubscriptions_licensemanagerlinuxsubscriptions::ComAmazonawsLicensemanagerlinuxsubscriptionsLicensemanagerlinuxsubscriptionsState as ServiceState;
 
 /// The largest tag set a resource may carry: the modelled `Tags` map is `len 0..50`,
@@ -64,18 +65,6 @@ const TAG_LIMIT: (u16, &str, &str) = (
     "BadRequestException",
     "The resultant tag set must not have more than 50 user tags.",
 );
-
-/// Assert `reply` is the HTTP status, wire error code and message of `refusal`.
-fn assert_refused(reply: &Reply, case: &str, refusal: (u16, &str, &str)) {
-    let (status, code, message) = refusal;
-    reply.error(case, status, code);
-    assert_eq!(
-        reply.message(),
-        message,
-        "case {case:?}: expected message {message:?}, got body {:?}",
-        reply.body
-    );
-}
 
 /// A JSON tag map from `(key, value)` pairs.
 fn tag_map(pairs: &[(String, String)]) -> Value {
@@ -348,14 +337,12 @@ async fn an_arn_addressing_no_resource_is_refused_by_both_tag_operations() {
 
     for (label, arn) in &unknown {
         let case = format!("TagResource on {label}");
-        assert_refused(
-            &tag_resource(&h, arn, &pairs(&[("env", "prod")])).await,
-            &case,
-            NOT_FOUND,
-        );
+        tag_resource(&h, arn, &pairs(&[("env", "prod")]))
+            .await
+            .refused(&case, NOT_FOUND);
 
         let case = format!("ListTagsForResource on {label}");
-        assert_refused(&list_tags(&h, arn).await, &case, NOT_FOUND);
+        list_tags(&h, arn).await.refused(&case, NOT_FOUND);
     }
 
     // Nothing the refused writes carried was stored: the store still holds exactly the
@@ -414,7 +401,7 @@ async fn a_write_past_the_tag_maximum_is_refused_and_stores_nothing() {
             reply.ok(&case);
             want.extend(added_pairs.iter().cloned());
         } else {
-            assert_refused(&reply, &case, TAG_LIMIT);
+            reply.refused(&case, TAG_LIMIT);
         }
 
         let got = reported_tags(&list_tags(&h, &arn).await, &case);

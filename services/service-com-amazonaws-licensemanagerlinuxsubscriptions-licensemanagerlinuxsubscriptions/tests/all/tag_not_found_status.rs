@@ -39,7 +39,7 @@ use serde_json::{json, Map, Value};
 
 use crate::harness::{
     deregister, get_provider, harness, list_tags, provider_arn_for, seed_provider, tag, untag,
-    Reply, REGION, SIGNING_NAME,
+    REGION, SIGNING_NAME,
 };
 
 /// A Secrets Manager ARN satisfying the modelled `SecretArn` pattern.
@@ -74,18 +74,6 @@ const PROVIDER_NOT_FOUND: (u16, &str, &str) = (
     "ResourceNotFoundException",
     "Registered Subscription Provider not found",
 );
-
-/// Assert `reply` is the HTTP status, wire error code and message of `refusal`.
-fn assert_refused(reply: &Reply, case: &str, refusal: (u16, &str, &str)) {
-    let (status, code, message) = refusal;
-    reply.error(case, status, code);
-    assert_eq!(
-        reply.message(),
-        message,
-        "case {case:?}: expected message {message:?}, got {:?}",
-        reply.message()
-    );
-}
 
 /// `count` distinct pairs, as the `tags` map of a `TagResource` body.
 fn tag_map(count: usize) -> Value {
@@ -163,7 +151,9 @@ async fn an_unregistered_resource_arn_is_reported_absent_with_http_404() {
             // this rule — `tag_plane_authorization.rs` pins that refusal.)
             for pairs in [1_usize, 2, 50] {
                 let case = format!("TagResource on {label} with {pairs} pair(s), attempt {attempt}");
-                assert_refused(&tag(&h, &arn, &tag_map(pairs)).await, &case, NOT_FOUND);
+                tag(&h, &arn, &tag_map(pairs))
+                    .await
+                    .refused(&case, NOT_FOUND);
             }
             // A removal: same, over the number of keys it names (the modelled `tagKeys`
             // maximum is 50).
@@ -172,11 +162,13 @@ async fn an_unregistered_resource_arn_is_reported_absent_with_http_404() {
                 let selection: Vec<&str> = named.iter().map(String::as_str).collect();
                 let case =
                     format!("UntagResource on {label} naming {keys} key(s), attempt {attempt}");
-                assert_refused(&untag(&h, &arn, &selection).await, &case, NOT_FOUND);
+                untag(&h, &arn, &selection)
+                    .await
+                    .refused(&case, NOT_FOUND);
             }
             // And the read.
             let case = format!("ListTagsForResource on {label}, attempt {attempt}");
-            assert_refused(&list_tags(&h, &arn).await, &case, NOT_FOUND);
+            list_tags(&h, &arn).await.refused(&case, NOT_FOUND);
         }
     }
 
@@ -226,11 +218,11 @@ async fn a_bad_request_on_the_tag_apis_keeps_http_400() {
     ];
     for arn in unparseable {
         let case = format!("TagResource with {arn}");
-        assert_refused(&tag(&h, arn, &tag_map(1)).await, &case, BAD_ARN);
+        tag(&h, arn, &tag_map(1)).await.refused(&case, BAD_ARN);
         let case = format!("ListTagsForResource with {arn}");
-        assert_refused(&list_tags(&h, arn).await, &case, BAD_ARN);
+        list_tags(&h, arn).await.refused(&case, BAD_ARN);
         let case = format!("UntagResource with {arn}");
-        assert_refused(&untag(&h, arn, &["env"]).await, &case, BAD_ARN);
+        untag(&h, arn, &["env"]).await.refused(&case, BAD_ARN);
     }
 
     // A tag set one past the modelled maximum is a wrong request on BOTH a resource that
@@ -245,7 +237,7 @@ async fn a_bad_request_on_the_tag_apis_keeps_http_400() {
         ),
     ] {
         let case = format!("TagResource with 51 pairs on {label}");
-        assert_refused(&tag(&h, &arn, &over_limit).await, &case, TAG_LIMIT);
+        tag(&h, &arn, &over_limit).await.refused(&case, TAG_LIMIT);
     }
 
     // The edge of the rule: the subscription-provider operations answer their OWN
@@ -255,8 +247,12 @@ async fn a_bad_request_on_the_tag_apis_keeps_http_400() {
     deregister(&h, &gone).await.ok("deregister that provider");
     for (label, arn) in unregistered(&live, &gone) {
         let case = format!("GetRegisteredSubscriptionProvider on {label}");
-        assert_refused(&get_provider(&h, &arn).await, &case, PROVIDER_NOT_FOUND);
+        get_provider(&h, &arn)
+            .await
+            .refused(&case, PROVIDER_NOT_FOUND);
         let case = format!("DeregisterSubscriptionProvider on {label}");
-        assert_refused(&deregister(&h, &arn).await, &case, PROVIDER_NOT_FOUND);
+        deregister(&h, &arn)
+            .await
+            .refused(&case, PROVIDER_NOT_FOUND);
     }
 }

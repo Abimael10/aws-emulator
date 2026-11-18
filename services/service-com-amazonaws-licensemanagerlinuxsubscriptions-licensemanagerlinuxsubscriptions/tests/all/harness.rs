@@ -55,6 +55,13 @@ pub const INVALID: &str = PROVIDER_STATUS_INVALID;
 /// it back out of the handler it is testing.
 pub const TOKEN_REFUSAL_MESSAGE: &str = "The subscription provider token is invalid or expired";
 
+/// The wire error code the tagging surface's own refusals must never name: `UntagResource`
+/// declares no error for it (`smithy_query(query="operation",operation="UntagResource")`
+/// lists `InternalServerException` and `ResourceNotFoundException` only), so a client
+/// branching on that operation's modelled errors cannot see it. Named once here, for
+/// [`Reply::refused_not_naming`]'s callers.
+pub const UNMODELLED_CODE: &str = "ValidationException";
+
 /// Base64url-encode `bytes` the way a JWT segment is encoded; `pad` selects whether the
 /// segment carries the `=` padding, which a token may be encoded with or without.
 ///
@@ -242,6 +249,37 @@ impl Reply {
     /// The `message` member of an error body, or `""` when there is none.
     pub fn message(&self) -> &str {
         self.body.get("message").and_then(Value::as_str).unwrap_or("")
+    }
+
+    /// Assert this reply is the refusal `refusal` states: its HTTP status, its wire error
+    /// code and its message.
+    ///
+    /// The ONE statement of what "this reply is that refusal" means in this crate, built
+    /// from [`Reply::error`] and [`Reply::message`]: a suite names the refusal it expects
+    /// and reads the answered one through here, so the same reply is reported the same way
+    /// whichever suite observed it.
+    pub fn refused(&self, case: &str, refusal: (u16, &str, &str)) {
+        let (status, code, message) = refusal;
+        self.error(case, status, code);
+        assert_eq!(
+            self.message(),
+            message,
+            "case {case:?}: expected message {message:?}, got {:?} with body {:?}",
+            self.message(),
+            self.body
+        );
+    }
+
+    /// The same refusal, plus: the code answered is not `unmodelled` — the code the called
+    /// operation declares no error for, which a client branching on its modelled errors
+    /// cannot see.
+    pub fn refused_not_naming(&self, case: &str, refusal: (u16, &str, &str), unmodelled: &str) {
+        self.refused(case, refusal);
+        let answered = self.error_type.as_deref().unwrap_or("<none>");
+        assert!(
+            !answered.contains(unmodelled),
+            "case {case:?}: the refusal must not name {unmodelled}, got {answered:?}"
+        );
     }
 }
 

@@ -45,7 +45,7 @@ use serde_json::{json, Value};
 
 use crate::harness::{
     harness, list_tags, percent_encode, provider_arn_for, seed_provider, send, tag, untag,
-    Harness, Reply, REGION,
+    Harness, Reply, REGION, UNMODELLED_CODE,
 };
 
 /// The code the refusals this surface states itself name, with the HTTP status that goes
@@ -55,10 +55,6 @@ const SURFACE_REFUSAL: (u16, &str) = (400, "BadRequestException");
 /// The code the service's modelled constraint envelope names, with its status: what a
 /// class the surface states no refusal of its own for keeps.
 const MODELLED_REFUSAL: (u16, &str) = (400, "ValidationException");
-
-/// The code a refusal of `UntagResource` must never name: that operation models no
-/// `ValidationException`, so a client branching on its modelled errors cannot see it.
-const UNDECLARED_CODE: &str = "ValidationException";
 
 /// The sentence stating a required request parameter the request did not carry: the fixed
 /// text, over the list of parameter names to add — here the one `@httpQuery` parameter
@@ -174,25 +170,17 @@ async fn reported_tags(h: &Harness, arn: &str, case: &str) -> BTreeMap<String, S
 
 /// Assert `reply` is the refusal `expected` states — status, wire code and sentence —
 /// and that a refusal of `operation` never names a code that operation does not model.
-fn assert_refusal(
-    reply: &Reply,
-    case: &str,
-    operation: &str,
-    expected: (u16, &str, &str),
-) {
-    let (status, code, message) = expected;
-    reply.error(case, status, code);
-    assert_eq!(
-        reply.message(),
-        message,
-        "case {case:?}: expected {message:?}, got {:?}",
-        reply.message()
-    );
-    let answered = reply.error_type.clone().unwrap_or_default();
-    assert!(
-        operation != "UntagResource" || !answered.contains(UNDECLARED_CODE),
-        "case {case:?}: {operation} models no {UNDECLARED_CODE}, got {answered:?}"
-    );
+///
+/// Both halves are read off the reply through the crate's one refusal assertion
+/// (`harness::Reply::refused` / `refused_not_naming`); what this row adds is WHICH
+/// operation the undeclared code is asserted against: `UntagResource` models no
+/// `ValidationException`, while the boundary row's `TagResource` declares it.
+fn assert_refusal(reply: &Reply, case: &str, operation: &str, expected: (u16, &str, &str)) {
+    if operation == "UntagResource" {
+        reply.refused_not_naming(case, expected, UNMODELLED_CODE);
+    } else {
+        reply.refused(case, expected);
+    }
 }
 
 /// The rule, over every class of refusal the surface states itself plus the boundary row

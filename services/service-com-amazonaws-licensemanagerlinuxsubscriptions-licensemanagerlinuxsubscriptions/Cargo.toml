@@ -43,6 +43,9 @@ aws-sdk-ec2 = { version = "1", default-features = false }
 emulator-core-build-support = { workspace = true }
 
 [dev-dependencies]
+# One integration-test target rooted at `tests/all/main.rs`: `automod` declares one module
+# per `tests/all/<name>.rs`, so a new suite is picked up by being there.
+automod = { workspace = true }
 # The registration suites mount Secrets Manager beside this service on one engine, because
 # `RegisterSubscriptionProvider` reads the secret its `SecretArn` names by calling it.
 service-com-amazonaws-secretsmanager-secretsmanager = { workspace = true }
