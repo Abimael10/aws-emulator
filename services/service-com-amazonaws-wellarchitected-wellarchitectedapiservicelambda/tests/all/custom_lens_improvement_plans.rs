@@ -134,7 +134,8 @@ const ROWS: &[Row] = &[
 /// A lens document defining ONE pillar with ONE question whose choices carry `choices`'
 /// improvement plans, following the lens JSON format specification: the `schemaVersion` the
 /// import requires, a per-choice `improvementPlan` object with its `displayText` and
-/// optional `url`, and one risk rule per choice with the `default` condition on the last.
+/// optional `url`, and risk rules with the `default` condition on the last
+/// (`super::custom_lens_import::authored_risk_rules`).
 fn document(name: &str, choices: &[Plan]) -> Value {
     let choice_ids = choice_ids(choices.len());
     let choices_json: Vec<Value> = choice_ids
@@ -152,11 +153,7 @@ fn document(name: &str, choices: &[Plan]) -> Value {
             choice
         })
         .collect();
-    let mut rules: Vec<Value> = choice_ids
-        .iter()
-        .map(|choice_id| json!({ "condition": choice_id, "risk": "NO_RISK" }))
-        .collect();
-    rules.push(json!({ "condition": "default", "risk": "HIGH_RISK" }));
+    let rules = super::custom_lens_import::authored_risk_rules(&choice_ids);
     json!({
         "schemaVersion": SCHEMA_VERSION,
         "name": name,

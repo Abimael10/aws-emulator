@@ -18,6 +18,12 @@
 //! recorded answer and the risk derived from it move with. The AWS-official half of the
 //! catalog is written through the same resolution, which the official-lens test here pins.
 //!
+//! The second rule pinned here is how a custom lens review GRADES such an answer: by the
+//! `riskRules` the lens document authored for that question, evaluated in order over the
+//! choices the answer records as in place
+//! (`an_answer_to_a_custom_lens_question_is_graded_by_the_authored_risk_rules`), whose rows
+//! differ along the form of the authored conditions and the risks they assign.
+//!
 //! Requests go through the real `MultiServiceRouter`, so routing, restJson1
 //! (de)serialization, boundary constraint validation and the handler all run as they do in
 //! production. The HTTP client is the shared `super::workload_harness`; the import and
@@ -852,5 +858,526 @@ async fn a_review_templates_imported_lens_review_can_be_answered() {
             "No question with ID {FRAMEWORK_QUESTION} was found in the lens with alias \
              {lens_arn}."
         ),
+    );
+}
+
+/// One question whose grading is under test: its id, the choices its document offers, the
+/// `riskRules` the document AUTHORS for it as `(condition, risk)` pairs in the document's
+/// own order, and the selections to answer it with, each with the `Risk` those rules rate
+/// that selection at.
+///
+/// The rows differ along the FORM of the authored conditions (a conjunction, a disjunction,
+/// a negation, a parenthesised group, a bare choice id, an id that is not an identifier),
+/// along the risks the rules assign (every member of the document's vocabulary, including a
+/// `default` rule that CLEARS rather than raises), along how many choices a question offers
+/// and along which of them a selection names — because every one of those is what the
+/// derivation is a function of.
+struct Graded {
+    question_id: &'static str,
+    choices: &'static [&'static str],
+    rules: &'static [(&'static str, &'static str)],
+    selections: &'static [(&'static [&'static str], &'static str)],
+}
+
+/// The risks a lens document's `riskRules` may assign, from the lens JSON format
+/// specification the `ImportLens` doc points at, beside the `Risk` enum member each maps to
+/// (`smithy_query(query="shape", shape="Risk")`).
+const NO_RISK: &str = "NO_RISK";
+const MEDIUM_RISK: &str = "MEDIUM_RISK";
+const HIGH_RISK: &str = "HIGH_RISK";
+
+/// The reserved condition the format requires on a question's LAST risk rule: the one that
+/// applies when no rule above it matched.
+const DEFAULT_CONDITION: &str = "default";
+
+/// The questions whose authored rules this suite grades answers against.
+const GRADED_QUESTIONS: &[Graded] = &[
+    // A conjunction clears the question, a bare id reduces it and `default` rates what is
+    // left — and an empty selection is UNANSWERED before any rule runs, so the `default`
+    // rule does not rate it.
+    Graded {
+        question_id: "conjunction",
+        choices: &["conjunction_c1", "conjunction_c2"],
+        rules: &[
+            ("conjunction_c1 && conjunction_c2", NO_RISK),
+            ("conjunction_c1", MEDIUM_RISK),
+            (DEFAULT_CONDITION, HIGH_RISK),
+        ],
+        selections: &[
+            (&[], "UNANSWERED"),
+            (&["conjunction_c2"], "HIGH"),
+            (&["conjunction_c1"], "MEDIUM"),
+            (&["conjunction_c1", "conjunction_c2"], "NONE"),
+        ],
+    },
+    // The same rule set, ending on the selection that matches only `default`.
+    Graded {
+        question_id: "falls-through",
+        choices: &["falls-through_c1", "falls-through_c2"],
+        rules: &[
+            ("falls-through_c1 && falls-through_c2", NO_RISK),
+            ("falls-through_c1", MEDIUM_RISK),
+            (DEFAULT_CONDITION, HIGH_RISK),
+        ],
+        selections: &[
+            (&["falls-through_c1", "falls-through_c2"], "NONE"),
+            (&["falls-through_c1"], "MEDIUM"),
+            (&["falls-through_c2"], "HIGH"),
+        ],
+    },
+    Graded {
+        question_id: "reduced",
+        choices: &["reduced_c1", "reduced_c2"],
+        rules: &[
+            ("reduced_c1 && reduced_c2", NO_RISK),
+            ("reduced_c1", MEDIUM_RISK),
+            (DEFAULT_CONDITION, HIGH_RISK),
+        ],
+        selections: &[(&["reduced_c1"], "MEDIUM")],
+    },
+    // A disjunction holds for any one of the choices it names.
+    Graded {
+        question_id: "disjunction",
+        choices: &["disjunction_c1", "disjunction_c2"],
+        rules: &[
+            ("disjunction_c1 || disjunction_c2", NO_RISK),
+            (DEFAULT_CONDITION, HIGH_RISK),
+        ],
+        selections: &[
+            (&["disjunction_c1"], "NONE"),
+            (&["disjunction_c2"], "NONE"),
+            (&[], "UNANSWERED"),
+            (&["disjunction_c1", "disjunction_c2"], "NONE"),
+        ],
+    },
+    // A negated id holds while that choice is NOT in place.
+    Graded {
+        question_id: "negation",
+        choices: &["negation_c1", "negation_c2"],
+        rules: &[
+            ("negation_c1 && !negation_c2", MEDIUM_RISK),
+            ("negation_c1 && negation_c2", NO_RISK),
+            (DEFAULT_CONDITION, HIGH_RISK),
+        ],
+        selections: &[
+            (&["negation_c1"], "MEDIUM"),
+            (&["negation_c1", "negation_c2"], "NONE"),
+            (&["negation_c2"], "HIGH"),
+        ],
+    },
+    // Parentheses group, so the condition is not read left to right.
+    Graded {
+        question_id: "grouped",
+        choices: &["grouped_c1", "grouped_c2", "grouped_c3"],
+        rules: &[
+            ("(grouped_c1 || grouped_c2) && grouped_c3", NO_RISK),
+            ("grouped_c3", MEDIUM_RISK),
+            (DEFAULT_CONDITION, HIGH_RISK),
+        ],
+        selections: &[
+            (&["grouped_c1", "grouped_c3"], "NONE"),
+            (&["grouped_c2", "grouped_c3"], "NONE"),
+            (&["grouped_c3"], "MEDIUM"),
+            (&["grouped_c1", "grouped_c2"], "HIGH"),
+        ],
+    },
+    // The rules are evaluated IN ORDER, so a selection matching two of them takes the
+    // FIRST one's risk: the same two rules in the other order would clear this question.
+    Graded {
+        question_id: "ordered",
+        choices: &["ordered_c1", "ordered_c2"],
+        rules: &[
+            ("ordered_c1", MEDIUM_RISK),
+            ("ordered_c1 && ordered_c2", NO_RISK),
+            (DEFAULT_CONDITION, HIGH_RISK),
+        ],
+        selections: &[
+            (&["ordered_c1", "ordered_c2"], "MEDIUM"),
+            (&["ordered_c2"], "HIGH"),
+        ],
+    },
+    // `default` is the fallback, not a fixed rating: a document may clear a question with
+    // it and raise one with a condition above it.
+    Graded {
+        question_id: "default-clears",
+        choices: &["default-clears_c1", "default-clears_c2"],
+        rules: &[
+            ("default-clears_c1", HIGH_RISK),
+            (DEFAULT_CONDITION, NO_RISK),
+        ],
+        selections: &[
+            (&["default-clears_c1"], "HIGH"),
+            (&["default-clears_c2"], "NONE"),
+        ],
+    },
+    // One choice, so "every choice" and "the first choice" are the same selection.
+    Graded {
+        question_id: "single-choice",
+        choices: &["single-choice_c1"],
+        rules: &[
+            ("single-choice_c1", MEDIUM_RISK),
+            (DEFAULT_CONDITION, HIGH_RISK),
+        ],
+        selections: &[(&["single-choice_c1"], "MEDIUM")],
+    },
+    // A `ChoiceId` is any 1..64-character string (`smithy_query(query="shape",
+    // shape="ChoiceId")`), so a condition's atoms are not restricted to identifiers.
+    Graded {
+        question_id: "punctuated-ids",
+        choices: &["punctuated.c-1", "punctuated.c-2"],
+        rules: &[
+            ("punctuated.c-1 && punctuated.c-2", NO_RISK),
+            ("punctuated.c-2", MEDIUM_RISK),
+            (DEFAULT_CONDITION, HIGH_RISK),
+        ],
+        selections: &[
+            (&["punctuated.c-2"], "MEDIUM"),
+            (&["punctuated.c-1", "punctuated.c-2"], "NONE"),
+            (&["punctuated.c-1"], "HIGH"),
+        ],
+    },
+    // Answered, then recorded as not applying to this review: the review's own word
+    // outranks what the rules would rate the selection at.
+    Graded {
+        question_id: "not-applicable",
+        choices: &["not-applicable_c1", "not-applicable_c2"],
+        rules: &[
+            ("not-applicable_c1", NO_RISK),
+            (DEFAULT_CONDITION, HIGH_RISK),
+        ],
+        selections: &[(&["not-applicable_c1"], "NONE")],
+    },
+    // Never answered, so still UNANSWERED however its rules would rate a selection.
+    Graded {
+        question_id: "untouched",
+        choices: &["untouched_c1", "untouched_c2"],
+        rules: &[("untouched_c1", NO_RISK), (DEFAULT_CONDITION, HIGH_RISK)],
+        selections: &[],
+    },
+    // A condition that is not an expression grades nothing, so the rules after it decide:
+    // the format bounds the TEXT of a condition and says nothing more about it, so a lens
+    // may author text like this and an answer must still be rated.
+    Graded {
+        question_id: "unparsable",
+        choices: &["unparsable_c1", "unparsable_c2"],
+        rules: &[
+            ("unparsable_c1 &&", NO_RISK),
+            ("unparsable_c1", MEDIUM_RISK),
+            (DEFAULT_CONDITION, HIGH_RISK),
+        ],
+        selections: &[
+            (&["unparsable_c1", "unparsable_c2"], "MEDIUM"),
+            (&["unparsable_c2"], "HIGH"),
+            (&["unparsable_c1"], "MEDIUM"),
+        ],
+    },
+];
+
+/// The `QuestionId` of the question the table records as not applying to its review, after
+/// answering it.
+const NOT_APPLICABLE_QUESTION: &str = "not-applicable";
+
+/// A lens document whose single pillar asks `questions`, each with the choices and the
+/// authored `riskRules` its row spells out — the lens JSON format specification's own
+/// properties, as `super::custom_lens_import::lens_document` writes them for a document
+/// built from counts.
+fn graded_lens_document(name: &str, questions: &[Graded]) -> Value {
+    let questions_json: Vec<Value> = questions
+        .iter()
+        .map(|question| {
+            let choices: Vec<Value> = question
+                .choices
+                .iter()
+                .map(|choice_id| json!({ "id": choice_id, "title": format!("Choice {choice_id}") }))
+                .collect();
+            let rules: Vec<Value> = question
+                .rules
+                .iter()
+                .map(|(condition, risk)| json!({ "condition": condition, "risk": risk }))
+                .collect();
+            json!({
+                "id": question.question_id,
+                "title": format!("How is {} governed?", question.question_id),
+                "description": "what this question asks about",
+                "choices": choices,
+                "riskRules": rules,
+            })
+        })
+        .collect();
+    json!({
+        "schemaVersion": "2021-11-01",
+        "name": name,
+        "pillars": [{
+            "id": "governance",
+            "name": "Pillar 0: governance",
+            "questions": questions_json,
+        }],
+    })
+}
+
+/// The `Risk` an answer carries, from the `Answer` a read or a write reported.
+fn risk_of(answer: &Answer) -> String {
+    string_member(&answer_of(answer), "Risk")
+}
+
+/// `GetLensReview`: `GET /workloads/{WorkloadId}/lensReviews/{LensAlias}`.
+async fn lens_review(client: &Client, workload_id: &str, lens: &str) -> Value {
+    let answer = client
+        .send(
+            "GET",
+            &format!(
+                "/workloads/{}/lensReviews/{}",
+                encode_path_segment(workload_id),
+                encode_path_segment(lens)
+            ),
+            None,
+        )
+        .await;
+    assert_eq!(
+        answer.status, 200,
+        "GetLensReview must report the review, got {answer:?}"
+    );
+    answer
+        .body
+        .get("LensReview")
+        .cloned()
+        .unwrap_or(Value::Null)
+}
+
+/// The `LensReviewSummary` `ListLensReviews` reports for `lens`.
+async fn lens_review_summary(client: &Client, workload_id: &str, lens: &str) -> Value {
+    let answer = client
+        .send(
+            "GET",
+            &format!(
+                "/workloads/{}/lensReviews",
+                encode_path_segment(workload_id)
+            ),
+            None,
+        )
+        .await;
+    assert_eq!(
+        answer.status, 200,
+        "ListLensReviews must report the workload's reviews, got {answer:?}"
+    );
+    answer
+        .body
+        .get("LensReviewSummaries")
+        .and_then(Value::as_array)
+        .and_then(|summaries| {
+            summaries
+                .iter()
+                .find(|summary| string_member(summary, "LensArn") == lens)
+                .cloned()
+        })
+        .unwrap_or_else(|| panic!("the review of {lens} must be listed, got {answer:?}"))
+}
+
+/// One `RiskCounts` map as a comparable histogram: every `Risk` the enum publishes, so a
+/// bucket a roll-up left out is a difference rather than an absence.
+fn risk_counts(value: &Value) -> std::collections::BTreeMap<String, i64> {
+    const RISKS: [&str; 5] = ["HIGH", "MEDIUM", "NONE", "NOT_APPLICABLE", "UNANSWERED"];
+    let counts = value.get("RiskCounts");
+    RISKS
+        .iter()
+        .map(|risk| {
+            let count = counts
+                .and_then(|counts| counts.get(*risk))
+                .and_then(Value::as_i64)
+                .unwrap_or_default();
+            ((*risk).to_string(), count)
+        })
+        .collect()
+}
+
+/// The rule: a question of a CUSTOM lens review is graded by the risk rules the lens
+/// DOCUMENT authored for it — the first rule whose condition holds over the choices the
+/// answer records as in place decides the `Risk`, the reserved `default` condition holding
+/// for every selection the rules above it leave, and the document's risk names mapping to
+/// the `Risk` enum (`NO_RISK` → `NONE`, `MEDIUM_RISK` → `MEDIUM`, `HIGH_RISK` → `HIGH`) —
+/// while an answer that selects nothing is `UNANSWERED` before any rule runs and one the
+/// review records as not applying is `NOT_APPLICABLE`.
+///
+/// The derived value is what every read of the review reports: the write's own answer, the
+/// single-answer read, the review's answer list, and the `RiskCounts` of the lens review and
+/// of its pillar, which equal the histogram of the review's own answers.
+#[tokio::test]
+async fn an_answer_to_a_custom_lens_question_is_graded_by_the_authored_risk_rules() {
+    let client = Client::new();
+    let case = "authored-rules";
+    let document = graded_lens_document("Lens authored rules", GRADED_QUESTIONS).to_string();
+    let lens_arn = imported_arn(
+        &import(&client, &document, None, "tok-import-authored", None).await,
+        case,
+    );
+    wait_for_the_import_to_land();
+    publish(&client, case, &lens_arn).await;
+    let workload_id = workload_reviewing(&client, case, &lens_arn).await;
+
+    // The questions as a CLIENT discovers them, before anything is answered.
+    let listed = listed_answers(&client, case, &workload_id, &lens_arn).await;
+    let discovered: Vec<String> = listed
+        .iter()
+        .map(|summary| string_member(summary, "QuestionId"))
+        .collect();
+    let authored: Vec<String> = GRADED_QUESTIONS
+        .iter()
+        .map(|question| question.question_id.to_string())
+        .collect();
+    assert_eq!(
+        discovered, authored,
+        "case {case:?}: the review asks the questions the document defines, got {discovered:?}"
+    );
+
+    // The `Risk` each question ends up at: the last selection answered for it, and
+    // `UNANSWERED` for a question no selection answered.
+    let mut expected_final: Vec<(&str, &str)> = Vec::new();
+
+    for question in GRADED_QUESTIONS {
+        expected_final.push((
+            question.question_id,
+            question
+                .selections
+                .last()
+                .map_or("UNANSWERED", |(_, risk)| *risk),
+        ));
+        for (selected, expected) in question.selections {
+            let sent: Vec<String> = selected.iter().map(|id| (*id).to_string()).collect();
+            let case = format!("{}-{selected:?}", question.question_id);
+            let written = update_answer(
+                &client,
+                &workload_id,
+                &lens_arn,
+                question.question_id,
+                json!({ "SelectedChoices": sent }),
+            )
+            .await;
+            assert_eq!(
+                written.status, 200,
+                "case {case:?}: a question the lens defines must be answerable, got {written:?}"
+            );
+            let rated = risk_of(&written);
+            assert_eq!(
+                rated, *expected,
+                "case {case:?}: the authored rules rate this selection {expected}, got {rated} \
+                 in {written:?}"
+            );
+            assert_eq!(
+                strings(&answer_of(&written), "SelectedChoices"),
+                sent,
+                "case {case:?}: the choices in place are the ones the request named, got \
+                 {written:?}"
+            );
+
+            // Derived from what is recorded, so the single-answer read agrees with the
+            // write that produced it.
+            let read = get_answer(&client, &workload_id, &lens_arn, question.question_id).await;
+            assert_eq!(
+                read.status, 200,
+                "case {case:?}: the answer must be readable back, got {read:?}"
+            );
+            let read_risk = risk_of(&read);
+            assert_eq!(
+                read_risk, *expected,
+                "case {case:?}: GetAnswer must report the same rating as the write, got \
+                 {read_risk} in {read:?}"
+            );
+        }
+    }
+
+    // A question the review records as not applying to it is `NOT_APPLICABLE`, whatever its
+    // rules rate the selection it still carries at.
+    let not_applicable = update_answer(
+        &client,
+        &workload_id,
+        &lens_arn,
+        NOT_APPLICABLE_QUESTION,
+        json!({ "IsApplicable": false, "Reason": "OUT_OF_SCOPE" }),
+    )
+    .await;
+    assert_eq!(
+        not_applicable.status, 200,
+        "case {case:?}: the question must be recordable as not applying, got {not_applicable:?}"
+    );
+    let rated = risk_of(&not_applicable);
+    assert_eq!(
+        rated, "NOT_APPLICABLE",
+        "case {case:?}: a question that does not apply is NOT_APPLICABLE, got {rated}"
+    );
+    for entry in &mut expected_final {
+        if entry.0 == NOT_APPLICABLE_QUESTION {
+            entry.1 = "NOT_APPLICABLE";
+        }
+    }
+
+    // Every read of the review reports the same derived value, and the roll-ups count it.
+    let answered = listed_answers(&client, case, &workload_id, &lens_arn).await;
+    let listed_risks: Vec<(String, String)> = answered
+        .iter()
+        .map(|summary| {
+            (
+                string_member(summary, "QuestionId"),
+                string_member(summary, "Risk"),
+            )
+        })
+        .collect();
+    let expected_risks: Vec<(String, String)> = expected_final
+        .iter()
+        .map(|(question_id, risk)| ((*question_id).to_string(), (*risk).to_string()))
+        .collect();
+    assert_eq!(
+        listed_risks, expected_risks,
+        "case {case:?}: ListAnswers must report the rating the authored rules derive for each \
+         question, got {listed_risks:?}"
+    );
+
+    let mut expected_counts: std::collections::BTreeMap<String, i64> =
+        ["HIGH", "MEDIUM", "NONE", "NOT_APPLICABLE", "UNANSWERED"]
+            .iter()
+            .map(|risk| ((*risk).to_string(), 0))
+            .collect();
+    for (_, risk) in &expected_final {
+        *expected_counts
+            .get_mut(*risk)
+            .unwrap_or_else(|| panic!("{risk} is not a Risk the enum publishes")) += 1;
+    }
+    assert!(
+        expected_counts.values().filter(|count| **count > 0).count() > 1,
+        "the table must spread the review's questions over several Risk buckets, got \
+         {expected_counts:?}"
+    );
+
+    let review = lens_review(&client, &workload_id, &lens_arn).await;
+    assert_eq!(
+        risk_counts(&review),
+        expected_counts,
+        "case {case:?}: the review's roll-up is the histogram of its own answers, got {review:?}"
+    );
+    let pillars = review
+        .get("PillarReviewSummaries")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    assert_eq!(
+        pillars.len(),
+        1,
+        "case {case:?}: the document defines one pillar, got {pillars:?}"
+    );
+    assert_eq!(
+        risk_counts(&pillars[0]),
+        expected_counts,
+        "case {case:?}: the pillar's roll-up counts the questions it asks, got {pillars:?}"
+    );
+
+    let summary = lens_review_summary(&client, &workload_id, &lens_arn).await;
+    assert_eq!(
+        risk_counts(&summary),
+        expected_counts,
+        "case {case:?}: the listed summary must report the same roll-up, got {summary:?}"
+    );
+    assert_eq!(
+        string_member(&summary, "LensVersion"),
+        "1.0",
+        "case {case:?}: the summary names the version the review is against, got {summary:?}"
     );
 }

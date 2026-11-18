@@ -139,6 +139,9 @@ mod consolidated_report;
 /// service writes one, shared by the lens review report and the consolidated report.
 mod report_pdf;
 mod store;
+/// The `Risk` the risk rules a LENS DOCUMENT authors rate an answer at — the condition
+/// language of the lens JSON format, evaluated against the choices an answer records.
+mod risk_rules;
 mod refusals;
 mod shares;
 mod agents;
@@ -149,6 +152,7 @@ pub use profiles::*;
 pub use agents::*;
 pub use shares::*;
 pub use refusals::*;
+pub use risk_rules::*;
 pub use framework_lens::*;
 pub use lens_document::*;
 pub use lens_review_report::*;
@@ -607,16 +611,21 @@ pub const NONE_OF_THESE_ID_SUFFIX: &str = "_no";
 /// How the lens a question belongs to rates an answer to it — which is lens content, so it
 /// travels with the question ([`ReviewQuestion::risk_rating`]) rather than being decided
 /// where an answer is read.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RiskRating {
     /// The risk rules the lens publishes for the question, as an AWS-official lens's
     /// catalog row carries them: a rule clears or reduces the question's risk only when
     /// the best practices it names are in place, and the lens's own default rule rates
     /// everything else ([`AnswerRecord::risk`]).
     LensRiskRules,
-    /// The best practices the answer leaves out, for lens content that declares no rules
-    /// this emulator evaluates: an answer with every best practice in place is `NONE`, one
-    /// with none in place is `HIGH` and one in between is `MEDIUM`.
+    /// The risk rules the lens DOCUMENT authors for this question, as an imported lens
+    /// carries them: the first rule whose condition holds over the choices the answer
+    /// records as in place decides the rating, the `default` rule rating every selection
+    /// the rules above it leave ([`authored_lens_risk`]).
+    AuthoredRiskRules(Vec<LensRiskRule>),
+    /// The best practices the answer leaves out, for lens content that authors no rules at
+    /// all: an answer with every best practice in place is `NONE`, one with none in place
+    /// is `HIGH` and one in between is `MEDIUM`.
     UnselectedBestPractices,
 }
 
@@ -1343,6 +1352,11 @@ impl AnswerRecord {
     ///   these" choice says no best practice is in place, which the default rule rates
     ///   [`RISK_HIGH`], as does any selection the rules leave to it
     ///   ([`official_lens_risk`]).
+    /// * [`RiskRating::AuthoredRiskRules`] — the rules the lens DOCUMENT authored for this
+    ///   question decide it: the first rule whose condition holds over the choices the
+    ///   answer records as in place, its authored risk mapped to the `Risk` enum, and the
+    ///   `default` rule reached by every selection the rules above it leave
+    ///   ([`authored_lens_risk`]).
     /// * [`RiskRating::UnselectedBestPractices`] — the best practices the answer leaves
     ///   out: with none in place `HIGH`, with some choice still unselected `MEDIUM`, and
     ///   with nothing left unselected `NONE`.
@@ -1387,20 +1401,46 @@ impl AnswerRecord {
         if !answers_a_choice {
             return RISK_UNANSWERED;
         }
-        match question.risk_rating {
+        match &question.risk_rating {
             RiskRating::LensRiskRules => {
                 official_lens_risk(in_place, best_practices, any_left_out, none_of_these)
             }
+            RiskRating::AuthoredRiskRules(rules) => {
+                // The rules are authored over the question's own choice IDS, so they are
+                // evaluated against the set of ids the answer records as in place rather
+                // than against how MANY of them it records. A rule set that grades nothing
+                // leaves the derivation to the best practices the answer left out, so a
+                // question is still rated when its lens authored no usable rule for it.
+                let selected: BTreeSet<&str> = self
+                    .reported_choice_answers(question)
+                    .filter(|choice| choice.status == CHOICE_STATUS_SELECTED)
+                    .map(|choice| choice.choice_id)
+                    .collect();
+                authored_lens_risk(rules, &selected)
+                    .unwrap_or_else(|| unselected_best_practices_risk(in_place, any_left_out))
+            }
             RiskRating::UnselectedBestPractices => {
-                if in_place == 0 {
-                    RISK_HIGH
-                } else if any_left_out {
-                    RISK_MEDIUM
-                } else {
-                    RISK_NONE
-                }
+                unselected_best_practices_risk(in_place, any_left_out)
             }
         }
+    }
+}
+
+/// The `Risk` the best practices an answer LEAVES OUT rate it at, for lens content that
+/// grades a question by no rule of its own: `in_place` of the question's best practices
+/// recorded as in place and `any_left_out` whether any is still unselected.
+///
+/// Nothing in place is [`RISK_HIGH`], something still left out is [`RISK_MEDIUM`] and
+/// nothing left out is [`RISK_NONE`]. One place, because an answer whose authored rules
+/// grade nothing is rated here exactly as one whose lens authored none
+/// ([`AnswerRecord::risk`]).
+pub fn unselected_best_practices_risk(in_place: usize, any_left_out: bool) -> &'static str {
+    if in_place == 0 {
+        RISK_HIGH
+    } else if any_left_out {
+        RISK_MEDIUM
+    } else {
+        RISK_NONE
     }
 }
 
@@ -1411,11 +1451,11 @@ impl AnswerRecord {
 ///
 /// A lens's rules are a list of conditions over the question's choices, each with the risk
 /// it assigns, ending in the `default` rule that rates every answer the conditions above
-/// it leave (the shape of `riskRules` in the lens JSON format, which this crate parses for
-/// an imported lens: [`LensRiskRule`]). The rules an AWS-official lens publishes per
-/// question are that lens's own content, which AWS publishes in no machine-readable form
-/// the model or the service docs carry, so the rule set stated here is the one this
-/// catalog carries for every question of such a lens:
+/// it leave (the shape of `riskRules` in the lens JSON format, which an IMPORTED lens
+/// carries and this crate evaluates: [`LensRiskRule`], [`authored_lens_risk`]). The rules
+/// an AWS-official lens publishes per question are that lens's own content, which AWS
+/// publishes in no machine-readable form the model or the service docs carry, so the rule
+/// set stated here is the one this catalog carries for every question of such a lens:
 ///
 /// 1. every best practice the question asks about is in place (selected, or recorded as
 ///    not applying to this review) — the question's risk is cleared, [`RISK_NONE`];
@@ -1631,8 +1671,10 @@ pub const LENS_SCHEMA_VERSION: &str = "2021-11-01";
 
 /// The risks a lens document's `riskRules` may assign, from that same format
 /// specification. They are the LENS DOCUMENT's own vocabulary, not the API's `Risk`
-/// enum: a rule names `HIGH_RISK` where the API reports `HIGH`.
-pub const LENS_JSON_RISK_VALUES: &[&str] = &["HIGH_RISK", "MEDIUM_RISK", "NO_RISK"];
+/// enum: a rule names `HIGH_RISK` where the API reports `HIGH`, which is what evaluating
+/// a question's rules maps ([`authored_lens_risk`]).
+pub const LENS_JSON_RISK_VALUES: &[&str] =
+    &[LENS_JSON_HIGH_RISK, LENS_JSON_MEDIUM_RISK, LENS_JSON_NO_RISK];
 
 /// The condition the LAST risk rule of a question carries: the rule that applies when
 /// no earlier rule matched.
@@ -2917,9 +2959,9 @@ impl LensChoiceContent {
 
 /// One rule that maps the choices selected for a question to the risk the answer
 /// carries. `condition` is the format specification's own expression over the
-/// question's choice ids, kept VERBATIM: this store records the rule rather than
-/// interpreting it, and an answer's `Risk` is derived from the best practices it leaves
-/// out ([`AnswerRecord::risk`]).
+/// question's choice ids, kept VERBATIM — an export of the lens serves the document back
+/// as it was authored — and READ where an answer to the question is rated
+/// ([`authored_lens_risk`], [`AnswerRecord::risk`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LensRiskRule {
     pub condition: String,
@@ -3015,7 +3057,16 @@ impl LensDefinition {
                     // A custom lens's questions offer exactly the choices its document
                     // declares.
                     none_of_these: None,
-                    risk_rating: RiskRating::UnselectedBestPractices,
+                    // The grading is the document's OWN: the `riskRules` it authored for
+                    // this question, carried with the question so every read of an answer
+                    // to it derives the same `Risk` ([`AnswerRecord::risk`]). A question
+                    // the document authored no rule for is graded by the best practices
+                    // its answer leaves out, there being no authored rule to apply.
+                    risk_rating: if question.risk_rules.is_empty() {
+                        RiskRating::UnselectedBestPractices
+                    } else {
+                        RiskRating::AuthoredRiskRules(question.risk_rules.clone())
+                    },
                 })
             })
             .collect()
@@ -3628,7 +3679,11 @@ pub fn parse_lens_json(document: &str) -> Result<LensDefinition, LensJsonRejecti
             let rule_values = lens_json_array(question_value, "riskRules")?;
             let mut risk_rules = Vec::new();
             for (rule_index, rule_value) in rule_values.iter().enumerate() {
-                let condition = lens_json_string(rule_value, "condition", (1, 1024))?;
+                let condition = lens_json_string(
+                    rule_value,
+                    "condition",
+                    LENS_JSON_CONDITION_LENGTH,
+                )?;
                 let risk = lens_json_string(rule_value, "risk", (1, 32))?;
                 if !LENS_JSON_RISK_VALUES.contains(&risk.as_str()) {
                     return Err(LensJsonRejection::Finding(

@@ -47,7 +47,8 @@ pub(crate) const ABSENT_LENS_ARN: &str =
 /// A lens document, as the lens JSON format specification the `ImportLens` doc points at
 /// defines one: a `schemaVersion`, a `name`, an optional `description` and the pillars,
 /// each pillar's questions, each question's choices and the risk rules that map the
-/// selected choices to a risk, the last of which carries the `default` condition.
+/// selected choices to a risk, the last of which carries the `default` condition
+/// ([`authored_risk_rules`]).
 ///
 /// `pillars` is `(pillar id, questions, choices per question)`, so a row can vary the
 /// document's shape without spelling the whole document out.
@@ -71,11 +72,7 @@ pub(crate) fn lens_document(
                             json!({ "id": choice_id, "title": format!("Choice {choice_id}") })
                         })
                         .collect();
-                    let mut rules: Vec<Value> = choice_ids
-                        .iter()
-                        .map(|choice_id| json!({ "condition": choice_id, "risk": "NO_RISK" }))
-                        .collect();
-                    rules.push(json!({ "condition": "default", "risk": "HIGH_RISK" }));
+                    let rules = authored_risk_rules(&choice_ids);
                     json!({
                         "id": format!("{pillar_id}_q{question}"),
                         "title": format!("Question {question} of {pillar_id}?"),
@@ -101,6 +98,25 @@ pub(crate) fn lens_document(
         document["description"] = json!(description);
     }
     document
+}
+
+/// The risk rules a document these suites build authors for a question offering
+/// `choice_ids`, in the form the lens JSON format specification requires: the `default`
+/// condition on the last rule and on no other.
+///
+/// The conditions spell the grading these suites expect of such a question, which the
+/// service derives by EVALUATING them against the choices an answer records as in place:
+/// every best practice in place clears the question (`NO_RISK`), at least one in place
+/// reduces it (`MEDIUM_RISK`), and the `default` rule rates every thinner answer
+/// (`HIGH_RISK`). The suite that pins the EVALUATION of authored rules,
+/// `super::custom_lens_answer_writes`, authors rule sets of its own.
+pub(crate) fn authored_risk_rules<Id: AsRef<str>>(choice_ids: &[Id]) -> Vec<Value> {
+    let ids: Vec<&str> = choice_ids.iter().map(AsRef::as_ref).collect();
+    vec![
+        json!({ "condition": ids.join(" && "), "risk": "NO_RISK" }),
+        json!({ "condition": ids.join(" || "), "risk": "MEDIUM_RISK" }),
+        json!({ "condition": "default", "risk": "HIGH_RISK" }),
+    ]
 }
 
 /// `PUT /importLens`, the wire form of `ImportLens`.

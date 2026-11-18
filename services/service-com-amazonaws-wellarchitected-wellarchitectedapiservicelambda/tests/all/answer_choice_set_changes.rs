@@ -58,18 +58,14 @@ const SELECTED: &str = "SELECTED";
 /// COUNTS, deriving each `ChoiceId` from its position, which cannot express a version that
 /// keeps a question's id while renaming or reordering its choices — the change these rows
 /// are about — so the ids are spelled here instead. Everything else follows the same lens
-/// JSON format specification: the `schemaVersion` the import requires, and one risk rule
-/// per choice with the `default` condition on the last.
+/// JSON format specification: the `schemaVersion` the import requires, and the same
+/// authored risk rules (`super::custom_lens_import::authored_risk_rules`).
 fn lens_document_offering(name: &str, choices: &[&str]) -> Value {
     let choices_json: Vec<Value> = choices
         .iter()
         .map(|choice_id| json!({ "id": choice_id, "title": format!("Choice {choice_id}") }))
         .collect();
-    let mut rules: Vec<Value> = choices
-        .iter()
-        .map(|choice_id| json!({ "condition": choice_id, "risk": "NO_RISK" }))
-        .collect();
-    rules.push(json!({ "condition": "default", "risk": "HIGH_RISK" }));
+    let rules = super::custom_lens_import::authored_risk_rules(choices);
     json!({
         "schemaVersion": "2021-11-01",
         "name": name,
