@@ -784,6 +784,18 @@ fn object(members: Vec<(&str, Option<Value>)>) -> Value {
     )
 }
 
+/// Whether `candidate` and `held` hold the SAME value for every option `named` names.
+///
+/// Compared through [`option_value`] — the one projection of a stored record every report of
+/// a domain's configuration is computed from — so two records hold "the same configuration"
+/// here exactly when a caller reading the configuration back off either would read the same
+/// thing, member by member, rather than when their private spellings of it happen to match.
+pub fn same_options(held: &Domain, candidate: &Domain, named: &[&str]) -> bool {
+    named
+        .iter()
+        .all(|option| option_value(held, option) == option_value(candidate, option))
+}
+
 /// The value `domain` holds for the option `option` names, as the JSON document a
 /// change reports it as — or `None` when the domain holds no value for it.
 ///

@@ -28,7 +28,14 @@
 //!   missing a required option;
 //! * **an index-management policy is a revisioned record**: creating one answers `201` with
 //!   the revision counters of the write, reading it back answers the same document, and
-//!   updating it is a write against the revision the caller read.
+//!   updating it is a write against the revision the caller read;
+//! * **a node reports the instance the SERVICE provisioned it on** — the processors of its
+//!   instance type and the size of the volume attached to it — with the operating system's
+//!   own identity and the path the volume is mounted at published in neither. The rows span
+//!   the instance sizes a family is offered in and three volume sizes;
+//! * **an index-management policy is NORMALISED on the way in**: every action of every state
+//!   is stored under the retry policy the plugin would retry it with, and an action that
+//!   declares its own keeps it.
 //!
 //! Every case drives the real wire path — a signed HTTP request through the multi-service
 //! router into the mounted service, under the prefixed path addressing a client on this
@@ -127,16 +134,20 @@ fn node_rows() -> Vec<NodeRow> {
 /// The members a managed domain publishes for NO node: the cluster's own addressing and the
 /// process detail of the machine a node runs on, which a self-managed cluster reports and a
 /// managed service does not.
-const REDACTED_NODE_MEMBERS: [&str; 8] = [
+const REDACTED_NODE_MEMBERS: [&str; 7] = [
     "host",
     "ip",
     "transport_address",
     "http_address",
     "settings",
-    "os",
     "process",
     "jvm",
 ];
+
+/// The members of a node's `os` section a managed domain publishes none of: WHICH operating
+/// system the service runs its nodes on is service-internal, while how many processors the
+/// instance it provisioned has is part of the topology it publishes.
+const REDACTED_OS_MEMBERS: [&str; 3] = ["name", "version", "pretty_name"];
 
 /// RULE: `GET /_nodes` reports the topology the domain's `ClusterConfig` provisions, and
 /// publishes none of the cluster's internal addressing.
@@ -221,6 +232,22 @@ async fn the_nodes_api_reports_the_configured_topology_and_redacts_the_internals
                     node[member]
                 );
             }
+            // The operating system section IS published, carrying the processors of the
+            // instance the node was provisioned on and none of the system's own identity.
+            assert!(
+                node["os"]["available_processors"]
+                    .as_i64()
+                    .is_some_and(|count| count > 0),
+                "case {case:?} ({id}): expected a positive os.available_processors, got {:?}",
+                node["os"]
+            );
+            for member in REDACTED_OS_MEMBERS {
+                assert!(
+                    node["os"][member].is_null(),
+                    "case {case:?} ({id}): a managed domain publishes no os.{member}, got {:?}",
+                    node["os"]
+                );
+            }
         }
         counted.sort();
         let mut expected: Vec<(Vec<String>, usize)> = row
@@ -267,6 +294,138 @@ async fn the_nodes_api_reports_the_configured_topology_and_redacts_the_internals
             (200, Some(0), Some(0)),
             "case {case:?}: expected a filter matching nothing to select no node, got {:?}",
             nothing.body
+        );
+    }
+}
+
+/// One instance a node is provisioned on: the type the create names, and how many processors
+/// an instance of that type has.
+///
+/// The counts are the ones the service's supported-instance-types table publishes a vCPU
+/// figure per, which is what the crate's own size scale expresses: the rows span the sizes a
+/// family is offered in — below `large`, `large`, `xlarge` itself and three larger multiples
+/// — across four families.
+const INSTANCE_PROCESSORS: [(&str, i64); 7] = [
+    ("t3.small.search", 2),
+    ("t3.medium.search", 2),
+    ("r6g.large.search", 2),
+    ("m5.xlarge.search", 4),
+    ("m5.2xlarge.search", 8),
+    ("c5.4xlarge.search", 16),
+    ("m5.12xlarge.search", 48),
+];
+
+/// How many bytes a volume of one gibibyte holds — `EBSOptions$VolumeSize` is "the size (in
+/// GiB) of the EBS volume", and the engine reports a file system in bytes.
+const BYTES_PER_GIB: i64 = 1024 * 1024 * 1024;
+
+/// The volume sizes, in GiB, the rows below attach to their nodes: the smallest volume the
+/// service attaches and two larger ones, so the reported total follows the volume rather than
+/// being one constant.
+const VOLUME_SIZES: [i64; 3] = [10, 20, 100];
+
+/// RULE: a node's `os` and `fs` sections report the instance the SERVICE provisioned it on —
+/// the processors of its instance type and the size of the volume attached to it — with the
+/// operating system's own identity and the path the volume is mounted at published in
+/// neither.
+#[tokio::test]
+async fn the_nodes_apis_report_the_processors_and_the_volume_of_each_node() {
+    let emulator = Emulator::new();
+
+    for (index, (instance_type, processors)) in INSTANCE_PROCESSORS.iter().enumerate() {
+        let volume = VOLUME_SIZES[index % VOLUME_SIZES.len()];
+        let case = format!("{instance_type} on a {volume} GiB volume");
+        let domain = format!("nodes-instance-{index}");
+        let created = emulator
+            .create(json!({
+                "DomainName": domain,
+                "ClusterConfig": { "InstanceType": instance_type, "InstanceCount": 2 },
+                "EBSOptions": {
+                    "EBSEnabled": true,
+                    "VolumeType": "gp3",
+                    "VolumeSize": volume,
+                },
+            }))
+            .await;
+        assert_eq!(
+            created.status, 200,
+            "case {case:?}: expected the domain created, got {} with {:?}",
+            created.status, created.body
+        );
+
+        let info = rest_prefixed(&emulator, &domain, "GET", "/_nodes", None).await;
+        let nodes = info.body["nodes"].as_object().cloned().unwrap_or_default();
+        assert_eq!(
+            nodes.len(),
+            2,
+            "case {case:?}: expected the two configured nodes, got {:?}",
+            info.body
+        );
+        for (id, node) in &nodes {
+            assert_eq!(
+                node["os"]["available_processors"].as_i64(),
+                Some(*processors),
+                "case {case:?} ({id}): expected {processors} processors, got {:?}",
+                node["os"]
+            );
+            assert_eq!(
+                node["os"]["allocated_processors"].as_i64(),
+                Some(*processors),
+                "case {case:?} ({id}): expected the engine to use every processor, got {:?}",
+                node["os"]
+            );
+        }
+
+        // The file system statistics report the volume attached to each node, in bytes,
+        // under both the whole-statistics path and the one narrowed to that metric.
+        for path in ["/_nodes/stats", "/_nodes/stats/fs"] {
+            let stats = rest_prefixed(&emulator, &domain, "GET", path, None).await;
+            assert_eq!(
+                stats.status, 200,
+                "case {case:?} (GET {path}): expected 200, got {} with {:?}",
+                stats.status, stats.body
+            );
+            let reported = stats.body["nodes"].as_object().cloned().unwrap_or_default();
+            assert_eq!(
+                reported.len(),
+                nodes.len(),
+                "case {case:?} (GET {path}): expected one entry per node, got {:?}",
+                stats.body
+            );
+            for (id, node) in &reported {
+                assert_eq!(
+                    node["fs"]["total"]["total_in_bytes"].as_i64(),
+                    Some(volume * BYTES_PER_GIB),
+                    "case {case:?} (GET {path}, {id}): expected the attached volume in bytes, \
+                     got {:?}",
+                    node["fs"]
+                );
+                // WHERE the volume is mounted is a path of the service's own.
+                for member in ["data", "io_stats"] {
+                    assert!(
+                        node["fs"][member].is_null(),
+                        "case {case:?} (GET {path}, {id}): a managed domain publishes no \
+                         fs.{member}, got {:?}",
+                        node["fs"]
+                    );
+                }
+            }
+        }
+
+        // A metric this cluster publishes no statistics for is not served at all — the same
+        // answer every path this plane does not serve gets — rather than a report carrying
+        // no section for what it asked about.
+        let other = rest_prefixed(&emulator, &domain, "GET", "/_nodes/stats/jvm", None).await;
+        assert_eq!(
+            other.status, 400,
+            "case {case:?}: expected the unserved-path answer for a metric this cluster \
+             publishes nothing for, got {} with {:?}",
+            other.status, other.body
+        );
+        assert!(
+            other.body["nodes"].is_null(),
+            "case {case:?}: expected no node report for it, got {:?}",
+            other.body
         );
     }
 }
@@ -845,6 +1004,95 @@ fn pipeline_rows() -> Vec<PipelineRow> {
             source: json!({ "message": "  hello  " }),
             stored: json!({ "message": "hello" }),
         },
+        // `convert` "converts a field in the currently ingested document to a different
+        // type": one row per type its `type` option names (`integer, long, float, double,
+        // string, boolean, auto`), so the whole catalog the processor reads is driven and
+        // not only the one type a caller happened to ask for.
+        PipelineRow {
+            case: "convert reads a text as an integer",
+            id: "pipe-convert-integer",
+            processors: json!([{ "convert": { "field": "count", "type": "integer" } }]),
+            source: json!({ "count": "42" }),
+            stored: json!({ "count": 42 }),
+        },
+        PipelineRow {
+            case: "convert reads a text as a long into another field",
+            id: "pipe-convert-long",
+            processors: json!([{
+                "convert": { "field": "size", "type": "long", "target_field": "size_bytes" }
+            }]),
+            source: json!({ "size": "9007199254740993" }),
+            stored: json!({
+                "size": "9007199254740993",
+                "size_bytes": 9_007_199_254_740_993_i64,
+            }),
+        },
+        PipelineRow {
+            case: "convert reads a text as a double",
+            id: "pipe-convert-double",
+            processors: json!([{ "convert": { "field": "ratio", "type": "double" } }]),
+            source: json!({ "ratio": "0.25" }),
+            stored: json!({ "ratio": 0.25 }),
+        },
+        PipelineRow {
+            case: "convert reads a text as a float",
+            id: "pipe-convert-float",
+            processors: json!([{ "convert": { "field": "share", "type": "float" } }]),
+            source: json!({ "share": "0.5" }),
+            stored: json!({ "share": 0.5 }),
+        },
+        PipelineRow {
+            case: "convert reads a word as a boolean, in either case",
+            id: "pipe-convert-boolean",
+            processors: json!([{ "convert": { "field": "enabled", "type": "boolean" } }]),
+            source: json!({ "enabled": "TRUE" }),
+            stored: json!({ "enabled": true }),
+        },
+        PipelineRow {
+            case: "convert writes a number as a string",
+            id: "pipe-convert-string",
+            processors: json!([{ "convert": { "field": "code", "type": "string" } }]),
+            source: json!({ "code": 42 }),
+            stored: json!({ "code": "42" }),
+        },
+        PipelineRow {
+            case: "convert reads every value of a field that holds several",
+            id: "pipe-convert-list",
+            processors: json!([{ "convert": { "field": "counts", "type": "integer" } }]),
+            source: json!({ "counts": ["1", "2", "3"] }),
+            stored: json!({ "counts": [1, 2, 3] }),
+        },
+        PipelineRow {
+            case: "convert auto takes the closest non-string type",
+            id: "pipe-convert-auto",
+            processors: json!([
+                { "convert": { "field": "count", "type": "auto" } },
+                { "convert": { "field": "enabled", "type": "auto" } },
+                { "convert": { "field": "ratio", "type": "auto" } },
+                { "convert": { "field": "message", "type": "auto" } },
+            ]),
+            source: json!({
+                "count": "7",
+                "enabled": "false",
+                "ratio": "1.5",
+                "message": "hello",
+            }),
+            stored: json!({
+                "count": 7,
+                "enabled": false,
+                "ratio": 1.5,
+                "message": "hello",
+            }),
+        },
+        PipelineRow {
+            case: "convert skips a field the source does not carry where it says so",
+            id: "pipe-convert-ignore-missing",
+            processors: json!([{
+                "convert": { "field": "absent", "type": "integer", "ignore_missing": true }
+            }]),
+            source: json!({ "message": "hello" }),
+            stored: json!({ "message": "hello" }),
+        },
         PipelineRow {
             case: "the processors run in the order they are declared",
             id: "pipe-chain",
@@ -1047,6 +1295,16 @@ async fn an_ingest_pipeline_rewrites_the_stored_source_and_simulate_predicts_it(
             "No processor type exists with name [attachment]",
         ),
         (
+            "a convert processor naming a type it cannot convert to",
+            json!([{ "convert": { "field": "count", "type": "duration" } }]),
+            "[type] type [duration] not supported, cannot convert field.",
+        ),
+        (
+            "a convert processor naming no type",
+            json!([{ "convert": { "field": "count" } }]),
+            "[type] required property is missing",
+        ),
+        (
             "a set processor naming no field",
             json!([{ "set": { "value": "prod" } }]),
             "[field] required property is missing",
@@ -1133,6 +1391,52 @@ async fn an_ingest_pipeline_rewrites_the_stored_source_and_simulate_predicts_it(
         stored.status, stored.body
     );
 
+    // A value the named type reads no value from refuses the write the same way: the
+    // conversion is of the document's own value, so a text no number can be read from is
+    // refused rather than stored as something else.
+    let conversion = rest_prefixed(
+        &emulator,
+        domain,
+        "PUT",
+        "/_ingest/pipeline/pipe-convert-strict",
+        Some(json!({
+            "processors": [{ "convert": { "field": "count", "type": "integer" } }]
+        })),
+    )
+    .await;
+    assert_eq!(
+        conversion.status, 200,
+        "case \"a convert pipeline\": expected it to be declared, got {} with {:?}",
+        conversion.status, conversion.body
+    );
+    let unconvertible = rest_prefixed(
+        &emulator,
+        domain,
+        "PUT",
+        "/events/_doc/unconvertible?pipeline=pipe-convert-strict",
+        Some(json!({ "count": "many" })),
+    )
+    .await;
+    assert_eq!(
+        (
+            unconvertible.status,
+            unconvertible.body["error"]["reason"]
+                .as_str()
+                .unwrap_or_default()
+        ),
+        (400, "unable to convert [many] to integer"),
+        "case \"a value the named type reads nothing from\": expected the write to be refused, \
+         got {} with {:?}",
+        unconvertible.status,
+        unconvertible.body
+    );
+    let unstored = rest_prefixed(&emulator, domain, "GET", "/events/_doc/unconvertible", None).await;
+    assert_eq!(
+        unstored.status, 404,
+        "case \"a refused conversion\": expected nothing to be stored, got {} with {:?}",
+        unstored.status, unstored.body
+    );
+
     // And a pipeline is removable, after which nothing holds it.
     let deleted = rest_prefixed(
         &emulator,
@@ -1212,6 +1516,201 @@ fn ism_policies() -> Vec<(&'static str, &'static str, Value)> {
     ]
 }
 
+/// The retry policy the index-management plugin applies to an action that declares none: how
+/// many times it retries the action, how it spaces the attempts and how long it waits before
+/// the first.
+fn default_action_retry() -> Value {
+    json!({ "count": 3, "backoff": "exponential", "delay": "1m" })
+}
+
+/// `states` as the plugin STORES them: every action of every state under the retry policy it
+/// applies, and an action that declared its own keeping it.
+fn under_action_defaults(states: &Value) -> Value {
+    let Some(states) = states.as_array() else {
+        return states.clone();
+    };
+    Value::Array(
+        states
+            .iter()
+            .map(|state| {
+                let mut state = state.clone();
+                if let Some(actions) = state["actions"].as_array_mut() {
+                    for action in actions.iter_mut() {
+                        if action["retry"].is_null() {
+                            action["retry"] = default_action_retry();
+                        }
+                    }
+                }
+                state
+            })
+            .collect(),
+    )
+}
+
+/// One policy to store under the plugin's defaults: the document written, and the `states`
+/// the plugin holds for it afterwards.
+///
+/// The rows differ along what the rule generalises over: how many states a policy declares,
+/// how many actions a state declares, whether an action declares a retry of its own, a state
+/// with no action at all, and a policy with no state at all.
+fn ism_default_rows() -> Vec<(&'static str, &'static str, Value, Value)> {
+    vec![
+        (
+            "an action that declares no retry",
+            "ism-default-one",
+            json!({
+                "default_state": "locked",
+                "states": [{ "name": "locked", "actions": [{ "read_only": {} }] }],
+            }),
+            json!([{
+                "name": "locked",
+                "actions": [{
+                    "read_only": {},
+                    "retry": { "count": 3, "backoff": "exponential", "delay": "1m" },
+                }],
+            }]),
+        ),
+        (
+            "an action that declares its own retry",
+            "ism-default-kept",
+            json!({
+                "default_state": "locked",
+                "states": [{
+                    "name": "locked",
+                    "actions": [{
+                        "read_only": {},
+                        "retry": { "count": 5, "backoff": "constant", "delay": "30m" },
+                    }],
+                }],
+            }),
+            json!([{
+                "name": "locked",
+                "actions": [{
+                    "read_only": {},
+                    "retry": { "count": 5, "backoff": "constant", "delay": "30m" },
+                }],
+            }]),
+        ),
+        (
+            "several states, several actions, one with a retry of its own",
+            "ism-default-many",
+            json!({
+                "default_state": "hot",
+                "states": [
+                    {
+                        "name": "hot",
+                        "actions": [],
+                        "transitions": [
+                            { "state_name": "warm", "conditions": { "min_doc_count": 2 } }
+                        ],
+                    },
+                    {
+                        "name": "warm",
+                        "actions": [
+                            { "replica_count": { "number_of_replicas": 0 } },
+                            {
+                                "read_only": {},
+                                "retry": { "count": 1, "backoff": "linear", "delay": "5m" },
+                            },
+                            { "close": {} },
+                        ],
+                        "transitions": [],
+                    },
+                ],
+            }),
+            json!([
+                {
+                    "name": "hot",
+                    "actions": [],
+                    "transitions": [
+                        { "state_name": "warm", "conditions": { "min_doc_count": 2 } }
+                    ],
+                },
+                {
+                    "name": "warm",
+                    "actions": [
+                        {
+                            "replica_count": { "number_of_replicas": 0 },
+                            "retry": { "count": 3, "backoff": "exponential", "delay": "1m" },
+                        },
+                        {
+                            "read_only": {},
+                            "retry": { "count": 1, "backoff": "linear", "delay": "5m" },
+                        },
+                        {
+                            "close": {},
+                            "retry": { "count": 3, "backoff": "exponential", "delay": "1m" },
+                        },
+                    ],
+                    "transitions": [],
+                },
+            ]),
+        ),
+        (
+            "a policy that declares no state at all",
+            "ism-default-none",
+            json!({ "description": "nothing to run" }),
+            Value::Null,
+        ),
+    ]
+}
+
+/// RULE: a policy is NORMALISED by the index-management plugin on the way in — every action
+/// of every state is stored under the retry policy the plugin would retry it with, so a
+/// policy read back carries the attempts the plugin will really make rather than only what
+/// the client happened to write; an action that declares its own retry keeps it.
+#[tokio::test]
+async fn an_index_management_policy_is_stored_under_the_plugins_action_defaults() {
+    let emulator = Emulator::new();
+    let domain = "ism-defaults";
+    given_domain(&emulator, domain, None).await;
+
+    for (case, id, policy, states) in ism_default_rows() {
+        let written = rest_prefixed(
+            &emulator,
+            domain,
+            "PUT",
+            &format!("/_plugins/_ism/policies/{id}"),
+            Some(json!({ "policy": policy.clone() })),
+        )
+        .await;
+        assert_eq!(
+            written.status, 201,
+            "case {case:?}: expected 201 from the policy create, got {} with {:?}",
+            written.status, written.body
+        );
+        // The answer the WRITE gives and the one a later READ gives are the same document:
+        // the defaults are applied to what is stored, not to one of the two reports.
+        let read = rest_prefixed(
+            &emulator,
+            domain,
+            "GET",
+            &format!("/_plugins/_ism/policies/{id}"),
+            None,
+        )
+        .await;
+        for (what, answer) in [("the write", &written), ("the read", &read)] {
+            assert_eq!(
+                answer.body["policy"]["policy"]["states"], states,
+                "case {case:?}: expected {what} to carry the states the plugin stores \
+                 ({states:?}), got {:?}",
+                answer.body["policy"]["policy"]["states"]
+            );
+        }
+        // Every other member is the client's own.
+        for (member, sent) in policy.as_object().expect("the row's policy is an object") {
+            if member == "states" {
+                continue;
+            }
+            assert_eq!(
+                &read.body["policy"]["policy"][member], sent,
+                "case {case:?}: expected {member} stored as written, got {:?}",
+                read.body["policy"]["policy"][member]
+            );
+        }
+    }
+}
+
 /// RULE: an index-management policy is a revisioned record — creating one answers `201` with
 /// the revision counters of the write, reading it back answers the document that was
 /// written, and updating it is a write against the revision the caller read.
@@ -1281,6 +1780,12 @@ async fn an_index_management_policy_is_stored_revisioned_and_read_back() {
             "case {case:?}: expected the write's own timestamp, got {reported:?}"
         );
         for (member, written) in policy.as_object().expect("the row's policy is an object") {
+            // The states are compared under the defaults the PLUGIN applies to them, which
+            // `an_index_management_policy_is_stored_under_the_plugins_action_defaults`
+            // asserts over its own table; every other member is stored as written.
+            if member == "states" {
+                continue;
+            }
             assert_eq!(
                 &reported[member], written,
                 "case {case:?}: expected the stored policy to carry {member} as written \
@@ -1288,6 +1793,13 @@ async fn an_index_management_policy_is_stored_revisioned_and_read_back() {
                 reported[member]
             );
         }
+        assert_eq!(
+            reported["states"],
+            under_action_defaults(&policy["states"]),
+            "case {case:?}: expected the states as written, under the plugin's own action \
+             defaults, got {:?}",
+            reported["states"]
+        );
         // Nothing the client did not write is added beside them.
         let reported_members: BTreeSet<&str> = reported
             .as_object()

@@ -16,9 +16,9 @@
 //! something the other would not do.
 //!
 //! The processors served are the ones this engine can carry out over a JSON source — `set`,
-//! `rename`, `remove`, `lowercase`, `uppercase` and `trim`. A declaration naming any other
-//! type is REFUSED when the pipeline is written, with the engine's own sentence for a
-//! processor type it does not register, rather than stored and silently skipped: a pipeline
+//! `rename`, `remove`, `convert`, `lowercase`, `uppercase` and `trim`. A declaration naming
+//! any other type is REFUSED when the pipeline is written, with the engine's own sentence for
+//! a processor type it does not register, rather than stored and silently skipped: a pipeline
 //! that is accepted is a pipeline that runs whole.
 
 use serde_json::{Map, Value};
@@ -86,7 +86,45 @@ enum Action {
         ignore_missing: bool,
         change: TextChange,
     },
+    /// `convert`: "converts a field in the currently ingested document to a different
+    /// type, such as converting a string to an integer".
+    Convert {
+        field: String,
+        target_field: String,
+        ignore_missing: bool,
+        to: ConvertType,
+    },
 }
+
+/// The type a `convert` processor converts a field's value to.
+///
+/// The catalog is the processor's own `type` option — "integer, long, float, double, string,
+/// boolean and auto" ([`CONVERT_TYPES`]) — and a value outside it names no conversion this
+/// processor performs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConvertType {
+    Integer,
+    Long,
+    Float,
+    Double,
+    String,
+    Boolean,
+    /// `auto`: "attempts to automatically convert the field value to the closest
+    /// non-string type", leaving a value no other type reads as the string it is.
+    Auto,
+}
+
+/// The conversions a `convert` processor performs, each under the name its `type` option
+/// states it as.
+const CONVERT_TYPES: [(&str, ConvertType); 7] = [
+    ("integer", ConvertType::Integer),
+    ("long", ConvertType::Long),
+    ("float", ConvertType::Float),
+    ("double", ConvertType::Double),
+    ("string", ConvertType::String),
+    ("boolean", ConvertType::Boolean),
+    ("auto", ConvertType::Auto),
+];
 
 /// Which rewriting of a string a text processor performs.
 #[derive(Debug, Clone, Copy)]
@@ -171,6 +209,33 @@ fn one(declared: &Value) -> Result<Processor, ProcessorError> {
         });
     }
     match kind.as_str() {
+        "convert" => {
+            let field = required_text(options, "field")?;
+            let named = required_text(options, "type")?;
+            let Some((_, to)) = CONVERT_TYPES
+                .iter()
+                .find(|(name, _)| *name == named.as_str())
+            else {
+                return Err(ProcessorError {
+                    error_type: PARSE_EXCEPTION,
+                    reason: format!("[type] type [{named}] not supported, cannot convert field."),
+                });
+            };
+            let target_field = options
+                .get("target_field")
+                .and_then(Value::as_str)
+                .unwrap_or(&field)
+                .to_string();
+            Ok(Processor {
+                kind: "convert",
+                action: Action::Convert {
+                    field,
+                    target_field,
+                    ignore_missing: flag(options, "ignore_missing", false),
+                    to: *to,
+                },
+            })
+        }
         "set" => Ok(Processor {
             kind: "set",
             action: Action::Set {
@@ -318,6 +383,28 @@ impl Processor {
                 };
                 write_path(source, target_field, Value::String(rewritten))
             }
+            Action::Convert {
+                field,
+                target_field,
+                ignore_missing,
+                to,
+            } => {
+                let Some(value) = read_path(source, field).cloned() else {
+                    return self.absent(field, *ignore_missing);
+                };
+                // "If the field value is an array, all members will be converted": the
+                // conversion is of the VALUES the field holds, so a field holding several
+                // holds the same number afterwards, each converted on its own.
+                let converted = match value {
+                    Value::Array(held) => Value::Array(
+                        held.into_iter()
+                            .map(|element| convert(&element, *to))
+                            .collect::<Result<Vec<Value>, ProcessorError>>()?,
+                    ),
+                    one => convert(&one, *to)?,
+                };
+                write_path(source, target_field, converted)
+            }
         }
     }
 
@@ -331,6 +418,92 @@ impl Processor {
             error_type: ILLEGAL_ARGUMENT_EXCEPTION,
             reason: format!("field [{field}] doesn't exist"),
         })
+    }
+}
+
+/// The value `value` converted to `to`, or the engine's refusal of a value that type reads
+/// nothing from.
+///
+/// Every conversion is read off the value's own TEXT, which is what the processor converts: a
+/// number written as a string and one written as a number convert alike, and a text no number
+/// can be read from is refused rather than quietly stored as something else.
+fn convert(value: &Value, to: ConvertType) -> Result<Value, ProcessorError> {
+    let text = convert_text(value);
+    match to {
+        ConvertType::Integer => text
+            .parse::<i32>()
+            .map(Value::from)
+            .map_err(|_| unconvertible(&text, "integer")),
+        ConvertType::Long => text
+            .parse::<i64>()
+            .map(Value::from)
+            .map_err(|_| unconvertible(&text, "long")),
+        ConvertType::Float => text
+            .parse::<f32>()
+            .ok()
+            .and_then(|number| ::serde_json::Number::from_f64(f64::from(number)))
+            .map(Value::Number)
+            .ok_or_else(|| unconvertible(&text, "float")),
+        ConvertType::Double => text
+            .parse::<f64>()
+            .ok()
+            .and_then(::serde_json::Number::from_f64)
+            .map(Value::Number)
+            .ok_or_else(|| unconvertible(&text, "double")),
+        ConvertType::String => Ok(Value::String(text)),
+        ConvertType::Boolean => boolean(&text).ok_or_else(|| ProcessorError {
+            error_type: ILLEGAL_ARGUMENT_EXCEPTION,
+            reason: format!("[{text}] is not a boolean value, cannot convert to boolean"),
+        }),
+        // "auto: attempts to automatically convert the field value to the closest
+        // non-string type": a value that is not text already HAS a type, and a text is read
+        // as the first of the types below it states, falling back to the text itself.
+        ConvertType::Auto => {
+            if !value.is_string() {
+                return Ok(value.clone());
+            }
+            for narrower in [
+                ConvertType::Boolean,
+                ConvertType::Integer,
+                ConvertType::Long,
+                ConvertType::Float,
+                ConvertType::Double,
+            ] {
+                if let Ok(converted) = convert(value, narrower) {
+                    return Ok(converted);
+                }
+            }
+            Ok(value.clone())
+        }
+    }
+}
+
+/// The TEXT a conversion is read off: the string a text field holds, and the JSON spelling of
+/// anything else.
+fn convert_text(value: &Value) -> String {
+    match value {
+        Value::String(text) => text.clone(),
+        other => other.to_string(),
+    }
+}
+
+/// The boolean `text` states, and `None` for a text that states neither — the two words the
+/// processor reads a boolean from, in either case.
+fn boolean(text: &str) -> Option<Value> {
+    if text.eq_ignore_ascii_case("true") {
+        return Some(Value::Bool(true));
+    }
+    if text.eq_ignore_ascii_case("false") {
+        return Some(Value::Bool(false));
+    }
+    None
+}
+
+/// The engine's refusal of a value the named type reads nothing from.
+fn unconvertible(text: &str, to: &str) -> ProcessorError {
+    ProcessorError {
+        error_type: ILLEGAL_ARGUMENT_EXCEPTION,
+        reason: format!("unable to convert [{text}] to {to}"),
     }
 }
 

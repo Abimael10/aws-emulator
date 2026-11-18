@@ -18,7 +18,8 @@
 //! * the ACCOUNT route — what the plugin tells each authenticated caller it is;
 //! * what a ROLE is worth — a principal its mappings bind may do only what one of its
 //!   roles permits, on the indexes that role's patterns name, and sees only the documents
-//!   and fields that role's `dls`/`fls` leave it.
+//!   and fields that role's `dls`/`fls` leave it — including through an AGGREGATION, which
+//!   is a read of the field it names.
 //!
 //! The control-plane harness is this crate's own ([`super::domain_lifecycle`]) and the
 //! endpoint resolution comes from [`super::domain_rest_data_plane`] rather than a second
@@ -1146,4 +1147,134 @@ async fn field_level_security_hides_a_field_from_a_hit_and_from_a_query() {
         "case \"the master reading the document\": expected the field to be served, got {:?}",
         unread.body
     );
+}
+
+/// RULE: an aggregation is a READ of the field it names, so it reads exactly the documents
+/// and fields the caller's own roles leave it: a field a role's `fls` hides contributes to no
+/// bucket and to no metric for the principals that role binds, and a document its `dls` does
+/// not admit is counted in none of them — while the master user, whom nothing narrows, is
+/// answered the whole summary.
+#[tokio::test]
+async fn an_aggregation_reads_only_the_documents_and_fields_the_caller_may_see() {
+    let emulator = Emulator::new();
+    let host = given_fgac_domain(&emulator, "fgac-aggs").await;
+    given_role(
+        &emulator,
+        &host,
+        "payroll_reader",
+        json!({
+            "index_patterns": ["payroll"],
+            "allowed_actions": ["read"],
+            // The salary is hidden from this role, and only the blue team's records are
+            // admitted to it: one rule per narrowing, so the two effects are told apart.
+            "fls": ["~salary"],
+            "dls": "{\"term\": {\"team\": \"blue\"}}"
+        }),
+    )
+    .await;
+    given_analyst(&emulator, &host, "payroll_reader").await;
+    given_documents(
+        &emulator,
+        &host,
+        "payroll",
+        &[
+            ("one", json!({ "team": "blue", "salary": 100 })),
+            ("two", json!({ "team": "blue", "salary": 100 })),
+            ("three", json!({ "team": "red", "salary": 200 })),
+            ("four", json!({ "team": "red", "salary": 300 })),
+        ],
+    )
+    .await;
+
+    // (case, the aggregations asked, what the narrowed user is answered, what the master is)
+    let rows: [(&str, Value, Value, Value); 3] = [
+        (
+            "a terms aggregation over a field the role hides",
+            json!({ "by_salary": { "terms": { "field": "salary" } } }),
+            json!({ "by_salary": {
+                "doc_count_error_upper_bound": 0,
+                "sum_other_doc_count": 0,
+                "buckets": [],
+            } }),
+            json!({ "by_salary": {
+                "doc_count_error_upper_bound": 0,
+                "sum_other_doc_count": 0,
+                "buckets": [
+                    { "key": 100, "doc_count": 2 },
+                    { "key": 200, "doc_count": 1 },
+                    { "key": 300, "doc_count": 1 },
+                ],
+            } }),
+        ),
+        (
+            "the metrics over that same hidden field",
+            json!({
+                "paid": { "value_count": { "field": "salary" } },
+                "lowest": { "min": { "field": "salary" } },
+                "highest": { "max": { "field": "salary" } },
+                "total": { "sum": { "field": "salary" } },
+                "mean": { "avg": { "field": "salary" } },
+            }),
+            json!({
+                "paid": { "value": 0 },
+                "lowest": { "value": Value::Null },
+                "highest": { "value": Value::Null },
+                "total": { "value": 0.0 },
+                "mean": { "value": Value::Null },
+            }),
+            json!({
+                "paid": { "value": 4 },
+                "lowest": { "value": 100.0 },
+                "highest": { "value": 300.0 },
+                "total": { "value": 700.0 },
+                "mean": { "value": 175.0 },
+            }),
+        ),
+        (
+            "a terms aggregation over a field the role leaves, bucketing the documents it \
+             admits",
+            json!({ "by_team": { "terms": { "field": "team" } } }),
+            json!({ "by_team": {
+                "doc_count_error_upper_bound": 0,
+                "sum_other_doc_count": 0,
+                "buckets": [{ "key": "blue", "doc_count": 2 }],
+            } }),
+            json!({ "by_team": {
+                "doc_count_error_upper_bound": 0,
+                "sum_other_doc_count": 0,
+                "buckets": [
+                    { "key": "blue", "doc_count": 2 },
+                    { "key": "red", "doc_count": 2 },
+                ],
+            } }),
+        ),
+    ];
+
+    for (case, aggs, narrowed, unnarrowed) in rows {
+        let body = json!({ "size": 0, "aggs": aggs });
+        let asked = as_analyst(
+            &emulator,
+            &host,
+            "POST",
+            "/payroll/_search",
+            Some(body.clone()),
+        )
+        .await;
+        assert_eq!(
+            asked.status, 200,
+            "case {case:?}: expected the narrowed user to be served, got {} with {:?}",
+            asked.status, asked.body
+        );
+        assert_eq!(
+            asked.body["aggregations"], narrowed,
+            "case {case:?}: expected the narrowed user {narrowed:?}, got {:?}",
+            asked.body["aggregations"]
+        );
+        let master = as_master(&emulator, &host, "POST", "/payroll/_search", Some(body)).await;
+        assert_eq!(
+            master.body["aggregations"], unnarrowed,
+            "case {case:?}: expected the master {unnarrowed:?}, got {:?}",
+            master.body["aggregations"]
+        );
+    }
 }

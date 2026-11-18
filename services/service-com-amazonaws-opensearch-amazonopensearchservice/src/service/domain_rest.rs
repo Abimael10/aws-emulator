@@ -154,6 +154,9 @@ mod analyze;
 /// answered in, and the fragments each carries.
 mod search;
 
+/// The AGGREGATIONS a search asks over the documents its query selected.
+mod aggregations;
+
 /// The BULK API: the newline-delimited action/source stream a client loads documents with,
 /// and the per-item answer each action earns.
 mod bulk;
@@ -365,8 +368,9 @@ const MAX_DOCUMENTS_VISITED: usize = state::INDEX_QUOTA * ingest::INDEX_DOCUMENT
 /// One hit a search answers with: the index the document came from, its id and its source.
 type Hit = (String, String, Value);
 
-/// How many documents a request SELECTED, and the page of hits it asked for.
-type Selected = (usize, Vec<Selection>);
+/// How many documents a request SELECTED, the page of hits it asked for, and what the
+/// aggregations it named observed over every one of them.
+type Selected = (usize, Vec<Selection>, aggregations::Aggregations);
 
 /// What the query asks of each field, as ONE index's chains analyze it: the field, and every
 /// term a clause on it asks about — which is what a fragment is wrapped around.
@@ -1533,6 +1537,37 @@ fn serve_resolved(
             }),
             _ => wrong_method(request, "GET"),
         },
+        // The node STATISTICS, over every node and over one. The segment after `stats` names
+        // the statistics asked for, and this cluster publishes ONE of them
+        // ([`nodes::PUBLISHED_METRIC`]): a path naming another is answered the way every
+        // other path this plane does not serve is, rather than with a report carrying no
+        // section for the metric it named.
+        ["_nodes", "stats"] => match request.method {
+            "GET" => guarded(domain, request, fgac::ACTION_NODES_INFO, |domain| {
+                ok(&nodes_stats(domain, None))
+            }),
+            _ => wrong_method(request, "GET"),
+        },
+        ["_nodes", "stats", metric] if nodes::publishes_metric(metric) => match request.method {
+            "GET" => guarded(domain, request, fgac::ACTION_NODES_INFO, |domain| {
+                ok(&nodes_stats(domain, None))
+            }),
+            _ => wrong_method(request, "GET"),
+        },
+        ["_nodes", node, "stats"] => match request.method {
+            "GET" => guarded(domain, request, fgac::ACTION_NODES_INFO, |domain| {
+                ok(&nodes_stats(domain, Some(node)))
+            }),
+            _ => wrong_method(request, "GET"),
+        },
+        ["_nodes", node, "stats", metric] if nodes::publishes_metric(metric) => {
+            match request.method {
+                "GET" => guarded(domain, request, fgac::ACTION_NODES_INFO, |domain| {
+                    ok(&nodes_stats(domain, Some(node)))
+                }),
+                _ => wrong_method(request, "GET"),
+            }
+        }
         ["_cluster", "settings"] => cluster_settings_request(domain, request),
         // The SNAPSHOT API: the repositories this cluster has registered, the snapshots it
         // has taken into one, and the restore of one. The reserved first segment names it
@@ -2211,74 +2246,6 @@ fn health_rank(status: &str) -> Option<u8> {
     }
 }
 
-/// The nodes of this domain's cluster, as `GET /_nodes` reports them.
-///
-/// The CENSUS is the one `DescribeDomainNodes` reports — one node per node the stored
-/// `ClusterConfig` provisions, in the role, instance type and Availability Zone that record
-/// names ([`crate::ops::describe_domain_nodes::domain_nodes`]) — so the control plane and
-/// the cluster can never describe one domain's topology differently.
-///
-/// What this REPORT carries of each node is the configured topology and nothing else: its
-/// id, the roles its configured node type holds, the engine release the domain runs and the
-/// Availability Zone it sits in. The cluster's own addressing and process detail — a node's
-/// host, its IP, its transport address, its settings, the JVM and the operating system it
-/// runs on — is service-internal on a managed domain and is published in none of them,
-/// rather than invented.
-///
-/// `node` is the id a request addressing ONE node names; a filter matching no node of the
-/// cluster reports no node, which is what the engine answers a node filter that selects
-/// nothing.
-fn nodes_info(domain: &Domain, node: Option<&str>) -> Value {
-    let (_, version) = engine_distribution(&domain.engine_version);
-    let dedicated_master = domain.cluster_config.dedicated_master_enabled == Some(true);
-    let mut nodes = Map::new();
-    for reported in crate::ops::describe_domain_nodes::domain_nodes(domain) {
-        let Some(id) = reported.node_id else {
-            continue;
-        };
-        if node.is_some_and(|named| named != id) {
-            continue;
-        }
-        let mut attributes = Map::new();
-        if let Some(zone) = &reported.availability_zone {
-            attributes.insert("availability_zone".to_string(), json!(zone));
-        }
-        nodes.insert(
-            id.clone(),
-            json!({
-                "name": id,
-                "version": version,
-                "roles": node_roles(reported.node_type.as_deref().unwrap_or_default(), dedicated_master),
-                "attributes": Value::Object(attributes),
-            }),
-        );
-    }
-    let total = nodes.len();
-    json!({
-        "_nodes": { "total": total, "successful": total, "failed": 0 },
-        "cluster_name": cluster_name(domain),
-        "nodes": Value::Object(nodes),
-    })
-}
-
-/// The roles OpenSearch publishes for a node of this domain, from the ROLE its cluster
-/// configuration provisions the node in.
-///
-/// A data node holds the data and ingest roles, and is cluster-manager eligible as well on a
-/// domain that provisions no dedicated master — there has to be somewhere for the cluster
-/// manager to be elected. A dedicated master node holds the cluster-manager role alone,
-/// which is what makes it dedicated, and a warm node holds the warm role beside the data one
-/// it serves searches from. A node type this emulator does not provision holds no role.
-fn node_roles(node_type: &str, dedicated_master: bool) -> Vec<&'static str> {
-    match node_type {
-        state::NODE_TYPE_DATA if dedicated_master => vec!["data", "ingest"],
-        state::NODE_TYPE_DATA => vec!["cluster_manager", "data", "ingest"],
-        state::NODE_TYPE_MASTER => vec!["cluster_manager"],
-        state::NODE_TYPE_ULTRAWARM => vec!["data", "warm"],
-        _ => Vec::new(),
-    }
-}
-
 /// A `GET` or `PUT` on the cluster's own settings.
 fn cluster_settings_request(domain: &mut Domain, request: &Request<'_>) -> RtResponse {
     match request.method {
@@ -2803,159 +2770,6 @@ fn simulated(index: &str, id: &str, source: &Value, timestamp: &str) -> Value {
         "_id": id,
         "_source": source,
         "_ingest": { "timestamp": timestamp },
-    })
-}
-
-/// A `PUT`, `GET` or `DELETE` on ONE index-management policy.
-fn ism_policy_request(
-    domain: &mut Domain,
-    request: &Request<'_>,
-    id: &str,
-    now: SystemTime,
-) -> RtResponse {
-    match request.method {
-        "PUT" => guarded(domain, request, fgac::ACTION_PUT_ISM_POLICY, |domain| {
-            write_ism_policy(domain, request, id, now)
-        }),
-        "GET" => guarded(domain, request, fgac::ACTION_GET_ISM_POLICY, |domain| {
-            match domain.ism_policies.get(id) {
-                Some(policy) => ok(&ism_policy_view(policy)),
-                None => error(404, STATUS_EXCEPTION, "Policy not found"),
-            }
-        }),
-        "DELETE" => guarded(domain, request, fgac::ACTION_DELETE_ISM_POLICY, |domain| {
-            match domain.ism_policies.remove(id) {
-                Some(policy) => ok(&json!({
-                    "_index": ISM_CONFIG_INDEX,
-                    "_id": policy.policy_id,
-                    "_version": policy.version,
-                    "result": "deleted",
-                    "_seq_no": policy.seq_no,
-                    "_primary_term": policy.primary_term,
-                })),
-                None => error(404, STATUS_EXCEPTION, "Policy not found"),
-            }
-        }),
-        _ => wrong_method(request, "PUT, GET, DELETE"),
-    }
-}
-
-/// The engine's error type for a request the index-management plugin refuses.
-const STATUS_EXCEPTION: &str = "status_exception";
-
-/// The index the index-management plugin keeps its own configuration in, which the write it
-/// performs is reported against.
-const ISM_CONFIG_INDEX: &str = ".opendistro-ism-config";
-
-/// The `_primary_term` every write of this cluster is taken in: one run of a cluster takes
-/// every write in one term, and nothing here re-elects a primary.
-const ISM_PRIMARY_TERM: i64 = 1;
-
-/// Write the index-management policy the path names.
-///
-/// Creating one is a 201; UPDATING one is a write against the revision the caller read, so
-/// it carries `if_seq_no` and `if_primary_term` — "to update an existing policy, you must
-/// specify the sequence number and primary term" — and a write that names neither, or names
-/// a revision the policy has moved past, is the engine's version conflict rather than a
-/// silent overwrite of someone else's policy.
-fn write_ism_policy(
-    domain: &mut Domain,
-    request: &Request<'_>,
-    id: &str,
-    now: SystemTime,
-) -> RtResponse {
-    let body = match request.json() {
-        Ok(Some(Value::Object(members))) => Value::Object(members),
-        Ok(_) => {
-            return error(
-                400,
-                PARSE_EXCEPTION,
-                "failed to parse: expected the body to be a JSON object carrying a policy",
-            )
-        }
-        Err(refusal) => return *refusal,
-    };
-    let Some(definition) = body.get("policy").filter(|policy| policy.is_object()) else {
-        return error(400, PARSE_EXCEPTION, "[policy] required property is missing");
-    };
-    let held = domain.ism_policies.get(id);
-    if let Some(held) = held {
-        let named = (
-            request.parameter("if_seq_no").and_then(|v| v.parse().ok()),
-            request
-                .parameter("if_primary_term")
-                .and_then(|v| v.parse().ok()),
-        );
-        if named != (Some(held.seq_no), Some(held.primary_term)) {
-            return error(
-                409,
-                VERSION_CONFLICT_ENGINE_EXCEPTION,
-                &format!(
-                    "[{id}]: version conflict, required seqNo [{}], primary term [{}]",
-                    held.seq_no, held.primary_term
-                ),
-            );
-        }
-    } else if domain.ism_policies.len() >= state::ISM_POLICY_QUOTA {
-        return error(
-            400,
-            ingest::ILLEGAL_ARGUMENT_EXCEPTION,
-            &format!(
-                "cluster [{}] already holds the maximum of {} index management policies, so \
-                 policy [{id}] could not be created",
-                cluster_name(domain),
-                state::ISM_POLICY_QUOTA
-            ),
-        );
-    }
-    let created = held.is_none();
-    let version = held.map_or(1, |held| held.version.saturating_add(1));
-    // The sequence number of a write is the next one over the plugin's configuration index,
-    // so it is one past the highest any policy carries.
-    let seq_no = domain
-        .ism_policies
-        .values()
-        .map(|policy| policy.seq_no)
-        .max()
-        .map_or(0, |highest| highest.saturating_add(1));
-    let policy = state::IsmPolicy {
-        policy_id: id.to_string(),
-        definition: definition.clone(),
-        version,
-        seq_no,
-        primary_term: ISM_PRIMARY_TERM,
-        updated_at: now,
-    };
-    let view = ism_policy_view(&policy);
-    domain.ism_policies.insert(id.to_string(), policy);
-    rendered(if created { 201 } else { 200 }, &view)
-}
-
-/// One index-management policy, as that plugin's policy API reports it: the revision
-/// counters of the write that stored it, and the policy document itself under the member it
-/// was written in.
-///
-/// The document is reported as it was WRITTEN, with the two members the plugin fills in
-/// itself beside it — the policy's own id, which is the one the path addressed it by, and
-/// when it was last written. Nothing else is added: a member the client did not write is
-/// not one this plugin holds.
-fn ism_policy_view(policy: &state::IsmPolicy) -> Value {
-    let mut reported = policy
-        .definition
-        .as_object()
-        .cloned()
-        .unwrap_or_else(Map::new);
-    reported.insert("policy_id".to_string(), json!(policy.policy_id));
-    reported.insert(
-        "last_updated_time".to_string(),
-        json!(state::epoch_millis(policy.updated_at)),
-    );
-    json!({
-        "_id": policy.policy_id,
-        "_version": policy.version,
-        "_seq_no": policy.seq_no,
-        "_primary_term": policy.primary_term,
-        "policy": { "policy": Value::Object(reported) },
     })
 }
 
@@ -3628,15 +3442,34 @@ fn count(
     across: &CrossCluster,
     files: &state::analysis::PackageFiles,
 ) -> RtResponse {
-    // No hit is reported by a count, so none is materialised for it — and neither section a
-    // search may order or highlight its hits with applies to one.
+    // A count reports HOW MANY documents the query selected and nothing about them, so none
+    // of the sections a search answers its hits with belongs to one: the order, the
+    // fragments — and the summaries, which a `_count` body does not take at all, so one
+    // carrying them is refused rather than answered with the section dropped.
+    match request.json() {
+        Ok(Some(body)) => {
+            if let Some(named) = ["aggs", "aggregations"]
+                .into_iter()
+                .find(|member| body.get(*member).is_some())
+            {
+                return error(
+                    400,
+                    PARSING_EXCEPTION,
+                    &format!("request does not support [{named}]"),
+                );
+            }
+        }
+        Ok(None) => {}
+        Err(refusal) => return *refusal,
+    }
     let asked = Answering {
         from: 0,
         size: 0,
         sorting: &search::Sorting::default(),
         highlighting: &search::Highlighting::default(),
     };
-    let (total, _) = match selected_documents(domain, request, index_name, across, files, &asked) {
+    let (total, _, _) = match selected_documents(domain, request, index_name, across, files, &asked)
+    {
         Ok(selected) => selected,
         Err(refusal) => return *refusal,
     };
@@ -3699,11 +3532,11 @@ fn search(
         sorting: &sorting,
         highlighting: &highlighting,
     };
-    let (total, hits) = match selected_documents(domain, request, index_name, across, files, &asked)
-    {
-        Ok(selected) => selected,
-        Err(refusal) => return *refusal,
-    };
+    let (total, hits, aggregated) =
+        match selected_documents(domain, request, index_name, across, files, &asked) {
+            Ok(selected) => selected,
+            Err(refusal) => return *refusal,
+        };
     record_searched(domain, request, index_name);
     let sorted = !sorting.is_empty();
     let hits: Vec<Value> = hits
@@ -3729,15 +3562,26 @@ fn search(
             Value::Object(hit)
         })
         .collect();
-    ok(&json!({
-        "timed_out": false,
-        "_shards": { "total": 1, "successful": 1, "skipped": 0, "failed": 0 },
-        "hits": {
+    let mut answer = Map::new();
+    answer.insert("timed_out".to_string(), json!(false));
+    answer.insert(
+        "_shards".to_string(),
+        json!({ "total": 1, "successful": 1, "skipped": 0, "failed": 0 }),
+    );
+    answer.insert(
+        "hits".to_string(),
+        json!({
             "total": { "value": total, "relation": "eq" },
             "max_score": if total == 0 { Value::Null } else { json!(search::MATCH_SCORE) },
             "hits": hits,
-        },
-    }))
+        }),
+    );
+    // The summaries the request asked OVER those documents, reported beside them; a request
+    // that asked for none carries no such section.
+    if !aggregated.is_empty() {
+        answer.insert("aggregations".to_string(), aggregated.reported());
+    }
+    ok(&Value::Object(answer))
 }
 
 /// Note the read a search or a count performed, for the domain's search slow-log
@@ -3865,6 +3709,10 @@ fn selected_documents(
         total: 0,
         page: Vec::new(),
         sorting,
+        // The summaries the request asked for, read before anything is scanned for the
+        // reason the two sections above are: a section this surface cannot read is refused
+        // rather than answered as if the request had named none.
+        aggregating: aggregations::Aggregations::of(&body)?,
     };
     // The analysis budget the WHOLE scan shares, held here rather than on the per-index
     // chains so the indexes a request names cannot each spend it over again.
@@ -3944,7 +3792,11 @@ fn selected_documents(
     {
         scan.consider(&select, index_name, id, source, &remote_reading)?;
     }
-    Ok((scan.total, scan.page()))
+    // Taken off the scan before its page is materialised, because the summaries are over
+    // every document the query selected rather than over the page.
+    let aggregated = ::std::mem::take(&mut scan.aggregating);
+    let total = scan.total;
+    Ok((total, scan.page(), aggregated))
 }
 
 /// What ONE index's documents are read against: the chains and mappings its own settings
@@ -4089,6 +3941,9 @@ struct Scan<'s> {
     /// The order the request asked for, which decides whether a selected document is kept
     /// where the scan reached it or ranked against the ones reached before it.
     sorting: &'s search::Sorting,
+    /// The summaries the request asked OVER the documents it selects, which every selected
+    /// document is read into — the page it asked for is not what they are computed from.
+    aggregating: aggregations::Aggregations,
 }
 
 impl Scan<'_> {
@@ -4135,6 +3990,10 @@ impl Scan<'_> {
         }
         let ordinal = self.total;
         self.total = self.total.saturating_add(1);
+        // Every selected document is read into the summaries the request asked for, whether
+        // or not it lands on the page: an aggregation is over the documents the query
+        // matched.
+        self.aggregating.consider(terms, source)?;
         let limit = self.from.saturating_add(self.size);
         // Without an order the page is the window of the scan's own sequence, so a document
         // outside it is counted and dropped; with one, every selected document is a
@@ -4774,4 +4633,14 @@ mod tests;
 /// WHICH documents a query selects: the clause tree a request's query states, and how that
 /// tree is asked of one document of one index.
 mod selection;
+
+/// The index-management plugin's policy API, and the defaults the plugin stores a policy
+/// under.
+mod ism;
+use ism::*;
+
+/// The NODES APIs: the cluster's nodes, and the statistics of one.
+mod nodes;
+use nodes::*;
+
 use selection::*;

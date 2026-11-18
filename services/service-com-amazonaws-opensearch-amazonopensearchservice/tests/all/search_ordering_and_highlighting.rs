@@ -17,6 +17,10 @@
 //! > exactly the matched token on an analyzed field and the whole value on a field held
 //! > whole — and a requested field carrying no asked-for term contributes no key at all.
 //!
+//! > an `aggs` section summarises the documents the query SELECTED, from the per-document
+//! > values of the field each aggregation names — the same values a sort key reads — and a
+//! > summary this cluster does not compute is refused rather than quietly left out.
+//!
 //! The harness is [`super::domain_lifecycle`]'s and the data-plane request helper is
 //! [`super::domain_rest_data_plane`]'s; this suite adds no second copy of either.
 
@@ -938,4 +942,218 @@ async fn what_one_hit_s_fragments_may_materialise_is_bounded() {
          {:?}",
         read.body["_source"]["body"].as_str().map(str::len)
     );
+}
+
+/// One aggregation to ask: the body a search carries, and the whole `aggregations` section
+/// the answer reports for it.
+///
+/// The rows differ along what the rule generalises over: which aggregation is asked
+/// (bucketing and each single-value metric), the TYPE of the field it reads (a keyword, a
+/// number and a keyword multi-field of an analyzed field), how many buckets the request asks
+/// for, whether a query narrows the documents first, a field no document holds a value for,
+/// and two aggregations asked at once.
+fn aggregation_rows() -> Vec<(&'static str, Value, Value)> {
+    vec![
+        (
+            "a terms aggregation over a keyword field",
+            json!({ "size": 0, "aggs": { "by_shelf": { "terms": { "field": "shelf" } } } }),
+            json!({ "by_shelf": {
+                "doc_count_error_upper_bound": 0,
+                "sum_other_doc_count": 0,
+                "buckets": [
+                    { "key": "east", "doc_count": 2 },
+                    { "key": "west", "doc_count": 1 },
+                ],
+            } }),
+        ),
+        (
+            "a terms aggregation asking for fewer buckets than there are",
+            json!({
+                "size": 0,
+                "aggs": { "by_shelf": { "terms": { "field": "shelf", "size": 1 } } }
+            }),
+            json!({ "by_shelf": {
+                "doc_count_error_upper_bound": 0,
+                "sum_other_doc_count": 1,
+                "buckets": [{ "key": "east", "doc_count": 2 }],
+            } }),
+        ),
+        (
+            "a terms aggregation over a number",
+            json!({ "size": 0, "aggs": { "by_rank": { "terms": { "field": "rank" } } } }),
+            json!({ "by_rank": {
+                "doc_count_error_upper_bound": 0,
+                "sum_other_doc_count": 0,
+                "buckets": [
+                    { "key": 1, "doc_count": 1 },
+                    { "key": 3, "doc_count": 1 },
+                ],
+            } }),
+        ),
+        (
+            "a terms aggregation over the keyword sub-field of an analyzed field",
+            json!({ "size": 0, "aggs": { "by_title": { "terms": { "field": "title.raw" } } } }),
+            json!({ "by_title": {
+                "doc_count_error_upper_bound": 0,
+                "sum_other_doc_count": 0,
+                "buckets": [
+                    { "key": "alpha release", "doc_count": 1 },
+                    { "key": "beta release", "doc_count": 1 },
+                    { "key": "gamma release", "doc_count": 1 },
+                ],
+            } }),
+        ),
+        (
+            "every single-value metric over the same number field",
+            json!({
+                "size": 0,
+                "aggs": {
+                    "ranks": { "value_count": { "field": "rank" } },
+                    "lowest": { "min": { "field": "rank" } },
+                    "highest": { "max": { "field": "rank" } },
+                    "total": { "sum": { "field": "rank" } },
+                    "mean": { "avg": { "field": "rank" } },
+                }
+            }),
+            json!({
+                "ranks": { "value": 2 },
+                "lowest": { "value": 1.0 },
+                "highest": { "value": 3.0 },
+                "total": { "value": 4.0 },
+                "mean": { "value": 2.0 },
+            }),
+        ),
+        (
+            "an aggregation over the documents a query selected",
+            json!({
+                "size": 0,
+                "query": { "term": { "shelf": "east" } },
+                "aggs": {
+                    "by_rank": { "terms": { "field": "rank" } },
+                    "ranks": { "value_count": { "field": "rank" } },
+                }
+            }),
+            json!({
+                "by_rank": {
+                    "doc_count_error_upper_bound": 0,
+                    "sum_other_doc_count": 0,
+                    "buckets": [{ "key": 3, "doc_count": 1 }],
+                },
+                "ranks": { "value": 1 },
+            }),
+        ),
+        (
+            "an aggregation over a field no document holds",
+            json!({
+                "size": 0,
+                "aggs": {
+                    "by_isbn": { "terms": { "field": "isbn" } },
+                    "isbns": { "value_count": { "field": "isbn" } },
+                    "lowest": { "min": { "field": "isbn" } },
+                    "total": { "sum": { "field": "isbn" } },
+                    "mean": { "avg": { "field": "isbn" } },
+                }
+            }),
+            json!({
+                "by_isbn": {
+                    "doc_count_error_upper_bound": 0,
+                    "sum_other_doc_count": 0,
+                    "buckets": [],
+                },
+                "isbns": { "value": 0 },
+                "lowest": { "value": Value::Null },
+                "total": { "value": 0.0 },
+                "mean": { "value": Value::Null },
+            }),
+        ),
+    ]
+}
+
+/// RULE: an aggregation summarises the documents the query SELECTED, from the per-document
+/// values of the field it names — the same values a sort key reads — so what it reports is
+/// computed from those documents and nothing else; a request that asks for none carries no
+/// such section, and one asking for a summary this cluster does not compute is refused.
+#[tokio::test]
+async fn an_aggregation_summarises_the_documents_the_query_selected() {
+    let emulator = Emulator::new();
+    given_indexed(&emulator).await;
+
+    for (case, body, expected) in aggregation_rows() {
+        let answered = search(&emulator, &format!("/{INDEX}/_search"), Some(body.clone())).await;
+        assert_eq!(
+            answered.status, 200,
+            "case {case:?}: expected 200, got {} with {:?}",
+            answered.status, answered.body
+        );
+        assert_eq!(
+            answered.body["aggregations"], expected,
+            "case {case:?}: expected {expected:?}, got {:?}",
+            answered.body["aggregations"]
+        );
+    }
+
+    // A search that asks for no summary carries no such section at all.
+    let plain = search(&emulator, &format!("/{INDEX}/_search"), None).await;
+    assert!(
+        plain.body["aggregations"].is_null(),
+        "case \"a search asking for no aggregation\": expected no section, got {:?}",
+        plain.body["aggregations"]
+    );
+
+    // A `_count` reports how many documents the query selected and nothing about them, so it
+    // takes no summary: a body carrying one is refused rather than counted with the section
+    // dropped.
+    for member in ["aggs", "aggregations"] {
+        let counted = search(
+            &emulator,
+            &format!("/{INDEX}/_count"),
+            Some(json!({ member: { "by_shelf": { "terms": { "field": "shelf" } } } })),
+        )
+        .await;
+        assert_eq!(
+            (
+                counted.status,
+                counted.body["error"]["reason"].as_str().unwrap_or_default()
+            ),
+            (400, format!("request does not support [{member}]").as_str()),
+            "case \"a count carrying {member}\": expected the engine's own refusal, got {} \
+             with {:?}",
+            counted.status,
+            counted.body
+        );
+    }
+
+    // A section this cluster cannot read is refused rather than answered as if it were not
+    // there.
+    for (case, body, reason) in [
+        (
+            "an aggregation type this cluster does not compute",
+            json!({ "aggs": { "unique": { "cardinality": { "field": "shelf" } } } }),
+            "Unknown aggregation type [cardinality]",
+        ),
+        (
+            "an aggregation naming no field",
+            json!({ "aggs": { "by_shelf": { "terms": {} } } }),
+            "[terms] aggregation [by_shelf] must name the [field] it reads",
+        ),
+        (
+            "an aggregation naming two types at once",
+            json!({
+                "aggs": { "by_shelf": { "terms": { "field": "shelf" }, "min": { "field": "rank" } } }
+            }),
+            "[by_shelf] aggregation must name exactly one type",
+        ),
+    ] {
+        let refused = search(&emulator, &format!("/{INDEX}/_search"), Some(body)).await;
+        assert_eq!(
+            (
+                refused.status,
+                refused.body["error"]["reason"].as_str().unwrap_or_default()
+            ),
+            (400, reason),
+            "case {case:?}: expected the engine's own refusal, got {} with {:?}",
+            refused.status,
+            refused.body
+        );
+    }
 }
