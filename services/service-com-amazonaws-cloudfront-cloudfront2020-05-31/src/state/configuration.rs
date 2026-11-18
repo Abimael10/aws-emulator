@@ -1240,6 +1240,115 @@ pub fn field_level_encryption_profile_quantity_mismatch(
         .find_map(|(label, quantity, len)| quantity_disagreement(label, *quantity, *len))
 }
 
+/// The modelled `InvalidArgument` (HTTP 400) for an encryption entity whose `FieldPatterns`
+/// OVERLAP, or `None` when no entity's patterns do.
+///
+/// `EncryptionEntity$FieldPatterns`: "You can provide the full field name, or any beginning
+/// characters followed by a wildcard (*). You can't overlap field patterns. For example, you
+/// can't have both ABC* and AB*. Note that field patterns are case-sensitive." So a pattern
+/// ending in the wildcard COVERS every field name beginning with the characters in front of
+/// it, and an entity cannot carry both that pattern and another pattern it covers — the field
+/// a request encrypts would then match two patterns and no key could be said to encrypt it.
+/// Checked WITHIN each entity, which is the scope the sentence states: two entities of one
+/// profile encrypt with different keys and are free to name the same field.
+///
+/// Compared byte for byte, the patterns being case-sensitive. Each entity's patterns are
+/// compared with one another, which is work the caller's own list length drives: the counts
+/// this operation admits at all are bounded ahead of it
+/// ([`field_level_encryption_profile_over_quota`]), so what this costs is bounded too.
+pub fn field_level_encryption_profile_overlapping_field_patterns(
+    config: &FieldLevelEncryptionProfileConfig,
+) -> Option<crate::ops::types::InvalidArgument> {
+    config
+        .encryption_entities
+        .items
+        .as_deref()
+        .unwrap_or_default()
+        .iter()
+        .any(|entity| {
+            overlapping_field_patterns(entity.field_patterns.items.as_deref().unwrap_or_default())
+        })
+        .then(|| crate::ops::types::InvalidArgument {
+            message: Some(OVERLAPPING_FIELD_PATTERNS_MESSAGE.to_string()),
+        })
+}
+
+/// Which list of a field-level encryption profile configuration is past the count this
+/// service admits, or `None` when every one of them is within it.
+///
+/// The entities are stored whole inside the profile record and are what the admission compares
+/// with one another, so both counts are bounded BEFORE anything walks them
+/// ([`MAX_FIELD_LEVEL_ENCRYPTION_ENCRYPTION_ENTITIES`],
+/// [`MAX_FIELD_LEVEL_ENCRYPTION_FIELD_PATTERNS`]) and a configuration past either is refused
+/// with the modelled error for that list.
+pub fn field_level_encryption_profile_over_quota(
+    config: &FieldLevelEncryptionProfileConfig,
+) -> Option<FieldLevelEncryptionProfileQuota> {
+    let entities = config
+        .encryption_entities
+        .items
+        .as_deref()
+        .unwrap_or_default();
+    if entities.len() > MAX_FIELD_LEVEL_ENCRYPTION_ENCRYPTION_ENTITIES {
+        return Some(FieldLevelEncryptionProfileQuota::EncryptionEntities);
+    }
+    entities
+        .iter()
+        .any(|entity| {
+            items_len(&entity.field_patterns.items) > MAX_FIELD_LEVEL_ENCRYPTION_FIELD_PATTERNS
+        })
+        .then_some(FieldLevelEncryptionProfileQuota::FieldPatterns)
+}
+
+/// WHICH list of a field-level encryption profile configuration is past its count, which is
+/// what decides the modelled error the refusal carries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FieldLevelEncryptionProfileQuota {
+    /// `EncryptionEntities` carries more entities than this service admits.
+    EncryptionEntities,
+    /// One entity's `FieldPatterns` carries more patterns than this service admits.
+    FieldPatterns,
+}
+
+/// The sentence `TooManyFieldLevelEncryptionEncryptionEntities` carries, which is the one the
+/// model states for the condition.
+pub const TOO_MANY_ENCRYPTION_ENTITIES_MESSAGE: &str =
+    "The maximum number of encryption entities for field-level encryption have been created.";
+
+/// The sentence `TooManyFieldLevelEncryptionFieldPatterns` carries, which is the one the model
+/// states for the condition.
+pub const TOO_MANY_FIELD_PATTERNS_MESSAGE: &str =
+    "The maximum number of field patterns for field-level encryption have been created.";
+
+
+/// Whether any of `patterns` is covered by a PREFIX pattern among them.
+///
+/// A pattern ending in the wildcard covers the field names beginning with the characters in
+/// front of it, so it covers another pattern exactly when that pattern begins with those
+/// characters — the pattern `AB*` covers `ABC*` and `ABC` alike. A pattern never counts as
+/// covering itself, so the walk compares each pattern against the OTHER entries by position.
+fn overlapping_field_patterns(patterns: &[String]) -> bool {
+    patterns.iter().enumerate().any(|(covering, pattern)| {
+        let Some(prefix) = pattern.strip_suffix(FIELD_PATTERN_WILDCARD) else {
+            return false;
+        };
+        patterns
+            .iter()
+            .enumerate()
+            .any(|(covered, other)| covered != covering && other.starts_with(prefix))
+    })
+}
+
+/// The character a field pattern names "any beginning characters followed by a wildcard"
+/// with, which is what makes a pattern cover more than the one field it spells.
+const FIELD_PATTERN_WILDCARD: &str = "*";
+
+/// The sentence CloudFront refuses overlapping field patterns with, on the wire: it states
+/// the rule the member broke, and carries no pattern out of the request.
+pub const OVERLAPPING_FIELD_PATTERNS_MESSAGE: &str =
+    "The parameter FieldPattern cannot start with a prefix field pattern already present in \
+     the encryption entity.";
+
 /// The modelled `InconsistentQuantities` message for the first list wrapper in a
 /// field-level encryption CONFIGURATION whose `Quantity` disagrees with the length of its
 /// `Items`, or `None` when every wrapper agrees.
@@ -1703,6 +1812,42 @@ pub fn foreign_staging_distribution_domain() -> crate::ops::types::InvalidArgume
 /// on the wire: it names the member that carried the value, and nothing else.
 pub const FOREIGN_STAGING_DISTRIBUTION_DOMAIN_MESSAGE: &str =
     "The parameter StagingDistributionDnsNames is not a default CloudFront domain name.";
+
+/// Whether a continuous deployment policy configuration names a staging distribution that is
+/// itself DISABLED.
+///
+/// `StagingDistributionDnsNames` names the distribution the policy moves traffic to, and
+/// `DistributionConfig$Enabled` is "whether the distribution is enabled to accept user
+/// requests for content" — a disabled one accepts none, so a policy over it could never route
+/// a viewer request and the configuration describes a deployment that cannot happen. Resolved
+/// against the STORED distributions, for the reason
+/// [`names_foreign_staging_distribution_domain`] is, and read AFTER that check: a name no
+/// distribution answers to has no `Enabled` state to read.
+pub fn names_disabled_staging_distribution(
+    store: &ComAmazonawsCloudfrontCloudfront20200531State,
+    config: &ContinuousDeploymentPolicyConfig,
+) -> bool {
+    staging_distribution_dns_names(config).iter().any(|name| {
+        store
+            .distribution_by_domain_name(name)
+            .is_some_and(|distribution| !distribution.config.enabled)
+    })
+}
+
+/// The modelled `InvalidArgument` (HTTP 400) for a `StagingDistributionDnsNames` naming a
+/// distribution that is disabled.
+///
+/// FIXED service text ([`DISABLED_STAGING_DISTRIBUTION_MESSAGE`]): what the refusal states is
+/// the RULE the member broke, so no domain name from the request belongs in it.
+pub fn disabled_staging_distribution() -> crate::ops::types::InvalidArgument {
+    crate::ops::types::InvalidArgument {
+        message: Some(DISABLED_STAGING_DISTRIBUTION_MESSAGE.to_string()),
+    }
+}
+
+/// The sentence CloudFront refuses a disabled staging distribution with, on the wire.
+pub const DISABLED_STAGING_DISTRIBUTION_MESSAGE: &str =
+    "The parameter Staging distributions contains disabled distributions.";
 
 /// `NoSuchContinuousDeploymentPolicy`'s message for an id no stored policy answers to, on
 /// the wire.

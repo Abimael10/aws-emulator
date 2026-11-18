@@ -176,9 +176,20 @@ async fn deleted_stack(router: &MultiServiceRouter, stack_name: &str, case: &str
 /// The public key body a row declares: a PEM document, multi-line and newline-terminated as a
 /// client's own key file is, so what is checked is that the body the template declared reaches
 /// CloudFront byte for byte rather than as some trimmed rendering of it.
+///
+/// It is a WHOLE RSA public key — the X.509 `SubjectPublicKeyInfo` of a 2048-bit modulus and
+/// the public exponent 65537 — because `PublicKeyConfig$EncodedKey` carries the public half of
+/// a key pair and CloudFront decodes the material it is given: a body that is not a readable
+/// RSA public key is refused rather than stored, so a template declaring one would provision
+/// nothing.
 const ENCODED_KEY: &str = "-----BEGIN PUBLIC KEY-----\n\
      MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAzk60INA65ckmJeCEER8b\n\
      NiMVtsSBRbFSavdPJRMrhhLFiZKbkIFtKUL5UgbvoAaYaTJmpk1b/g0C2RzZwcj4\n\
+     q83vq83vq83vq83vq83vq83vq83vq83vq83vq83vq83vq83vq83vq83vq83vq83v\n\
+     q83vq83vq83vq83vq83vq83vq83vq83vq83vq83vq83vq83vq83vq83vq83vq83v\n\
+     q83vq83vq83vq83vq83vq83vq83vq83vq83vq83vq83vq83vq83vq83vq83vq83v\n\
+     q83vq83vq83vq83vq83vq83vq83vq83vq83vq83vq83vq83vq83vq83vq83vq83v\n\
+     qwIDAQAB\n\
      -----END PUBLIC KEY-----\n";
 
 /// One row of the table: a template, and what the rule says the resource it declares must then

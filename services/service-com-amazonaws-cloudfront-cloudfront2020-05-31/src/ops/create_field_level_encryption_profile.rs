@@ -171,11 +171,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let _ = ctx;
         let config = input.field_level_encryption_profile_config;
         let now = ::std::time::SystemTime::now();
-        let mut store = state.lock();
-        // Materialise whatever the clock owes the rest of the store before this call reads
-        // it, as every handler here does. A profile itself has no transition owed: the model
-        // gives it no status, so one this service accepts is usable at once.
-        store.settle(now);
+
+        // Everything the CONFIGURATION alone decides is decided here, before the store's lock
+        // is taken: none of it reads a stored record, and the work the last of them costs is
+        // the caller's own list lengths, which no other caller should wait on.
 
         // Every CloudFront list travels in a wrapper that states its own length beside the
         // list itself, and a request whose `Quantity` disagrees with its `Items` describes
@@ -206,6 +205,57 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         }
+
+        // "The maximum number of encryption entities for field-level encryption have been
+        // created." / "The maximum number of field patterns for field-level encryption have
+        // been created." A profile's entities are stored whole inside its record and are what
+        // the admission below compares with one another, so both counts are held to what this
+        // service admits BEFORE anything walks them.
+        match crate::state::field_level_encryption_profile_over_quota(&config) {
+            Some(crate::state::FieldLevelEncryptionProfileQuota::EncryptionEntities) => {
+                return Err(
+                    CreateFieldLevelEncryptionProfileErrorModeled::TooManyFieldLevelEncryptionEncryptionEntities(
+                        TooManyFieldLevelEncryptionEncryptionEntities {
+                            message: Some(
+                                crate::state::TOO_MANY_ENCRYPTION_ENTITIES_MESSAGE.to_string(),
+                            ),
+                        },
+                    )
+                    .into(),
+                );
+            }
+            Some(crate::state::FieldLevelEncryptionProfileQuota::FieldPatterns) => {
+                return Err(
+                    CreateFieldLevelEncryptionProfileErrorModeled::TooManyFieldLevelEncryptionFieldPatterns(
+                        TooManyFieldLevelEncryptionFieldPatterns {
+                            message: Some(
+                                crate::state::TOO_MANY_FIELD_PATTERNS_MESSAGE.to_string(),
+                            ),
+                        },
+                    )
+                    .into(),
+                );
+            }
+            None => {}
+        }
+
+        // `EncryptionEntity$FieldPatterns`: "You can't overlap field patterns. For example,
+        // you can't have both ABC* and AB*." A profile whose patterns overlap says nothing
+        // about which key encrypts a field both of them match, so no such profile is stored
+        // ([`crate::state::field_level_encryption_profile_overlapping_field_patterns`]).
+        if let Some(refusal) =
+            crate::state::field_level_encryption_profile_overlapping_field_patterns(&config)
+        {
+            return Err(
+                CreateFieldLevelEncryptionProfileErrorModeled::InvalidArgument(refusal).into(),
+            );
+        }
+
+        let mut store = state.lock();
+        // Materialise whatever the clock owes the rest of the store before this call reads
+        // it, as every handler here does. A profile itself has no transition owed: the model
+        // gives it no status, so one this service accepts is usable at once.
+        store.settle(now);
 
         // "Profile name for the field-level encryption profile": a name identifies ONE
         // profile of this account, so a name another profile already holds cannot name a

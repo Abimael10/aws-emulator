@@ -223,6 +223,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // `DistributionConfig$Enabled` is "whether the distribution is enabled to accept user
+        // requests for content": a staging distribution that is disabled accepts none, so a
+        // policy over it could never move traffic to it and none is minted
+        // ([`crate::state::names_disabled_staging_distribution`]). Read after the resolution
+        // above, a name that resolves to no distribution having no state to read.
+        if crate::state::names_disabled_staging_distribution(&store, &config) {
+            return Err(CreateContinuousDeploymentPolicyErrorModeled::InvalidArgument(
+                crate::state::disabled_staging_distribution(),
+            )
+            .into());
+        }
+
         // "A continuous deployment policy with this configuration already exists": a
         // create repeating a configuration the store already holds names that policy
         // rather than storing a second copy of it.

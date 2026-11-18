@@ -286,6 +286,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             config,
             last_modified_time: now,
             etag: etag.clone(),
+            // The `Server-Timing` sampling this policy has spent so far: none yet, no
+            // response having been served under it
+            // ([`crate::state::StoredResponseHeadersPolicy::adds_server_timing_to_next_response`]).
+            server_timing_cursor: 0,
         };
         // Read from the record just built, never from the request.
         let response_headers_policy = stored.to_response_headers_policy();

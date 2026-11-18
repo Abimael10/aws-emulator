@@ -289,6 +289,51 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
+        // "The maximum number of encryption entities for field-level encryption have been
+        // created." / "The maximum number of field patterns for field-level encryption have
+        // been created." Both counts are held to what this service admits BEFORE anything
+        // walks the entities — the same bound the create path applies, so an update cannot
+        // store what a create would refuse, nor cost more work to admit.
+        match crate::state::field_level_encryption_profile_over_quota(&config) {
+            Some(crate::state::FieldLevelEncryptionProfileQuota::EncryptionEntities) => {
+                return Err(
+                    UpdateFieldLevelEncryptionProfileErrorModeled::TooManyFieldLevelEncryptionEncryptionEntities(
+                        TooManyFieldLevelEncryptionEncryptionEntities {
+                            message: Some(
+                                crate::state::TOO_MANY_ENCRYPTION_ENTITIES_MESSAGE.to_string(),
+                            ),
+                        },
+                    )
+                    .into(),
+                );
+            }
+            Some(crate::state::FieldLevelEncryptionProfileQuota::FieldPatterns) => {
+                return Err(
+                    UpdateFieldLevelEncryptionProfileErrorModeled::TooManyFieldLevelEncryptionFieldPatterns(
+                        TooManyFieldLevelEncryptionFieldPatterns {
+                            message: Some(
+                                crate::state::TOO_MANY_FIELD_PATTERNS_MESSAGE.to_string(),
+                            ),
+                        },
+                    )
+                    .into(),
+                );
+            }
+            None => {}
+        }
+
+        // `EncryptionEntity$FieldPatterns`: "You can't overlap field patterns. For example,
+        // you can't have both ABC* and AB*." The SAME check the create path makes, because a
+        // configuration is checked on every payload that states one: an update cannot store
+        // the overlapping patterns a create would have refused.
+        if let Some(refusal) =
+            crate::state::field_level_encryption_profile_overlapping_field_patterns(&config)
+        {
+            return Err(
+                UpdateFieldLevelEncryptionProfileErrorModeled::InvalidArgument(refusal).into(),
+            );
+        }
+
         // `EncryptionEntity$PublicKeyId` is "The public key associated with a set of
         // field-level encryption patterns, to be used when encrypting the fields that match
         // the patterns": the profile encrypts WITH that key, so an id no stored public key

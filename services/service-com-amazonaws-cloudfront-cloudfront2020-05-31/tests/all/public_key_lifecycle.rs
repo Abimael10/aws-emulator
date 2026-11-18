@@ -230,29 +230,74 @@ impl Key {
     }
 }
 
-/// A PEM-encoded public key body of `lines` 64-character lines, written the way a PEM
-/// document is: the armour, then the base64 body, then the closing armour.
+/// One PEM-enveloped RSA PUBLIC key, distinct for each `(lines, filler)` pair, whose
+/// modulus is as many octets wide as `lines` selects.
 ///
-/// The VALUE is immaterial to every rule under test — the service stores the encoded key
-/// as submitted and reports it back — so the rows below vary its FORM (one line or many,
-/// short body or long) rather than trying to be a particular key. The document carries no
-/// trailing newline: the XML text of an element is read with its surrounding whitespace
-/// stripped at the request boundary, so a value is compared as the boundary hands it to a
-/// handler.
+/// `PublicKeyConfig$EncodedKey` carries the RSA public key of a key pair — the service
+/// decodes the material and refuses anything that is not such a key — so a row of this table
+/// carries a key a PKCS#1 reader accepts rather than text in a PEM envelope. The VALUE itself
+/// is immaterial to the rules under test, which is why it is SYNTHESISED here rather than
+/// generated: the structure is what the service reads, and a generated pair would cost a key
+/// generation per row of every table in this suite.
+///
+/// The rows still vary the FORM, as the rules under test are about the form a configuration
+/// takes: `lines` widens the modulus, so the envelope's body runs over one line or over many.
+/// The document carries no trailing newline: the XML text of an element is read with its
+/// surrounding whitespace stripped at the request boundary, so a value is compared as the
+/// boundary hands it to a handler.
 pub(crate) fn pem(lines: usize, filler: char) -> String {
-    let body: Vec<String> = (0..lines)
-        .map(|index| {
-            let mut line: String = std::iter::repeat_n(filler, 63).collect();
-            // One differing character per line, so no two lines of the body are equal.
-            line.push(char::from(b'A' + u8::try_from(index % 26).unwrap_or(0)));
-            line
-        })
-        .collect();
-    format!(
-        "-----BEGIN PUBLIC KEY-----\n{}\n-----END PUBLIC KEY-----",
-        body.join("\n")
+    ::pem::encode_config(
+        &::pem::Pem::new(PUBLIC_KEY_LABEL.to_string(), public_key_info(lines, filler)),
+        // The line ending a client's own PEM file carries, which is also the one the XML text
+        // of the element is read back as.
+        ::pem::EncodeConfig::new().set_line_ending(::pem::LineEnding::LF),
     )
+    .trim_end()
+    .to_string()
 }
+
+/// The PEM label RFC 7468 section 13 gives an X.509 `SubjectPublicKeyInfo`, which is the
+/// envelope `EncodedKey` carries a public key in.
+const PUBLIC_KEY_LABEL: &str = "PUBLIC KEY";
+
+/// The DER of a `SubjectPublicKeyInfo` holding one RSA public key: the algorithm
+/// `rsaEncryption` and, inside the bit string, the PKCS#1 `RSAPublicKey` of the modulus
+/// `lines` and `filler` select and the public exponent 65537.
+fn public_key_info(lines: usize, filler: char) -> Vec<u8> {
+    use ::pkcs1::der::asn1::{Any, BitString, Null};
+    use ::pkcs1::der::Encode as _;
+    use ::x509_cert::spki::{AlgorithmIdentifierOwned, SubjectPublicKeyInfoOwned};
+
+    // The width `lines` selects, in whole 64-octet steps, with the top bit of the modulus set
+    // (so its width really is that many octets) and the bottom bit set (a product of two odd
+    // primes is odd). Every octet in between is derived from the row's own `filler` and
+    // position, so no two rows carry the same key.
+    let mut modulus = vec![0u8; 64 * (1 + lines % 8)];
+    let seed = u8::try_from(u32::from(filler) % 251).unwrap_or_default();
+    for (index, octet) in modulus.iter_mut().enumerate() {
+        *octet = seed.wrapping_add(u8::try_from(index % 251).unwrap_or_default());
+    }
+    modulus[0] |= 0x80;
+    let last = modulus.len() - 1;
+    modulus[last] |= 0x01;
+    let key = ::pkcs1::RsaPublicKey {
+        modulus: ::pkcs1::UintRef::new(&modulus).expect("a positive modulus"),
+        public_exponent: ::pkcs1::UintRef::new(&[0x01, 0x00, 0x01]).expect("65537"),
+    };
+    let der = key.to_der().expect("an RSAPublicKey encodes as DER");
+    let info = SubjectPublicKeyInfoOwned {
+        algorithm: AlgorithmIdentifierOwned {
+            oid: RSA_ENCRYPTION_OID.parse().expect("the rsaEncryption OID"),
+            parameters: Some(Any::from(Null)),
+        },
+        subject_public_key: BitString::from_bytes(&der).expect("a whole number of octets"),
+    };
+    info.to_der().expect("a SubjectPublicKeyInfo encodes as DER")
+}
+
+/// The object identifier of `rsaEncryption` (PKCS#1), which an RSA key's
+/// `SubjectPublicKeyInfo` names its algorithm by.
+const RSA_ENCRYPTION_OID: &str = "1.2.840.113549.1.1.1";
 
 /// The configurations every case below is run over.
 ///
@@ -275,7 +320,9 @@ fn table() -> Vec<Key> {
         pem(2, 'B'),
         pem(4, 'C'),
         pem(8, 'D'),
-        "-----BEGIN PUBLIC KEY-----\nSHORT\n-----END PUBLIC KEY-----".to_string(),
+        // The narrowest modulus this helper writes, so one row's envelope body is a single
+        // line.
+        pem(0, 'E'),
     ];
 
     keys.iter()

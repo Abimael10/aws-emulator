@@ -1175,6 +1175,7 @@ pub async fn serve<Eng: Send + Sync + 'static>(
     let served_for;
     let mut plan;
     let realtime_log;
+    let server_timing;
     // WHICH of a continuous deployment's two distributions serves this request, decided ONCE
     // here so everything below — the behaviour, its functions, the web ACL, the origin and the
     // series the answer is counted into — is the same distribution's
@@ -1190,6 +1191,14 @@ pub async fn serve<Eng: Send + Sync + 'static>(
         staging = continuous_deployment::staging_distribution(&mut store, req, now);
         edge_functions = associated_functions(&store, req, staging.as_deref());
         (served_for, plan) = plan_request(&store, req, &cf_id, now, staging.as_deref());
+        // WHETHER this answer carries the response headers policy's `Server-Timing` header is
+        // that policy's `SamplingRate` to decide, and it is decided HERE, over the sequence of
+        // the responses the policy is applied to
+        // (`crate::state::StoredResponseHeadersPolicy::adds_server_timing_to_next_response`) —
+        // the header's own metrics are measured as the request is served, further down.
+        server_timing = served_for
+            .as_ref()
+            .is_some_and(|served| store.adds_server_timing(&served.response_headers_policy_id));
         // WHETHER this request's log data is delivered at all is the matched behaviour's
         // real-time log configuration to decide, and it is decided HERE, over the sequence of
         // the requests that configuration covers ([`realtime_logs::sampled`]) — the record
@@ -1396,6 +1405,28 @@ pub async fn serve<Eng: Send + Sync + 'static>(
         response_headers::apply(
             policy,
             response_headers::ViewerCors::of_request(req),
+            &mut response,
+        );
+    }
+    // And the `Server-Timing` group of that policy, for a response its sampling selected: the
+    // metrics are what the edge MEASURED serving this request — which layer answered it,
+    // whether the cache held the object, the origin's first-byte latency and the edge's own —
+    // so they are read off the serving path here rather than stated by the configuration
+    // ([`response_headers::ServerTiming`]).
+    if server_timing {
+        response_headers::apply_server_timing(
+            &response_headers::ServerTiming {
+                request_id: &cf_id,
+                cache_hit: match served_from {
+                    edge_metrics::ServedFrom::EdgeCache => Some(true),
+                    edge_metrics::ServedFrom::Origin => Some(false),
+                    // A page CloudFront generated itself is no object of an origin's, so the
+                    // edge cache neither held it nor missed it.
+                    edge_metrics::ServedFrom::CloudFront => None,
+                },
+                origin_latency,
+                taken: received.elapsed(),
+            },
             &mut response,
         );
     }
@@ -1661,6 +1692,10 @@ struct ServedFor {
     /// account no longer holds). Its header groups are applied to whatever the edge serves
     /// ([`response_headers`]).
     response_headers_policy: Option<ResponseHeadersPolicyConfig>,
+    /// `ResponseHeadersPolicyId` of the behaviour that matched — the empty string for a
+    /// behaviour that attaches none. The policy's own `Server-Timing` sampling is counted
+    /// against the RECORD it names, so the id travels beside the configuration read off it.
+    response_headers_policy_id: String,
 }
 
 /// The distribution one viewer request resolved to and the FUNCTIONS its matched cache
@@ -1905,6 +1940,10 @@ fn plan_request(
             .as_deref()
             .and_then(|id| store.readable_response_headers_policy(id))
             .map(|policy| policy.config.clone()),
+        response_headers_policy_id: behavior
+            .response_headers_policy_id
+            .clone()
+            .unwrap_or_default(),
     };
     let plan = plan_resolved(store, &addressed, &resolved, req, cf_id, now, behavior);
     (Some(served_for), plan)

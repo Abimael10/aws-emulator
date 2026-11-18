@@ -213,21 +213,19 @@ impl StoredRealtimeLogConfig {
     ///
     /// `SamplingRate` is "a whole number between 1 and 100 (inclusive) to determine the
     /// percentage of viewer requests that are represented in the real-time log data", so of
-    /// every hundred requests a configuration covers, exactly that many are represented: each
-    /// covered request adds the rate to the cursor, and a record is delivered — and a whole
-    /// percent spent — as soon as the cursor has a whole request's worth in it. What is left
-    /// over CARRIES to the next request, which is what makes the long-run share the rate
-    /// itself at every value of it: 100 represents every request, 75 three in four, 50 every
-    /// second one, and 1 one in a hundred. No randomness, and the cursor stays below one
-    /// whole percent plus the rate, which the create and update paths hold to
+    /// every hundred requests a configuration covers, exactly that many are represented:
+    /// 100 represents every request, 75 three in four, 50 every second one, and 1 one in a
+    /// hundred. Counted by the one share counting this service decides every share by
+    /// ([`super::takes_next_share`]), in whole percents, so the long-run share is the rate
+    /// itself at every value of it and no request depends on a random draw. The cursor stays
+    /// below one whole percent plus the rate, which the create and update paths hold to
     /// [`MAX_SAMPLING_RATE`].
     pub fn represents_next_request(&mut self) -> bool {
-        self.sampling_cursor = self.sampling_cursor.saturating_add(self.sampling_rate);
-        if self.sampling_cursor < WHOLE_SAMPLING_PERCENT {
-            return false;
-        }
-        self.sampling_cursor -= WHOLE_SAMPLING_PERCENT;
-        true
+        super::takes_next_share(
+            &mut self.sampling_cursor,
+            self.sampling_rate,
+            WHOLE_SAMPLING_PERCENT,
+        )
     }
 }
 

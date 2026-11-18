@@ -206,7 +206,7 @@ pub fn refusal(
     let Some(signature) = decode_base64(&presented.signature, MAX_SIGNATURE_BYTES) else {
         return Some(Refusal::AccessDenied);
     };
-    let Some(key) = rsa_public_key(&encoded_key) else {
+    let Some(key) = crate::state::rsa_public_key_bits(&encoded_key) else {
         // The stored `EncodedKey` is not an RSA public key this process can read, so no
         // signature can be verified against it.
         return Some(Refusal::AccessDenied);
@@ -489,22 +489,6 @@ fn decode_base64(value: &str, ceiling: usize) -> Option<Vec<u8>> {
         .decode(standard.as_bytes())
         .ok()?;
     (bytes.len() <= ceiling).then_some(bytes)
-}
-
-/// The RSA public key the stored `EncodedKey` carries, as the verifier reads it.
-///
-/// `PublicKeyConfig$EncodedKey` is "the public key that you can use with signed URLs and
-/// signed cookies, or with field-level encryption" — a PEM-enveloped X.509
-/// `SubjectPublicKeyInfo`, which is what `openssl rsa -pubout` writes. The envelope is split
-/// by the crate that owns the PEM format and the structure inside it decoded by the one that
-/// owns `SubjectPublicKeyInfo`, so the key a signature is verified against is the key a
-/// client really uploaded.
-fn rsa_public_key(encoded_key: &str) -> Option<Vec<u8>> {
-    use ::x509_cert::der::Decode as _;
-
-    let block = ::pem::parse(encoded_key).ok()?;
-    let info = ::x509_cert::spki::SubjectPublicKeyInfoRef::from_der(block.contents()).ok()?;
-    Some(info.subject_public_key.raw_bytes().to_vec())
 }
 
 /// Whether `signature` is the signature of `statement` under the RSA public key `key`.

@@ -112,8 +112,14 @@ aws-sdk-lambda = { version = "1", default-features = false }
 # the crate that owns the format rather than by scanning text.
 pem = "3"
 # Decodes the DER inside one `CERTIFICATE` PEM block as an X.509 certificate, so a trust
-# store's `NumberOfCaCertificates` counts certificates a real parser accepted.
+# store's `NumberOfCaCertificates` counts certificates a real parser accepted. It also owns
+# the `SubjectPublicKeyInfo` a public key's `EncodedKey` is enveloped in
+# (`state::public_key_material`).
 x509-cert = "0.2"
+# Decodes the RSA public key inside that `SubjectPublicKeyInfo`, so the material
+# `CreatePublicKey` admits is a key the crate that owns PKCS#1 accepted rather than text that
+# merely looks like one (`state::public_key_material`).
+pkcs1 = "0.7"
 # The two content codings a cache behaviour's automatic compression serves an answer under
 # (`service::edge::compression`): `brotli` produces the `br` bytes a viewer that negotiated
 # Brotli receives, `flate2` the `gzip` ones. The bytes the edge serves are the encoders' own,
@@ -181,7 +187,6 @@ tokio = { workspace = true, features = ["io-util", "net", "time"] }
 # RSASSA-PKCS1-v1_5 encoding itself over the modular exponentiation `num-bigint` provides and
 # the key parts `pkcs1`/`pkcs8` read out of the generated key. TEST-ONLY.
 num-bigint = "0.4"
-pkcs1 = "0.7"
 pkcs8 = "0.10"
 # The .zip deployment package the function behind the function-URL origin suite is created
 # from, written in memory the way a caller uploads one. TEST-ONLY.

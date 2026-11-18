@@ -6,20 +6,22 @@
 //! (de)serialization, the handler, the persisted state and serialization — the same path a
 //! client takes. The rules under test are:
 //!
-//! * "Tests a connection function": a connection function's code is a SCRIPT that runs with
-//!   the connection it decides about in scope as the global `connection` — it declares no
-//!   handler — so the result is what the STORED code of the addressed stage DID with the
-//!   submitted connection object: the connection it allowed (`connection.allow()`, reported
-//!   as the JSON of the connection as the script left it, since
+//! * "Tests a connection function": a connection function's code runs with the connection it
+//!   decides about in scope as the global `connection` — and is handed that connection where
+//!   it declares a `handler` — so the result is what the STORED code of the addressed stage DID
+//!   with the submitted connection object: the DECISION it took (`connection.allow()` or
+//!   `connection.deny()`, reported as the JSON of the connection as the code left it, carrying
+//!   the decision that was taken, since
 //!   `ConnectionFunctionTestResult$ConnectionFunctionOutput` is a plain string the model
 //!   states no structure for), the lines it logged in the order it logged them, and — when it
 //!   failed — the error message of that failure, beside the summary of
-//!   the stage that ran and the share of the allowed execution time the run took. A script
-//!   that takes no decision and fails at nothing allowed no connection and reports no error;
+//!   the stage that ran and the share of the allowed execution time the run took. Code that
+//!   takes no decision and fails at nothing reports the connection as it left it and no
+//!   error;
 //! * a result that is served at all reports BOTH halves of the run: the output member is
-//!   present on every 200 and carries the empty JSON object for a run that allowed no
-//!   connection, and the error-message member is present on every 200 and carries the EMPTY
-//!   STRING for a run that reported no error;
+//!   present on every 200 and carries the empty JSON object for a run that produced no
+//!   connection at all, and the error-message member is present on every 200 and carries the
+//!   EMPTY STRING for a run that reported no error;
 //! * the stage decides WHICH stored record runs: a request naming no stage tests the stage a
 //!   connection function is created in, `LIVE` tests what a publish copied there, and a stage
 //!   no stored connection function has — the `LIVE` stage of one nothing published among
@@ -35,7 +37,7 @@
 //! * a test REPORTS, so it persists nothing: the connection function, its version tokens and
 //!   its code stand exactly as they did before it.
 //!
-//! The table rows differ along everything the first rule generalises over — what the script
+//! The table rows differ along everything the first rule generalises over — what the code
 //! DOES (allows the connection it was handed, allows it after changing it, computes what it
 //! adds from the connection, walks the connection it was handed, allows from inside a
 //! promise, logs, raises, decides nothing, does not compile, never returns) and which
@@ -76,7 +78,9 @@ const EMPTY_OUTPUT_DOCUMENT: &str = "{}";
 /// A connection object a client submits: the connection a connection function decides about,
 /// carrying the viewer and the TLS details of it. Its content is the CALLER's, so what a row
 /// proves is that the script is handed exactly this document.
-const CONNECTION_OBJECT: &str = r#"{"version":"1.0",
+///
+/// `pub(crate)` for the reason [`test_connection_function`] is.
+pub(crate) const CONNECTION_OBJECT: &str = r#"{"version":"1.0",
      "context":{"distributionDomainName":"d111111abcdef8.cloudfront.net",
      "distributionId":"EDFDVBD6EXAMPLE","connectionId":"c-1"},
      "viewer":{"ip":"198.51.100.11","tls":{"version":"TLSv1.3",
@@ -98,7 +102,10 @@ const OTHER_CONNECTION_OBJECT: &str = r#"{"version":"1.0",
 /// base64 blob member a restXml request puts it in, the stage when the request names one,
 /// and `if_match` as the `If-Match` header the operation binds its required `IfMatch` member
 /// to.
-async fn test_connection_function(
+///
+/// `pub(crate)` so a sibling suite that tests a connection function goes over this one wire
+/// path rather than growing a copy of it.
+pub(crate) async fn test_connection_function(
     router: &MultiServiceRouter,
     id: &str,
     stage: Option<&str>,
@@ -128,13 +135,13 @@ async fn test_connection_function(
 
 /// What one create handed back: the id it minted and the version token of the `DEVELOPMENT`
 /// stage it stored, which is the version a test of that stage is checked against.
-struct Created {
-    id: String,
-    etag: String,
+pub(crate) struct Created {
+    pub(crate) id: String,
+    pub(crate) etag: String,
 }
 
 /// Create the connection function `name` with `code` and answer what the create minted.
-async fn create_one(router: &MultiServiceRouter, name: &str, code: &str) -> Created {
+pub(crate) async fn create_one(router: &MultiServiceRouter, name: &str, code: &str) -> Created {
     let create = Create {
         case: "a connection function under test",
         name: name.to_string(),
@@ -158,12 +165,12 @@ async fn create_one(router: &MultiServiceRouter, name: &str, code: &str) -> Crea
 
 /// The text of one member of the `ConnectionFunctionTestResult` document, or `None` when it
 /// carries none.
-fn result_text<'a>(result: &'a Node, name: &str) -> Option<&'a str> {
+pub(crate) fn result_text<'a>(result: &'a Node, name: &str) -> Option<&'a str> {
     result.text_at(name)
 }
 
 /// The log lines the result reports, in the order they appear in it.
-fn result_logs(result: &Node) -> Vec<String> {
+pub(crate) fn result_logs(result: &Node) -> Vec<String> {
     result
         .at("ConnectionFunctionExecutionLogs")
         .map(|logs| {
@@ -175,8 +182,8 @@ fn result_logs(result: &Node) -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// `text` as JSON, or a panic naming the case: the output member carries the JSON of the
-/// connection the script allowed, so it is compared as a document rather than as text.
+/// `text` as JSON, or a panic naming the case: the output member carries a JSON document, so
+/// it is compared as a document rather than as text.
 fn json(text: &str, case: &str) -> Json {
     ::serde_json::from_str(text)
         .unwrap_or_else(|error| panic!("case {case}: expected JSON, got {text:?} ({error})"))
@@ -193,15 +200,30 @@ struct Run {
     code: &'static str,
     /// The connection object the request carries, as the JSON text a client submits.
     connection_object: &'static str,
-    /// The JSON the `ConnectionFunctionOutput` member must carry, when the run allows the
-    /// connection.
+    /// The JSON of the CONNECTION the `ConnectionFunctionOutput` member must report: the
+    /// document carries the decision the run took where it took one ([`reported`]).
     output: Option<&'static str>,
+    /// Whether the run reported its output as a DECISION it took, rather than as the
+    /// connection it was handed and left as it stands.
+    decided: bool,
     /// The log lines the result must report, in order.
     logs: Vec<&'static str>,
     /// A fragment the reported error message must contain, or `Some("")` for a run that must
     /// report SOME error message whose wording is the engine's own. `None` where the run must
     /// report no error at all.
     error: Option<&'static str>,
+}
+
+/// The output document a result reports for a run over the connection `connection`: the
+/// connection as the code left it, carrying the decision that was taken where `decided` says
+/// the run allowed it.
+fn reported(connection: &str, decided: bool) -> String {
+    let mut document: Json = ::serde_json::from_str(connection)
+        .expect("every row of this table submits a JSON connection object");
+    if decided {
+        document["decision"] = Json::String("allow".to_string());
+    }
+    document.to_string()
 }
 
 /// Every rule below is asserted over these runs.
@@ -212,6 +234,7 @@ fn run_table() -> Vec<Run> {
             code: "connection.allow();\n",
             connection_object: CONNECTION_OBJECT,
             output: Some(CONNECTION_OBJECT),
+            decided: true,
             logs: Vec::new(),
             error: None,
         },
@@ -220,6 +243,7 @@ fn run_table() -> Vec<Run> {
             code: "connection.allow();\n",
             connection_object: OTHER_CONNECTION_OBJECT,
             output: Some(OTHER_CONNECTION_OBJECT),
+            decided: true,
             logs: Vec::new(),
             error: None,
         },
@@ -236,6 +260,7 @@ fn run_table() -> Vec<Run> {
                  "cipher":"TLS_AES_128_GCM_SHA256","sni":"example.com"}},
                  "decided":{"by":"tls","value":"TLSv1.3"}}"#,
             ),
+            decided: true,
             logs: Vec::new(),
             error: None,
         },
@@ -253,6 +278,7 @@ fn run_table() -> Vec<Run> {
                  "cipher":"ECDHE-RSA-AES128-GCM-SHA256","sni":"shop.example.com"}},
                  "seen":"3:cipher-sni-version"}"#,
             ),
+            decided: true,
             logs: Vec::new(),
             error: None,
         },
@@ -271,6 +297,7 @@ fn run_table() -> Vec<Run> {
                  "cipher":"TLS_AES_128_GCM_SHA256","sni":"example.com"}},
                  "total":49995000}"#,
             ),
+            decided: true,
             logs: Vec::new(),
             error: None,
         },
@@ -288,6 +315,7 @@ fn run_table() -> Vec<Run> {
                  "cipher":"TLS_AES_128_GCM_SHA256","sni":"example.com"}},
                  "walked":"version,context,viewer"}"#,
             ),
+            decided: true,
             logs: Vec::new(),
             error: None,
         },
@@ -306,6 +334,7 @@ fn run_table() -> Vec<Run> {
                  "cipher":"TLS_AES_128_GCM_SHA256","sni":"example.com"}},
                  "awaited":true}"#,
             ),
+            decided: true,
             logs: Vec::new(),
             error: None,
         },
@@ -317,6 +346,7 @@ fn run_table() -> Vec<Run> {
                    connection.allow();\n",
             connection_object: CONNECTION_OBJECT,
             output: Some(CONNECTION_OBJECT),
+            decided: true,
             logs: vec![
                 "ip 198.51.100.11",
                 "{\"version\":\"TLSv1.3\",\"cipher\":\"TLS_AES_128_GCM_SHA256\",\
@@ -331,14 +361,17 @@ fn run_table() -> Vec<Run> {
                    throw new Error('no route for ' + connection.viewer.tls.sni);\n",
             connection_object: CONNECTION_OBJECT,
             output: None,
+            decided: false,
             logs: vec!["about to fail"],
             error: Some("Error: no route for example.com"),
         },
         Run {
-            case: "a script that decides nothing about the connection",
+            case: "a script that decides nothing about the connection, which reports the \
+                   connection as it left it",
             code: "var unused = connection.viewer.ip;\n",
             connection_object: CONNECTION_OBJECT,
-            output: None,
+            output: Some(CONNECTION_OBJECT),
+            decided: false,
             logs: Vec::new(),
             error: None,
         },
@@ -347,6 +380,7 @@ fn run_table() -> Vec<Run> {
             code: "connection.allow(;\n",
             connection_object: CONNECTION_OBJECT,
             output: None,
+            decided: false,
             logs: Vec::new(),
             error: Some("SyntaxError"),
         },
@@ -355,6 +389,7 @@ fn run_table() -> Vec<Run> {
             code: "while (true) { }\n",
             connection_object: CONNECTION_OBJECT,
             output: None,
+            decided: false,
             logs: Vec::new(),
             error: Some("stopped"),
         },
@@ -365,11 +400,11 @@ fn run_table() -> Vec<Run> {
 // The rules
 // ---------------------------------------------------------------------------
 
-/// The result is what the stored code DID with the submitted connection object: the value it
-/// allowed, as the JSON of it; the lines it logged, in order; and the error message of a run
-/// that failed, with no output beside it. Every result reports a compute utilization that is a
-/// whole-number percentage of the allowed execution time, and the summary of the stage that
-/// ran.
+/// The result is what the stored code DID with the submitted connection object: the decision
+/// it took, as the JSON document naming it; the lines it logged, in order; and the error
+/// message of a run that failed, with no output beside it. Every result reports a compute
+/// utilization that is a whole-number percentage of the allowed execution time, and the
+/// summary of the stage that ran.
 #[tokio::test]
 async fn a_test_reports_what_the_stored_code_did_with_the_connection_object() {
     let router = emulator();
@@ -438,7 +473,7 @@ async fn a_test_reports_what_the_stored_code_did_with_the_connection_object() {
         );
 
         // Both halves of the run are reported on every result that is served at all: the
-        // connection it allowed — the empty JSON object for a run that allowed none — and the
+        // decision it took — the empty JSON object for a run that took none — and the
         // error message, which is the empty string for a run that reported none.
         let output = result_text(result, "ConnectionFunctionOutput").unwrap_or_else(|| {
             panic!(
@@ -448,8 +483,14 @@ async fn a_test_reports_what_the_stored_code_did_with_the_connection_object() {
         });
         assert_eq!(
             json(output, case),
-            json(run.output.unwrap_or(EMPTY_OUTPUT_DOCUMENT), case),
-            "case {case}: expected the connection the run produced, got {output}"
+            json(
+                &run.output.map_or_else(
+                    || EMPTY_OUTPUT_DOCUMENT.to_string(),
+                    |connection| reported(connection, run.decided)
+                ),
+                case
+            ),
+            "case {case}: expected the connection the run reported, got {output}"
         );
 
         let message = result_text(result, "ConnectionFunctionErrorMessage").unwrap_or_else(|| {

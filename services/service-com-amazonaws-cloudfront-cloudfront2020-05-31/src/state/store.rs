@@ -692,6 +692,20 @@ impl ComAmazonawsCloudfrontCloudfront20200531State {
         }
     }
 
+    /// Whether the answer the edge is about to serve under the response headers policy `id`
+    /// carries the `Server-Timing` header, advancing that policy's own sampling cursor.
+    ///
+    /// The ACCOUNT's own policies only: a policy AWS published states no `Server-Timing`
+    /// configuration, so none of them writes the header and none has a share to spend. Takes
+    /// the store mutably because the share of responses the header is written on is counted
+    /// over the SEQUENCE of them, so serving one is what moves the cursor
+    /// ([`StoredResponseHeadersPolicy::adds_server_timing_to_next_response`]).
+    pub fn adds_server_timing(&mut self, id: &str) -> bool {
+        self.response_headers_policies
+            .get_mut(id)
+            .is_some_and(StoredResponseHeadersPolicy::adds_server_timing_to_next_response)
+    }
+
     /// The response headers policy whose STORED configuration carries `name`, or `None`.
     ///
     /// `ResponseHeadersPolicyConfig$Name`: "The name must be unique for response headers

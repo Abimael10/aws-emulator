@@ -37,9 +37,13 @@
 //! headers answer what an ACTUAL request's answer may be read for and appear on that one
 //! ([`ViewerCors`]).
 //!
-//! `ServerTimingHeadersConfig` is the one group this module does not write: its header
-//! carries CloudFront's own CDN timing metrics, which are not a value this emulator can
-//! state for work it did not do.
+//! `ServerTimingHeadersConfig` is the group whose header is written from what the edge
+//! MEASURED while serving the request rather than from the configuration ([`ServerTiming`]):
+//! the metrics it carries are facts of this one exchange — which layer answered it, whether
+//! the edge cache held the object, and the latencies the edge clocked — so the header is
+//! written where those are known and carries nothing for work nothing did.
+
+use ::std::time::Duration;
 
 use ::aws_smithy_runtime_api::http::Response as RtResponse;
 
@@ -385,4 +389,76 @@ fn put(response: &mut RtResponse, name: &str, value: String, overridden: bool) {
         return;
     }
     let _ = response.headers_mut().try_insert(name, value);
+}
+
+/// The response header the `Server-Timing` group writes.
+const SERVER_TIMING: &str = "server-timing";
+
+/// What the edge MEASURED while serving one request, which its `Server-Timing` metrics
+/// report.
+///
+/// "You can use the `Server-Timing` header to view metrics that can help you gain insights
+/// about the behavior and performance of CloudFront. For example, you can see which cache
+/// layer served a cache hit, or the first byte latency from the origin when there was a cache
+/// miss." So every metric is a fact of THIS exchange, read off the serving path rather than
+/// stated by the configuration: a metric whose work did not happen is not written at all.
+#[derive(Debug, Clone, Copy)]
+pub struct ServerTiming<'r> {
+    /// The id the edge minted for this request, which `cdn-rid` reports.
+    pub request_id: &'r str,
+    /// Whether the EDGE CACHE held the object this answer is, `None` for an answer that is no
+    /// object of an origin's at all (a page CloudFront generated itself).
+    pub cache_hit: Option<bool>,
+    /// How long the origin took to answer, for an answer an origin produced: the first-byte
+    /// latency `cdn-upstream-fbl` reports, and what tells this exchange had an upstream leg.
+    pub origin_latency: Option<Duration>,
+    /// How long the edge spent on the request, which `cdn-downstream-fbl` reports.
+    pub taken: Duration,
+}
+
+impl ServerTiming<'_> {
+    /// The header value: the metrics of this exchange, comma-separated, as the header's own
+    /// grammar lists them (RFC-style `name;desc="…"` and `name;dur=…` members).
+    ///
+    /// The names are the ones CloudFront publishes for this header: `cdn-rid` for the request
+    /// id, `cdn-cache-hit` and `cdn-cache-miss` for what the edge cache did, `cdn-upstream-fbl`
+    /// for the origin's first-byte latency, `cdn-upstream-layer` for the layer that made the
+    /// upstream request, and `cdn-downstream-fbl` for the edge's own.
+    fn value(&self) -> String {
+        let mut metrics = vec![format!("cdn-rid;desc=\"{}\"", self.request_id)];
+        match self.cache_hit {
+            Some(true) => metrics.push("cdn-cache-hit".to_string()),
+            Some(false) => metrics.push("cdn-cache-miss".to_string()),
+            None => {}
+        }
+        if let Some(latency) = self.origin_latency {
+            metrics.push(format!("cdn-upstream-layer;desc=\"{EDGE_LAYER}\""));
+            metrics.push(format!("cdn-upstream-fbl;dur={}", milliseconds(latency)));
+        }
+        metrics.push(format!("cdn-downstream-fbl;dur={}", milliseconds(self.taken)));
+        metrics.join(", ")
+    }
+}
+
+/// The cache layer an upstream request is made from in this emulator: the EDGE location
+/// itself, there being no regional or mid-tier cache in front of the origin here.
+const EDGE_LAYER: &str = "EDGE";
+
+/// A measured span in whole milliseconds, which is the unit a `Server-Timing` `dur` carries.
+fn milliseconds(span: Duration) -> u128 {
+    span.as_millis()
+}
+
+/// Put the `Server-Timing` header of this exchange on the answer the edge is about to serve.
+///
+/// Written for the response the policy's own sampling selected
+/// ([`crate::state::StoredResponseHeadersPolicy::adds_server_timing_to_next_response`]), and
+/// never over a header the origin sent under that name: the metrics are CloudFront's own, so
+/// they are appended as a further member list rather than replacing the origin's.
+pub fn apply_server_timing(timing: &ServerTiming<'_>, response: &mut RtResponse) {
+    let value = match response.headers().get(SERVER_TIMING) {
+        Some(origins) if !origins.is_empty() => format!("{origins}, {}", timing.value()),
+        _ => timing.value(),
+    };
+    let _ = response.headers_mut().try_insert(SERVER_TIMING, value);
 }

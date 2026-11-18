@@ -136,11 +136,14 @@ pub(crate) struct Security {
 }
 
 /// `ResponseHeadersPolicyServerTimingHeadersConfig`.
+///
+/// Its fields are `pub(crate)` so a sibling suite that attaches a policy enabling this group
+/// at a stated sampling rate builds the same document rather than growing a copy of it.
 #[derive(Debug, Clone)]
 pub(crate) struct ServerTiming {
-    enabled: bool,
+    pub(crate) enabled: bool,
     /// `SamplingRate`, which the model bounds to `0..100`, or `None` to leave it out.
-    sampling_rate: Option<f64>,
+    pub(crate) sampling_rate: Option<f64>,
 }
 
 /// One `ResponseHeadersPolicyConfig` a client submits. A `None` means the member is left

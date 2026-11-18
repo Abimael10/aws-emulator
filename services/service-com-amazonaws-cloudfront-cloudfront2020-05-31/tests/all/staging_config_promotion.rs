@@ -159,6 +159,19 @@ async fn arrange(router: &MultiServiceRouter, primary: &Config, staging: &Config
         .to_string();
     let staging_stale_etag = copied.header("etag").to_string();
 
+    // The continuous deployment policy is created over the staging distribution the copy has
+    // just made, BEFORE the configuration under test lands on it: a policy names a staging
+    // distribution that accepts user requests, and the configuration staged below may itself
+    // be a disabled one — which is exactly what this workflow then promotes.
+    let policy = create_policy(router, &policy_xml(&staging_domain, true)).await;
+    assert_eq!(
+        policy.status, 201,
+        "case {case}: expected HTTP 201 from CreateContinuousDeploymentPolicy, got {} with {}",
+        policy.status, policy.raw
+    );
+    let policy_id = policy.root().text_at("Id").unwrap_or_default().to_string();
+    let policy_etag = policy.header("etag").to_string();
+
     // The configuration under test lands on the staging distribution — the changes a
     // continuous deployment tests there before they are promoted. `Staging` stays `true`:
     // this update changes the configuration, not the kind of distribution it is.
@@ -175,15 +188,6 @@ async fn arrange(router: &MultiServiceRouter, primary: &Config, staging: &Config
         staged.status, staged.raw
     );
     let staging_etag = staged.header("etag").to_string();
-
-    let policy = create_policy(router, &policy_xml(&staging_domain, true)).await;
-    assert_eq!(
-        policy.status, 201,
-        "case {case}: expected HTTP 201 from CreateContinuousDeploymentPolicy, got {} with {}",
-        policy.status, policy.raw
-    );
-    let policy_id = policy.root().text_at("Id").unwrap_or_default().to_string();
-    let policy_etag = policy.header("etag").to_string();
 
     // The primary names the policy, which is what pairs it with the staging distribution.
     let attached = update_distribution(

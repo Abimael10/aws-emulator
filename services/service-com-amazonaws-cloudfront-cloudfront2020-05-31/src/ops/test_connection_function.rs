@@ -3,13 +3,14 @@
 //! @op TestConnectionFunction
 //! IMPLEMENTED: a test RUNS the stored connection function code over the connection object
 //! the request carries — on the JavaScript engine embedded in this process
-//! ([`crate::state::function_runtime`]) — and reports what that run produced: the connection
-//! the code allowed, the lines it logged, the error it raised and how much of the allowed
-//! execution time it took. A connection function declares no handler: its code is a script
-//! that runs with the connection in scope and decides about it, so the run is that script's
-//! own work. It PERSISTS nothing: the stage, the code and the version token it runs against
-//! are read from the one stored connection function record, and a test leaves that record
-//! exactly as it stands. This is the ONLY file to touch for this operation.
+//! ([`crate::state::function_runtime`]) — and reports what that run produced: the DECISION it
+//! took on the connection, the lines it logged, the error it raised and how much of the
+//! allowed execution time it took. A connection function's code decides about the connection
+//! CloudFront puts in scope for it, either in its own body or in a handler it declares, so
+//! the run is that code's own work. It PERSISTS nothing: the stage, the code and the version
+//! token it runs against are read from the one stored connection function record, and a test
+//! leaves that record exactly as it stands. This is the ONLY file to touch for this
+//! operation.
 //!
 //! ## Shape of an operation
 //!
@@ -228,7 +229,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         let (stage, code, connection_function_summary) = prepared;
 
-        // "The connection object" is the connection the script is run over: the service puts
+        // "The connection object" is the connection the code is run over: the service puts
         // it in scope for that code, so a payload that is not a JSON object describes no
         // connection a connection function can decide about, and is refused with the modelled
         // `InvalidArgument` rather than run. The sentence the caller is served is the FIXED
@@ -250,7 +251,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The run itself: the code the store holds, over that connection object, under every
         // bound the runtime module declares, on a blocking thread. The connection is put in
-        // scope for that code, and the decision the script takes on it is what the run
+        // scope for that code, and the decision it takes on it is what the run
         // produced.
         let run = crate::state::run_connection_function(code, connection_object).await;
         let compute_utilization = run.compute_utilization();
@@ -303,8 +304,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // "The connection function error message" — the empty string for a run that
                 // reported no error.
                 connection_function_error_message: Some(reported.error_message),
-                // "The connection function output" — the connection the script allowed, as it
-                // left it, and the empty JSON object for a run that allowed none.
+                // "The connection function output" — the decision the code took and the
+                // connection it took it on, as the code left it, and the empty JSON object
+                // for a run that took no decision at all.
                 connection_function_output: Some(reported.output),
             }),
         })
@@ -323,7 +325,7 @@ fn invalid_argument(reason: impl ::std::fmt::Display) -> TestConnectionFunctionE
 /// nothing of its content, which is the caller's own.
 fn outcome_kind(outcome: &crate::state::FunctionOutcome) -> &'static str {
     match outcome {
-        crate::state::FunctionOutcome::Returned(_) => "allowed the connection",
+        crate::state::FunctionOutcome::Returned(_) => "decided about the connection",
         crate::state::FunctionOutcome::Failed(_) => "failed",
         crate::state::FunctionOutcome::Unanswered => "decided nothing",
         crate::state::FunctionOutcome::Unavailable(_) => "not run",

@@ -117,8 +117,9 @@ impl StoredContinuousDeploymentPolicy {
     /// it, advancing the policy's own traffic cursor.
     ///
     /// Each covered request adds the weight to the cursor, and the request is routed to
-    /// staging — spending a whole request's worth — as soon as the cursor holds one. What is
-    /// left over CARRIES to the next request, which is what makes the long-run share the
+    /// staging — spending a whole request's worth — as soon as the cursor holds one, by the one
+    /// share counting this service decides every share by ([`super::takes_next_share`]). What
+    /// is left over CARRIES to the next request, which is what makes the long-run share the
     /// weight itself at every value of it: 0.15 sends three of every twenty requests, 0.05 one
     /// of every twenty, and 0 none. No randomness, and the cursor stays below one whole
     /// request plus the weight, which the create and update paths hold to
@@ -128,12 +129,11 @@ impl StoredContinuousDeploymentPolicy {
     /// weight's own binary fraction, so adding the share up is exact and the share a weight
     /// names over a run of requests is the one it names however long the run is.
     fn takes_next_share(&mut self, weight: f32) -> bool {
-        self.traffic_cursor = self.traffic_cursor.saturating_add(share_of_a_request(weight));
-        if self.traffic_cursor < WHOLE_REQUEST_SHARE {
-            return false;
-        }
-        self.traffic_cursor -= WHOLE_REQUEST_SHARE;
-        true
+        super::takes_next_share(
+            &mut self.traffic_cursor,
+            share_of_a_request(weight),
+            WHOLE_REQUEST_SHARE,
+        )
     }
 }
 

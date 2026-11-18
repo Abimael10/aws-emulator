@@ -173,6 +173,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // "The public key that you can use with signed URLs and signed cookies, or with
+        // field-level encryption": the material is the RSA PUBLIC key of a key pair, so
+        // anything else — the PRIVATE half of that pair, a certificate, a key of another
+        // algorithm, or text that is no PEM at all — is not a public key CloudFront can
+        // verify a signature against, and no key is stored for it. Decided by the crates that
+        // own the formats ([`crate::state::is_rsa_public_key`]) rather than by reading the
+        // text, and refused BEFORE anything is minted.
+        if !crate::state::is_rsa_public_key(&config.encoded_key) {
+            return Err(CreatePublicKeyErrorModeled::InvalidArgument(
+                crate::state::invalid_encoded_key(),
+            )
+            .into());
+        }
+
         // "A name to help identify the public key": a name identifies ONE key of this
         // account, so a name another key already holds cannot name a second one — the key
         // that holds it is left exactly as it was. Checked FIRST of the two values a key is

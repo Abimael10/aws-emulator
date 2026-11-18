@@ -294,6 +294,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
+        // A staging distribution that is DISABLED accepts no user request, so a policy over
+        // one could never move traffic to it — refused on an update's payload exactly as on a
+        // create's ([`crate::state::names_disabled_staging_distribution`]).
+        if crate::state::names_disabled_staging_distribution(&store, &config) {
+            return Err(
+                UpdateContinuousDeploymentPolicyErrorModeled::InvalidArgument(
+                    crate::state::disabled_staging_distribution(),
+                )
+                .into(),
+            );
+        }
+
         // A member outside what the documentation allows for it is "An argument is
         // invalid", named member by member — the same walk the create path makes, so an
         // update cannot store a configuration a create would have refused.

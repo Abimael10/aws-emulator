@@ -5,10 +5,10 @@
 //!
 //! A CONNECTION function is code of the same runtime, stored by the same kind of create and
 //! held to the same quota, so it runs HERE too ([`run_connection_function`]) rather than on a
-//! second engine. Its programming model is the other one: a connection function declares no
-//! handler — its code is a SCRIPT that runs over the connection CloudFront is deciding about,
-//! which this module puts in scope as the global `connection`, and the decision that script
-//! takes on it (`connection.allow()`) is what the run produced.
+//! second engine. Its programming model is the other one: the code runs over the connection
+//! CloudFront is deciding about, which this module puts in scope as the global `connection`
+//! and hands to a `handler` the code declares, and the DECISION it takes on that connection
+//! (`connection.allow()` or `connection.deny()`) is what the run produced.
 //!
 //! "CloudFront runs the function, passing it the event object that you provided, and returns
 //! the function's result (the modified event object) in the response. The response also
@@ -25,7 +25,7 @@
 //! and ONE host function — the log writer the console is built over, which only appends to
 //! this run's own captured lines and is deleted from the global object before any of the
 //! caller's code is compiled, so only the console closure still holds it. A connection
-//! function's script also reaches the connection in scope, whose decision answers the run
+//! function's code also reaches the connection in scope, whose decisions answer the run
 //! through a channel the code cannot reach. No module loader is installed, so an `import`
 //! resolves to nothing; plain QuickJS registers no filesystem, process, environment,
 //! network, host-library or thread API, and nothing here adds one.
@@ -176,8 +176,9 @@ pub enum FunctionOutcome {
     /// a bound of this module stopped it.
     Failed(String),
     /// The code RAN and came back without answering, and nothing about it failed: a
-    /// connection function's script that took no decision about the connection it was run
-    /// over. There is nothing to report but the lines it logged and the time it spent — and
+    /// connection function that took no decision about the connection it was run over,
+    /// declared no handler to take one, and whose connection could not be read back out of the
+    /// engine. There is nothing to report but the lines it logged and the time it spent — and
     /// no error either, because nothing went wrong. A handler model run has no such outcome:
     /// a handler that never settles is a run that failed.
     Unanswered,
@@ -307,11 +308,11 @@ enum Model {
     /// CALLED with the event object, and the result is "the function's result (the modified
     /// event object)" that call came back with ([`event_output`]).
     Handler,
-    /// A connection function: the code is a SCRIPT, run with the connection it decides about
-    /// in scope as the global `connection`, and the result is the connection it ALLOWED
-    /// ([`returned_output`]). Nothing is called: a connection function declares no
-    /// handler, so a script that only decides is a whole connection function — and a script
-    /// that decides nothing is one too, which is why taking no decision is not a failure.
+    /// A connection function: the code runs over the connection it decides about, in scope as
+    /// the global `connection` and handed to a `handler` it may declare, and the result is the
+    /// DECISION it took on that connection ([`returned_output`]). Code that only decides is a
+    /// whole connection function — and so is code that decides nothing, which is why taking no
+    /// decision is not a failure.
     ConnectionScript,
 }
 
@@ -329,9 +330,11 @@ impl Model {
     ///
     /// A HANDLER that returned a promise nothing settled produced no event object, which is
     /// the run failing — the model states the function's result IS the event object it
-    /// returns. A SCRIPT that took no decision about the connection failed at nothing: the
-    /// model requires no decision of a connection function, so the run reports what it did
-    /// (its logs and the time it spent) and neither an output nor an error.
+    /// returns. A connection function that took no decision about the connection failed at
+    /// nothing: the model requires no decision of a connection function, so what the run
+    /// produced is the connection as the code left it, read back out of the engine, and this
+    /// is the answer only for a run whose connection could not be read back at all — its logs
+    /// and the time it spent, and neither an output nor an error.
     fn unanswered(self) -> FunctionOutcome {
         match self {
             Self::Handler => FunctionOutcome::Failed(UNSETTLED.to_string()),
@@ -349,14 +352,13 @@ pub async fn run_function(code: Vec<u8>, event: String) -> FunctionRun {
 }
 
 /// Run the connection function `code` over the connection object `connection_object` (the
-/// JSON text of it), reporting the connection it allowed as the output a
+/// JSON text of it), reporting the decision it took on that connection as the output a
 /// `ConnectionFunctionTestResult` carries.
 ///
 /// A connection function is code of the same runtime, stored by the same create and held to
 /// the same quota as a CloudFront function, so it runs on the same engine under the same
-/// bounds ([`run_on_engine`]); what differs is the programming model: the code is a SCRIPT
-/// that decides about the connection in scope, rather than a handler called with an event
-/// object.
+/// bounds ([`run_on_engine`]); what differs is the programming model: the code decides about
+/// the connection in scope, rather than returning an event object.
 pub async fn run_connection_function(code: Vec<u8>, connection_object: String) -> FunctionRun {
     run_on_engine(code, connection_object, Model::ConnectionScript).await
 }
@@ -458,15 +460,43 @@ fn run(code: Vec<u8>, argument: &str, model: Model) -> FunctionRun {
         drain_jobs(&runtime, &bounds);
         elapsed += started.elapsed();
     }
+    // A breached bound is the run's answer, whatever the code then said or returned: the
+    // latch is host state the code cannot reach. Read BEFORE anything re-enters the engine,
+    // so a run the clock or the step budget already stopped is answered without running a
+    // line more of the caller's code.
+    let breach = bounds.breach();
+
+    // The CONNECTION as the code LEFT it, read back out of the engine while this run's bounds
+    // are STILL IN FORCE: what a connection function's run produced is the connection it was
+    // deciding about with whatever the code did to it, so a run that took no decision of its
+    // own still reports that connection rather than nothing ([`Model::unanswered`]). Read from
+    // the engine rather than assembled here, so it is the document the code left behind.
+    //
+    // Rendering it runs the caller's own code again — a `toJSON` or an accessor the code put on
+    // the connection is called by the renderer — so it happens with the interrupt handler still
+    // installed and the same budget still being spent: code that diverges in a `toJSON` is
+    // stopped by the clock and the step count exactly as code that diverges in the body is, and
+    // a run already stopped is not re-entered at all.
+    let left = match (model, breach.as_ref()) {
+        (Model::ConnectionScript, None) => context.with(|ctx| {
+            ctx.globals()
+                .get::<_, Value<'_>>(CONNECTION_GLOBAL)
+                .ok()
+                .and_then(|connection| ctx.json_stringify(connection).ok().flatten())
+                .and_then(|text| text.to_string().ok())
+        }),
+        _ => None,
+    };
+
     // The run is over, and nothing the engine does to tear itself down is the function's
     // work: the interrupt handler is taken off first, then any exception a bound left
     // pending in the context is taken, so nothing of a stopped run is held at teardown.
     runtime.set_interrupt_handler(None);
     context.with(|ctx| drop(ctx.catch()));
 
-    // A breached bound is the run's answer, whatever the code then said or returned: the
-    // latch is host state the code cannot reach.
-    if let Some(breach) = bounds.breach() {
+    // The stop a bound latched, including one the read-back above spent the last of the budget
+    // on: either way what the run came to is the stop.
+    if let Some(breach) = breach.or_else(|| bounds.breach()) {
         return finished(FunctionOutcome::Failed(breach), &collected, elapsed);
     }
     let outcome = match invoked {
@@ -479,7 +509,17 @@ fn run(code: Vec<u8>, argument: &str, model: Model) -> FunctionRun {
                     Err(message) => FunctionOutcome::Failed(message),
                 },
                 Some(Answered::Raised(message)) => FunctionOutcome::Failed(message),
-                None => model.unanswered(),
+                // A connection function that took no decision of its own produced the
+                // connection it was handed, as it left it: its own mutations are what that run
+                // came to. A run whose connection could not be read back has nothing to report
+                // but what it did ([`Model::unanswered`]).
+                None => match left {
+                    Some(document) => match model.output(&document) {
+                        Ok(output) => FunctionOutcome::Returned(output),
+                        Err(message) => FunctionOutcome::Failed(message),
+                    },
+                    None => model.unanswered(),
+                },
             }
         }
     };
@@ -622,16 +662,29 @@ fn invoke_handler(
     (invoked, started.elapsed())
 }
 
-/// Put the connection in scope, run the code as a SCRIPT and report what it decided — the
+/// Put the connection in scope, run the code over it and report what it decided — the
 /// connection function model.
 ///
-/// A connection function declares no handler: it is code that runs over the connection
-/// CloudFront is deciding about, which this module puts in scope as the global `connection`
-/// before any of that code is compiled — the connection object the request carried, carrying
-/// the decision the service lets a script take on it (`connection.allow()`). Taking that
-/// decision is what answers the run, so the result reports the connection the script allowed;
-/// a script that raises reports the raise, and one that decided nothing has not answered at
-/// all.
+/// A connection function is code that runs over the connection CloudFront is deciding about:
+/// this module puts that connection in scope before any of the caller's code is compiled —
+/// the connection object the request carried, carrying the two decisions the service lets code
+/// take on it, `allow()` and `deny()` — and TAKING one of them is what answers the run, so the
+/// result reports the connection as the code left it, carrying the decision that was taken
+/// ([`CONNECTION_SOURCE`]).
+///
+/// The code reaches that connection the way the runtime hands it over: as the global
+/// `connection` its body reads, and as the argument of the function its code DECLARES — under
+/// the name the runtime names, or as the single function that code declared
+/// ([`DECLARED_SOURCE`]), since the function a connection function declares is the one the
+/// runtime calls. So the code runs first, and the function it declared is then called with the
+/// connection object, through the one invoker this module calls a handler through
+/// ([`INVOKER_SOURCE`]): a raise inside that function is reported exactly as a raise in the
+/// code's own body is, and a function that comes back with a value reports that value. The
+/// channel the answer travels through keeps the FIRST answer, so the decision the code took
+/// stands over whatever it then returned.
+///
+/// Code that raises reports the raise; code that decided nothing reports the connection as it
+/// left it, read back by the caller of this function.
 fn invoke_script(
     ctx: &Ctx<'_>,
     source: &str,
@@ -639,10 +692,19 @@ fn invoke_script(
     answer: &Arc<Mutex<Option<Answered>>>,
 ) -> (Invoked, Duration) {
     // Held BEFORE any of the caller's code is compiled, for the reason the handler model's
-    // invoker is: what the decision does is this module's own however the code rebinds the
+    // invoker is: what a decision does is this module's own however the code rebinds the
     // global object, and the channel it answers through is unreachable from that code.
     let prepare = match ctx.eval::<Function<'_>, _>(CONNECTION_SOURCE).catch(ctx) {
         Ok(prepare) => prepare,
+        Err(caught) => {
+            return (
+                Invoked::Unavailable(format!("the engine did not start: {caught}")),
+                Duration::ZERO,
+            )
+        }
+    };
+    let invoker = match ctx.eval::<Function<'_>, _>(INVOKER_SOURCE).catch(ctx) {
+        Ok(invoker) => invoker,
         Err(caught) => {
             return (
                 Invoked::Unavailable(format!("the engine did not start: {caught}")),
@@ -655,25 +717,68 @@ fn invoke_script(
         Err(unavailable) => return (unavailable, Duration::ZERO),
     };
     let settle = Func::from(settle_channel(answer));
-    if let Err(caught) = prepare.call::<_, ()>((connection, settle)).catch(ctx) {
+    if let Err(caught) = prepare
+        .call::<_, ()>((connection.clone(), settle))
+        .catch(ctx)
+    {
         return (
             Invoked::Unavailable(format!("the connection could not be put in scope: {caught}")),
             Duration::ZERO,
         );
     }
 
-    // From here on the clock is the FUNCTION's: compiling and running its script IS the
+    // What the code DECLARED, read once the code has run: prepared before any of it is
+    // compiled, so the globals it compares against are this module's own and not the code's.
+    let finder = match ctx.eval::<Function<'_>, _>(DECLARED_SOURCE).catch(ctx) {
+        Ok(finder) => finder,
+        Err(caught) => {
+            return (
+                Invoked::Unavailable(format!("the engine did not start: {caught}")),
+                Duration::ZERO,
+            )
+        }
+    };
+
+    // From here on the clock is the FUNCTION's: compiling and running its code IS the
     // invocation.
     let started = Instant::now();
-    if let Err(caught) = ctx.eval::<Value<'_>, _>(source).catch(ctx) {
-        return (Invoked::Failed(raised_message(&caught)), started.elapsed());
+    let declared = match ctx.eval::<Value<'_>, _>(source).catch(ctx) {
+        // The code's own value, where it IS a function: code whose body is the function it
+        // declares has declared it that way.
+        Ok(value) if value.is_function() => value,
+        // Otherwise the function the code DECLARED, which is what the runtime calls
+        // ([`DECLARED_SOURCE`]).
+        Ok(_) => match finder.call::<_, Value<'_>>(()).catch(ctx) {
+            Ok(declared) => declared,
+            Err(caught) => return (Invoked::Failed(raised_message(&caught)), started.elapsed()),
+        },
+        Err(caught) => return (Invoked::Failed(raised_message(&caught)), started.elapsed()),
+    };
+    // The handler form: code that has not decided in its own body may have declared the
+    // handler that decides, which is called with the connection object it decides about.
+    if answer
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .is_none()
+    {
+        if let Some(handler) = declared.into_function() {
+            let settle = Func::from(settle_channel(answer));
+            if let Err(caught) = invoker
+                .call::<_, ()>((handler, connection, settle))
+                .catch(ctx)
+            {
+                // The invoker reports the code's own raise itself, so reaching here means the
+                // run was interrupted out of it — which the latch has already recorded.
+                return (Invoked::Failed(raised_message(&caught)), started.elapsed());
+            }
+        }
     }
     let pending = answer
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
         .is_none();
-    // A script that has not decided yet may have queued the work that decides for it, so the
-    // run is reported as pending and the jobs it queued are drained before its answer is read.
+    // Code that has not decided yet may have queued the work that decides for it, so the run
+    // is reported as pending and the jobs it queued are drained before its answer is read.
     let invoked = if pending {
         Invoked::Pending
     } else {
@@ -681,6 +786,42 @@ fn invoke_script(
     };
     (invoked, started.elapsed())
 }
+
+/// The code that reads back WHICH function a connection function's code declared.
+///
+/// It is prepared before any of the caller's code is compiled: it records the globals that
+/// exist then, and the function it answers afterwards is one the CODE declared — the one the
+/// runtime names (`handler`) where the code declares that name, and otherwise the single
+/// function the code declared, which is the function it has to run. Code that declared no
+/// function, or more than one under names the runtime does not name, has declared no handler
+/// and answers `null`: there is nothing a caller said to call.
+///
+/// An expression rather than a global, for the reason [`INVOKER_SOURCE`] is one.
+const DECLARED_SOURCE: &str = r#"
+(function () {
+    const before = Object.create(null);
+    for (const key of Object.getOwnPropertyNames(globalThis)) {
+        before[key] = true;
+    }
+    return function () {
+        if (typeof globalThis.handler === "function") {
+            return globalThis.handler;
+        }
+        let found = null;
+        let declared = 0;
+        for (const key of Object.getOwnPropertyNames(globalThis)) {
+            if (before[key] === true) {
+                continue;
+            }
+            if (typeof globalThis[key] === "function") {
+                found = globalThis[key];
+                declared = declared + 1;
+            }
+        }
+        return declared === 1 ? found : null;
+    };
+})()
+"#;
 
 /// Run the engine's pending jobs until the returned promise settles, the queue empties, the
 /// job bound is spent or a bound of this run ends it.
@@ -730,20 +871,20 @@ fn event_output(text: &str) -> Result<String, String> {
 }
 
 /// The result `ConnectionFunctionTestResult$ConnectionFunctionOutput` carries for a
-/// connection function that allowed the connection `text` (the JSON the engine rendered it
-/// as).
+/// connection function whose run answered with `text` (the JSON the engine rendered that
+/// answer as: the connection the code decided about, carrying the decision it took).
 ///
 /// Reported as it stands rather than re-serialised or wrapped in a member of this emulator's
 /// choosing — "the connection function output" is a plain string the model states no
-/// structure for — so what a caller reads is the connection the script allowed, with the
-/// changes that script made to it. The one thing checked is that it is within what this
-/// operation's documents carry ([`MAX_OUTPUT_BYTES`]), and a value past that is the run
-/// failing, as an event object past it is.
+/// structure for — so what a caller reads is what the code's own decision produced. The one
+/// thing checked is that it is within what this operation's documents carry
+/// ([`MAX_OUTPUT_BYTES`]), and a value past that is the run failing, as an event object past
+/// it is.
 fn returned_output(text: &str) -> Result<String, String> {
     if text.len() > MAX_OUTPUT_BYTES {
         return Err(format!(
-            "The function allowed a connection of {} bytes, and at most {MAX_OUTPUT_BYTES} \
-             bytes are allowed",
+            "The function answered with a connection of {} bytes, and at most \
+             {MAX_OUTPUT_BYTES} bytes are allowed",
             text.len()
         ));
     }
@@ -942,40 +1083,68 @@ const INVOKER_SOURCE: &str = r#"
 })()
 "#;
 
-/// The code that puts the connection in scope: it installs the decision
-/// (`connection.allow()`, which states that the connection may proceed and is what answers
-/// the run) on the connection object the request carried, and binds that object as the
-/// global `connection` every connection function's script reads.
+/// The code that puts the connection in scope: it installs the two DECISIONS the service lets
+/// a connection function take — `allow()`, which states that the connection may proceed, and
+/// `deny()`, which states that it may not — on the connection object the request carried, and
+/// binds that object as the global `connection` the code reads.
 ///
-/// An expression rather than a global, for the reason [`INVOKER_SOURCE`] is one: the
-/// caller's code can neither read it nor replace it, and it captures `JSON.stringify` and
-/// `String` before any of that code runs, so code that rebinds either cannot change how the
-/// connection it allowed is rendered. The decision reports through the channel it is handed,
-/// which the caller's code cannot reach. It is defined as a NON-ENUMERABLE member, so the
-/// connection a script walks is the document the request carried and nothing of this
-/// emulator's own.
+/// Taking a decision RECORDS it on the connection it was taken on and ANSWERS the run with the
+/// connection object as it then stands, so what a caller reads is the connection the code
+/// decided about carrying the decision it took: the two decisions are the whole point of
+/// testing a connection function, so a run that allowed a connection and a run that denied the
+/// same one report different documents, and a client can tell a deny-by-default function from
+/// an allowing one.
+///
+/// The decisions are installed on the connection object the request carried, which is the one
+/// the code decides about and the one the handler it declares is called with.
+///
+/// An expression rather than a global, for the reason [`INVOKER_SOURCE`] is one: the caller's
+/// code can neither read it nor replace it, and it captures `JSON.stringify` and `String`
+/// before any of that code runs, so code that rebinds either cannot change how the connection
+/// it decided about is rendered. The decisions report through the channel they are handed,
+/// which the caller's code cannot reach. They are defined as NON-ENUMERABLE members, so the
+/// connection a function walks — and the one the answer renders — is the document the request
+/// carried, with the decision the code took and nothing else of this emulator's own.
 const CONNECTION_SOURCE: &str = r#"
 (function () {
     const stringify = JSON.stringify;
     const toText = String;
     return function (connection, settle) {
-        Object.defineProperty(connection, "allow", {
-            enumerable: false,
-            value: function () {
-                let text;
-                try {
-                    text = stringify(connection);
-                } catch (error) {
-                    settle(true, toText(error));
-                    return;
-                }
-                settle(false, text === undefined ? "null" : text);
+        const answer = function () {
+            let text;
+            try {
+                text = stringify(connection);
+            } catch (error) {
+                settle(true, toText(error));
+                return;
             }
-        });
+            settle(false, text === undefined ? "null" : text);
+        };
+        const decision = function (object, taken) {
+            return function () {
+                object.decision = taken;
+                answer();
+            };
+        };
+        const install = function (object) {
+            Object.defineProperty(object, "allow", {
+                enumerable: false,
+                value: decision(object, "allow")
+            });
+            Object.defineProperty(object, "deny", {
+                enumerable: false,
+                value: decision(object, "deny")
+            });
+        };
+        install(connection);
         globalThis.connection = connection;
     };
 })()
 "#;
+
+/// The global a connection function's code reads the connection it decides about through, and
+/// the one the host reads the connection back out of once the run is over.
+const CONNECTION_GLOBAL: &str = "connection";
 
 /// The run's budget, as the engine's interrupt handler spends it, and the latch that says
 /// which bound ended the run.

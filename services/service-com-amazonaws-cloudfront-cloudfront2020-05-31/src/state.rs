@@ -1098,6 +1098,22 @@ pub const MAX_FIELD_LEVEL_ENCRYPTION_QUERY_ARG_PROFILES: usize = 100;
 /// profiles for field-level encryption have been created.").
 pub const MAX_FIELD_LEVEL_ENCRYPTION_CONTENT_TYPE_PROFILES: usize = 100;
 
+/// The most ENCRYPTION ENTITIES one field-level encryption profile may carry.
+///
+/// CHOSEN by this emulator, for the same reason as
+/// [`MAX_FIELD_LEVEL_ENCRYPTION_QUERY_ARG_PROFILES`]: the entities are stored whole inside the
+/// profile record, so this is what bounds one profile's contribution to the store — and what
+/// bounds the work admitting one costs ([`field_level_encryption_profile_overlapping_field_patterns`]
+/// compares the patterns of each entity with one another). A request past it is refused with
+/// the modelled `TooManyFieldLevelEncryptionEncryptionEntities` ("The maximum number of
+/// encryption entities for field-level encryption have been created.").
+pub const MAX_FIELD_LEVEL_ENCRYPTION_ENCRYPTION_ENTITIES: usize = 100;
+
+/// The most FIELD PATTERNS one encryption entity may carry, bounded for the same reasons and
+/// refused with the modelled `TooManyFieldLevelEncryptionFieldPatterns` ("The maximum number
+/// of field patterns for field-level encryption have been created.").
+pub const MAX_FIELD_LEVEL_ENCRYPTION_FIELD_PATTERNS: usize = 100;
+
 /// The `PriceClass` reported for a distribution whose stored configuration names none:
 /// the class that covers every CloudFront edge location, which is what
 /// "`PriceClass_All`, CloudFront responds to requests for your objects from all
@@ -2516,6 +2532,11 @@ pub struct StoredResponseHeadersPolicy {
     /// The version token the last mutation handed back, and the single source of truth
     /// for every `If-Match` check against this policy.
     pub etag: String,
+    /// How much of a response's worth of `Server-Timing` sampling the responses this policy
+    /// has already been applied to add up to, in ten-thousandths of a percent — bookkeeping
+    /// of this emulator's, which no response carries
+    /// ([`StoredResponseHeadersPolicy::adds_server_timing_to_next_response`]).
+    pub server_timing_cursor: i64,
 }
 
 impl StoredResponseHeadersPolicy {
@@ -2528,7 +2549,57 @@ impl StoredResponseHeadersPolicy {
             response_headers_policy_config: self.config.clone(),
         }
     }
+
+    /// Whether the NEXT response this policy is applied to carries the `Server-Timing`
+    /// header, advancing the policy's own sampling cursor.
+    ///
+    /// `ServerTimingHeadersConfig$Enabled` is "a Boolean that determines whether CloudFront
+    /// adds the `Server-Timing` header to HTTP responses that it sends in response to requests
+    /// that match a cache behavior that's associated with this response headers policy", and
+    /// `SamplingRate` "a number 0–100 (inclusive) that specifies the percentage of responses
+    /// that you want CloudFront to add the `Server-Timing` header to. When you set the
+    /// sampling rate to 100, CloudFront adds the `Server-Timing` header to the HTTP response
+    /// for every request … When you set it to 50, CloudFront adds the header to 50% of the
+    /// responses … You can set the sampling rate to any number 0–100 with up to four decimal
+    /// places."
+    ///
+    /// So of every hundred responses the policy is applied to, exactly that many carry the
+    /// header, counted by the one share counting this service decides every share by
+    /// ([`takes_next_share`]), in the finer unit this rate is stated in
+    /// ([`SERVER_TIMING_SAMPLING_UNIT`]).
+    ///
+    /// `SamplingRate` is OPTIONAL while `Enabled` is required, and what the enable states is
+    /// that CloudFront adds the header to the responses the behaviour serves — so a policy
+    /// that enables the group and states no rate narrows that to nothing and carries the
+    /// header on every response. A rate of zero names no share of them, so it carries the
+    /// header on none.
+    pub fn adds_server_timing_to_next_response(&mut self) -> bool {
+        let Some(configured) = self.config.server_timing_headers_config.as_ref() else {
+            return false;
+        };
+        if !configured.enabled {
+            return false;
+        }
+        let rate = configured
+            .sampling_rate
+            .unwrap_or(SERVER_TIMING_WHOLE_SAMPLING_PERCENT);
+        let share = (rate.clamp(0.0, SERVER_TIMING_WHOLE_SAMPLING_PERCENT)
+            * f64::from(SERVER_TIMING_SAMPLING_UNIT))
+        .round() as i64;
+        let whole =
+            i64::from(SERVER_TIMING_SAMPLING_UNIT) * (SERVER_TIMING_WHOLE_SAMPLING_PERCENT as i64);
+        takes_next_share(&mut self.server_timing_cursor, share, whole)
+    }
 }
+
+/// The whole of a percentage, which a `Server-Timing` `SamplingRate` is stated as: "a number
+/// 0–100 (inclusive) that specifies the percentage of responses".
+pub const SERVER_TIMING_WHOLE_SAMPLING_PERCENT: f64 = 100.0;
+
+/// The sampling cursor's unit, in parts of one percent: a rate is stated "with up to four
+/// decimal places", so ten thousand parts of a percent hold every rate a caller may state
+/// exactly.
+pub const SERVER_TIMING_SAMPLING_UNIT: u32 = 10_000;
 
 /// One CloudFront origin access control, as this emulator persists it.
 ///
@@ -2685,7 +2756,10 @@ pub const CACHE_POLICY_TYPE_MANAGED: &str = "managed";
 /// CloudFront Developer Guide ("Using the managed cache policies"), which lists each
 /// policy's name, its identifier and its cache key and TTL settings; the model itself
 /// carries no list of them (`smithy_query(query="shape",shape="CachePolicyType")` admits
-/// only the two type values), so the catalog is written out here.
+/// only the two type values), so the catalog is written out here. Where an entry's published
+/// values are not in that guide's list, they are the ones a recorded
+/// `ListCachePolicies(Type=managed)` answer reports for it, which is the same published
+/// catalog read from the service rather than from the guide.
 #[derive(Debug, Clone)]
 pub struct ManagedCachePolicy {
     /// `CachePolicy$Id` — the identifier AWS publishes for this policy, the same in every
@@ -2831,7 +2905,8 @@ const MANAGED_POLICY_LAST_MODIFIED_UNIX_SECONDS: u64 = 1_590_883_200;
 ///
 /// Each entry's identifier, name and settings are the ones Amazon publishes for it, and the
 /// entries stand in the order that same list presents them (see [`ManagedCachePolicy`] for
-/// the source).
+/// the source of each). Nothing a caller does changes a published policy, so every account and
+/// every process reads the same catalog.
 pub const MANAGED_CACHE_POLICIES: &[ManagedCachePolicy] = &[
     ManagedCachePolicy {
         id: "658327ea-f89d-4fab-a63d-7e88639e58f6",
@@ -2907,11 +2982,181 @@ pub const MANAGED_CACHE_POLICIES: &[ManagedCachePolicy] = &[
         gzip: true,
         brotli: true,
         header_behavior: "whitelist",
-        headers: &["Authorization", "Host"],
+        headers: &["Authorization", "CloudFront-Viewer-Country", "Host"],
+        cookie_behavior: "all",
+        cookies: &[],
+        query_string_behavior: "all",
+        query_strings: &[],
+    },
+    // The Amplify FAMILY: the policies Amplify attaches to the behaviours of an application
+    // it hosts, one pair per kind of content it serves — the application's own responses, the
+    // same without the cookies in the cache key, its image-optimization route and its static
+    // assets — each in the original and the revised (`-V2`) form Amplify moved to.
+    //
+    // Their identifiers and settings are the published ones, read off the service's own
+    // managed listing: the family differs by what the kind of content asks of the cache key —
+    // which headers an application response varies on, whether the deployment cookie and
+    // query parameter are in the key, and whether the cookies are at all — while every one of
+    // them leaves the span an object is held for to the origin's own cache directives, with a
+    // floor of none and a ceiling of a year.
+    ManagedCachePolicy {
+        id: "4d1d2f1d-3a71-49ad-9e08-7ea5d843a556",
+        name: "Managed-Amplify-Default",
+        comment: "Default policy for an AWS Amplify hosted application",
+        min_ttl: 0,
+        default_ttl: 0,
+        max_ttl: 31_536_000,
+        gzip: true,
+        brotli: true,
+        header_behavior: "whitelist",
+        headers: &["Accept", "Authorization", "CloudFront-Viewer-Country", "Host"],
+        cookie_behavior: "all",
+        cookies: &[],
+        query_string_behavior: "all",
+        query_strings: &[],
+    },
+    ManagedCachePolicy {
+        id: "1b1c9610-973a-4fb9-9932-a6c274840887",
+        name: "Managed-Amplify-Default-V2",
+        comment: "Default policy for an AWS Amplify hosted application, revised",
+        min_ttl: 0,
+        default_ttl: 0,
+        max_ttl: 31_536_000,
+        gzip: true,
+        brotli: true,
+        header_behavior: "whitelist",
+        headers: &[
+            "Accept",
+            "Authorization",
+            "CloudFront-Viewer-Country",
+            "Host",
+            "RSC",
+            "X-Amplify-Dpl",
+        ],
+        cookie_behavior: "all",
+        cookies: &[],
+        query_string_behavior: "all",
+        query_strings: &[],
+    },
+    ManagedCachePolicy {
+        id: "a6bad946-36c3-4c33-aa98-362c74a7fb13",
+        name: "Managed-Amplify-DefaultNoCookies",
+        comment: "Default policy for an AWS Amplify hosted application, without cookies in \
+                  the cache key",
+        min_ttl: 0,
+        default_ttl: 0,
+        max_ttl: 31_536_000,
+        gzip: true,
+        brotli: true,
+        header_behavior: "whitelist",
+        headers: &["Accept", "Authorization", "CloudFront-Viewer-Country", "Host"],
         cookie_behavior: "none",
         cookies: &[],
         query_string_behavior: "all",
         query_strings: &[],
+    },
+    ManagedCachePolicy {
+        id: "17322e93-4707-445a-93bc-6c8c16621822",
+        name: "Managed-Amplify-DefaultNoCookies-V2",
+        comment: "Default policy for an AWS Amplify hosted application, without cookies in \
+                  the cache key, revised",
+        min_ttl: 0,
+        default_ttl: 0,
+        max_ttl: 31_536_000,
+        gzip: true,
+        brotli: true,
+        header_behavior: "whitelist",
+        headers: &[
+            "Accept",
+            "Authorization",
+            "CloudFront-Viewer-Country",
+            "Host",
+            "RSC",
+            "X-Amplify-Dpl",
+        ],
+        cookie_behavior: "whitelist",
+        cookies: &["__dpl"],
+        query_string_behavior: "all",
+        query_strings: &[],
+    },
+    ManagedCachePolicy {
+        id: "1c6db51a-a33f-469a-8245-dae26771f530",
+        name: "Managed-Amplify-ImageOptimization",
+        comment: "Policy for the image optimization route of an AWS Amplify hosted \
+                  application",
+        min_ttl: 0,
+        default_ttl: 0,
+        max_ttl: 31_536_000,
+        gzip: true,
+        brotli: true,
+        header_behavior: "whitelist",
+        headers: &["Accept", "Authorization", "Host"],
+        cookie_behavior: "none",
+        cookies: &[],
+        query_string_behavior: "all",
+        query_strings: &[],
+    },
+    ManagedCachePolicy {
+        id: "766eb028-1aff-4eb2-a5a4-2674e1538f26",
+        name: "Managed-Amplify-ImageOptimization-V2",
+        comment: "Policy for the image optimization route of an AWS Amplify hosted \
+                  application, revised",
+        min_ttl: 0,
+        default_ttl: 0,
+        max_ttl: 31_536_000,
+        gzip: true,
+        brotli: true,
+        header_behavior: "whitelist",
+        headers: &[
+            "Accept",
+            "Authorization",
+            "CloudFront-Viewer-Country",
+            "Host",
+            "RSC",
+            "X-Amplify-Dpl",
+        ],
+        cookie_behavior: "whitelist",
+        cookies: &["__dpl"],
+        query_string_behavior: "all",
+        query_strings: &[],
+    },
+    ManagedCachePolicy {
+        id: "7e5fad67-ee98-4ad0-b05a-394999eefc1a",
+        name: "Managed-Amplify-StaticContent",
+        comment: "Policy for the static content of an AWS Amplify hosted application",
+        min_ttl: 0,
+        default_ttl: 0,
+        max_ttl: 31_536_000,
+        gzip: true,
+        brotli: true,
+        header_behavior: "whitelist",
+        headers: &["Authorization", "Host"],
+        cookie_behavior: "none",
+        cookies: &[],
+        query_string_behavior: "none",
+        query_strings: &[],
+    },
+    ManagedCachePolicy {
+        id: "4c02794c-7c81-4ba1-8b5d-e05fb0f95ed8",
+        name: "Managed-Amplify-StaticContent-V2",
+        comment: "Policy for the static content of an AWS Amplify hosted application, revised",
+        min_ttl: 0,
+        default_ttl: 0,
+        max_ttl: 31_536_000,
+        gzip: true,
+        brotli: true,
+        header_behavior: "whitelist",
+        headers: &[
+            "Authorization",
+            "CloudFront-Viewer-Country",
+            "Host",
+            "RSC",
+            "X-Amplify-Dpl",
+        ],
+        cookie_behavior: "whitelist",
+        cookies: &["__dpl"],
+        query_string_behavior: "whitelist",
+        query_strings: &["dpl"],
     },
     ManagedCachePolicy {
         id: "83da9c7e-98b4-4e11-a168-04f0df8e2c65",
@@ -3300,6 +3545,9 @@ impl ManagedResponseHeadersPolicy {
             config: self.to_config(),
             last_modified_time: managed_policy_last_modified(),
             etag: self.etag(),
+            // A published policy states no `Server-Timing` configuration, so it never writes
+            // that header and spends no part of the sampling cursor a policy record carries.
+            server_timing_cursor: 0,
         }
     }
 
@@ -4032,6 +4280,18 @@ pub use announced_url::*;
 /// [`functions`] is one; `pub use` keeps every name reachable as `crate::state::<name>`.
 mod resource_policies;
 pub use resource_policies::*;
+
+/// The SHARE of a sequence of occurrences a stated proportion names: the one deterministic
+/// counting every share this service serves is decided by. A SUBMODULE for the same reason
+/// [`functions`] is one; `pub use` keeps every name reachable as `crate::state::<name>`.
+mod shares;
+pub use shares::*;
+
+/// The KEY MATERIAL a public key carries: the one decode of a submitted `EncodedKey`, which
+/// is what both admits it and verifies a signature under it. A SUBMODULE for the same reason
+/// [`functions`] is one; `pub use` keeps every name reachable as `crate::state::<name>`.
+mod public_key_material;
+pub use public_key_material::*;
 
 /// What an identifier bound to the request PATH has to be before the operation it addresses
 /// resolves it: the form CloudFront issues that resource kind's identifiers in, and — for the
