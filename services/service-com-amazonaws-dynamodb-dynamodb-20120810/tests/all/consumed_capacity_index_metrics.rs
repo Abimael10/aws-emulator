@@ -198,7 +198,9 @@ fn rows() -> Vec<Row> {
             body: json!({"TableName": "", "IndexName": GLOBAL_INDEX}),
             reads: true,
             base: 0.0,
-            index: 0.5,
+            // A scan of an index is charged a WHOLE read unit for each entry it
+            // evaluated, which is what the index's own series gains.
+            index: 1.0,
         },
         Row {
             case: "a Query served by the local secondary index",

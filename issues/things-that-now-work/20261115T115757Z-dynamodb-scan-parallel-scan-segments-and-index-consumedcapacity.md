@@ -20,6 +20,8 @@ Issue-Commit: 015bd153266295538afd2721c5b6fd3d37297a70
 
 > _Note: this issue was identified against the code base at commit `015bd153266295538afd2721c5b6fd3d37297a70`. If you are an issue fixer working on this, the code base you are currently working in can have drifted, so you might need to trace the issue back to the current code base._
 
+> _Resolution: causes 3 and 4 are CLOSED — a scan of a secondary index is charged a whole read unit per 4 KB of each entry it evaluated, on that index's own arm, and the two recorded index-scan steps pass. Of causes 1 and 2, what is CLOSED is the walk the segments are cut from: a scan walks the key space in the order its partitions are laid out, so a segment is a contiguous RUN of the scan's own walk, the segments in segment order are the unsegmented scan, and a segment pages along its own run. What is DECLINED is WHICH items each segment answers (`$.Items[*]` and the `Count`/`ScannedCount` that follow from it, the two `dynamodb-trajwf-parallel-scan-segment-contract` segment steps): a partition's place in the key space follows the service's INTERNAL hash function, which is published nowhere and cannot be derived from the model, the request or the stored state, so reproducing one recording's per-segment item sets would mean choosing a digest variant until that fixture's keys landed as recorded. The emulator's placement is its own, stated as such where it is computed; what callers can rely on — one segment per partition, stable under writes, disjoint, covering, and contiguous in the walk — is implemented and pinned by `tests/all/scan_key_space_walk.rs` and `tests/all/scan_segment_partitions.rs`. A later sweep that re-files those two steps should read this paragraph first._
+
 ## Operation
 Scan
 

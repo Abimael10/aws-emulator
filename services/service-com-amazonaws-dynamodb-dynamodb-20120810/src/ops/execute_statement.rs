@@ -537,7 +537,8 @@ fn select_items(
         .map_or(usize::MAX, |limit| usize::try_from(limit).unwrap_or(0));
     let mut page_size: i64 = 0;
     // What the rows the plan evaluated COST, where the plan is a scan: one read unit per
-    // 4 KB of EACH row, half a unit where the read is eventually consistent — the charge a
+    // 4 KB of EACH row, half a unit where the read is eventually consistent, and a whole
+    // unit per 4 KB of each entry where the source is a secondary index — the charge a
     // `Scan` of the same rows carries ([`crate::ops::scan`]).
     let mut page_units: f64 = 0.0;
     // An index reports the attributes it PROJECTS — "only the attributes that are
@@ -557,8 +558,16 @@ fn select_items(
         }
         let size = held_size(item, projected.as_ref());
         page_size = page_size.saturating_add(size);
-        page_units +=
-            crate::state::read_capacity_units(size, input.consistent_read.unwrap_or(false));
+        // A plan that walks a SECONDARY INDEX is charged over what that index holds for
+        // each row, in whole read units, exactly as the `Scan` of the same index is — one
+        // rule for every reader that charges per row over a walk
+        // ([`crate::state::walk_row_capacity_units`]); a plan that walks the table's own
+        // items takes the rate the statement asked to read them with.
+        page_units += crate::state::walk_row_capacity_units(
+            select.index.is_some(),
+            size,
+            input.consistent_read.unwrap_or(false),
+        );
         evaluated += 1;
         if let Some(condition) = condition.as_ref() {
             if !condition.evaluate(Some(*item)).map_err(lift)? {

@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op Scan
-//! IMPLEMENTED: walks the stored table — "accessing every item in a table" — in
-//! stored primary-key order, reporting `Count`/`ScannedCount` and the
+//! IMPLEMENTED: walks the stored table — "accessing every item in a table" — in the
+//! order its KEY SPACE is laid out, reporting `Count`/`ScannedCount` and the
 //! `LastEvaluatedKey` computed from the page it stopped on.
 //!
 //! The page stops at the caller's `Limit` ("the maximum number of items to
@@ -12,11 +12,15 @@
 //! stopped with items still left to evaluate, which is what lets a caller tell the
 //! last page from a full one — "If LastEvaluatedKey is not empty, it does not
 //! necessarily mean that there is more data in the result set", so a page that ends
-//! exactly on the last item is free to report none. A parallel scan
-//! (`Segment`/`TotalSegments`) divides the key space being walked into one block of
-//! PARTITIONS per segment, so the segments together evaluate every item exactly once and
-//! every item sharing a partition key is evaluated by one of them ([`Segmentation`],
-//! [`Partitions`]); a resume token belongs to the segment whose block holds it, so one
+//! exactly on the last item is free to report none.
+//!
+//! What ORDER that walk has is the order the key space itself is laid out in: each
+//! partition sits where the hash of its partition key puts it ([`partition_hash`]), and
+//! the rows of one partition follow in the order the store holds them. A parallel scan
+//! (`Segment`/`TotalSegments`) divides that same space into one contiguous block of it per
+//! segment ([`Segmentation`]), so every item sharing a partition key is evaluated by one
+//! segment, a segment reads a RUN of this walk, and the segments together evaluate every
+//! item exactly once. A resume token belongs to the segment whose block holds it, so one
 //! presented under another segment of the same scan is refused rather than resumed
 //! ([`start_key_of_another_segment`]).
 //!
@@ -28,8 +32,9 @@
 //! one parser this crate has for it ([`crate::state::ParsedCondition`]).
 //!
 //! A scan that names an `IndexName` walks that SECONDARY INDEX instead — "accessing
-//! every item in a table or a secondary index" — in the order the index holds its
-//! entries, which is its own key order with the table's primary key breaking the tie;
+//! every item in a table or a secondary index" — over the index's own key space: its
+//! partitions where the hash of each index partition key puts them, the entries of one of
+//! them in index-key order with the table's primary key breaking the tie;
 //! an item the index does not cover is not there to be scanned, and each entry carries
 //! the attributes the index projects. A read that needs an attribute its index does not
 //! project is served from the parent table, which only a LOCAL index can do.
@@ -45,9 +50,13 @@
 //! `ConsistentRead` needs no handling beyond its effect on `ConsumedCapacity` — this
 //! store holds one copy of each item, so a scan of it always sees every completed write
 //! — except on a global secondary index, which does not support it and refuses the
-//! request. A `ProjectionExpression` path that reaches INSIDE an attribute (`a.b`,
-//! `a[1]`) is served like any other: it reports the value at that path wrapped in the
-//! containers the path steps through ([`crate::state::project_paths`]).
+//! request. What the scan is CHARGED is a read unit per 4 KB of each row it evaluated,
+//! which `ConsistentRead` halves on the table's own items and never on the entries of a
+//! secondary index ([`crate::state::walk_row_capacity_units`]). A `ProjectionExpression`
+//! path that reaches
+//! INSIDE an attribute (`a.b`, `a[1]`) is served like any other: it reports the value at
+//! that path wrapped in the containers the path steps through
+//! ([`crate::state::project_paths`]).
 //!
 //! Which index the request named, what each reported item is narrowed to and whether a
 //! read has to go on to the parent table are decided by the rules `Query` reads an index
@@ -541,13 +550,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )
         });
 
-        // The walk is over what this scan READS, in the order that reading has: the
-        // table's items in primary-key order, or the entries one secondary index holds
-        // in the order the index orders them ([`crate::state::IndexItemKey`]). Either
-        // way it is the order a `LastEvaluatedKey` resumes from. The list is one entry
+        // The walk is over what this scan READS: the table's items, or the entries one
+        // secondary index holds ([`crate::state::IndexItemKey`]). The list is one entry
         // per STORED item, so its size is what the table HOLDS and not anything this
         // request chose; the entry each row is read as is built inside the page below,
-        // where the page budget bounds it.
+        // where the page budget bounds it. The ORDER the rows are read in is settled
+        // below, and is the order a `LastEvaluatedKey` resumes from.
         let candidates: Vec<(crate::state::ReadPosition<'_>, &crate::state::Item)> = match index {
             None => table
                 .items
@@ -596,6 +604,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             empty_element,
         )
         .map_err(lift)?;
+        // Where the token resumes from sits in the same space the walk below is ordered
+        // by, so the place of its partition ([`partition_hash`]) is taken once: the segment
+        // check here and the forward filter further down both ask about that place.
+        let resumed = resumed
+            .as_ref()
+            .map(|from| (partition_hash(from.partition(index.as_ref())), from));
         // "In a parallel scan, a Scan request that includes ExclusiveStartKey must specify
         // the same segment whose previous Scan returned the corresponding value of
         // LastEvaluatedKey" (`Scan$ExclusiveStartKey`). A segment is a block of the key
@@ -604,8 +618,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // request's segment does not scan, and resuming it there would read a slice of the
         // table twice and leave another unread. It is refused rather than served
         // ([`start_key_of_another_segment`]).
-        if let Some(from) = resumed.as_ref() {
-            if !segmentation.owns(from.partition(index.as_ref())) {
+        if let Some((from_hash, _)) = resumed {
+            if !segmentation.owns(from_hash) {
                 return Err(lift(start_key_of_another_segment(&segmentation)));
             }
         }
@@ -613,37 +627,49 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Segment membership is decided from the row's own PARTITION KEY, not from where
         // the row sits in this walk ([`Segmentation::owns`]), so a later page of the same
         // segment sees the same share of what is scanned and a segment's share does not
-        // move when another item is written. Decided once per PARTITION: rows that share a
-        // partition key are contiguous in either walk — the table's items are ordered
-        // partition-first ([`crate::state::ItemKey`]) and an index's entries by the index
-        // key ([`crate::state::IndexItemKey`]) — so one pass over the walk places each
-        // partition once and reuses that answer for its run of rows.
-        let owned: Vec<bool> = {
-            let mut owned: Vec<bool> = Vec::with_capacity(candidates.len());
-            let mut placed: Option<(&[crate::state::AttributeValueKey], bool)> = None;
-            for (position, _) in &candidates {
-                let partition = position.partition(index.as_ref());
-                let owns = match placed {
-                    Some((previous, owns)) if previous == partition => owns,
-                    _ => segmentation.owns(partition),
-                };
-                owned.push(owns);
-                placed = Some((partition, owns));
-            }
-            owned
-        };
-        let evaluated = candidates
+        // move when another item is written. The walk itself is in the order the KEY SPACE
+        // is laid out — each partition where the hash of its key puts it
+        // ([`partition_hash`]), the rows of one partition in the order the store holds them
+        // — which is the order a segment's block of that space is contiguous in, so a
+        // segment reads a run of this walk and the segments together read all of it.
+        //
+        // The place is taken once per PARTITION: rows that share a partition key are
+        // contiguous in `candidates` — the table's items are ordered partition-first
+        // ([`crate::state::ItemKey`]) and an index's entries by the index key
+        // ([`crate::state::IndexItemKey`]) — so one pass places each partition once and
+        // reuses that answer for its run of rows.
+        let mut ordered: Vec<WalkRow<'_>> = Vec::with_capacity(candidates.len());
+        let mut placed: Option<(&[crate::state::AttributeValueKey], u64)> = None;
+        for (position, item) in &candidates {
+            let partition = position.partition(index.as_ref());
+            let hash = match placed {
+                Some((previous, hash)) if previous == partition => hash,
+                _ => partition_hash(partition),
+            };
+            placed = Some((partition, hash));
+            ordered.push(WalkRow {
+                hash,
+                position,
+                item,
+            });
+        }
+        ordered.sort_by(|left, right| {
+            left.hash
+                .cmp(&right.hash)
+                .then_with(|| left.position.cmp(right.position))
+        });
+        let evaluated = ordered
             .iter()
-            .enumerate()
-            .filter(|(row, _)| owned.get(*row).copied().unwrap_or(false))
-            .map(|(_, row)| row)
+            .filter(|row| segmentation.owns(row.hash))
             // "Use this value to start a new operation, EXCLUDING this value in the
             // new request" (`Scan$LastEvaluatedKey`). A scan always walks forward.
-            .filter(|(position, _)| {
-                resumed
-                    .as_ref()
-                    .is_none_or(|from| position.past(from, true))
-            });
+            .filter(|row| {
+                resumed.is_none_or(|(from_hash, from)| {
+                    row.hash > from_hash
+                        || (row.hash == from_hash && row.position.past(from, true))
+                })
+            })
+            .map(|row| (row.position, row.item));
 
         // "A single Scan operation first reads up to the maximum number of items set
         // (if using the Limit parameter) or a maximum of 1 MB of data" (the `Scan`
@@ -657,7 +683,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // What the page COSTS: one read unit per 4 KB of EACH item it evaluated, half a
         // unit per 4 KB where the read is eventually consistent — the charge a read of one
         // item carries ([`crate::state::read_capacity_units`]), summed over the items this
-        // scan examined, exactly as a batched read of the same items is charged.
+        // scan examined, exactly as a batched read of the same items is charged. A scan of
+        // a SECONDARY INDEX is charged over what the index holds for each row, in whole
+        // units ([`crate::state::index_scan_capacity_units`]).
         let mut page_units: f64 = 0.0;
         // What this scan spends on the TABLE rather than on the index it read: the
         // base-table fetches it made, charged per item.
@@ -683,7 +711,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 break;
             }
             page_size = page_size.saturating_add(size);
-            page_units += crate::state::read_capacity_units(
+            page_units += crate::state::walk_row_capacity_units(
+                index.is_some(),
                 crate::state::item_size(read.projected()),
                 consistent_read,
             );
@@ -734,7 +763,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // A scan that evaluated nothing still spends the one unit a read takes at least —
         // the charge the walk itself carries — which is what a read of a key no item
-        // answers to is charged too.
+        // answers to is charged too. That base charge is the WALK's and not a row's: the
+        // per-row rounding an index scan is charged in has no entry to apply to here, so an
+        // empty page costs what the request asked to read with, index or no index.
         let units = if page.is_empty() {
             crate::state::read_capacity_units(0, consistent_read)
         } else {
@@ -861,6 +892,19 @@ const PROJECTION_ASK: usize = 0;
 /// `ConditionalOperator` that combines its entries — stated.
 const FILTER_ASK: usize = 1;
 
+/// One row of the walk a `Scan` reads, as the walk ORDERS it: where the partition it
+/// belongs to sits in the hash space ([`partition_hash`]), the row's own place in what is
+/// being walked, and the stored item it reads.
+///
+/// `hash` first because that is what the walk is ordered by and what decides which segment
+/// evaluates the row; the place breaks a tie, so rows of one partition stay in the order
+/// the store holds them.
+struct WalkRow<'a> {
+    hash: u64,
+    position: &'a crate::state::ReadPosition<'a>,
+    item: &'a crate::state::Item,
+}
+
 /// Which share of the table one `Scan` request evaluates.
 ///
 /// "TotalSegments represents the total number of segments into which the Scan
@@ -917,21 +961,20 @@ impl Segmentation {
         }
     }
 
-    /// Whether the partition whose key values are `partition` belongs to this request's
-    /// segment.
+    /// Whether the partition whose key hashes to `hash` belongs to this request's segment.
     ///
     /// The segments divide the hash space the key space is laid out by into as many equal
     /// blocks as there are segments, and a partition sits where the hash of its key puts
     /// it ([`partition_hash`]) — so the blocks together cover every partition exactly
     /// once, no partition falls in two of them, and a segment's share is decided by the
     /// key alone. The sequential scan (one segment) owns the whole space, which is the
-    /// same answer the division gives and is answered without hashing anything.
-    fn owns(&self, partition: &[crate::state::AttributeValueKey]) -> bool {
+    /// same answer the division gives.
+    fn owns(&self, hash: u64) -> bool {
         if self.total <= 1 {
             return true;
         }
         let total = u128::try_from(self.total).unwrap_or(1);
-        let block = (u128::from(partition_hash(partition)) * total) >> u64::BITS;
+        let block = (u128::from(hash) * total) >> u64::BITS;
         usize::try_from(block).unwrap_or(0) == self.segment
     }
 }
@@ -942,11 +985,20 @@ impl Segmentation {
 /// "DynamoDB uses the partition key's value as input to an internal hash function. The
 /// output value from the hash function determines the partition" (the Developer Guide's
 /// "Partitions and data distribution"), so the place a partition occupies is a function of
-/// its KEY and of nothing else — which is what makes a segment's share stable while the
-/// table is written to. The digest is taken over each key component's own text
-/// ([`crate::state::AttributeValueKey::key_text`]), length-prefixed so two components
-/// cannot run together into one value a different key would also produce; an index key
-/// may carry several components, and they are all part of the one partition they address.
+/// its KEY and of nothing else — which is what makes a segment's share, and the order a
+/// scan walks the partitions in, stable while the table is written to. THAT is the rule.
+/// WHICH function places a key is internal to the service and published nowhere, so the one
+/// here is internal to this emulator too — the digest this crate already digests with, over
+/// each key component's own text ([`crate::state::AttributeValueKey::key_text`]),
+/// length-prefixed so two components cannot run together into one value a different key
+/// would also produce; an index key may carry several components, and they are all part of
+/// the one partition they address. No caller can rely on WHERE a given key lands, only on
+/// its landing in one place, in one segment, and staying there however the table is
+/// written to.
+///
+/// The digest PLACES a key in that space and does nothing else: it signs nothing, verifies
+/// nothing, protects nothing, and the value it answers is derived from a key the response
+/// already carries, so nothing about it is secret.
 fn partition_hash(partition: &[crate::state::AttributeValueKey]) -> u64 {
     use ::sha2::Digest;
 

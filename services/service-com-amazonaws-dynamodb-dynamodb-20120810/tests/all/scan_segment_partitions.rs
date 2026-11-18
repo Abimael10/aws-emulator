@@ -30,18 +30,22 @@ use crate::emulator::{describe_when_active, emulator, ok};
 
 /// One seeded table: how many distinct partition keys it holds, and how many items sit in
 /// each of them.
-struct Shape {
-    case: &'static str,
-    table: &'static str,
-    partitions: usize,
-    rows: usize,
+///
+/// Reachable from the sibling suites of this test binary, so the tables a rule about what a
+/// scan WALKS is read over are declared and seeded once
+/// (`tests/all/scan_key_space_walk.rs`).
+pub(crate) struct Shape {
+    pub(crate) case: &'static str,
+    pub(crate) table: &'static str,
+    pub(crate) partitions: usize,
+    pub(crate) rows: usize,
 }
 
 /// The table shapes every segmentation row below is driven over: one partition holding
 /// every item (where a parallel scan's segments cannot split the item list without
 /// splitting a partition), partitions holding several items each, and one item per
 /// partition.
-const SHAPES: [Shape; 4] = [
+pub(crate) const SHAPES: [Shape; 4] = [
     Shape {
         case: "one partition of five items",
         table: "SegOnePartition",
@@ -70,13 +74,13 @@ const SHAPES: [Shape; 4] = [
 
 impl Shape {
     /// How many items this shape seeds.
-    fn total(&self) -> usize {
+    pub(crate) fn total(&self) -> usize {
         self.partitions * self.rows
     }
 
-    /// Every item key this shape seeds, in the order a scan of the table walks them:
-    /// partition first, then sort key.
-    fn keys(&self) -> Vec<String> {
+    /// Every item key this shape seeds, in the order the store holds them: partition first,
+    /// then sort key.
+    pub(crate) fn keys(&self) -> Vec<String> {
         (0..self.partitions)
             .flat_map(|partition| {
                 (0..self.rows).map(move |row| format!("p{partition}/{row}"))
@@ -86,14 +90,14 @@ impl Shape {
 }
 
 /// The partition component of one of those item keys.
-fn partition_of(key: &str) -> String {
+pub(crate) fn partition_of(key: &str) -> String {
     key.split('/').next().unwrap_or(key).to_string()
 }
 
 /// The item keys a response reports, in the order it reported them. A response that
 /// carries no `Items` member reports none, which is what a segment with nothing to
 /// evaluate — and a filter that kept nothing — answers.
-fn item_keys(page: &Value) -> Vec<String> {
+pub(crate) fn item_keys(page: &Value) -> Vec<String> {
     page.get("Items")
         .and_then(Value::as_array)
         .map(|items| {
@@ -119,7 +123,7 @@ fn scanned_count(page: &Value) -> usize {
 /// Create every [`SHAPES`] table and seed its items. The creates are issued together and
 /// awaited afterwards, so the suite waits out ONE transition span rather than one per
 /// table.
-async fn seed_shapes(router: &MultiServiceRouter) {
+pub(crate) async fn seed_shapes(router: &MultiServiceRouter) {
     for shape in &SHAPES {
         ok(
             router,
@@ -168,13 +172,47 @@ async fn an_unsegmented_scan_evaluates_every_item_of_the_table() {
 
     for shape in &SHAPES {
         let page = ok(&router, "Scan", json!({"TableName": shape.table})).await;
-        let expected = shape.keys();
+        let answered = item_keys(&page);
+        // A scan walks the KEY SPACE: each partition where the hash of its key puts it,
+        // and the rows of one partition in sort-key order. So what a scan reports is every
+        // item exactly once, with each partition's own rows contiguous and ascending —
+        // never the partitions in key order.
+        let mut sorted = answered.clone();
+        sorted.sort();
+        let mut expected = shape.keys();
+        expected.sort();
         assert_eq!(
-            item_keys(&page),
-            expected,
-            "case {:?}: a scan with no filter reports every item in key order, got {page}",
+            sorted, expected,
+            "case {:?}: a scan with no filter reports every item exactly once, got {page}",
             shape.case
         );
+        let partitions: Vec<String> = answered.iter().map(|key| partition_of(key)).collect();
+        let mut seen: Vec<String> = Vec::new();
+        for partition in &partitions {
+            if seen.last() != Some(partition) {
+                assert!(
+                    !seen.contains(partition),
+                    "case {:?}: a partition's rows are contiguous in the walk, but \
+                     {partition:?} comes back a second time, got {partitions:?}",
+                    shape.case
+                );
+                seen.push(partition.clone());
+            }
+        }
+        for partition in &seen {
+            let rows: Vec<&String> = answered
+                .iter()
+                .filter(|key| partition_of(key) == *partition)
+                .collect();
+            let mut ascending = rows.clone();
+            ascending.sort();
+            assert_eq!(
+                rows, ascending,
+                "case {:?}: partition {partition:?} is walked in sort-key order, got \
+                 {rows:?}",
+                shape.case
+            );
+        }
         assert_eq!(
             (page["Count"].clone(), page["ScannedCount"].clone()),
             (json!(expected.len()), json!(expected.len())),

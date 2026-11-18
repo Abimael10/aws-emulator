@@ -39,6 +39,36 @@ pub fn fetch_capacity_units(size: i64) -> f64 {
     read_capacity_units(size, true)
 }
 
+/// The capacity units SCANNING one entry of a secondary index costs: that entry's own size
+/// rounded up to the read unit, in whole units.
+///
+/// A scan of an index is charged over what the index HOLDS for each row it evaluated, and
+/// the recorded answer for such a scan charges a WHOLE unit for each entry inside one 4 KB
+/// read unit — the same per-row, unhalved rounding the base-table arm of an index read is
+/// charged in, which is why this answers through [`fetch_capacity_units`]: one computation,
+/// so a change to the unhalved per-row rounding cannot reach one arm and not the other. The
+/// halving an eventually consistent read takes off ([`read_capacity_units`]) is what a read
+/// of the TABLE's own items is charged at.
+pub fn index_scan_capacity_units(size: i64) -> f64 {
+    fetch_capacity_units(size)
+}
+
+/// What ONE ROW of a walk is charged, which follows what the WALK reads rather than the
+/// operation that drives it: a row of a secondary index is charged over what that index
+/// holds for it, in whole units ([`index_scan_capacity_units`]); a row of the TABLE's own
+/// items is charged at the rate the request asked to read it with
+/// ([`read_capacity_units`]). `reads_index` says which walk this is.
+///
+/// Stated once, for the readers that charge PER ROW over a walk — `Scan` and the PartiQL
+/// `SELECT` whose plan is a scan — so the two cannot drift.
+pub fn walk_row_capacity_units(reads_index: bool, size: i64, consistent_read: bool) -> f64 {
+    if reads_index {
+        index_scan_capacity_units(size)
+    } else {
+        read_capacity_units(size, consistent_read)
+    }
+}
+
 /// How many whole units of `unit_bytes` cover `size` bytes, never fewer than one.
 fn units_of(size: i64, unit_bytes: i64) -> f64 {
     let size = size.max(0);

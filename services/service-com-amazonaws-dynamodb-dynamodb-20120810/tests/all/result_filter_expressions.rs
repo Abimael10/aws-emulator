@@ -235,12 +235,16 @@ async fn a_scan_filter_decides_which_items_the_response_carries() {
             ),
         )
         .await;
+        // WHICH items the filter keeps is this suite's business, not the order the scan
+        // walks the key space in, so the two sides are compared as sets. The order itself
+        // is a rule of its own, read where the walk is: `scan_key_space_walk` and
+        // `scan_segment_partitions`.
+        let mut answered = titles(&scanned);
+        answered.sort();
+        let mut kept: Vec<String> = row.titles.iter().map(|title| (*title).to_string()).collect();
+        kept.sort();
         assert_eq!(
-            titles(&scanned),
-            row.titles
-                .iter()
-                .map(|title| (*title).to_string())
-                .collect::<Vec<String>>(),
+            answered, kept,
             "case {case:?}: expected the items {:?} match, got {scanned}",
             row.expression
         );
