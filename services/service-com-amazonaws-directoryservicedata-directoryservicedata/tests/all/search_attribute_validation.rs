@@ -19,7 +19,8 @@ use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
 use super::validation_envelope::{
-    call, emulator, Answer, DIRECTORY, UNUSED_DIRECTORY, VALIDATION_EXCEPTION,
+    call, emulator, Answer, DIRECTORY, PAGED_DIRECTORY, SEARCH_ATTRIBUTES_CEILING,
+    UNUSED_DIRECTORY, VALIDATION_EXCEPTION,
 };
 
 /// A `DirectoryId` this account holds and nothing is ever written to, for the cases about a
@@ -31,6 +32,12 @@ const EMPTY_DIRECTORY: &str = UNUSED_DIRECTORY;
 /// here rather than imported so a wrong value in the implementation fails.
 const INVALID_ATTRIBUTE_FOR_SEARCH: &str = "INVALID_ATTRIBUTE_FOR_SEARCH";
 
+/// The `ValidationExceptionReason` a paginated read refuses a cursor it did not issue with
+/// (`smithy_query(query="shape", shape="ValidationExceptionReason")` holds it too): the one
+/// the rows below read once every attribute the request names is searchable, which is how
+/// they pin that the attribute set is read FIRST.
+const INVALID_NEXT_TOKEN: &str = "INVALID_NEXT_TOKEN";
+
 /// The attribute of a user and of a group that the service's attribute list holds and marks
 /// `Searchable: No`: the object's common name, which carries the account name over again.
 const UNSEARCHABLE: &str = "cn";
@@ -38,6 +45,42 @@ const UNSEARCHABLE: &str = "cn";
 /// The account name of the user and of the group the cases below search for.
 const USER: &str = "jdoe";
 const GROUP: &str = "engineering";
+
+/// A value several groups hold for one DATA attribute, so a page of one issues a cursor and
+/// the rows about what the refusal PRECEDES have a real walk to interrupt.
+const SHARED: &str = "shared-across-groups";
+
+/// DATA attribute names of the service's own attribute list — the list
+/// `CreateGroupRequest$OtherAttributes` links — as this API spells them, taken from the
+/// crate's schema catalogue of that list (`src/state/attribute_schema.rs`). Every one of them
+/// is an attribute a caller writes and the directory searches as the data it is, so a request
+/// naming them is served; they fill the attribute list up to the size the model admits.
+const CATALOGUED: [&str; 24] = [
+    "Co",
+    "CodePage",
+    "Company",
+    "CountryCode",
+    "Department",
+    "Description",
+    "DisplayName",
+    "Division",
+    "EmployeeID",
+    "EmployeeNumber",
+    "EmployeeType",
+    "FacsimileTelephoneNumber",
+    "HomeDirectory",
+    "HomeDrive",
+    "HomePhone",
+    "Info",
+    "Initials",
+    "IpPhone",
+    "L",
+    "ManagedBy",
+    "Manager",
+    "MiddleName",
+    "Mobile",
+    "OtherTelephone",
+];
 
 /// The sentence a refused search states: fixed text around the attribute the request named,
 /// quoted as the request spelled it.
@@ -283,4 +326,233 @@ async fn a_refused_search_leaves_the_directory_as_it_stood() {
              {after:?}"
         );
     }
+}
+
+/// One row of the ordering table below: what the request carries BESIDES its attributes,
+/// the attributes it names, the name its refusal must quote, the attributes the mirrored
+/// request names instead, and the `Reason` that mirror draws (`None` when it is served).
+type OrderingRow = (
+    &'static str,
+    Value,
+    Vec<&'static str>,
+    &'static str,
+    Vec<&'static str>,
+    Option<&'static str>,
+);
+
+/// RULE: the ATTRIBUTE SET alone decides the refusal — it is read before the page cursor,
+/// the realm, the page size and the search string's own matching, so none of those can turn
+/// a search the directory cannot run into one it answers, and the rule holds at every size
+/// `SearchAttributes` admits.
+///
+/// The rows differ along what else the request carries (a cursor a previous page issued, a
+/// cursor no page issued, a realm the directory holds and a realm it does not, the largest
+/// page the model admits, a search string nothing holds) and along the SIZE of the attribute
+/// list, up to the maximum the model declares with the unsearchable name as its last entry.
+/// Each row is mirrored by the same request with a searchable name in the offender's place,
+/// which is answered.
+#[tokio::test]
+async fn the_attribute_set_alone_decides_whether_the_search_is_refused() {
+    let router = emulator();
+
+    // Three groups holding one value for one data attribute, so a page of one leaves groups
+    // behind it and the search issues a cursor to resume from.
+    for name in ["alpha", "beta", "gamma"] {
+        let created = call(
+            &router,
+            "/Groups/CreateGroup",
+            PAGED_DIRECTORY,
+            &json!({
+                "SAMAccountName": name,
+                "OtherAttributes": {"Description": {"S": SHARED}},
+            }),
+        )
+        .await;
+        assert_eq!(
+            created.status, 200,
+            "case {name:?}: the create must be accepted, got {} with {:?}",
+            created.status, created.body
+        );
+    }
+
+    let page = call(
+        &router,
+        "/Groups/SearchGroups",
+        PAGED_DIRECTORY,
+        &json!({"SearchString": SHARED, "SearchAttributes": ["Description"], "MaxResults": 1}),
+    )
+    .await;
+    assert_eq!(
+        page.status, 200,
+        "the first page over a searchable attribute must be served, got {} with {:?}",
+        page.status, page.body
+    );
+    let cursor = page.body["NextToken"]
+        .as_str()
+        .unwrap_or_else(|| {
+            panic!(
+                "a page of one with groups behind it issues a cursor, got {:?}",
+                page.body
+            )
+        })
+        .to_string();
+    // The realm the directory itself answers in, read from that page rather than written
+    // here, so the row carries the realm this directory really has.
+    let held_realm = page.body["Realm"]
+        .as_str()
+        .unwrap_or_else(|| {
+            panic!(
+                "a served page states the realm it searched, got {:?}",
+                page.body
+            )
+        })
+        .to_string();
+
+    // The attribute list at the maximum size the model admits, with the unsearchable name as
+    // its last entry, and the same list with a searchable name in its place.
+    let mut at_the_ceiling: Vec<&str> = CATALOGUED.to_vec();
+    at_the_ceiling.push("Cn");
+    let mut all_searchable: Vec<&str> = CATALOGUED.to_vec();
+    all_searchable.push("SAMAccountName");
+    assert_eq!(
+        at_the_ceiling.len(),
+        SEARCH_ATTRIBUTES_CEILING,
+        "the ceiling row must carry the largest list the model admits, got {}",
+        at_the_ceiling.len()
+    );
+
+    // (case, what the request carries besides the attributes, the attributes, the offender,
+    // the attributes the mirrored request names instead, the `Reason` that mirror draws)
+    let rows: [OrderingRow; 7] = [
+        (
+            "the cursor the previous page issued",
+            json!({"NextToken": cursor.clone()}),
+            vec!["Description", "Cn"],
+            "Cn",
+            vec!["Description"],
+            None,
+        ),
+        (
+            "a cursor no page ever issued",
+            json!({"NextToken": "not-a-cursor-this-service-minted"}),
+            vec!["Cn"],
+            "Cn",
+            vec!["SAMAccountName"],
+            // With every name searchable, the cursor is what the request fails on — which is
+            // the ordering this row pins: the attribute set is read first.
+            Some(INVALID_NEXT_TOKEN),
+        ),
+        (
+            "the realm the directory answers in",
+            json!({"Realm": held_realm.clone()}),
+            vec!["Cn"],
+            "Cn",
+            vec!["SAMAccountName"],
+            None,
+        ),
+        (
+            "a realm no directory of this account holds",
+            json!({"Realm": "sim2real-elsewhere.example.org"}),
+            vec!["Description", "CN"],
+            "CN",
+            vec!["Description"],
+            None,
+        ),
+        (
+            "the largest page the model admits",
+            json!({"MaxResults": 250}),
+            vec!["cN"],
+            "cN",
+            vec!["SAMAccountName"],
+            None,
+        ),
+        (
+            "a search string no object holds",
+            json!({"SearchString": "sim2real-no-object-holds-this"}),
+            vec!["cn"],
+            "cn",
+            vec!["Description"],
+            None,
+        ),
+        (
+            "the offender as the last name the list admits",
+            json!({}),
+            at_the_ceiling.clone(),
+            "Cn",
+            all_searchable.clone(),
+            None,
+        ),
+    ];
+
+    for (what, extra, attributes, quoted, mirrored_attributes, mirrored_reason) in rows {
+        let mut request = search(SHARED, &attributes);
+        for (member, value) in extra.as_object().expect("an object of members") {
+            request[member] = value.clone();
+        }
+        let case = format!("SearchGroups over {attributes:?} with {what}");
+        let refused = call(&router, "/Groups/SearchGroups", PAGED_DIRECTORY, &request).await;
+        assert_refused(&case, &refused, quoted);
+
+        // The same request with only searchable names is decided by what it carries BESIDES
+        // the attributes, so the row is about the attribute and nothing else.
+        let mut mirrored = request.clone();
+        mirrored["SearchAttributes"] = json!(mirrored_attributes);
+        let answered = call(&router, "/Groups/SearchGroups", PAGED_DIRECTORY, &mirrored).await;
+        match mirrored_reason {
+            None => {
+                assert_eq!(
+                    answered.status, 200,
+                    "case {case:?}: the same request over {mirrored_attributes:?} must be \
+                     served, got {} with {:?}",
+                    answered.status, answered.body
+                );
+                assert!(
+                    answered.body.get("Reason").is_none(),
+                    "case {case:?}: an answered search states no Reason, got {:?}",
+                    answered.body
+                );
+            }
+            Some(reason) => {
+                assert_eq!(
+                    answered.status, 400,
+                    "case {case:?}: the same request over {mirrored_attributes:?} must be \
+                     refused, got {} with {:?}",
+                    answered.status, answered.body
+                );
+                assert_eq!(
+                    answered.body.get("Reason").and_then(Value::as_str),
+                    Some(reason),
+                    "case {case:?}: expected Reason {reason} once every name is searchable, \
+                     got {:?}",
+                    answered.body
+                );
+            }
+        }
+    }
+
+    // And the cursor the first page issued still resumes that same walk, which is what the
+    // refused rows above left untouched.
+    let resumed = call(
+        &router,
+        "/Groups/SearchGroups",
+        PAGED_DIRECTORY,
+        &json!({
+            "SearchString": SHARED,
+            "SearchAttributes": ["Description"],
+            "MaxResults": 1,
+            "NextToken": cursor,
+        }),
+    )
+    .await;
+    assert_eq!(
+        resumed.status, 200,
+        "the cursor must still resume the walk, got {} with {:?}",
+        resumed.status, resumed.body
+    );
+    assert_eq!(
+        resumed.body["Groups"].as_array().map(Vec::len),
+        Some(1),
+        "the resumed page must report the group after the first, got {:?}",
+        resumed.body
+    );
 }
