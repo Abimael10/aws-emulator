@@ -53,7 +53,7 @@ pub const EXPORT_TASK_STATUS_VALUES: [&str; 6] = [
 
 /// The statuses an export task does not leave on its own: "Any data that has already been
 /// written to the S3 bucket isn't removed", and nothing moves a finished export again.
-const TERMINAL_STATUSES: [&str; 3] = [
+pub const TERMINAL_STATUSES: [&str; 3] = [
     EXPORT_TASK_STATUS_CANCELED,
     EXPORT_TASK_STATUS_COMPLETE,
     EXPORT_TASK_STATUS_FAILED,
