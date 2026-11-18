@@ -374,3 +374,159 @@ async fn a_dangling_monitor_reference_is_refused_with_the_services_own_sentence(
         "a refused create must persist no subscription, got {subscriptions}"
     );
 }
+
+/// RULE: the ARN-list filter of a paginated read selects among the resources the account
+/// holds and asserts the existence of none of them, so an ARN whose resource an earlier
+/// delete removed matches nothing: it contributes no element, it suppresses none of the
+/// resources the SAME list names that the account still holds, and the read answers HTTP
+/// 200 with its required list — empty only when nothing it named matched. The cursor walk
+/// is the same filter applied page by page, so paging such a filter reports exactly the
+/// survivors it names, once each, in the registry's ARN order.
+///
+/// This is the delete-then-confirm loop: the table spans how many removed ARNs the filter
+/// names, where they sit relative to surviving ones, how many survivors stand beside them,
+/// the order the list is written in, a repeated ARN, and the page sizes the selection can
+/// be cut at.
+#[tokio::test]
+async fn a_filter_naming_removed_monitors_still_reports_the_survivors() {
+    let emulator = Emulator::start();
+    // Five customer managed monitors, so a filter can mix any number of removed ARNs with
+    // any number of surviving ones at any position.
+    let mut minted = Vec::new();
+    for index in 0..5 {
+        minted.push(create_monitor(&emulator, &format!("confirm-{index}")).await);
+    }
+    // The registry is keyed on the ARN, so that is the order every page walks.
+    minted.sort();
+    // Two removals, so a case can name one removed ARN or several.
+    let removed = vec![minted[1].clone(), minted[3].clone()];
+    for arn in &removed {
+        emulator
+            .ok("DeleteAnomalyMonitor", &json!({"MonitorArn": arn}))
+            .await;
+    }
+    let live: Vec<String> = minted
+        .iter()
+        .filter(|arn| !removed.contains(arn))
+        .cloned()
+        .collect();
+
+    let cases: Vec<(&str, Vec<String>)> = vec![
+        ("one removed ARN alone", vec![removed[0].clone()]),
+        ("every removed ARN at once", removed.clone()),
+        (
+            "a removed ARN before a surviving one",
+            vec![removed[0].clone(), live[0].clone()],
+        ),
+        (
+            "a removed ARN after a surviving one",
+            vec![live[0].clone(), removed[1].clone()],
+        ),
+        (
+            "a removed ARN between two surviving ones",
+            vec![live[2].clone(), removed[1].clone(), live[0].clone()],
+        ),
+        (
+            "every ARN ever minted, in reverse order",
+            minted.iter().rev().cloned().collect(),
+        ),
+        (
+            "the same removed ARN named twice beside a survivor",
+            vec![removed[0].clone(), removed[0].clone(), live[1].clone()],
+        ),
+        ("only surviving ARNs", live.clone()),
+    ];
+
+    for (case, filter) in cases {
+        // `live` is in ARN order already, so selecting from it keeps the registry's order.
+        let expected: Vec<String> = live
+            .iter()
+            .filter(|arn| filter.contains(arn))
+            .cloned()
+            .collect();
+
+        let (status, answered) = emulator
+            .call(
+                "GetAnomalyMonitors",
+                &json!({"MonitorArnList": filter.clone()}),
+            )
+            .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected HTTP 200, got {status}: {answered}"
+        );
+        assert!(
+            answered
+                .get("AnomalyMonitors")
+                .is_some_and(Value::is_array),
+            "case {case:?}: the required AnomalyMonitors member must be present, got {answered}"
+        );
+        let selected = reported(&answered, "AnomalyMonitors", "MonitorArn");
+        assert_eq!(
+            selected, expected,
+            "case {case:?}: expected exactly the named monitors the account still holds, got \
+             {selected:?}"
+        );
+        assert!(
+            answered.get("NextPageToken").is_none_or(Value::is_null),
+            "case {case:?}: a read that names no MaxResults reports the whole selection in one \
+             page, so it carries no cursor, got {answered}"
+        );
+        assert!(
+            error_code(&answered).is_empty() && error_message(&answered).is_empty(),
+            "case {case:?}: a selecting filter raises no error, got {answered}"
+        );
+
+        // The same filter walked page by page selects the same survivors, once each, in the
+        // same order — and the confirm read changed nothing, so it answers the same twice.
+        for page_size in [1_usize, 2, 3, 5, 9] {
+            let mut walked: Vec<String> = Vec::new();
+            let mut token: Option<String> = None;
+            let mut pages = 0_usize;
+            loop {
+                let mut request = json!({"MonitorArnList": filter.clone(),
+                                         "MaxResults": page_size});
+                if let Some(token) = &token {
+                    request["NextPageToken"] = json!(token);
+                }
+                let (status, answered) = emulator.call("GetAnomalyMonitors", &request).await;
+                assert_eq!(
+                    status, 200,
+                    "case {case:?} at MaxResults {page_size}: expected HTTP 200, got {status}: \
+                     {answered}"
+                );
+                let page = reported(&answered, "AnomalyMonitors", "MonitorArn");
+                assert!(
+                    page.len() <= page_size,
+                    "case {case:?} at MaxResults {page_size}: a page holds at most MaxResults \
+                     monitors, got {page:?}"
+                );
+                walked.extend(page);
+                pages += 1;
+                assert!(
+                    pages <= minted.len() + 1,
+                    "case {case:?} at MaxResults {page_size}: the walk must terminate, got \
+                     {pages} pages"
+                );
+                match answered["NextPageToken"].as_str() {
+                    Some(next) => token = Some(next.to_string()),
+                    None => break,
+                }
+            }
+            assert_eq!(
+                walked, expected,
+                "case {case:?} at MaxResults {page_size}: paging the filter must report every \
+                 surviving monitor it names exactly once, in order, got {walked:?}"
+            );
+        }
+    }
+
+    // The confirm reads are reads: the account still holds exactly the survivors.
+    let all = emulator.ok("GetAnomalyMonitors", &json!({})).await;
+    assert_eq!(
+        reported(&all, "AnomalyMonitors", "MonitorArn"),
+        live,
+        "the reads must leave the registry holding exactly the monitors no delete removed, got \
+         {all}"
+    );
+}
