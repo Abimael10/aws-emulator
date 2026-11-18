@@ -1371,3 +1371,136 @@ async fn the_policy_target_plane_refusals_state_the_api_sentences() {
         listed.policy_arns()
     );
 }
+
+/// `AttachPolicy` records a pair only for a `policyName` the MODEL admits.
+///
+/// `AttachPolicy$policyName` is modelled `length 1..128, pattern ^[\w+=,.@-]+$`
+/// (`smithy_query(query="operation",operation="AttachPolicy")`), so a name INSIDE that
+/// constraint — at either published bound of the length, or carrying any character class
+/// the pattern allows — records the pair for every target form the member documents, and
+/// both listings report it; a name one character past the published maximum, or carrying
+/// a character the pattern does not admit, is refused `InvalidRequestException` (400)
+/// naming the member it refused, before any state is touched, and leaves the relation
+/// exactly as it was.
+#[tokio::test]
+async fn the_attach_records_a_pair_only_for_a_policy_name_the_model_admits() {
+    let emulator = Emulator::new();
+
+    let certificate = given_certificate(&emulator, true).await;
+    let group = given_thing_group(&emulator, "bounded-group", &json!({})).await;
+    let cognito = format!("{REGION}:4f5e6d7c-8b9a-0123-4567-89abcdef0123");
+
+    // One target per form `ListAttachedPolicies$target` documents, so the bound is tested
+    // on every kind of target rather than on one. Each is addressed by the form the
+    // listings report it in: the ARN this account holds, or the identity as supplied.
+    let targets: [(&str, String); 3] = [
+        ("a certificate ARN", certificate.clone()),
+        ("a thing group ARN", group.clone()),
+        ("a Cognito identity", cognito.clone()),
+    ];
+
+    // Names INSIDE the constraint: each published bound of `length 1..128`, and one
+    // carrying every punctuation character `^[\w+=,.@-]+$` admits.
+    let longest = "p".repeat(128);
+    let admitted: [&str; 3] = ["a", longest.as_str(), "bound+policy=1.ok@x,y-z_2"];
+    for policy_name in admitted {
+        given_policy(&emulator, policy_name).await;
+    }
+
+    for (target_label, target) in &targets {
+        for policy_name in admitted {
+            let label = format!(
+                "{target_label} with a policyName of {} character(s)",
+                policy_name.len()
+            );
+            let attached = emulator.attach_policy(policy_name, target).await;
+            assert_eq!(
+                attached.status, 200,
+                "case {label}: AttachPolicy must answer 200, got {} {:?}",
+                attached.status, attached.body
+            );
+
+            // The pair is readable from both ends of the relation.
+            let listed = emulator.walk_attached_policies(target, false, None).await;
+            assert!(
+                listed.contains(&policy_name.to_string()),
+                "case {label}: ListAttachedPolicies must report the attached policy, \
+                 got {listed:?}"
+            );
+            let holders = emulator.walk_policy_targets(policy_name, None).await;
+            assert!(
+                holders.contains(target),
+                "case {label}: ListTargetsForPolicy must report {target}, got {holders:?}"
+            );
+        }
+    }
+
+    // What each target holds once every admitted name is attached: the state the refusals
+    // below must leave untouched.
+    let mut recorded: Vec<(String, BTreeSet<String>)> = Vec::new();
+    for (_target_label, target) in &targets {
+        let held: BTreeSet<String> = emulator
+            .walk_attached_policies(target, false, None)
+            .await
+            .into_iter()
+            .collect();
+        recorded.push((target.clone(), held));
+    }
+
+    // Names OUTSIDE the constraint: one character past the published maximum length, and
+    // names carrying a character the pattern does not admit. Each is still ONE URI path
+    // segment, so the request reaches this route and is refused for its VALUE rather than
+    // routed somewhere else.
+    let too_long = "p".repeat(129);
+    let refused_names: [(&str, &str); 6] = [
+        (
+            "a policyName one character past the modelled maximum length",
+            too_long.as_str(),
+        ),
+        ("a policyName carrying `!`", "outside!pattern"),
+        ("a policyName carrying `*`", "outside*pattern"),
+        ("a policyName carrying `~`", "outside~pattern"),
+        ("a policyName carrying `$`", "outside$pattern"),
+        ("a policyName carrying `(`", "outside(pattern"),
+    ];
+    for (target_label, target) in &targets {
+        for (name_label, policy_name) in refused_names {
+            let label = format!("{target_label} with {name_label}");
+            let refused = emulator.attach_policy(policy_name, target).await;
+            assert_eq!(
+                refused.status, 400,
+                "case {label}: AttachPolicy must refuse it 400, got {} {:?}",
+                refused.status, refused.body
+            );
+            // The class is this service's own validation refusal, so the 400 is the
+            // CONSTRAINT refusing the value rather than any other 400 the route could
+            // produce.
+            assert_eq!(
+                refused.error_code.as_deref(),
+                Some(QUALIFIED_INVALID_REQUEST),
+                "case {label}: expected InvalidRequestException, got {:?} {:?}",
+                refused.error_code,
+                refused.body
+            );
+            assert!(
+                refused.message().contains("policyName"),
+                "case {label}: the refusal must name the member it refused, got {:?}",
+                refused.message()
+            );
+        }
+    }
+
+    // No refusal recorded anything: every target holds exactly the pairs the admitted
+    // names recorded.
+    for (target, before) in &recorded {
+        let after: BTreeSet<String> = emulator
+            .walk_attached_policies(target, false, None)
+            .await
+            .into_iter()
+            .collect();
+        assert_eq!(
+            &after, before,
+            "case {target}: a refused attach must record nothing, got {after:?}"
+        );
+    }
+}
