@@ -7,7 +7,7 @@
 //! table or column that showed the defect:
 //!
 //! 1. A column's `Type` names the KIND of data it stores, in the dictionary's mixed-case
-//!    vocabulary — `String`, `Number`, `Double`, `Integer`, `Timestamp`, `Boolean`, `Map`,
+//!    vocabulary — `String`, `Number`, `Double`, `Int`, `Timestamp`, `Boolean`, `Map`,
 //!    `Map<String, String>` — and
 //!    every column carries the dictionary's `Description` for it, within the modelled
 //!    bound. No column reports a storage-engine type name (`STRING`,
@@ -47,7 +47,7 @@ const COLUMN_TYPE_VOCABULARY: &[&str] = &[
     "String",
     "Number",
     "Double",
-    "Integer",
+    "Int",
     "Timestamp",
     "Boolean",
     "Map",
@@ -144,7 +144,7 @@ const PUBLISHED_COLUMNS: &[(&str, &[(&str, &str)])] = &[
             // `Double`, the lookback day count as the whole number of days it is, and the
             // resource's tags as a key-value map NAMING its key and value types: tokens of
             // its own, not the cost and usage dictionary's.
-            ("recommendation_lookback_period_in_days", "Integer"),
+            ("recommendation_lookback_period_in_days", "Int"),
             ("estimated_monthly_cost_before_discount", "Double"),
             ("estimated_savings_percentage_after_discount", "Double"),
             ("tags", "Map<String, String>"),

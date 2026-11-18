@@ -9,24 +9,21 @@
 //! changes — and the column set `GetTable` reports for a configuration is equally the set a
 //! submitted `QueryStatement` may name ("TableProperties are additional configurations you
 //! can provide to change the data and schema of a table" — the modelled doc for
-//! `GetTableRequest$TableProperties`). A property whose published description advertises
-//! columns and selects none would make its own `TablePropertyDescription` a claim no
-//! configuration can act on, and would refuse every query naming those columns at every
-//! value of it.
+//! `GetTableRequest$TableProperties`). A gated column that no published property switches
+//! on would be a column no configuration can reach, and every query naming it would be
+//! refused at every value of every property.
 //!
 //! The rows differ along what the rule generalises over:
 //!
 //! * the property: every column-selecting property of the catalog, including ones the issue
-//!   that prompted this suite did not cite, and both a property that publishes a default
-//!   and one that publishes none (in force only for a request that names it);
+//!   that prompted this suite did not cite;
 //! * the value and the request form: the including value, the excluding value, the property
 //!   named alone, named beside every sibling property of its table, and named by no request
 //!   at all;
 //! * the reading: `GetTable`'s reported schema and the columns a `CreateExport` query
 //!   statement may name;
-//! * and — read off the published descriptions rather than a list written here — every
-//!   property the catalog advertises as including columns, so a property added later is
-//!   covered too.
+//! * and — read off the catalog's own gating rather than a list written here — every
+//!   property any column is gated on, so a gate added later is covered too.
 //!
 //! The router, the request signing and the export-definition helpers come from the
 //! `export_lifecycle` and `query_column_selection` suites of this same test target.
@@ -53,17 +50,13 @@ type IncludedColumnList = &'static [(&'static str, &'static str)];
 /// columns it includes with the kind of data each stores.
 ///
 /// SOURCE: the AWS Data Exports table dictionary, which `ListTables` mirrors and `GetTable`
-/// reports. Each property's own published description says what it includes — "Whether IAM
-/// principal columns should be included or not", "Whether to include resource IDs on line
-/// items", "Whether to include fission columns" — and the columns below are the ones that
-/// text names. The resource-ID and fission rows are entries the issue that prompted this
-/// suite did not cite.
+/// reports. Each property's own published description says what it includes — "Whether to
+/// include resource IDs on line items", "Whether to include fission columns" — and the
+/// columns below are the ones the recorded schema carries only at the including value. A
+/// property that changes the DATA in the rows rather than the column set (the IAM principal
+/// data, the capacity reservation data, the billing view) is no row here: the recorded
+/// schema carries the same columns at either value of it.
 const INCLUDED_COLUMNS: &[(&str, &str, IncludedColumnList)] = &[
-    (
-        COST_AND_USAGE_REPORT,
-        "INCLUDE_IAM_PRINCIPAL_DATA",
-        &[("line_item_user_identifier", "String")],
-    ),
     (
         COST_AND_USAGE_REPORT,
         "INCLUDE_RESOURCES",
@@ -87,10 +80,6 @@ const INCLUDED_COLUMNS: &[(&str, &str, IncludedColumnList)] = &[
         ],
     ),
 ];
-
-/// The word a published `TablePropertyDescription` uses for what a schema is made of, which
-/// is how a property says it selects columns rather than data.
-const COLUMNS_IN_A_DESCRIPTION: &str = "column";
 
 /// The `(Name, Type)` of each column `GetTable` reports for `table` under `properties`, in
 /// the order the response lists them.
@@ -249,39 +238,41 @@ async fn a_property_selects_exactly_the_columns_it_includes() {
     }
 }
 
-/// RULE, read off the PUBLISHED descriptions rather than a list written here: every property
-/// the catalog advertises as including columns includes at least one, so a property whose
-/// description promises columns can never be a configuration that changes nothing.
+/// RULE, read off the catalog's OWN gating rather than a list written here: every property
+/// that gates a column of a published table is a property that table publishes, whose
+/// published values switch it, and switching it really does change the reported schema — so
+/// every gated column is reachable through a configuration a client can send, and a gate on
+/// a property no table publishes cannot hide a column for good.
+///
+/// The converse does NOT hold and is not asserted: a property published as including
+/// something can include it in the DATA the rows carry rather than in the column set (the
+/// IAM principal data), and the recorded schema then carries the same columns at either
+/// value of it.
 #[tokio::test]
-async fn every_property_advertised_as_including_columns_includes_some() {
+async fn every_property_that_gates_a_column_advertises_and_selects_it() {
     let client = Client::new();
     let mut checked = 0usize;
 
     for table in TABLE_CATALOG {
-        for property in table.properties {
-            let advertises_columns = property
-                .description
-                .to_ascii_lowercase()
-                .contains(COLUMNS_IN_A_DESCRIPTION);
-            let switchable = property.valid_values.contains(&PROPERTY_TRUE)
-                && property.valid_values.contains(&PROPERTY_FALSE);
-            if !advertises_columns || !switchable {
-                continue;
-            }
+        let gating: BTreeSet<&str> = table
+            .columns()
+            .filter_map(|column| column.requires.map(|(property, _)| property))
+            .collect();
+        for property in gating {
+            let case = format!("{}/{}", table.name, property);
+            let published = table.property(property).unwrap_or_else(|| {
+                panic!("case {case:?}: a column's gate must be a property the table publishes")
+            });
+            assert!(
+                published.valid_values.contains(&PROPERTY_TRUE)
+                    && published.valid_values.contains(&PROPERTY_FALSE),
+                "case {case:?}: a column-selecting property publishes the values that switch it, got {:?}",
+                published.valid_values
+            );
             checked += 1;
-            let case = format!("{}/{}", table.name, property.name);
-            let with = schema(
-                &client,
-                table.name,
-                Some(json!({ property.name: PROPERTY_TRUE })),
-            )
-            .await;
-            let without = schema(
-                &client,
-                table.name,
-                Some(json!({ property.name: PROPERTY_FALSE })),
-            )
-            .await;
+            let with = schema(&client, table.name, Some(json!({ property: PROPERTY_TRUE }))).await;
+            let without =
+                schema(&client, table.name, Some(json!({ property: PROPERTY_FALSE }))).await;
             let added: Vec<&str> = with
                 .iter()
                 .map(|(name, _)| name.as_str())
@@ -289,8 +280,8 @@ async fn every_property_advertised_as_including_columns_includes_some() {
                 .collect();
             assert!(
                 !added.is_empty(),
-                "case {case:?}: the property publishes {:?}, so it must include at least one column, got the same {} columns either way",
-                property.description,
+                "case {case:?}: the property publishes {:?}, so switching it must change the column set, got the same {} columns either way",
+                published.description,
                 with.len()
             );
         }
@@ -298,7 +289,7 @@ async fn every_property_advertised_as_including_columns_includes_some() {
 
     assert!(
         checked > 0,
-        "case \"advertised columns\": the catalog publishes at least one property that advertises columns"
+        "case \"gated columns\": the catalog gates at least one column on a table property"
     );
 }
 

@@ -26,12 +26,12 @@
 //! The column TYPE vocabulary is the dictionary's: a column's `Type` names the KIND of
 //! data the column stores ("The kind of data a column stores" — smithy_query shape
 //! `Column`, member `Type`) in the dictionary's own mixed-case words — `String`,
-//! `Number`, `Double`, `Integer`, `Timestamp`, `Boolean`, `Map`, `Map<String, String>` —
+//! `Number`, `Double`, `Int`, `Timestamp`, `Boolean`, `Map`, `Map<String, String>` —
 //! never an upper-cased storage-engine spelling such as `STRING` or `MAP<STRING,STRING>`,
 //! which the catalog does not publish. The vocabulary is PER SCHEMA, not per kind of
 //! value: the cost and usage dictionary measures costs with `Number` while the
 //! recommendations and carbon emissions dictionaries measure theirs with `Double`; the
-//! recommendations dictionary counts a whole number of days with `Integer` and publishes
+//! recommendations dictionary counts a whole number of days with `Int` and publishes
 //! its key-value column with the PARAMETERISED map token that names the key and value
 //! types — so each table below carries the token ITS dictionary publishes rather than one
 //! token chosen for every numeric or key-value column of the catalog.
@@ -78,8 +78,10 @@ const MAP: &str = "Map";
 /// definition needs those two types to materialise the column it will receive.
 const MAP_OF_STRING_TO_STRING: &str = "Map<String, String>";
 /// A column's `Type` for a whole-number count — the recommendations dictionary's lookback
-/// period, counted in days.
-const INTEGER: &str = "Integer";
+/// period, counted in days. The token is the one THAT dictionary publishes for a whole
+/// number, which is not the spelling a storage engine or another dictionary would use for
+/// the same kind of value.
+const INT: &str = "Int";
 
 /// The value a boolean-valued table property takes to switch its data or columns ON.
 pub const PROPERTY_TRUE: &str = "TRUE";
@@ -533,13 +535,13 @@ fn invalid_table_property_value(
 /// publishes them.
 ///
 /// Not every property gates a column: INCLUDE_CAPACITY_RESERVATION_DATA,
-/// INCLUDE_MANUAL_DISCOUNT_COMPATIBILITY and BILLING_VIEW_ARN change the DATA the table
-/// reports (which reservations are covered, how discounts are expressed, which billing
-/// view the data is scoped to) rather than the set of columns, and the recorded AWS
-/// schema carries the same columns at either value of each. INCLUDE_RESOURCES,
-/// INCLUDE_SPLIT_COST_ALLOCATION_DATA and INCLUDE_IAM_PRINCIPAL_DATA do gate columns —
-/// each the columns its published description says it includes, which for the last is the
-/// line item's IAM principal column — and TIME_GRANULARITY changes the granularity of the
+/// INCLUDE_MANUAL_DISCOUNT_COMPATIBILITY, INCLUDE_IAM_PRINCIPAL_DATA and BILLING_VIEW_ARN
+/// change the DATA the table reports (which reservations are covered, how discounts are
+/// expressed, whether the rows carry the principal that made the request, which billing
+/// view the data is scoped to) rather than the set of columns, and the recorded AWS schema
+/// carries the same columns at either value of each. INCLUDE_RESOURCES and
+/// INCLUDE_SPLIT_COST_ALLOCATION_DATA do gate columns — each the columns its published
+/// description says it includes — and TIME_GRANULARITY changes the granularity of the
 /// rows.
 const COST_AND_USAGE_REPORT_PROPERTIES: &[TablePropertySpec] = &[
     TIME_GRANULARITY_PROPERTY,
@@ -648,8 +650,29 @@ const TIME_GRANULARITY_PROPERTY: TablePropertySpec = TablePropertySpec {
 // Columns
 // ---------------------------------------------------------------------------
 
+/// The text the dictionary publishes for a REGION CODE column: what a Region is, that the
+/// code is the name of an AWS Region, and an example of one. Both the carbon emissions and
+/// the cost and usage dictionaries publish this entry for their Region code column, so it
+/// is written once and named by each.
+const REGION_CODE_DESCRIPTION: &str = "A Region is a physical location around the world where data centers are clustered. AWS calls each group of logical data centers an Availability Zone (AZ). Each AWS Region consists of multiple, isolated, and physically separate AZs within a geographical area. The Region code attribute has the same name as an AWS Region, and specifies where the AWS service is available. For example, us-east-1.";
+
+/// The text the dictionary publishes for the code of the PRODUCT a row measures, with its
+/// example. The carbon emissions dictionary publishes it for its product code column and
+/// the FOCUS schemas publish it for the AWS extension that exposes that column, so it is
+/// written once and named by each rather than copied.
+const PRODUCT_CODE_DESCRIPTION: &str = "The code of the product measured. For example, Amazon EC2 is the product code for Amazon Elastic Compute Cloud.";
+
+/// The text the dictionary publishes for the SELLER of a product or service, with the
+/// clause on third-party AWS Marketplace transactions. The cost and usage dictionary
+/// publishes it for its own legal-entity column and the dashboard view for its curated one.
+const LEGAL_ENTITY_DESCRIPTION: &str = "The Seller of Record of a specific product or service. In most cases, the invoicing entity and legal entity are the same. The values might differ for third-party AWS Marketplace transactions.";
+
 /// The columns of `CARBON_EMISSIONS`, in the dictionary's order. Every emissions measure
 /// is published as a `Double` value beside the `String` unit it is measured in.
+///
+/// The dictionary publishes the supported unit of measurement with the unit column of a
+/// measure that totals EVERY scope, and publishes a per-scope measure's unit column as the
+/// unit used for that scope's emissions alone.
 const CARBON_EMISSIONS_COLUMNS: &[ColumnSpec] = &[
     col(
         "payer_account_id",
@@ -681,23 +704,19 @@ const CARBON_EMISSIONS_COLUMNS: &[ColumnSpec] = &[
         STRING,
         "The version of the model that was used to generate the carbon footprint value.",
     ),
-    col(
-        "product_code",
-        STRING,
-        "The code of the product measured. For example, Amazon EC2 is the product code for Amazon Elastic Compute Cloud.",
-    ),
+    col("product_code", STRING, PRODUCT_CODE_DESCRIPTION),
     // The Region the usage originated in, published as a code and — in `location` — as the
     // human-readable place that code stands for, which is why `location` names
     // `region_code` in its own text.
     col(
         "region_code",
         STRING,
-        "A Region is a physical location around the world where data centers are clustered. AWS calls each group of logical data centers an Availability Zone (AZ). Each AWS Region consists of multiple, isolated, and physically separate AZs within a geographic area. The Region code attribute specifies where the AWS service is available. For example, us-east-1.",
+        REGION_CODE_DESCRIPTION,
     ),
     col(
         "location",
         STRING,
-        "Describes the human-readable location where the usage originated from, corresponding to the region_code. For example, US East (N. Virginia).",
+        "Describes the human-readable location where the usage originated from, corresponding to the region_code. For example, US East (N. Virginia). Emissions from Global Services, such as Amazon CloudFront, are reported under Global.",
     ),
     // The emissions MEASURES. Each one is reported as a value and the unit that value is
     // measured in, rather than as a single column in an assumed unit: the table publishes
@@ -711,7 +730,7 @@ const CARBON_EMISSIONS_COLUMNS: &[ColumnSpec] = &[
     col(
         "total_lbm_emissions_unit",
         STRING,
-        "The unit of measurement for the total estimated location-based method (LBM) emissions value. The unit we currently support is metric tons of carbon dioxide-equivalent (MTCO2e).",
+        "The unit of measure used for location-based method (LBM) emissions. The unit we currently support is metric tons of carbon dioxide-equivalent (MTCO2e).",
     ),
     col(
         "total_mbm_emissions_value",
@@ -721,57 +740,57 @@ const CARBON_EMISSIONS_COLUMNS: &[ColumnSpec] = &[
     col(
         "total_mbm_emissions_unit",
         STRING,
-        "The unit of measurement for the total estimated market-based method (MBM) emissions value. The unit we currently support is metric tons of carbon dioxide-equivalent (MTCO2e).",
+        "The unit of measure used for market-based method (MBM) emissions. The unit we currently support is metric tons of carbon dioxide-equivalent (MTCO2e).",
     ),
     col(
         "total_scope_1_emissions_value",
         DOUBLE,
-        "The total estimated Scope 1 emissions value associated with the account.",
+        "The Scope 1 emissions value associated with the account.",
     ),
     col(
         "total_scope_1_emissions_unit",
         STRING,
-        "The unit of measurement for the total estimated Scope 1 emissions value. The unit we currently support is metric tons of carbon dioxide-equivalent (MTCO2e).",
+        "The unit of measure used for Scope 1 emissions.",
     ),
     col(
         "total_scope_2_lbm_emissions_value",
         DOUBLE,
-        "The total estimated Scope 2 location-based method (LBM) emissions value associated with the account.",
+        "The Scope 2 location-based method (LBM) emissions value associated with the account.",
     ),
     col(
         "total_scope_2_lbm_emissions_unit",
         STRING,
-        "The unit of measurement for the total estimated Scope 2 location-based method (LBM) emissions value. The unit we currently support is metric tons of carbon dioxide-equivalent (MTCO2e).",
+        "The unit of measure used for Scope 2 location-based method (LBM) emissions.",
     ),
     col(
         "total_scope_2_mbm_emissions_value",
         DOUBLE,
-        "The total estimated Scope 2 market-based method (MBM) emissions value associated with the account.",
+        "The Scope 2 market-based method (MBM) emissions value associated with the account.",
     ),
     col(
         "total_scope_2_mbm_emissions_unit",
         STRING,
-        "The unit of measurement for the total estimated Scope 2 market-based method (MBM) emissions value. The unit we currently support is metric tons of carbon dioxide-equivalent (MTCO2e).",
+        "The unit of measure used for Scope 2 market-based method (MBM) emissions.",
     ),
     col(
         "total_scope_3_lbm_emissions_value",
         DOUBLE,
-        "The total estimated Scope 3 location-based method (LBM) emissions value associated with the account.",
+        "The Scope 3 location-based method (LBM) emissions value associated with the account.",
     ),
     col(
         "total_scope_3_lbm_emissions_unit",
         STRING,
-        "The unit of measurement for the total estimated Scope 3 location-based method (LBM) emissions value. The unit we currently support is metric tons of carbon dioxide-equivalent (MTCO2e).",
+        "The unit of measure used for Scope 3 location-based method (LBM) emissions.",
     ),
     col(
         "total_scope_3_mbm_emissions_value",
         DOUBLE,
-        "The total estimated Scope 3 market-based method (MBM) emissions value associated with the account.",
+        "The Scope 3 market-based method (MBM) emissions value associated with the account.",
     ),
     col(
         "total_scope_3_mbm_emissions_unit",
         STRING,
-        "The unit of measurement for the total estimated Scope 3 market-based method (MBM) emissions value. The unit we currently support is metric tons of carbon dioxide-equivalent (MTCO2e).",
+        "The unit of measure used for Scope 3 market-based method (MBM) emissions.",
     ),
 ];
 
@@ -875,7 +894,7 @@ const COST_AND_USAGE_REPORT_COLUMNS: &[ColumnSpec] = &[
     col(
         "line_item_legal_entity",
         STRING,
-        "The Seller of Record of a specific product or service.",
+        LEGAL_ENTITY_DESCRIPTION,
     ),
     col(
         "line_item_line_item_description",
@@ -941,7 +960,7 @@ const COST_AND_USAGE_REPORT_COLUMNS: &[ColumnSpec] = &[
     col(
         "line_item_unblended_rate",
         STRING,
-        "In consolidated billing for accounts using AWS Organizations, the unblended rate is the rate associated with an individual account's service usage.\nFor Amazon EC2 and Amazon RDS line items that have an RI discount applied to them, the UnblendedRate is zero. Line items with an RI discount have a LineItemType of DiscountedUsage.",
+        "In consolidated billing for accounts using AWS Organizations, the unblended rate is the rate associated with an individual account's service usage.\n\nFor Amazon EC2 and Amazon RDS line items that have an RI discount applied to them, the UnblendedRate is zero. Line items with an RI discount have a LineItemType of DiscountedUsage.",
     ),
     col(
         "line_item_usage_account_id",
@@ -973,17 +992,15 @@ const COST_AND_USAGE_REPORT_COLUMNS: &[ColumnSpec] = &[
         STRING,
         "The usage details of the line item.",
     ),
-    // The IAM PRINCIPAL column of the line item, which the table carries only while
-    // INCLUDE_IAM_PRINCIPAL_DATA is TRUE: the property's published description is "Whether
-    // IAM principal columns should be included or not", so it selects a column set exactly
-    // as INCLUDE_RESOURCES and INCLUDE_SPLIT_COST_ALLOCATION_DATA do, and the table
-    // publishes no other column the dictionary describes as the IAM principal's.
-    col_when(
+    // The IAM PRINCIPAL column of the line item, which the dictionary publishes in EVERY
+    // schema of this table: the recorded schema carries it for a request that names no
+    // table property, so it is not a column INCLUDE_IAM_PRINCIPAL_DATA selects — that
+    // property changes the principal DATA the rows carry, not whether a client can discover
+    // and ask for the column.
+    col(
         "line_item_user_identifier",
         STRING,
-        "The unique identifier of the IAM principal that made the request that generated this line item.",
-        PROPERTY_INCLUDE_IAM_PRINCIPAL_DATA,
-        PROPERTY_TRUE,
+        "The unique identifier for the user that is responsible for this usage line item",
     ),
     col(
         "pricing_currency",
@@ -1045,11 +1062,7 @@ const COST_AND_USAGE_REPORT_COLUMNS: &[ColumnSpec] = &[
         STRING,
         "A comment regarding the product.",
     ),
-    col(
-        "product_fee_code",
-        STRING,
-        "Describes the fee code of the product.",
-    ),
+    col("product_fee_code", STRING, "The code that refers to the fee."),
     col(
         "product_fee_description",
         STRING,
@@ -1113,11 +1126,7 @@ const COST_AND_USAGE_REPORT_COLUMNS: &[ColumnSpec] = &[
     // The Region a resource resides in, published with the dictionary's whole
     // Region/Availability-Zone explanation — the same explanation the carbon emissions
     // dictionary publishes its Region code with.
-    col(
-        "product_region_code",
-        STRING,
-        "A Region is a physical location around the world where data centers are clustered. AWS calls each group of logical data centers an Availability Zone (AZ). Each AWS Region consists of multiple, isolated, and physically separate AZs within a geographic area. The Region code attribute specifies where the AWS service is available. For example, us-east-1.",
-    ),
+    col("product_region_code", STRING, REGION_CODE_DESCRIPTION),
     col(
         "product_servicecode",
         STRING,
@@ -1126,12 +1135,12 @@ const COST_AND_USAGE_REPORT_COLUMNS: &[ColumnSpec] = &[
     col(
         "product_sku",
         STRING,
-        "Describes a unique code for a product. The SKU is created by combining the ProductCode, UsageType, and Operation.",
+        "A unique code for a product. The SKU is created by combining the ProductCode, UsageType, and Operation. For size-flexible RIs, the SKU uses the instance that was used.",
     ),
     col(
         "product_to_location",
         STRING,
-        "Describes the location of the Region where the usage is sent to.",
+        "Describes the location where the usage is sent to.",
     ),
     col(
         "product_to_location_type",
@@ -1146,7 +1155,7 @@ const COST_AND_USAGE_REPORT_COLUMNS: &[ColumnSpec] = &[
     col(
         "product_usagetype",
         STRING,
-        "Describes the usage type of the product.",
+        "Describes the usage details of the line item.",
     ),
     // The reservation family, published in the dictionary's own abbreviation for a
     // Reserved Instance — "RI" — and, for a NET column, as the AFTER-DISCOUNT amount of
@@ -1465,7 +1474,7 @@ const COST_AND_USAGE_REPORT_COLUMNS: &[ColumnSpec] = &[
 
 /// The columns of `COST_OPTIMIZATION_RECOMMENDATIONS`, in the dictionary's order. This
 /// dictionary publishes its money and percentage columns as `Double`, the lookback day
-/// count as `Integer`, and the resource's tags as a key-value `Map<String, String>`.
+/// count as `Int`, and the resource's tags as a key-value `Map<String, String>`.
 const COST_OPTIMIZATION_RECOMMENDATIONS_COLUMNS: &[ColumnSpec] = &[
     col(
         "account_id",
@@ -1525,12 +1534,12 @@ const COST_OPTIMIZATION_RECOMMENDATIONS_COLUMNS: &[ColumnSpec] = &[
     col(
         "estimated_savings_percentage_after_discount",
         DOUBLE,
-        "The estimated savings percentage after discounts, relative to the total cost over the cost calculation lookback period.",
+        "The estimated savings percentage after discounts relative to the total cost over the cost calculation lookback period.",
     ),
     col(
         "estimated_savings_percentage_before_discount",
         DOUBLE,
-        "The estimated savings percentage before discounts, relative to the total cost over the cost calculation lookback period.",
+        "The estimated savings percentage before discounts relative to the total cost over the cost calculation lookback period.",
     ),
     col(
         "implementation_effort",
@@ -1540,7 +1549,7 @@ const COST_OPTIMIZATION_RECOMMENDATIONS_COLUMNS: &[ColumnSpec] = &[
     col(
         "last_refresh_timestamp",
         TIMESTAMP,
-        "The time when the recommendation was last generated, in UTC. The format is YYYY-MM-DDTHH:mm:ssZ.",
+        "The time when the recommendation was last generated.",
     ),
     col("recommendation_id", STRING, "The ID for the recommendation."),
     col(
@@ -1548,8 +1557,8 @@ const COST_OPTIMIZATION_RECOMMENDATIONS_COLUMNS: &[ColumnSpec] = &[
         // A whole number of days, which this dictionary counts with its own integer token
         // rather than with the floating-point token it measures money and percentages
         // with.
-        INTEGER,
-        "The lookback period in days, used to calculate the savings.",
+        INT,
+        "The lookback period that's used to generate the recommendation.",
     ),
     col(
         "recommendation_source",
@@ -1893,7 +1902,7 @@ const FOCUS_1_2_REVISED_DESCRIPTIONS: &[(&str, &str)] = &[
     ),
     (
         "ConsumedUnit",
-        "The provider-specified measurement unit indicating how a provider measures usage of a metered SKU associated with a resource or service.",
+        "Provider-specified measurement unit indicating how a provider measures usage of a metered SKU associated with a resource or service.",
     ),
     (
         "ContractedUnitPrice",
@@ -1947,32 +1956,32 @@ const FOCUS_1_2_ADDED_COLUMNS: &[ColumnSpec] = &[
     col(
         "PricingCurrency",
         STRING,
-        "Represents the currency that a charge was priced in.",
+        "The national or virtual currency denomination that a resource or service was priced in.",
     ),
     col(
         "PricingCurrencyContractedUnitPrice",
         NUMBER,
-        "The contracted unit price for a single Pricing Unit of the associated SKU, denominated in the pricing currency.",
+        "The agreed-upon unit price for a single Pricing Unit of the associated SKU, inclusive of negotiated discounts, if present, while excluding negotiated commitment discounts or any other discounts, and expressed in Pricing Currency.",
     ),
     col(
         "PricingCurrencyEffectiveCost",
         NUMBER,
-        "The effective cost of a charge, denominated in the pricing currency.",
+        "The cost of the charge after applying all reduced rates, discounts, and the applicable portion of relevant, prepaid purchases (one-time or recurring) that covered this charge, as denominated in Pricing Currency.",
     ),
     col(
         "PricingCurrencyListUnitPrice",
         NUMBER,
-        "The list unit price for a single Pricing Unit of the associated SKU, denominated in the pricing currency.",
+        "The suggested provider-published unit price for a single Pricing Unit of the associated SKU, exclusive of any discounts and expressed in Pricing Currency.",
     ),
     col(
         "ServiceSubcategory",
         STRING,
-        "Secondary classification of the Service Category for a service.",
+        "Secondary classification of the Service Category for a service based on its core function.",
     ),
     col(
         "SkuMeter",
         STRING,
-        "A provider-specified description of the functionality or capability that a SKU measures.",
+        "Provider-specified description of the functionality or capability that a SKU measures.",
     ),
     col(
         "SkuPriceDetails",
@@ -1982,7 +1991,7 @@ const FOCUS_1_2_ADDED_COLUMNS: &[ColumnSpec] = &[
     col(
         "SubAccountType",
         STRING,
-        "The provider-assigned name that identifies the type of a sub account.",
+        "A provider-assigned name to identify the type of a sub account.",
     ),
 ];
 
@@ -2006,11 +2015,7 @@ const FOCUS_AWS_EXTENSION_COLUMNS: &[ColumnSpec] = &[
         STRING,
         "The specific AWS operation covered by this line item. This describes the specific usage of the line item. For example, a value of RunInstances indicates the operation of an Amazon EC2 instance.",
     ),
-    col(
-        "x_ServiceCode",
-        STRING,
-        "This identifies the specific AWS service to the customer as a unique short abbreviation.",
-    ),
+    col("x_ServiceCode", STRING, PRODUCT_CODE_DESCRIPTION),
     col(
         "x_UsageType",
         STRING,
@@ -2072,7 +2077,7 @@ const COST_AND_USAGE_DASHBOARD_COLUMNS: &[ColumnSpec] = &[
     col(
         "linked_account_name",
         STRING,
-        "The account name of the account that used this line item. For organizations, this can be either the management account or a member account. You can use this field to track costs or usage by account.",
+        "The name of the account that used this line item. For organizations, this can be either the management account or a member account. You can use this field to track costs or usage by account.",
     ),
     col(
         "invoice_id",
@@ -2094,14 +2099,10 @@ const COST_AND_USAGE_DASHBOARD_COLUMNS: &[ColumnSpec] = &[
         STRING,
         "Helps you identify whether your invoices or transactions are for AWS Marketplace or for purchases of other AWS services.",
     ),
-    // The seller of a product, which the VIEW words in lower case while the cost and usage
-    // dictionary capitalises the term on its own `line_item_legal_entity` column: the two
-    // dictionaries word the same fact their own way, which is why this is not shared text.
-    col(
-        "legal_entity",
-        STRING,
-        "The seller of record of a specific product or service.",
-    ),
+    // The seller of a product, published with the whole entry the dictionary gives it — the
+    // same entry the cost and usage dictionary publishes on its own `line_item_legal_entity`
+    // column.
+    col("legal_entity", STRING, LEGAL_ENTITY_DESCRIPTION),
     col(
         "service",
         STRING,
@@ -2125,7 +2126,7 @@ const COST_AND_USAGE_DASHBOARD_COLUMNS: &[ColumnSpec] = &[
     col(
         "product_group",
         STRING,
-        "The group of the product that the line item applies to.",
+        "A construct of several products that are similar by definition, or grouped together.",
     ),
     col(
         "operation",
@@ -2157,12 +2158,12 @@ const COST_AND_USAGE_DASHBOARD_COLUMNS: &[ColumnSpec] = &[
         STRING,
         "Describes the instance type, size, and family, which define the CPU, networking, and storage capacity of your instance.",
     ),
-    // The INSTANCE dimensions of the aggregated line item, each published as a property of
-    // the instance the usage is for.
+    // The INSTANCE dimensions of the aggregated line item, each published as the dictionary
+    // publishes that attribute of the instance the usage is for.
     col(
         "instance_type_family",
         STRING,
-        "The instance family of the instance type that is associated with the usage.",
+        "The instance family that is associated with the given usage.",
     ),
     col(
         "current_generation",
@@ -2172,32 +2173,31 @@ const COST_AND_USAGE_DASHBOARD_COLUMNS: &[ColumnSpec] = &[
     col(
         "platform",
         STRING,
-        "The operating system of the instance that is associated with the usage.",
+        "Describes the operating system of your Amazon EC2 instance.",
     ),
     col(
         "processor",
         STRING,
-        "The physical processor of the instance that is associated with the usage.",
+        "Describes the processor on your Amazon EC2 instance.",
     ),
     col(
         "processor_features",
         STRING,
-        "The features of the physical processor of the instance that is associated with the usage.",
+        "Describes the processor features of your instances.",
     ),
     col(
         "database_engine",
         STRING,
-        "The database engine that is running on the instance that is associated with the usage.",
+        "Describes the database engine for your instance.",
     ),
-    // The view's enumerated dimensions are published in the dictionary's own "possible
-    // values are …" form, run on from the sentence without a break, as `charge_category`
-    // and `purchase_option` are published above: the form is the dictionary's, not a
-    // missing full stop.
     col(
         "tenancy",
         STRING,
-        "The tenancy of the instance possible values are Shared, Dedicated, and Host.",
+        "The type of tenancy allowed on the Amazon EC2 instance.",
     ),
+    // The view's enumerated dimensions are published in the dictionary's own "possible
+    // values are …" form, run on from the sentence without a break, as `charge_category` is
+    // published: the form is the dictionary's, not a missing full stop.
     col(
         "purchase_option",
         STRING,

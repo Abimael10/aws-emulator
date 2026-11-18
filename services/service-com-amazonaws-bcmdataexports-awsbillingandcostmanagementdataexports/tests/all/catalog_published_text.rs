@@ -37,6 +37,14 @@
 //!    over a table spanning every schema and its column families, and as invariants over
 //!    EVERY column of EVERY table — no description in the catalog's own "a map column
 //!    containing …" voice, no upper-cased storage-engine token.
+//! 5. Carried over whole includes the dictionary's PARAGRAPH BREAKS: an entry published as
+//!    several paragraphs keeps the blank line between them, and no published description
+//!    carries a line break that is not part of such a break.
+//! 6. The column SET is published data too: a column the dictionary publishes is reported
+//!    for every configuration of its table that does not gate it, and a column a schema
+//!    reports is one a submitted query may name.
+//! 7. Where the dictionary publishes ONE entry for a column of several tables or schema
+//!    versions, every one of them reports that entry.
 //!
 //! Every literal expectation below cites its source: the AWS Data Exports table
 //! dictionary, as recorded on the wire for `GetTable` / `ListTables`. The router, the
@@ -48,8 +56,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde_json::{json, Value};
 
 use service_com_amazonaws_bcmdataexports_awsbillingandcostmanagementdataexports::state::{
-    PROPERTY_ANY_VALUE, PROPERTY_INCLUDE_RESOURCES, PROPERTY_INCLUDE_SPLIT_COST_ALLOCATION_DATA,
-    PROPERTY_TRUE,
+    PROPERTY_ANY_VALUE, PROPERTY_FALSE, PROPERTY_INCLUDE_IAM_PRINCIPAL_DATA,
+    PROPERTY_INCLUDE_RESOURCES, PROPERTY_INCLUDE_SPLIT_COST_ALLOCATION_DATA,
+    PROPERTY_TIME_GRANULARITY, PROPERTY_TRUE,
 };
 
 /// The table names, the reader of a reported schema and the published sentences the
@@ -59,6 +68,13 @@ use super::catalog_schema_versions::{
     FOCUS_1_2, PUBLISHED_DESCRIPTIONS as VERSIONED_SENTENCES, RECOMMENDATIONS,
 };
 use super::export_lifecycle::{error_code, Client};
+/// The export definition a round trip submits, the refusal reader for a column no table
+/// publishes and the name of such a column come from the suite that already writes them
+/// down, so a published column is proven selectable through the SAME definition an
+/// unpublished one is refused through.
+use super::query_column_selection::{
+    assert_column_refused, export_body, export_name, UNPUBLISHED_COLUMN,
+};
 
 /// `(table, column, the Description the dictionary publishes for it)`.
 ///
@@ -625,12 +641,17 @@ const PUBLISHED_SENTENCES: &[(&str, &str, &str)] = &[
     (
         CARBON_EMISSIONS,
         "total_lbm_emissions_unit",
-        "The unit of measurement for the total estimated location-based method (LBM) emissions value. The unit we currently support is metric tons of carbon dioxide-equivalent (MTCO2e).",
+        "The unit of measure used for location-based method (LBM) emissions. The unit we currently support is metric tons of carbon dioxide-equivalent (MTCO2e).",
     ),
     (
         CARBON_EMISSIONS,
         "total_scope_3_mbm_emissions_value",
-        "The total estimated Scope 3 market-based method (MBM) emissions value associated with the account.",
+        "The Scope 3 market-based method (MBM) emissions value associated with the account.",
+    ),
+    (
+        CARBON_EMISSIONS,
+        "total_scope_3_mbm_emissions_unit",
+        "The unit of measure used for Scope 3 market-based method (MBM) emissions.",
     ),
     // The cost and usage table: the paying account and the using account, each with the
     // dictionary's own clause on what the column is for …
@@ -709,7 +730,7 @@ const PUBLISHED_SENTENCES: &[(&str, &str, &str)] = &[
     (
         COST_AND_USAGE_REPORT,
         "product_region_code",
-        "A Region is a physical location around the world where data centers are clustered. AWS calls each group of logical data centers an Availability Zone (AZ). Each AWS Region consists of multiple, isolated, and physically separate AZs within a geographic area. The Region code attribute specifies where the AWS service is available. For example, us-east-1.",
+        "A Region is a physical location around the world where data centers are clustered. AWS calls each group of logical data centers an Availability Zone (AZ). Each AWS Region consists of multiple, isolated, and physically separate AZs within a geographical area. The Region code attribute has the same name as an AWS Region, and specifies where the AWS service is available. For example, us-east-1.",
     ),
     (
         COST_AND_USAGE_REPORT,
@@ -742,7 +763,7 @@ const PUBLISHED_SENTENCES: &[(&str, &str, &str)] = &[
     (
         DASHBOARD,
         "linked_account_name",
-        "The account name of the account that used this line item. For organizations, this can be either the management account or a member account. You can use this field to track costs or usage by account.",
+        "The name of the account that used this line item. For organizations, this can be either the management account or a member account. You can use this field to track costs or usage by account.",
     ),
     (
         DASHBOARD,
@@ -812,22 +833,22 @@ const PUBLISHED_SENTENCES: &[(&str, &str, &str)] = &[
     (
         RECOMMENDATIONS,
         "estimated_savings_percentage_before_discount",
-        "The estimated savings percentage before discounts, relative to the total cost over the cost calculation lookback period.",
+        "The estimated savings percentage before discounts relative to the total cost over the cost calculation lookback period.",
     ),
     (
         RECOMMENDATIONS,
         "estimated_savings_percentage_after_discount",
-        "The estimated savings percentage after discounts, relative to the total cost over the cost calculation lookback period.",
+        "The estimated savings percentage after discounts relative to the total cost over the cost calculation lookback period.",
     ),
     (
         RECOMMENDATIONS,
         "recommendation_lookback_period_in_days",
-        "The lookback period in days, used to calculate the savings.",
+        "The lookback period that's used to generate the recommendation.",
     ),
     (
         RECOMMENDATIONS,
         "last_refresh_timestamp",
-        "The time when the recommendation was last generated, in UTC. The format is YYYY-MM-DDTHH:mm:ssZ.",
+        "The time when the recommendation was last generated.",
     ),
     (
         RECOMMENDATIONS,
@@ -885,7 +906,7 @@ const PUBLISHED_SENTENCES: &[(&str, &str, &str)] = &[
     (
         FOCUS_1_0,
         "x_ServiceCode",
-        "This identifies the specific AWS service to the customer as a unique short abbreviation.",
+        "The code of the product measured. For example, Amazon EC2 is the product code for Amazon Elastic Compute Cloud.",
     ),
     (
         FOCUS_1_0,
@@ -909,7 +930,7 @@ const PUBLISHED_SENTENCES: &[(&str, &str, &str)] = &[
     (
         FOCUS_1_2,
         "ConsumedUnit",
-        "The provider-specified measurement unit indicating how a provider measures usage of a metered SKU associated with a resource or service.",
+        "Provider-specified measurement unit indicating how a provider measures usage of a metered SKU associated with a resource or service.",
     ),
     (
         FOCUS_1_2,
@@ -919,22 +940,22 @@ const PUBLISHED_SENTENCES: &[(&str, &str, &str)] = &[
     (
         FOCUS_1_2,
         "PricingCurrency",
-        "Represents the currency that a charge was priced in.",
+        "The national or virtual currency denomination that a resource or service was priced in.",
     ),
     (
         FOCUS_1_2,
         "PricingCurrencyEffectiveCost",
-        "The effective cost of a charge, denominated in the pricing currency.",
+        "The cost of the charge after applying all reduced rates, discounts, and the applicable portion of relevant, prepaid purchases (one-time or recurring) that covered this charge, as denominated in Pricing Currency.",
     ),
     (
         FOCUS_1_2,
-        "SkuId",
-        "The identifier assigned to a SKU by the provider.",
+        "PricingCurrencyListUnitPrice",
+        "The suggested provider-published unit price for a single Pricing Unit of the associated SKU, exclusive of any discounts and expressed in Pricing Currency.",
     ),
     (
         FOCUS_1_2,
-        "SkuPriceId",
-        "The identifier assigned to a SKU Price by the provider.",
+        "ServiceSubcategory",
+        "Secondary classification of the Service Category for a service based on its core function.",
     ),
     (
         FOCUS_1_2,
@@ -944,37 +965,51 @@ const PUBLISHED_SENTENCES: &[(&str, &str, &str)] = &[
     (
         FOCUS_1_2,
         "SubAccountType",
-        "The provider-assigned name that identifies the type of a sub account.",
+        "A provider-assigned name to identify the type of a sub account.",
     ),
+    // NOT a row yet: the FOCUS 1.2 `SkuId`, `SkuPriceId` and `x_Discounts` entries, and the
+    // dashboard view's own `pricing_unit`, `unblended_cost`, `amortized_cost`,
+    // `current_generation` and `ri_sp_*` entries. The recording the rest of this table is
+    // taken from shows that the catalog's text for them is NOT what the dictionary publishes,
+    // but does not publish the text itself, so a row here would pin a value already known to
+    // be wrong. They stay without an expectation until the published text for them is in
+    // hand.
 ];
 
 /// The emissions the carbon dictionary publishes a measure for, with the words its text
-/// names that measure by (AWS Data Exports table dictionary): a value column names the
-/// method or scope it totals, and its unit column names the same one.
-const EMISSIONS_MEASURE_WORDS: &[(&str, &[&str])] = &[
-    ("total_lbm_emissions", &["location-based method (LBM)"]),
-    ("total_mbm_emissions", &["market-based method (MBM)"]),
-    ("total_scope_1_emissions", &["Scope 1"]),
+/// names that measure by and whether the dictionary publishes the SUPPORTED UNIT with that
+/// measure's unit column (AWS Data Exports table dictionary, as recorded for `GetTable`): a
+/// value column names the method or scope it reports and its unit column names the same
+/// one, and the unit of measurement the dictionary says it supports is published with the
+/// measures that total every scope rather than with a per-scope one.
+const EMISSIONS_MEASURE_WORDS: &[(&str, &[&str], bool)] = &[
+    ("total_lbm_emissions", &["location-based method (LBM)"], true),
+    ("total_mbm_emissions", &["market-based method (MBM)"], true),
+    ("total_scope_1_emissions", &["Scope 1"], false),
     (
         "total_scope_2_lbm_emissions",
         &["Scope 2", "location-based method (LBM)"],
+        false,
     ),
     (
         "total_scope_2_mbm_emissions",
         &["Scope 2", "market-based method (MBM)"],
+        false,
     ),
     (
         "total_scope_3_lbm_emissions",
         &["Scope 3", "location-based method (LBM)"],
+        false,
     ),
     (
         "total_scope_3_mbm_emissions",
         &["Scope 3", "market-based method (MBM)"],
+        false,
     ),
 ];
 
-/// The unit the carbon dictionary says it supports, named by every unit column it
-/// publishes (AWS Data Exports table dictionary).
+/// The unit the carbon dictionary says it supports, published with the unit column of a
+/// measure that totals every scope (AWS Data Exports table dictionary).
 const SUPPORTED_EMISSIONS_UNIT: &str = "metric tons of carbon dioxide-equivalent (MTCO2e)";
 
 /// Wording that belongs to a description OF the catalog rather than to the dictionary's
@@ -1002,7 +1037,7 @@ const TAG_WORDED_COLUMNS: &[(&str, &str, &str)] = &[
 const PARAMETERISED_MAP_TOKEN: &str = "Map<String, String>";
 
 /// The `Type` token the recommendations dictionary counts a whole number of days with.
-const WHOLE_NUMBER_TOKEN: &str = "Integer";
+const WHOLE_NUMBER_TOKEN: &str = "Int";
 
 /// The name part that marks a cost and usage column as the NET of what it measures.
 const NET_COLUMN_MARKER: &str = "_net_";
@@ -1154,14 +1189,16 @@ async fn a_type_token_carries_everything_the_dictionary_publishes_with_it() {
 }
 
 /// RULE, applied to the family the dictionary publishes as value-and-unit pairs: each
-/// measure's value column names the method or scope it totals, and its unit column names
-/// the same one AND the unit of measurement the dictionary says it supports.
+/// measure's value column names the method or scope it reports, its unit column names the
+/// same one, and the unit of measurement the dictionary says it supports is published
+/// exactly where the dictionary publishes it — with the unit column of a measure that
+/// totals every scope, and with no value column at all.
 #[tokio::test]
 async fn an_emissions_measure_names_its_method_and_its_supported_unit() {
     let client = Client::new();
     let schema = descriptions_of(&client, CARBON_EMISSIONS).await;
 
-    for (measure, words) in EMISSIONS_MEASURE_WORDS {
+    for (measure, words, publishes_supported_unit) in EMISSIONS_MEASURE_WORDS {
         for suffix in ["_value", "_unit"] {
             let name = format!("{measure}{suffix}");
             let case = format!("{CARBON_EMISSIONS}.{name}");
@@ -1177,8 +1214,8 @@ async fn an_emissions_measure_names_its_method_and_its_supported_unit() {
             let names_the_unit = description.contains(SUPPORTED_EMISSIONS_UNIT);
             assert_eq!(
                 names_the_unit,
-                suffix == "_unit",
-                "case {case:?}: only a unit column names the supported unit, got {description:?}"
+                suffix == "_unit" && *publishes_supported_unit,
+                "case {case:?}: the supported unit is published exactly where the dictionary publishes it, got {description:?}"
             );
         }
     }
@@ -1239,4 +1276,241 @@ async fn a_net_column_is_published_as_the_after_discount_amount() {
         net_columns > 10,
         "case \"net columns\": the schema publishes a net column per measure it nets, got {net_columns} across the configurations"
     );
+}
+
+/// `(table, column, how many paragraphs the dictionary publishes for it)` for the columns
+/// whose published entry runs to more than one paragraph (AWS Data Exports table
+/// dictionary, as recorded for `GetTable`): the paragraphs are separated by a BLANK LINE,
+/// which is part of the published value.
+const PARAGRAPHED_COLUMNS: &[(&str, &str, usize)] =
+    &[(COST_AND_USAGE_REPORT, "line_item_unblended_rate", 2)];
+
+/// The separator the dictionary publishes BETWEEN two paragraphs of one entry: a blank
+/// line, i.e. two line breaks.
+const PARAGRAPH_SEPARATOR: &str = "\n\n";
+
+/// RULE: a published description is carried over WHOLE, so an entry the dictionary
+/// publishes as several paragraphs keeps the blank line between them — and, over EVERY
+/// column of EVERY table rather than the one the report cited, a line break in a published
+/// description is only ever part of such a paragraph break, never a normalised-away blank
+/// line and never a leading or trailing one.
+#[tokio::test]
+async fn a_published_description_keeps_the_dictionarys_paragraph_breaks() {
+    let client = Client::new();
+
+    for (table, column, paragraphs) in PARAGRAPHED_COLUMNS {
+        let case = format!("{table}.{column}");
+        let described = descriptions_of(&client, table).await;
+        let reported = described
+            .get(*column)
+            .unwrap_or_else(|| panic!("case {case:?}: the table must publish the column"));
+        let published: Vec<&str> = reported.split(PARAGRAPH_SEPARATOR).collect();
+        assert_eq!(
+            published.len(),
+            *paragraphs,
+            "case {case:?}: expected {paragraphs} paragraphs separated by a blank line, got {reported:?}"
+        );
+        for paragraph in &published {
+            assert!(
+                !paragraph.trim().is_empty() && !paragraph.contains('\n'),
+                "case {case:?}: each paragraph is published whole, got {paragraph:?}"
+            );
+        }
+    }
+
+    for table in published_table_names(&client).await {
+        for (name, description) in descriptions_of(&client, &table).await {
+            let case = format!("{table}.{name}");
+            assert!(
+                !description.starts_with('\n') && !description.ends_with('\n'),
+                "case {case:?}: a published description neither opens nor closes with a line break, got {description:?}"
+            );
+            for paragraph in description.split(PARAGRAPH_SEPARATOR) {
+                assert!(
+                    !paragraph.contains('\n'),
+                    "case {case:?}: a line break is published as the blank line between two paragraphs, got {description:?}"
+                );
+            }
+        }
+    }
+}
+
+/// The IAM principal column of the cost and usage table, with the kind of data and the text
+/// the dictionary publishes for it (AWS Data Exports table dictionary, as recorded for
+/// `GetTable`).
+const IAM_PRINCIPAL_COLUMN: (&str, &str, &str) = (
+    "line_item_user_identifier",
+    "String",
+    "The unique identifier for the user that is responsible for this usage line item",
+);
+
+/// The table property whose published description names the IAM principal data, which the
+/// recorded schema carries the column at EITHER value of.
+const IAM_PRINCIPAL_PROPERTY: &str = PROPERTY_INCLUDE_IAM_PRINCIPAL_DATA;
+
+/// RULE: the column SET is part of the published data, so every column the dictionary
+/// publishes for a table is reported for every configuration of that table that does not
+/// gate it — and a column a schema reports is equally a column a submitted query may name.
+/// Asserted over a table of configurations spanning the forms a request takes: naming no
+/// properties at all, an empty map, the property that carries the same data at both its
+/// values, a column-selecting property, and a property that changes the rows' granularity.
+#[tokio::test]
+async fn a_published_column_is_reported_for_every_configuration_that_does_not_gate_it() {
+    let client = Client::new();
+    let (column, data_type, published) = IAM_PRINCIPAL_COLUMN;
+
+    for (label, properties) in [
+        ("no TableProperties", None),
+        ("an empty TableProperties", Some(json!({}))),
+        (
+            "the IAM principal data included",
+            Some(json!({ IAM_PRINCIPAL_PROPERTY: PROPERTY_TRUE })),
+        ),
+        (
+            "the IAM principal data excluded",
+            Some(json!({ IAM_PRINCIPAL_PROPERTY: PROPERTY_FALSE })),
+        ),
+        (
+            "a column-selecting property",
+            Some(json!({ PROPERTY_INCLUDE_RESOURCES: PROPERTY_TRUE })),
+        ),
+        (
+            "another granularity",
+            Some(json!({ PROPERTY_TIME_GRANULARITY: "MONTHLY" })),
+        ),
+    ] {
+        let case = format!("{COST_AND_USAGE_REPORT}.{column} with {label}");
+        let request = match &properties {
+            None => json!({ "TableName": COST_AND_USAGE_REPORT }),
+            Some(properties) => {
+                json!({ "TableName": COST_AND_USAGE_REPORT, "TableProperties": properties })
+            }
+        };
+        let body = client.ok("GetTable", &request).await;
+        let reported = body
+            .get("Schema")
+            .and_then(Value::as_array)
+            .unwrap_or_else(|| panic!("case {case:?}: expected a Schema list, got {body}"))
+            .iter()
+            .find(|candidate| candidate.get("Name").and_then(Value::as_str) == Some(column))
+            .unwrap_or_else(|| panic!("case {case:?}: the published column must be reported"));
+        assert_eq!(
+            reported.get("Type").and_then(Value::as_str),
+            Some(data_type),
+            "case {case:?}: expected the published kind of data {data_type:?}, got {reported}"
+        );
+        assert_eq!(
+            reported.get("Description").and_then(Value::as_str),
+            Some(published),
+            "case {case:?}: expected the dictionary's published description {published:?}, got {reported}"
+        );
+    }
+
+    // And the query half: a column every configuration reports is one a query statement may
+    // name without configuring anything — while a column no configuration publishes is
+    // refused, naming it — so the published set really is the set a query is judged against.
+    let statement = format!("SELECT {column} FROM {COST_AND_USAGE_REPORT}");
+    let created = client
+        .ok(
+            "CreateExport",
+            &json!({
+                "Export": export_body(&export_name("published_principal_column"), &statement, None),
+            }),
+        )
+        .await;
+    let arn = created["ExportArn"]
+        .as_str()
+        .unwrap_or_else(|| panic!("case {column:?}: CreateExport must return an ExportArn"))
+        .to_string();
+    let fetched = client.ok("GetExport", &json!({ "ExportArn": arn })).await;
+    assert_eq!(
+        fetched["Export"]["DataQuery"]["QueryStatement"].as_str(),
+        Some(statement.as_str()),
+        "case {column:?}: the stored definition must carry the statement naming the published column, got {fetched}"
+    );
+
+    let unpublished = format!("SELECT {UNPUBLISHED_COLUMN} FROM {COST_AND_USAGE_REPORT}");
+    let (status, body) = client
+        .call(
+            "CreateExport",
+            &json!({
+                "Export": export_body(
+                    &export_name("unpublished_column"),
+                    &unpublished,
+                    None,
+                ),
+            }),
+        )
+        .await;
+    assert_column_refused(
+        &format!("{COST_AND_USAGE_REPORT} selecting {UNPUBLISHED_COLUMN}"),
+        status,
+        &body,
+        UNPUBLISHED_COLUMN,
+    );
+}
+
+/// `(the dictionary entry, the (table, column) pairs that publish it)`: one entry of the
+/// dictionary published by more than one table or schema version (AWS Data Exports table
+/// dictionary, as recorded for `GetTable`). Rows span an entry two different dictionaries
+/// publish (the Region code), an AWS extension that exposes a line-item column across both
+/// FOCUS versions and the superseded preview table, and two entries the curated view shares
+/// with the table it views.
+const SHARED_DICTIONARY_ENTRIES: &[(&str, &[(&str, &str)])] = &[
+    (
+        "A Region is a physical location around the world where data centers are clustered. AWS calls each group of logical data centers an Availability Zone (AZ). Each AWS Region consists of multiple, isolated, and physically separate AZs within a geographical area. The Region code attribute has the same name as an AWS Region, and specifies where the AWS service is available. For example, us-east-1.",
+        &[
+            (CARBON_EMISSIONS, "region_code"),
+            (COST_AND_USAGE_REPORT, "product_region_code"),
+        ],
+    ),
+    (
+        "The code of the product measured. For example, Amazon EC2 is the product code for Amazon Elastic Compute Cloud.",
+        &[
+            (CARBON_EMISSIONS, "product_code"),
+            (FOCUS_1_0, "x_ServiceCode"),
+            (FOCUS_1_0_PREVIEW, "x_ServiceCode"),
+            (FOCUS_1_2, "x_ServiceCode"),
+        ],
+    ),
+    (
+        "The Seller of Record of a specific product or service. In most cases, the invoicing entity and legal entity are the same. The values might differ for third-party AWS Marketplace transactions.",
+        &[
+            (COST_AND_USAGE_REPORT, "line_item_legal_entity"),
+            (DASHBOARD, "legal_entity"),
+        ],
+    ),
+    (
+        "The name of the account that used this line item. For organizations, this can be either the management account or a member account. You can use this field to track costs or usage by account.",
+        &[
+            (COST_AND_USAGE_REPORT, "line_item_usage_account_name"),
+            (DASHBOARD, "linked_account_name"),
+        ],
+    ),
+];
+
+/// RULE: a column is published with the dictionary's text for it, so where the dictionary
+/// publishes ONE entry for a column of several tables (or of several versions of one
+/// schema), every one of them reports that entry — a paraphrase on any of them would make
+/// the same documented fact read differently per table.
+#[tokio::test]
+async fn one_dictionary_entry_is_published_by_every_table_that_carries_it() {
+    let client = Client::new();
+
+    let mut schemas: BTreeMap<&str, BTreeMap<String, String>> = BTreeMap::new();
+    for (published, carriers) in SHARED_DICTIONARY_ENTRIES {
+        for (table, column) in *carriers {
+            if !schemas.contains_key(table) {
+                schemas.insert(table, descriptions_of(&client, table).await);
+            }
+            let case = format!("{table}.{column}");
+            let reported = schemas[table]
+                .get(*column)
+                .unwrap_or_else(|| panic!("case {case:?}: the table must publish the column"));
+            assert_eq!(
+                reported, published,
+                "case {case:?}: expected the dictionary's one entry {published:?}, got {reported:?}"
+            );
+        }
+    }
 }

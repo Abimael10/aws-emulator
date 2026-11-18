@@ -68,11 +68,13 @@ pub(crate) const RECOMMENDATIONS: &str = "COST_OPTIMIZATION_RECOMMENDATIONS";
 pub(crate) const CARBON_EMISSIONS: &str = "CARBON_EMISSIONS";
 
 /// `(column, the FOCUS 1.0 text, the FOCUS 1.2 text)` for every column the 1.2
-/// specification re-words over 1.0 (AWS Data Exports table dictionary, as recorded for
-/// `GetTable` on each table). The rows span the families the revision touches: a period's
-/// limits become its BOUNDS, the commitment-discount family drops "-based", the SKU a
-/// charge is measured against becomes a METERED SKU, a SKU identifier becomes one the
-/// PROVIDER assigns, and the charge classifications and the effective cost are re-defined.
+/// specification re-words over 1.0 and whose 1.2 text is known (AWS Data Exports table
+/// dictionary, as recorded for `GetTable` on each table). The rows span the families the
+/// revision touches: a period's limits become its BOUNDS, the commitment-discount family
+/// drops "-based", the SKU a charge is measured against becomes a METERED SKU, and the
+/// charge classifications and the effective cost are re-defined. A re-worded column whose
+/// 1.2 text the recording does not publish is in
+/// [`REVISED_BY_FOCUS_1_2_TEXT_UNRESOLVED`] instead.
 const REVISED_BY_FOCUS_1_2: &[(&str, &str, &str)] = &[
     (
         "BillingPeriodEnd",
@@ -102,17 +104,7 @@ const REVISED_BY_FOCUS_1_2: &[(&str, &str, &str)] = &[
     (
         "ConsumedUnit",
         "Provider-specified measurement unit indicating how a provider measures usage of a given SKU associated with a resource or service.",
-        "The provider-specified measurement unit indicating how a provider measures usage of a metered SKU associated with a resource or service.",
-    ),
-    (
-        "SkuId",
-        "A unique identifier that defines a provider-supported construct for organizing properties that are common across one or more SKU Prices.",
-        "The identifier assigned to a SKU by the provider.",
-    ),
-    (
-        "SkuPriceId",
-        "A unique identifier that defines the unit price used to calculate the charge.",
-        "The identifier assigned to a SKU Price by the provider.",
+        "Provider-specified measurement unit indicating how a provider measures usage of a metered SKU associated with a resource or service.",
     ),
     (
         "ChargeCategory",
@@ -161,6 +153,23 @@ const REVISED_BY_FOCUS_1_2: &[(&str, &str, &str)] = &[
     ),
 ];
 
+/// `(column, the FOCUS 1.0 text)` for a column the 1.2 specification re-words whose 1.2
+/// text is NOT yet known: the recording for the 1.2 table shows the catalog's current
+/// string for it is not what that specification publishes, and it does not publish the
+/// string itself (replaying the 1.0 text for it diverges too). So the rule is asserted here
+/// as far as the evidence reaches — the 1.0 schemas publish THIS text and the 1.2 schema
+/// publishes something else — without pinning a 1.2 string known to be wrong.
+const REVISED_BY_FOCUS_1_2_TEXT_UNRESOLVED: &[(&str, &str)] = &[
+    (
+        "SkuId",
+        "A unique identifier that defines a provider-supported construct for organizing properties that are common across one or more SKU Prices.",
+    ),
+    (
+        "SkuPriceId",
+        "A unique identifier that defines the unit price used to calculate the charge.",
+    ),
+];
+
 /// The columns the cost and usage dashboard carries over from the cost and usage table
 /// under that table's own name (AWS Data Exports table dictionary): a column the view
 /// publishes and the catalog used to omit, so a client could not discover or request it.
@@ -198,12 +207,12 @@ pub(crate) const PUBLISHED_DESCRIPTIONS: &[(&str, &str, &str)] = &[
     (
         CARBON_EMISSIONS,
         "region_code",
-        "A Region is a physical location around the world where data centers are clustered. AWS calls each group of logical data centers an Availability Zone (AZ). Each AWS Region consists of multiple, isolated, and physically separate AZs within a geographic area. The Region code attribute specifies where the AWS service is available. For example, us-east-1.",
+        "A Region is a physical location around the world where data centers are clustered. AWS calls each group of logical data centers an Availability Zone (AZ). Each AWS Region consists of multiple, isolated, and physically separate AZs within a geographical area. The Region code attribute has the same name as an AWS Region, and specifies where the AWS service is available. For example, us-east-1.",
     ),
     (
         CARBON_EMISSIONS,
         "location",
-        "Describes the human-readable location where the usage originated from, corresponding to the region_code. For example, US East (N. Virginia).",
+        "Describes the human-readable location where the usage originated from, corresponding to the region_code. For example, US East (N. Virginia). Emissions from Global Services, such as Amazon CloudFront, are reported under Global.",
     ),
     // The cost and usage table: the unblended pair, worded as the dictionary words the
     // blended pair, and the usage amount with the caveats the dictionary ships with it.
@@ -215,7 +224,7 @@ pub(crate) const PUBLISHED_DESCRIPTIONS: &[(&str, &str, &str)] = &[
     (
         COST_AND_USAGE_REPORT,
         "line_item_unblended_rate",
-        "In consolidated billing for accounts using AWS Organizations, the unblended rate is the rate associated with an individual account's service usage.\nFor Amazon EC2 and Amazon RDS line items that have an RI discount applied to them, the UnblendedRate is zero. Line items with an RI discount have a LineItemType of DiscountedUsage.",
+        "In consolidated billing for accounts using AWS Organizations, the unblended rate is the rate associated with an individual account's service usage.\n\nFor Amazon EC2 and Amazon RDS line items that have an RI discount applied to them, the UnblendedRate is zero. Line items with an RI discount have a LineItemType of DiscountedUsage.",
     ),
     (
         COST_AND_USAGE_REPORT,
@@ -377,6 +386,31 @@ async fn each_focus_version_reports_its_own_specifications_text() {
         }
     }
 
+    // The columns the 1.2 specification re-words whose 1.2 text is not yet known: the rule
+    // holds as far as the evidence reaches — the 1.0 schemas publish their own text and the
+    // 1.2 schema publishes something else.
+    for (column, text_1_0) in REVISED_BY_FOCUS_1_2_TEXT_UNRESOLVED {
+        for (schema, table) in [(&focus_1_0, FOCUS_1_0), (&preview, FOCUS_1_0_PREVIEW)] {
+            let case = format!("{table}.{column}");
+            let reported = schema
+                .get(*column)
+                .unwrap_or_else(|| panic!("case {case:?}: the schema must publish the column"));
+            assert_eq!(
+                reported.description, *text_1_0,
+                "case {case:?}: expected this version's own published text {text_1_0:?}, got {:?}",
+                reported.description
+            );
+        }
+        let case = format!("{FOCUS_1_2}.{column}");
+        let reported = focus_1_2
+            .get(*column)
+            .unwrap_or_else(|| panic!("case {case:?}: the schema must publish the column"));
+        assert_ne!(
+            reported.description, *text_1_0,
+            "case {case:?}: the 1.2 specification re-words this column, so the 1.0 text must not leak into it"
+        );
+    }
+
     // Over the WHOLE shared column set: a column both versions publish keeps one `Type`
     // across them, because a re-wording is not a change of the kind of data stored …
     let shared: BTreeSet<&str> = focus_1_0
@@ -407,7 +441,7 @@ async fn each_focus_version_reports_its_own_specifications_text() {
         .collect();
     assert_eq!(
         differing.len(),
-        REVISED_BY_FOCUS_1_2.len(),
+        REVISED_BY_FOCUS_1_2.len() + REVISED_BY_FOCUS_1_2_TEXT_UNRESOLVED.len(),
         "case \"FOCUS versions\": expected exactly the revised columns to differ, got {differing:?}"
     );
 

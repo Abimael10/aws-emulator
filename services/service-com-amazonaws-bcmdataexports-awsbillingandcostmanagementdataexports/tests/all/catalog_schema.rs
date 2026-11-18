@@ -186,7 +186,7 @@ const PUBLISHED_TYPES: &[(&str, &str, &str)] = &[
     (
         RECOMMENDATIONS,
         "recommendation_lookback_period_in_days",
-        "Integer",
+        "Int",
     ),
     (RECOMMENDATIONS, "tags", "Map<String, String>"),
     (RECOMMENDATIONS, "restart_needed", "Boolean"),
