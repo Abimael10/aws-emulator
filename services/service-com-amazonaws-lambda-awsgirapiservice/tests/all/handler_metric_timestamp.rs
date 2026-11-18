@@ -226,7 +226,11 @@ async fn invoke(
 /// ("Start time less than 15 days ago - Round down to the nearest whole minute",
 /// `GetMetricStatisticsInput$StartTime`), and well inside the two weeks back a datapoint may
 /// be published into.
-fn window_start() -> f64 {
+///
+/// `pub(crate)` so the sibling suite that reads a series a handler published into
+/// ([`crate::handler_observability_sdk`]) lays its window from this one writer of the
+/// whole-minute convention rather than from a second copy.
+pub(crate) fn window_start() -> f64 {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .expect("the clock is after the epoch")

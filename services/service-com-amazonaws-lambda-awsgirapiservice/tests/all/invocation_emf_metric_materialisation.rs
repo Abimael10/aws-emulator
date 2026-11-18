@@ -109,7 +109,11 @@ fn emulator() -> MultiServiceRouter {
 }
 
 /// Epoch milliseconds, the unit an `InputLogEvent$timestamp` and an EMF `Timestamp` carry.
-fn now_ms() -> i64 {
+///
+/// `pub(crate)` so the sibling suite that writes a log event with the SDK its runtime ships
+/// ([`crate::handler_observability_sdk`]) stamps it from this one writer of the unit rather
+/// than from a second copy.
+pub(crate) fn now_ms() -> i64 {
     i64::try_from(
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
