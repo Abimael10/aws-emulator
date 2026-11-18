@@ -39,10 +39,12 @@
 //! error of that field's own path with the value `null`, which is how a GraphQL result
 //! states a field that did not resolve.
 
+use ::std::collections::BTreeMap;
 use ::std::time::Duration;
 
 use ::serde_json::{json, Map as JsonMap, Value as Json};
 
+use super::lambda;
 use super::mapping_template::{self, Raised};
 use super::PlaneContext;
 use crate::ops::evaluate_code::appsync_js::{self, Outcome};
@@ -197,6 +199,12 @@ const MAX_ENGINE_RUNTIME: ::std::time::Duration = ::std::time::Duration::from_se
 /// met the bound rather than run with the steps that fit.
 const MAX_PIPELINE_STEPS: usize = 10;
 
+/// How many sibling resolutions ONE invocation of a batched resolver carries where the
+/// resolver configures no maximum batching size of its own: as many as one may configure
+/// ("maxBatchSize", whose range is 0 to 2,000), which is also what bounds the gathering of the
+/// resolutions a definition's own `BatchInvoke` merges.
+const MAX_BATCHED_RESOLUTIONS: usize = 2_000;
+
 /// How many fields one selection set may select, for the same reason.
 const MAX_SELECTED_FIELDS: usize = 64;
 
@@ -276,8 +284,29 @@ const TEMPLATE_WAIT_CEILING: ::std::time::Duration = ::std::time::Duration::from
 /// guide).
 const LOCAL_DATA_SOURCE: &str = "NONE";
 
-/// The member a request function returns the result of a local resolver in.
+/// The `DataSourceType` of a data source that IS a function of AWS Lambda: "the data source
+/// is an Lambda function" (`DataSource$type`), which a resolver bound to it resolves against
+/// by INVOKING ([`super::lambda`]).
+const LAMBDA_DATA_SOURCE: &str = "AWS_LAMBDA";
+
+/// The member a request function returns the result of a local resolver in, and — for a data
+/// source that is a function — the event that function is invoked with: AppSync's Lambda
+/// data-source request carries `{"version", "operation", "payload"}`, and the `payload` IS
+/// the event.
 const PAYLOAD_MEMBER: &str = "payload";
+
+/// The member that request names the INVOCATION by, and the value that names the batched one:
+/// `BatchInvoke` is the operation whose event is the LIST of the events of the field
+/// resolutions merged into it, and `Invoke` (the other value) the one whose event is the one
+/// field's own.
+const OPERATION_MEMBER: &str = "operation";
+const BATCH_INVOKE_OPERATION: &str = "BatchInvoke";
+
+/// The members one element of a BATCHED answer reports an error of ITS OWN item with: the
+/// sentence that item failed with, and the class of it. An element carrying a sentence is the
+/// one sibling that did not resolve; the others are unaffected.
+const ITEM_ERROR_MESSAGE_MEMBER: &str = "errorMessage";
+const ITEM_ERROR_TYPE_MEMBER: &str = "errorType";
 
 /// The names of the two functions a resolver's `code` defines (`Resolver$code`: "the
 /// `resolver` code that contains the request and response functions").
@@ -461,6 +490,12 @@ impl Execution<'_> {
     /// Resolve every field of one selection set against `source`, the value the parent field
     /// resolved to, and answer the object a GraphQL result carries them in.
     ///
+    /// The selections are walked in the order the document wrote them, except that the SIBLING
+    /// resolutions of one batched resolver are performed TOGETHER: a resolver that configures a
+    /// maximum batching size resolves the siblings that address it in ONE invocation of its
+    /// data source ([`Self::batched_results`]), so each of them takes its value from that one
+    /// answer rather than from an invocation of its own.
+    ///
     /// Boxed, because a field's own sub-selection is resolved the same way: the recursion is
     /// over a future, which Rust needs a pointer for.
     fn resolve_fields<'f>(
@@ -472,25 +507,75 @@ impl Execution<'_> {
         depth: usize,
     ) -> ::std::pin::Pin<Box<dyn ::std::future::Future<Output = Json> + Send + 'f>> {
         Box::pin(async move {
-            let mut resolved = JsonMap::new();
-            for field in fields {
-                let mut field_path = path.clone();
-                field_path.push(json!(field.key));
-                let value = self
-                    .resolve_field(type_name, source, field, &field_path, depth)
+            let parents = vec![(path, source.clone())];
+            self.resolve_fields_over(type_name, parents, fields, depth)
+                .await
+                .into_iter()
+                .next()
+                .unwrap_or_else(|| Json::Object(JsonMap::new()))
+        })
+    }
+
+    /// Resolve `fields` over EVERY parent in `parents` — the value each resolved to and where in
+    /// the result it sits — and answer the object a GraphQL result carries each parent's
+    /// selection in, in the parents' own order.
+    ///
+    /// One call per LEVEL of the result rather than per parent, because that is the span a
+    /// batched resolver batches over: the resolutions of one batched field across SIBLING
+    /// parents (the elements one list resolved to) are merged into one invocation of its data
+    /// source just as the resolutions of its siblings under one parent are
+    /// ([`Self::batch_groups`]), so each of them takes its value from that one answer.
+    fn resolve_fields_over<'f>(
+        &'f mut self,
+        type_name: &'f str,
+        parents: Vec<(Vec<Json>, Json)>,
+        fields: &'f [SelectedField],
+        depth: usize,
+    ) -> ::std::pin::Pin<Box<dyn ::std::future::Future<Output = Vec<Json>> + Send + 'f>> {
+        Box::pin(async move {
+            // The resolutions ONE invocation of a batched resolver carries are performed
+            // BEFORE the walk, so each member of such a group takes its value from that one
+            // answer rather than from an invocation of its own. Only the resolutions a group
+            // GATHERED are held, keyed by where each sits — that collection is as large as the
+            // gathering, which [`Self::batch_groups`] bounds.
+            let mut ready: BTreeMap<(usize, usize), Result<Json, Failure>> = BTreeMap::new();
+            for (plan, members) in self.batch_groups(type_name, &parents, fields) {
+                let results = self
+                    .batched_results(&plan, type_name, &parents, fields, &members)
                     .await;
-                // What the RESULT holds is counted down in host code, for the reason
-                // [`MAX_ANSWER_BYTES`] records: every value placed in it passes here.
-                let value = self.affordable_answer(value, &field_path);
-                resolved.insert(field.key.clone(), value);
+                for (member, result) in members.iter().zip(results) {
+                    ready.insert((member.parent, member.field), result);
+                }
             }
-            Json::Object(resolved)
+            let mut answers = Vec::with_capacity(parents.len());
+            for (index, (path, source)) in parents.iter().enumerate() {
+                let mut resolved = JsonMap::new();
+                for (at, field) in fields.iter().enumerate() {
+                    let mut field_path = path.clone();
+                    field_path.push(json!(field.key));
+                    let prepared = ready.remove(&(index, at));
+                    let value = self
+                        .resolve_field(type_name, source, field, &field_path, depth, prepared)
+                        .await;
+                    // What the RESULT holds is counted down in host code, for the reason
+                    // [`MAX_ANSWER_BYTES`] records: every value placed in it passes here.
+                    let value = self.affordable_answer(value, &field_path);
+                    resolved.insert(field.key.clone(), value);
+                }
+                answers.push(Json::Object(resolved));
+            }
+            answers
         })
     }
 
     /// Resolve ONE field: run the resolver attached to it where the API holds one, take the
     /// member of the parent object where it does not, and project the field's own
     /// sub-selection onto whatever that came to.
+    ///
+    /// `ready` is the value a resolution PERFORMED ALREADY came to — what one batched
+    /// invocation produced for this field ([`Self::batched_results`]) — so the field is traced,
+    /// reported and projected here exactly as one resolved on its own, and nothing of it is run
+    /// a second time.
     async fn resolve_field(
         &mut self,
         type_name: &str,
@@ -498,6 +583,7 @@ impl Execution<'_> {
         field: &SelectedField,
         path: &[Json],
         depth: usize,
+        ready: Option<Result<Json, Failure>>,
     ) -> Json {
         if depth >= MAX_SELECTION_DEPTH {
             self.fault(field_error(path, &format!("{TOO_DEEP} {MAX_SELECTION_DEPTH}.")));
@@ -545,21 +631,26 @@ impl Execution<'_> {
         let start_offset = self.started.elapsed();
         self.steps.clear();
         self.appended.clear();
-        let resolved: Result<Json, Failure> = match plan {
-            // A field the API attaches no resolver to is the member of the object its
-            // parent resolved to, which is what a GraphQL object's own field is.
-            None => Ok(source.get(&field.name).cloned().unwrap_or(Json::Null)),
-            Some(plan) => {
-                if self.runs >= MAX_RESOLVER_RUNS {
-                    self.fault(field_error(
-                        path,
-                        &format!("{TOO_MANY_RUNS} {MAX_RESOLVER_RUNS}."),
-                    ));
-                    return Json::Null;
+        let resolved: Result<Json, Failure> = match ready {
+            // A resolution this field's own siblings performed WITH it: the value is already
+            // what the resolver came to, so nothing of it is run again.
+            Some(ready) => ready,
+            None => match plan {
+                // A field the API attaches no resolver to is the member of the object its
+                // parent resolved to, which is what a GraphQL object's own field is.
+                None => Ok(source.get(&field.name).cloned().unwrap_or(Json::Null)),
+                Some(plan) => {
+                    if self.runs >= MAX_RESOLVER_RUNS {
+                        self.fault(field_error(
+                            path,
+                            &format!("{TOO_MANY_RUNS} {MAX_RESOLVER_RUNS}."),
+                        ));
+                        return Json::Null;
+                    }
+                    self.runs = self.runs.saturating_add(1);
+                    self.run(&plan, type_name, source, field).await
                 }
-                self.runs = self.runs.saturating_add(1);
-                self.run(&plan, type_name, source, field).await
-            }
+            },
         };
         if self.traced && self.traces.len() < MAX_FIELD_TRACES {
             let duration = self.started.elapsed().saturating_sub(start_offset);
@@ -634,22 +725,60 @@ impl Execution<'_> {
             }
             match value {
                 Json::Array(elements) => {
-                    let mut projected: Vec<Json> = Vec::with_capacity(elements.len());
+                    // The elements that are OBJECTS have the selection projected onto them
+                    // TOGETHER, because they are the sibling parents of one level of the
+                    // result: a batched resolver merges the resolutions of one field across
+                    // them into one invocation of its data source
+                    // ([`Self::resolve_fields_over`]). Everything else is projected on its
+                    // own, as a nested list is a level of its own and a scalar carries no
+                    // sub-selection.
+                    let inner = depth.saturating_add(1);
+                    let mut projected: Vec<Option<Json>> = Vec::with_capacity(elements.len());
+                    let mut parents: Vec<(Vec<Json>, Json)> = Vec::new();
+                    let mut filled: Vec<usize> = Vec::new();
                     for (index, element) in elements.into_iter().enumerate() {
                         let mut element_path = path.to_vec();
                         element_path.push(json!(index));
-                        projected.push(
-                            self.projected(
-                                child_type,
-                                element,
-                                field,
-                                &element_path,
-                                depth.saturating_add(1),
-                            )
-                            .await,
-                        );
+                        if matches!(element, Json::Object(_)) {
+                            if inner >= MAX_SELECTION_DEPTH {
+                                self.fault(field_error(
+                                    &element_path,
+                                    &format!("{TOO_DEEP} {MAX_SELECTION_DEPTH}."),
+                                ));
+                                projected.push(Some(Json::Null));
+                                continue;
+                            }
+                            filled.push(index);
+                            parents.push((element_path, element));
+                            projected.push(None);
+                            continue;
+                        }
+                        let resolved = self
+                            .projected(child_type, element, field, &element_path, inner)
+                            .await;
+                        projected.push(Some(resolved));
                     }
-                    Json::Array(projected)
+                    if !parents.is_empty() {
+                        let resolved = self
+                            .resolve_fields_over(
+                                child_type,
+                                parents,
+                                &field.selections,
+                                inner.saturating_add(1),
+                            )
+                            .await;
+                        for (at, value) in filled.into_iter().zip(resolved) {
+                            if let Some(slot) = projected.get_mut(at) {
+                                *slot = Some(value);
+                            }
+                        }
+                    }
+                    Json::Array(
+                        projected
+                            .into_iter()
+                            .map(|slot| slot.unwrap_or(Json::Null))
+                            .collect(),
+                    )
                 }
                 Json::Object(_) => {
                     self.resolve_fields(
@@ -686,6 +815,7 @@ impl Execution<'_> {
             data_source: step_data_source(api, resolver.data_source_name.as_deref()),
             functions: pipeline_steps(api, resolver),
             is_pipeline: resolver.kind == crate::state::PIPELINE_KIND,
+            max_batch_size: resolver.max_batch_size,
         })
     }
 
@@ -858,8 +988,9 @@ impl Execution<'_> {
                 code: plan.code.clone(),
                 templates: plan.templates.clone(),
                 data_source: plan.data_source.clone(),
+                max_batch_size: plan.max_batch_size,
             };
-            return self.run_step(&step, &base, &mut stash, &Json::Null).await;
+            return self.run_step(&step, &base, &mut stash, None).await;
         }
         // A pipeline runs a step per function it names, and no pipeline of this service runs
         // more of them than AppSync holds one ([`MAX_PIPELINE_STEPS`]).
@@ -889,7 +1020,7 @@ impl Execution<'_> {
         }
         for step in &plan.functions {
             previous = self
-                .run_step(step, &base, &mut stash, &previous)
+                .run_step(step, &base, &mut stash, Some(&previous))
                 .await
                 .map_err(|failure| failure.prefixed(&step.name))?;
         }
@@ -914,39 +1045,88 @@ impl Execution<'_> {
 
     /// Run ONE step — a UNIT resolver, or one function of a pipeline — against its own data
     /// source, and answer what its definition made of the result.
+    ///
+    /// A step carrying NEITHER `code` nor mapping templates has no definition to run, and that
+    /// is exactly the Direct Lambda resolver AppSync documents: "VTL request mapping templates
+    /// are optional when using an Lambda data source", so a step on a data source that IS a
+    /// function invokes it over the field's own context document and takes what it returned as
+    /// the field's value ([`Self::run_direct`]). A step carrying neither on any other data
+    /// source really has nothing to run.
     async fn run_step(
         &mut self,
         step: &PipelineStep,
         base: &FieldContext,
         stash: &mut Json,
-        previous: &Json,
+        previous: Option<&Json>,
     ) -> Result<Json, Failure> {
         let Some(code) = &step.code else {
             // A definition written as VTL MAPPING TEMPLATES rather than as APPSYNC_JS
             // code, which is the other form `Resolver$requestMappingTemplate` /
-            // `$responseMappingTemplate` carry; a step that carries neither has no
-            // definition to run at all.
+            // `$responseMappingTemplate` carry; a step that carries neither is a Direct
+            // Lambda resolver where its data source is a function.
             return match &step.templates {
                 Some(templates) => {
                     self.run_templates(step, templates, base, stash, previous)
                         .await
                 }
-                None => Err(NO_DEFINITION.to_string().into()),
+                None => self.run_direct(step, base, stash, previous).await,
             };
         };
         let recorded = self.recorded_step(&step.name);
-        let context = step_context(base, stash, &Json::Null, Some(previous));
+        let context = step_context(base, stash, &Json::Null, previous);
         let requested = self
             .evaluated(code, REQUEST_FUNCTION, &context, stash)
             .await?;
         self.record_request(recorded, &requested);
-        let result = self.data_source_result(step, &requested)?;
-        let context = step_context(base, stash, &result, Some(previous));
+        let result = self.data_source_result(step, &requested).await?;
+        let context = step_context(base, stash, &result, previous);
         let answered = self
             .evaluated(code, RESPONSE_FUNCTION, &context, stash)
             .await?;
         self.record_response(recorded, &answered);
         Ok(answered)
+    }
+
+    /// Run one step that carries NO definition at all: the Direct Lambda resolver.
+    ///
+    /// AppSync invokes the data source's function over the whole resolver context document —
+    /// the `arguments`, `identity`, `source`, `request`, `prev`, `stash` and `info` a resolver
+    /// reads ([`step_context`]) — and the value the function RETURNED is the field's value,
+    /// because there is no response definition to map it through. A step whose data source is
+    /// not a function has nothing to run.
+    async fn run_direct(
+        &mut self,
+        step: &PipelineStep,
+        base: &FieldContext,
+        stash: &Json,
+        previous: Option<&Json>,
+    ) -> Result<Json, Failure> {
+        let data_source = self.invokable(step)?;
+        let context = direct_event(base, stash, previous);
+        let recorded = self.recorded_step(&step.name);
+        self.record_request(recorded, &loggable_event(&context));
+        let answered = self
+            .lambda_results(&data_source, vec![context], batches(step.max_batch_size))
+            .await?
+            .into_iter()
+            .next()
+            .unwrap_or_else(|| Err(NOT_ONE_RESULT.to_string().into()))?;
+        self.record_response(recorded, &answered);
+        Ok(answered)
+    }
+
+    /// The data source of `step` where it is one a resolver INVOKES, or the refusal for a step
+    /// that carries no definition and resolves against anything else.
+    fn invokable(&self, step: &PipelineStep) -> Result<StepDataSource, Failure> {
+        let Some(data_source) = &step.data_source else {
+            return Err(crate::state::DATA_SOURCE_NAME_MISSING_MESSAGE
+                .to_string()
+                .into());
+        };
+        if data_source.kind != LAMBDA_DATA_SOURCE {
+            return Err(NO_DEFINITION.to_string().into());
+        }
+        Ok(data_source.clone())
     }
 
     /// ONE APPSYNC_JS evaluation of this request, charged against what the request may run
@@ -995,22 +1175,22 @@ impl Execution<'_> {
         templates: &Templates,
         base: &FieldContext,
         stash: &mut Json,
-        previous: &Json,
+        previous: Option<&Json>,
     ) -> Result<Json, Failure> {
         let recorded = self.recorded_step(&step.name);
         let requested = match &templates.request {
             Some(template) => {
-                let context = step_context(base, stash, &Json::Null, Some(previous));
+                let context = step_context(base, stash, &Json::Null, previous);
                 let rendered = self.rendered(template, &context, stash).await?;
                 read_rendered(&rendered, REQUEST_TEMPLATE)?
             }
             None => Json::Null,
         };
         self.record_request(recorded, &requested);
-        let result = self.data_source_result(step, &requested)?;
+        let result = self.data_source_result(step, &requested).await?;
         let answered = match &templates.response {
             Some(template) => {
-                let context = step_context(base, stash, &result, Some(previous));
+                let context = step_context(base, stash, &result, previous);
                 let rendered = self.rendered(template, &context, stash).await?;
                 read_rendered(&rendered, RESPONSE_TEMPLATE)?
             }
@@ -1147,23 +1327,409 @@ impl Execution<'_> {
     /// returned.
     ///
     /// `NONE` is "There is no data source", so the request's own `payload` IS the result —
-    /// the local resolver AppSync documents. Every other type names a resource of another
-    /// service, which this endpoint does not call, so the field is reported as one that did
-    /// not resolve rather than answered with a value nothing produced.
-    fn data_source_result(&self, step: &PipelineStep, requested: &Json) -> Result<Json, Failure> {
-        let Some(data_source) = &step.data_source else {
+    /// the local resolver AppSync documents. `AWS_LAMBDA` is a FUNCTION, so the request's
+    /// `payload` is the event that function is INVOKED with and what it returned is the
+    /// result; the request's `operation` says whether that event travels on its own
+    /// (`Invoke`) or as the one-element list a batched invocation carries (`BatchInvoke`).
+    /// Every other type names a resource of another service, which this endpoint does not
+    /// call, so the field is reported as one that did not resolve rather than answered with a
+    /// value nothing produced.
+    async fn data_source_result(
+        &mut self,
+        step: &PipelineStep,
+        requested: &Json,
+    ) -> Result<Json, Failure> {
+        let Some(data_source) = step.data_source.clone() else {
             return Err(crate::state::DATA_SOURCE_NAME_MISSING_MESSAGE
                 .to_string()
                 .into());
         };
-        if data_source.kind != LOCAL_DATA_SOURCE {
-            return Err(format!(
-                "{DATA_SOURCE_NOT_CALLED} {} data source {}.",
-                data_source.kind, data_source.name
+        let payload = || requested.get(PAYLOAD_MEMBER).cloned().unwrap_or(Json::Null);
+        match data_source.kind.as_str() {
+            LOCAL_DATA_SOURCE => Ok(payload()),
+            LAMBDA_DATA_SOURCE => {
+                let batched = requested
+                    .get(OPERATION_MEMBER)
+                    .and_then(Json::as_str)
+                    .is_some_and(|operation| operation == BATCH_INVOKE_OPERATION)
+                    || batches(step.max_batch_size);
+                self.lambda_results(&data_source, vec![payload()], batched)
+                    .await?
+                    .into_iter()
+                    .next()
+                    .unwrap_or_else(|| Err(NOT_ONE_RESULT.to_string().into()))
+            }
+            other => Err(format!(
+                "{DATA_SOURCE_NOT_CALLED} {other} data source {}.",
+                data_source.name
             )
-            .into());
+            .into()),
         }
-        Ok(requested.get(PAYLOAD_MEMBER).cloned().unwrap_or(Json::Null))
+    }
+
+    /// INVOKE the function `data_source` names once, over `events`, and answer one result per
+    /// event.
+    ///
+    /// `batched` says what the event DOCUMENT is: the LIST of the events, which is what the
+    /// `BatchInvoke` operation carries and what the function then answers one element per, or
+    /// the single event of the one resolution, which is `Invoke`. So a batched invocation that
+    /// answers anything but a list of exactly as many elements as it was given has answered
+    /// nothing usable for the siblings it merged, which is reported rather than guessed at.
+    ///
+    /// The invocation is made only where the data source's own service role may make it
+    /// ([`lambda::role_refusal`]) — "the system assumes this role when accessing the data
+    /// source" — and a run whose handler RAISED is reported as the error that handler raised:
+    /// the class the runtime named for it and its own sentence.
+    async fn lambda_results(
+        &mut self,
+        data_source: &StepDataSource,
+        events: Vec<Json>,
+        batched: bool,
+    ) -> Result<Vec<Result<Json, Failure>>, Failure> {
+        let Some(configured) = data_source.function_arn.as_deref() else {
+            return Err(
+                crate::state::missing_data_source_config_message(LAMBDA_CONFIG_MEMBER).into(),
+            );
+        };
+        let Some(target) = lambda::function_target(configured) else {
+            return Err(format!("{NOT_A_FUNCTION} {configured}").into());
+        };
+        if let Some(refused) = lambda::role_refusal(
+            &self.context.engine,
+            data_source.service_role_arn.as_deref(),
+            &target.arn,
+        ) {
+            return Err(Failure::Raised(Box::new(Raised {
+                message: refused,
+                error_type: Some(LAMBDA_INVOCATION_ERROR_TYPE.to_string()),
+                ..Raised::default()
+            })));
+        }
+        let document = match batched {
+            true => Json::Array(events.clone()),
+            false => events.first().cloned().unwrap_or(Json::Null),
+        };
+        let ran = match lambda::invoke(&self.context.callback, &target, &document).await {
+            Ok(ran) => ran,
+            Err(unreached) => return Err(unreached.reason().into()),
+        };
+        if ran.failed() {
+            let (class, message) = ran.raised();
+            return Err(Failure::Raised(Box::new(Raised {
+                message,
+                error_type: Some(class),
+                ..Raised::default()
+            })));
+        }
+        let answered = ran.value();
+        if !batched {
+            return Ok(vec![Ok(answered)]);
+        }
+        let Some(elements) = answered.as_array().filter(|list| list.len() == events.len()) else {
+            return Err(format!("{NOT_A_BATCHED_ANSWER} {}.", events.len()).into());
+        };
+        Ok(elements.iter().cloned().map(batched_item).collect())
+    }
+
+    /// The resolver of `field` where it BATCHES its siblings' resolutions with this one, or
+    /// `None` where each resolution is an invocation of its own ([`ResolverPlan::batch_size`]).
+    fn batched_plan(&self, type_name: &str, field: &SelectedField) -> Option<ResolverPlan> {
+        let plan = self.plan(type_name, &field.name)?;
+        plan.batch_size().map(|_| plan)
+    }
+
+    /// The groups of resolutions ONE invocation of a batched resolver each carries: the plan the
+    /// group is resolved by, and the resolutions it merges.
+    ///
+    /// Two resolutions at one LEVEL of the result are MERGEABLE when they are resolved the same
+    /// way — the same data source, the same definition and the same batching size
+    /// ([`ResolverPlan::batch_group`]) — because the invocation they share runs one program over
+    /// one data source. They need not be of the same parent and need not be of the same field:
+    /// what one invocation carries is a resolution per selection, as many as the resolver's own
+    /// maximum batching size, and the resolutions past it make a further group. So the
+    /// resolutions of one batched field across the elements one list resolved to are one
+    /// invocation, which is the batching AppSync's own guide is written about.
+    ///
+    /// The gathering itself is bounded and linear in what it gathers, because the NUMBER of
+    /// parents at a level is what a resolver's own answer came to rather than anything this
+    /// crate fixes: a resolution is a RUN, so no more of them are gathered than this request may
+    /// still run ([`MAX_RESOLVER_RUNS`]), and a resolution past that is left to be resolved on
+    /// its own and to report the bound it met. Each selection's group key is derived ONCE and the
+    /// group still open for it is looked up by that key, so no gathered group is ever rescanned.
+    fn batch_groups(
+        &self,
+        type_name: &str,
+        parents: &[(Vec<Json>, Json)],
+        fields: &[SelectedField],
+    ) -> Vec<(ResolverPlan, Vec<BatchMember>)> {
+        let mut groups: Vec<(ResolverPlan, Vec<BatchMember>)> = Vec::new();
+        // Where the group still OPEN for one key sits, so a member is placed without walking
+        // the groups gathered so far.
+        let mut open: BTreeMap<BatchKey, usize> = BTreeMap::new();
+        let affordable = MAX_RESOLVER_RUNS.saturating_sub(self.runs);
+        let mut gathered = 0usize;
+        for (at, field) in fields.iter().enumerate() {
+            let Some(plan) = self.batched_plan(type_name, field) else {
+                continue;
+            };
+            let Some(key) = plan.batch_group() else {
+                continue;
+            };
+            let size = plan.batch_size().unwrap_or(1);
+            for parent in 0..parents.len() {
+                if gathered >= affordable {
+                    return groups;
+                }
+                let member = BatchMember { parent, field: at };
+                let placed = open.get(&key).copied().filter(|at| {
+                    groups
+                        .get(*at)
+                        .is_some_and(|(_, members)| members.len() < size)
+                });
+                match placed {
+                    Some(at) => {
+                        if let Some((_, members)) = groups.get_mut(at) {
+                            members.push(member);
+                        }
+                    }
+                    None => {
+                        open.insert(key.clone(), groups.len());
+                        groups.push((plan.clone(), vec![member]));
+                    }
+                }
+                gathered = gathered.saturating_add(1);
+            }
+        }
+        groups
+    }
+
+    /// Resolve the `members` of ONE group — the resolutions a batched resolver merges — in one
+    /// invocation of its data source, answering what each of them came to, in their own order.
+    ///
+    /// Each member's REQUEST half is run on its own, over its own context and its own stash,
+    /// because each resolves one field of one parent; what they produce is merged into the ONE
+    /// event list the invocation carries, and each member's RESPONSE half then runs over the
+    /// element of the answer that is its own. A member whose own half raised, and one whose
+    /// element reported an error of its own item, is the only member that did not resolve.
+    async fn batched_results(
+        &mut self,
+        plan: &ResolverPlan,
+        type_name: &str,
+        parents: &[(Vec<Json>, Json)],
+        fields: &[SelectedField],
+        members: &[BatchMember],
+    ) -> Vec<Result<Json, Failure>> {
+        let Some((mut step, in_pipeline)) = plan.batched_step() else {
+            return members
+                .iter()
+                .map(|_| Err(NO_DEFINITION.to_string().into()))
+                .collect();
+        };
+        step.name = members
+            .first()
+            .and_then(|member| fields.get(member.field))
+            .map(|field| field.name.clone())
+            .unwrap_or_default();
+        // One resolution is one run, batched or not, so the whole group is charged here.
+        if self.runs.saturating_add(members.len()) > MAX_RESOLVER_RUNS {
+            return members
+                .iter()
+                .map(|_| Err(format!("{TOO_MANY_RUNS} {MAX_RESOLVER_RUNS}.").into()))
+                .collect();
+        }
+        self.runs = self.runs.saturating_add(members.len());
+        // Where in the result each member sits, which is what an error of it is reported under.
+        let paths: Vec<Vec<Json>> = members
+            .iter()
+            .map(|member| {
+                let mut path = parents
+                    .get(member.parent)
+                    .map(|(path, _)| path.clone())
+                    .unwrap_or_default();
+                if let Some(field) = fields.get(member.field) {
+                    path.push(json!(field.key));
+                }
+                path
+            })
+            .collect();
+        // Every member's request half, each over its own context and stash.
+        let mut prepared: Vec<Result<(FieldContext, Json, Json), Failure>> =
+            Vec::with_capacity(members.len());
+        for (member, path) in members.iter().zip(&paths) {
+            let Some((field, source)) = fields
+                .get(member.field)
+                .zip(parents.get(member.parent).map(|(_, source)| source))
+            else {
+                prepared.push(Err(NOT_ONE_RESULT.to_string().into()));
+                continue;
+            };
+            let base = self.field_context(type_name, source, field);
+            let mut stash = Json::Object(JsonMap::new());
+            let requested = self
+                .batched_request(&step, &base, &mut stash, in_pipeline)
+                .await;
+            // What this member's own templates APPENDED is reported under its own path, which
+            // is what appending an error is for.
+            for appended in ::std::mem::take(&mut self.appended) {
+                self.fault(appended.document(path));
+            }
+            prepared.push(requested.map(|requested| (base, stash, requested)));
+        }
+        let events: Vec<Json> = prepared
+            .iter()
+            .filter_map(|ready| ready.as_ref().ok())
+            .map(|(_, _, requested)| match step.has_definition() {
+                // A definition RENDERED the request, so the event is its `payload`; a Direct
+                // Lambda resolver has none, so the event is the context document itself.
+                true => requested.get(PAYLOAD_MEMBER).cloned().unwrap_or(Json::Null),
+                false => requested.clone(),
+            })
+            .collect();
+        let Some(data_source) = step.data_source.clone() else {
+            return members
+                .iter()
+                .map(|_| {
+                    Err(crate::state::DATA_SOURCE_NAME_MISSING_MESSAGE
+                        .to_string()
+                        .into())
+                })
+                .collect();
+        };
+        // WHICH operation the invocation is: `BatchInvoke` carries the events of every member
+        // in ONE list, and `Invoke` carries one member's event on its own. A batching size
+        // configures the first outright; a definition that rendered the request names the
+        // operation itself, and it is batched only where EVERY member's own request named the
+        // batched one.
+        let batched = match step.has_definition() {
+            true => prepared.iter().all(|ready| {
+                ready.as_ref().ok().is_none_or(|(_, _, requested)| {
+                    requested
+                        .get(OPERATION_MEMBER)
+                        .and_then(Json::as_str)
+                        .is_some_and(|operation| operation == BATCH_INVOKE_OPERATION)
+                        || batches(step.max_batch_size)
+                })
+            }),
+            false => batches(step.max_batch_size),
+        };
+        let invoked = match (events.is_empty(), batched) {
+            // Nothing to invoke for: no member produced an event at all.
+            (true, _) => Ok(Vec::new()),
+            (false, true) => self.lambda_results(&data_source, events, true).await,
+            // Not one invocation after all: each member's own event travels on its own.
+            (false, false) => {
+                let mut answered = Vec::with_capacity(events.len());
+                for event in events {
+                    let one = self.lambda_results(&data_source, vec![event], false).await;
+                    answered.push(match one {
+                        Ok(results) => results
+                            .into_iter()
+                            .next()
+                            .unwrap_or_else(|| Err(NOT_ONE_RESULT.to_string().into())),
+                        Err(failure) => Err(failure),
+                    });
+                }
+                Ok(answered)
+            }
+        };
+        let mut answers = match invoked {
+            Ok(answers) => answers.into_iter(),
+            // The invocation itself produced nothing, so no member of the group resolved.
+            Err(failure) => {
+                return prepared
+                    .into_iter()
+                    .map(|ready| Err(ready.err().unwrap_or_else(|| failure.clone())))
+                    .collect()
+            }
+        };
+        let mut resolved = Vec::with_capacity(members.len());
+        for (path, ready) in paths.iter().zip(prepared) {
+            let (base, mut stash, _) = match ready {
+                Ok(ready) => ready,
+                Err(failure) => {
+                    resolved.push(Err(failure));
+                    continue;
+                }
+            };
+            let result = match answers.next() {
+                Some(Ok(result)) => result,
+                Some(Err(failure)) => {
+                    resolved.push(Err(failure));
+                    continue;
+                }
+                None => {
+                    resolved.push(Err(NOT_ONE_RESULT.to_string().into()));
+                    continue;
+                }
+            };
+            let answered = self
+                .batched_response(&step, &base, &mut stash, &result, in_pipeline)
+                .await;
+            for appended in ::std::mem::take(&mut self.appended) {
+                self.fault(appended.document(path));
+            }
+            resolved.push(answered);
+        }
+        resolved
+    }
+
+    /// The REQUEST half of one member of a batched resolution: what the step's definition
+    /// renders for it, or — for a Direct Lambda resolver — the field's own context document.
+    ///
+    /// `in_pipeline` says whether the step is a FUNCTION of a pipeline, which is what decides
+    /// whether the resolution has a previous step at all.
+    async fn batched_request(
+        &mut self,
+        step: &PipelineStep,
+        base: &FieldContext,
+        stash: &mut Json,
+        in_pipeline: bool,
+    ) -> Result<Json, Failure> {
+        let previous = in_pipeline.then_some(&Json::Null);
+        match (&step.code, &step.templates) {
+            (Some(code), _) => {
+                let context = step_context(base, stash, &Json::Null, previous);
+                self.evaluated(code, REQUEST_FUNCTION, &context, stash)
+                    .await
+            }
+            (None, Some(templates)) => match &templates.request {
+                Some(template) => {
+                    let context = step_context(base, stash, &Json::Null, previous);
+                    let rendered = self.rendered(template, &context, stash).await?;
+                    read_rendered(&rendered, REQUEST_TEMPLATE)
+                }
+                None => Ok(Json::Null),
+            },
+            (None, None) => Ok(direct_event(base, stash, previous)),
+        }
+    }
+
+    /// The RESPONSE half of one member, over the element of the batched answer that is its own:
+    /// what the step's definition makes of that element, or the element itself for a Direct
+    /// Lambda resolver, which has no response definition to map it through.
+    async fn batched_response(
+        &mut self,
+        step: &PipelineStep,
+        base: &FieldContext,
+        stash: &mut Json,
+        result: &Json,
+        in_pipeline: bool,
+    ) -> Result<Json, Failure> {
+        let context = step_context(base, stash, result, in_pipeline.then_some(&Json::Null));
+        match (&step.code, &step.templates) {
+            (Some(code), _) => {
+                self.evaluated(code, RESPONSE_FUNCTION, &context, stash)
+                    .await
+            }
+            (None, Some(templates)) => match &templates.response {
+                Some(template) => {
+                    let rendered = self.rendered(template, &context, stash).await?;
+                    read_rendered(&rendered, RESPONSE_TEMPLATE)
+                }
+                None => Ok(result.clone()),
+            },
+            (None, None) => Ok(result.clone()),
+        }
     }
 
     /// The parts of a field's `ctx` that do not change between the steps that resolve it.
@@ -1182,6 +1748,7 @@ impl Execution<'_> {
                     .iter()
                     .map(|selected| json!(selected.name))
                     .collect::<Vec<Json>>(),
+                "selectionSetGraphQL": selection_set_graphql(&field.selections, 0),
             }),
         }
     }
@@ -1205,6 +1772,115 @@ struct ResolverPlan {
     functions: Vec<PipelineStep>,
     /// Whether the resolver is of the `PIPELINE` kind.
     is_pipeline: bool,
+    /// "The maximum batching size for a resolver" (`Resolver$maxBatchSize`): how many field
+    /// resolutions of this resolver one invocation of its data source may carry, and — since
+    /// "the default is 0", which batches nothing — whether it batches at all.
+    max_batch_size: i32,
+}
+
+impl ResolverPlan {
+    /// The step ONE batched invocation of this resolver runs, and whether that step is a
+    /// FUNCTION of a pipeline — or `None` for a resolver that is not batched.
+    ///
+    /// A resolver batches only where its step configures a maximum batching size
+    /// (`maxBatchSize`, whose default of 0 batches nothing) and its data source IS a function,
+    /// because batching is the `BatchInvoke` operation of a Lambda data source. Which step that
+    /// is depends on the kind: a UNIT resolver's own definition is the step, while a PIPELINE
+    /// resolver invokes functions and "the maximum batching size for a function"
+    /// (`FunctionConfiguration$maxBatchSize`) is each function's own — so a pipeline batches
+    /// where it is ONE such function and the resolver's own before and after steps add nothing
+    /// of their own to it.
+    fn batched_step(&self) -> Option<(PipelineStep, bool)> {
+        let invokes_a_function = |step: &PipelineStep| {
+            step.data_source
+                .as_ref()
+                .is_some_and(|data_source| data_source.kind == LAMBDA_DATA_SOURCE)
+        };
+        if !self.is_pipeline {
+            let step = PipelineStep {
+                name: String::new(),
+                code: self.code.clone(),
+                templates: self.templates.clone(),
+                data_source: self.data_source.clone(),
+                max_batch_size: self.max_batch_size,
+            };
+            // A batching size configures `BatchInvoke` outright. A resolver whose own
+            // DEFINITION renders the request may name that operation itself instead, and which
+            // operation it named is known only once that definition has run — so such a
+            // resolver's sibling resolutions are gathered too, and what they rendered is what
+            // decides whether one invocation carries them all
+            // ([`Execution::batched_results`]).
+            let gathers = batches(step.max_batch_size) || step.has_definition();
+            return (invokes_a_function(&step) && gathers).then_some((step, false));
+        }
+        if self.code.is_some() || self.templates.is_some() {
+            return None;
+        }
+        let [function] = self.functions.as_slice() else {
+            return None;
+        };
+        (invokes_a_function(function) && batches(function.max_batch_size))
+            .then(|| (function.clone(), true))
+    }
+
+    /// How many resolutions ONE invocation of this resolver's data source carries, or `None`
+    /// for a resolver that is not batched.
+    ///
+    /// The resolver's own maximum batching size where it configures one; else as many as a
+    /// resolver may configure ([`MAX_BATCHED_RESOLUTIONS`]), which is what a `BatchInvoke` a
+    /// definition names for itself carries.
+    fn batch_size(&self) -> Option<usize> {
+        let (step, _) = self.batched_step()?;
+        Some(match step.max_batch_size > 0 {
+            true => usize::try_from(step.max_batch_size).unwrap_or(MAX_BATCHED_RESOLUTIONS),
+            false => MAX_BATCHED_RESOLUTIONS,
+        })
+    }
+
+    /// What makes two sibling resolutions MERGEABLE into one invocation: the data source the
+    /// invocation is made on, the definition the invocation's event is produced by (none for a
+    /// Direct Lambda resolver, which has one) and the batching size that invocation carries at
+    /// most. Two resolutions that agree on all of it run one program over one data source,
+    /// which is what one invocation can carry.
+    fn batch_group(&self) -> Option<BatchKey> {
+        let (step, in_pipeline) = self.batched_step()?;
+        let templates = step.templates.unwrap_or(Templates {
+            request: None,
+            response: None,
+        });
+        Some((
+            step.data_source
+                .map(|data_source| data_source.name)
+                .unwrap_or_default(),
+            step.code,
+            templates.request,
+            templates.response,
+            step.max_batch_size,
+            in_pipeline,
+        ))
+    }
+}
+
+/// What two resolutions have to AGREE ON to be merged into one invocation
+/// ([`ResolverPlan::batch_group`]): the data source, the definition that produces the event and
+/// the batching size, and whether the step is a function of a pipeline.
+type BatchKey = (
+    String,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    i32,
+    bool,
+);
+
+/// ONE resolution a batched invocation carries: which selection it is of, and which of the
+/// parents at that level of the result it belongs to.
+#[derive(Debug, Clone, Copy)]
+struct BatchMember {
+    /// The parent whose selection this resolution is, as its position in the level's parents.
+    parent: usize,
+    /// The selection this resolution is of, as its position in the selection set.
+    field: usize,
 }
 
 /// One step of a resolution: a UNIT resolver, or one function of a pipeline.
@@ -1215,6 +1891,19 @@ struct PipelineStep {
     code: Option<String>,
     templates: Option<Templates>,
     data_source: Option<StepDataSource>,
+    /// The maximum batching size the definition this step came from configures, which says
+    /// whether its data source is invoked with the BATCHED event document.
+    max_batch_size: i32,
+}
+
+impl PipelineStep {
+    /// Whether this step carries a DEFINITION at all: the `code` a resolver or a function is
+    /// written in, or the mapping templates that are the other form of one. A step carrying
+    /// neither is the Direct Lambda resolver AppSync documents, where the field's own context
+    /// document IS the event its data source is invoked with.
+    fn has_definition(&self) -> bool {
+        self.code.is_some() || self.templates.is_some()
+    }
 }
 
 /// The mapping templates one step is defined by: one per direction, either of which a
@@ -1302,11 +1991,52 @@ fn read_rendered(rendered: &str, direction: &str) -> Result<Json, Failure> {
         .map_err(|error| Failure::Message(format!("{direction} {NOT_RENDERED_JSON} {error}")))
 }
 
-/// The data source one step resolves against: its type, and the name it is held under.
+/// Whether a definition configuring the maximum batching size `max_batch_size` is BATCHED at
+/// all: "the default is 0" (`Resolver$maxBatchSize`), which batches nothing, so only a
+/// positive size asks for the `BatchInvoke` operation and the list event document it carries.
+fn batches(max_batch_size: i32) -> bool {
+    max_batch_size > 0
+}
+
+/// ONE element of a batched answer, as the result of the sibling it belongs to.
+///
+/// An element that REPORTS AN ERROR OF ITS OWN ITEM — an object carrying `errorMessage`, with
+/// `errorType` naming its class where the function named one — is the one sibling that did not
+/// resolve: it reports that error under its own path and resolves to nothing, and no other
+/// sibling of the invocation is affected. Every other element is the value its sibling takes.
+fn batched_item(element: Json) -> Result<Json, Failure> {
+    let member = |name: &str| {
+        element
+            .get(name)
+            .and_then(Json::as_str)
+            .map(str::to_string)
+            .filter(|text| !text.is_empty())
+    };
+    match member(ITEM_ERROR_MESSAGE_MEMBER) {
+        Some(message) => Err(Failure::Raised(Box::new(Raised {
+            message,
+            error_type: member(ITEM_ERROR_TYPE_MEMBER),
+            ..Raised::default()
+        }))),
+        None => Ok(element),
+    }
+}
+
+/// The data source one step resolves against: its type, the name it is held under, and — for
+/// a data source that IS a function — what addresses that function and whose role it is
+/// invoked under.
 #[derive(Debug, Clone)]
 struct StepDataSource {
     kind: String,
     name: String,
+    /// "The Amazon Resource Name (ARN) for the Lambda function"
+    /// (`LambdaDataSourceConfig$lambdaFunctionArn`), for a data source configured with one.
+    function_arn: Option<String>,
+    /// "The Identity and Access Management (IAM) service role Amazon Resource Name (ARN) for
+    /// the data source. The system assumes this role when accessing the data source"
+    /// (`DataSource$serviceRoleArn`) — so it is the principal whose permissions admit the
+    /// invocation.
+    service_role_arn: Option<String>,
 }
 
 /// The data source `name` of `api`, or `None` when the API holds none under that name.
@@ -1317,6 +2047,11 @@ fn step_data_source(api: &GraphqlApiRecord, name: Option<&str>) -> Option<StepDa
         .map(|record: &DataSourceRecord| StepDataSource {
             kind: record.r#type.clone(),
             name: record.name.clone(),
+            function_arn: record
+                .lambda_config
+                .as_ref()
+                .map(|config| config.lambda_function_arn.clone()),
+            service_role_arn: record.service_role_arn.clone(),
         })
 }
 
@@ -1345,12 +2080,14 @@ fn pipeline_steps(api: &GraphqlApiRecord, resolver: &ResolverRecord) -> Vec<Pipe
                     function.response_mapping_template.as_deref(),
                 ),
                 data_source: step_data_source(api, Some(&function.data_source_name)),
+                max_batch_size: function.max_batch_size,
             },
             None => PipelineStep {
                 name: function_id.clone(),
                 code: None,
                 templates: None,
                 data_source: None,
+                max_batch_size: 0,
             },
         })
         .collect()
@@ -1383,6 +2120,124 @@ fn logged_context(type_name: &str, field: &SelectedField) -> Json {
         },
     })
 }
+
+/// The event a DIRECT Lambda resolver's data source is invoked with: the resolver context
+/// document of the field being resolved.
+///
+/// It carries the members a Direct Lambda resolver's event has and no others — the field's
+/// `arguments`, who the request presented itself as (`identity`), the value its parent resolved
+/// to (`source`), the request's own fields (`request`), where the field sits (`info`), the
+/// `stash` the resolution carries and the previous step's result (`prev`) — because this
+/// document IS the event, not the `$context` a definition is evaluated over
+/// ([`step_context`], which also carries the aliases and the result members that context
+/// has).
+///
+/// `previous` is `None` for a resolution that is not a step of a PIPELINE, and `prev` is then
+/// nothing at all: there is no previous step for it to be the result of.
+fn direct_event(base: &FieldContext, stash: &Json, previous: Option<&Json>) -> Json {
+    json!({
+        "arguments": base.arguments,
+        "identity": base.identity,
+        "source": base.source,
+        "request": base.request,
+        "info": base.info,
+        "stash": stash,
+        "prev": previous.map_or(Json::Null, |result| json!({"result": result})),
+    })
+}
+
+/// The selection set `selections` as `info.selectionSetGraphQL` states it: the GraphQL text of
+/// the selection, as the request's own document wrote it.
+///
+/// `info.selectionSetList` is the NAMES of the selected fields and this is the SELECTION itself,
+/// so it carries what a name does not: the alias a selection answers under where it carries one,
+/// and the arguments it selects with. A field that selects nothing — a scalar — has no selection
+/// set at all and the text is empty; every other selection is a brace-delimited block, one
+/// selected field per line, with each field's own sub-selection nested inside it.
+fn selection_set_graphql(selections: &[SelectedField], depth: usize) -> String {
+    if selections.is_empty() {
+        return String::new();
+    }
+    let indent = "  ".repeat(depth.saturating_add(1));
+    let closing = "  ".repeat(depth);
+    let mut written = String::from("{\n");
+    for selected in selections {
+        written.push_str(&indent);
+        // "alias: field" where the selection answers under a key of its own.
+        if selected.key != selected.name {
+            written.push_str(&selected.key);
+            written.push_str(": ");
+        }
+        written.push_str(&selected.name);
+        written.push_str(&written_arguments(&selected.arguments));
+        let nested = selection_set_graphql(&selected.selections, depth.saturating_add(1));
+        if !nested.is_empty() {
+            written.push(' ');
+            written.push_str(&nested);
+        }
+        written.push('\n');
+    }
+    written.push_str(&closing);
+    written.push('}');
+    written
+}
+
+/// The arguments one selection carries, as GraphQL writes an argument list — `(name: value, …)`,
+/// and nothing at all for a selection that carries none.
+///
+/// The values are the ones the selection resolved to, the request's own variables substituted,
+/// so each is written as the GraphQL literal of that value ([`written_value`]).
+fn written_arguments(arguments: &JsonMap<String, Json>) -> String {
+    if arguments.is_empty() {
+        return String::new();
+    }
+    let written: Vec<String> = arguments
+        .iter()
+        .map(|(name, value)| format!("{name}: {}", written_value(value)))
+        .collect();
+    format!("({})", written.join(", "))
+}
+
+/// One argument value as GraphQL writes a literal of it.
+///
+/// GraphQL's literals are JSON's but for an INPUT OBJECT, whose member names are written bare
+/// rather than quoted — so a value is written through the one serializer this crate writes JSON
+/// with, and an object member by member.
+fn written_value(value: &Json) -> String {
+    match value {
+        Json::Object(members) => {
+            let written: Vec<String> = members
+                .iter()
+                .map(|(name, member)| format!("{name}: {}", written_value(member)))
+                .collect();
+            format!("{{{}}}", written.join(", "))
+        }
+        Json::Array(elements) => {
+            let written: Vec<String> = elements.iter().map(written_value).collect();
+            format!("[{}]", written.join(", "))
+        }
+        other => other.to_string(),
+    }
+}
+
+/// `event` as a field-level LOG record may carry it: the event MINUS the request's own fields.
+///
+/// A record is read by whoever can read the API's log group and is kept for that group's whole
+/// retention, and the request's own fields are where a caller presents its authorization
+/// material — so no record carries them, which is the same reading the context a verbose record
+/// keeps is built on ([`logged_context`]). Only the value handed to the data source carries
+/// them, because that is the event AppSync invokes the function with.
+fn loggable_event(event: &Json) -> Json {
+    let mut reduced = event.clone();
+    if let Some(members) = reduced.as_object_mut() {
+        members.remove(REQUEST_MEMBER);
+    }
+    reduced
+}
+
+/// The member of a resolver context document that carries the REQUEST's own fields, which a
+/// log record leaves out ([`loggable_event`]).
+const REQUEST_MEMBER: &str = "request";
 
 /// The `ctx` one step is run with: what the field carries, the stash as the steps before it
 /// left it, the result the data source produced and the previous step's result.
@@ -1866,3 +2721,136 @@ const RESPONSE_TEMPLATE: &str = "The response";
 const STASH_MEMBER: &str = "stash";
 const DATA_SOURCE_NOT_CALLED: &str = "This endpoint does not call the";
 const NO_PIPELINE_FUNCTIONS: &str = "This field's pipeline resolver invokes no function.";
+
+/// The member a data source whose type is `AWS_LAMBDA` is configured through, which is what a
+/// data source holding none is reported as missing.
+const LAMBDA_CONFIG_MEMBER: &str = "lambdaConfig";
+
+/// The sentences a Lambda data source's own refusals state: a configured value that names no
+/// function at all, a batched invocation whose answer is not one element per merged
+/// resolution, and an invocation that produced no result for the resolution it was made for.
+const NOT_A_FUNCTION: &str = "This data source's lambdaFunctionArn names no Lambda function:";
+const NOT_A_BATCHED_ANSWER: &str =
+    "The data source's function answered a batched invocation with something other than a list \
+     of";
+const NOT_ONE_RESULT: &str =
+    "The data source's function returned no result for this field's resolution.";
+
+/// The `errorType` AppSync reports for an invocation of a data source's function that COULD
+/// NOT BE MADE — the class its errors of that kind carry, under the `Lambda:` prefix every
+/// error of a Lambda data source is reported under.
+const LAMBDA_INVOCATION_ERROR_TYPE: &str = "Lambda:IllegalArgument";
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// One selected field, as a case writes one.
+    fn selected(key: &str, name: &str, arguments: Json, selections: Vec<SelectedField>) -> SelectedField {
+        SelectedField {
+            key: key.to_string(),
+            name: name.to_string(),
+            arguments: arguments.as_object().cloned().unwrap_or_default(),
+            selections,
+        }
+    }
+
+    /// `info.selectionSetGraphQL` is the SELECTION, so it carries what the list of names does
+    /// not: the alias a selection answers under, the arguments it selects with and the
+    /// sub-selection of each selected field. A field that selects nothing has no selection set.
+    #[test]
+    fn the_selection_set_is_written_as_the_document_wrote_it() {
+        // The rows differ along what the selection carries: nothing, plain fields, an alias,
+        // arguments of every literal form, and a nested sub-selection.
+        let cases: [(&str, Vec<SelectedField>, &str); 6] = [
+            ("a scalar field, which selects nothing", Vec::new(), ""),
+            (
+                "two plain fields",
+                vec![
+                    selected("id", "id", Json::Null, Vec::new()),
+                    selected("name", "name", Json::Null, Vec::new()),
+                ],
+                "{\n  id\n  name\n}",
+            ),
+            (
+                "a selection answering under an alias",
+                vec![selected("mine", "id", Json::Null, Vec::new())],
+                "{\n  mine: id\n}",
+            ),
+            (
+                "arguments of each literal form",
+                vec![selected(
+                    "item",
+                    "item",
+                    json!({"id": "a", "size": 2, "live": true, "tags": ["x", "y"]}),
+                    Vec::new(),
+                )],
+                "{\n  item(id: \"a\", size: 2, live: true, tags: [\"x\", \"y\"])\n}",
+            ),
+            (
+                "an input object, whose members GraphQL writes bare",
+                vec![selected("item", "item", json!({"by": {"id": "a"}}), Vec::new())],
+                "{\n  item(by: {id: \"a\"})\n}",
+            ),
+            (
+                "a nested sub-selection",
+                vec![selected(
+                    "author",
+                    "author",
+                    Json::Null,
+                    vec![
+                        selected("name", "name", Json::Null, Vec::new()),
+                        selected(
+                            "posts",
+                            "posts",
+                            Json::Null,
+                            vec![selected("title", "title", Json::Null, Vec::new())],
+                        ),
+                    ],
+                )],
+                "{\n  author {\n    name\n    posts {\n      title\n    }\n  }\n}",
+            ),
+        ];
+        for (case, selections, expected) in cases {
+            let written = selection_set_graphql(&selections, 0);
+            assert_eq!(
+                written, expected,
+                "case {case:?}: expected {expected:?}, got {written:?}"
+            );
+        }
+    }
+
+    /// A field-level log record leaves the request's own fields out, whatever else the event
+    /// carries, because that is where a caller presents its authorization material.
+    #[test]
+    fn a_logged_event_carries_everything_but_the_requests_own_fields() {
+        let event = json!({
+            "arguments": {"id": "a"},
+            "identity": {"resolverContext": {"who": "someone"}},
+            "source": Json::Null,
+            "request": {"headers": {"authorization": "a-token-a-caller-presented"}},
+            "info": {"fieldName": "item"},
+            "stash": {},
+            "prev": Json::Null,
+        });
+        let logged = loggable_event(&event);
+        assert_eq!(
+            logged.get("request"),
+            None,
+            "case a logged event: expected the request's own fields to be left out, got {logged}"
+        );
+        for member in ["arguments", "identity", "source", "info", "stash", "prev"] {
+            assert_eq!(
+                logged.get(member),
+                event.get(member),
+                "case a logged event: expected {member:?} to be carried as the event has it, \
+                 got {logged}"
+            );
+        }
+        assert!(
+            !logged.to_string().contains("a-token-a-caller-presented"),
+            "case a logged event: expected no part of the material a caller presented, got \
+             {logged}"
+        );
+    }
+}

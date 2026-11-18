@@ -22,6 +22,11 @@ pub mod event_data_plane;
 /// is one.
 pub mod graphql_data_plane;
 
+/// The decisions a GraphQL API's `AWS_LAMBDA` authorizer has taken, for as long as each may
+/// be reused. A field of the store below for the same reason the planes are: the window a
+/// decision may be reused in is read under the same lock as the API that configured it.
+pub mod lambda_authorizer_cache;
+
 /// The GraphQL types created under a GraphQL API, and how one type definition is
 /// parsed, kept and reported.
 mod schema_types;
@@ -2136,6 +2141,9 @@ pub struct ComAmazonawsAppsyncAwsdeepdishcontrolplaneserviceState {
     /// it ([`graphql_data_plane`]). Held beside the API records so a reader cannot see an
     /// API whose real-time plane this store does not hold.
     pub graphql_data_plane: graphql_data_plane::GraphqlDataPlane,
+    /// The decisions each GraphQL API's `AWS_LAMBDA` authorizer has taken, for as long as
+    /// each may be reused ([`lambda_authorizer_cache`]).
+    pub lambda_authorizer_cache: lambda_authorizer_cache::LambdaAuthorizerCache,
     /// Advanced once per minted id, so no id is ever a function of the request.
     id_seed: u64,
     /// Advanced once per created resource, giving each record its creation order.

@@ -202,6 +202,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // is what makes a deleted API stop answering where it published
         // ([`crate::service::graphql_api`]).
         guard.graphql_data_plane.forget_api(&input.api_id);
+        // And so do the authorization decisions its Lambda authorizer had taken: an API that
+        // is gone decides nothing, so no window of one of its decisions outlives it.
+        guard.lambda_authorizer_cache.forget_api(&input.api_id);
 
         Ok(DeleteGraphqlApiOutput {})
     }

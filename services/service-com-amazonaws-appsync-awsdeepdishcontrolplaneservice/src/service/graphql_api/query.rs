@@ -54,7 +54,7 @@ use ::service_com_amazonaws_wafv2_awswaf_20190729::service::edge as waf_edge;
 use ::tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use super::execution::{self, GraphqlRequest};
-use super::{caller, field_logs, PlaneContext};
+use super::{authorizer, caller, field_logs, PlaneContext};
 use crate::service::event_api::{self, PresentedAuth};
 
 /// The response field every answer this endpoint writes carries the request's own id in, as
@@ -352,6 +352,42 @@ async fn served_request(
         unauthorized: Vec::new(),
     };
     let mut request = request;
+    // What the API's `AWS_LAMBDA` authorization mode decides about this call, which is taken
+    // BEFORE any field of it resolves: the authorizer is invoked with the token presented and
+    // what it returned admits the call, withholds fields of it, or refuses it outright
+    // ([`authorizer`]). An API that configured no Lambda authorizer decides nothing here.
+    let presented = authorizer::Presented {
+        token: presented_material(&parts.headers),
+        request_id,
+        query: &request.query,
+        operation_name: request.operation_name.as_deref(),
+        variables: &request.variables,
+    };
+    match authorizer::decided(context, &presented).await {
+        authorizer::Decided::NotApplicable => {}
+        authorizer::Decided::Refused => {
+            ::tracing::info!(
+                api_id = %context.api_id,
+                "this API's Lambda authorizer did not authorize this call"
+            );
+            return refusal_logged(
+                context,
+                request_id,
+                started,
+                clock,
+                UNAUTHORIZED_STATUS,
+                event_api::UNAUTHORIZED_ERROR_TYPE,
+                event_api::UNAUTHORIZED_MESSAGE,
+            )
+            .await;
+        }
+        authorizer::Decided::Admitted { identity, denied } => {
+            // What the authorizer published about the caller IS this call's identity, and the
+            // fields it withheld resolve to nothing.
+            request.identity = identity;
+            request.unauthorized.extend(denied);
+        }
+    }
     // What IAM says about the fields this call selects. A call NONE of whose fields it
     // permits is refused outright; one it permits some of is served, with the rest reported
     // as fields the caller may not access.
@@ -363,7 +399,8 @@ async fn served_request(
         );
         return error_response(401, event_api::UNAUTHORIZED_ERROR_TYPE, PERMISSION_DENIED);
     }
-    request.unauthorized = judged.refused;
+    // Beside the fields the authorizer withheld, where there was one.
+    request.unauthorized.extend(judged.refused);
     let answered = execution::execute(context, &request).await;
     field_logs::delivered(
         context,
@@ -482,6 +519,17 @@ fn judged_fields(
         judged.refused.push((type_name, field_name));
     }
     judged
+}
+
+/// The material a request presents for an authorization mode to decide: the value of the
+/// request's own `authorization` field, which is where AppSync reads a Lambda authorizer's
+/// input from — and also where a SIGNED call presents its signature, which the mode that reads
+/// one decides instead ([`authorizer::decided`]).
+fn presented_material(headers: &::http::HeaderMap) -> &str {
+    headers
+        .get(::http::header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
 }
 
 /// The request's own fields as a resolver reads them (`ctx.request.headers`): one member per
@@ -719,3 +767,8 @@ const NO_WEBSOCKETS: &str =
 /// refusal of the `AWS_IAM` authorization mode, which names neither the field it refused nor
 /// the policy that refused it.
 pub const PERMISSION_DENIED: &str = "Permission denied";
+
+/// The status a call this API's Lambda authorizer did not authorize is answered with: the
+/// request reached no field of the API, so it is refused rather than served — the status every
+/// unauthorized call on a GraphQL API's data plane is answered with.
+const UNAUTHORIZED_STATUS: u16 = 401;

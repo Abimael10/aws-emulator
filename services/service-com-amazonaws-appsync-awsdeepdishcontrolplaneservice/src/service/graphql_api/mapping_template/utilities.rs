@@ -244,11 +244,17 @@ fn unix_millis() -> u64 {
         .map_or(0, |since| since.as_millis().min(u128::from(u64::MAX)) as u64)
 }
 
-/// How much room a pattern `$util.matches` compiles may take: an explicit budget, because
-/// the expression comes from the template rather than from this crate — a pattern past it is
-/// refused like one that does not parse. Well under the crate's own defaults.
-const MAX_PATTERN_PROGRAM_BYTES: usize = 64 * 1024;
-const MAX_PATTERN_DFA_BYTES: usize = 256 * 1024;
+/// How much room a pattern this crate compiles from CALLER TEXT may take: an explicit budget,
+/// because the expression comes from a template or from a stored configuration rather than
+/// from this crate — a pattern past it is refused like one that does not parse. Well under the
+/// crate's own defaults.
+///
+/// Shared by every reader of a caller-supplied expression — `$util.matches` here and the
+/// `identityValidationExpression` an API's Lambda authorizer is gated by
+/// ([`crate::service::graphql_api::authorizer`]) — so one crate weighs one pattern one way.
+pub const MAX_PATTERN_PROGRAM_BYTES: usize = 64 * 1024;
+/// See [`MAX_PATTERN_PROGRAM_BYTES`].
+pub const MAX_PATTERN_DFA_BYTES: usize = 256 * 1024;
 
 /// The sentences a helper fault states.
 const NOT_JSON: &str = "This value is not a JSON document.";
