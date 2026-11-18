@@ -794,3 +794,160 @@ async fn a_modify_replaces_the_network_and_a_delete_leaves_nothing() {
         "case an unfiltered read: expected the groups the account holds in {REGION}, got {names:?}"
     );
 }
+
+/// A cluster subnet group name is a LOWER-CASE identifier ("Amazon Redshift
+/// stores the value as a lowercase string" —
+/// `smithy_query(query="doc", shape="CreateClusterSubnetGroupMessage",
+/// member="ClusterSubnetGroupName")`), so the identifier the service resolves a
+/// request against, and the one its `ClusterSubnetGroupNotFoundFault` reports,
+/// is the folded form of what the request spelled — never the request's own
+/// case.
+///
+/// The rows differ along what that rule generalises over: the case form of the
+/// requested name (upper, capitalised, mixed with digits, already folded), its
+/// length (both ends of the documented 255-character rule) and the OPERATION
+/// that resolves it, which fixes which of the two sentences the fault carries.
+#[tokio::test]
+async fn a_subnet_group_refusal_names_the_identifier_in_its_stored_lower_case_form() {
+    let emulator = Emulator::new();
+    let subnets = emulator.subnet_ids("the network every row shares", 1).await;
+
+    // One group the account DOES hold — created under a mixed-case name, so the
+    // folded spelling is what it is stored under — so no refusal below can be an
+    // "every name is refused" artefact.
+    let created = create_group(&emulator, "Held-Subnets", &subnets).await;
+    assert_eq!(
+        created.status, 200,
+        "case seed the held group: expected 200, got {} with body {}",
+        created.status, created.body
+    );
+    assert_eq!(
+        created.text("ClusterSubnetGroupName").as_deref(),
+        Some("held-subnets"),
+        "case seed the held group: expected the folded name stored, got {:?}",
+        created.text("ClusterSubnetGroupName")
+    );
+
+    // `max_len` is the documented bound on `ClusterSubnetGroupName`; see
+    // `state::SUBNET_GROUP_NAME_RULE`.
+    let longest: String = std::iter::once('G')
+        .chain(std::iter::repeat_n('X', state::SUBNET_GROUP_NAME_RULE.max_len - 1))
+        .collect();
+    let absent: Vec<(&str, String)> = vec![
+        ("an unknown name in upper case", "NO-SUCH-SUBNET-GROUP".to_string()),
+        (
+            "an unknown name capitalised",
+            "No-Such-Subnet-Group".to_string(),
+        ),
+        (
+            "an unknown mixed-case name carrying digits",
+            "Probe2Group3Here".to_string(),
+        ),
+        ("the longest unknown name, in upper case", longest),
+        ("the shortest unknown name, in upper case", "G".to_string()),
+        (
+            "an unknown name already in lower case",
+            "no-such-subnet-group".to_string(),
+        ),
+        (
+            "a held group's name with one extra character, in upper case",
+            "HELD-SUBNETSX".to_string(),
+        ),
+    ];
+
+    for (case, requested) in &absent {
+        // The sentences, written out here rather than computed from the code
+        // under test: the only variable part is the identifier, folded.
+        let folded = requested.to_ascii_lowercase();
+        let read_refusal = format!("Cluster Subnet group '{folded}' not found.");
+        let dereference_refusal = format!("Cluster subnet group '{folded}' does not exist.");
+
+        let described = describe_group(&emulator, requested).await;
+        let read_case = format!("DescribeClusterSubnetGroups on {case}");
+        assert_refused(&read_case, &described, 400, "ClusterSubnetGroupNotFoundFault");
+        assert_eq!(
+            described.text("Message").as_deref(),
+            Some(read_refusal.as_str()),
+            "case {read_case}: expected the refusal {read_refusal:?}, got {:?}",
+            described.text("Message")
+        );
+
+        let deleted = emulator
+            .call(
+                "DeleteClusterSubnetGroup",
+                &[("ClusterSubnetGroupName", requested.as_str())],
+            )
+            .await;
+        let delete_case = format!("DeleteClusterSubnetGroup on {case}");
+        assert_refused(&delete_case, &deleted, 400, "ClusterSubnetGroupNotFoundFault");
+        assert_eq!(
+            deleted.text("Message").as_deref(),
+            Some(dereference_refusal.as_str()),
+            "case {delete_case}: expected the refusal {dereference_refusal:?}, got {:?}",
+            deleted.text("Message")
+        );
+
+        let modified = modify_group(&emulator, requested, None, &subnets).await;
+        let modify_case = format!("ModifyClusterSubnetGroup on {case}");
+        assert_refused(
+            &modify_case,
+            &modified,
+            400,
+            "ClusterSubnetGroupNotFoundFault",
+        );
+        assert_eq!(
+            modified.text("Message").as_deref(),
+            Some(dereference_refusal.as_str()),
+            "case {modify_case}: expected the refusal {dereference_refusal:?}, got {:?}",
+            modified.text("Message")
+        );
+
+        let launched = emulator
+            .call(
+                "CreateCluster",
+                &[
+                    ("ClusterIdentifier", "folded-identifier-probe"),
+                    ("NodeType", "ra3.xlplus"),
+                    ("MasterUsername", "admin"),
+                    ("ClusterSubnetGroupName", requested.as_str()),
+                ],
+            )
+            .await;
+        let launch_case = format!("CreateCluster on {case}");
+        assert_refused(
+            &launch_case,
+            &launched,
+            400,
+            "ClusterSubnetGroupNotFoundFault",
+        );
+        assert_eq!(
+            launched.text("Message").as_deref(),
+            Some(dereference_refusal.as_str()),
+            "case {launch_case}: expected the refusal {dereference_refusal:?}, got {:?}",
+            launched.text("Message")
+        );
+    }
+
+    // The other half of the same rule: because the identifier is folded before
+    // it is resolved, every spelling of a stored name names THAT group and the
+    // group reports its stored, folded name.
+    for (case, spelling) in [
+        ("the stored spelling", "held-subnets"),
+        ("the stored name in upper case", "HELD-SUBNETS"),
+        ("the stored name as the create spelled it", "Held-Subnets"),
+        ("the stored name in another mixed case", "hELD-sUBNETS"),
+    ] {
+        let described = describe_group(&emulator, spelling).await;
+        assert_eq!(
+            described.status, 200,
+            "case {case}: expected the held group reported with 200, got {} with body {}",
+            described.status, described.body
+        );
+        assert_eq!(
+            all_text(&described.body, "ClusterSubnetGroupName"),
+            vec!["held-subnets".to_string()],
+            "case {case}: expected only the held group, under its stored name, got body {}",
+            described.body
+        );
+    }
+}

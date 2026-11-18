@@ -433,32 +433,41 @@ pub enum SubnetGroupNotFoundWording {
 }
 
 /// How an operation that resolves a `ClusterSubnetGroupName` to nothing says so,
-/// quoting the name as the REQUEST spelled it — the caller has to recognise what
-/// it asked for.
+/// quoting the identifier in the form the service RESOLVES it in.
 ///
 /// Recorded Amazon Redshift wording for `ClusterSubnetGroupNotFoundFault` ("The
 /// cluster subnet group name does not refer to an existing cluster subnet
 /// group"), per [`SubnetGroupNotFoundWording`]. One function for every path that
 /// raises the fault, so two operations that word it the same way cannot drift
 /// apart.
+///
+/// The one variable part is the identifier, named in the documented lower-case
+/// form — "Amazon Redshift stores the value as a lowercase string"
+/// ([`normalized_subnet_group_name`]) — because that is the identifier the
+/// lookup this refusal reports on was made with: a request spelling it in
+/// another case asks about the same group and is told about the same identifier.
+/// Folded HERE so no raiser of the fault can leak the request's spelling into
+/// the sentence.
 pub fn subnet_group_not_found_message(
     wording: SubnetGroupNotFoundWording,
     requested: &str,
 ) -> String {
+    let name = normalized_subnet_group_name(requested);
     match wording {
         SubnetGroupNotFoundWording::NotFound => {
-            format!("Cluster Subnet group '{requested}' not found.")
+            format!("Cluster Subnet group '{name}' not found.")
         }
         SubnetGroupNotFoundWording::DoesNotExist => {
-            format!("Cluster subnet group '{requested}' does not exist.")
+            format!("Cluster subnet group '{name}' does not exist.")
         }
     }
 }
 
 /// How a create refuses a `ClusterSubnetGroupName` the account already has a
 /// group under, quoting the name as the REQUEST spelled it — the caller has to
-/// recognise what it asked for, exactly as
-/// [`subnet_group_not_found_message`] quotes it.
+/// recognise what it asked for (unlike
+/// [`subnet_group_not_found_message`], which reports the identifier the lookup
+/// it failed was made with).
 ///
 /// Recorded Amazon Redshift wording for `ClusterSubnetGroupAlreadyExistsFault`
 /// (`smithy_query(query="shape", shape="ClusterSubnetGroupAlreadyExistsFault")`
