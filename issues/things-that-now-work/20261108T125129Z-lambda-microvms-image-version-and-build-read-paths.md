@@ -86,3 +86,41 @@ Cause 3 (update response):
 6. UpdateMicrovmImage(imageIdentifier=<imageArn>, baseImageArn=base, buildRoleArn=<same role>, codeArtifact={'uri': 's3://<unique>-absent/code2.zip'}).
    AWS: the 200 response carries latestActiveImageVersion naming the image's live version (recorded: '1.0').
    Emulator: the member is absent.
+
+## Resolution
+
+Cause 2 is FIXED. Cause 1's `versionStateTimeBucket` half and Cause 3 were already
+correct in the code base this was fixed on (the issue was filed against an older
+commit): the replay of both fixtures reports
+`ListMicrovmImageVersions|$.items[*].versionStateTimeBucket` and
+`UpdateMicrovmImage|$.latestActiveImageVersion` as fixed, and the
+`lambdamicrovms-image-version-status-and-update` fixture replays clean end to end.
+Cause 1's `baseImageVersion` half is DECLINED, for the reason
+'20261102T072953Z-lambda-microvms-image-version-records-are-written-from.md' already
+recorded for the same value on the create path: the corpus answers two different
+values for the same unpinned create against the same managed base image ARN, so the
+resolved value is the one AWS's catalogue happened to publish at recording time — a
+per-run value that already has the member's modelled type, format and invariants.
+
+Cause 2: every response reporting one BUILD of a MicroVM image version
+(`ListMicrovmImageBuilds`' rows and `GetMicrovmImageBuild`) now writes
+`terminationReasonCode` beside its modelled payload, through the build record's one
+projection of it (`state::MicrovmImageBuild::recorded_termination_reason_code_member`),
+so the member is part of the row's shape: the key is there for every build, with no
+value for a build no termination applies to. The record carries the code
+(`MicrovmImageBuild::termination_reason_code`), and the one condition under which this
+service stops a build in flight — a delete of the version the build is running for —
+now terminates that build instead of leaving it reported as running.
+
+The replay key `ListMicrovmImageBuilds|2xx->2xx|$.items[*]` still diverges after the
+member was added: the row comparison is whole-item, and the recorded rows differ from
+the emulator's on values no AWS rule fixes — the per-run `buildId`
+('20261117T102011Z-lambda-microvms-getmicrovmimagebuild-answers-with-a-buildid-that.md'
+owns that key and reports the same identifier diverging while rendering identically on
+the single-build read of this same fixture) and the chosen chipset generations of the
+fan-out, whose particular numbers
+'20261027T003752Z-lambda-microvms-re-delete-of-a-gone-image.md' settled as values
+rather than contract (a replay with the generations that recording published does not
+close this key either). Both are declined here as per-run/recorded values; the member
+this cause is about is served, which `tests/all/image_build_read_path.rs`
+(`every_build_row_carries_the_recorded_termination_reason_code`) pins on the wire.

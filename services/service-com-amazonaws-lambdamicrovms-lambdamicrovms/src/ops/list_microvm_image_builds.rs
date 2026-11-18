@@ -277,19 +277,43 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // `items` is `@required`, so it is always projected — an empty page included.
             items: page
                 .into_iter()
-                .map(|build| MicrovmImageBuildSummary {
-                    image_arn: image.image_arn.clone(),
-                    image_version: version.image_version.clone(),
-                    build_id: build.build_id.clone(),
-                    build_state: build.state.clone(),
-                    architecture: build.architecture.clone(),
-                    chipset: build.chipset.clone(),
-                    chipset_generation: build.chipset_generation.clone(),
-                    state_reason: build.state_reason.clone(),
-                    created_at: build.created_at,
-                })
+                .map(|build| summary_of(&image.image_arn, &version.image_version, build))
                 .collect(),
         })
+    }
+}
+
+/// The modelled summary of one stored build of the version `image_version` of the image
+/// whose ARN is `image_arn`, with the build's own recorded `terminationReasonCode` beside
+/// it — through the record's one projection of it, so a listing row and the single-build
+/// read cannot disagree about whether the platform stopped that build.
+fn summary_of(
+    image_arn: &str,
+    image_version: &str,
+    build: &crate::state::MicrovmImageBuild,
+) -> MicrovmImageBuildRow {
+    MicrovmImageBuildRow::new(
+        payload_of(image_arn, image_version, build),
+        build.recorded_termination_reason_code_member(&TERMINATION_REASON_CODE_ON_BUILD_SUMMARY),
+    )
+}
+
+/// The modelled half of one listing row.
+fn payload_of(
+    image_arn: &str,
+    image_version: &str,
+    build: &crate::state::MicrovmImageBuild,
+) -> MicrovmImageBuildSummary {
+    MicrovmImageBuildSummary {
+        image_arn: image_arn.to_string(),
+        image_version: image_version.to_string(),
+        build_id: build.build_id.clone(),
+        build_state: build.state.clone(),
+        architecture: build.architecture.clone(),
+        chipset: build.chipset.clone(),
+        chipset_generation: build.chipset_generation.clone(),
+        state_reason: build.state_reason.clone(),
+        created_at: build.created_at,
     }
 }
 

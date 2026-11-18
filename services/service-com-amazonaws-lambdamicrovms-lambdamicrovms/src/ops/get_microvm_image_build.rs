@@ -146,7 +146,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     for GetMicrovmImageBuild<Eng>
 {
     type Input = GetMicrovmImageBuildInput;
-    type Output = GetMicrovmImageBuildOutput;
+    type Output = GetMicrovmImageBuildResponse;
     type Error = GetMicrovmImageBuildError;
 
     const NAME: &'static str = "GetMicrovmImageBuild";
@@ -231,18 +231,50 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )));
         };
 
-        Ok(GetMicrovmImageBuildOutput {
-            image_arn: image.image_arn.clone(),
-            image_version: version.image_version.clone(),
-            build_id: build.build_id.clone(),
-            build_state: build.state.clone(),
-            architecture: build.architecture.clone(),
-            chipset: build.chipset.clone(),
-            chipset_generation: build.chipset_generation.clone(),
-            state_reason: build.state_reason.clone(),
-            created_at: build.created_at,
-            snapshot_build: build.snapshot_build.clone(),
-        })
+        Ok(rendered(
+            &image.image_arn,
+            &version.image_version,
+            build,
+        ))
+    }
+}
+
+/// What `GetMicrovmImageBuild` answers: the modelled `GetMicrovmImageBuildOutput` plus
+/// the recorded `terminationReasonCode`.
+pub type GetMicrovmImageBuildResponse = RecordedMembers<GetMicrovmImageBuildOutput>;
+
+/// The STORED build record as this operation's response, with the build's own recorded
+/// `terminationReasonCode` beside it — through the record's one projection of it, so this
+/// read and the listing row for the same build cannot disagree about whether the platform
+/// stopped it.
+fn rendered(
+    image_arn: &str,
+    image_version: &str,
+    build: &crate::state::MicrovmImageBuild,
+) -> GetMicrovmImageBuildResponse {
+    GetMicrovmImageBuildResponse::new(
+        payload_of(image_arn, image_version, build),
+        build.recorded_termination_reason_code_member(&TERMINATION_REASON_CODE_ON_GET_BUILD_OUTPUT),
+    )
+}
+
+/// The modelled half of the response for a stored build.
+fn payload_of(
+    image_arn: &str,
+    image_version: &str,
+    build: &crate::state::MicrovmImageBuild,
+) -> GetMicrovmImageBuildOutput {
+    GetMicrovmImageBuildOutput {
+        image_arn: image_arn.to_string(),
+        image_version: image_version.to_string(),
+        build_id: build.build_id.clone(),
+        build_state: build.state.clone(),
+        architecture: build.architecture.clone(),
+        chipset: build.chipset.clone(),
+        chipset_generation: build.chipset_generation.clone(),
+        state_reason: build.state_reason.clone(),
+        created_at: build.created_at,
+        snapshot_build: build.snapshot_build.clone(),
     }
 }
 

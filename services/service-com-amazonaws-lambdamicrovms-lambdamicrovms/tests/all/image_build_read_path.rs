@@ -21,13 +21,17 @@ use serde_json::{json, Value};
 use service_com_amazonaws_lambdamicrovms_lambdamicrovms::state::{
     image_build_not_found_message, image_version_not_found_message, invalid_arn_format_message,
     managed_base_image_arn, published_managed_base_image_versions,
-    BUILD_STATE_IN_PROGRESS, BUILD_STATE_SUCCESSFUL, BUILD_TARGETS,
-    DEFAULT_MINIMUM_MEMORY_IN_MIB, FIRST_IMAGE_VERSION, MANAGED_BASE_IMAGE_IDS, MAX_LIST_PAGE,
+    BUILD_STATE_FAILED, BUILD_STATE_IN_PROGRESS, BUILD_STATE_SUCCESSFUL, BUILD_TARGETS,
+    BUILD_TERMINATED_BY_VERSION_DELETION, DEFAULT_MINIMUM_MEMORY_IN_MIB, FIRST_IMAGE_VERSION,
+    MANAGED_BASE_IMAGE_IDS, MAX_LIST_PAGE,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
+use crate::image_build_outcome::{emulator as emulator_with_object_store, stage_object};
+use crate::image_version_deletion::delete_version;
 use crate::microvm_lifecycle::{
-    as_uri_value, call, emulator, expected_image_arn, image_body, ACCOUNT, PAST_THE_SPAN, REGION,
+    as_uri_value, call, emulator, expected_image_arn, image_body, poll_until, ACCOUNT,
+    PAST_THE_SPAN, REGION,
 };
 
 /// `GET /2025-09-09/microvm-images/{imageIdentifier}/versions/{imageVersion}/builds`,
@@ -753,4 +757,217 @@ async fn a_next_token_this_listing_did_not_issue_is_refused() {
             body["message"]
         );
     }
+}
+
+/// The IAM build role every image minted below is built with: `RoleArn`, pattern
+/// `^arn:aws[a-z\-]*:iam::[0-9]{12}:role/?[a-zA-Z_0-9+=,.@\-_/]+$`.
+const TERMINATION_BUILD_ROLE_ARN: &str = "arn:aws:iam::123456789012:role/microvm-build-read";
+
+/// `PUT /2025-09-09/microvm-images/{imageIdentifier}` building from `uri` — the call that
+/// mints a FURTHER version of an image, so a case can hold a version whose build is in
+/// flight beside one that has already settled.
+async fn update_image(router: &MultiServiceRouter, identifier: &str, uri: &str) -> (u16, Value) {
+    let body = json!({
+        "baseImageArn": managed_base_image_arn(REGION, MANAGED_BASE_IMAGE_IDS[0]),
+        "buildRoleArn": TERMINATION_BUILD_ROLE_ARN,
+        "codeArtifact": {"uri": uri},
+    });
+    call(
+        router,
+        "PUT",
+        &format!("/2025-09-09/microvm-images/{}", as_uri_value(identifier)),
+        Some(body),
+    )
+    .await
+}
+
+/// Look at the builds of `image_version` of `identifier` until every one of them reports
+/// `build_state` — the condition the emulator reaches on its own clock, never a duration
+/// this test measures.
+async fn poll_until_builds_report(
+    router: &MultiServiceRouter,
+    case: &str,
+    identifier: &str,
+    image_version: &str,
+    build_state: &str,
+) {
+    poll_until(
+        case,
+        &format!("every build of {image_version} of {identifier} reports {build_state}"),
+        || async {
+            let (status, body) = list_builds(router, identifier, image_version, "").await;
+            let items = body["items"].as_array().cloned().unwrap_or_default();
+            status == 200
+                && !items.is_empty()
+                && items
+                    .iter()
+                    .all(|item| item["buildState"] == json!(build_state))
+        },
+    )
+    .await;
+}
+
+/// Assert that every build of `image_version` of `identifier` reports `build_state` and
+/// the recorded `terminationReasonCode` `expected_code` — as a KEY of the row whether or
+/// not a code applies — and that the listing row and the build's own read agree on it.
+async fn assert_termination_reason_code(
+    router: &MultiServiceRouter,
+    case: &str,
+    identifier: &str,
+    image_version: &str,
+    build_state: &str,
+    expected_code: Option<&str>,
+) {
+    let (status, body) = list_builds(router, identifier, image_version, "").await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: listing the builds of {image_version} got {status} {body}"
+    );
+    let rows = page_items(&body, case);
+    assert!(
+        !rows.is_empty(),
+        "case {case:?}: version {image_version} holds builds to report, got {body}"
+    );
+    for row in &rows {
+        let build_id = row["buildId"].as_str().unwrap_or_default().to_string();
+        assert_eq!(
+            row["buildState"].as_str(),
+            Some(build_state),
+            "case {case:?}: build {build_id} expected buildState {build_state}, got {:?}",
+            row["buildState"]
+        );
+        // The member belongs to the ROW's shape, so the key is there for every build —
+        // which is what a client indexing it off any row reads.
+        assert!(
+            row.get("terminationReasonCode").is_some(),
+            "case {case:?}: build {build_id} must carry terminationReasonCode, got {row}"
+        );
+        assert_eq!(
+            row["terminationReasonCode"].as_str(),
+            expected_code,
+            "case {case:?}: build {build_id} expected terminationReasonCode \
+             {expected_code:?}, got {:?}",
+            row["terminationReasonCode"]
+        );
+
+        let (status, read) = get_build(router, identifier, image_version, &build_id).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: reading {build_id} got {status} {read}"
+        );
+        assert!(
+            read.get("terminationReasonCode").is_some(),
+            "case {case:?}: the read of {build_id} must carry terminationReasonCode, got {read}"
+        );
+        assert_eq!(
+            read["terminationReasonCode"], row["terminationReasonCode"],
+            "case {case:?}: the listing and the read project one record, got {:?} and {:?}",
+            read["terminationReasonCode"], row["terminationReasonCode"]
+        );
+    }
+}
+
+/// RULE: `terminationReasonCode` belongs to the SHAPE of a build row rather than to a
+/// particular build, so every response reporting one build of a MicroVM image version
+/// carries the member — with no value for a build no termination applies to, whichever
+/// state that build reached on its own, and with the code the PLATFORM stopped the build
+/// with for one it terminated — and the listing row and the build's own read report the
+/// same stored value.
+#[tokio::test]
+async fn every_build_row_carries_the_recorded_termination_reason_code() {
+    // The owner of objects is mounted beside this service on one engine, so a build can
+    // settle on either branch of its own verdict: the router here is `image_build_outcome`'s
+    // for exactly that reason.
+    let router = emulator_with_object_store();
+    stage_object(&router, "mvm-read-path-artifacts", "app.zip").await;
+    let served = "s3://mvm-read-path-artifacts/app.zip";
+
+    // A build still IN FLIGHT: nothing has terminated it, and nothing has settled it
+    // either, so it carries the key with no code.
+    let building = create_image(
+        &router,
+        "settling-build",
+        json!({"codeArtifact": {"uri": served}}),
+    )
+    .await;
+    assert_termination_reason_code(
+        &router,
+        "a build still in flight",
+        &building,
+        FIRST_IMAGE_VERSION,
+        BUILD_STATE_IN_PROGRESS,
+        None,
+    )
+    .await;
+
+    // The same builds once the clock has settled them on the SUCCESS branch: a verdict of
+    // their own, so still no code.
+    let case = "a build that produced a snapshot";
+    poll_until_builds_report(
+        &router,
+        case,
+        &building,
+        FIRST_IMAGE_VERSION,
+        BUILD_STATE_SUCCESSFUL,
+    )
+    .await;
+    assert_termination_reason_code(
+        &router,
+        case,
+        &building,
+        FIRST_IMAGE_VERSION,
+        BUILD_STATE_SUCCESSFUL,
+        None,
+    )
+    .await;
+
+    // A build the object store answered for by NOT serving its code artifact: it settles
+    // FAILED on a verdict of its own, which is the recorded row — the key is there and no
+    // code applies, because nothing terminated the build.
+    let case = "a build its own code artifact refuted";
+    let refuted = create_image(
+        &router,
+        "refuted-build",
+        json!({"codeArtifact": {"uri": "s3://mvm-read-path-no-such-bucket/app.zip"}}),
+    )
+    .await;
+    poll_until_builds_report(&router, case, &refuted, FIRST_IMAGE_VERSION, BUILD_STATE_FAILED)
+        .await;
+    assert_termination_reason_code(
+        &router,
+        case,
+        &refuted,
+        FIRST_IMAGE_VERSION,
+        BUILD_STATE_FAILED,
+        None,
+    )
+    .await;
+
+    // A build the PLATFORM stopped: deleting the version a build is running for leaves
+    // nothing building it, so the build comes to rest on the terminal state for a build
+    // that produced no snapshot and names the code that stopped it.
+    let case = "a build the platform stopped";
+    let (status, updated) = update_image(&router, &building, served).await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: the update expected 200, got {status} {updated}"
+    );
+    let terminated = updated["imageVersion"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    let (status, deleted) = delete_version(&router, &building, &terminated).await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: deleting {terminated} expected 200, got {status} {deleted}"
+    );
+    assert_termination_reason_code(
+        &router,
+        case,
+        &building,
+        &terminated,
+        BUILD_STATE_FAILED,
+        Some(BUILD_TERMINATED_BY_VERSION_DELETION),
+    )
+    .await;
 }

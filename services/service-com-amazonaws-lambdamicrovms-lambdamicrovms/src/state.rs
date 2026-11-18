@@ -1207,6 +1207,18 @@ pub const BUILD_STATE_SUCCESSFUL: &str = "SUCCESSFUL";
 /// `stateReason` ("the reason for the build state, if applicable") and no snapshot.
 pub const BUILD_STATE_FAILED: &str = "FAILED";
 
+/// The `terminationReasonCode` a build carries when the platform STOPPED it rather than
+/// letting it run to a verdict of its own: the version it was building was deleted while
+/// it was still in flight ([`MicrovmImage::begin_version_deletion`]), so nothing is
+/// building that version any more.
+///
+/// The member is recorded AWS behaviour rather than modelled (the shapes reporting a
+/// build declare no such member, so the model publishes no code vocabulary for it), and
+/// this names the one condition under which this service stops a build in flight. A build
+/// that reached a verdict of its own — one that produced a snapshot, and one its own code
+/// artifact or build steps refuted — was not terminated and carries no code at all.
+pub const BUILD_TERMINATED_BY_VERSION_DELETION: &str = "VERSION_DELETED";
+
 /// One target an image version's asynchronous build produces a build record for: a CPU
 /// architecture, the chipset that architecture runs on, and the generation of that
 /// chipset the build targets.
@@ -1408,6 +1420,53 @@ pub struct MicrovmImageBuild {
     pub created_at: DateTime,
     /// The snapshot the build produced; absent until the build succeeds.
     pub snapshot_build: Option<SnapshotBuild>,
+    /// Why the PLATFORM stopped this build, as the recorded `terminationReasonCode`
+    /// reports it ([`BUILD_TERMINATED_BY_VERSION_DELETION`]); `None` for a build nothing
+    /// terminated, which is every build that ran to a verdict of its own.
+    pub termination_reason_code: Option<String>,
+}
+
+impl MicrovmImageBuild {
+    /// The `terminationReasonCode` a response reporting this build answers with: the code
+    /// the platform stopped it with, and nothing for a build no termination applies to.
+    ///
+    /// The ONE projection of the stored code, so a listing row for a build and that
+    /// build's own read cannot disagree about whether it was terminated.
+    pub fn reported_termination_reason_code(&self) -> Option<String> {
+        self.termination_reason_code.clone()
+    }
+
+    /// This build's termination reason code, as the recorded-only member a response writes
+    /// beside its modelled payload under the member schema `member`.
+    ///
+    /// The member is part of the build row's SHAPE, so it is always written: a build no
+    /// code applies to carries the key with no value ([`RecordedMember::Absent`]) rather
+    /// than no key, which is what a client indexing the member off any build row reads.
+    pub fn recorded_termination_reason_code_member(
+        &self,
+        member: &'static ::aws_smithy_schema::Schema,
+    ) -> Vec<RecordedMember> {
+        vec![match self.reported_termination_reason_code() {
+            Some(code) => RecordedMember::Text(member, code),
+            None => RecordedMember::Absent(member),
+        }]
+    }
+
+    /// Record that the PLATFORM stopped this build, with the code `reason_code`.
+    ///
+    /// A build the platform stopped produced nothing anybody can run, so it comes to rest
+    /// on the one terminal `BuildState` for a build that produced no snapshot
+    /// ([`BUILD_STATE_FAILED`]) and holds no snapshot. A build that already reached a
+    /// verdict of its own is left exactly as it settled: a termination cannot rewrite a
+    /// build that had already ended.
+    pub fn terminate(&mut self, reason_code: &str) {
+        if self.state == BUILD_STATE_SUCCESSFUL || self.state == BUILD_STATE_FAILED {
+            return;
+        }
+        self.state = BUILD_STATE_FAILED.to_string();
+        self.snapshot_build = None;
+        self.termination_reason_code = Some(reason_code.to_string());
+    }
 }
 
 /// One version of a MicroVM image: the build inputs the create (or an update)
@@ -1716,6 +1775,15 @@ impl MicrovmImage {
         version.updated_at = Some(at);
         version.delete_due_at = Some(now + IMAGE_VERSION_DELETE_SPAN);
         let abandoned_build = version.build_due_at.take().is_some();
+        // The build of a version being deleted produces nothing anyone can read, so the
+        // PLATFORM stops it: each per-target build still in flight is terminated, naming
+        // the condition that stopped it, rather than left reported as running when nothing
+        // is building it any more.
+        if abandoned_build {
+            for build in version.builds.values_mut() {
+                build.terminate(BUILD_TERMINATED_BY_VERSION_DELETION);
+            }
+        }
         let state_after_deletion = version.state.clone();
 
         if self.latest_active_image_version.as_deref() == Some(image_version) {
@@ -2517,6 +2585,7 @@ impl ComAmazonawsLambdamicrovmsLambdamicrovmsState {
                     state_reason: None,
                     created_at,
                     snapshot_build: None,
+                    termination_reason_code: None,
                 },
             );
         }

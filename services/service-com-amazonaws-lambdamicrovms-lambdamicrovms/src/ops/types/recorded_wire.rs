@@ -10,7 +10,7 @@
 //! derived structure at all: it is written AFTER the modelled payload's own members,
 //! under a member schema declared here, by [`RecordedMembers`].
 //!
-//! Two such members exist on this service's successful bodies:
+//! The members this service's RECORDED responses carry beside the modelled ones are:
 //!
 //! * `id` on every response that reports a stored MicroVM IMAGE record — the image's
 //!   own identity, which a client keys its records on and joins a later read or listing
@@ -33,6 +33,19 @@
 //!   (`smithy_query(query="shape",shape="GetMicrovmImageVersionOutput,MicrovmImageVersionSummary,UpdateMicrovmImageVersionResponse",model_path="services/service-com-amazonaws-lambdamicrovms-lambdamicrovms/smithy-model/com-amazonaws-lambdamicrovms-lambdamicrovms.json")`).
 //!   Every response reporting a version carries it, so the three paths that report one
 //!   cannot disagree about a version's settlement.
+//! * `terminationReasonCode` on every response that reports one BUILD of a MicroVM image
+//!   version — the code the platform stopped that build with
+//!   ([`crate::state::MicrovmImageBuild::reported_termination_reason_code`]), which a
+//!   client reads to tell a build the platform ended from one that failed on its own.
+//!   `MicrovmImageBuildSummary` and `GetMicrovmImageBuildOutput` declare `imageArn`,
+//!   `imageVersion`, `buildId`, `buildState`, `architecture`, `chipset`,
+//!   `chipsetGeneration`, `stateReason`, `createdAt` (and, on the read, `snapshotBuild`)
+//!   and no such member
+//!   (`smithy_query(query="shape",shape="MicrovmImageBuildSummary,GetMicrovmImageBuildOutput",model_path="services/service-com-amazonaws-lambdamicrovms-lambdamicrovms/smithy-model/com-amazonaws-lambdamicrovms-lambdamicrovms.json")`).
+//!   The member is part of the ROW's shape rather than of a particular build, so it is
+//!   written on every build a response reports — with no value at all
+//!   ([`RecordedMember::Absent`]) for a build no code applies to, which is what lets a
+//!   client index it whether or not its build was terminated.
 //!
 //! Each member schema is declared in the `com.amazonaws.lambdamicrovms.recorded`
 //! namespace rather than in the service's own: the member is NOT in the model, so its
@@ -167,12 +180,44 @@ pub const VERSION_STATE_TIME_BUCKET_ON_UPDATE_VERSION_RESPONSE: ::aws_smithy_sch
         20,
     );
 
+/// `terminationReasonCode` on `MicrovmImageBuildSummary` — one row of the build listing
+/// — whose nine modelled members occupy indices `0..=8`.
+pub const TERMINATION_REASON_CODE_ON_BUILD_SUMMARY: ::aws_smithy_schema::Schema =
+    ::aws_smithy_schema::Schema::new_member(
+        ::aws_smithy_schema::ShapeId::from_static(
+            "com.amazonaws.lambdamicrovms.recorded#MicrovmImageBuildSummary$terminationReasonCode",
+            RECORDED_NAMESPACE,
+            "terminationReasonCode",
+        ),
+        ::aws_smithy_schema::ShapeType::String,
+        "terminationReasonCode",
+        9,
+    );
+
+/// `terminationReasonCode` on `GetMicrovmImageBuildOutput`, whose ten modelled members
+/// occupy indices `0..=9`.
+pub const TERMINATION_REASON_CODE_ON_GET_BUILD_OUTPUT: ::aws_smithy_schema::Schema =
+    ::aws_smithy_schema::Schema::new_member(
+        ::aws_smithy_schema::ShapeId::from_static(
+            "com.amazonaws.lambdamicrovms.recorded#GetMicrovmImageBuildOutput$terminationReasonCode",
+            RECORDED_NAMESPACE,
+            "terminationReasonCode",
+        ),
+        ::aws_smithy_schema::ShapeType::String,
+        "terminationReasonCode",
+        10,
+    );
+
 /// One member the RECORDED service carries beside a modelled response, with the member
 /// schema it is written under.
 #[derive(Debug, Clone)]
 pub enum RecordedMember {
     /// A string-valued member.
     Text(&'static ::aws_smithy_schema::Schema, String),
+    /// A member the recorded responses carry with NO value: the key is written, and its
+    /// value is the wire's own absent value, so a client reading the member finds the key
+    /// whether or not the record has something to report under it.
+    Absent(&'static ::aws_smithy_schema::Schema),
     /// A list of `CpuConfiguration`, each element written against that modelled
     /// structure's own schema — the way the vendored codegen writes a list of
     /// structures.
@@ -210,6 +255,7 @@ impl<T: ::aws_smithy_schema::serde::SerializableStruct>
         for member in &self.members {
             match member {
                 RecordedMember::Text(schema, value) => serializer.write_string(schema, value)?,
+                RecordedMember::Absent(schema) => serializer.write_null(schema)?,
                 RecordedMember::CpuConfigurations(schema, configurations) => {
                     serializer.write_list(schema, &|elements| {
                         for configuration in configurations {
