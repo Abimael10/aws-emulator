@@ -34,8 +34,10 @@ fn every_enumerated_declaration_root_is_a_file_on_disk() {
     // and in how their header is written.
     let root = workspace_root();
     let roots = declaration_roots();
+    // A floor rather than a census: a crate that migrates to the macro layout takes one root
+    // out of this walk.
     assert!(
-        roots.len() > 400,
+        roots.len() > 100,
         "expected one tests/all.rs per crate that hand-declares its suites under {}, read {} \
          of them",
         root.display(),

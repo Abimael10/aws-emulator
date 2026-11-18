@@ -52,8 +52,11 @@ fn every_declaration_root_opens_each_header_sentence() {
     // in how many suites they declare, and in whether they keep a note among those
     // declarations.
     let roots = declaration_roots();
+    // A floor rather than a census: every crate that migrates to the macro layout takes one
+    // root out of this walk, so the number proves only that the walk reached the crates that
+    // hand-declare their suites.
     assert!(
-        roots.len() > 400,
+        roots.len() > 100,
         "expected one tests/all.rs per crate that hand-declares its suites under {}, read {} of \
          them",
         workspace_root().display(),

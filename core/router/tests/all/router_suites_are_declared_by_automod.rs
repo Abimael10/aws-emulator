@@ -229,7 +229,7 @@ fn every_crate_that_holds_suites_keeps_exactly_one_kind_of_declaration_root() {
          {list_crates} on the hand-written layout"
     );
     assert!(
-        list_crates > 400,
+        list_crates > 100,
         "expected one declaration list per service crate, read {list_crates}"
     );
 }
@@ -279,8 +279,10 @@ fn every_declaration_root_the_workspace_rules_read_belongs_to_a_crate_that_keeps
     // crate it belongs to — one that keeps a hand-written list, rather than one on the macro
     // layout or one keeping both roots.
     let roots = declaration_roots();
+    // A floor rather than a census: a crate that migrates to the macro layout takes one root
+    // out of this walk.
     assert!(
-        roots.len() > 400,
+        roots.len() > 100,
         "expected one declaration root per service crate, read {} of them",
         roots.len()
     );

@@ -67,8 +67,11 @@ fn every_declaration_root_ends_with_its_last_declaration() {
     // declarations are spelled and in how long a header they open with.
     let root = workspace_root();
     let roots = declaration_roots();
+    // A floor rather than a census: every crate that migrates to the macro layout takes one
+    // root out of this walk, so the number proves only that the walk reached the crates that
+    // keep a hand-written root.
     assert!(
-        roots.len() > 400,
+        roots.len() > 100,
         "expected one tests/all.rs per service crate under {}, read {} of them",
         root.display(),
         roots.len()

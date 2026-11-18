@@ -174,8 +174,11 @@ fn the_enumerated_roots_are_the_all_rs_of_every_crate_that_has_one() {
         .map(|crate_dir| crate_dir.join("tests").join("all.rs"))
         .collect();
     // Without this, an enumerator that answered nothing would satisfy the comparison below.
+    // A floor rather than a census: every crate that migrates to the macro layout takes one
+    // out of this set, so what the number proves is that the walk reached the service crates
+    // at all.
     assert!(
-        expected.len() > 400,
+        expected.len() > 100,
         "expected one declaration root per service crate under {}, read {} of them",
         workspace_root().display(),
         expected.len()
@@ -209,8 +212,10 @@ fn every_enumerated_root_is_a_file_a_reader_can_open() {
     // panics on a path that is absent, so a root that names no file reports nothing about the
     // layout it was enumerated to check.
     let roots = declaration_roots();
+    // A floor rather than a census: a crate that migrates to the macro layout takes one root
+    // out of this walk.
     assert!(
-        roots.len() > 400,
+        roots.len() > 100,
         "expected one declaration root per service crate under {}, read {} of them",
         workspace_root().display(),
         roots.len()

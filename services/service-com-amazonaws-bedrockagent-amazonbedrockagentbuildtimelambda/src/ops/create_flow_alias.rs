@@ -6,6 +6,9 @@
 //! stored in [`crate::state`] so `GetFlowAlias` and `ListFlowAliases` report it.
 //! The alias's single routing entry must name a version the addressed flow
 //! actually holds, so an alias never points at a version that does not exist.
+//! That routing target is what the call resolves FIRST, so a request whose
+//! version cannot be resolved — including one addressing a flow that is not
+//! stored — is refused for the flow VERSION it pinned.
 //!
 //! ## Shape of an operation
 //!
@@ -227,6 +230,34 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Ok(existing.to_create_output());
         }
 
+        // An alias ROUTES to a version of the flow it belongs to, so the version
+        // its routing configuration names is the FIRST thing resolved: it is the
+        // version the request pins the deployment to. A version resolves only
+        // when the addressed flow holds it — the flow's DRAFT version, or a
+        // number `CreateFlowVersion` has cut and nothing has deleted — so a
+        // routing entry naming a version the flow does not hold, naming no
+        // version at all, or addressing a flow that is not stored resolves to no
+        // flow version, and the modelled 404 names that unresolvable FLOW
+        // VERSION rather than the flow it was looked for under. Nothing is
+        // written for it.
+        if input.routing_configuration.iter().any(|entry| {
+            entry
+                .flow_version
+                .as_deref()
+                .is_none_or(|version| !state.flow_version_exists(&flow_id, version))
+        }) {
+            return Err(CreateFlowAliasErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(crate::state::flow_version_not_found_message(Self::NAME)),
+                },
+            )
+            .into());
+        }
+
+        // The flow the alias belongs to, for the ARN the alias is reported
+        // under. A routing target resolved above is a version of THIS flow, so
+        // the flow is stored by the time this runs; the refusal stands for the
+        // flow that is not, and names the flow it could not resolve.
         let Some(flow) = state.flows.get(&flow_id) else {
             return Err(CreateFlowAliasErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
@@ -236,32 +267,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
         let flow_arn = flow.arn.clone();
-
-        // An alias ROUTES to a version of the flow it belongs to, so every
-        // version its routing configuration names must be one that flow holds:
-        // the flow's DRAFT version, or a number `CreateFlowVersion` has cut and
-        // nothing has deleted. A reference to anything else — a version the flow
-        // does not hold, or an entry naming no version at all — resolves to no
-        // flow version, which is the modelled 404: the resource that could not
-        // be resolved is the flow version, not the flow. Nothing is written for
-        // it.
-        if input
-            .routing_configuration
-            .iter()
-            .any(|entry| {
-                entry
-                    .flow_version
-                    .as_deref()
-                    .is_none_or(|version| !state.flow_version_exists(&flow_id, version))
-            })
-        {
-            return Err(CreateFlowAliasErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: Some(crate::state::flow_version_not_found_message(Self::NAME)),
-                },
-            )
-            .into());
-        }
 
         // The store is bounded per flow: past the bound a create is refused
         // rather than adding another record, and `ServiceQuotaExceededException`

@@ -129,7 +129,10 @@
 //! the record -> wire projections ([`FlowAliasRecord::to_create_output`] /
 //! [`FlowAliasRecord::to_get_output`] / [`FlowAliasRecord::to_summary`]) and the
 //! one rule that resolves an alias's routing target against the versions its
-//! flow holds.
+//! flow holds. A flow carries the reserved test alias of its DRAFT version from
+//! creation, stored with the flow by
+//! [`ComAmazonawsBedrockagentAmazonbedrockagentbuildtimelambdaState::store_flow`],
+//! so every reader reports it like any other alias.
 //!
 //! The prompt library (`CreatePrompt`, `GetPrompt`) is backed by the
 //! [`prompts`](ComAmazonawsBedrockagentAmazonbedrockagentbuildtimelambdaState::prompts)
@@ -500,9 +503,12 @@ impl FlowStatus {
 /// `CreateFlowVersion` is documented "Creates a version of the flow that you can
 /// deploy", and what makes the DRAFT deployable is the preparation `PrepareFlow`
 /// performs ("Prepares the DRAFT version of a flow so that it can be invoked");
-/// so a flow the service has not driven to this status has nothing to cut a
+/// so a flow whose preparation has not reached this status has nothing to cut a
 /// deployable version from, and the call is refused with the operation's
-/// modelled `ConflictException`.
+/// modelled `ConflictException`. The status compared against it is the one the
+/// flow's preparation SETTLED at ([`FlowRecord::settled_status`]), not the one
+/// the clock is still reporting: a preparation the service has already decided
+/// is not a reason to refuse the very next call.
 pub const FLOW_STATUS_VERSIONS_ARE_CUT_FROM: FlowStatus = FlowStatus::Prepared;
 
 /// The outcome of a preparation `PrepareFlow` has already accepted, and the
@@ -566,6 +572,24 @@ impl FlowRecord {
     /// clock owes.
     pub fn preparation_in_flight(&self) -> bool {
         self.pending_preparation.is_some() || self.status == FlowStatus::Preparing
+    }
+
+    /// The `FlowStatus` this flow's preparation has SETTLED at: the outcome a
+    /// preparation already accepted reached, whether or not the clock has
+    /// reported it yet, and otherwise the status the flow stands in.
+    ///
+    /// Preparation is decided when `PrepareFlow` accepts the call — the outcome
+    /// is held in [`Self::pending_preparation`] and only its REPORTING waits for
+    /// the clock — so an operation ordered behind preparation (one that needs a
+    /// prepared DRAFT) asks this rather than the reported status: a flow whose
+    /// preparation has succeeded serves such a call straight away, while the
+    /// status a reader sees still moves `Preparing` -> outcome. The status a
+    /// refusal NAMES stays the one the flow is reported in, which is what a
+    /// caller sees and waits on.
+    pub fn settled_status(&self) -> FlowStatus {
+        self.pending_preparation
+            .as_ref()
+            .map_or(self.status, |pending| pending.status)
     }
 
     /// This record as the `CreateFlow` response: every member comes from the
@@ -859,11 +883,6 @@ pub struct FlowVersionRecord {
     /// The definition this version packages, as the DRAFT held it when the
     /// version was cut.
     pub definition: Option<FlowDefinition>,
-    /// The status this version settles to, and when — set only for a version cut
-    /// from a DRAFT whose preparation was still in flight, so the version
-    /// reports the outcome of the very preparation it packages instead of
-    /// standing in a transient status for ever.
-    pub pending_status: Option<(SystemTime, FlowStatus)>,
     pub created_at: SystemTime,
 }
 
@@ -885,19 +904,17 @@ impl FlowVersionRecord {
             flow_id: flow.flow_id.clone(),
             arn: flow.arn.clone(),
             version,
-            status: flow.status,
+            // A numbered version is a snapshot of a DRAFT whose preparation
+            // SUCCEEDED — that is what makes it the deployable package the
+            // operation documents — so it carries the status that preparation
+            // settled at and never a transient one: the version is immutable,
+            // and nothing about it is still being decided.
+            status: flow.settled_status(),
             name: flow.name.clone(),
             description: description.or_else(|| flow.description.clone()),
             execution_role_arn: flow.execution_role_arn.clone(),
             customer_encryption_key_arn: flow.customer_encryption_key_arn.clone(),
             definition: flow.definition.clone(),
-            // The preparation of the DRAFT this version packages is the
-            // version's own: whatever that preparation reaches, it reaches at
-            // the same instant.
-            pending_status: flow
-                .pending_preparation
-                .as_ref()
-                .map(|pending| (pending.due, pending.status)),
             created_at: now,
         }
     }
@@ -3220,17 +3237,6 @@ impl ComAmazonawsBedrockagentAmazonbedrockagentbuildtimelambdaState {
             // The flow changed when the clock made the change due, not when it
             // was noticed.
             flow.updated_at = pending.due;
-        }
-        // A numbered version cut from a DRAFT whose preparation was still in
-        // flight settles with that preparation: the version packages the very
-        // definition being prepared, so its outcome is due at the same instant.
-        for version in self.flow_versions.values_mut() {
-            if let Some((due, next)) = version.pending_status {
-                if now >= due {
-                    version.status = next;
-                    version.pending_status = None;
-                }
-            }
         }
         for knowledge_base in self.knowledge_bases.values_mut() {
             if let Some((due, next)) = knowledge_base.pending_status {

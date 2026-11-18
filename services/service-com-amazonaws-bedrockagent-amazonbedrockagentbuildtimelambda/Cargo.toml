@@ -53,6 +53,8 @@ service-com-amazonaws-sts-awssecuritytokenservicev20110615 = { workspace = true 
 emulator-core-build-support = { workspace = true }
 
 [dev-dependencies]
+# Compiles every `tests/all/<name>.rs` suite from `tests/all/main.rs`.
+automod = { workspace = true }
 sha2 = { workspace = true }
 hex = { workspace = true }
 

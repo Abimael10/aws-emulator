@@ -5,6 +5,12 @@
 //! Mints a flow and STORES it in [`crate::state`]: the response is projected from
 //! the stored record, so a following `GetFlow` reports the same flow.
 //!
+//! A flow comes into being with the reserved test alias of its DRAFT version
+//! ([`crate::state::TEST_ALIAS_ID`]), which
+//! [`crate::state::ComAmazonawsBedrockagentAmazonbedrockagentbuildtimelambdaState::store_flow`]
+//! writes with the flow, so `GetFlowAlias` and `ListFlowAliases` report it with
+//! no caller action.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -272,9 +278,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let output = record.to_create_output();
         if let Some(token) = input.client_token {
-            state.flow_client_tokens.insert(token, flow_id.clone());
+            state.flow_client_tokens.insert(token, flow_id);
         }
-        state.flows.insert(flow_id, record);
+        // The flow is stored with the reserved test alias every flow carries:
+        // the alias routes to the DRAFT version this call just created, so a
+        // client can invoke that DRAFT for testing with no further action.
+        state.store_flow(record);
 
         Ok(output)
     }

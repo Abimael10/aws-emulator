@@ -11,6 +11,11 @@
 //! the flow holds, the DRAFT version every flow has, and numbers past the ones
 //! cut, including the widest the modelled `NumericalVersion` admits.
 //!
+//! Every flow also carries the reserved test alias of its DRAFT version, which
+//! these listings enumerate beside the caller's own; the rows here are about the
+//! aliases a CALLER creates, so the helpers below report those and the reserved
+//! alias has its own suite.
+//!
 //! Every assertion here goes through the router, so it exercises the real wire
 //! path (route matching, model constraint validation, serialization) rather than
 //! calling a handler directly.
@@ -35,6 +40,10 @@ const AUTHORIZATION: &str = "AWS4-HMAC-SHA256 \
 /// `^arn:aws(-[^:]+)?:iam::([0-9]{12})?:role/(service-role/)?.+$`.
 const EXECUTION_ROLE: &str =
     "arn:aws:iam::000000000000:role/service-role/AmazonBedrockExecutionRoleForFlows";
+
+/// The reserved alias id every flow carries an alias under, as the modelled
+/// `FlowAliasId` (`pattern ^(TSTALIASID|[0-9a-zA-Z]{10})$`) admits it.
+const TEST_ALIAS_ID: &str = "TSTALIASID";
 
 /// One HTTP answer from the emulator, parsed.
 #[derive(Debug)]
@@ -69,10 +78,19 @@ impl Answer {
             .unwrap_or_else(|| panic!("flowAliasSummaries is not an array in {:?}", self.body))
     }
 
-    /// The `name` member of every reported alias summary, in the order the
-    /// response listed them.
-    fn listed_names(&self) -> Vec<String> {
+    /// The reported summaries of the aliases a CALLER created: every summary but
+    /// the flow's reserved test alias, which the service creates with the flow.
+    fn caller_summaries(&self) -> Vec<Value> {
         self.summaries()
+            .into_iter()
+            .filter(|summary| summary["id"].as_str() != Some(TEST_ALIAS_ID))
+            .collect()
+    }
+
+    /// The `name` member of every reported caller-created alias summary, in the
+    /// order the response listed them.
+    fn listed_names(&self) -> Vec<String> {
+        self.caller_summaries()
             .iter()
             .map(|summary| {
                 summary["name"]
@@ -440,7 +458,7 @@ async fn create_flow_alias_resolves_its_routing_target_against_the_flows_version
             listed.listed_names()
         );
         assert_eq!(
-            listed.summaries()[0]["id"].as_str(),
+            listed.caller_summaries()[0]["id"].as_str(),
             Some(alias_id.as_str()),
             "case {case} ({flow_version}): the summary names the stored alias, got {:?}",
             listed.summaries()
@@ -583,10 +601,15 @@ async fn an_alias_belongs_to_one_flow_and_a_retry_creates_no_second_one() {
     );
 
     // Rows: a well-formed flow id the store does not hold, on each operation.
+    // What each names as the missing resource is what it was asked to resolve:
+    // a create resolves the version its routing configuration pins first, so it
+    // reports that unresolvable flow version, while a read of the flow's aliases
+    // reports the flow.
     let unknown_flow = "0123456789";
-    for (operation, answer) in [
+    for (operation, resource_type, answer) in [
         (
             "CreateFlowAlias",
+            "FlowVersion",
             emulator
                 .create_flow_alias(
                     unknown_flow,
@@ -599,10 +622,12 @@ async fn an_alias_belongs_to_one_flow_and_a_retry_creates_no_second_one() {
         ),
         (
             "GetFlowAlias",
+            "Flow",
             emulator.get_flow_alias(unknown_flow, &alias_id).await,
         ),
         (
             "ListFlowAliases",
+            "Flow",
             emulator.list_flow_aliases(unknown_flow, None, None).await,
         ),
     ] {
@@ -612,8 +637,9 @@ async fn an_alias_belongs_to_one_flow_and_a_retry_creates_no_second_one() {
         );
         assert_eq!(
             answer.string(&["message"]),
-            not_found_message(operation, "Flow"),
-            "case {case} ({operation}): the refusal names the missing flow, got {answer:?}"
+            not_found_message(operation, resource_type),
+            "case {case} ({operation}): the refusal names the resource it could not \
+             resolve, got {answer:?}"
         );
     }
 

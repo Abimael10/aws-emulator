@@ -243,8 +243,12 @@ fn the_two_layouts_together_cover_every_crate_that_holds_suites() {
         .iter()
         .map(|root| crate_dir_of_macro_root(root))
         .collect();
+    // A floor rather than a census: every crate that migrates to the macro layout takes one
+    // crate out of this set and puts it in the other, so what the number has to prove is only
+    // that the walk reached the service crates at all — a walk that reached nothing would
+    // satisfy the rules below by holding nothing to break them.
     assert!(
-        listed.len() > 400,
+        listed.len() > 100,
         "expected one hand-written root per service crate that keeps one, read {}",
         listed.len()
     );

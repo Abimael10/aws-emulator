@@ -1,17 +1,24 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! `CreateFlowVersion` is ordered behind preparation, end to end over HTTP: a
-//! numbered version is cut only from a flow the service holds in the `Prepared`
-//! status, and a flow in any other modelled `FlowStatus` is refused with the
-//! operation's modelled `ConflictException` without a version being cut.
+//! numbered version is cut only from a flow whose preparation SUCCEEDED, and a
+//! flow with no successful preparation behind it is refused with the operation's
+//! modelled `ConflictException` without a version being cut.
+//!
+//! What the rule reads is the OUTCOME of the preparation the service accepted,
+//! not the status the clock is still reporting: a flow the service has just
+//! accepted a sound preparation for is versioned by the very next call, while a
+//! flow being prepared towards a failure is refused even though it is reported
+//! in the same transient status.
 //!
 //! The table below spans the statuses a stored flow can be in when the call
-//! arrives — never prepared, prepared and then changed, being prepared, left
-//! `Failed` by a preparation a defect stopped, and prepared — so the rule is
-//! asserted over the whole modelled enum rather than over one recorded status.
-//! A second table takes the same statuses across the two forms the modelled
+//! arrives — never prepared, prepared and then changed, being prepared towards
+//! each of the two outcomes a preparation reaches, left `Failed` by a
+//! preparation a defect stopped, and prepared — so the rule is asserted over the
+//! whole modelled enum rather than over one recorded status. A second table
+//! takes the refusing statuses across the two forms the modelled
 //! `FlowIdentifier` admits and across how often the refused cut is repeated,
-//! because what decides the refusal is the addressed flow's stored status and
+//! because what decides the refusal is the addressed flow's own preparation and
 //! nothing else: not how the request spelled the identifier, not how many times
 //! it was taken, and not what another flow in the same store stands in.
 //!
@@ -261,7 +268,7 @@ impl Emulator {
                 self.update_flow(case, flow_id, passthrough_definition())
                     .await;
             }
-            Drive::Preparing => {
+            Drive::Preparing | Drive::PreparingToFailure => {
                 self.prepare_flow(case, flow_id).await;
             }
             Drive::PreparationFailed | Drive::Prepared => {
@@ -390,52 +397,87 @@ enum Drive {
     Created,
     /// Prepared, settled, then changed again by `UpdateFlow`.
     ChangedAfterPreparing,
-    /// `PrepareFlow` accepted and the outcome not yet due.
+    /// `PrepareFlow` accepted for a sound definition and the outcome not yet
+    /// reported.
     Preparing,
+    /// `PrepareFlow` accepted for a definition a defect stops, and the outcome
+    /// not yet reported.
+    PreparingToFailure,
     /// Prepared with a definition a defect stops, and the outcome settled.
     PreparationFailed,
     /// Prepared with a sound definition, and the outcome settled.
     Prepared,
 }
 
+impl Drive {
+    /// The definition the flow a row drives is created with: one a defect stops
+    /// for the rows whose preparation must fail, a sound one otherwise.
+    fn definition(self) -> Value {
+        match self {
+            Self::PreparationFailed | Self::PreparingToFailure => cyclic_definition(),
+            _ => passthrough_definition(),
+        }
+    }
+}
+
 /// Rows spanning the modelled `FlowStatus` values a stored flow can carry when
-/// `CreateFlowVersion` arrives, with the status each one leaves the flow in.
-const STATUS_CASES: &[(&str, Drive, &str)] = &[
-    ("a flow nobody has prepared", Drive::Created, "NotPrepared"),
+/// `CreateFlowVersion` arrives: the status the service reports it in, and
+/// whether the cut is served.
+///
+/// What serves a cut is a SUCCESSFUL preparation behind the DRAFT, so the two
+/// rows reported in the transient `Preparing` status differ in their outcome
+/// alone — the one whose definition prepares cleanly is versioned, the one a
+/// defect stops is not.
+const STATUS_CASES: &[(&str, Drive, &str, bool)] = &[
+    (
+        "a flow nobody has prepared",
+        Drive::Created,
+        "NotPrepared",
+        false,
+    ),
     (
         "a flow changed after it was prepared",
         Drive::ChangedAfterPreparing,
         "NotPrepared",
+        false,
     ),
-    ("a flow still being prepared", Drive::Preparing, "Preparing"),
+    (
+        "a flow whose accepted preparation is still being reported",
+        Drive::Preparing,
+        "Preparing",
+        true,
+    ),
+    (
+        "a flow being prepared towards a failure",
+        Drive::PreparingToFailure,
+        "Preparing",
+        false,
+    ),
     (
         "a flow whose preparation failed",
         Drive::PreparationFailed,
         "Failed",
+        false,
     ),
-    ("a prepared flow", Drive::Prepared, "Prepared"),
+    ("a prepared flow", Drive::Prepared, "Prepared", true),
 ];
 
-/// The rule: `CreateFlowVersion` cuts a version only from a flow in the
-/// `Prepared` status. Every other status is refused 409 `ConflictException`
-/// naming the status the flow is in, and the refusal writes nothing — the
-/// listing gains no entry and no version number is consumed, which the cut taken
-/// after the flow is driven to `Prepared` proves by still being version 1.
+/// The rule: `CreateFlowVersion` cuts a version only from a flow whose
+/// preparation succeeded. A flow with no successful preparation behind it is
+/// refused 409 `ConflictException` naming the status it is reported in, and the
+/// refusal writes nothing — the listing gains no entry and no version number is
+/// consumed, which the cut taken after the flow is driven to `Prepared` proves
+/// by still being version 1.
 #[tokio::test]
 async fn create_flow_version_is_ordered_behind_preparation() {
-    for (case, drive, expected_status) in STATUS_CASES {
+    for (case, drive, expected_status, served) in STATUS_CASES {
         let emulator = Emulator::new();
-        let definition = if *drive == Drive::PreparationFailed {
-            cyclic_definition()
-        } else {
-            passthrough_definition()
-        };
-        let flow = emulator.create_flow(case, definition).await;
+        let flow = emulator.create_flow(case, drive.definition()).await;
         let flow_id = flow.string(&["id"]);
 
         emulator.drive_into(case, &flow_id, *drive).await;
 
-        // The status the rule reads is the one the service reports for the flow.
+        // The status the flow is reported in, which is what a refusal names.
         let read = emulator.get_flow(&flow_id).await;
         assert_eq!(
             read.string(&["status"]),
@@ -444,10 +486,10 @@ async fn create_flow_version_is_ordered_behind_preparation() {
         );
 
         let cut = emulator.create_flow_version(&flow_id).await;
-        if *expected_status == "Prepared" {
+        if *served {
             assert_eq!(
                 cut.status, 201,
-                "case {case}: a prepared flow is versioned, got {cut:?}"
+                "case {case}: a flow whose preparation succeeded is versioned, got {cut:?}"
             );
             assert_eq!(
                 cut.string(&["version"]),
@@ -457,7 +499,8 @@ async fn create_flow_version_is_ordered_behind_preparation() {
             assert_eq!(
                 cut.string(&["status"]),
                 "Prepared",
-                "case {case}: the version snapshots the prepared DRAFT, got {cut:?}"
+                "case {case}: the version reports the outcome of the preparation it \
+                 packages, got {cut:?}"
             );
             assert_eq!(
                 emulator.list_flow_versions(&flow_id).await.listed_versions(),
@@ -509,10 +552,10 @@ async fn create_flow_version_is_ordered_behind_preparation() {
     }
 }
 
-/// The guard is read off the flow's STORED status, not off the call that
-/// preceded it: the same flow refuses a cut while its preparation is in flight,
-/// serves one once that preparation's outcome is due, and refuses again as soon
-/// as a change puts the flow back out of `Prepared`.
+/// The guard is read off the ADDRESSED flow's own preparation: the same flow is
+/// versioned as soon as a sound preparation has been accepted for it, again once
+/// that preparation's outcome is reported, and refused as soon as a change puts
+/// the flow back behind a preparation.
 #[tokio::test]
 async fn the_version_guard_follows_the_flow_through_its_statuses() {
     let case = "one flow through the whole progression";
@@ -522,25 +565,31 @@ async fn the_version_guard_follows_the_flow_through_its_statuses() {
         .await;
     let flow_id = flow.string(&["id"]);
 
-    // Preparing: refused while the outcome is not yet due.
-    emulator.prepare_flow(case, &flow_id).await;
+    // A cut taken before any preparation is refused.
     let refused = emulator.create_flow_version(&flow_id).await;
     assert_eq!(
         refused.string(&["message"]),
-        conflict_message("Preparing"),
-        "case {case}: a cut taken mid-preparation is refused, got {refused:?}"
+        conflict_message("NotPrepared"),
+        "case {case}: a cut taken before preparation is refused, got {refused:?}"
     );
 
-    // Prepared: served.
-    emulator.settle_preparation(case, &flow_id);
+    // Preparing: the preparation has been accepted and succeeded, so the very
+    // next call is served — only the reporting of the outcome is outstanding.
+    emulator.prepare_flow(case, &flow_id).await;
     let first = emulator.create_flow_version(&flow_id).await;
     assert_eq!(
         first.status, 201,
         "case {case}: expected CreateFlowVersion -> 201, got {first:?}"
     );
+    assert_eq!(
+        first.string(&["version"]),
+        "1",
+        "case {case}: the first version cut is numbered 1, got {first:?}"
+    );
 
-    // A second cut of the same prepared flow is served too: the guard is about
-    // the flow's status, not about how many versions it already holds.
+    // Prepared: served too, and the numbering advances — the guard is about the
+    // flow's preparation, not about how many versions it already holds.
+    emulator.settle_preparation(case, &flow_id);
     let second = emulator.create_flow_version(&flow_id).await;
     assert_eq!(
         second.string(&["version"]),
@@ -602,9 +651,9 @@ impl Address {
 /// pattern `^[a-zA-Z0-9](-*[a-zA-Z0-9]){0,256}$`).
 const CLIENT_TOKEN: &str = "prepare-ordering-refusal-token-0001";
 
-/// The rows of [`STATUS_CASES`] a cut is refused in: every modelled
-/// `FlowStatus` other than `Prepared`, with the token the service reports for a
-/// flow driven into it.
+/// The rows of [`STATUS_CASES`] a cut is refused in: every state a flow with no
+/// successful preparation behind it can be in, with the token the service
+/// reports for a flow driven into it.
 const REFUSING_STATUSES: &[(&str, Drive, &str)] = &[
     ("never prepared", Drive::Created, "NotPrepared"),
     (
@@ -612,7 +661,11 @@ const REFUSING_STATUSES: &[(&str, Drive, &str)] = &[
         Drive::ChangedAfterPreparing,
         "NotPrepared",
     ),
-    ("preparation in flight", Drive::Preparing, "Preparing"),
+    (
+        "preparation in flight towards a failure",
+        Drive::PreparingToFailure,
+        "Preparing",
+    ),
     (
         "preparation a cyclic definition failed",
         Drive::PreparationFailed,
@@ -639,12 +692,7 @@ async fn the_refused_cut_is_decided_by_the_addressed_flow_and_writes_nothing() {
                     format!("{status_case}, addressed by {address:?}, refused {attempts} time(s)");
                 let case = case.as_str();
                 let emulator = Emulator::new();
-                let definition = if *drive == Drive::PreparationFailed {
-                    cyclic_definition()
-                } else {
-                    passthrough_definition()
-                };
-                let flow = emulator.create_flow(case, definition).await;
+                let flow = emulator.create_flow(case, drive.definition()).await;
                 let flow_id = flow.string(&["id"]);
                 let label = address.label(&flow);
                 emulator.drive_into(case, &flow_id, *drive).await;

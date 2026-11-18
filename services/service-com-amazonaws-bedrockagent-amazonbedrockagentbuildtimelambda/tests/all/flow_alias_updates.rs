@@ -43,6 +43,10 @@ const AUTHORIZATION: &str = "AWS4-HMAC-SHA256 \
 const EXECUTION_ROLE: &str =
     "arn:aws:iam::000000000000:role/service-role/AmazonBedrockExecutionRoleForFlows";
 
+/// The reserved alias id every flow carries an alias under, as the modelled
+/// `FlowAliasId` (`pattern ^(TSTALIASID|[0-9a-zA-Z]{10})$`) admits it.
+const TEST_ALIAS_ID: &str = "TSTALIASID";
+
 /// The members of an alias an `UpdateFlowAlias` request carries, and so the ones
 /// it replaces. Every other member of the response is the stored alias's own.
 const MUTABLE_MEMBERS: &[&str] = &[
@@ -88,6 +92,16 @@ impl Answer {
             .as_array()
             .cloned()
             .unwrap_or_else(|| panic!("flowAliasSummaries is not an array in {:?}", self.body))
+    }
+
+    /// The reported summaries of the aliases a CALLER created: every summary but
+    /// the flow's reserved test alias, which the service creates with the flow
+    /// and these rows about caller-created aliases leave out.
+    fn caller_summaries(&self) -> Vec<Value> {
+        self.summaries()
+            .into_iter()
+            .filter(|summary| summary["id"].as_str() != Some(TEST_ALIAS_ID))
+            .collect()
     }
 }
 
@@ -529,7 +543,7 @@ async fn update_flow_alias_replaces_the_mutable_members_and_keeps_the_identity()
             "case {case}: expected ListFlowAliases -> 200, got {listed:?}"
         );
         assert_eq!(
-            listed.summaries(),
+            listed.caller_summaries(),
             vec![updated.body.clone()],
             "case {case}: the flow enumerates the one alias as the update left it, \
              got {listed:?}"
@@ -693,8 +707,7 @@ async fn update_flow_alias_resolves_the_alias_the_request_addresses() {
 
     // Rows: pairs naming no alias of the addressed flow. The missing resource is
     // the flow when the flow is unknown, and the alias otherwise — including
-    // when the alias ARN names another flow's alias, and when the identifier is
-    // the test-alias token no create has used.
+    // when the alias ARN names another flow's alias.
     let unknown_flow = "0123456789";
     for (form, flow_identifier, alias_identifier, resource) in [
         ("an unknown flow", unknown_flow, alias_id.as_str(), "Flow"),
@@ -702,12 +715,6 @@ async fn update_flow_alias_resolves_the_alias_the_request_addresses() {
             "an alias id nothing created",
             first_id.as_str(),
             "0123456789",
-            "FlowAlias",
-        ),
-        (
-            "the test alias no create has used",
-            first_id.as_str(),
-            "TSTALIASID",
             "FlowAlias",
         ),
         (
@@ -802,7 +809,7 @@ async fn update_flow_alias_resolves_the_alias_the_request_addresses() {
         ("the second flow", second_id.as_str(), "base-alias"),
     ] {
         let listed = emulator.list_flow_aliases(identifier).await;
-        let summaries = listed.summaries();
+        let summaries = listed.caller_summaries();
         assert_eq!(
             summaries.len(),
             1,

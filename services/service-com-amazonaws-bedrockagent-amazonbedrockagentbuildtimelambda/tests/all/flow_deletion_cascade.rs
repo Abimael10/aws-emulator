@@ -46,6 +46,10 @@ const AUTHORIZATION: &str = "AWS4-HMAC-SHA256 \
 const EXECUTION_ROLE: &str =
     "arn:aws:iam::000000000000:role/service-role/AmazonBedrockExecutionRoleForFlows";
 
+/// The reserved alias id every flow carries an alias under, as the modelled
+/// `FlowAliasId` (`pattern ^(TSTALIASID|[0-9a-zA-Z]{10})$`) admits it.
+const TEST_ALIAS_ID: &str = "TSTALIASID";
+
 /// The error every read of a deleted flow answers, and the status this service's
 /// model binds to it.
 ///
@@ -91,13 +95,16 @@ impl Answer {
             .collect()
     }
 
-    /// The `name` member of every `ListFlowAliases` summary, in the order the
-    /// response listed them.
+    /// The `name` member of every `ListFlowAliases` summary of an alias a CALLER
+    /// created, in the order the response listed them: the flow's reserved test
+    /// alias, which the service creates and removes with the flow itself, is not
+    /// one of the children these rows count.
     fn listed_alias_names(&self) -> Vec<String> {
         self.member(&["flowAliasSummaries"])
             .as_array()
             .unwrap_or_else(|| panic!("flowAliasSummaries is not an array in {:?}", self.body))
             .iter()
+            .filter(|summary| summary["id"].as_str() != Some(TEST_ALIAS_ID))
             .map(|summary| summary["name"].as_str().unwrap_or_default().to_string())
             .collect()
     }
@@ -209,11 +216,6 @@ impl Emulator {
             .as_mut()
             .unwrap_or_else(|| panic!("case {case}: expected a preparation in flight"));
         pending.due = due;
-        for version in state.flow_versions.values_mut() {
-            if let Some((_, next)) = version.pending_status {
-                version.pending_status = Some((due, next));
-            }
-        }
     }
 
     /// A prepared flow cut into `versions` numbered versions and carrying

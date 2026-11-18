@@ -6,6 +6,12 @@
 //! as it stands, stored in [`crate::state`] so `ListFlowVersions` enumerates it
 //! beside the DRAFT it was cut from.
 //!
+//! A version is cut only from a DRAFT whose preparation SUCCEEDED, which is the
+//! outcome [`crate::state::FlowRecord::settled_status`] reports: a flow the
+//! service has accepted a sound `PrepareFlow` for is versioned by the very next
+//! call, while a flow with no successful preparation behind it is refused with
+//! the modelled `ConflictException` naming the status it is reported in.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -241,15 +247,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // Versioning is ordered behind preparation: a numbered version is a
-        // snapshot of the DRAFT as a deployable package, and only a DRAFT that
-        // `PrepareFlow` has driven to `Prepared` is one. A flow in any other
-        // modelled `FlowStatus` — never prepared, still being prepared, or left
-        // `Failed` by a preparation a defect in the definition stopped — is
-        // refused with the modelled `ConflictException`, which names the status
-        // the flow is stored in so the caller knows what to wait for. The
-        // refusal is taken BEFORE anything is written, so no version number is
-        // consumed and the flow's listing gains no entry.
-        if flow.status != crate::state::FLOW_STATUS_VERSIONS_ARE_CUT_FROM {
+        // snapshot of the DRAFT as a deployable package, and only a DRAFT
+        // `PrepareFlow` has prepared is one. What decides that is the status the
+        // flow's preparation SETTLED at — the outcome an accepted preparation
+        // already reached, whose reporting alone waits for the clock — so a flow
+        // the service has just accepted a sound preparation for is versioned by
+        // the very next call, and only a flow with no successful preparation
+        // behind it (never prepared, changed since, or left `Failed` by a defect
+        // in the definition) is refused with the modelled `ConflictException`.
+        // The refusal names the status the flow is REPORTED in, which is the one
+        // the caller sees and waits on. It is taken BEFORE anything is written,
+        // so no version number is consumed and the flow's listing gains no
+        // entry.
+        if flow.settled_status() != crate::state::FLOW_STATUS_VERSIONS_ARE_CUT_FROM {
             return Err(CreateFlowVersionErrorModeled::ConflictException(
                 ConflictException {
                     message: Some(crate::state::resource_status_conflict_message(

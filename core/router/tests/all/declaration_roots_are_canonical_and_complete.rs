@@ -91,8 +91,10 @@ fn every_declaration_root_declares_the_module_directories_beside_it() {
     // target in a `tests/all.rs`, differing in how many suites they declare, in how their
     // declarations are spelled, and in what sits beside them under `tests/all/`.
     let roots = declaration_roots();
+    // A floor rather than a census: a crate that migrates to the macro layout takes one root
+    // out of this walk.
     assert!(
-        roots.len() > 400,
+        roots.len() > 100,
         "expected one tests/all.rs per service crate under {}, read {} of them",
         workspace_root().display(),
         roots.len()
@@ -204,8 +206,10 @@ fn the_walk_reads_only_the_top_level_of_a_tests_all_directory() {
     // the `mod.rs` of a directory directly under `tests/all/` — never a file deeper in, which
     // the module there declares itself. Read against every root's directory on disk.
     let roots = declaration_roots();
+    // A floor rather than a census: a crate that migrates to the macro layout takes one root
+    // out of this walk.
     assert!(
-        roots.len() > 400,
+        roots.len() > 100,
         "expected one tests/all.rs per service crate under {}, read {} of them",
         workspace_root().display(),
         roots.len()

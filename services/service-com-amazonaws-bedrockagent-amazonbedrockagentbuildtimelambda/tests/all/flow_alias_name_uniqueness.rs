@@ -42,6 +42,10 @@ const AUTHORIZATION: &str = "AWS4-HMAC-SHA256 \
 const EXECUTION_ROLE: &str =
     "arn:aws:iam::000000000000:role/service-role/AmazonBedrockExecutionRoleForFlows";
 
+/// The reserved alias id every flow carries an alias under, as the modelled
+/// `FlowAliasId` (`pattern ^(TSTALIASID|[0-9a-zA-Z]{10})$`) admits it.
+const TEST_ALIAS_ID: &str = "TSTALIASID";
+
 /// One HTTP answer from the emulator, parsed.
 #[derive(Debug)]
 struct Answer {
@@ -68,13 +72,16 @@ impl Answer {
             .to_string()
     }
 
-    /// The `(name, id)` of every reported alias summary, in the order the
-    /// response listed them.
+    /// The `(name, id)` of every reported CALLER-created alias summary, in the
+    /// order the response listed them: the flow's reserved test alias, which the
+    /// service creates with the flow, is not one a caller named, so these rows
+    /// about the caller-settable alias namespace leave it out.
     fn listed(&self) -> Vec<(String, String)> {
         self.member(&["flowAliasSummaries"])
             .as_array()
             .unwrap_or_else(|| panic!("flowAliasSummaries is not an array in {:?}", self.body))
             .iter()
+            .filter(|summary| summary["id"].as_str() != Some(TEST_ALIAS_ID))
             .map(|summary| {
                 (
                     summary["name"].as_str().unwrap_or_default().to_string(),
@@ -700,7 +707,7 @@ async fn delete_flow_alias_resolves_every_modelled_identifier_form() {
         assert_eq!(
             emulator.list_flow_aliases(&flow_id).await.listed(),
             Vec::<(String, String)>::new(),
-            "case {case} ({form}): the flow holds no alias after the delete"
+            "case {case} ({form}): the flow holds no caller-created alias after the delete"
         );
     }
 
@@ -718,12 +725,6 @@ async fn delete_flow_alias_resolves_every_modelled_identifier_form() {
             "an alias id nothing created",
             flow_id.as_str(),
             "0123456789",
-            "FlowAlias",
-        ),
-        (
-            "the test alias no create has used",
-            flow_id.as_str(),
-            "TSTALIASID",
             "FlowAlias",
         ),
         (

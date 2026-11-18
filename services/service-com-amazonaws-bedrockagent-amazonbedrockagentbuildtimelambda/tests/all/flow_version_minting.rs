@@ -225,11 +225,6 @@ impl Emulator {
             .as_mut()
             .unwrap_or_else(|| panic!("case {case}: expected a preparation in flight"));
         pending.due = due;
-        for version in state.flow_versions.values_mut() {
-            if let Some((_, next)) = version.pending_status {
-                version.pending_status = Some((due, next));
-            }
-        }
     }
 }
 

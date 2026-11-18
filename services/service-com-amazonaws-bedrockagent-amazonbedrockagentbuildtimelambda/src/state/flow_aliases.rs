@@ -10,6 +10,14 @@
 //! by that pair in
 //! [`flow_aliases`](super::ComAmazonawsBedrockagentAmazonbedrockagentbuildtimelambdaState::flow_aliases)
 //! and no flow can ever report another flow's alias.
+//!
+//! Not every alias is a caller's: each flow also carries the reserved
+//! [`TEST_ALIAS_ID`] alias, which routes to the flow's DRAFT version and is
+//! stored with the flow itself
+//! ([`ComAmazonawsBedrockagentAmazonbedrockagentbuildtimelambdaState::store_flow`]),
+//! so a client can reach the DRAFT for testing before any version is cut. It is
+//! an alias like any other to every reader, and out of the caller-settable alias
+//! namespace to every writer.
 
 use super::*;
 
@@ -57,6 +65,40 @@ pub struct FlowAliasRecord {
 }
 
 impl FlowAliasRecord {
+    /// The reserved test alias of `flow`, as the service creates it with the
+    /// flow itself.
+    ///
+    /// It is an alias like any other — the same record, reported through the
+    /// same projections — pinned to the one thing that makes it the TEST alias:
+    /// it routes to the flow's DRAFT version, the version `PrepareFlow` prepares
+    /// for testing, so it is reachable before any numbered version has been cut.
+    /// Its id, name and description are all the reserved
+    /// [`TEST_ALIAS_ID`] token, and its ARN is the flow's own ARN with that
+    /// alias segment appended, as the modelled `FlowAliasArn` admits. It carries
+    /// the flow's creation instant, because that is when it came into being.
+    pub fn test_alias_of(flow: &FlowRecord) -> Self {
+        Self {
+            flow_id: flow.flow_id.clone(),
+            alias_id: TEST_ALIAS_ID.to_string(),
+            arn: format!("{}/alias/{TEST_ALIAS_ID}", flow.arn),
+            name: TEST_ALIAS_ID.to_string(),
+            description: Some(TEST_ALIAS_ID.to_string()),
+            routing_configuration: vec![FlowAliasRoutingConfigurationListItem {
+                flow_version: Some(DRAFT_VERSION.to_string()),
+            }],
+            concurrency_configuration: None,
+            tags: HashMap::new(),
+            created_at: flow.created_at,
+            updated_at: flow.created_at,
+        }
+    }
+
+    /// Whether this is the reserved test alias the service creates with the
+    /// flow, rather than one a caller created on it.
+    pub fn is_test_alias(&self) -> bool {
+        self.alias_id == TEST_ALIAS_ID
+    }
+
     /// This record as the `CreateFlowAlias` response: every member comes from
     /// the record just stored, never from the request being served.
     pub fn to_create_output(&self) -> CreateFlowAliasOutput {
@@ -148,9 +190,15 @@ pub fn flow_alias_identifier_pattern_message(identifier: &str) -> String {
 }
 
 /// The test alias every flow carries on AWS, as the modelled `FlowAliasId`
-/// (`^(TSTALIASID|[0-9a-zA-Z]{10})$`) spells it. It is admitted as an identifier
-/// form, and names an alias this store holds only once something has created
-/// one under it.
+/// (`^(TSTALIASID|[0-9a-zA-Z]{10})$`) spells it — the one alias id this service
+/// reserves, admitted as an identifier form and as a segment of the modelled
+/// `FlowAliasArn`.
+///
+/// It is the service's OWN alias of the flow, not a caller's: every stored flow
+/// carries it from creation ([`FlowAliasRecord::test_alias_of`]), it is never
+/// minted for a caller ([`ComAmazonawsBedrockagentAmazonbedrockagentbuildtimelambdaState::mint_flow_alias_id`]),
+/// and it is how a client invokes the flow's DRAFT version for testing before
+/// any version has been cut.
 pub const TEST_ALIAS_ID: &str = "TSTALIASID";
 
 /// The flow and alias a modelled `FlowAliasIdentifier` names, or `None` when the
@@ -268,6 +316,24 @@ impl FlowAliasPageCursor {
 }
 
 impl ComAmazonawsBedrockagentAmazonbedrockagentbuildtimelambdaState {
+    /// Store `flow`, together with the reserved test alias it carries from
+    /// creation.
+    ///
+    /// A flow and its test alias come into being TOGETHER — the alias is the
+    /// service's own, created with no caller action and routing to the DRAFT
+    /// version the flow is created with — so one place stores both and no stored
+    /// flow is ever without it. The aliases go with the flow when it is removed,
+    /// this one included
+    /// ([`Self::remove_flow_aliases`]).
+    pub fn store_flow(&mut self, flow: FlowRecord) {
+        let test_alias = FlowAliasRecord::test_alias_of(&flow);
+        self.flow_aliases.insert(
+            (flow.flow_id.clone(), test_alias.alias_id.clone()),
+            test_alias,
+        );
+        self.flows.insert(flow.flow_id.clone(), flow);
+    }
+
     /// Mint an unused `flowAliasId` for this flow, which the modelled
     /// `FlowAliasId` shape constrains to the same `^[0-9a-zA-Z]{10}$` as a
     /// `flowId` (beside the reserved test-alias token). `None` when every one of
@@ -352,15 +418,17 @@ impl ComAmazonawsBedrockagentAmazonbedrockagentbuildtimelambdaState {
     /// The alias that still references `flow_id`, or `None` when the flow has
     /// none.
     ///
-    /// What USES a flow is an alias created on it, whichever version of it the
-    /// alias routes to: the alias is how a caller reaches the flow, so every one
-    /// of them is a live reference. When the flow has several the
+    /// What USES a flow is an alias a CALLER created on it, whichever version of
+    /// it the alias routes to: such an alias is how a caller reaches the flow,
+    /// so every one of them is a live reference. The reserved test alias is not
+    /// one: the service created it with the flow and it goes with the flow, so a
+    /// caller has nothing to act on for it. When the flow has several the
     /// earliest-created one is reported, so a refusal naming it names the same
     /// alias however the store happens to be iterated.
     pub fn flow_alias_referencing_flow(&self, flow_id: &str) -> Option<&FlowAliasRecord> {
         self.flow_aliases
             .values()
-            .filter(|record| record.flow_id == flow_id)
+            .filter(|record| record.flow_id == flow_id && !record.is_test_alias())
             .min_by_key(|record| record.sort_key())
     }
 

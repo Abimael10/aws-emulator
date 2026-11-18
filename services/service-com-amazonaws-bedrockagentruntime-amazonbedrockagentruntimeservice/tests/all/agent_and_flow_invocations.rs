@@ -891,11 +891,6 @@ async fn a_flow_the_plane_does_not_hold_is_delivered_inside_the_stream() {
             other_flow.clone(),
             held_alias_arn.clone(),
         ),
-        (
-            "the draft alias token, which no flow here has an alias under",
-            held_flow.clone(),
-            "TSTALIASID".to_string(),
-        ),
     ];
 
     for (case, flow, alias) in rows {
@@ -1066,65 +1061,68 @@ async fn a_prepared_flow_delivers_the_outputs_its_own_definition_reaches() {
         emulator.prepare_flow(row.case, &flow).await;
         let (alias, _) = emulator.create_flow_alias(row.case, &flow, "DRAFT").await;
 
-        let reply = emulator
-            .invoke_flow(
-                &flow,
-                &alias,
-                flow_request("FlowInput", row.document.clone()),
-            )
-            .await;
-        assert_eq!(
-            reply.status,
-            200,
-            "case {:?}: expected 200, got {} {:?}",
-            row.case,
-            reply.status,
-            String::from_utf8_lossy(&reply.body)
-        );
-        assert_eq!(
-            reply.content_type, EVENT_STREAM,
-            "case {:?}: expected an event-stream body, got {:?}",
-            row.case, reply.content_type
-        );
-        let frames = decode_frames(row.case, &reply.body);
-        let mut expected: Vec<&str> = vec!["flowOutputEvent"; row.outputs.len()];
-        expected.push("flowCompletionEvent");
-        assert_eq!(
-            frame_names(&frames),
-            expected,
-            "case {:?}: expected one output event per output node, then the completion",
-            row.case
-        );
-        for (frame, node) in frames.iter().zip(&row.outputs) {
+        // Both aliases of the DRAFT this row prepared run the same definition: the one
+        // this row created, and the reserved test alias the build-time plane carries on
+        // every flow (`FlowAliasId` is `^(TSTALIASID|[0-9a-zA-Z]{10})$`), which is the
+        // alias a client invokes a DRAFT through before any version is cut.
+        for alias_identifier in [alias.as_str(), DRAFT_ALIAS] {
+            let case = format!("{} through the alias {alias_identifier}", row.case);
+            let case = case.as_str();
+            let reply = emulator
+                .invoke_flow(
+                    &flow,
+                    alias_identifier,
+                    flow_request("FlowInput", row.document.clone()),
+                )
+                .await;
             assert_eq!(
-                frame.payload["nodeName"].as_str(),
-                Some(*node),
-                "case {:?}: expected the output to name {node:?}, got {:?}",
-                row.case,
-                frame.payload
-            );
-            // A served output event carries `nodeName` and `content` alone: `nodeType` is a
-            // key this operation's recorded responses do not publish, whatever the model
-            // marks it.
-            assert!(
-                frame.payload.get("nodeType").is_none(),
-                "case {:?}: an output event publishes no nodeType, got {:?}",
-                row.case,
-                frame.payload
+                reply.status,
+                200,
+                "case {case:?}: expected 200, got {} {:?}",
+                reply.status,
+                String::from_utf8_lossy(&reply.body)
             );
             assert_eq!(
-                frame.payload["content"]["document"], row.document,
-                "case {:?}: expected the document that entered the flow, got {:?}",
-                row.case, frame.payload
+                reply.content_type, EVENT_STREAM,
+                "case {case:?}: expected an event-stream body, got {:?}",
+                reply.content_type
+            );
+            let frames = decode_frames(case, &reply.body);
+            let mut expected: Vec<&str> = vec!["flowOutputEvent"; row.outputs.len()];
+            expected.push("flowCompletionEvent");
+            assert_eq!(
+                frame_names(&frames),
+                expected,
+                "case {case:?}: expected one output event per output node, then the completion"
+            );
+            for (frame, node) in frames.iter().zip(&row.outputs) {
+                assert_eq!(
+                    frame.payload["nodeName"].as_str(),
+                    Some(*node),
+                    "case {case:?}: expected the output to name {node:?}, got {:?}",
+                    frame.payload
+                );
+                // A served output event carries `nodeName` and `content` alone: `nodeType`
+                // is a key this operation's recorded responses do not publish, whatever the
+                // model marks it.
+                assert!(
+                    frame.payload.get("nodeType").is_none(),
+                    "case {case:?}: an output event publishes no nodeType, got {:?}",
+                    frame.payload
+                );
+                assert_eq!(
+                    frame.payload["content"]["document"], row.document,
+                    "case {case:?}: expected the document that entered the flow, got {:?}",
+                    frame.payload
+                );
+            }
+            let completion = &frames[frames.len() - 1].payload;
+            assert_eq!(
+                completion["completionReason"].as_str(),
+                Some("SUCCESS"),
+                "case {case:?}: expected the run to complete successfully, got {completion:?}"
             );
         }
-        let completion = &frames[frames.len() - 1].payload;
-        assert_eq!(
-            completion["completionReason"].as_str(),
-            Some("SUCCESS"),
-            "case {:?}: expected the run to complete successfully, got {completion:?}",
-            row.case
-        );
     }
 }
 

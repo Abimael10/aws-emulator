@@ -46,6 +46,10 @@ const AUTHORIZATION: &str = "AWS4-HMAC-SHA256 \
 const EXECUTION_ROLE: &str =
     "arn:aws:iam::000000000000:role/service-role/AmazonBedrockExecutionRoleForFlows";
 
+/// The reserved alias id every flow carries an alias under, as the modelled
+/// `FlowAliasId` (`pattern ^(TSTALIASID|[0-9a-zA-Z]{10})$`) admits it.
+const TEST_ALIAS_ID: &str = "TSTALIASID";
+
 /// How many numbered versions the flow every row below races against holds, so a
 /// racer can route to a different version from its neighbour and still name one
 /// the flow holds.
@@ -77,13 +81,16 @@ impl Answer {
             .to_string()
     }
 
-    /// The `(name, id)` of every reported alias summary, in the order the
-    /// response listed them.
+    /// The `(name, id)` of every reported CALLER-created alias summary, in the
+    /// order the response listed them: the flow's reserved test alias, which the
+    /// service creates with the flow, is in no caller's race for a name, so
+    /// these rows leave it out.
     fn listed(&self) -> Vec<(String, String)> {
         self.member(&["flowAliasSummaries"])
             .as_array()
             .unwrap_or_else(|| panic!("flowAliasSummaries is not an array in {:?}", self.body))
             .iter()
+            .filter(|summary| summary["id"].as_str() != Some(TEST_ALIAS_ID))
             .map(|summary| {
                 let member = |name: &str| {
                     summary[name]
