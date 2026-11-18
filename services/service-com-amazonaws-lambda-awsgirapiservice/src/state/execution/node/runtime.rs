@@ -1956,14 +1956,16 @@ pub(super) const RUNTIME_SOURCE: &str = r##"
         // services are reachable, signs the request and dispatches it. The credentials the
         // CLIENT was built with travel with the call, so a client built with a session the
         // handler was vended is signed as that session; one built with none is signed as the
-        // identity the invocation was given.
-        awsCall: function (service, operation, region, body, credentials) {
+        // identity the invocation was given. The ENDPOINT it was built with travels for the
+        // same reason: that is where the SDK sends such a client's calls.
+        awsCall: function (service, operation, region, body, credentials, endpoint) {
             return hostAwsCall(
                 service,
                 operation,
                 region,
                 body,
-                typeof credentials === 'string' ? credentials : ''
+                typeof credentials === 'string' ? credentials : '',
+                typeof endpoint === 'string' ? endpoint : ''
             );
         },
         // The ONE request the `http` and `https` core modules send: the host decides which

@@ -1601,11 +1601,12 @@ fn host_module(vm: &VirtualMachine, session: &Arc<Session>) -> PyResult<PyRef<Py
         &module,
         "aws",
         move |args: FuncArgs, vm: &VirtualMachine| {
-            let (service, operation, region, body, credentials): (
+            let (service, operation, region, body, credentials, endpoint): (
                 String,
                 String,
                 String,
                 String,
+                OptionalArg<String>,
                 OptionalArg<String>,
             ) = args.bind(vm)?;
             let call_bounds = calling.bounds();
@@ -1640,6 +1641,14 @@ fn host_module(vm: &VirtualMachine, session: &Arc<Session>) -> PyResult<PyRef<Py
                     return Ok(vm.ctx.new_str(refusal_answer("not_made", &detail)).into())
                 }
             };
+            // Addressed at the endpoint the SDK CLIENT this call was made through was built
+            // with, where it was built with one: an API whose resource is named only by its
+            // endpoint is addressed nowhere else
+            // ([`super::aws_api::ClientEndpoint`]).
+            let addressed: Option<&str> = endpoint.as_ref().map(String::as_str).into();
+            let access = access.addressed_by_client(
+                addressed.and_then(super::aws_api::ClientEndpoint::configured),
+            );
             let remaining = call_bounds.remaining();
             if remaining.is_zero() {
                 return Err(vm.new_runtime_error(Stop::Deadline.reason().to_owned()));

@@ -1000,6 +1000,7 @@ class Client:
         aws_access_key_id=None,
         aws_secret_access_key=None,
         aws_session_token=None,
+        endpoint_url=None,
         **_ignored
     ):
         import os
@@ -1021,9 +1022,14 @@ class Client:
         self._credentials = _supplied_credentials(
             aws_access_key_id, aws_secret_access_key, aws_session_token
         )
-        self._endpoint_url = "https://%s.%s.amazonaws.com" % (
-            service_name,
-            self._region_name,
+        # WHERE this client's calls are addressed: "The complete URL to use for the
+        # constructed client", which the SDK sends every call of this client to. A client
+        # built with none is addressed at the service's own regional endpoint, and that is
+        # what it reports; an API whose resource is named only by its endpoint — the
+        # `@connections` surface of a WebSocket api — is reachable no other way.
+        self._configured_endpoint = endpoint_url if endpoint_url else ""
+        self._endpoint_url = self._configured_endpoint or (
+            "https://%s.%s.amazonaws.com" % (service_name, self._region_name)
         )
         self.exceptions = _ClientExceptions(service_name)
         self.meta = _ClientMeta(
@@ -1174,6 +1180,7 @@ class Client:
                 self._region_name,
                 json.dumps(self._sent(parameters), default=_encoded),
                 self._credentials,
+                self._configured_endpoint,
             )
         )
         refused = answered.get("refused")

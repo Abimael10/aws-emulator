@@ -508,6 +508,7 @@ function Client(configuration) {
     this.config = {
         region: held.region === undefined ? globalThis.process.env.AWS_REGION : held.region,
         credentials: held.credentials,
+        endpoint: held.endpoint,
         serviceId: SERVICE
     };
 }
@@ -551,6 +552,23 @@ function signedWith(credentials) {
     });
 }
 
+// WHERE a client's calls are addressed: the endpoint the client was built with
+// (`new Client({ endpoint: 'https://host/stage' })`), which is where the SDK sends every call
+// of such a client. A client built with none is addressed at the service's own regional
+// endpoint, which the empty value stands for. A `URL` — or anything else carrying the address
+// written out under `href`, which is how the SDK reads such a value — is addressed at that;
+// an endpoint given as parts or as a provider function is not one this runtime reads, so such
+// a client is addressed as one built with none rather than at an address assembled here.
+function addressedAt(endpoint) {
+    if (typeof endpoint === 'string') {
+        return endpoint;
+    }
+    if (endpoint !== null && typeof endpoint === 'object' && typeof endpoint.href === 'string') {
+        return endpoint.href;
+    }
+    return '';
+}
+
 Client.prototype.send = function (command) {
     var self = this;
     return new Promise(function (resolve, reject) {
@@ -567,7 +585,8 @@ Client.prototype.send = function (command) {
                 operation,
                 region,
                 JSON.stringify(sentInput(command.input === undefined ? {} : command.input)),
-                signedWith(self.config.credentials)
+                signedWith(self.config.credentials),
+                addressedAt(self.config.endpoint)
             ));
         } catch (error) {
             reject(error);

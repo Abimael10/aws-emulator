@@ -33,6 +33,12 @@
 //!   the next service as that session, and the serving service judges it on the policies in
 //!   force on THAT identity. Nothing is minted here and nothing is taken on trust: a
 //!   credential this emulator did not vend verifies nowhere.
+//! * A call made through an SDK client the handler built WITH AN ENDPOINT OF ITS OWN is
+//!   addressed at that endpoint ([`ClientEndpoint`]), because that is where every AWS SDK
+//!   sends the calls of such a client — and for an API whose resource is named ONLY by its
+//!   endpoint, the address is part of the request. The destination is still this emulator's
+//!   own router; what the endpoint decides is the `Host` and the path the serving service
+//!   reads the addressing off.
 //! * Only the services in [`APIS`] are reachable, and only the operations their own models
 //!   bind. A token that is not in that table is REFUSED rather than guessed at: the guest
 //!   is told the service is unknown, and nothing is sent.
@@ -1707,6 +1713,89 @@ impl CallerIdentity {
     }
 }
 
+/// The longest endpoint URL this seam reads. A value past it is no address of this emulator's,
+/// so it is not read at all and the call is addressed at the called service's own endpoint.
+const MAX_ENDPOINT_CHARS: usize = 2048;
+
+/// The ENDPOINT an SDK CLIENT the guest built was configured with, as a request is addressed
+/// at it: the authority it names, and the base path in front of the operation's own binding.
+///
+/// WHY a client's endpoint has to travel at all: every AWS SDK sends the calls of a client
+/// built with an explicit endpoint to THAT endpoint, and for an API whose resource is named
+/// only by its endpoint the address IS part of the request. API Gateway's `@connections`
+/// surface is one — its operations take no api and no stage member
+/// (`smithy_query(query="operation", operation="PostToConnection", model_path="services/service-com-amazonaws-apigatewaymanagementapi-apigatewaymanagementapi/smithy-model/com-amazonaws-apigatewaymanagementapi-apigatewaymanagementapi.json")`),
+/// and AWS publishes them on the owning api's own invoke endpoint, the URL a backend's client
+/// is configured with — so WHICH api's stage a call addresses, and therefore the `execute-api`
+/// resource it is authorized on, is readable nowhere else in the request. A call dispatched at
+/// the service's own regional host instead addresses no stage at all.
+///
+/// Only an absolute `http`/`https` URL naming an authority and a plain path is read: anything
+/// else leaves the call addressed at the called service's own regional endpoint, exactly as a
+/// client built with no endpoint is. Nothing here opens a socket — the destination is still
+/// the in-process callback, as the module docs state — so what an endpoint decides is the
+/// `Host` field and the path, and never where the request goes. For the same reason only the
+/// AUTHORITY and the PATH travel: the SCHEME selects a transport, and this dispatch has one
+/// transport, so an endpoint written either way reaches the same router. What a value may NOT
+/// carry is read strictly, so only a plain base path is ever put in front of the operation's
+/// own: no userinfo on the authority, no query, and no empty or dot segment — written out or
+/// percent-encoded — in the path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClientEndpoint {
+    /// The authority the request is addressed at: the host, with the port where the URL names
+    /// one.
+    authority: String,
+    /// The path in front of the operation's own binding — empty, or `/` followed by segments.
+    base_path: String,
+}
+
+impl ClientEndpoint {
+    /// What `url` addresses, or `None` for a value this seam does not read as an endpoint (see
+    /// the type's own documentation).
+    #[must_use]
+    pub fn configured(url: &str) -> Option<Self> {
+        let url = url.trim();
+        if url.is_empty() || url.len() > MAX_ENDPOINT_CHARS {
+            return None;
+        }
+        let parsed: ::http::Uri = url.parse().ok()?;
+        if !matches!(parsed.scheme_str(), Some("http" | "https")) {
+            return None;
+        }
+        let authority = parsed.authority()?.to_string();
+        // An authority carrying USERINFO is not an endpoint's: it would travel as part of the
+        // `Host` field, which names a host and a port and nothing else.
+        if authority.contains('@') {
+            return None;
+        }
+        // A query is no part of an endpoint, and a base path may not walk: a value carrying
+        // either is not read as one, so nothing a guest supplies can address a path of its own
+        // devising in front of the operation's.
+        if parsed.query().is_some() {
+            return None;
+        }
+        let base_path = parsed.path().trim_end_matches('/').to_string();
+        if base_path.split('/').skip(1).any(|segment| !plain(segment)) {
+            return None;
+        }
+        Some(Self {
+            authority,
+            base_path,
+        })
+    }
+}
+
+/// Whether one path segment is a plain one: a segment a base path may carry, rather than an
+/// empty one or a dot segment that walks.
+///
+/// A dot segment counts however it is written, because a path is read after its escapes are
+/// decoded (RFC 3986 §2.3: a percent-encoded unreserved character "should be decoded to its
+/// corresponding unreserved character"), so `%2e%2e` is the same segment as `..`.
+fn plain(segment: &str) -> bool {
+    let decoded = segment.to_ascii_lowercase().replace("%2e", ".");
+    !decoded.is_empty() && decoded != "." && decoded != ".."
+}
+
 /// What a running handler reaches the rest of this emulator through.
 ///
 /// Built from the operation context of the call that started the run, so the callback it
@@ -1753,6 +1842,10 @@ pub struct AwsAccess {
     /// endpoint, in which case no URL is signed at all rather than one signed for an address
     /// nothing answers.
     endpoint: Option<::smithy_server_runtime::EndpointUrl>,
+    /// The ENDPOINT the SDK CLIENT a call was made through was configured with, where it was
+    /// built with one ([`ClientEndpoint`]) — `None` for a client built with none, whose calls
+    /// are addressed at the called service's own regional endpoint.
+    client_endpoint: Option<ClientEndpoint>,
 }
 
 impl AwsAccess {
@@ -1770,6 +1863,7 @@ impl AwsAccess {
             published: None,
             dialable: None,
             endpoint: None,
+            client_endpoint: None,
         })
     }
 
@@ -1851,6 +1945,17 @@ impl AwsAccess {
     #[must_use]
     pub fn addressed_at(mut self, endpoint: ::smithy_server_runtime::EndpointUrl) -> Self {
         self.endpoint = Some(endpoint);
+        self
+    }
+
+    /// The same access, addressing every call it makes at `endpoint` — the endpoint the SDK
+    /// CLIENT the call was made through was configured with ([`ClientEndpoint`]).
+    ///
+    /// `None` addresses the call at the called service's own regional endpoint, which is where
+    /// an SDK sends the calls of a client built with no endpoint of its own.
+    #[must_use]
+    pub fn addressed_by_client(mut self, endpoint: Option<ClientEndpoint>) -> Self {
+        self.client_endpoint = endpoint;
         self
     }
 
@@ -1968,8 +2073,11 @@ impl AwsAccess {
                     region,
                     operation,
                     body,
-                    self.identity.as_ref(),
-                    self.trace_header.as_deref(),
+                    Caller {
+                        identity: self.identity.as_ref(),
+                        trace_header: self.trace_header.as_deref(),
+                        addressed_at: self.client_endpoint.as_ref(),
+                    },
                 )
                 .await
             }
@@ -2203,6 +2311,23 @@ pub struct Answer {
     pub payload_blobs: Vec<String>,
 }
 
+/// What the CALLER of one dispatch brings to it, beside the operation and the input document:
+/// the credential the request is signed with, the tracing context it carries, and the endpoint
+/// the SDK client it was made through was configured with.
+///
+/// One value rather than three parameters, because all three are facts about the CLIENT and
+/// the invocation rather than about the request, and every one of them is read in one place.
+struct Caller<'a> {
+    /// The credential the request is signed with, or `None` to sign with the credential the
+    /// framework hands this emulator's handlers ([`signed`]).
+    identity: Option<&'a CallerIdentity>,
+    /// The tracing header the request carries, or `None` for a run with no trace context.
+    trace_header: Option<&'a str>,
+    /// The endpoint the request is addressed at, or `None` to address it at the called
+    /// service's own regional endpoint ([`ClientEndpoint`]).
+    addressed_at: Option<&'a ClientEndpoint>,
+}
+
 /// Build, sign and dispatch one request, and read the answer back.
 async fn dispatch(
     callback: &EmbeddedEmulator,
@@ -2210,10 +2335,9 @@ async fn dispatch(
     region: &str,
     operation: &str,
     body: &str,
-    identity: Option<&CallerIdentity>,
-    trace_header: Option<&str>,
+    caller: Caller<'_>,
 ) -> Result<Answer, Refusal> {
-    sent(callback, api, region, operation, body, identity, trace_header)
+    sent(callback, api, region, operation, body, caller)
         .await
         .map_err(|detail| match detail {
             Sent::TooLarge => Refusal::ResponseTooLarge,
@@ -2236,10 +2360,19 @@ async fn sent(
     region: &str,
     operation: &str,
     body: &str,
-    identity: Option<&CallerIdentity>,
-    trace_header: Option<&str>,
+    caller: Caller<'_>,
 ) -> Result<Answer, Sent> {
-    let host = api.host(region);
+    let Caller {
+        identity,
+        trace_header,
+        addressed_at,
+    } = caller;
+    // WHERE the request is addressed: the endpoint the SDK client was configured with, where
+    // it was built with one, and otherwise the called service's own regional endpoint
+    // ([`ClientEndpoint`]). The base path goes in front of the path the operation's own
+    // binding names, which is how every SDK addresses a client's endpoint.
+    let host = addressed_at.map_or_else(|| api.host(region), |at| at.authority.clone());
+    let base_path = addressed_at.map_or("", |at| at.base_path.as_str());
     let mut builder = ::http::Request::builder().header("host", host.clone());
     // The invocation's own tracing context, stamped on the request the way an SDK inside a
     // function stamps it (see [`AwsAccess::trace_header`]). It is put on BEFORE the signature
@@ -2255,7 +2388,7 @@ async fn sent(
         } => {
             builder = builder
                 .method("POST")
-                .uri(format!("https://{host}/"))
+                .uri(format!("https://{host}{base_path}/"))
                 .header("content-type", api.content_type())
                 .header(TARGET_HEADER, format!("{target_prefix}.{operation}"));
             // A client of a query-compatible service asks for the legacy error vocabulary
@@ -2274,7 +2407,7 @@ async fn sent(
             let bound = super::rest_json::bind(rest, operation, &input).map_err(Sent::NotMade)?;
             builder = builder
                 .method(bound.method.as_str())
-                .uri(format!("https://{host}{}", bound.target));
+                .uri(format!("https://{host}{base_path}{}", bound.target));
             if bound.json_body {
                 builder = builder.header("content-type", api.content_type());
             }
@@ -2501,7 +2634,8 @@ fn well_formed_region(region: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        api_for, held_model, reachable_services, well_formed_operation, well_formed_region, APIS,
+        api_for, held_model, reachable_services, well_formed_operation, well_formed_region,
+        ClientEndpoint, APIS,
     };
 
     /// RULE: a service is reached by either spelling of its SDK id — the words run together, as
@@ -2806,6 +2940,96 @@ mod tests {
                 actual, expected,
                 "case {case:?}: expected well_formed_region({region:?}) to be {expected}, \
                  got {actual}"
+            );
+        }
+    }
+
+    /// RULE: a client's endpoint decides the authority a call is addressed at and the base
+    /// path in front of the operation's own binding, and a value that is no absolute
+    /// `http`/`https` URL naming an authority and a plain path is not read as an endpoint at
+    /// all — such a call is addressed at the called service's own regional endpoint.
+    ///
+    /// The rows span what the rule generalises over: whether the URL names a port, how its
+    /// path is written (none, a stage, a stage with a trailing slash, several segments), the
+    /// scheme, and the forms a base path may not take.
+    #[test]
+    fn a_clients_endpoint_decides_the_authority_and_the_base_path() {
+        // Longer than this seam reads, for the row that pins the bound.
+        let past_the_bound = format!(
+            "https://127.0.0.1:45273/{}",
+            "p".repeat(super::MAX_ENDPOINT_CHARS)
+        );
+        // (case, the configured value, the authority and base path it addresses)
+        type Row<'a> = (&'a str, &'a str, Option<(&'a str, &'a str)>);
+        let rows: &[Row<'_>] = &[
+            (
+                "the published endpoint of an api's stage",
+                "https://abc123.execute-api.us-east-1.amazonaws.com/prod",
+                Some(("abc123.execute-api.us-east-1.amazonaws.com", "/prod")),
+            ),
+            (
+                "the same with a trailing slash",
+                "https://abc123.execute-api.us-east-1.amazonaws.com/prod/",
+                Some(("abc123.execute-api.us-east-1.amazonaws.com", "/prod")),
+            ),
+            (
+                "an address carrying a port, as this emulator's own planes do",
+                "https://127.0.0.1:45273/prod",
+                Some(("127.0.0.1:45273", "/prod")),
+            ),
+            (
+                "an endpoint with no path at all",
+                "https://127.0.0.1:45273",
+                Some(("127.0.0.1:45273", "")),
+            ),
+            (
+                "an endpoint whose path is a bare slash",
+                "http://localhost:8080/",
+                Some(("localhost:8080", "")),
+            ),
+            (
+                "a base path of several segments, as a custom domain's mapping adds",
+                "https://api.example.test/v1/socket",
+                Some(("api.example.test", "/v1/socket")),
+            ),
+            ("the empty value, which is a client built with none", "", None),
+            ("a value naming no authority", "/prod/@connections", None),
+            (
+                "a scheme no AWS endpoint is addressed by",
+                "ws://127.0.0.1:45273/prod",
+                None,
+            ),
+            ("a path that walks", "https://127.0.0.1:45273/prod/../other", None),
+            (
+                "a path that walks percent-encoded",
+                "https://127.0.0.1:45273/prod/%2E%2E/other",
+                None,
+            ),
+            (
+                "an authority carrying userinfo",
+                "https://user@127.0.0.1:45273/prod",
+                None,
+            ),
+            (
+                "a path carrying an empty segment",
+                "https://127.0.0.1:45273/prod//x",
+                None,
+            ),
+            (
+                "a value carrying a query",
+                "https://127.0.0.1:45273/prod?x=1",
+                None,
+            ),
+            ("a value longer than this seam reads", &past_the_bound, None),
+        ];
+        for (case, configured, expected) in rows {
+            let addressed = ClientEndpoint::configured(configured);
+            let read = addressed
+                .as_ref()
+                .map(|at| (at.authority.as_str(), at.base_path.as_str()));
+            assert_eq!(
+                read, *expected,
+                "case {case:?}: expected {expected:?}, got {read:?}"
             );
         }
     }

@@ -664,7 +664,8 @@ fn install_host(
                       operation: String,
                       region: String,
                       body: String,
-                      credentials: String| {
+                      credentials: String,
+                      endpoint: String| {
                     // A run whose budget is already spent makes no further call: the
                     // latched stop is its answer, so work it starts afterwards is work
                     // nothing will report.
@@ -701,6 +702,13 @@ fn install_host(
                         Some(identity) => access.clone().signing_as(Some(identity)),
                         None => access.clone(),
                     };
+                    // Addressed at the endpoint the client this call was made through was
+                    // built with, where it was built with one: an API whose resource is named
+                    // only by its endpoint is addressed nowhere else
+                    // ([`super::aws_api::ClientEndpoint`]).
+                    let access = access.addressed_by_client(
+                        super::aws_api::ClientEndpoint::configured(&endpoint),
+                    );
                     call_answer(&access.call(&service, &operation, &region, &body, remaining))
                 },
             ),
