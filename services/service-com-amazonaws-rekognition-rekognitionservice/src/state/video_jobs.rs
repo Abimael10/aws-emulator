@@ -241,3 +241,21 @@ pub fn committed_parameters(
 fn member(name: &str, value: Option<&str>) -> (String, String) {
     (name.to_string(), value.unwrap_or_default().to_string())
 }
+
+/// One stated member per element of a LIST input member: the member's modelled name followed
+/// by the element's position, and the element itself.
+///
+/// A list is flattened element by element rather than joined into one value, so two requests
+/// differing in a list's length, its order or any one element are two different requests
+/// whatever the elements contain — a joined value would make two lists that differ only in
+/// where a separator falls compare equal. A request that left the member out, and one that
+/// sent it empty, both state no element: an empty list asks for nothing, which is what
+/// leaving it out asks for too.
+pub fn list_members(name: &str, values: Option<&[String]>) -> Vec<(String, Option<String>)> {
+    values
+        .unwrap_or_default()
+        .iter()
+        .enumerate()
+        .map(|(index, value)| (format!("{name}.{}", index + 1), Some(value.clone())))
+        .collect()
+}

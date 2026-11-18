@@ -66,7 +66,8 @@
 //! stored-video analysis is the JOB — a `Start…` operation establishes with this emulator's
 //! own Amazon S3 that the object it was given is served ([`video_source`]), records the
 //! request as a job of [`video_jobs`] and hands back the identifier the matching `Get…`
-//! operation reads that job by, with the job's status owed by the clock. The analysis
+//! operation reads that job by, with the job's status owed by the clock. That start is one
+//! sequence for the whole family, so it lives once in [`video_analysis`]. The analysis
 //! RESULTS belong to the `Get…` operation that reports them, and the ones that would report
 //! them stay unimplemented 501s.
 //!
@@ -83,6 +84,7 @@ pub mod image_source;
 pub mod label_detection;
 pub mod modeled_error;
 pub mod project_policies;
+pub mod video_analysis;
 pub mod video_jobs;
 pub mod video_source;
 

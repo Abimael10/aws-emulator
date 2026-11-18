@@ -1,15 +1,19 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op StartLabelDetection
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `StartLabelDetection`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`StartLabelDetection::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Starting a label detection on a stored video RECORDS A JOB: the video the request names
+//! is confirmed against this emulator's own Amazon S3, the request is written to this
+//! service's video-job store ([`crate::state::video_jobs`]) and the `JobId` that store keyed
+//! it by is what the caller gets back, so the same token sent again answers with that same
+//! job rather than starting a second one. That sequence is the one every `Start…` operation
+//! of this API runs, so it lives once in [`crate::state::video_analysis`]; what this file
+//! owns is the input members that configure a LABEL analysis — the confidence floor, the
+//! features asked for and the label filters — and which modelled error each refusal is
+//! answered with. The labels the analysis finds are the business of `GetLabelDetection`,
+//! which is a scaffold stub of its own; nothing in this process decodes video, so this
+//! handler establishes nothing about the media beyond the object store serving the object it
+//! was given.
 //!
 //! ## Shape of an operation
 //!
@@ -130,6 +134,10 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+// Every modelled error this handler answers with is built through this trait, so each
+// one carries its `Code` member beside its `Message`.
+use crate::state::modeled_error::ModeledError;
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -206,18 +214,121 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `StartLabelDetection` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(StartLabelDetectionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("StartLabelDetection"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            StartLabelDetectionErrorModeled::InternalServerError(
+                crate::state::modeled_error::store_unavailable(),
+            )
+        })?;
+
+        // Starting a stored-video analysis is one sequence for the whole `Start…` family —
+        // the token it may already have committed, the object store's answer about the video,
+        // the ceiling on running jobs, then the job record — so it is run from
+        // [`crate::state::video_analysis`] rather than written out here. What is this
+        // operation's own are the input members that configure ITS analysis.
+        let job_id = crate::state::video_analysis::start(
+            &state,
+            ctx,
+            crate::state::video_analysis::StartRequest {
+                analysis: Self::NAME,
+                video: &input.video,
+                client_request_token: input.client_request_token.as_deref(),
+                job_tag: input.job_tag.as_deref(),
+                notification_channel: input.notification_channel.as_ref(),
+                parameters: analysis_parameters(&input),
+            },
+        )
+        .await
+        .map_err(not_started)?;
+
+        // "StartLabelDetection returns a job identifier (JobId) which you use to get the
+        // results of the operation", and that is the response's only member.
+        Ok(StartLabelDetectionOutput {
+            job_id: Some(job_id),
+        })
     }
+}
+
+/// The input members that configure THIS analysis, by their modelled member names and as the
+/// request stated them: the confidence floor the detected labels are to be filtered by
+/// (`MinConfidence`), the features the analysis is asked to return (`Features`) and the
+/// filters those features are to be narrowed by (`Settings`).
+///
+/// They are what the job records beyond the video, the channel and the tag, and together with
+/// those they are also "the other input parameters" a reused `ClientRequestToken` is compared
+/// against. A member the request left out is stated as absent rather than as the value the
+/// analysis would apply for it: the documented default confidence of 50 and the
+/// `GENERAL_LABELS` feature this operation applies by default are properties of the ANALYSIS,
+/// which nothing in this process runs, so recording either would report a request the caller
+/// did not make.
+fn analysis_parameters(
+    input: &StartLabelDetectionInput,
+) -> Vec<crate::state::video_analysis::StatedMember> {
+    let general_labels = input
+        .settings
+        .as_ref()
+        .and_then(|settings| settings.general_labels.as_ref());
+    let mut parameters = vec![(
+        "MinConfidence".to_string(),
+        input.min_confidence.map(|confidence| confidence.to_string()),
+    )];
+    // The list members, flattened element by element. Every filter list
+    // `GeneralLabelsSettings` models is one the request can narrow the analysis with, so each
+    // is compared and recorded
+    // (`smithy_query(query="shape",shape="GeneralLabelsSettings")`).
+    for (member, values) in [
+        ("Features", input.features.as_deref()),
+        (
+            "Settings.GeneralLabels.LabelInclusionFilters",
+            general_labels.and_then(|settings| settings.label_inclusion_filters.as_deref()),
+        ),
+        (
+            "Settings.GeneralLabels.LabelExclusionFilters",
+            general_labels.and_then(|settings| settings.label_exclusion_filters.as_deref()),
+        ),
+        (
+            "Settings.GeneralLabels.LabelCategoryInclusionFilters",
+            general_labels
+                .and_then(|settings| settings.label_category_inclusion_filters.as_deref()),
+        ),
+        (
+            "Settings.GeneralLabels.LabelCategoryExclusionFilters",
+            general_labels
+                .and_then(|settings| settings.label_category_exclusion_filters.as_deref()),
+        ),
+    ] {
+        parameters.extend(crate::state::video_jobs::list_members(member, values));
+    }
+    parameters
+}
+
+/// The modelled answer for a start this operation did not carry out: one modelled error per
+/// reason, each carrying the reason's own message.
+fn not_started(reason: crate::state::video_analysis::NotStarted) -> StartLabelDetectionError {
+    use crate::state::video_analysis::NotStarted;
+    use crate::state::video_source::UnreachableVideo;
+
+    let message = reason.message().to_string();
+    match reason {
+        NotStarted::IdempotentParameterMismatch(_) => {
+            StartLabelDetectionErrorModeled::IdempotentParameterMismatchException(
+                IdempotentParameterMismatchException::with_message(message),
+            )
+        }
+        NotStarted::ConcurrencyLimitReached(_) => {
+            StartLabelDetectionErrorModeled::LimitExceededException(
+                LimitExceededException::with_message(message),
+            )
+        }
+        NotStarted::Unreachable(UnreachableVideo::NoObject(_)) => {
+            StartLabelDetectionErrorModeled::InvalidParameterException(
+                InvalidParameterException::with_message(message),
+            )
+        }
+        NotStarted::Unreachable(UnreachableVideo::Unreadable(_)) => {
+            StartLabelDetectionErrorModeled::InvalidS3ObjectException(
+                InvalidS3ObjectException::with_message(message),
+            )
+        }
+    }
+    .into()
 }

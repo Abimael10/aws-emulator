@@ -198,106 +198,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
         })?;
 
-        // "The other input parameters" a reused `ClientRequestToken` is compared against:
-        // every input member beside the token itself, which for a stored-video analysis is
-        // the video, the notification channel, the job tag and — the one member specific to
-        // THIS analysis — the face attributes it was asked to return.
-        let committed = crate::state::video_jobs::committed_parameters(
-            input.video.s3_object.as_ref(),
-            input.notification_channel.as_ref(),
-            input.job_tag.as_deref(),
-            &[(
-                "FaceAttributes",
-                input.face_attributes.as_deref().unwrap_or_default(),
-            )],
-        );
-        let compared: Vec<(&str, &str)> = committed
-            .iter()
-            .map(|(member, value)| (member.as_str(), value.as_str()))
-            .collect();
-
-        // A token this operation already committed is decided before the video is looked at:
-        // "if you use the same token with multiple StartFaceDetection requests, the same
-        // JobId is returned", so a retry answers with the job it already started and starts
-        // nothing — and a token reused for a different request is the modelled refusal. The
-        // guard is released before the object store is asked, so nothing is held across an
-        // await.
-        if let Some(token) = input.client_request_token.as_deref() {
-            let state = state.lock();
-            match state
-                .client_request_tokens
-                .classify(Self::NAME, token, &compared)
-            {
-                crate::state::idempotency::TokenUse::Mismatch => {
-                    return Err(
-                        StartFaceDetectionErrorModeled::IdempotentParameterMismatchException(
-                            crate::state::modeled_error::idempotent_parameter_mismatch(),
-                        )
-                        .into(),
-                    );
-                }
-                crate::state::idempotency::TokenUse::Retry => {
-                    if let Some(job) = state.video_jobs.started_under_token(Self::NAME, token) {
-                        return Ok(StartFaceDetectionOutput {
-                            job_id: Some(job.job_id.clone()),
-                        });
-                    }
-                    // The store is bounded, so the job that token started may since have
-                    // been forgotten. There is no job left to answer with, so the request is
-                    // carried out again below rather than answered with an identifier
-                    // nothing backs.
-                }
-                crate::state::idempotency::TokenUse::First => {}
-            }
-        }
-
-        // The one thing a start operation establishes about the video: that the object store
-        // serves the object it names. Nothing of the media is read — see
-        // [`crate::state::video_source`].
-        let video = crate::state::video_source::locate_video(ctx, &input.video)
-            .await
-            .map_err(unreachable_error)?;
-
-        let started_at = ::std::time::SystemTime::now();
-        let mut state = state.lock();
-
-        // The jobs live in this process's memory and an analysis runs for a span, so there
-        // is a ceiling on how many may run at once: past it a start is refused with the
-        // modelled limit error — the condition that error is modelled for — rather than
-        // allowed to grow the process without limit. The check precedes the write, so a
-        // refused request records nothing and commits no token.
-        if state.video_jobs.at_concurrency_limit(started_at) {
-            return Err(StartFaceDetectionErrorModeled::LimitExceededException(
-                LimitExceededException::with_message(format!(
-                    "The maximum number of concurrently running video analysis jobs ({}) has \
-                     been reached",
-                    crate::state::video_jobs::MAX_CONCURRENT_JOBS
-                )),
-            )
-            .into());
-        }
-
-        let job_id = crate::state::new_job_id();
-        let mut job =
-            crate::state::video_jobs::VideoJob::new(job_id.clone(), Self::NAME, video, started_at);
-        job.client_request_token = input.client_request_token.clone();
-        job.job_tag = input.job_tag.clone();
-        job.notification_channel = input.notification_channel.clone();
-        // The analysis's own parameter, kept as the request stated it: `FaceAttributes`
-        // selects which facial attributes the job's results are to carry, so it belongs to
-        // the job rather than to the start.
-        job.parameters = input
-            .face_attributes
-            .clone()
-            .map(|attributes| vec![("FaceAttributes".to_string(), attributes)])
-            .unwrap_or_default();
-        state.video_jobs.record(job);
-
-        if let Some(token) = input.client_request_token.as_deref() {
-            state
-                .client_request_tokens
-                .commit(Self::NAME, token, &compared);
-        }
+        // Starting a stored-video analysis is one sequence for the whole `Start…` family —
+        // the token it may already have committed, the object store's answer about the
+        // video, the ceiling on running jobs, then the job record — so it is run from
+        // [`crate::state::video_analysis`] rather than written out here. What is this
+        // operation's own is the one input member that configures ITS analysis:
+        // `FaceAttributes` selects which facial attributes the job's results are to carry,
+        // so it belongs to the job rather than to the start.
+        let job_id = crate::state::video_analysis::start(
+            &state,
+            ctx,
+            crate::state::video_analysis::StartRequest {
+                analysis: Self::NAME,
+                video: &input.video,
+                client_request_token: input.client_request_token.as_deref(),
+                job_tag: input.job_tag.as_deref(),
+                notification_channel: input.notification_channel.as_ref(),
+                parameters: vec![("FaceAttributes".to_string(), input.face_attributes.clone())],
+            },
+        )
+        .await
+        .map_err(not_started)?;
 
         // "StartFaceDetection returns a job identifier (JobId) that you use to get the
         // results of the operation", and that is the response's only member.
@@ -307,19 +228,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     }
 }
 
-/// The modelled answer for a video this operation cannot start an analysis on: one modelled
-/// error per reason, each carrying the reason's own message.
-fn unreachable_error(
-    reason: crate::state::video_source::UnreachableVideo,
-) -> StartFaceDetectionError {
+/// The modelled answer for a start this operation did not carry out: one modelled error per
+/// reason, each carrying the reason's own message.
+fn not_started(reason: crate::state::video_analysis::NotStarted) -> StartFaceDetectionError {
+    use crate::state::video_analysis::NotStarted;
     use crate::state::video_source::UnreachableVideo;
 
     let message = reason.message().to_string();
     match reason {
-        UnreachableVideo::NoObject(_) => StartFaceDetectionErrorModeled::InvalidParameterException(
-            InvalidParameterException::with_message(message),
-        ),
-        UnreachableVideo::Unreadable(_) => {
+        NotStarted::IdempotentParameterMismatch(_) => {
+            StartFaceDetectionErrorModeled::IdempotentParameterMismatchException(
+                IdempotentParameterMismatchException::with_message(message),
+            )
+        }
+        NotStarted::ConcurrencyLimitReached(_) => {
+            StartFaceDetectionErrorModeled::LimitExceededException(
+                LimitExceededException::with_message(message),
+            )
+        }
+        NotStarted::Unreachable(UnreachableVideo::NoObject(_)) => {
+            StartFaceDetectionErrorModeled::InvalidParameterException(
+                InvalidParameterException::with_message(message),
+            )
+        }
+        NotStarted::Unreachable(UnreachableVideo::Unreadable(_)) => {
             StartFaceDetectionErrorModeled::InvalidS3ObjectException(
                 InvalidS3ObjectException::with_message(message),
             )

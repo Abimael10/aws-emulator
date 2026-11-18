@@ -338,14 +338,21 @@ fn harness() -> MultiServiceRouter {
 /// The emulator with this service and the emulator's own Amazon S3 on ONE engine — what the
 /// assembled emulator runs, narrowed to the two services an S3-sourced image needs.
 pub(crate) fn harness_with_object_store() -> MultiServiceRouter {
+    harness_with_object_store_on_engine().0
+}
+
+/// The same emulator, with the engine it was mounted on handed back beside it, for a suite
+/// that has to read what a handler PERSISTED rather than only what it answered.
+pub(crate) fn harness_with_object_store_on_engine(
+) -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
     router.register_service(EmulatedService::new(Arc::clone(&engine)));
     router.register_service(service_com_amazonaws_s3_amazons3::EmulatedService::new(
-        engine,
+        Arc::clone(&engine),
     ));
-    router
+    (router, engine)
 }
 
 /// One path-style request to the emulator's Amazon S3 front door.

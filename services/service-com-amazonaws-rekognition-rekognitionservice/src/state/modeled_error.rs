@@ -253,6 +253,24 @@ pub fn idempotent_parameter_mismatch() -> IdempotentParameterMismatchException {
     IdempotentParameterMismatchException::with_message(IDEMPOTENT_PARAMETER_MISMATCH_MESSAGE)
 }
 
+/// The fixed text a start refused because too many video analyses are already running is
+/// worded with, with the ceiling it names taken from
+/// [`super::video_jobs::MAX_CONCURRENT_JOBS`] rather than written into the sentence.
+///
+/// `LimitExceededException` documents the class — "if you start too many jobs concurrently,
+/// subsequent calls to start operations … will raise a LimitExceededException exception …
+/// until the number of concurrently running jobs is below the Amazon Rekognition service
+/// limit" (`smithy_query(query="doc",shape="LimitExceededException")`) — but no refusal of it
+/// is recorded, so unlike [`IDEMPOTENT_PARAMETER_MISMATCH_MESSAGE`] this wording is not taken
+/// from an exchange. It states the quota that was reached and nothing of the request, and it
+/// is one wording for every `Start…` operation of the family, since the ceiling is one.
+pub fn video_job_concurrency_limit_message() -> String {
+    format!(
+        "The maximum number of concurrently running video analysis jobs ({}) has been reached",
+        super::video_jobs::MAX_CONCURRENT_JOBS
+    )
+}
+
 /// The fixed text a project policy document that is not a policy at all is refused with.
 ///
 /// It is the `Message` a recorded AWS `PutProjectPolicy` refusal of an unparseable document
