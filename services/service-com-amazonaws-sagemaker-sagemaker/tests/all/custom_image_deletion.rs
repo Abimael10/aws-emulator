@@ -386,8 +386,28 @@ async fn an_image_a_studio_app_runs_on_is_in_use_and_refused() {
         } else {
             json!({ "SageMakerImageArn": image_arn })
         };
+        // An app runs for a user profile its domain holds, so the domain the app hangs
+        // off is a created one and the owner is created in it: which `DomainId` that is
+        // makes no difference to the image-in-use rule under test.
+        let domain = emulator
+            .ok(
+                "CreateDomain",
+                &json!({
+                    "DomainName": format!("studio-{image_name}"),
+                    "AuthMode": "IAM",
+                    "DefaultUserSettings": { "ExecutionRole": ROLE_ARN }
+                }),
+            )
+            .await;
+        let domain_id = str_field(&domain, "DomainId");
+        emulator
+            .ok(
+                "CreateUserProfile",
+                &json!({ "DomainId": domain_id, "UserProfileName": "studio-user" }),
+            )
+            .await;
         let app = json!({
-            "DomainId": "d-abc123",
+            "DomainId": domain_id,
             "UserProfileName": "studio-user",
             "AppType": "KernelGateway",
             "AppName": format!("app-{case}"),
@@ -460,11 +480,28 @@ async fn an_image_a_studio_app_runs_on_is_in_use_and_refused() {
     // An app running on ANOTHER image does not make this one in use: the check is about
     // the image the request names, not about any app existing.
     emulator.create_image_in("us-east-1", "unused-image").await;
+    let domain = emulator
+        .ok(
+            "CreateDomain",
+            &json!({
+                "DomainName": "studio-other-image",
+                "AuthMode": "IAM",
+                "DefaultUserSettings": { "ExecutionRole": ROLE_ARN }
+            }),
+        )
+        .await;
+    let domain_id = str_field(&domain, "DomainId");
+    emulator
+        .ok(
+            "CreateUserProfile",
+            &json!({ "DomainId": domain_id, "UserProfileName": "studio-user" }),
+        )
+        .await;
     emulator
         .ok(
             "CreateApp",
             &json!({
-                "DomainId": "d-abc123",
+                "DomainId": domain_id,
                 "UserProfileName": "studio-user",
                 "AppType": "JupyterLab",
                 "AppName": "app-on-other-image",

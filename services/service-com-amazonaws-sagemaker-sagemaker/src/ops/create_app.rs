@@ -175,7 +175,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let region = crate::state::request_region(ctx);
         let arn = crate::state::app_arn(&region, &key);
 
+        let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
+        // An app lives in the domain the request names and runs FOR its owner ("Creates a
+        // running app for the specified UserProfile"), so both parents have to be ones this
+        // service holds: a `DomainId` that resolves to no domain, or a user profile that
+        // domain does not hold, is refused here before anything is written, rather than
+        // leaving an app record hanging off a resource that exists nowhere — which no later
+        // call could resolve and no `DeleteApp` could release. The model declares no
+        // not-found error for this operation, so each refusal travels as the service-common
+        // `ValidationException`, worded with the crate's one sentence for that fact.
+        if !store.domain_resolves(&key.domain_id, now) {
+            return Err(CreateAppError::validation(crate::state::domain_not_found(
+                &region,
+                &key.domain_id,
+            )));
+        }
+        if let crate::state::AppOwner::UserProfile(user_profile_name) = &key.owner {
+            if !store.holds_user_profile(&key.domain_id, user_profile_name, now) {
+                return Err(CreateAppError::validation(
+                    crate::state::user_profile_not_found(user_profile_name),
+                ));
+            }
+        }
         // The store is bounded, so a caller varying the app's name cannot grow it without
         // end. `ResourceLimitExceeded` is the limit failure this operation models.
         if !store.apps_below_quota() {
@@ -198,7 +220,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        let now = ::std::time::SystemTime::now();
         store.apps.insert(
             key,
             crate::state::App {
@@ -207,9 +228,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // Stored verbatim, so `DescribeApp` replays the spec the launch used.
                 // The member's doc also makes a KernelGateway app's `InstanceType`
                 // required across the app's, the user profile's and the domain's
-                // `ResourceSpec`; the latter two are written by `CreateUserProfile` /
-                // `CreateDomain`, which are still scaffolds, so that precondition
-                // cannot be evaluated here and is left to their own issues.
+                // `ResourceSpec`; the domain's is written by `CreateDomain` and the user
+                // profile's by `CreateUserProfile`, and resolving that precondition across
+                // all three is left to its own issue.
                 resource_spec: input.resource_spec,
                 recovery_mode: input.recovery_mode,
                 tags: input.tags.unwrap_or_default(),

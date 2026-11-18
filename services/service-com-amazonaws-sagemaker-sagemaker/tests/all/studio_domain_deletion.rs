@@ -533,6 +533,20 @@ async fn delete_domain_refuses_a_domain_that_still_holds_apps() {
         let created = emulator.ok("CreateDomain", &minimal("hosting", "IAM")).await;
         let domain_id = str_field(&created, "DomainId");
         let request = json!({ "DomainId": domain_id });
+        // An app runs for the user profile its request names, and `CreateApp` resolves
+        // that owner in the domain, so each row's user-profile owner is created first. A
+        // space owner is not a resource this service holds records of.
+        for app in &apps {
+            if let Some(owner) = app.get("UserProfileName").and_then(Value::as_str) {
+                let profile = with_members(&request, &json!({ "UserProfileName": owner }));
+                let (status, parsed) = emulator.call("CreateUserProfile", &profile).await;
+                assert_eq!(
+                    status, 200,
+                    "case {case}: expected HTTP 200 from CreateUserProfile {profile}, got \
+                     {status} with {parsed}"
+                );
+            }
+        }
         for app in &apps {
             let body = with_members(&request, app);
             let (status, parsed) = emulator.call("CreateApp", &body).await;

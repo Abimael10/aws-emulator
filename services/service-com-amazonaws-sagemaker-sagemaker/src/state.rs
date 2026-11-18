@@ -1159,6 +1159,12 @@ pub use domain::*;
 pub mod domain_network;
 pub use domain_network::*;
 
+/// The Studio USER PROFILE slice — the profile `CreateUserProfile` writes and
+/// `DescribeUserProfile` replays, which is also the owner a Studio app hangs off: see
+/// `state/user_profile.rs`.
+pub mod user_profile;
+pub use user_profile::*;
+
 /// The job slices (training, processing and transform jobs): see `state/jobs.rs`.
 pub mod jobs;
 pub use jobs::*;
@@ -1420,6 +1426,7 @@ tag_accessors!(
     trial_components,
     trials,
     tuning_jobs,
+    user_profiles,
 );
 
 // ---------------------------------------------------------------------------
@@ -2783,6 +2790,11 @@ pub struct ComAmazonawsSagemakerSagemakerState {
     /// key and `ListDomains` has one stable order to page over. See [`Domain`], whose
     /// slice lives in [`domain`].
     pub domains: BTreeMap<String, Domain>,
+    /// Studio user profiles, keyed by [`user_profile_key`] — the domain the profile lives
+    /// in plus its case-folded name, because a profile "represents a single user within a
+    /// domain" and `DescribeUserProfile` resolves one by exactly that pair. See
+    /// [`UserProfile`], whose slice lives in [`user_profile`].
+    pub user_profiles: BTreeMap<(String, String), UserProfile>,
     /// Keyed by `ModelPackageGroupName`.
     pub model_package_groups: BTreeMap<String, ModelPackageGroup>,
     /// Keyed by `RecommendationJobName`, which AWS documents unique to the account in a

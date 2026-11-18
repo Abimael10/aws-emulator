@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateUserProfile
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateUserProfile`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateUserProfile::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: stores a Studio user profile in `crate::state` under the domain and name
+//! the request pairs, launching it `Pending` with the `InService` transition the clock
+//! owes recorded, and refuses a name the domain already holds with the modelled
+//! `ResourceInUse`. This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -163,18 +158,126 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateUserProfile` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateUserProfileErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateUserProfile"))
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(|| CreateUserProfileError::validation(crate::state::NO_STATE))?;
+
+        let region = crate::state::request_region(ctx);
+        let now = ::std::time::SystemTime::now();
+        // The ARN names both members that identify the profile, so a reader of either one
+        // reports the same value and two domains can hold the same user name.
+        let arn = crate::state::resource_arn(
+            &region,
+            crate::state::USER_PROFILE_ARN_KIND,
+            &format!("{}/{}", input.domain_id, input.user_profile_name),
+        );
+        let key = crate::state::user_profile_key(&input.domain_id, &input.user_profile_name);
+
+        let mut store = state.lock();
+        // The removals the clock already completed are materialised first, so a domain
+        // whose teardown is done is gone here too — and so are the profiles that hung off
+        // it. Each was due at its stored instant whether or not anybody called, so this
+        // call's observer makes no difference to the result.
+        store.release_deleted_domains(now);
+
+        // "A user profile represents a single user WITHIN A DOMAIN": the profile belongs to
+        // the domain the request names, so an id this account holds no domain under cannot
+        // take one, and the domain's own `AuthMode` decides the next precondition. The
+        // model declares no not-found error for this operation, so the refusal travels as
+        // the service-common `ValidationException`, worded with the crate's one sentence
+        // for a `DomainId` that resolves to nothing. A domain the service is already
+        // tearing down still resolves until the clock completes its removal, which is the
+        // one rule every reader of a `DomainId` follows here; whether a create into a
+        // `Deleting` domain is refused is the teardown path's own question, left to it.
+        let Some(auth_mode) = store
+            .domain_mut(&input.domain_id, now)
+            .map(|domain| domain.auth_mode.clone())
+        else {
+            return Err(CreateUserProfileError::validation(
+                crate::state::domain_not_found(&region, &input.domain_id),
+            ));
+        };
+
+        // Both single-sign-on members are the user's identity in the directory the domain
+        // authenticates against, so whether they belong on the request is the domain's
+        // `AuthMode` to decide: "If the Domain's AuthMode is IAM Identity Center, this
+        // field is required […] If the Domain's AuthMode is not IAM Identity Center, this
+        // field cannot be specified." Refused before anything is written, so a profile
+        // never carries an identity the domain cannot authenticate and never lacks one it
+        // must have.
+        let named_sso: Vec<&str> = crate::state::NAMED_SINGLE_SIGN_ON_MEMBERS
+            .iter()
+            .copied()
+            .zip([
+                input.single_sign_on_user_identifier.is_some(),
+                input.single_sign_on_user_value.is_some(),
+            ])
+            .filter_map(|(member, named)| named.then_some(member))
+            .collect();
+        if auth_mode == crate::state::AUTH_MODE_IAM_IDENTITY_CENTER {
+            if named_sso.len() < crate::state::NAMED_SINGLE_SIGN_ON_MEMBERS.len() {
+                return Err(CreateUserProfileError::validation(
+                    crate::state::single_sign_on_members_required(),
+                ));
+            }
+        } else if !named_sso.is_empty() {
+            return Err(CreateUserProfileError::validation(
+                crate::state::single_sign_on_members_not_allowed(&named_sso),
+            ));
+        }
+
+        // The store is bounded, so a caller creating profile after profile cannot grow it
+        // without end. `ResourceLimitExceeded` is the limit failure this operation models.
+        if !store.user_profiles_below_quota() {
+            return Err(CreateUserProfileErrorModeled::ResourceLimitExceeded(
+                ResourceLimitExceeded {
+                    message: Some(format!(
+                        "The account-level service limit for user profiles is {}, with \
+                         current utilization of {} and a request delta of 1.",
+                        crate::state::USER_PROFILE_QUOTA,
+                        store.user_profiles.len()
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // A profile already stored under this name is the resource this call would have to
+        // take over, so the create is refused rather than overwriting it. The name "is not
+        // case sensitive", and the key is case-folded, so a second spelling of one name
+        // lands here too.
+        if store.user_profiles.contains_key(&key) {
+            return Err(CreateUserProfileErrorModeled::ResourceInUse(ResourceInUse {
+                message: Some(crate::state::user_profile_already_exists(&arn)),
+            })
+            .into());
+        }
+
+        store.user_profiles.insert(
+            key,
+            crate::state::UserProfile {
+                arn: arn.clone(),
+                domain_id: input.domain_id,
+                // Stored as the caller spelled it, so a reader replays that spelling.
+                name: input.user_profile_name,
+                single_sign_on_user_identifier: input.single_sign_on_user_identifier,
+                single_sign_on_user_value: input.single_sign_on_user_value,
+                // Stored verbatim, so `DescribeUserProfile` replays the settings the create
+                // carried and nothing the request never named.
+                user_settings: input.user_settings,
+                tags: input.tags.unwrap_or_default(),
+                // A profile comes up `Pending` and owes the clock its `InService`, so a
+                // caller that reads it straight back still observes the transient status.
+                status: crate::state::USER_PROFILE_STATUS_PENDING.to_string(),
+                creation_time: now,
+                last_modified_time: now,
+                in_service_due_at: now + crate::state::USER_PROFILE_IN_SERVICE_AFTER,
+            },
+        );
+        drop(store);
+
+        crate::state::record_state_change(Self::NAME, &arn, ctx);
+        Ok(CreateUserProfileOutput {
+            user_profile_arn: Some(arn),
+        })
     }
 }

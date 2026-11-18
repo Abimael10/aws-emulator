@@ -267,13 +267,34 @@ impl ComAmazonawsSagemakerSagemakerState {
             .filter(|domain| !domain.is_released(now))
     }
 
-    /// Drop every domain whose removal the clock already completed.
+    /// Whether the `DomainId` `domain_id` still resolves to a domain of this account, i.e.
+    /// a reader would answer for it.
+    ///
+    /// Asked rather than resolved where only the existence matters — what a resource that
+    /// hangs off the domain ([`UserProfile`]) is weighed against, so the one rule about
+    /// which ids resolve ([`Self::domain_mut`]) holds for those resources too.
+    pub fn domain_resolves(&self, domain_id: &str, now: SystemTime) -> bool {
+        self.domains
+            .get(domain_id)
+            .is_some_and(|domain| !domain.is_released(now))
+    }
+
+    /// Drop every domain whose removal the clock already completed, and with it everything
+    /// that hung off that domain.
     ///
     /// Materialises only what was already due: the removal was owed at the stored instant
     /// whether or not anybody called, and a lookup already answers `None` for such a
-    /// domain ([`Domain::is_released`]), so this changes nothing a later caller sees — it
-    /// frees the quota slot the gone domain still held. The call that asked for each
-    /// removal already recorded it, so nothing is answered back.
+    /// domain ([`Domain::is_released`]) and for its user profiles
+    /// ([`Self::user_profile_mut`]), so this changes nothing a later caller sees — it
+    /// frees the quota slots the gone domain and its profiles still held. The call that
+    /// asked for each removal already recorded it, so nothing is answered back.
+    ///
+    /// The profiles go WITH the domain rather than standing in the way of its teardown:
+    /// AWS refuses a teardown while the domain still holds non-deleted user profiles, but
+    /// `DeleteUserProfile` is still a scaffold here, so gating `DeleteDomain` on profiles
+    /// no caller can release would leave the domain unrecoverable. That precondition
+    /// belongs with `DeleteUserProfile`'s own implementation; until then a released domain
+    /// takes its profiles with it so no record addresses a domain no reader resolves.
     pub fn release_deleted_domains(&mut self, now: SystemTime) {
         let released: Vec<String> = self
             .domains
@@ -284,6 +305,7 @@ impl ComAmazonawsSagemakerSagemakerState {
         for id in &released {
             self.domains.remove(id);
         }
+        self.release_domain_user_profiles(&released);
     }
 
     /// Whether the domain `domain_id` still holds Studio apps, i.e. apps created in it

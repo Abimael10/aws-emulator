@@ -560,8 +560,29 @@ async fn a_version_a_studio_app_runs_on_is_in_use_and_refused() {
     // One app pinned to version 1 of the image. An app on ANOTHER image's version exists
     // too, so the refusal below is about the version the request names rather than about
     // any app existing.
+    //
+    // An app runs for a user profile its domain holds, so the domain the apps hang off is
+    // a created one and their owner is created in it: which `DomainId` that is makes no
+    // difference to the version-in-use rule under test.
+    let domain = emulator
+        .ok(
+            "CreateDomain",
+            &json!({
+                "DomainName": "studio-pinned",
+                "AuthMode": "IAM",
+                "DefaultUserSettings": { "ExecutionRole": ROLE_ARN }
+            }),
+        )
+        .await;
+    let domain_id = str_field(&domain, "DomainId");
+    emulator
+        .ok(
+            "CreateUserProfile",
+            &json!({ "DomainId": domain_id, "UserProfileName": "studio-user" }),
+        )
+        .await;
     let app = json!({
-        "DomainId": "d-abc123",
+        "DomainId": domain_id,
         "UserProfileName": "studio-user",
         "AppType": "KernelGateway",
         "AppName": "app-on-v1",
@@ -584,7 +605,7 @@ async fn a_version_a_studio_app_runs_on_is_in_use_and_refused() {
         .ok(
             "CreateApp",
             &json!({
-                "DomainId": "d-abc123",
+                "DomainId": domain_id,
                 "UserProfileName": "studio-user",
                 "AppType": "JupyterLab",
                 "AppName": "app-on-other",

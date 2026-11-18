@@ -15,11 +15,12 @@
 //! both owner kinds, and for a request that differs from a stored app in each single
 //! component.
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde_json::{json, Map, Value};
 
 use crate::inference_deployment_lifecycle::{error_code, message, str_field, Emulator, ACCOUNT};
+use crate::studio_user_profiles::{seed_studio_domain, seed_studio_owner};
 
 /// Every value `AppType` accepts, from the model
 /// (`smithy_query(query="shape", shape="AppType", model_path=".../com-amazonaws-sagemaker-sagemaker.json")`,
@@ -36,8 +37,13 @@ const APP_TYPES: [&str; 9] = [
     "TensorBoard",
 ];
 
-/// Long enough to pass `state::APP_IN_SERVICE_AFTER` (300 ms).
-const PAST_IN_SERVICE_DUE: Duration = Duration::from_millis(600);
+/// How long a poll below gives the clock to launch an app: far longer than the span the
+/// state gives `state::APP_IN_SERVICE_AFTER`, so a loaded host still settles well inside
+/// it. Only the loop's condition decides when it stops.
+const SETTLE_DEADLINE: Duration = Duration::from_secs(120);
+
+/// How often that poll looks again.
+const POLL_INTERVAL: Duration = Duration::from_millis(25);
 
 /// The two members that can name an app's owner, per `CreateApp`'s input: exactly one of
 /// them is set on any accepted request.
@@ -120,6 +126,23 @@ fn with_members(base: &Value, extra: &Value) -> Value {
         merged.insert(member.clone(), value.clone());
     }
     Value::Object(merged)
+}
+
+/// Put the PARENTS `app` hangs off into the store, so a create of it resolves them.
+///
+/// `CreateApp` only creates an app in a domain this service holds, and only for a user
+/// profile that domain holds, and these rows address domains by `DomainId`s of their own
+/// choosing — ids no `CreateDomain` can mint, since the id is the server's — so the domain
+/// and, for a user-profile app, the profile are seeded directly into the store the handler
+/// reads (`crate::studio_user_profiles`), the way a suite seeds any record whose writer it
+/// is not exercising. A space app's owner is a space, which this service holds no records
+/// of, so only its domain is seeded.
+fn seed_owner(emulator: &Emulator, app: &AppRef, region: &str) {
+    if app.owner_member == "UserProfileName" {
+        seed_studio_owner(emulator, region, &app.domain, &app.owner_name);
+    } else {
+        seed_studio_domain(emulator, region, &app.domain);
+    }
 }
 
 /// The rows the round-trip and release rules are asserted over: every app type in the
@@ -270,6 +293,7 @@ async fn describe_app_replays_exactly_what_create_app_stored() {
 
     for (app, extra, echoed) in round_trip_rows() {
         let case = &app.case;
+        seed_owner(&emulator, &app, "us-east-1");
         let created = emulator
             .ok("CreateApp", &with_members(&app.body(), &extra))
             .await;
@@ -359,6 +383,7 @@ async fn an_app_arn_names_the_region_the_caller_signed_for() {
             "JupyterLab",
             "regional",
         );
+        seed_owner(&emulator, &app, region);
         let (status, created) = emulator.call_in(region, "CreateApp", &app.body()).await;
         assert_eq!(
             status, 200,
@@ -392,6 +417,7 @@ async fn an_app_advances_from_pending_to_in_service_once_the_clock_owes_it() {
         "JupyterLab",
         "waiter",
     );
+    seed_owner(&emulator, &app, "us-east-1");
     emulator.ok("CreateApp", &app.body()).await;
 
     let pending = emulator.ok("DescribeApp", &app.body()).await;
@@ -401,14 +427,21 @@ async fn an_app_advances_from_pending_to_in_service_once_the_clock_owes_it() {
         "case immediately-after-create: Status, got {pending:?}"
     );
 
-    tokio::time::sleep(PAST_IN_SERVICE_DUE).await;
-
-    let settled = emulator.ok("DescribeApp", &app.body()).await;
-    assert_eq!(
-        str_field(&settled, "Status"),
-        "InService",
-        "case after-the-due-span: Status, got {settled:?}"
-    );
+    // Wait for the CONDITION, not for a fixed time: the launch is the clock's, and no call
+    // has to make it happen.
+    let deadline = Instant::now() + SETTLE_DEADLINE;
+    let settled = loop {
+        let described = emulator.ok("DescribeApp", &app.body()).await;
+        if str_field(&described, "Status") == "InService" {
+            break described;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "case after-the-due-span: the app must reach InService on the clock, last read \
+             {described:?}"
+        );
+        tokio::time::sleep(POLL_INTERVAL).await;
+    };
     let again = emulator.ok("DescribeApp", &app.body()).await;
     assert_eq!(
         again, settled,
@@ -433,6 +466,7 @@ async fn deleting_an_app_that_is_not_stored_is_refused_with_resource_not_found()
         "JupyterServer",
         "default",
     );
+    seed_owner(&emulator, &stored, "us-east-1");
     emulator.ok("CreateApp", &stored.body()).await;
 
     // Rows: the empty-store case, then one row per identifying member, each differing
@@ -586,6 +620,7 @@ async fn deleting_an_app_releases_it_and_leaves_every_other_app_alone() {
         ),
     ];
     for app in &apps {
+        seed_owner(&emulator, app, "us-east-1");
         emulator.ok("CreateApp", &app.body()).await;
     }
 
@@ -640,6 +675,7 @@ async fn creating_an_app_whose_key_is_in_use_is_refused_with_resource_in_use() {
 
     for (app, extra, _) in round_trip_rows() {
         let case = &app.case;
+        seed_owner(&emulator, &app, "us-east-1");
         emulator
             .ok("CreateApp", &with_members(&app.body(), &extra))
             .await;
@@ -697,6 +733,7 @@ async fn an_app_request_must_name_exactly_one_owner() {
         "JupyterServer",
         "default",
     );
+    seed_owner(&emulator, &stored, "us-east-1");
     emulator.ok("CreateApp", &stored.body()).await;
 
     let neither = json!({
@@ -829,6 +866,7 @@ async fn a_create_past_the_app_quota_is_refused_with_the_modelled_limit_failure(
         )
     };
 
+    seed_owner(&emulator, &app_at(0), "us-east-1");
     for index in 0..QUOTA {
         emulator.ok("CreateApp", &app_at(index).body()).await;
     }
