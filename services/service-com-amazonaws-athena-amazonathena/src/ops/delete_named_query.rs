@@ -3,9 +3,11 @@
 //! @op DeleteNamedQuery
 //! IMPLEMENTED: takes the saved query the request's `NamedQueryId` names out of the record
 //! `CreateNamedQuery` wrote, so a later `GetNamedQuery` or `ListNamedQueries` no longer
-//! reports it. The operation is `@idempotent` and its id member is an `@idempotencyToken`,
-//! so a repeat of the same delete answers the same success: once the query is gone there is
-//! nothing left for the call to remove.
+//! reports it, and refuses an id this account holds no saved query under — one no create ever
+//! minted, and one an earlier delete already took — in the same words a read of that id is
+//! refused with. The operation's `@idempotent` trait says a repeat has the effect of one
+//! call, not that a call with nothing to remove is a success: the service answers a saved
+//! query it no longer holds as a request naming something that does not exist.
 //!
 //! ## Shape of an operation
 //!
@@ -143,10 +145,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
 
         // The ONE place a saved query leaves the registry: the create token that minted it
-        // goes with it, so no token is left naming a query this account no longer holds. An
-        // id this account holds no query under leaves the registry as it was, which is the
-        // state this call asks for either way (see this file's header on its idempotency).
-        store.named_queries.remove(&input.named_query_id);
+        // goes with it, so no token is left naming a query this account no longer holds. The
+        // removal and the miss are decided in that one step, under the one lock — the
+        // registry answers with the record it took, or with nothing when it held none — so
+        // two deletes of the same id racing each other cannot both take it.
+        if store.named_queries.remove(&input.named_query_id).is_none() {
+            // Athena models no not-found error for this operation; naming a saved query this
+            // account holds none of is "something wrong with the input to the request",
+            // which is what `InvalidRequestException` (HTTP 400) reports, under the code for
+            // a refusal the request itself caused. Worded as the read of such an id is: an id
+            // with no saved query behind it is one fact, however it is asked about.
+            return Err(DeleteNamedQueryError::invalid_request(
+                crate::state::ERROR_CODE_INVALID_INPUT,
+                crate::state::named_query_not_found(&input.named_query_id),
+            ));
+        }
 
         // `DeleteNamedQueryOutput` models no members: that the query is gone is observed by
         // reading it back.

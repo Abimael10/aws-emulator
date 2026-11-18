@@ -218,7 +218,9 @@ pub fn new_named_query_id() -> String {
     ::uuid::Uuid::new_v4().as_hyphenated().to_string()
 }
 
-/// The message a read of a named query no `CreateNamedQuery` minted answers with.
+/// The message an operation addressing a named query this account holds none of answers
+/// with: a read of an id no `CreateNamedQuery` minted, a read of one a `DeleteNamedQuery`
+/// took, and that delete itself.
 ///
 /// Amazon Athena's own wording for this error class: the fixed text is `NamedQuery: ` and
 /// ` does not exist`, and the one variable part is the `NamedQueryId` the CALLER supplied. The

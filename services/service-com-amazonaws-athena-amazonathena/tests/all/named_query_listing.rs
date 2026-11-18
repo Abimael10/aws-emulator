@@ -320,9 +320,9 @@ async fn a_read_of_an_unminted_id_is_refused_in_athenas_own_words() {
 }
 
 /// A delete takes the query it names out of the read that resolves its id and out of the
-/// workgroup's listing, and leaves every other query exactly where it is — and a delete with
-/// nothing left to remove answers the same success, which is what the operation's own
-/// idempotency means.
+/// workgroup's listing, and leaves every other query exactly where it is — and an id this
+/// account holds no query under is refused in the same words a read of that id is refused
+/// with, taking nothing away.
 #[tokio::test]
 async fn a_deleted_named_query_is_gone_from_every_read() {
     let router = router();
@@ -330,19 +330,46 @@ async fn a_deleted_named_query_is_gone_from_every_read() {
     let removed = create_named_query(&router, "remove-me", "SELECT 2", None).await;
     let last = create_named_query(&router, "keep-two", "SELECT 3", None).await;
 
-    // `(the case, the id the delete names)`: the query this account holds, the same id again —
-    // which has nothing left to remove — and an id no create ever minted.
-    let deletes: &[(&str, &str)] = &[
-        ("the query this account holds", removed.as_str()),
-        ("the same id again", removed.as_str()),
-        ("an id no create minted", "00000000-0000-4000-8000-000000000000"),
+    // `(the case, the id the delete names, whether the registry holds a query under it)`: the
+    // query this account holds, the same id again — which has nothing left to remove — and an
+    // id no create ever minted.
+    let deletes: &[(&str, &str, bool)] = &[
+        ("the query this account holds", removed.as_str(), true),
+        ("the same id again", removed.as_str(), false),
+        (
+            "an id no create minted",
+            "00000000-0000-4000-8000-000000000000",
+            false,
+        ),
     ];
-    for (case, id) in deletes {
+    for (case, id, holds_a_query) in deletes {
         let (status, answered) = call(&router, "DeleteNamedQuery", &json!({ "NamedQueryId": id })).await;
-        assert_eq!(
-            status, 200,
-            "case {case:?}: expected HTTP 200 from DeleteNamedQuery, got {status} with {answered:?}"
-        );
+        if *holds_a_query {
+            assert_eq!(
+                status, 200,
+                "case {case:?}: expected HTTP 200 from DeleteNamedQuery, got {status} with {answered:?}"
+            );
+        } else {
+            // A delete has a query to take only while the registry holds one under that id.
+            // An id it holds none under is refused rather than answered as a success — the
+            // same refusal, in the same words, a read of that id states.
+            assert_eq!(
+                status, 400,
+                "case {case:?}: expected HTTP 400 from DeleteNamedQuery for an id naming no \
+                 query, got {status} with {answered:?}"
+            );
+            assert_eq!(
+                error_code(&answered),
+                INVALID_REQUEST,
+                "case {case:?}: expected the error {INVALID_REQUEST}, got {answered:?}"
+            );
+            let expected = format!("NamedQuery: {id} does not exist");
+            assert_eq!(
+                message(&answered),
+                expected,
+                "case {case:?}: expected the refusal {expected:?}, got {answered:?}"
+            );
+        }
 
         // The deleted query resolves to nothing afterwards.
         let (status, gone) = call(&router, "GetNamedQuery", &json!({ "NamedQueryId": id })).await;
