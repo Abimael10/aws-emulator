@@ -38,18 +38,18 @@ use super::query_wire::{element, form_encode};
 
 /// Keep this at or above the stack the other whole-router suites build on: the same
 /// assembly runs here.
-const BOOT_STACK_SIZE: usize = 64 * 1024 * 1024;
+pub(crate) const BOOT_STACK_SIZE: usize = 64 * 1024 * 1024;
 
 /// The Region every call below is signed for.
-const REGION: &str = "us-west-2";
+pub(crate) const REGION: &str = "us-west-2";
 
 /// The master user every cluster below is created with, and its password — a test
 /// credential, and the only place it appears.
-const MASTER_USER: &str = "pgadmin";
+pub(crate) const MASTER_USER: &str = "pgadmin";
 const MASTER_PASSWORD: &str = "emu-Secret-99";
 
 /// The database every cluster below carries.
-const DATABASE: &str = "obsdb";
+pub(crate) const DATABASE: &str = "obsdb";
 
 /// The engine version the clusters run.
 ///
@@ -60,15 +60,15 @@ const DATABASE: &str = "obsdb";
 const ENGINE_VERSION: &str = "14.12";
 
 /// The log type the PostgreSQL engines' server log is exported under.
-const POSTGRESQL_LOG_TYPE: &str = "postgresql";
+pub(crate) const POSTGRESQL_LOG_TYPE: &str = "postgresql";
 
 /// How long the suite waits for a condition it polls for (a cluster reaching `available`,
 /// an event reaching the log group). Generous: a loaded machine may take far longer than
 /// this emulator's own transition span, and nothing here is timed.
-const POLL_DEADLINE: Duration = Duration::from_secs(60);
+pub(crate) const POLL_DEADLINE: Duration = Duration::from_secs(60);
 
 /// How long it waits between looks while polling.
-const POLL_INTERVAL: Duration = Duration::from_millis(50);
+pub(crate) const POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 /// What one call answered.
 struct Answer {
@@ -154,7 +154,7 @@ async fn rds(router: &MultiServiceRouter, action: &str, params: &[(&str, String)
 }
 
 /// One CloudWatch Logs call that must be served, as its JSON client sends one.
-async fn logs(
+pub(crate) async fn logs(
     router: &MultiServiceRouter,
     operation: &str,
     request: Value,
@@ -181,7 +181,7 @@ async fn logs(
 
 /// Create the row's cluster, wait for it to report `available`, and answer with the address
 /// it published.
-async fn available_cluster(
+pub(crate) async fn available_cluster(
     router: &MultiServiceRouter,
     case: &str,
     identifier: &str,
@@ -243,26 +243,26 @@ async fn available_cluster(
 
 /// A refusal the server sent: the SQLSTATE a client branches on and the sentence it reports.
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct Refusal {
-    code: String,
-    message: String,
+pub(crate) struct Refusal {
+    pub(crate) code: String,
+    pub(crate) message: String,
 }
 
 /// What one statement answered: what the server SAID about it, and whether it was refused.
 #[derive(Debug, Clone, Default)]
-struct Said {
-    notices: Vec<Refusal>,
+pub(crate) struct Said {
+    pub(crate) notices: Vec<Refusal>,
 }
 
 /// A PostgreSQL session opened on an engine endpoint of this emulator, in the clear.
-struct Session {
+pub(crate) struct Session {
     conn: TcpStream,
 }
 
 impl Session {
     /// Open a session on `address:port` as libpq does: the startup message, the cleartext
     /// password, and then the parameters the server reports.
-    async fn open(case: &str, address: &str, port: u16) -> Self {
+    pub(crate) async fn open(case: &str, address: &str, port: u16) -> Self {
         assert_eq!(
             address, "127.0.0.1",
             "case {case:?}: the published endpoint must be this machine's loopback address, \
@@ -325,7 +325,7 @@ impl Session {
     }
 
     /// Run one simple query and read everything the server answers for it.
-    async fn query(&mut self, case: &str, sql: &str) -> Result<Said, Refusal> {
+    pub(crate) async fn query(&mut self, case: &str, sql: &str) -> Result<Said, Refusal> {
         let mut message = Vec::new();
         put_cstring(&mut message, sql);
         self.send(b'Q', &message).await;
@@ -419,7 +419,7 @@ fn read_cstring(body: &[u8], at: usize) -> (String, usize) {
 }
 
 /// The messages the log group carries, filtered by `pattern` where the row names one.
-async fn filtered_events(
+pub(crate) async fn filtered_events(
     router: &MultiServiceRouter,
     case: &str,
     log_group: &str,
