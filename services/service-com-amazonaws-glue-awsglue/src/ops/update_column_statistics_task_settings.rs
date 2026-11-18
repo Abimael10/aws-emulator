@@ -1,15 +1,38 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateColumnStatisticsTaskSettings
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateColumnStatisticsTaskSettings`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateColumnStatisticsTaskSettings::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Rewrites the column statistics task settings of ONE stored table — the entry
+//! `CreateColumnStatisticsTaskSettings` wrote and `GetColumnStatisticsTaskSettings` reports
+//! ([`crate::state::TableEntry::column_statistics_task_settings`]) — so after an update that
+//! read reports exactly the configuration this request leaves behind.
+//!
+//! The entry is addressed by the same two members the read and the delete address it by, so
+//! every address that holds no entry — a database the catalog does not hold, a table that
+//! database does not hold, or a stored table no create has written settings for — is the
+//! operation's modelled `EntityNotFoundException` in the entry's own fixed wording
+//! ([`crate::state::messages::COLUMN_STATISTICS_TASK_SETTINGS_NOT_FOUND`]) and writes
+//! nothing: an update with no entry to rewrite is not a create.
+//!
+//! Each member the request STATES replaces what the entry holds and each member it omits is
+//! preserved, the way every other update of this service merges a partial request
+//! (`UpdateCrawler`). `SampleSize` is modelled with a default of 0, so a request always
+//! carries one and the stored share always follows it; an EMPTY `ColumnNameList` states no
+//! column name, exactly as it does on the create, so it leaves the settings listing none
+//! and the runs they configure take their documented default of every column of the table.
+//!
+//! A statistics run of that table is performed BY this service acting as the settings'
+//! `Role`, so a request that REPLACES the role is held to the resolution the create makes:
+//! a role the account's own IAM answers that Glue cannot assume
+//! ([`crate::state::glue_role_is_unassumable`]) is refused with the operation's modelled
+//! `InvalidInputException` and nothing is written. A `Schedule` is stored only when it is
+//! the cron expression the service documents, the same way every other operation that
+//! writes a schedule refuses anything else.
+//!
+//! The settings this operation writes are the configuration of the table's FUTURE runs, so
+//! the runs already recorded for it are left exactly as they are and none is started here:
+//! an update is not a start. The operation's `VersionMismatchException` is not reachable —
+//! the request carries no version for the service to compare against the stored entry.
 //!
 //! ## Shape of an operation
 //!
@@ -157,18 +180,142 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateColumnStatisticsTaskSettings` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateColumnStatisticsTaskSettingsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // This operation models no server fault, so an unreachable store is reported
+            // as the operation's own timeout error, the same way `GetCrawler` reports it.
+            return Err(
+                UpdateColumnStatisticsTaskSettingsErrorModeled::OperationTimeoutException(
+                    OperationTimeoutException {
+                        message: Some("the Glue Data Catalog store is unavailable".into()),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        let catalog_id = crate::state::resolve_catalog_id(input.catalog_id.as_ref());
+        let region = crate::state::request_region(ctx.parts());
+        // Whether the caller may address this catalog at all is decided FIRST, before the
+        // request's own contents and before the entity lookup: a `CatalogId` of another
+        // account is reachable only through that catalog's own resource policy (see
+        // `crate::state::catalog_refusal`).
+        match crate::state::catalog_refusal(&state.lock(), &catalog_id, &region, Self::NAME) {
+            None => {}
+            Some(crate::state::CatalogRefusal::NotFound(message)) => {
+                return Err(not_found(message))
+            }
+            Some(crate::state::CatalogRefusal::NotAuthorized(message)) => {
+                return Err(
+                    UpdateColumnStatisticsTaskSettingsErrorModeled::AccessDeniedException(
+                        AccessDeniedException {
+                            message: Some(message),
+                        },
+                    )
+                    .into(),
+                );
+            }
+        }
+
+        // The entry this request rewrites is resolved FIRST, under a SCOPED guard: an
+        // address the catalog holds no settings entry under is a miss whatever else the
+        // request carries, so the entry is settled before its members are judged — and the
+        // guard cannot be held across the role resolution below, which asks this emulator's
+        // own IAM. The lookup is the state's own
+        // ([`crate::state::ComAmazonawsGlueAwsglueState::column_statistics_task_settings`]),
+        // the read-only half of the one the write below makes, so the two cannot drift; it
+        // is made again under the guard that writes, because the table or its entry can
+        // have been dropped in between.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateColumnStatisticsTaskSettings"))
+        // `DatabaseName` and `TableName` are `@required` with `length 1..255`, so reaching
+        // here the only question is what the catalog holds under them. Every way the
+        // address can miss is the one miss in the one fixed wording, the one the read and
+        // the delete answer with: the refusal is about the settings entry the pair
+        // addresses, so it names neither of the two names that addressed it.
+        if state
+            .lock()
+            .column_statistics_task_settings(&catalog_id, &input.database_name, &input.table_name)
+            .is_none()
+        {
+            return Err(settings_not_found());
+        }
+
+        // Every check below is on the settings this update would LEAVE BEHIND, so each one
+        // looks at the member the request carries and ignores the ones it omits.
+
+        // The statistics runs these settings configure are performed BY this service acting
+        // as their `Role`, so a request that REPLACES the role is held to the resolution the
+        // create makes: a role this service cannot assume backs no statistics run at all, so
+        // the update is refused and nothing is persisted. A request that names no `Role`
+        // keeps the stored one, which the create already resolved.
+        //
+        // The question is put to the emulator's OWN IAM over its OWN in-process callback
+        // (see [`crate::state::glue_role_is_unassumable`]), and only what IAM ANSWERED is
+        // refused, so an emulator with no IAM to ask refuses nothing. Awaited with no store
+        // guard held.
+        if let Some(role) = input.role.as_deref() {
+            if crate::state::glue_role_is_unassumable(ctx, &region, role).await {
+                return Err(invalid_input(
+                    crate::state::messages::ROLE_NOT_ASSUMABLE.to_string(),
+                ));
+            }
+        }
+
+        // A `Schedule` is "a schedule for running the column statistics, specified in CRON
+        // syntax", whose documented form is `cron(<six fields>)`. Anything else is not a
+        // schedule this service can run, so it is refused rather than stored and reported
+        // back — the same decision every other operation that writes a schedule makes.
+        if let Some(schedule) = input.schedule.as_deref() {
+            if !crate::state::is_cron_expression(schedule) {
+                return Err(invalid_input(
+                    crate::state::messages::schedule_not_a_cron_expression(schedule),
+                ));
+            }
+        }
+
+        let mut store = state.lock();
+        let Some(settings) = store.column_statistics_task_settings_mut(
+            &catalog_id,
+            &input.database_name,
+            &input.table_name,
+        ) else {
+            return Err(settings_not_found());
+        };
+        settings.apply_update_input(&input);
+        ::tracing::info!(
+            operation = "UpdateColumnStatisticsTaskSettings",
+            catalog_id = %catalog_id,
+            database = %input.database_name,
+            table = %input.table_name,
+            "updated the column statistics task settings of a Data Catalog table"
+        );
+
+        Ok(UpdateColumnStatisticsTaskSettingsOutput {})
     }
+}
+
+/// This operation's modelled miss for an address holding no settings entry, in the fixed
+/// wording the read and the delete answer with.
+fn settings_not_found() -> UpdateColumnStatisticsTaskSettingsError {
+    not_found(crate::state::messages::COLUMN_STATISTICS_TASK_SETTINGS_NOT_FOUND.to_string())
+}
+
+/// This operation's modelled miss: "A specified entity does not exist".
+fn not_found(message: String) -> UpdateColumnStatisticsTaskSettingsError {
+    UpdateColumnStatisticsTaskSettingsErrorModeled::EntityNotFoundException(
+        EntityNotFoundException {
+            message: Some(message),
+            from_federation_source: None,
+        },
+    )
+    .into()
+}
+
+/// This operation's modelled refusal of a request it cannot store: "The input provided was
+/// not valid."
+fn invalid_input(message: String) -> UpdateColumnStatisticsTaskSettingsError {
+    UpdateColumnStatisticsTaskSettingsErrorModeled::InvalidInputException(InvalidInputException {
+        message: Some(message),
+        from_federation_source: None,
+    })
+    .into()
 }

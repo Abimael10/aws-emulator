@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! End-to-end tests for the Glue column-statistics task-SETTINGS slice:
-//! `CreateColumnStatisticsTaskSettings` and the `GetColumnStatisticsTaskSettings` that
-//! reports the settings it wrote.
+//! `CreateColumnStatisticsTaskSettings`, the `UpdateColumnStatisticsTaskSettings` that
+//! rewrites what it wrote, and the `GetColumnStatisticsTaskSettings` that reports them.
 //!
 //! Every call goes over the wire through the shared [`crate::wire`] harness, so what is
 //! asserted is HTTP behaviour and not a direct call into a handler.
 //!
 //! The rule under test: the settings of a column statistics task belong to ONE stored
-//! table, so a create persists the configuration it states against that table and a read
-//! of that table reports it back unchanged — its stored catalog, database and table names,
+//! table, so a create persists the configuration it states against that table, an update
+//! rewrites exactly the members it states on that entry and preserves the ones it omits,
+//! and a read of that table reports it back unchanged — its stored catalog, database and
+//! table names,
 //! the stated schedule as a scheduled cron schedule, the columns, role, sample size and
 //! security configuration as stated — while a create addressing a table the catalog does
 //! not hold, a second create for a table that already carries settings, and a schedule
@@ -1082,4 +1084,701 @@ async fn a_table_miss_is_refused_in_one_fixed_sentence_that_withholds_the_name()
         "case {:?}: the stored table's settings report the role the create named, got {settings}",
         "the stored table"
     );
+}
+
+// ---------------------------------------------------------------------------
+// The update rewrites the entry a create wrote
+// ---------------------------------------------------------------------------
+
+/// A second role, so a row that REPLACES the settings' role is distinguishable from one that
+/// preserves the role the create stated ([`ROLE`]).
+const OTHER_ROLE: &str = "arn:aws:iam::000000000000:role/glue-column-stats-role-2";
+
+/// A second cron expression of the documented form, "to run something every day at 03:30
+/// UTC" (`Schedule$ScheduleExpression`), so a row that replaces a stored schedule is
+/// distinguishable from one that preserves it.
+const NIGHTLY_SCHEDULE: &str = "cron(30 3 * * ? *)";
+
+/// The update body addressing one entry, plus whatever `extra` states.
+fn update_body(database: &str, table: &str, extra: Value) -> Value {
+    let mut body = json!({ "DatabaseName": database, "TableName": table });
+    if let Some(members) = extra.as_object() {
+        for (member, value) in members {
+            body[member] = value.clone();
+        }
+    }
+    body
+}
+
+/// Update one entry, asserting the operation answers 200 with a body carrying no member of
+/// its own (`UpdateColumnStatisticsTaskSettingsResponse` declares none).
+async fn update_settings(router: &MultiServiceRouter, body: &Value) {
+    let answered = ok(router, "UpdateColumnStatisticsTaskSettings", body).await;
+    let empty = answered
+        .as_object()
+        .map(|members| members.is_empty())
+        .unwrap_or(answered.is_null());
+    assert!(
+        empty,
+        "an update answers an empty response, got {answered} for {body}"
+    );
+}
+
+/// Assert the update of this address is the modelled miss carrying the settings entry's own
+/// fixed sentence.
+async fn assert_update_is_miss(router: &MultiServiceRouter, case: &str, body: &Value) {
+    let (status, parsed) = call(router, "UpdateColumnStatisticsTaskSettings", body).await;
+    assert_eq!(
+        status, 400,
+        "case {case:?}: an update with no entry to rewrite is refused, got {status} with {parsed}"
+    );
+    assert!(
+        error_code(&parsed).ends_with("EntityNotFoundException"),
+        "case {case:?}: expected EntityNotFoundException, got {:?} with {parsed}",
+        error_code(&parsed)
+    );
+    assert_eq!(
+        error_message(&parsed),
+        READ_SETTINGS_MISS_MESSAGE,
+        "case {case:?}: expected the fixed settings-miss sentence, got {:?}",
+        error_message(&parsed)
+    );
+}
+
+/// One row of the rewrite table below: a stored table, the settings a create writes for it,
+/// the members the update states, and what the read of them must report afterwards. A named
+/// structure rather than a tuple, so every column of the table reads as what it is.
+struct UpdateCase<'a> {
+    /// What this row varies, named in each of its assertions.
+    case: &'a str,
+    database: &'a str,
+    table: &'a str,
+    /// The columns the stored table declares.
+    columns: &'a [&'a str],
+    /// The create members beyond the three `@required` ones.
+    created: Value,
+    /// The update members beyond the two `@required` ones.
+    update: Value,
+    /// The `Role` the settings must report after the update.
+    expected_role: &'a str,
+    /// The cron expression the settings must report afterwards, if any.
+    expected_schedule: Option<&'a str>,
+    /// The column list the settings must report afterwards, if any.
+    expected_columns: Option<Vec<&'a str>>,
+    /// The `SampleSize` the settings must report afterwards.
+    expected_sample: f64,
+    /// The `SecurityConfiguration` the settings must report afterwards, if any.
+    expected_security_configuration: Option<&'a str>,
+}
+
+/// What `UpdateColumnStatisticsTaskSettings` states is what
+/// `GetColumnStatisticsTaskSettings` reports afterwards: each stated member replaces what the
+/// entry held, each omitted member is preserved, and the entry still belongs to the table it
+/// was created for.
+///
+/// The rows differ along which members the update states (the schedule, the role, the column
+/// list — none, an empty list, one, several — each published `SampleSize` bound and one in
+/// between, the security configuration, the catalog named explicitly, the names in another
+/// casing, an entry in a second database) and along what the entry held before it.
+#[tokio::test]
+async fn an_update_rewrites_the_members_it_states_and_preserves_the_rest() {
+    let router = emulator();
+
+    let cases: Vec<UpdateCase<'_>> = vec![
+        UpdateCase {
+            case: "an update that replaces the schedule",
+            database: "update_db",
+            table: "scheduled",
+            columns: &["id", "amount"],
+            created: json!({ "Schedule": DAILY_SCHEDULE, "SampleSize": 10.0 }),
+            update: json!({ "Schedule": NIGHTLY_SCHEDULE, "SampleSize": 10.0 }),
+            expected_role: ROLE,
+            expected_schedule: Some(NIGHTLY_SCHEDULE),
+            expected_columns: None,
+            expected_sample: 10.0,
+            expected_security_configuration: None,
+        },
+        UpdateCase {
+            case: "an update that adds a schedule to settings that carried none",
+            database: "update_db",
+            table: "unscheduled",
+            columns: &["id"],
+            created: json!({}),
+            update: json!({ "Schedule": DAILY_SCHEDULE }),
+            expected_role: ROLE,
+            expected_schedule: Some(DAILY_SCHEDULE),
+            expected_columns: None,
+            expected_sample: 0.0,
+            expected_security_configuration: None,
+        },
+        UpdateCase {
+            case: "an update that replaces the role",
+            database: "update_db",
+            table: "role_change",
+            columns: &["id"],
+            created: json!({ "Schedule": DAILY_SCHEDULE }),
+            update: json!({ "Role": OTHER_ROLE }),
+            expected_role: OTHER_ROLE,
+            expected_schedule: Some(DAILY_SCHEDULE),
+            expected_columns: None,
+            expected_sample: 0.0,
+            expected_security_configuration: None,
+        },
+        UpdateCase {
+            case: "an update that states no member beyond the required pair",
+            database: "update_db",
+            table: "untouched",
+            columns: &["id", "amount"],
+            created: json!({
+                "Schedule": DAILY_SCHEDULE,
+                "ColumnNameList": ["id"],
+                "SecurityConfiguration": "stats-security",
+            }),
+            update: json!({}),
+            expected_role: ROLE,
+            expected_schedule: Some(DAILY_SCHEDULE),
+            expected_columns: Some(vec!["id"]),
+            // `SampleSize` is modelled with a default of 0, so a request that states none
+            // still carries that share and the stored one follows it.
+            expected_sample: 0.0,
+            expected_security_configuration: Some("stats-security"),
+        },
+        UpdateCase {
+            case: "an update that replaces one column list with another",
+            database: "update_db",
+            table: "column_list",
+            columns: &["id", "amount", "country"],
+            created: json!({ "Schedule": DAILY_SCHEDULE, "ColumnNameList": ["id"] }),
+            update: json!({ "ColumnNameList": ["amount", "country"] }),
+            expected_role: ROLE,
+            expected_schedule: Some(DAILY_SCHEDULE),
+            expected_columns: Some(vec!["amount", "country"]),
+            expected_sample: 0.0,
+            expected_security_configuration: None,
+        },
+        UpdateCase {
+            case: "an update listing every column the table declares",
+            database: "update_db",
+            table: "all_columns",
+            columns: &["a", "b", "c"],
+            created: json!({ "Schedule": DAILY_SCHEDULE, "ColumnNameList": ["a"] }),
+            update: json!({ "ColumnNameList": ["a", "b", "c"] }),
+            expected_role: ROLE,
+            expected_schedule: Some(DAILY_SCHEDULE),
+            expected_columns: Some(vec!["a", "b", "c"]),
+            expected_sample: 0.0,
+            expected_security_configuration: None,
+        },
+        UpdateCase {
+            case: "an update whose empty column list states no column",
+            database: "update_db",
+            table: "empty_list",
+            columns: &["a", "b"],
+            created: json!({ "Schedule": DAILY_SCHEDULE, "ColumnNameList": ["a", "b"] }),
+            update: json!({ "ColumnNameList": [] }),
+            expected_role: ROLE,
+            expected_schedule: Some(DAILY_SCHEDULE),
+            expected_columns: None,
+            expected_sample: 0.0,
+            expected_security_configuration: None,
+        },
+        // `SampleSize` is `range 0..100`
+        // (`smithy_query operation=UpdateColumnStatisticsTaskSettings`): each published bound,
+        // and one in between, is stored as stated.
+        UpdateCase {
+            case: "an update sampling the smallest share the model admits",
+            database: "update_db",
+            table: "sample_low",
+            columns: &["a"],
+            created: json!({ "Schedule": DAILY_SCHEDULE, "SampleSize": 50.0 }),
+            update: json!({ "SampleSize": 0.0 }),
+            expected_role: ROLE,
+            expected_schedule: Some(DAILY_SCHEDULE),
+            expected_columns: None,
+            expected_sample: 0.0,
+            expected_security_configuration: None,
+        },
+        UpdateCase {
+            case: "an update sampling the largest share the model admits",
+            database: "update_db",
+            table: "sample_high",
+            columns: &["a"],
+            created: json!({ "Schedule": DAILY_SCHEDULE }),
+            update: json!({ "SampleSize": 100.0 }),
+            expected_role: ROLE,
+            expected_schedule: Some(DAILY_SCHEDULE),
+            expected_columns: None,
+            expected_sample: 100.0,
+            expected_security_configuration: None,
+        },
+        UpdateCase {
+            case: "an update sampling a share between the bounds",
+            database: "update_db",
+            table: "sample_mid",
+            columns: &["a"],
+            created: json!({ "Schedule": DAILY_SCHEDULE, "SampleSize": 100.0 }),
+            update: json!({ "SampleSize": 12.5 }),
+            expected_role: ROLE,
+            expected_schedule: Some(DAILY_SCHEDULE),
+            expected_columns: None,
+            expected_sample: 12.5,
+            expected_security_configuration: None,
+        },
+        UpdateCase {
+            case: "an update that omits the sample size the create stated",
+            database: "update_db",
+            table: "omitted_sample",
+            columns: &["a"],
+            created: json!({ "Schedule": DAILY_SCHEDULE, "SampleSize": 75.0 }),
+            update: json!({ "Role": OTHER_ROLE }),
+            expected_role: OTHER_ROLE,
+            expected_schedule: Some(DAILY_SCHEDULE),
+            expected_columns: None,
+            // `SampleSize` is modelled with a default of 0 rather than as an optional
+            // member, so a request that states none still carries that share and the
+            // stored one follows it: the share goes back to the model's own default rather
+            // than keeping the one the create stated.
+            expected_sample: 0.0,
+            expected_security_configuration: None,
+        },
+        UpdateCase {
+            case: "an update that replaces the security configuration",
+            database: "update_db",
+            table: "secured",
+            columns: &["a"],
+            created: json!({ "Schedule": DAILY_SCHEDULE, "SecurityConfiguration": "first" }),
+            update: json!({ "SecurityConfiguration": "second" }),
+            expected_role: ROLE,
+            expected_schedule: Some(DAILY_SCHEDULE),
+            expected_columns: None,
+            expected_sample: 0.0,
+            expected_security_configuration: Some("second"),
+        },
+        UpdateCase {
+            case: "an update naming the account's own catalog explicitly",
+            database: "update_db",
+            table: "explicit_catalog",
+            columns: &["a"],
+            created: json!({ "Schedule": DAILY_SCHEDULE }),
+            update: json!({ "CatalogID": ACCOUNT_ID, "SampleSize": 25.0 }),
+            expected_role: ROLE,
+            expected_schedule: Some(DAILY_SCHEDULE),
+            expected_columns: None,
+            expected_sample: 25.0,
+            expected_security_configuration: None,
+        },
+        UpdateCase {
+            case: "an update addressing the names in another casing",
+            database: "Update_Mixed_DB",
+            table: "Mixed_Case_Table",
+            columns: &["Day", "Revenue"],
+            created: json!({ "Schedule": DAILY_SCHEDULE, "ColumnNameList": ["Day"] }),
+            update: json!({ "ColumnNameList": ["Revenue"], "SampleSize": 1.0 }),
+            expected_role: ROLE,
+            expected_schedule: Some(DAILY_SCHEDULE),
+            expected_columns: Some(vec!["Revenue"]),
+            expected_sample: 1.0,
+            expected_security_configuration: None,
+        },
+        UpdateCase {
+            case: "an update of an entry in a second database of the same catalog",
+            database: "other_update_db",
+            table: "elsewhere",
+            columns: &["a", "b"],
+            created: json!({ "Schedule": DAILY_SCHEDULE }),
+            update: json!({ "Role": OTHER_ROLE, "ColumnNameList": ["b"] }),
+            expected_role: OTHER_ROLE,
+            expected_schedule: Some(DAILY_SCHEDULE),
+            expected_columns: Some(vec!["b"]),
+            expected_sample: 0.0,
+            expected_security_configuration: None,
+        },
+    ];
+
+    for row in cases {
+        let case = row.case;
+        store_table(&router, row.database, row.table, row.columns).await;
+        // Every row but one states a SCHEDULE on the create, so that create starts no run of
+        // its own; the row that states none is read back only through the settings, which no
+        // run touches.
+        ok(
+            &router,
+            "CreateColumnStatisticsTaskSettings",
+            &create_body(row.database, row.table, row.created.clone()),
+        )
+        .await;
+
+        // The update addresses the names in whatever casing this row sends; the read below
+        // addresses the created spelling, so what is asserted is the one stored entry.
+        update_settings(
+            &router,
+            &update_body(row.database, row.table, row.update.clone()),
+        )
+        .await;
+
+        let settings = get_settings(&router, &read_body(row.database, row.table)).await;
+        assert_eq!(
+            settings.get("Role").and_then(Value::as_str),
+            Some(row.expected_role),
+            "case {case:?}: the settings report the role the update left behind, got {settings}"
+        );
+        assert_eq!(
+            settings
+                .get("Schedule")
+                .and_then(|schedule| schedule.get("ScheduleExpression"))
+                .and_then(Value::as_str),
+            row.expected_schedule,
+            "case {case:?}: the settings report the schedule the update left behind, got \
+             {settings}"
+        );
+        assert_eq!(
+            reported_columns(&settings),
+            row.expected_columns
+                .as_ref()
+                .map(|names| names.iter().map(|name| name.to_string()).collect()),
+            "case {case:?}: the settings report the column list the update left behind, got \
+             {settings}"
+        );
+        assert_eq!(
+            reported_number(&settings, "SampleSize"),
+            row.expected_sample,
+            "case {case:?}: the settings report the sample size the update left behind, got \
+             {settings}"
+        );
+        assert_eq!(
+            settings.get("SecurityConfiguration").and_then(Value::as_str),
+            row.expected_security_configuration,
+            "case {case:?}: the settings report the security configuration the update left \
+             behind, got {settings}"
+        );
+        // The entry still belongs to the table it was created for.
+        assert_eq!(
+            (
+                settings.get("DatabaseName").and_then(Value::as_str),
+                settings.get("TableName").and_then(Value::as_str),
+            ),
+            (
+                Some(row.database.to_lowercase().as_str()),
+                Some(row.table.to_lowercase().as_str()),
+            ),
+            "case {case:?}: the updated entry still belongs to its stored table, got {settings}"
+        );
+    }
+}
+
+/// An update rewrites the ONE entry it addresses: every other table's entry still reports
+/// exactly what its own write left, in the same database and in a second one.
+#[tokio::test]
+async fn an_update_leaves_every_other_entry_in_place() {
+    let router = emulator();
+
+    // (database, table) — three entries in one database and one in a second, so the update is
+    // checked against neighbours on both sides of the address.
+    let entries = [
+        ("neighbour_update_db", "first_table"),
+        ("neighbour_update_db", "second_table"),
+        ("neighbour_update_db", "third_table"),
+        ("second_neighbour_update_db", "first_table"),
+    ];
+    for (database, table) in entries {
+        // The table declares the column its own settings list, so each entry's
+        // `ColumnNameList` names a real column of its table AND identifies the entry.
+        store_table(&router, database, table, &[table, "shared"]).await;
+        ok(
+            &router,
+            "CreateColumnStatisticsTaskSettings",
+            &create_body(
+                database,
+                table,
+                json!({ "ColumnNameList": [table], "Schedule": DAILY_SCHEDULE }),
+            ),
+        )
+        .await;
+    }
+
+    for (updated_so_far, (database, table)) in entries.iter().enumerate() {
+        let (database, table) = (*database, *table);
+        let case = format!("updating {database}.{table}");
+        update_settings(
+            &router,
+            &update_body(database, table, json!({ "ColumnNameList": ["shared"] })),
+        )
+        .await;
+
+        for (index, (other_database, other_table)) in entries.iter().enumerate() {
+            let (other_database, other_table) = (*other_database, *other_table);
+            let settings = get_settings(&router, &read_body(other_database, other_table)).await;
+            let expected = if index <= updated_so_far {
+                json!(["shared"])
+            } else {
+                json!([other_table])
+            };
+            assert_eq!(
+                settings["ColumnNameList"], expected,
+                "case {case:?}: the entry of {other_database}.{other_table} carries the list \
+                 its own write left, got {settings}"
+            );
+        }
+    }
+}
+
+/// An update that finds no entry under the names it addressed writes nothing and is refused
+/// with the modelled miss — in the settings entry's own fixed sentence, which withholds both
+/// names the request addressed the entry by, whichever half of that address missed.
+///
+/// The recorded case is the first row: an update addressed at a table the catalog does not
+/// hold. The rows differ along HOW the address misses.
+#[tokio::test]
+async fn an_update_with_no_entry_to_rewrite_is_the_modelled_miss() {
+    let router = emulator();
+    store_table(&router, "miss_update_db", "bare_table", &["a"]).await;
+    store_table(&router, "miss_update_db", "kept_table", &["a", "b"]).await;
+    store_table(&router, "elsewhere_update_db", "elsewhere_table", &["a"]).await;
+    ok(
+        &router,
+        "CreateColumnStatisticsTaskSettings",
+        &create_body(
+            "miss_update_db",
+            "kept_table",
+            json!({ "ColumnNameList": ["a"], "Schedule": DAILY_SCHEDULE }),
+        ),
+    )
+    .await;
+
+    // (case, the update that must be refused) — a table name nothing created, a stored table
+    // carrying no entry, the name of a table another database holds, a stored name with a
+    // suffix, the shortest and the longest names `NameString` admits (`length 1..255`,
+    // `smithy_query operation=UpdateColumnStatisticsTaskSettings`), a catalog of another
+    // account, and a database the catalog does not hold.
+    let cases: Vec<(&str, Value)> = vec![
+        (
+            "a table name nothing created",
+            update_body(
+                "miss_update_db",
+                "no_such_table",
+                json!({ "Role": OTHER_ROLE }),
+            ),
+        ),
+        (
+            "a stored table carrying no entry",
+            update_body("miss_update_db", "bare_table", json!({})),
+        ),
+        (
+            "the name of a table another database holds",
+            update_body("miss_update_db", "elsewhere_table", json!({})),
+        ),
+        (
+            "a stored name carrying a suffix",
+            update_body("miss_update_db", "kept_table-does-not-exist", json!({})),
+        ),
+        (
+            "the shortest table name the model admits",
+            update_body("miss_update_db", "t", json!({})),
+        ),
+        (
+            "the longest table name the model admits",
+            update_body("miss_update_db", &"t".repeat(255), json!({})),
+        ),
+        (
+            "a database the catalog does not hold",
+            update_body("no_such_update_db", "kept_table", json!({})),
+        ),
+    ];
+
+    for (case, body) in cases {
+        assert_update_is_miss(&router, case, &body).await;
+
+        // The refused update wrote nothing: the one stored entry still reads back as its
+        // create wrote it.
+        let settings = get_settings(&router, &read_body("miss_update_db", "kept_table")).await;
+        assert_eq!(
+            settings["ColumnNameList"],
+            json!(["a"]),
+            "case {case:?}: a refused update changes nothing, got {settings}"
+        );
+        assert_eq!(
+            settings.get("Role").and_then(Value::as_str),
+            Some(ROLE),
+            "case {case:?}: a refused update leaves the stored role, got {settings}"
+        );
+    }
+
+    // A `CatalogID` of ANOTHER account is a different refusal, and the one this operation
+    // models for it: whether the caller may address that catalog at all is decided before
+    // the entry is looked up, and a catalog of another account is reachable only through
+    // that catalog's own resource policy — so the update is the modelled access refusal
+    // rather than a miss, exactly as the create answers it.
+    let (status, parsed) = call(
+        &router,
+        "UpdateColumnStatisticsTaskSettings",
+        &update_body(
+            "miss_update_db",
+            "kept_table",
+            json!({ "CatalogID": "210987654321" }),
+        ),
+    )
+    .await;
+    assert_eq!(
+        status, 400,
+        "case {:?}: an update addressed at another account's catalog is refused, got {status} \
+         with {parsed}",
+        "a catalog of another account"
+    );
+    assert!(
+        error_code(&parsed).ends_with("AccessDeniedException"),
+        "case {:?}: expected AccessDeniedException, got {:?} with {parsed}",
+        "a catalog of another account",
+        error_code(&parsed)
+    );
+
+    // And the entry an update DOES address is still rewritable afterwards.
+    update_settings(
+        &router,
+        &update_body("miss_update_db", "kept_table", json!({ "Role": OTHER_ROLE })),
+    )
+    .await;
+    let settings = get_settings(&router, &read_body("miss_update_db", "kept_table")).await;
+    assert_eq!(
+        settings.get("Role").and_then(Value::as_str),
+        Some(OTHER_ROLE),
+        "case {:?}: the stored entry takes an update after every refused one, got {settings}",
+        "the stored entry after every refused update"
+    );
+}
+
+/// A `Schedule` that is not the cron expression the service documents is not a schedule this
+/// service can run, so the update is refused as invalid input and the stored entry keeps the
+/// schedule it carried.
+#[tokio::test]
+async fn an_update_whose_schedule_is_not_a_cron_expression_is_refused() {
+    let router = emulator();
+    store_table(&router, "schedule_update_db", "scheduled_table", &["a"]).await;
+    ok(
+        &router,
+        "CreateColumnStatisticsTaskSettings",
+        &create_body(
+            "schedule_update_db",
+            "scheduled_table",
+            json!({ "Schedule": DAILY_SCHEDULE }),
+        ),
+    )
+    .await;
+
+    // The rows differ along HOW the expression departs from
+    // `cron(<minutes> <hours> <day-of-month> <month> <day-of-week> <year>)`: too few fields,
+    // too many, no `cron(..)` wrapper at all, an unclosed wrapper, and no field at all.
+    for (case, schedule) in [
+        ("too few fields", "cron(15 12 * * ?)"),
+        ("too many fields", "cron(15 12 * * ? * *)"),
+        ("no cron wrapper", "15 12 * * ? *"),
+        ("an unclosed wrapper", "cron(15 12 * * ? *"),
+        ("no field at all", "cron()"),
+    ] {
+        let (status, parsed) = call(
+            &router,
+            "UpdateColumnStatisticsTaskSettings",
+            &update_body(
+                "schedule_update_db",
+                "scheduled_table",
+                json!({ "Schedule": schedule }),
+            ),
+        )
+        .await;
+        assert_eq!(
+            status, 400,
+            "case {case:?}: a schedule that is not a cron expression is refused, got {status} \
+             with {parsed}"
+        );
+        assert!(
+            error_code(&parsed).ends_with("InvalidInputException"),
+            "case {case:?}: expected InvalidInputException, got {:?} with {parsed}",
+            error_code(&parsed)
+        );
+        assert_eq!(
+            error_message(&parsed),
+            format!(
+                "Schedule {schedule} is not a cron expression of the form \
+                 cron(<minutes> <hours> <day-of-month> <month> <day-of-week> <year>)"
+            ),
+            "case {case:?}: the refusal names the expression and the form it must take, got \
+             {:?}",
+            error_message(&parsed)
+        );
+
+        // The refused update wrote nothing: the stored entry keeps its schedule.
+        let settings = get_settings(
+            &router,
+            &read_body("schedule_update_db", "scheduled_table"),
+        )
+        .await;
+        assert_eq!(
+            settings
+                .get("Schedule")
+                .and_then(|stored| stored.get("ScheduleExpression"))
+                .and_then(Value::as_str),
+            Some(DAILY_SCHEDULE),
+            "case {case:?}: a refused update leaves the stored schedule, got {settings}"
+        );
+    }
+}
+
+/// A member outside the bounds the model publishes is refused at the boundary, before the
+/// handler runs, and changes nothing.
+#[tokio::test]
+async fn an_update_outside_the_modelled_bounds_is_refused() {
+    let router = emulator();
+    store_table(&router, "bounds_update_db", "bounds_table", &["a"]).await;
+    ok(
+        &router,
+        "CreateColumnStatisticsTaskSettings",
+        &create_body(
+            "bounds_update_db",
+            "bounds_table",
+            json!({ "Schedule": DAILY_SCHEDULE }),
+        ),
+    )
+    .await;
+
+    // (case, the update) — one past each published bound of `NameString` (`length 1..255`)
+    // and of `SampleSizePercentage` (`range 0..100`),
+    // `smithy_query operation=UpdateColumnStatisticsTaskSettings`.
+    let cases: Vec<(&str, Value)> = vec![
+        (
+            "a table name shorter than the model admits",
+            update_body("bounds_update_db", "", json!({})),
+        ),
+        (
+            "a table name longer than the model admits",
+            update_body("bounds_update_db", &"t".repeat(256), json!({})),
+        ),
+        (
+            "a sample size below the modelled range",
+            update_body("bounds_update_db", "bounds_table", json!({ "SampleSize": -1.0 })),
+        ),
+        (
+            "a sample size above the modelled range",
+            update_body(
+                "bounds_update_db",
+                "bounds_table",
+                json!({ "SampleSize": 101.0 }),
+            ),
+        ),
+    ];
+
+    for (case, body) in cases {
+        let (status, parsed) = call(&router, "UpdateColumnStatisticsTaskSettings", &body).await;
+        assert_eq!(
+            status, 400,
+            "case {case:?}: a member outside the modelled bounds is refused, got {status} with \
+             {parsed}"
+        );
+
+        // The refused update wrote nothing: the stored entry is exactly what the create left.
+        let settings = get_settings(&router, &read_body("bounds_update_db", "bounds_table")).await;
+        assert_eq!(
+            reported_number(&settings, "SampleSize"),
+            0.0,
+            "case {case:?}: a refused update leaves the stored sample size, got {settings}"
+        );
+    }
 }

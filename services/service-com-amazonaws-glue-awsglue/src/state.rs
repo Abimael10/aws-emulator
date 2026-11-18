@@ -406,7 +406,8 @@ use crate::ops::types::{
     Trigger, TriggerNodeDetails,
     Tag, TargetProcessingProperties, TargetTableConfig,
     TriggerUpdate,
-    UpdateClassifierInput, UpdateCrawlerInput, UpdateDataQualityRulesetInput, UpdateGlossaryInput,
+    UpdateClassifierInput, UpdateColumnStatisticsTaskSettingsInput, UpdateCrawlerInput,
+    UpdateDataQualityRulesetInput, UpdateGlossaryInput,
     UpdateMLTransformInput,
     UpdateWorkflowInput,
     UsageProfileDefinition,
@@ -1497,6 +1498,40 @@ impl ComAmazonawsGlueAwsglueState {
             let overflow = self.column_statistics_task_runs.len() - MAX_COLUMN_STATISTICS_TASK_RUNS;
             self.column_statistics_task_runs.drain(..overflow);
         }
+    }
+
+    /// The column statistics task settings a create wrote for this table, or `None` when
+    /// the addressed catalog holds no entry under those names — because it holds no such
+    /// database, no such table, or a table no create has written settings for.
+    ///
+    /// ONE resolution of that address, so the read-only probe an operation makes before it
+    /// writes and the write itself cannot drift: the settings hang on the stored table
+    /// ([`TableEntry::column_statistics_task_settings`]) and `database_name` and
+    /// `table_name` are matched folded, the way the catalog stores them.
+    pub fn column_statistics_task_settings(
+        &self,
+        catalog_id: &str,
+        database_name: &str,
+        table_name: &str,
+    ) -> Option<&ColumnStatisticsTaskSettingsEntry> {
+        self.database(catalog_id, database_name)
+            .and_then(|database| database.tables.get(&fold_name(table_name)))
+            .and_then(|table| table.column_statistics_task_settings.as_ref())
+    }
+
+    /// The same entry, mutably: the one `UpdateColumnStatisticsTaskSettings` rewrites.
+    ///
+    /// The lookup rule is [`Self::column_statistics_task_settings`]'s, so the entry a
+    /// write rewrites is exactly the entry a read reports.
+    pub fn column_statistics_task_settings_mut(
+        &mut self,
+        catalog_id: &str,
+        database_name: &str,
+        table_name: &str,
+    ) -> Option<&mut ColumnStatisticsTaskSettingsEntry> {
+        self.database_mut(catalog_id, database_name)
+            .and_then(|database| database.tables.get_mut(&fold_name(table_name)))
+            .and_then(|table| table.column_statistics_task_settings.as_mut())
     }
 
     /// Give every data quality rule recommendation run the state the CLOCK already owed

@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! End-to-end tests for the ADMISSION of a caller-supplied execution role on the writes
-//! that are not a crawler's: `CreateColumnStatisticsTaskSettings`, `CreateMLTransform`, the
+//! that are not a crawler's: `CreateColumnStatisticsTaskSettings`, the
+//! `UpdateColumnStatisticsTaskSettings` that replaces those settings' role,
+//! `CreateMLTransform`, the
 //! `UpdateMLTransform` that replaces a transform's role, and `CreateSession`.
 //!
 //! The rule under test: a resource that Glue itself RUNS AS a caller-supplied `Role` — the
@@ -630,6 +632,113 @@ async fn an_ml_transform_update_that_replaces_the_role_is_held_to_the_same_resol
             read["Role"],
             json!(expected_role),
             "case {case:?}: expected the stored transform to carry {expected_role:?}, got {read}"
+        );
+    }
+}
+
+/// `UpdateColumnStatisticsTaskSettings` resolves a `Role` it would REPLACE the stored one
+/// with the same way the create does: an un-assumable role is refused with the create's own
+/// sentence and the stored settings keep the role they had, while an update that names no
+/// role at all is untouched by the resolution.
+///
+/// The rows differ along which role the update names and whether it names one at all.
+#[tokio::test]
+async fn a_column_statistics_settings_update_that_replaces_the_role_is_held_to_the_same_resolution()
+{
+    let (router, engine) = emulator_with_iam();
+    let assumable = seed_role(&engine, "settings-update-glue-role", Some(glue_trust()));
+    let other_assumable = seed_role(
+        &engine,
+        "settings-update-glue-role-two",
+        Some(glue_trust()),
+    );
+    let unassumable = seed_role(
+        &engine,
+        "settings-update-ec2-role",
+        Some(trust("Allow", "ec2.amazonaws.com", "sts:AssumeRole")),
+    );
+    let absent = role_arn(DEFAULT_PATH, "settings-update-absent-role");
+
+    // (case, the members the update carries beside the pair that addresses the entry, the
+    // role the entry must carry afterwards)
+    let rows: Vec<(&str, Value, String)> = vec![
+        (
+            "a replacement role Glue can assume",
+            json!({ "Role": other_assumable }),
+            other_assumable.clone(),
+        ),
+        (
+            "a replacement role Glue cannot assume",
+            json!({ "Role": unassumable }),
+            assumable.clone(),
+        ),
+        (
+            "a replacement role this account does not hold",
+            json!({ "Role": absent }),
+            assumable.clone(),
+        ),
+        (
+            "an update that names no role",
+            json!({ "SampleSize": 5.0 }),
+            assumable.clone(),
+        ),
+    ];
+
+    for (index, (case, members, expected_role)) in rows.iter().enumerate() {
+        // One table per row, carrying the settings this row's update rewrites. The create
+        // states a SCHEDULE, so it starts no statistics run of its own.
+        let table = format!("update_settings_{index}");
+        store_table(&router, &table).await;
+        ok(
+            &router,
+            "CreateColumnStatisticsTaskSettings",
+            &json!({
+                "DatabaseName": DATABASE,
+                "TableName": table,
+                "Role": assumable,
+                "Schedule": "cron(15 12 * * ? *)",
+            }),
+        )
+        .await;
+
+        let mut request = members.clone();
+        request["DatabaseName"] = json!(DATABASE);
+        request["TableName"] = json!(table);
+        let (status, body) = call(&router, "UpdateColumnStatisticsTaskSettings", &request).await;
+        let refused = *expected_role == assumable && members.get("Role").is_some();
+        if refused {
+            assert_eq!(
+                status, 400,
+                "case {case:?}: expected the update to be refused, got {status} with {body}"
+            );
+            assert!(
+                error_code(&body).contains("InvalidInputException"),
+                "case {case:?}: expected InvalidInputException, got {body}"
+            );
+            let role = members["Role"].as_str().expect("the row names a role");
+            assert_refusal_message(
+                case,
+                Write::ColumnStatisticsTaskSettings,
+                role,
+                &body,
+            );
+        } else {
+            assert_eq!(
+                status, 200,
+                "case {case:?}: expected the update to be admitted, got {status} with {body}"
+            );
+        }
+
+        let read = ok(
+            &router,
+            "GetColumnStatisticsTaskSettings",
+            &json!({ "DatabaseName": DATABASE, "TableName": table }),
+        )
+        .await;
+        assert_eq!(
+            read["ColumnStatisticsTaskSettings"]["Role"],
+            json!(expected_role),
+            "case {case:?}: expected the stored settings to carry {expected_role:?}, got {read}"
         );
     }
 }

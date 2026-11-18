@@ -488,6 +488,34 @@ impl ColumnStatisticsTaskSettingsEntry {
         }
     }
 
+    /// Merge what an `UpdateColumnStatisticsTaskSettings` request STATES into the settings a
+    /// table already carries: each member the request states replaces what is stored, and
+    /// each member it omits is preserved — the way every other update of this service merges
+    /// a partial request ([`CrawlerEntry::apply_update`]).
+    ///
+    /// `SampleSize` is modelled with a default of 0 rather than as an optional member, so a
+    /// request always carries a share and the stored one always follows it. An EMPTY
+    /// `ColumnNameList` states no column name, exactly as it does on the create, so it
+    /// leaves the settings listing none and the runs they configure take their own default
+    /// ([`table_column_names`]).
+    pub fn apply_update_input(&mut self, input: &UpdateColumnStatisticsTaskSettingsInput) {
+        if let Some(role) = &input.role {
+            self.role = role.clone();
+        }
+        self.sample_size = input.sample_size;
+        if let Some(schedule) = &input.schedule {
+            self.schedule_expression = Some(schedule.clone());
+        }
+        if let Some(column_name_list) = &input.column_name_list {
+            // An empty list states no column either, so it is recorded as none rather than
+            // as settings that cover nothing.
+            self.column_name_list = (!column_name_list.is_empty()).then(|| column_name_list.clone());
+        }
+        if let Some(security_configuration) = &input.security_configuration {
+            self.security_configuration = Some(security_configuration.clone());
+        }
+    }
+
     /// Rebuild the modelled `ColumnStatisticsTaskSettings` shape from what is stored.
     ///
     /// `table` is the stored table these settings hang on, which is where their catalog,
