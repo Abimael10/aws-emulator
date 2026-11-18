@@ -18,12 +18,15 @@
 //! * onboarding resolves the `connectInstanceId` against Amazon Connect's own instance
 //!   registry, so an id the account does not hold is HTTP 404 — in the words that
 //!   operation refuses an instance it cannot find — and persists nothing;
-//! * an instance that already holds an onboarding job is not onboarded a second time —
+//! * starting an onboarding is IDEMPOTENT: a start re-sent while the job it asked for
+//!   is still running is served (HTTP 200) and reports that job, writing nothing — the
+//!   first job keeps its encryption config and still reaches the finished status;
+//! * an instance whose onboarding job has FINISHED is not onboarded a second time —
 //!   HTTP 409 `ConflictException`, with the stored record left exactly as it was;
 //! * a `keyArn` is required when encryption is `enabled`; a config that breaks that rule
 //!   is HTTP 400 `ValidationException` and persists nothing.
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 use service_com_amazonaws_connectcampaigns_amazonconnectcampaignservice::ops::types::INSTANCE_ONBOARDING_JOB_STATUS_CODE_VALUES;
@@ -34,11 +37,23 @@ use service_com_amazonaws_connectcampaigns_amazonconnectcampaignservice::state::
     ONBOARDING_STATUS_SUCCEEDED,
 };
 
-use super::common::{call, job_status, reach_the_due_instant, router, Answer, Harness, KEY_ARN};
+use super::common::{
+    call, hold_the_job_unfinished, job_status, reach_the_due_instant, router, Answer, Harness,
+    KEY_ARN,
+};
 
 /// The region every case here signs for; nothing in an onboarding record is
 /// region-dependent, so one is enough.
 const REGION: &str = "us-east-1";
+
+/// How long the one case that lets the wall clock reach a job's due instant keeps
+/// looking for the status that instant owes. Generous beside
+/// [`ONBOARDING_JOB_DURATION`], so a loaded host reaches it too, and reached as soon as
+/// the condition holds rather than waited out.
+const POLL_DEADLINE: Duration = Duration::from_secs(60);
+
+/// How long that case waits between two looks.
+const POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 /// The sentence a request asking to ONBOARD an instance the account does not hold is
 /// refused with, as fixed text around the id the request carried. Written out here rather
@@ -305,10 +320,14 @@ async fn the_clock_alone_finishes_a_started_job() {
     );
 
     // Nothing in the emulator sleeps for the transition: the record stores the instant,
-    // so this case only has to let the wall clock reach it.
-    tokio::time::sleep(ONBOARDING_JOB_DURATION + Duration::from_millis(250)).await;
-
-    let polled = status(&harness, instance).await;
+    // so this case only has to let the wall clock reach it — and then look again until
+    // the status it owes shows up, rather than reading once at a moment it guessed.
+    let deadline = Instant::now() + POLL_DEADLINE;
+    let mut polled = status(&harness, instance).await;
+    while job_status(&polled) != ONBOARDING_STATUS_SUCCEEDED && Instant::now() < deadline {
+        tokio::time::sleep(POLL_INTERVAL).await;
+        polled = status(&harness, instance).await;
+    }
     assert_eq!(
         (polled.status, job_status(&polled)),
         (200, ONBOARDING_STATUS_SUCCEEDED),
@@ -445,25 +464,143 @@ async fn onboarding_requires_an_instance_the_account_holds() {
 }
 
 #[tokio::test]
-async fn an_instance_that_already_holds_a_job_is_not_onboarded_again() {
-    // One row per way a second call can differ from the first: the same config, a
-    // different config, and a call made after the first job is due to have finished —
-    // none of them starts a second job, and none of them overwrites the first.
-    let rows: Vec<(&str, Value, bool)> = vec![
-        ("the same config, job still running", service_key_config(), false),
+async fn a_repeat_start_while_the_job_runs_reports_that_job() {
+    // `StartInstanceOnboardingJob` is `@idempotent` (from
+    // `smithy_query(query="operation", operation="StartInstanceOnboardingJob")`), so a
+    // start re-sent while the job it asked for is still running is answered with that
+    // job rather than refused. Rows span what the rule generalises over: the instance
+    // id's form, the encryption config the repeat carries (the same one, a customer-key
+    // one, forms the first call did not carry), and how many times the start is
+    // re-sent.
+    let rows: Vec<(&str, String, Value, usize)> = vec![
         (
-            "a different config, job still running",
-            json!({"enabled": true, "encryptionType": "KMS", "keyArn": KEY_ARN}),
-            false,
+            "one character, the same config re-sent once",
+            "a".to_string(),
+            service_key_config(),
+            1,
         ),
         (
-            "a different config, job already finished",
+            "uuid form, a customer KMS key on the repeat",
+            "1b4d2c7e-0a55-4f81-9d2c-7e0a554f8100".to_string(),
+            json!({"enabled": true, "encryptionType": "KMS", "keyArn": KEY_ARN}),
+            1,
+        ),
+        (
+            "every admitted punctuation, re-sent three times",
+            "a.b_c-D9".to_string(),
+            json!({"enabled": false, "encryptionType": "KMS"}),
+            3,
+        ),
+        (
+            "256 characters, a key with no type, re-sent twice",
+            "i".repeat(256),
             json!({"enabled": true, "keyArn": KEY_ARN}),
-            true,
+            2,
         ),
     ];
 
-    for (case, second_config, finish_first) in rows {
+    for (case, instance, repeat_config, repeats) in rows {
+        let harness = router();
+        harness.register_connect_instance(REGION, &instance);
+
+        let first_config = service_key_config();
+        let started = start(&harness, &instance, &first_config).await;
+
+        // The job this case asserts on must still be RUNNING for every call it makes,
+        // and that is a property of the record rather than of how fast this host runs
+        // the loop: the due instant goes out of reach before anything is asserted,
+        // exactly as the finished cases pull it into the past.
+        hold_the_job_unfinished(&harness, &instance);
+
+        assert_eq!(
+            (started.status, job_status(&started)),
+            (200, ONBOARDING_STATUS_IN_PROGRESS),
+            "case {case:?}: expected the first onboarding to be served, got {} {}",
+            started.status,
+            started.body
+        );
+
+        for repeat in 1..=repeats {
+            let again = start(&harness, &instance, &repeat_config).await;
+            assert_eq!(
+                (again.status, job_status(&again)),
+                (200, ONBOARDING_STATUS_IN_PROGRESS),
+                "case {case:?} repeat {repeat}: expected the running job to be reported, \
+                 got {} {}",
+                again.status,
+                again.body
+            );
+            assert_eq!(
+                again
+                    .body
+                    .pointer("/connectInstanceOnboardingJobStatus/connectInstanceId")
+                    .and_then(Value::as_str),
+                Some(instance.as_str()),
+                "case {case:?} repeat {repeat}: the reported job names the instance the \
+                 request carried, got {}",
+                again.body
+            );
+            assert!(
+                again
+                    .body
+                    .pointer("/connectInstanceOnboardingJobStatus/failureCode")
+                    .is_none_or(Value::is_null),
+                "case {case:?} repeat {repeat}: a job that has not failed carries no \
+                 failureCode, got {}",
+                again.body
+            );
+
+            // Nothing was written: the repeat's config was not taken, so the config the
+            // FIRST call persisted is still the instance's.
+            assert_eq!(
+                stored_config(&harness, &instance),
+                Some(sent_config(&first_config)),
+                "case {case:?} repeat {repeat}: expected the first config to be kept, \
+                 got {:?}",
+                stored_config(&harness, &instance)
+            );
+        }
+
+        // The first job was left undisturbed: it is the one the clock still finishes.
+        reach_the_due_instant(&harness, &instance);
+        let polled = status(&harness, &instance).await;
+        assert_eq!(
+            (polled.status, job_status(&polled)),
+            (200, ONBOARDING_STATUS_SUCCEEDED),
+            "case {case:?}: expected the first job to reach the finished status, got {} {}",
+            polled.status,
+            polled.body
+        );
+        assert_eq!(
+            stored_config(&harness, &instance),
+            Some(sent_config(&first_config)),
+            "case {case:?}: the finished job keeps the config the first call carried, got {:?}",
+            stored_config(&harness, &instance)
+        );
+    }
+}
+
+#[tokio::test]
+async fn an_instance_whose_onboarding_has_finished_is_not_onboarded_again() {
+    // Once the job has FINISHED there is no onboarding left to do, so the repeat is a
+    // genuine conflict. One row per way such a second call can differ from the first:
+    // the config it carries and how many times it is re-sent — none of them starts a
+    // second job, and none of them overwrites the first.
+    let rows: Vec<(&str, Value, usize)> = vec![
+        ("the same config", service_key_config(), 1),
+        (
+            "a different config",
+            json!({"enabled": true, "encryptionType": "KMS", "keyArn": KEY_ARN}),
+            1,
+        ),
+        (
+            "a key with no type, re-sent twice",
+            json!({"enabled": true, "keyArn": KEY_ARN}),
+            2,
+        ),
+    ];
+
+    for (case, second_config, repeats) in rows {
         let harness = router();
         let instance = "twice-onboarded-instance";
         harness.register_connect_instance(REGION, instance);
@@ -475,57 +612,54 @@ async fn an_instance_that_already_holds_a_job_is_not_onboarded_again() {
             "case {case:?}: expected the first onboarding to be served, got {} {}",
             started.status, started.body
         );
-        if finish_first {
-            reach_the_due_instant(&harness, instance);
+        reach_the_due_instant(&harness, instance);
+
+        for repeat in 1..=repeats {
+            let refused = start(&harness, instance, &second_config).await;
+            assert_eq!(
+                refused.status, 409,
+                "case {case:?} repeat {repeat}: expected HTTP 409 for an instance already \
+                 onboarded, got {} {}",
+                refused.status, refused.body
+            );
+            assert!(
+                refused.error_code.ends_with("ConflictException"),
+                "case {case:?} repeat {repeat}: expected ConflictException, got {:?}",
+                refused.error_code
+            );
+            assert_eq!(
+                refused.message(),
+                ALREADY_ONBOARDED_WORDING,
+                "case {case:?} repeat {repeat}: expected the conflict wording, got {}",
+                refused.body
+            );
+            assert!(
+                refused
+                    .body
+                    .get("connectInstanceOnboardingJobStatus")
+                    .is_none(),
+                "case {case:?} repeat {repeat}: a refused onboarding reports no job, got {}",
+                refused.body
+            );
+
+            // The refusal left the first job's record exactly as it was — the second
+            // call's config was not taken.
+            assert_eq!(
+                stored_config(&harness, instance),
+                Some(sent_config(&first_config)),
+                "case {case:?} repeat {repeat}: expected the first config to be kept, got {:?}",
+                stored_config(&harness, instance)
+            );
+            let polled = status(&harness, instance).await;
+            assert_eq!(
+                (polled.status, job_status(&polled)),
+                (200, ONBOARDING_STATUS_SUCCEEDED),
+                "case {case:?} repeat {repeat}: expected the finished job to be reported \
+                 unchanged, got {} {}",
+                polled.status,
+                polled.body
+            );
         }
-
-        let refused = start(&harness, instance, &second_config).await;
-        assert_eq!(
-            refused.status, 409,
-            "case {case:?}: expected HTTP 409 for an instance that already holds a job, \
-             got {} {}",
-            refused.status, refused.body
-        );
-        assert!(
-            refused.error_code.ends_with("ConflictException"),
-            "case {case:?}: expected ConflictException, got {:?}",
-            refused.error_code
-        );
-        assert_eq!(
-            refused.message(),
-            ALREADY_ONBOARDED_WORDING,
-            "case {case:?}: expected the conflict wording, got {}",
-            refused.body
-        );
-        assert!(
-            refused.body.get("connectInstanceOnboardingJobStatus").is_none(),
-            "case {case:?}: a refused onboarding reports no job, got {}",
-            refused.body
-        );
-
-        // The refusal left the first job's record exactly as it was — the second call's
-        // config was not taken.
-        assert_eq!(
-            stored_config(&harness, instance),
-            Some(sent_config(&first_config)),
-            "case {case:?}: expected the first config to be kept, got {:?}",
-            stored_config(&harness, instance)
-        );
-        let polled = status(&harness, instance).await;
-        assert_eq!(
-            (polled.status, job_status(&polled)),
-            (
-                200,
-                if finish_first {
-                    ONBOARDING_STATUS_SUCCEEDED
-                } else {
-                    ONBOARDING_STATUS_IN_PROGRESS
-                }
-            ),
-            "case {case:?}: expected the first job to be reported unchanged, got {} {}",
-            polled.status,
-            polled.body
-        );
     }
 }
 

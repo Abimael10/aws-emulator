@@ -131,6 +131,28 @@ pub fn reach_the_due_instant(harness: &Harness, instance: &str) {
     record.succeeds_at = SystemTime::now() - Duration::from_secs(1);
 }
 
+/// How far out [`hold_the_job_unfinished`] pushes a job's due instant: far enough that
+/// no case can reach it while it runs, however slowly the host runs it.
+const A_LONG_WAY_OFF: Duration = Duration::from_secs(3600);
+
+/// Keep `instance`'s onboarding job unfinished for as long as a case needs, by pushing
+/// the instant it is due to have finished out of reach — the mirror of
+/// [`reach_the_due_instant`], so a case that asserts on a job still RUNNING says so
+/// through the record rather than racing the wall clock. Panics when the instance holds
+/// no record, because a case that reaches for a point of a job it never started is a
+/// broken case.
+pub fn hold_the_job_unfinished(harness: &Harness, instance: &str) {
+    let state = harness
+        .engine()
+        .state::<ComAmazonawsConnectcampaignsAmazonconnectcampaignserviceState>();
+    let mut store = state.lock();
+    let record = store
+        .instance_onboarding
+        .get_mut(instance)
+        .unwrap_or_else(|| panic!("case {instance:?}: the start call stored no record"));
+    record.succeeds_at = SystemTime::now() + A_LONG_WAY_OFF;
+}
+
 /// Drive one request through the router and report what came back. A `body` of
 /// `Value::Null` sends no body at all.
 pub async fn call(

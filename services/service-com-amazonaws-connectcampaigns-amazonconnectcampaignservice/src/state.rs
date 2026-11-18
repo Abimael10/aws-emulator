@@ -433,18 +433,28 @@ impl ComAmazonawsConnectcampaignsAmazonconnectcampaignserviceState {
     /// Start the onboarding job of `connect_instance_id`, persisting `encryption_config`
     /// as that instance's, or report why no job was started.
     ///
-    /// The one place this store takes an onboarding record, so the two refusals an
-    /// onboarding call owes are decided once rather than per handler: an instance this
-    /// service already holds a job for is not onboarded a second time, and the store is
-    /// bounded. Nothing is written on either refusal.
+    /// The one place this store takes an onboarding record, so what an onboarding call
+    /// owes is decided once rather than per handler.
+    ///
+    /// An instance whose job is still RUNNING keeps that job and takes nothing from the
+    /// repeat call ([`OnboardingStarted::Unchanged`]): starting an onboarding is
+    /// idempotent, so a request asking for work this store is already doing has nothing
+    /// left to start and is answered with the job it is doing — which is what makes a
+    /// re-sent start safe after a lost or timed-out answer. Only an instance whose job
+    /// has FINISHED onboarding it — one already onboarded, so there is no onboarding
+    /// left to do — is refused ([`OnboardingRefused::AlreadyOnboarded`]), and the store
+    /// is bounded. Nothing is written on either refusal, nor on a repeat.
     pub fn start_instance_onboarding(
         &mut self,
         connect_instance_id: &str,
         encryption_config: EncryptionConfig,
         now: SystemTime,
-    ) -> Result<StoredInstanceOnboarding, OnboardingRefused> {
-        if self.instance_onboarding.contains_key(connect_instance_id) {
-            return Err(OnboardingRefused::AlreadyOnboarded);
+    ) -> Result<OnboardingStarted, OnboardingRefused> {
+        if let Some(existing) = self.instance_onboarding.get(connect_instance_id) {
+            if existing.status_at(now) == ONBOARDING_STATUS_SUCCEEDED {
+                return Err(OnboardingRefused::AlreadyOnboarded);
+            }
+            return Ok(OnboardingStarted::Unchanged(existing.clone()));
         }
         if self.instance_onboarding.len() >= MAX_ONBOARDED_INSTANCES {
             return Err(OnboardingRefused::StoreFull);
@@ -456,7 +466,7 @@ impl ComAmazonawsConnectcampaignsAmazonconnectcampaignserviceState {
         );
         self.instance_onboarding
             .insert(record.connect_instance_id.clone(), record.clone());
-        Ok(record)
+        Ok(OnboardingStarted::Started(record))
     }
 
     /// Delete the onboarding job this service holds for `connect_instance_id`, and
@@ -981,13 +991,42 @@ pub fn service_linked_role_arn() -> String {
     )
 }
 
+/// What an accepted onboarding-start request did, as
+/// [`ComAmazonawsConnectcampaignsAmazonconnectcampaignserviceState::start_instance_onboarding`]
+/// reports it. Either way it carries the record the store now holds for the instance,
+/// which is what the call reports back.
+#[derive(Debug, Clone)]
+pub enum OnboardingStarted {
+    /// The instance held no onboarding job, so one was started and the call's encryption
+    /// config is now that instance's.
+    Started(StoredInstanceOnboarding),
+    /// The instance's onboarding job has not FINISHED onboarding it, so that job stays
+    /// and nothing was written. A job still running is the reachable case; a job in
+    /// [`ONBOARDING_STATUS_FAILED`] is reported the same way, carrying the failure code
+    /// its record names, so the answer is always the job the store holds.
+    Unchanged(StoredInstanceOnboarding),
+}
+
+impl OnboardingStarted {
+    /// The onboarding record the store holds for the instance after the call, whether
+    /// this call started its job or found one it has not finished — so the operation
+    /// reports the stored record and never a second reading of it.
+    pub fn record(&self) -> &StoredInstanceOnboarding {
+        match self {
+            Self::Started(record) | Self::Unchanged(record) => record,
+        }
+    }
+}
+
 /// Why a requested onboarding job was not started, as
 /// [`ComAmazonawsConnectcampaignsAmazonconnectcampaignserviceState::start_instance_onboarding`]
 /// reports it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OnboardingRefused {
-    /// The instance already holds an onboarding job, so there is no onboarding left to
-    /// start for it: the modelled `ConflictException` (HTTP 409).
+    /// The instance's onboarding job has already FINISHED onboarding it, so there is no
+    /// onboarding left to start for it: the modelled `ConflictException` (HTTP 409). A
+    /// job that has NOT finished is not this refusal — it is
+    /// [`OnboardingStarted::Unchanged`].
     AlreadyOnboarded,
     /// This emulator's store already holds [`MAX_ONBOARDED_INSTANCES`] records, so it
     /// takes no further instance.

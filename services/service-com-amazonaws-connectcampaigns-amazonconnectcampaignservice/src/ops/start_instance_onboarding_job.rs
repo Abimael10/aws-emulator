@@ -8,9 +8,13 @@
 //! The onboarding is GATED on the Connect instance existing: Amazon Connect owns the
 //! instance registry (`crate::state::connect_instance_refusal` reads it), and a
 //! `connectInstanceId` the account holds no instance for is answered with the modelled
-//! `ResourceNotFoundException` (HTTP 404) with nothing persisted. An instance this
-//! service already holds a job for is answered with the modelled `ConflictException`
-//! (HTTP 409), also with nothing written.
+//! `ResourceNotFoundException` (HTTP 404) with nothing persisted. An instance whose
+//! onboarding job has already FINISHED is answered with the modelled
+//! `ConflictException` (HTTP 409), also with nothing written.
+//!
+//! The operation is `@idempotent`, so a repeat of a start whose job has not finished is
+//! not a conflict: it reports that job's status and writes nothing, which is what makes
+//! a re-sent PUT — the normal reaction to a lost or timed-out answer — safe.
 //!
 //! The record this call writes is what the reporting side reads:
 //! `GetInstanceOnboardingJobStatus` reports its job status.
@@ -254,14 +258,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // write happens here and not in the operation that reports the job. The job
         // itself is owed by the clock, which is why the record carries the instant it is
         // due to have finished rather than a status nothing would ever move.
+        //
+        // A start the store is already running is reported rather than refused: the
+        // operation is `@idempotent`, so the request asks for onboarding already under
+        // way and the job under way is the answer it is owed. The record it reports is
+        // the stored one, encryption config included, so the repeat changes nothing a
+        // later reader sees.
         let now = ::std::time::SystemTime::now();
         let started = state.lock().start_instance_onboarding(
             &input.connect_instance_id,
             input.encryption_config,
             now,
         );
-        let stored = match started {
-            Ok(stored) => stored,
+        let outcome = match started {
+            Ok(outcome) => outcome,
             Err(crate::state::OnboardingRefused::AlreadyOnboarded) => {
                 audit("ConflictException");
                 return Err(StartInstanceOnboardingJobErrorModeled::ConflictException(
@@ -291,12 +301,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         };
 
-        audit("accepted");
+        audit(match outcome {
+            crate::state::OnboardingStarted::Started(_) => "accepted",
+            crate::state::OnboardingStarted::Unchanged(_) => "accepted-unchanged",
+        });
 
         // Answered from what was stored, so a response that differs from the stored
         // record cannot happen.
         Ok(StartInstanceOnboardingJobOutput {
-            connect_instance_onboarding_job_status: Some(stored.to_job_status(now)),
+            connect_instance_onboarding_job_status: Some(outcome.record().to_job_status(now)),
         })
     }
 }
