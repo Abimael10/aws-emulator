@@ -1903,9 +1903,15 @@ pub(super) const PUBLISHED_CONTROLS: &[ControlSeed] = &[
     ControlSeed {
         slug: "securityhub-s3-1",
         name: "S3 general purpose buckets should have block public access settings enabled",
-        description: "Checks whether the bucket-level block public access settings of an \
-                      Amazon S3 general purpose bucket are enabled, and reports the \
-                      finding in Security Hub.",
+        // The implementing Security Hub control's own published text: what the control
+        // checks, followed by the condition under which it fails. The check is on the
+        // ACCOUNT-level block public access settings, which is also why the control
+        // governs every S3 resource type those settings restrict access to.
+        description: "This control checks whether the following Amazon S3 block public \
+                      access settings are configured at the account level: \
+                      ignorePublicAcls, blockPublicPolicy, blockPublicAcls, and \
+                      restrictPublicBuckets. The control fails if one or more of the \
+                      account-level block public access settings is set to false.",
         behavior: DETECTIVE,
         severity: MEDIUM,
         implementation_type: SECURITY_HUB_CONTROL,
@@ -1915,7 +1921,16 @@ pub(super) const PUBLISHED_CONTROLS: &[ControlSeed] = &[
         scope: REGIONAL,
         deployable_regions: GENERALLY_AVAILABLE_REGIONS,
         parameters: NO_PARAMETERS,
-        governed_resources: &["AWS::S3::Bucket"],
+        // The account-level block public access settings restrict public access to every
+        // S3 surface that can grant it, so the catalog publishes each of those resource
+        // types as governed, in resource-type order.
+        governed_resources: &[
+            "AWS::S3::AccessPoint",
+            "AWS::S3::Bucket",
+            "AWS::S3::BucketPolicy",
+            "AWS::S3::MultiRegionAccessPoint",
+            "AWS::S3::MultiRegionAccessPointPolicy",
+        ],
         governed_providers: AWS,
         implements: "restrict-public-access",
         frameworks: NO_FRAMEWORK_ITEMS,
@@ -1923,9 +1938,11 @@ pub(super) const PUBLISHED_CONTROLS: &[ControlSeed] = &[
     ControlSeed {
         slug: "securityhub-s3-5",
         name: "S3 general purpose buckets should require requests to use SSL",
-        description: "Checks whether an Amazon S3 general purpose bucket has a policy \
-                      that requires requests to use SSL, and reports the finding in \
-                      Security Hub.",
+        // The implementing Security Hub control's own published text: what the control
+        // checks, followed by the condition under which it fails.
+        description: "This control checks whether an Amazon S3 general purpose bucket has \
+                      a policy that requires requests to use SSL. The control fails if \
+                      the bucket policy doesn't require requests to use SSL.",
         behavior: DETECTIVE,
         severity: MEDIUM,
         implementation_type: SECURITY_HUB_CONTROL,
@@ -2309,6 +2326,19 @@ pub(super) const PUBLISHED_CATALOG_RECORDS: &[PublishedCatalogRecord] = &[
     PublishedCatalogRecord {
         slug: "securityhub-rds-3",
         identifier: "dsrtfqf4g9gvlguj5hqahozla",
+        release_time: Some(1_669_593_600),
+    },
+    // The two controls over Amazon S3 belong to that same body of governance
+    // capability, so the catalog dates them with the one instant recorded above rather
+    // than with an instant of their own.
+    PublishedCatalogRecord {
+        slug: "securityhub-s3-1",
+        identifier: "alm61aw5oxpgfgh3bhmish87u",
+        release_time: Some(1_669_593_600),
+    },
+    PublishedCatalogRecord {
+        slug: "securityhub-s3-5",
+        identifier: "35hoe56okxxh2ujnsub92wkym",
         release_time: Some(1_669_593_600),
     },
     // Released after the body above, so the catalog dates it with its own instant.

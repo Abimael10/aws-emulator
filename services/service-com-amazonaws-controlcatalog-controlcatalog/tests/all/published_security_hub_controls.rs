@@ -19,11 +19,11 @@
 //! catalog records, and they differ in
 //! severity (all four modeled values), in designator form (`SH.` followed by the
 //! control's own Security Hub id, and the catalog's own `SH.{SERVICE}.DT.{N}`), in
-//! parameter-requirement summary, in whether any available resource type represents what
-//! the control governs, and in release instant (controls released together against
-//! controls released on their own). Every row is crossed with the page sizes a client
-//! walks the listing at, with the implementation-type filter a client narrows it by, and
-//! with `GetControl`.
+//! parameter-requirement summary, in how many resource types the control governs (none,
+//! because no available resource type represents what it governs, exactly one, and
+//! several), and in release instant (controls released together against controls released
+//! on their own). Every row is crossed with the page sizes a client walks the listing at,
+//! with the implementation-type filter a client narrows it by, and with `GetControl`.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -172,6 +172,43 @@ const PUBLISHED_SECURITY_HUB_CONTROLS: &[PublishedSecurityHubControl] = &[
         parameter_requirement_summary: "NONE",
         release_time: 1_669_593_600,
         governed_resources: &["AWS::RDS::DBInstance"],
+    },
+    // The control whose check is on the ACCOUNT-level block public access settings, so
+    // the catalog publishes every S3 resource type those settings restrict access to as
+    // governed — the row that spans a governed-resource list of several types.
+    PublishedSecurityHubControl {
+        designator: "SH.S3.1",
+        identifier: "alm61aw5oxpgfgh3bhmish87u",
+        implementation_identifier: "S3.1",
+        name: "S3 general purpose buckets should have block public access settings enabled",
+        description: "This control checks whether the following Amazon S3 block public \
+                      access settings are configured at the account level: \
+                      ignorePublicAcls, blockPublicPolicy, blockPublicAcls, and \
+                      restrictPublicBuckets. The control fails if one or more of the \
+                      account-level block public access settings is set to false.",
+        severity: "MEDIUM",
+        parameter_requirement_summary: "NONE",
+        release_time: 1_669_593_600,
+        governed_resources: &[
+            "AWS::S3::AccessPoint",
+            "AWS::S3::Bucket",
+            "AWS::S3::BucketPolicy",
+            "AWS::S3::MultiRegionAccessPoint",
+            "AWS::S3::MultiRegionAccessPointPolicy",
+        ],
+    },
+    PublishedSecurityHubControl {
+        designator: "SH.S3.5",
+        identifier: "35hoe56okxxh2ujnsub92wkym",
+        implementation_identifier: "S3.5",
+        name: "S3 general purpose buckets should require requests to use SSL",
+        description: "This control checks whether an Amazon S3 general purpose bucket has \
+                      a policy that requires requests to use SSL. The control fails if \
+                      the bucket policy doesn't require requests to use SSL.",
+        severity: "MEDIUM",
+        parameter_requirement_summary: "NONE",
+        release_time: 1_669_593_600,
+        governed_resources: &["AWS::S3::Bucket"],
     },
     // Released after the body of controls above, so it carries its own release instant.
     PublishedSecurityHubControl {
@@ -416,6 +453,92 @@ async fn every_recorded_security_hub_control_is_served_with_its_published_record
                 .iter()
                 .any(|row| !row.governed_resources.is_empty()),
         "case governed resources: the table must span both an empty and a non-empty list"
+    );
+}
+
+/// `GovernedResources` reports the resource types a control governs — EVERY one of them.
+///
+/// A control's check can bear on more than one resource type, and the catalog publishes
+/// the whole set: the list is never reduced to the one type that names the implementing
+/// service, never reordered out of the catalog's own order and never carries a type
+/// twice. An empty list is reserved for a control whose governed resources "cannot be
+/// represented by available resource types". The set is catalog content rather than a
+/// per-request projection, so the same list comes back at every page size, through the
+/// type-filtered listing and through `GetControl`.
+#[tokio::test]
+async fn a_control_governing_several_resource_types_publishes_every_one_of_them() {
+    let emulator = Emulator::new();
+
+    // One entry per (control, way the client read it): the case name, the control's
+    // published row, and the governed-resource list that read served.
+    let mut served_lists: Vec<(String, &PublishedSecurityHubControl, Vec<String>)> = Vec::new();
+    for body in requests() {
+        for page_size in PAGE_SIZES {
+            let listed = listed_by_arn(&emulator, page_size, &body).await;
+            for row in PUBLISHED_SECURITY_HUB_CONTROLS {
+                let arn = catalog_arn(row.identifier);
+                let case = format!("{} maxResults={page_size:?} {body}", row.designator);
+                let served = listed
+                    .get(&arn)
+                    .unwrap_or_else(|| panic!("case {case}: the catalog must publish {arn}"));
+                served_lists.push((case, row, strings(served, "GovernedResources")));
+            }
+        }
+    }
+    for row in PUBLISHED_SECURITY_HUB_CONTROLS {
+        let arn = catalog_arn(row.identifier);
+        let read_back = emulator
+            .ok("/get-control", &format!(r#"{{"ControlArn":"{arn}"}}"#))
+            .await;
+        served_lists.push((
+            format!("{} read as {arn}", row.designator),
+            row,
+            strings(&read_back, "GovernedResources"),
+        ));
+    }
+
+    for (case, row, served_types) in &served_lists {
+        let expected = row.governed_resources;
+        // Not one published type is dropped...
+        for resource_type in expected {
+            assert!(
+                served_types.iter().any(|served| served == resource_type),
+                "case {case}: expected the governed resource type {resource_type} among \
+                 the published list, got {served_types:?}"
+            );
+        }
+        // ...nothing beyond them is reported, and the catalog's own order is kept...
+        assert_eq!(
+            served_types, expected,
+            "case {case}: expected the published governed resource types, got \
+             {served_types:?}"
+        );
+        // ...and no type is reported twice.
+        let distinct: BTreeSet<&String> = served_types.iter().collect();
+        assert_eq!(
+            distinct.len(),
+            served_types.len(),
+            "case {case}: expected each governed resource type once, got {served_types:?}"
+        );
+    }
+
+    // The rows span the multiplicities the rule generalises over, so no case above is
+    // read as evidence for a narrower rule than the one under test.
+    let multiplicities: BTreeSet<usize> = PUBLISHED_SECURITY_HUB_CONTROLS
+        .iter()
+        .map(|row| row.governed_resources.len())
+        .collect();
+    for expected in [0usize, 1] {
+        assert!(
+            multiplicities.contains(&expected),
+            "case governed-resource count {expected}: the table must span it for the rule \
+             to be tested, saw {multiplicities:?}"
+        );
+    }
+    assert!(
+        multiplicities.iter().any(|count| *count > 1),
+        "case governed-resource count >1: the table must span a control governing several \
+         resource types for the rule to be tested, saw {multiplicities:?}"
     );
 }
 
