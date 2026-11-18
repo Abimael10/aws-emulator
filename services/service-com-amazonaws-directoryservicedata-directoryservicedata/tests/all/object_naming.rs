@@ -17,7 +17,8 @@
 //! * an attribute is held under the name the directory's SCHEMA gives it, resolved from the
 //!   requested name case insensitively ("Attribute names are case insensitive" —
 //!   `smithy_query(query="doc", shape="CreateUserRequest", member="OtherAttributes")`), so
-//!   the case a request wrote is not the case a read reports.
+//!   the case a request wrote is not the case a read reports — on a user and on a group
+//!   alike, and whoever wrote it: one attribute of the schema has one reported name.
 //!
 //! And the fourth rule here is how this API states a `ResourceNotFoundException`: the CLASS
 //! of object asked about and the directory it was asked about in, with no object name.
@@ -433,6 +434,239 @@ async fn an_attribute_is_reported_under_the_name_the_schema_holds_it_under() {
             "case {case:?}: the search must report the attribute under {:?}, got {:?}",
             row.reported,
             searched.body
+        );
+    }
+}
+
+/// The schema attribute names the ONE-REPORTED-NAME invariant is checked over, each with the
+/// name this API reports it under.
+///
+/// Source: the `lDAPDisplayName` of an attribute of the directory's own schema, as the
+/// service's documented attribute list carries it (the list
+/// `smithy_query(query="doc", shape="CreateUserRequest", member="OtherAttributes")` links),
+/// reported with its leading letter in upper case. The names differ in length, in word count
+/// and in how much of their own spelling is already upper case, and none of them is the name
+/// the describe rows above cite.
+const SCHEMA_ATTRIBUTES: &[(&str, &str)] = &[
+    ("displayName", "DisplayName"),
+    ("employeeType", "EmployeeType"),
+    ("physicalDeliveryOfficeName", "PhysicalDeliveryOfficeName"),
+    ("wWWHomePage", "WWWHomePage"),
+    ("st", "St"),
+];
+
+/// The spellings of one schema attribute name these cases write it and ask for it under: the
+/// schema's own, both whole-word cases of it, and the name this API reports it under.
+///
+/// Deduplicated, because a one-word lower-case name is several of those at once, and each
+/// spelling stands for a DIFFERENT writer below.
+fn spellings(schema_name: &str, reported: &str) -> Vec<String> {
+    let mut all: Vec<String> = Vec::new();
+    for spelling in [
+        schema_name.to_string(),
+        schema_name.to_uppercase(),
+        schema_name.to_lowercase(),
+        reported.to_string(),
+    ] {
+        if !all.contains(&spelling) {
+            all.push(spelling);
+        }
+    }
+    all
+}
+
+/// The `OtherAttributes` map holding exactly `value` under `name`.
+fn one_attribute(name: &str, value: &Value) -> Value {
+    json!({name: value.clone()})
+}
+
+/// The attribute names an answer reported its `OtherAttributes` under, sorted.
+fn reported_names(answer: &Answer) -> Vec<String> {
+    answer.body["OtherAttributes"]
+        .as_object()
+        .map(|attributes| {
+            let mut names: Vec<String> = attributes.keys().cloned().collect();
+            names.sort();
+            names
+        })
+        .unwrap_or_default()
+}
+
+/// RULE: an attribute is reported under the name the directory's schema holds it under on
+/// every object class — a GROUP's attributes project through the same rule a user's do, on
+/// the describe and on the search alike.
+#[tokio::test]
+async fn a_group_reports_an_attribute_under_the_name_the_schema_holds_it_under() {
+    let rows = rows();
+    let router = emulator(&rows);
+    let directory = rows[0].directory;
+    let value = json!({"S": "a stored value"});
+
+    for (index, &(schema_name, reported)) in SCHEMA_ATTRIBUTES.iter().enumerate() {
+        let case = format!("the group attribute {schema_name}");
+        // One group per row, named inside `GroupName`'s pattern, with the attribute written
+        // in a case the schema does not use: a reported name that were the stored key would
+        // differ from the one every leg below asserts.
+        let group = format!("attrGroup{index}");
+        served(
+            &case,
+            "CreateGroup",
+            &call(
+                &router,
+                "/Groups/CreateGroup",
+                directory,
+                &json!({
+                    "SAMAccountName": group,
+                    "OtherAttributes": {schema_name.to_uppercase(): value.clone()},
+                }),
+            )
+            .await,
+        );
+
+        for asked in spellings(schema_name, reported) {
+            let described = call(
+                &router,
+                "/Groups/DescribeGroup",
+                directory,
+                &json!({"SAMAccountName": group, "OtherAttributes": [asked.as_str()]}),
+            )
+            .await;
+            served(&case, "DescribeGroup", &described);
+            assert_eq!(
+                described.body["OtherAttributes"],
+                one_attribute(reported, &value),
+                "case {case:?} asked as {asked:?}: expected the attribute under {reported:?}, \
+                 got {:?}",
+                described.body
+            );
+
+            let searched = call(
+                &router,
+                "/Groups/SearchGroups",
+                directory,
+                &json!({
+                    "SearchString": group,
+                    "SearchAttributes": ["SAMAccountName", asked.as_str()],
+                }),
+            )
+            .await;
+            served(&case, "SearchGroups", &searched);
+            let found = searched.body["Groups"]
+                .as_array()
+                .and_then(|groups| groups.first())
+                .cloned()
+                .unwrap_or(Value::Null);
+            assert_eq!(
+                found["OtherAttributes"],
+                one_attribute(reported, &value),
+                "case {case:?} searched as {asked:?}: expected the attribute under \
+                 {reported:?}, got {:?}",
+                searched.body
+            );
+        }
+    }
+}
+
+/// RULE: one attribute of the schema has ONE reported name whoever wrote it — objects whose
+/// writes spelled the name differently are reported under the same name, and a later write in
+/// another spelling changes that one attribute rather than adding a second beside it.
+#[tokio::test]
+async fn one_attribute_has_one_reported_name_whichever_case_wrote_it() {
+    let rows = rows();
+    let router = emulator(&rows);
+    let directory = rows[0].directory;
+
+    for (index, &(schema_name, reported)) in SCHEMA_ATTRIBUTES.iter().enumerate() {
+        let written = spellings(schema_name, reported);
+        let mut answered: Vec<String> = Vec::new();
+
+        for (writer, spelling) in written.iter().enumerate() {
+            let case = format!("{schema_name} written as {spelling}");
+            // One user per writer, inside `UserName`'s `@length(min: 1, max: 20)`, each
+            // holding a value of its own so no leg can read another writer's attribute.
+            let user = format!("w{index}u{writer}");
+            let value = json!({"S": format!("written as {spelling}")});
+            served(
+                &case,
+                "CreateUser",
+                &call(
+                    &router,
+                    "/Users/CreateUser",
+                    directory,
+                    &json!({
+                        "SAMAccountName": user,
+                        "OtherAttributes": {spelling.as_str(): value.clone()},
+                    }),
+                )
+                .await,
+            );
+
+            // Asked under a spelling this writer did NOT use, so what comes back is the
+            // directory's name for the attribute and not an echo of either request.
+            let asked = &written[(writer + 1) % written.len()];
+            let described = call(
+                &router,
+                "/Users/DescribeUser",
+                directory,
+                &json!({"SAMAccountName": user, "OtherAttributes": [asked.as_str()]}),
+            )
+            .await;
+            served(&case, "DescribeUser", &described);
+            assert_eq!(
+                described.body["OtherAttributes"],
+                one_attribute(reported, &value),
+                "case {case:?} asked as {asked:?}: expected the attribute under {reported:?}, \
+                 got {:?}",
+                described.body
+            );
+            answered.extend(reported_names(&described));
+        }
+
+        answered.dedup();
+        assert_eq!(
+            answered.as_slice(),
+            [reported.to_string()],
+            "case {schema_name}: every writer's attribute must be reported under one name, \
+             got {answered:?}"
+        );
+
+        // A later write in another spelling: one attribute, changed — a read asking under
+        // every spelling at once still answers with one entry.
+        let case = format!("{schema_name} rewritten in another spelling");
+        let user = format!("w{index}u0");
+        let changed = json!({"S": "written again, in another spelling"});
+        let rewriting = written
+            .last()
+            .expect("a schema name has at least one spelling");
+        served(
+            &case,
+            "UpdateUser",
+            &call(
+                &router,
+                "/Users/UpdateUser",
+                directory,
+                &json!({
+                    "SAMAccountName": user,
+                    "UpdateType": "REPLACE",
+                    "OtherAttributes": {rewriting.as_str(): changed.clone()},
+                }),
+            )
+            .await,
+        );
+        let described = call(
+            &router,
+            "/Users/DescribeUser",
+            directory,
+            &json!({"SAMAccountName": user, "OtherAttributes": written.clone()}),
+        )
+        .await;
+        served(&case, "DescribeUser", &described);
+        assert_eq!(
+            described.body["OtherAttributes"],
+            one_attribute(reported, &changed),
+            "case {case:?}: expected the one attribute under {reported:?} with the value the \
+             rewrite carries, got {:?}",
+            described.body
         );
     }
 }
