@@ -47,7 +47,7 @@ const ACCOUNT: &str = engine::EMULATOR_ACCOUNT_ID;
 
 /// The origin OpsCenter records for every work item a CloudWatch alarm action opens, whichever
 /// alarm raised it.
-const OPS_ITEM_SOURCE: &str = "CloudWatch Alarm";
+pub(crate) const OPS_ITEM_SOURCE: &str = "CloudWatch Alarm";
 
 /// One Systems Manager call over its `awsJson1_1` wire, answering `(status, body)`.
 async fn ssm(
@@ -78,7 +78,7 @@ async fn ssm(
 /// The OpsItems OpsCenter holds in `region` that were opened for the alarm `alarm` — the way a
 /// client looks for the work item an alarm raised: among the items an alarm action opened, the
 /// ones titled for that alarm.
-async fn ops_items_of(
+pub(crate) async fn ops_items_of(
     router: &MultiServiceRouter,
     case: &str,
     region: &str,
@@ -108,7 +108,7 @@ async fn ops_items_of(
 
 /// Wait until OpsCenter holds `wanted` OpsItems for the alarm, and answer what it holds by
 /// then. The wait is for the CONDITION rather than for a span.
-async fn until_ops_items(
+pub(crate) async fn until_ops_items(
     router: &MultiServiceRouter,
     case: &str,
     region: &str,
@@ -127,11 +127,16 @@ async fn until_ops_items(
 }
 
 /// The `Action` history items the alarm holds, as `DescribeAlarmHistory` reports them.
-async fn action_items(
+///
+/// The kinds of alarm asked for are the caller's: "If you omit this parameter, only metric
+/// alarms are returned, even if composite alarms or log alarms exist in the account."
+/// (`DescribeAlarmHistoryInput$AlarmTypes`)
+pub(crate) async fn action_items(
     router: &MultiServiceRouter,
     case: &str,
     region: &str,
     alarm: &str,
+    alarm_types: &[&str],
 ) -> Vec<Value> {
     let body = cw(
         router,
@@ -140,7 +145,7 @@ async fn action_items(
         "DescribeAlarmHistory",
         &json!({
             "AlarmName": alarm,
-            "AlarmTypes": ["MetricAlarm"],
+            "AlarmTypes": alarm_types,
             "HistoryItemType": "Action",
         }),
     )
@@ -152,26 +157,27 @@ async fn action_items(
 }
 
 /// Wait until the alarm accounts for `wanted` action executions, either way.
-async fn until_recorded(
+pub(crate) async fn until_recorded(
     router: &MultiServiceRouter,
     case: &str,
     region: &str,
     alarm: &str,
+    alarm_types: &[&str],
     wanted: usize,
 ) -> Vec<Value> {
     let looks = WORK_WAIT.as_millis() / LOOK_INTERVAL.as_millis().max(1);
     for _ in 0..looks {
-        let items = action_items(router, case, region, alarm).await;
+        let items = action_items(router, case, region, alarm, alarm_types).await;
         if items.len() >= wanted {
             return items;
         }
         tokio::time::sleep(LOOK_INTERVAL).await;
     }
-    action_items(router, case, region, alarm).await
+    action_items(router, case, region, alarm, alarm_types).await
 }
 
 /// The `HistoryData` of one action item, parsed.
-fn history_data(item: &Value) -> Value {
+pub(crate) fn history_data(item: &Value) -> Value {
     serde_json::from_str(item["HistoryData"].as_str().unwrap_or("null")).unwrap_or(Value::Null)
 }
 
@@ -340,7 +346,7 @@ async fn an_ops_item_alarm_action_opens_the_work_item_and_the_switch_gates_it() 
             );
         }
 
-        let items = until_recorded(&router, case, region, &armed, 1).await;
+        let items = until_recorded(&router, case, region, &armed, &["MetricAlarm"], 1).await;
         assert_eq!(
             items.len(),
             1,
@@ -479,7 +485,7 @@ async fn an_ops_item_alarm_action_opens_the_work_item_and_the_switch_gates_it() 
             twins.is_empty(),
             "case {case:?}: an alarm whose actions are off opens no OpsItem, got {twins:?}"
         );
-        let suppressed = action_items(&router, case, region, &disabled).await;
+        let suppressed = action_items(&router, case, region, &disabled, &["MetricAlarm"]).await;
         assert!(
             suppressed.is_empty(),
             "case {case:?}: a suppressed action is no execution to account for, got \
