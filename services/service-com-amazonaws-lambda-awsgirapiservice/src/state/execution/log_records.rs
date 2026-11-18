@@ -53,17 +53,88 @@ pub(super) struct Report {
     pub memory_size: i32,
     /// The most memory the run was measured holding, in MB.
     pub used_mb: i64,
+    /// How long the INITIALIZATION of the execution environment took, in milliseconds, for a
+    /// run that paid it — and `None` for one an already-initialized environment served, whose
+    /// report states no such span.
+    pub init_ms: Option<f64>,
 }
 
-/// The frame that OPENS a run's log: the invocation and the version that executes it.
-pub(super) fn start(json: bool, at: SystemTime, request_id: &str, version: &str) -> String {
+/// What the record of an environment's INITIALIZATION states: which kind of environment it
+/// is, the function it was built for, and the runtime version it stands on.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct Initialization<'a> {
+    /// Which kind of execution environment this is, as the admission that let the first
+    /// invocation in decided.
+    pub initialization_type: &'a str,
+    /// The function the environment was built for.
+    pub function_name: &'a str,
+    /// The version of it the environment holds.
+    pub function_version: &'a str,
+    /// The managed runtime version the environment stands on.
+    pub runtime_version: &'a str,
+    /// The ARN that runtime version is addressed by, which is the one a read of the function
+    /// reports for it.
+    pub runtime_version_arn: &'a str,
+    /// The execution environment this is the initialization of, as the log STREAM that
+    /// environment writes to — which is what identifies one instance of a function's
+    /// environment to a client reading its logs.
+    pub instance_id: &'a str,
+    /// The most memory that instance may hold, in BYTES: the function's own `MemorySize`,
+    /// which is all an environment of it is given.
+    pub instance_max_memory: i64,
+}
+
+/// The frame that opens the log of a new EXECUTION ENVIRONMENT, before the first invocation
+/// that environment serves: Lambda states the initialization of an environment as a record of
+/// its own, which is what lets a client tell a cold start from a warm one, attribute the
+/// module-scope output that follows it to the initialization, and read which runtime version
+/// the environment stands on.
+pub(super) fn init_start(json: bool, at: SystemTime, about: &Initialization<'_>) -> String {
+    if !json {
+        return format!(
+            "INIT_START Runtime Version: {}\tRuntime Version ARN: {}",
+            about.runtime_version, about.runtime_version_arn
+        );
+    }
+    platform(
+        at,
+        "initStart",
+        ::serde_json::json!({
+            "initializationType": about.initialization_type,
+            "phase": INIT_PHASE,
+            "functionName": about.function_name,
+            "functionVersion": about.function_version,
+            "instanceId": about.instance_id,
+            "instanceMaxMemory": about.instance_max_memory,
+            "runtimeVersion": about.runtime_version,
+            "runtimeVersionArn": about.runtime_version_arn,
+        }),
+    )
+}
+
+/// The phase a platform record of an environment's initialization names itself as.
+const INIT_PHASE: &str = "init";
+
+/// The frame that OPENS a run's log: the invocation, the function it ran and the version that
+/// executed it.
+pub(super) fn start(
+    json: bool,
+    at: SystemTime,
+    request_id: &str,
+    function_arn: &str,
+    version: &str,
+) -> String {
     if !json {
         return format!("START RequestId: {request_id} Version: {version}");
     }
     platform(
         at,
         "start",
-        ::serde_json::json!({ "requestId": request_id, "version": version }),
+        ::serde_json::json!({
+            "requestId": request_id,
+            "functionArn": function_arn,
+            "version": version,
+        }),
     )
 }
 
@@ -97,29 +168,45 @@ pub(super) fn report(
         billed_ms,
         memory_size,
         used_mb,
+        init_ms,
     } = measured;
     if !json {
+        // Each figure is one FIELD of the line, closed by the separator the fields are laid
+        // out with — so a client reading the report splits on that separator and finds the
+        // same fields whether or not the run paid an initialization, which is the one extra
+        // field a cold start states. The status clause CLOSES the line, so it carries no
+        // separator of its own.
+        let initialization =
+            init_ms.map_or_else(String::new, |spent| format!("Init Duration: {spent:.2} ms\t"));
         let mut line = format!(
             "REPORT RequestId: {request_id}\tDuration: {duration_ms:.2} ms\tBilled Duration: \
-             {billed_ms} ms\tMemory Size: {memory_size} MB\tMax Memory Used: {used_mb} MB"
+             {billed_ms} ms\tMemory Size: {memory_size} MB\tMax Memory Used: {used_mb} \
+             MB\t{initialization}"
         );
         if let Some(status) = reported_status(completion) {
-            line.push_str("\tStatus: ");
+            line.push_str("Status: ");
             line.push_str(status);
         }
         return line;
+    }
+    let mut metrics = ::serde_json::json!({
+        "durationMs": round_hundredths(duration_ms),
+        "billedDurationMs": billed_ms,
+        "memorySizeMB": memory_size,
+        "maxMemoryUsedMB": used_mb,
+    });
+    if let (Some(members), Some(spent)) = (metrics.as_object_mut(), init_ms) {
+        members.insert(
+            "initDurationMs".to_string(),
+            ::serde_json::json!(round_hundredths(spent)),
+        );
     }
     platform(
         at,
         "report",
         ::serde_json::json!({
             "requestId": request_id,
-            "metrics": {
-                "durationMs": round_hundredths(duration_ms),
-                "billedDurationMs": billed_ms,
-                "memorySizeMB": memory_size,
-                "maxMemoryUsedMB": used_mb,
-            },
+            "metrics": metrics,
             "status": status(completion),
         }),
     )
@@ -200,10 +287,9 @@ fn unlevelled_severity() -> u8 {
 ///
 /// A PLATFORM frame is a system record rather than an application one, so the application
 /// level filters none of them — what a function's `SystemLogLevel` admits of them is a
-/// reading of its own ([`crate::state::configured_system_log_level`], which a read of the
-/// function reports) and no frame of a run is withheld here; everything else is an
-/// application record, judged at the level it states and at [`unlevelled_severity`] when it
-/// states none.
+/// reading of its own ([`system_admitted_at`]) and no frame of a run is withheld here;
+/// everything else is an application record, judged at the level it states and at
+/// [`unlevelled_severity`] when it states none.
 pub(super) fn admitted_at(message: &str, filter: Option<&str>) -> bool {
     let Some(threshold) = filter.and_then(severity) else {
         return true;
@@ -228,6 +314,71 @@ pub(super) fn admitted_at(message: &str, filter: Option<&str>) -> bool {
         .and_then(severity)
         .unwrap_or_else(unlevelled_severity);
     level >= threshold
+}
+
+/// Whether the record `message` is one Lambda SENDS to CloudWatch Logs at the SYSTEM log
+/// level `filter`: `SystemLogLevel` is "set this property to filter the system logs for your
+/// function that Lambda sends to CloudWatch", and it filters the platform records
+/// INDEPENDENTLY of the level the application records are filtered at — so a function can
+/// keep its application logs while suppressing the platform noise, or the other way round.
+///
+/// Only a PLATFORM record is a system record: an application record is judged by
+/// [`admitted_at`] and never withheld here, whatever the system level is.
+pub(super) fn system_admitted_at(message: &str, filter: Option<&str>) -> bool {
+    let Some(threshold) = filter.and_then(severity) else {
+        return true;
+    };
+    let Some(kind) = platform_kind(message) else {
+        return true;
+    };
+    // A kind this ladder does not place is SENT: a record whose level is unknown is judged the
+    // way a record stating no level is ([`admitted_at`]), so nothing is withheld for want of a
+    // reading of it.
+    platform_record_level(&kind)
+        .and_then(severity)
+        .is_none_or(|level| level >= threshold)
+}
+
+/// The kind a platform record names itself as (`platform.start`, …), or `None` for a record
+/// that is no platform record at all.
+fn platform_kind(message: &str) -> Option<String> {
+    let record: ::serde_json::Map<String, ::serde_json::Value> =
+        match ::serde_json::from_str(message) {
+            Ok(::serde_json::Value::Object(members)) => members,
+            _ => return None,
+        };
+    let kind = record.get(TYPE_MEMBER)?.as_str()?;
+    kind.starts_with(PLATFORM_TYPE_PREFIX)
+        .then(|| kind.to_string())
+}
+
+/// How much DETAIL each platform record names, on the ladder the system level filters by.
+///
+/// The frames of an ORDINARY run — the initialization of the execution environment, the
+/// opening of an invocation, the end of the runtime's work on it and the report of what it
+/// spent — are the records Lambda states about every invocation, so they are that ladder's
+/// `INFO` records; a record about a log Lambda could not deliver is a warning about the log
+/// itself.
+///
+/// Source: the three levels the model's `SystemLogLevel` enum declares (`DEBUG | INFO |
+/// WARN`), against the platform record kinds this module writes ([`init_start`], [`start`],
+/// [`runtime_done`], [`report`]).
+const PLATFORM_RECORD_LEVELS: &[(&str, &str)] = &[
+    ("platform.initStart", "INFO"),
+    ("platform.start", "INFO"),
+    ("platform.runtimeDone", "INFO"),
+    ("platform.report", "INFO"),
+    ("platform.logsDropped", "WARN"),
+];
+
+/// The level the platform record `kind` is stated at, or `None` for a kind the ladder above
+/// does not place — a record this reading says nothing about, which is therefore withheld by
+/// no level.
+fn platform_record_level(kind: &str) -> Option<&'static str> {
+    PLATFORM_RECORD_LEVELS
+        .iter()
+        .find(|(named, _)| *named == kind)
+        .map(|(_, level)| *level)
 }
 
 /// What the run came to, as the platform records state it: the handler answered, the handler
@@ -279,15 +430,28 @@ mod tests {
         SystemTime::UNIX_EPOCH + ::std::time::Duration::from_millis(1_793_000_000_123)
     }
 
-    /// One `Report`, as a run that spent something leaves one.
+    /// One `Report`, as a run an already-initialized environment served leaves one.
     fn measured() -> Report {
         Report {
             duration_ms: 12.345,
             billed_ms: 13,
             memory_size: 256,
             used_mb: 42,
+            init_ms: None,
         }
     }
+
+    /// The same `Report` of a run that BUILT the environment it ran in, which states what the
+    /// initialization took beside what the run did.
+    fn initialized() -> Report {
+        Report {
+            init_ms: Some(123.456),
+            ..measured()
+        }
+    }
+
+    /// The ARN of the function every frame below is a frame of.
+    const FUNCTION_ARN: &str = "arn:aws:lambda:us-east-1:000000000000:function:orders";
 
     /// RULE: the plain-text format keeps the runtime's own framing, line for line.
     #[test]
@@ -297,7 +461,7 @@ mod tests {
         let rows: &[(&str, String, &str)] = &[
             (
                 "the opening frame",
-                start(false, at(), "req-1", "7"),
+                start(false, at(), "req-1", FUNCTION_ARN, "7"),
                 "START RequestId: req-1 Version: 7",
             ),
             (
@@ -309,7 +473,13 @@ mod tests {
                 "the frame that states what the run spent",
                 report(false, at(), "req-1", &completion, measured()),
                 "REPORT RequestId: req-1\tDuration: 12.35 ms\tBilled Duration: 13 ms\tMemory \
-                 Size: 256 MB\tMax Memory Used: 42 MB",
+                 Size: 256 MB\tMax Memory Used: 42 MB\t",
+            ),
+            (
+                "the same frame for a run that built the environment it ran in",
+                report(false, at(), "req-1", &completion, initialized()),
+                "REPORT RequestId: req-1\tDuration: 12.35 ms\tBilled Duration: 13 ms\tMemory \
+                 Size: 256 MB\tMax Memory Used: 42 MB\tInit Duration: 123.46 ms\t",
             ),
             (
                 "the same frame for a run stopped at the function's own Timeout, which \
@@ -350,7 +520,7 @@ mod tests {
                     measured(),
                 ),
                 "REPORT RequestId: req-1\tDuration: 12.35 ms\tBilled Duration: 13 ms\tMemory \
-                 Size: 256 MB\tMax Memory Used: 42 MB",
+                 Size: 256 MB\tMax Memory Used: 42 MB\t",
             ),
         ];
         for (case, actual, expected) in rows {
@@ -370,7 +540,7 @@ mod tests {
         let rows: &[(&str, String, &str)] = &[
             (
                 "the opening frame",
-                start(true, at(), "req-1", "7"),
+                start(true, at(), "req-1", FUNCTION_ARN, "7"),
                 "platform.start",
             ),
             (
@@ -406,6 +576,201 @@ mod tests {
                 !rendered.contains('\t'),
                 "case {case:?}: no plain-text framing is left in a structured record, got \
                  {rendered:?}"
+            );
+        }
+    }
+
+    /// One `Initialization`, as an environment built for an invocation states one.
+    fn initializing(initialization_type: &str) -> Initialization<'_> {
+        Initialization {
+            initialization_type,
+            function_name: "orders",
+            function_version: "7",
+            runtime_version: "python3.12",
+            runtime_version_arn: "arn:aws:lambda:us-east-1::runtime:0123abcd",
+            instance_id: "2026/10/26/[7]0123456789abcdef0123456789abcdef",
+            instance_max_memory: 256 * 1024 * 1024,
+        }
+    }
+
+    /// RULE: a run that BUILT its execution environment opens that environment's log with the
+    /// platform record of the initialization, which names the kind of environment it is, the
+    /// phase it states and the function it was built for.
+    #[test]
+    fn the_initialization_of_an_environment_is_a_platform_record_of_its_own() {
+        // (case, the kind of environment the admission decided)
+        let rows: &[(&str, &str)] = &[
+            ("an environment started for an invocation", "on-demand"),
+            (
+                "one provisioned concurrency keeps initialized",
+                "provisioned-concurrency",
+            ),
+        ];
+        for (case, initialization_type) in rows {
+            let about = initializing(initialization_type);
+            let rendered = init_start(true, at(), &about);
+            let parsed: ::serde_json::Value =
+                ::serde_json::from_str(&rendered).expect("the record is JSON");
+            assert_eq!(
+                parsed["type"].as_str(),
+                Some("platform.initStart"),
+                "case {case:?}: expected the initialization record, got {rendered:?}"
+            );
+            // (the member, what it must carry)
+            let members: &[(&str, &str)] = &[
+                ("initializationType", initialization_type),
+                ("phase", INIT_PHASE),
+                ("functionName", about.function_name),
+                ("functionVersion", about.function_version),
+                ("instanceId", about.instance_id),
+                ("runtimeVersion", about.runtime_version),
+                ("runtimeVersionArn", about.runtime_version_arn),
+            ];
+            for (member, expected) in members {
+                let actual = parsed["record"][*member].as_str();
+                assert_eq!(
+                    actual,
+                    Some(*expected),
+                    "case {case:?}: expected {member} to be {expected:?}, got {actual:?} in \
+                     {rendered:?}"
+                );
+            }
+            assert_eq!(
+                parsed["time"].as_str(),
+                Some("2026-10-26T07:33:20.123Z"),
+                "case {case:?}: expected the instant the frame was written, got {rendered:?}"
+            );
+            // The memory the instance may hold is the function's own, in bytes.
+            let memory = parsed["record"]["instanceMaxMemory"].as_i64();
+            assert_eq!(
+                memory,
+                Some(about.instance_max_memory),
+                "case {case:?}: expected the instance's memory in bytes, got {memory:?} in \
+                 {rendered:?}"
+            );
+            // The same frame under the plain-text format is the runtime's own line, naming
+            // the runtime version the environment stands on.
+            let text = init_start(false, at(), &about);
+            assert_eq!(
+                text,
+                format!(
+                    "INIT_START Runtime Version: {}\tRuntime Version ARN: {}",
+                    about.runtime_version, about.runtime_version_arn
+                ),
+                "case {case:?}: expected the plain-text initialization line, got {text:?}"
+            );
+        }
+    }
+
+    /// RULE: `SystemLogLevel` filters the PLATFORM records of a run independently of the level
+    /// the application records are filtered at — one row per level the model declares for it,
+    /// at and around each platform record's own level, plus an application record, which this
+    /// filter never withholds.
+    #[test]
+    fn a_platform_record_is_sent_only_at_the_selected_system_level_and_lower() {
+        let completion = Completion::Returned("{}".to_string());
+        let application = ::serde_json::json!({
+            "timestamp": "2026-10-26T07:33:20.123Z",
+            "level": "ERROR",
+            "message": "a line the handler wrote",
+            "requestId": "req-1",
+        })
+        .to_string();
+        let dropped = ::serde_json::json!({
+            "time": "2026-10-26T07:33:20.123Z",
+            "type": "platform.logsDropped",
+            "record": { "reason": "Consumer seems to have fallen behind" },
+        })
+        .to_string();
+        // (case, the record, the system level in force, whether Lambda sends it)
+        let rows: Vec<(&str, String, Option<&str>, bool)> = vec![
+            (
+                "the frame that opens an environment's log, under the most detailed level",
+                init_start(true, at(), &initializing("on-demand")),
+                Some("DEBUG"),
+                true,
+            ),
+            (
+                "the frame that opens an invocation, at its own level",
+                start(true, at(), "req-1", FUNCTION_ARN, "7"),
+                Some("INFO"),
+                true,
+            ),
+            (
+                "the frame that closes the handler's run, one level higher in detail than the \
+                 filter",
+                runtime_done(true, at(), "req-1", &completion),
+                Some("WARN"),
+                false,
+            ),
+            (
+                "the frame that states what the run spent, one level higher in detail",
+                report(true, at(), "req-1", &completion, measured()),
+                Some("WARN"),
+                false,
+            ),
+            (
+                "the frame that opens an environment's log, one level higher in detail",
+                init_start(true, at(), &initializing("on-demand")),
+                Some("WARN"),
+                false,
+            ),
+            (
+                "a record about a log Lambda could not deliver, at the least detailed level",
+                dropped.clone(),
+                Some("WARN"),
+                true,
+            ),
+            (
+                "the same record under a filter at the most detailed level",
+                dropped,
+                Some("DEBUG"),
+                true,
+            ),
+            (
+                "a platform record of a kind this reading does not place, which no level \
+                 withholds",
+                ::serde_json::json!({
+                    "time": "2026-10-26T07:33:20.123Z",
+                    "type": "platform.extension",
+                    "record": { "name": "a telemetry extension" },
+                })
+                .to_string(),
+                Some("WARN"),
+                true,
+            ),
+            (
+                "a frame of a function filtered at no system level at all",
+                report(true, at(), "req-1", &completion, measured()),
+                None,
+                true,
+            ),
+            (
+                "an application record, which the system level never withholds",
+                application,
+                Some("WARN"),
+                true,
+            ),
+            (
+                "the plain-text framing of a run, which states no record kind",
+                "START RequestId: req-1 Version: 7".to_string(),
+                Some("WARN"),
+                true,
+            ),
+        ];
+        for (case, message, filter, expected) in rows {
+            let actual = system_admitted_at(&message, filter);
+            assert_eq!(
+                actual, expected,
+                "case {case:?}: expected sent = {expected} under {filter:?}, got {actual} for \
+                 {message:?}"
+            );
+            // The two filters are independent: the application level judges the application
+            // records and withholds no platform record.
+            assert!(
+                platform_kind(&message).is_none() || admitted_at(&message, Some("FATAL")),
+                "case {case:?}: the application level withholds no platform record, got \
+                 {message:?}"
             );
         }
     }
@@ -585,7 +950,7 @@ mod tests {
             ),
             (
                 "a platform frame, which is a system record and not an application one",
-                start(true, at(), "req-1", "7"),
+                start(true, at(), "req-1", FUNCTION_ARN, "7"),
                 Some("FATAL"),
                 true,
             ),

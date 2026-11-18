@@ -101,6 +101,9 @@ pub(crate) async fn filtered(
         })
         .iter()
         .map(|event| {
+            // Each event is ONE record of the run, carried as the write produced it — the break
+            // that closed the write included; what a reader compares is the record's own text
+            // ([`crate::invocation_log_delivery::record_text`]).
             event["message"]
                 .as_str()
                 .unwrap_or_else(|| panic!("case {case:?}: every event carries a message"))

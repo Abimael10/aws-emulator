@@ -90,9 +90,15 @@ const TEXT_FORMAT: &str = "Text";
 /// See [`TEXT_FORMAT`].
 const JSON_FORMAT: &str = "JSON";
 
-/// How many records ONE run of these handlers leaves: the three frames of the run, and the one
-/// line the handler printed.
-const RECORDS_PER_RUN: usize = 4;
+/// How many records ONE run of these handlers leaves: the record that states the
+/// initialization of the execution environment it built, the three frames of the run, and the
+/// one line the handler printed.
+const RECORDS_PER_RUN: usize = 5;
+
+/// How many of those records the PLATFORM writes itself, which under the structured format are
+/// the platform records a client parses: the initialization of the environment, and the three
+/// frames of the run.
+const PLATFORM_RECORDS_PER_RUN: usize = 4;
 
 /// The python handler every python row deploys: it prints the marker the event carries and
 /// answers it, so the record it wrote can be told from any other row's.
@@ -416,10 +422,9 @@ async fn every_delivered_log_record_carries_the_line_break_that_closed_its_write
                 })
                 .count();
             assert_eq!(
-                frames,
-                TEXT_FRAMES.len(),
-                "case {case:?}: expected the run's {} platform records, got {texts:?}",
-                TEXT_FRAMES.len()
+                frames, PLATFORM_RECORDS_PER_RUN,
+                "case {case:?}: expected the run's {PLATFORM_RECORDS_PER_RUN} platform records, \
+                 got {texts:?}"
             );
         } else {
             for frame in TEXT_FRAMES {

@@ -820,17 +820,106 @@ pub(super) const RUNTIME_SOURCE: &str = r##"
             hostLog(text + '\n');
             return;
         }
+        if (!admittedLevel(level)) {
+            return;
+        }
         if (jsonRecords()) {
-            hostLog(JSON.stringify({
-                timestamp: new Date().toISOString(),
-                level: level,
-                message: text,
-                requestId: state.requestId
-            }) + '\n');
+            hostLog(jsonRecord(level, Array.prototype.slice.call(args), text) + '\n');
             return;
         }
         hostLog(new Date().toISOString() + '\t' + state.requestId + '\t' + level + '\t'
             + text + '\n');
+    }
+
+    // How much DETAIL each level names, in the order `ApplicationLogLevel` documents —
+    // "TRACE is the highest level and FATAL is the lowest" — which is the ladder the level
+    // the invocation's environment states is read on.
+    //
+    // Source: the model's `ApplicationLogLevel` enum (TRACE | DEBUG | INFO | WARN | ERROR |
+    // FATAL).
+    var LOG_LEVEL_DETAIL = {
+        TRACE: 0,
+        DEBUG: 1,
+        INFO: 2,
+        WARN: 3,
+        ERROR: 4,
+        FATAL: 5
+    };
+
+    // Whether a record at `level` is one this runtime writes at all: "Lambda only sends
+    // application logs at the selected level of detail and lower", and the managed runtimes
+    // apply that where the record is written. A function filtered at no level writes every
+    // record, and so does a record at a level the ladder does not place.
+    function admittedLevel(level) {
+        var configured = state === null ? null : state.logLevel;
+        if (configured === null || configured === undefined || configured === '') {
+            return true;
+        }
+        var threshold = LOG_LEVEL_DETAIL[String(configured).toUpperCase()];
+        var detail = LOG_LEVEL_DETAIL[level];
+        if (threshold === undefined || detail === undefined) {
+            return true;
+        }
+        return detail >= threshold;
+    }
+
+    // ONE application record under the STRUCTURED format: the instant it was written, its
+    // level, the invocation it belongs to and the MESSAGE.
+    //
+    // A single argument stays the value it is — an object logged under this format is a JSON
+    // object a client parses rather than the runtime's inspect text of it, and an Error is
+    // the error document it describes ([`errorMessage`]) — while several arguments are the
+    // formatted line they make, exactly as the text format states it. An Error among several
+    // arguments names its own class, message and stack on the record beside that line, which
+    // is what makes a logged failure readable as a record.
+    function jsonRecord(level, args, text) {
+        var record = {
+            timestamp: new Date().toISOString(),
+            level: level,
+            requestId: state.requestId
+        };
+        if (args.length === 1 && args[0] !== undefined) {
+            record.message = errorDocument(args[0]);
+        } else {
+            record.message = text;
+            for (var index = 0; index < args.length; index += 1) {
+                if (args[index] instanceof Error) {
+                    var reported = raised(args[index]);
+                    record.errorType = reported.errorType;
+                    record.errorMessage = reported.errorMessage;
+                    record.stackTrace = reported.trace;
+                    break;
+                }
+            }
+        }
+        return recordText(record, text);
+    }
+
+    // `value` as a record's message states it: the error DOCUMENT for an error — its class,
+    // its message and its stack, which is how a structured record carries one — and the value
+    // itself for anything else.
+    function errorDocument(value) {
+        if (!(value instanceof Error)) {
+            return value;
+        }
+        var reported = raised(value);
+        return {
+            errorType: reported.errorType,
+            errorMessage: reported.errorMessage,
+            stackTrace: reported.trace
+        };
+    }
+
+    // `record` as the text of one record. A message the serializer cannot carry — a value
+    // holding a cycle — leaves the record carrying the formatted line instead, so a log call
+    // never fails the invocation that made it.
+    function recordText(record, text) {
+        try {
+            return JSON.stringify(record);
+        } catch (error) {
+            record.message = text;
+            return JSON.stringify(record);
+        }
     }
 
     // Whether this invocation's records are the structured ones, which the invocation's own
@@ -1608,15 +1697,19 @@ pub(super) const RUNTIME_SOURCE: &str = r##"
             return;
         }
         state.loggedError = true;
+        if (!admittedLevel('ERROR')) {
+            return;
+        }
         if (jsonRecords()) {
             hostLog(JSON.stringify({
                 timestamp: new Date().toISOString(),
                 level: 'ERROR',
-                message: reported.errorMessage,
                 requestId: state.requestId,
-                errorType: reported.errorType,
-                errorMessage: reported.errorMessage,
-                stackTrace: reported.trace
+                message: {
+                    errorType: reported.errorType,
+                    errorMessage: reported.errorMessage,
+                    stackTrace: reported.trace
+                }
             }) + '\n');
             return;
         }
@@ -2053,6 +2146,10 @@ pub(super) const RUNTIME_SOURCE: &str = r##"
             requestId: input.requestId,
             // The FORM this invocation's records take, which its own environment states.
             logFormat: input.environment.AWS_LAMBDA_LOG_FORMAT,
+            // The LEVEL its application records are filtered at, which its own environment
+            // states as the function's `ApplicationLogLevel`: a record more detailed than
+            // this is one the runtime does not write at all ([`admittedLevel`]).
+            logLevel: input.environment.AWS_LAMBDA_LOG_LEVEL,
             esModuleHint: null,
             loggedError: false,
             rejections: [],

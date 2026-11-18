@@ -255,9 +255,13 @@ fn stream_shape(stream: &str) -> Result<String, String> {
 
 /// The request id the framing of a run's log names, as the `START` and `REPORT` lines must agree
 /// on it.
+///
+/// The log of the execution environment the run BUILT opens on the record that states its
+/// initialization, so the invocation's own opening frame is the first `START` line of it.
 fn framed_request_id(case: &str, lines: &[String]) -> String {
     let opening = lines
-        .first()
+        .iter()
+        .find(|line| line.starts_with("START RequestId: "))
         .unwrap_or_else(|| panic!("case {case:?}: expected a log with a START line, got {lines:?}"));
     let id = opening
         .strip_prefix("START RequestId: ")
@@ -541,21 +545,33 @@ async fn a_role_short_of_the_group_create_leaves_it_absent_until_the_group_exist
             .to_string();
         stream_shape(&stream).unwrap_or_else(|wrong| panic!("case {case:?}: {wrong}"));
         let (lines, _) = delivered(&router, case, &group, &stream).await;
-        framed_request_id(case, &lines);
         assert!(
             lines.iter().any(|line| line.contains("lazy-grant-first")),
             "case {case:?}: expected the run's own line in {stream:?} once {group:?} exists, got \
              {lines:?}"
         );
-        // How many runs are in the group states the rule exactly: the row that could not create
-        // it lost its first run's log, and the row that could kept both.
+        // The stream belongs to the EXECUTION ENVIRONMENT, which served both runs, so the two
+        // runs share it and each is bracketed by its own framing. How many runs are in it
+        // states the rule exactly: the row that could not create the group lost its first
+        // run's log, and the row that could kept both.
+        let framed = |prefix: &str| {
+            lines
+                .iter()
+                .filter(|line| line.starts_with(prefix))
+                .count()
+        };
+        let runs = if row.creates { 2 } else { 1 };
+        assert_eq!(
+            (framed("START RequestId: "), framed("REPORT RequestId: ")),
+            (runs, runs),
+            "case {case:?}: expected {runs} run(s) bracketed in {stream:?}, got {lines:?}"
+        );
         let held = streams(&router, case, &group).await;
-        let expected = if row.creates { 2 } else { 1 };
         assert_eq!(
             held.len(),
-            expected,
-            "case {case:?}: expected {expected} run(s) to have left a stream in {group:?}, got \
-             {held:?}"
+            1,
+            "case {case:?}: expected the one environment that served both runs to have left one \
+             stream in {group:?}, got {held:?}"
         );
     }
 }

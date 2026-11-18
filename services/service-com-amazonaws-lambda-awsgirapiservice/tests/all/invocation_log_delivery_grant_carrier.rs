@@ -43,8 +43,8 @@ use smithy_server_runtime::MultiServiceRouter;
 
 use crate::event_source_mapping_role_access::{allow, element, given_role, iam};
 use crate::invocation_log_delivery::{
-    create_function, delivered, emulator, events, groups, invoke, record_text, streams, Created,
-    LOGS, LOG_WRITES, NODE_RUNTIME, PYTHON_RUNTIME,
+    create_function, delivered, emulator, events, groups, invocations_log, invoke, record_text,
+    streams, Created, LOGS, LOG_WRITES, NODE_RUNTIME, PYTHON_RUNTIME,
 };
 // The reader a client polls a delivered log with, owned by the suite that first needed it
 // rather than written out a second time here.
@@ -305,30 +305,39 @@ async fn the_document_carrying_the_logs_grant_does_not_change_what_an_invocation
             "case {case:?}: expected one stream for the one invocation, got {held:?}"
         );
         let stream = held[0].clone();
-        let (lines, rebuilt) = delivered(&router, case, &group, &stream).await;
+        let (lines, _text) = delivered(&router, case, &group, &stream).await;
+        let rebuilt = invocations_log(&lines);
         assert_eq!(
             rebuilt, reported,
             "case {case:?}: expected the group to hold the log the invocation reported, got \
              {rebuilt:?} against {reported:?}"
         );
 
-        // The framing, the handler's own lines between it, and nothing else.
+        // The framing, the handler's own lines between it, and nothing else — opened by the
+        // initialization of the execution environment the run built.
         assert_eq!(
             lines.len(),
-            row.written.len() + 3,
-            "case {case:?}: expected 3 framing lines around {} of the handler's own, got \
+            row.written.len() + 4,
+            "case {case:?}: expected 4 framing lines around {} of the handler's own, got \
              {lines:?}",
             row.written.len()
         );
-        let opening = lines.first().cloned().unwrap_or_default();
+        assert!(
+            lines
+                .first()
+                .is_some_and(|line| line.starts_with("INIT_START Runtime Version: ")),
+            "case {case:?}: expected the log to open on the environment's initialization, got \
+             {lines:?}"
+        );
+        let opening = lines.get(1).cloned().unwrap_or_default();
         assert!(
             opening.starts_with(START_PREFIX)
                 && opening.ends_with(&format!("{VERSION_FIELD}{UNPUBLISHED_VERSION}")),
-            "case {case:?}: expected the log to open on its START line naming the version that \
+            "case {case:?}: expected the invocation's START line naming the version that \
              executed, got {opening:?}"
         );
         for (position, written) in row.written.iter().enumerate() {
-            let actual = lines.get(position + 1).cloned().unwrap_or_default();
+            let actual = lines.get(position + 2).cloned().unwrap_or_default();
             // A node runtime delivers a console line FRAMED, so the text the handler wrote
             // is the last of the line's tab-separated fields.
             let text = actual.rsplit('\t').next().unwrap_or_default();
@@ -481,7 +490,8 @@ async fn attaching_the_managed_policy_makes_the_next_invocation_deliver_its_log(
         1,
         "case {case:?}: expected only the delivering run's stream, got {held:?}"
     );
-    let (lines, rebuilt) = delivered(&router, case, &group, &held[0]).await;
+    let (lines, _text) = delivered(&router, case, &group, &held[0]).await;
+    let rebuilt = invocations_log(&lines);
     assert_eq!(
         rebuilt, reported,
         "case {case:?}: expected the group to hold the second run's log, got {rebuilt:?} \
@@ -490,7 +500,12 @@ async fn attaching_the_managed_policy_makes_the_next_invocation_deliver_its_log(
     assert!(
         lines
             .first()
-            .is_some_and(|line| line.starts_with(START_PREFIX)),
-        "case {case:?}: expected the delivered log to open on its START line, got {lines:?}"
+            .is_some_and(|line| line.starts_with("INIT_START Runtime Version: ")),
+        "case {case:?}: expected the delivered log to open on the environment's \
+         initialization, got {lines:?}"
+    );
+    assert!(
+        lines.get(1).is_some_and(|line| line.starts_with(START_PREFIX)),
+        "case {case:?}: expected the invocation's START line after it, got {lines:?}"
     );
 }

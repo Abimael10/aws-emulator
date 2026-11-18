@@ -213,10 +213,11 @@ class _LambdaJsonLogFormatter(_LambdaLogFormatter):
     A function whose `LogFormat` is JSON has its application records delivered as JSON
     objects rather than in the text framing above, so a client reads the level, the message
     and the invocation off named members instead of off tab-separated fields: the level is
-    the emitting logger's own level NAME, the message is the formatted line, the request id
-    is the invocation's, and the timestamp is the instant the record was created. A record
-    carrying an exception names its class and its frames beside them, which is what makes a
-    failure readable as a record rather than as free text.
+    the emitting logger's own level NAME, the message is the formatted line, the logger is
+    the one that emitted the record, the request id is the invocation's, and the timestamp is
+    the instant the record was created. A record carrying an exception names its class and
+    its frames beside them, which is what makes a failure readable as a record rather than as
+    free text.
     """
 
     def format(self, record):
@@ -224,6 +225,7 @@ class _LambdaJsonLogFormatter(_LambdaLogFormatter):
             "timestamp": self.formatTime(record),
             "level": record.levelname,
             "message": record.getMessage(),
+            "logger": record.name,
             "requestId": self._request_id,
         }
         failure = self.exception(record)
@@ -234,7 +236,7 @@ class _LambdaJsonLogFormatter(_LambdaLogFormatter):
         return json.dumps(document)
 
 
-def _install_logging(request_id, log_format):
+def _install_logging(request_id, log_format, log_level):
     """Give the root logger the handler the managed runtime gives it.
 
     A record emitted through `logging` reaches no output on its own: with no handler on
@@ -248,9 +250,13 @@ def _install_logging(request_id, log_format):
     The FORMAT is the function's own, which the invocation's environment states: the text
     framing of the managed runtime, or the structured record its JSON format delivers.
 
-    The LEVEL is left exactly as the library's own default (a warning), because that is
-    the level the managed runtime leaves the root logger at: what a record has to clear is
-    the level the handler's own code set, and nothing here lowers or raises it.
+    The LEVEL is the function's own too, where it has one: `ApplicationLogLevel` filters the
+    application logs "to the selected level of detail and lower", and a managed runtime
+    applies that by setting the ROOT logger to the level the invocation's environment states
+    — which is what makes a function configured at a level see that level's records and
+    nothing more detailed. A function that states no level leaves the root logger exactly as
+    the library's own default (a warning), because that is where the managed runtime leaves
+    it: what a record then has to clear is the level the handler's own code set.
 
     Installed before the handler's module is imported, so a record a module emits while it
     is being imported is carried too, and installed as the ONLY handler, so a handler
@@ -268,12 +274,39 @@ def _install_logging(request_id, log_format):
     for installed in list(root.handlers):
         root.removeHandler(installed)
     root.addHandler(handler)
+    level = _LOG_LEVELS.get(str(log_level or "").upper())
+    if level is not None:
+        root.setLevel(level)
+
+
+# What each `ApplicationLogLevel` is as a level of the logging library, in the order the
+# member documents them — "TRACE is the highest level and FATAL is the lowest". The library
+# names four of the six; the two it does not are the level below its lowest (a trace is more
+# detailed than a debug record) and its own highest (a fatal record is a critical one).
+#
+# Source: the model's `ApplicationLogLevel` enum (TRACE | DEBUG | INFO | WARN | ERROR |
+# FATAL) against the levels `logging` declares.
+_LOG_LEVELS = {
+    "TRACE": logging.DEBUG - 5,
+    "DEBUG": logging.DEBUG,
+    "INFO": logging.INFO,
+    "WARN": logging.WARNING,
+    "ERROR": logging.ERROR,
+    "FATAL": logging.CRITICAL,
+}
 
 
 def _configured_log_format(environment):
     """The log format the invocation's own environment states, as the runtime reads it."""
 
     return (environment or {}).get("AWS_LAMBDA_LOG_FORMAT") or ""
+
+
+def _configured_log_level(environment):
+    """The application log level the invocation's own environment states, as the runtime
+    reads it."""
+
+    return (environment or {}).get("AWS_LAMBDA_LOG_LEVEL") or ""
 
 
 # The MOUNTS a module one run imports can come from, and the DIRECTORY each of them is
@@ -575,7 +608,14 @@ def _report(error_type, error_message, stack_trace):
     message, then the handler's own traceback. That is what a client reads out of the
     function's log group for a failed invocation.
 
-    Under the STRUCTURED log format the same report is ONE record instead of those lines:
+    It is ONE record: the report is written in a single write, so the whole of it — the
+    `[ERROR]` line, the traceback header and every frame — is one event of the function's
+    log group rather than one event per line of it, which is what lets a client read a
+    failure as the one thing that happened. The frames keep their INDENTATION as
+    non-breaking spaces, which is what the managed runtime writes them with, so the shape of
+    the traceback survives a reader that collapses runs of ordinary spaces.
+
+    Under the STRUCTURED log format the same report is ONE record of that format instead:
     the class, the message and the frames become the members of a single JSON object,
     because a client that selected that format reads its function's log as records.
     """
@@ -595,10 +635,30 @@ def _report(error_type, error_message, stack_trace):
             + "\n"
         )
         return
-    sys.stderr.write("[ERROR] %s: %s\n" % (error_type, error_message))
-    sys.stderr.write("Traceback (most recent call last):\n")
+    lines = [
+        "[ERROR] %s: %s" % (error_type, error_message),
+        "Traceback (most recent call last):",
+    ]
     for frame in stack_trace:
-        sys.stderr.write(frame if frame.endswith("\n") else frame + "\n")
+        for line in frame.rstrip("\n").split("\n"):
+            lines.append(_indented(line))
+    # ONE write, and no break of its own: the report is one record, whose last line is its
+    # last line.
+    sys.stderr.write("\n".join(lines))
+
+
+# The space the frames of a reported traceback are indented with: a non-breaking one, which
+# is what the managed runtime writes the indentation of an error report as.
+_REPORT_INDENT = "\u00a0"
+
+
+def _indented(line):
+    """``line`` with its leading spaces written as the space above, one for one — so the
+    frame keeps the depth the traceback states it at and nothing else about the line
+    changes."""
+
+    stripped = line.lstrip(" ")
+    return _REPORT_INDENT * (len(line) - len(stripped)) + stripped
 
 
 def _raised(error_type, error_message, stack_trace):
@@ -723,7 +783,9 @@ def _prepare(request, library):
     # Before the handler's module is imported, which is where a module-level record is
     # emitted from.
     _install_logging(
-        request["requestId"], _configured_log_format(request.get("environment"))
+        request["requestId"],
+        _configured_log_format(request.get("environment")),
+        _configured_log_level(request.get("environment")),
     )
 
     handler = request["handler"]
@@ -851,7 +913,9 @@ def _bind(request):
     if environment is not None:
         prepared["environment"] = environment
     _install_logging(
-        prepared["requestId"], _configured_log_format(prepared.get("environment"))
+        prepared["requestId"],
+        _configured_log_format(prepared.get("environment")),
+        _configured_log_level(prepared.get("environment")),
     )
     return None
 

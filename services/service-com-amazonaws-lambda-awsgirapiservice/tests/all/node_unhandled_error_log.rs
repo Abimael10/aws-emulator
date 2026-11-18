@@ -17,7 +17,7 @@
 //! ([`crate::invoke_request_id::one_invocation_stream_at_a_time`]).
 
 use crate::invocation_log_delivery::{
-    create_function, delivered, emulator, invoke, streams, Created, NODE_RUNTIME,
+    create_function, delivered, emulator, invocations_log, invoke, streams, Created, NODE_RUNTIME,
 };
 use crate::node_handler_error_wording::{ROLE, ROWS};
 
@@ -53,7 +53,8 @@ async fn the_group_holds_the_error_report_of_a_run_that_raised() {
             1,
             "case {case:?}: expected one stream for the invocation, got {held:?}"
         );
-        let (lines, rebuilt) = delivered(&router, case, &group, &held[0]).await;
+        let (lines, _text) = delivered(&router, case, &group, &held[0]).await;
+        let rebuilt = invocations_log(&lines);
         assert_eq!(
             rebuilt, reported,
             "case {case:?}: expected the group to hold the log the invocation reported, got \

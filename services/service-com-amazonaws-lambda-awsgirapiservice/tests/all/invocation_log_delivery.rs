@@ -265,6 +265,10 @@ pub(crate) const FUNCTION_ERROR_HEADER: &str = "x-amz-function-error";
 /// The whole log of one stream as its text, each line closed by its break — which is the form
 /// the invocation itself reports its log tail in.
 ///
+/// An event's own message is the LINE as the runtime wrote it, the break that closed it
+/// included, so the lines are reported here without it and the text is the messages as they
+/// were held.
+///
 /// `pub(crate)` for the reason [`groups`] is.
 pub(crate) async fn delivered(
     router: &MultiServiceRouter,
@@ -281,6 +285,32 @@ pub(crate) async fn delivered(
         .map(|(_, record)| record_text(record).to_string())
         .collect();
     (lines, text)
+}
+
+/// The log of the INVOCATIONS a stream holds: its records, each closed by its break, less the
+/// record that states the initialization of the execution environment — which is the
+/// ENVIRONMENT's own record, written to the group ahead of the first invocation it serves and
+/// no part of what any invocation reports as its own log.
+///
+/// This is the form an invocation reports its log tail in, which is what makes the two
+/// readings of one run comparable.
+///
+/// `pub(crate)` for the reason [`groups`] is.
+pub(crate) fn invocations_log(records: &[String]) -> String {
+    records
+        .iter()
+        .filter(|record| !states_initialization(record))
+        .map(|record| format!("{record}\n"))
+        .collect()
+}
+
+/// Whether `record` is the one that states the initialization of an execution environment, in
+/// either of the two forms a function's `LogFormat` renders it in.
+///
+/// `pub(crate)` for the reason [`groups`] is.
+pub(crate) fn states_initialization(record: &str) -> bool {
+    record.starts_with("INIT_START Runtime Version: ")
+        || record.contains("\"type\":\"platform.initStart\"")
 }
 
 /// A function the suite creates: its deployment package, its runtime and where it logs.
@@ -587,8 +617,10 @@ async fn an_invocation_delivers_its_log_to_the_functions_log_group() {
         );
         let stream = held[0].clone();
 
-        // The whole log the invocation reported, line for line, is what the group holds.
-        let (lines, rebuilt) = delivered(&router, case, &group, &stream).await;
+        // The whole log the invocation reported, record for record, is what the group holds —
+        // beside the one record the ENVIRONMENT wrote for its own initialization.
+        let (lines, _rebuilt) = delivered(&router, case, &group, &stream).await;
+        let rebuilt = invocations_log(&lines);
         assert_eq!(
             rebuilt, reported,
             "case {case:?}: expected the group to hold the log the invocation reported, got \
@@ -606,22 +638,31 @@ async fn an_invocation_delivers_its_log_to_the_functions_log_group() {
             );
         }
 
-        // The framing, and the handler's own lines between it.
+        // The framing, and the handler's own lines between it. The log opens on the
+        // initialization of the execution environment the run built, which precedes the
+        // invocation's own START line.
         assert!(
             lines
                 .first()
+                .is_some_and(|line| line.starts_with("INIT_START Runtime Version: ")),
+            "case {case:?}: expected the log to open on the initialization of the environment, \
+             got {lines:?}"
+        );
+        assert!(
+            lines
+                .get(1)
                 .is_some_and(|line| line.starts_with("START RequestId: ")),
-            "case {case:?}: expected the log to open on its START line, got {lines:?}"
+            "case {case:?}: expected the invocation's START line after it, got {lines:?}"
         );
         assert_eq!(
             lines.len(),
-            row.written.len() + 3,
-            "case {case:?}: expected 3 framing lines around {} of the handler's own, got \
+            row.written.len() + 4,
+            "case {case:?}: expected 4 framing lines around {} of the handler's own, got \
              {lines:?}",
             row.written.len()
         );
         for (position, written) in row.written.iter().enumerate() {
-            let actual = lines.get(position + 1).cloned().unwrap_or_default();
+            let actual = lines.get(position + 2).cloned().unwrap_or_default();
             // A node runtime delivers a console line FRAMED — the instant, the invocation's
             // id, the level, then the text — so what the handler wrote is the last field.
             let text = actual.rsplit('\t').next().unwrap_or_default();
@@ -639,8 +680,9 @@ async fn an_invocation_delivers_its_log_to_the_functions_log_group() {
         );
 
         // The stream names the invocation: the date it ran, the version that executed, and
-        // the invocation's own id, which is the one the START line carries.
-        let request_id = lines[0]
+        // the invocation's own id, which is the one the START line carries — the environment
+        // was built for this invocation, so the stream it opened is named after it.
+        let request_id = lines[1]
             .trim_start_matches("START RequestId: ")
             .split(' ')
             .next()
@@ -725,7 +767,8 @@ async fn each_invocation_writes_its_own_stream_of_the_one_group() {
         "case {case:?}: expected one stream per invocation, got {held:?}"
     );
     for stream in &held {
-        let (_, rebuilt) = delivered(&router, case, group, stream).await;
+        let (records, _) = delivered(&router, case, group, stream).await;
+        let rebuilt = invocations_log(&records);
         assert!(
             rebuilt == first || rebuilt == second,
             "case {case:?}: expected {stream:?} to hold one of the two runs' logs, got \
@@ -897,24 +940,36 @@ async fn a_handler_that_raises_logs_its_runtimes_error_report() {
         1,
         "case {case:?}: expected one stream for the invocation, got {held:?}"
     );
-    let (lines, rebuilt) = delivered(&router, case, group, &held[0]).await;
+    let (lines, _text) = delivered(&router, case, group, &held[0]).await;
+    let rebuilt = invocations_log(&lines);
     assert_eq!(
         rebuilt, reported,
         "case {case:?}: expected the group to hold the log the invocation reported, got \
          {rebuilt:?} against {reported:?}"
+    );
+    // The report is ONE record of the group — a failure is one thing that happened, so the
+    // `[ERROR]` line, the traceback header and the frames are one event and not one per line.
+    let report: Vec<&String> = lines
+        .iter()
+        .filter(|line| line.starts_with("[ERROR] "))
+        .collect();
+    assert_eq!(
+        report.len(),
+        1,
+        "case {case:?}: expected the runtime's error report as one record, got {lines:?}"
     );
     for expected in [
         "[ERROR] ValueError: the handler gave up",
         "Traceback (most recent call last):",
     ] {
         assert!(
-            lines.iter().any(|line| line == expected),
-            "case {case:?}: expected the line {expected:?} in the log, got {lines:?}"
+            report[0].lines().any(|line| line == expected),
+            "case {case:?}: expected the line {expected:?} in the report, got {report:?}"
         );
     }
     assert!(
-        lines.iter().any(|line| line.contains("lambda_function.py")),
-        "case {case:?}: expected the handler's own frame in the traceback, got {lines:?}"
+        report[0].contains("lambda_function.py"),
+        "case {case:?}: expected the handler's own frame in the traceback, got {report:?}"
     );
 }
 
@@ -1040,24 +1095,30 @@ async fn an_asynchronous_run_is_logged_and_a_dry_run_is_not() {
         1,
         "case {case:?}: expected one stream for the one run, got {held:?}"
     );
-    // The whole log of the run, in order: the framing around the one line the handler wrote.
-    let expected_lines = 4;
+    // The whole log of the run, in order: the environment's initialization, then the framing
+    // around the one line the handler wrote.
+    let expected_lines = 5;
     assert_eq!(
         lines.len(),
         expected_lines,
         "case {case:?}: expected the framing around the handler's one line, got {lines:?}"
     );
     assert!(
-        lines[0].starts_with("START RequestId: "),
-        "case {case:?}: expected the log to open on its START line, got {lines:?}"
+        lines[0].starts_with("INIT_START Runtime Version: "),
+        "case {case:?}: expected the log to open on the environment's initialization, got \
+         {lines:?}"
+    );
+    assert!(
+        lines[1].starts_with("START RequestId: "),
+        "case {case:?}: expected the invocation's START line after it, got {lines:?}"
     );
     assert_eq!(
-        lines[1].rsplit('\t').next().unwrap_or_default(),
+        lines[2].rsplit('\t').next().unwrap_or_default(),
         "a queued run",
         "case {case:?}: expected the handler's own line, got {lines:?}"
     );
     assert!(
-        lines[2].starts_with("END RequestId: ") && lines[3].starts_with("REPORT RequestId: "),
+        lines[3].starts_with("END RequestId: ") && lines[4].starts_with("REPORT RequestId: "),
         "case {case:?}: expected the log to close on END and then REPORT, got {lines:?}"
     );
 }

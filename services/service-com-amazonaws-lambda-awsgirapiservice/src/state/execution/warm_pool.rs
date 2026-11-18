@@ -257,6 +257,11 @@ fn reported(why: String) -> Finished {
         completion: Completion::Internal(why),
         log: String::new(),
         log_records: Vec::new(),
+        init_records: Vec::new(),
+        // Nothing was initialized, because nothing ran at all.
+        initialized: false,
+        init_duration: None,
+        log_stream: None,
         elapsed: Duration::ZERO,
         // Nothing ran, so no reading of a run's memory was taken.
         max_memory_bytes: None,
@@ -311,6 +316,17 @@ fn serve_jobs(jobs: Receiver<Job>) {
     };
     let clock = Clock::host();
     let initializing = Instant::now();
+    // The log STREAM this execution environment writes to: one stream per environment, which
+    // is what makes the invocations a standing environment serves share a stream and a new
+    // environment open one of its own. It is the stream the invocation that BUILT the
+    // environment was composed with, and every later invocation served here is told the same
+    // one — so what the runtime reports as its stream and what the delivery writes to are the
+    // environment's own ([`super::log_stream_name`]).
+    let log_stream = first
+        .served
+        .environment
+        .get(super::LOG_STREAM_VARIABLE)
+        .cloned();
     // What the environment is finally torn down against: the budget of the LAST invocation it
     // served, so a guest `atexit` callback is bounded like the handlers were.
     let mut budget = first.served.budget;
@@ -321,6 +337,7 @@ fn serve_jobs(jobs: Receiver<Job>) {
             // and no environment is kept.
             let mut finished = *failed;
             finished.elapsed = initializing.elapsed();
+            finished.log_stream = log_stream.clone();
             let _ = first.answer.send(Answered {
                 finished,
                 reusable: false,
@@ -334,12 +351,24 @@ fn serve_jobs(jobs: Receiver<Job>) {
     let mut served = 0u64;
     loop {
         served = served.saturating_add(1);
+        // Every invocation served here reports the stream of the environment serving it,
+        // whichever stream its own caller composed.
+        if let Some(stream) = log_stream.clone() {
+            job.served
+                .environment
+                .insert(super::LOG_STREAM_VARIABLE.to_string(), stream);
+        }
         let mut finished = prepared.invoke(&job.served.as_run(), &clock);
+        finished.log_stream = log_stream.clone();
         // The invocation that BUILT the environment waited for the initialization as well as
         // for its own run, so that is what its duration is. Every later invocation waited for
         // its own run alone, which is the whole point of the environment still standing.
         if let Some(initializing) = cold.take() {
-            finished.elapsed = initializing.elapsed();
+            let whole = initializing.elapsed();
+            // What the INITIALIZATION itself took: the whole wait, less the handler's own run
+            // — which is the span the report of a cold start states as its `Init Duration`.
+            finished.init_duration = Some(whole.saturating_sub(finished.elapsed));
+            finished.elapsed = whole;
         }
         // Whether this environment may stand: the invocation it just served has to have
         // COMPLETED, and the environment itself has to be within what a standing one may hold

@@ -47,8 +47,8 @@ use smithy_server_runtime::MultiServiceRouter;
 use crate::event_source_mapping_role_access::{allow, given_role};
 use crate::event_source_mappings::call;
 use crate::invocation_log_delivery::{
-    create_function_logging, delivered, emulator, groups, invoke, streams, Created, LOGS,
-    LOG_WRITES, NODE_RUNTIME, PYTHON_RUNTIME,
+    create_function_logging, delivered, emulator, groups, invocations_log, invoke,
+    states_initialization, streams, Created, LOGS, LOG_WRITES, NODE_RUNTIME, PYTHON_RUNTIME,
 };
 
 /// Where `CreateFunction` is bound.
@@ -295,7 +295,10 @@ async fn the_log_format_selects_the_form_of_every_delivered_record() {
             1,
             "case {case:?}: expected one stream for one invocation, got {held:?}"
         );
-        let (lines, text) = delivered(&router, case, &group, &held[0]).await;
+        let (lines, _text) = delivered(&router, case, &group, &held[0]).await;
+        // What the group holds beside the one record the ENVIRONMENT wrote for its own
+        // initialization, which no invocation reports as its log.
+        let text = invocations_log(&lines);
         if row.withholds_printed {
             // ONE log, read two ways — except for a record the function's application log
             // level withholds from CloudWatch Logs, which the invocation's own tail still
@@ -305,7 +308,7 @@ async fn the_log_format_selects_the_form_of_every_delivered_record() {
                 "case {case:?}: expected the withheld line in the tail and not in the group, \
                  got {text:?} against {tail:?}"
             );
-            for line in &lines {
+            for line in lines.iter().filter(|line| !states_initialization(line)) {
                 assert!(
                     tail.contains(line.as_str()),
                     "case {case:?}: expected every delivered record in the log the invocation \
@@ -468,8 +471,8 @@ async fn the_application_log_level_decides_which_records_reach_cloudwatch_logs()
             .collect();
         assert_eq!(
             frames.len(),
-            3,
-            "case {case:?}: expected the run's three platform frames, got {frames:?}"
+            4,
+            "case {case:?}: expected the run's four platform frames, got {frames:?}"
         );
     }
 }
@@ -537,15 +540,20 @@ fn assert_structured(case: &str, row: &Row, lines: &[String]) {
         };
         parsed.push(members);
     }
-    // The frames Lambda writes itself: the run opened, the handler's run ended, and what it
-    // spent — each naming the platform record it is.
+    // The frames Lambda writes itself: the environment was initialized, the run opened, the
+    // handler's run ended, and what it spent — each naming the platform record it is.
     let kinds: Vec<&str> = parsed
         .iter()
         .filter_map(|members| members.get("type").and_then(Value::as_str))
         .collect();
     assert_eq!(
         kinds,
-        vec!["platform.start", "platform.runtimeDone", "platform.report"],
+        vec![
+            "platform.initStart",
+            "platform.start",
+            "platform.runtimeDone",
+            "platform.report"
+        ],
         "case {case:?}: expected the run's platform records, got {kinds:?}"
     );
     let frame = parsed
@@ -614,8 +622,13 @@ fn assert_structured(case: &str, row: &Row, lines: &[String]) {
 /// Under the plain-text format the same log is the runtime's own framing.
 fn assert_plain_text(case: &str, row: &Row, lines: &[String]) {
     assert!(
-        lines[0].starts_with("START RequestId: "),
-        "case {case:?}: expected the log to open on its START line, got {lines:?}"
+        lines[0].starts_with("INIT_START Runtime Version: "),
+        "case {case:?}: expected the log to open on the environment's initialization, got \
+         {lines:?}"
+    );
+    assert!(
+        lines[1].starts_with("START RequestId: "),
+        "case {case:?}: expected the invocation's START line after it, got {lines:?}"
     );
     let closing: Vec<&String> = lines.iter().rev().take(2).collect();
     assert!(

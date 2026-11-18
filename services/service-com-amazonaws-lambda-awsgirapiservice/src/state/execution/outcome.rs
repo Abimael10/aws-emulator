@@ -121,12 +121,33 @@ pub struct Finished {
     /// Everything the handler wrote to its output streams, capped.
     pub log: String,
     /// That same output as the RECORDS the run wrote it in, in order: the text of one write,
-    /// without the line break that closed it ([`Capture::records`]).
+    /// the break that closed it included ([`Capture::records`]).
     ///
     /// A record is what the run wrote in ONE call, so text carrying line breaks of its own —
     /// the stack of an error written to the console — is one record and not several: that is
     /// what keeps one log event per thing the handler reported ([`super::log_delivery`]).
+    ///
+    /// These are the records of the INVOKE phase alone; what the initialization wrote is
+    /// [`Finished::init_records`].
     pub log_records: Vec<String>,
+    /// What the INITIALIZATION phase wrote, in order and in the same form: the records the
+    /// module-level code of the package left while the execution environment was being built,
+    /// before this invocation was bound to it ([`Capture::begin_invocation`]).
+    ///
+    /// Kept apart from the invocation's own records because output written during init
+    /// precedes the invocation's opening frame in the function's log, which is how a client
+    /// attributes module-scope output to the cold start.
+    pub init_records: Vec<String>,
+    /// Whether this run paid the INITIALIZATION phase — whether the execution environment it
+    /// ran in was built for it rather than already standing.
+    pub initialized: bool,
+    /// How long that initialization took, for a run that paid it and reached its handler's
+    /// own phase — what the run's report states as its `Init Duration`.
+    pub init_duration: Option<Duration>,
+    /// The log stream the EXECUTION ENVIRONMENT that served this run writes to, when that
+    /// environment decided one of its own ([`super::warm_pool`]), and `None` for a run whose
+    /// environment was built for it alone — whose stream is the one its caller composed.
+    pub log_stream: Option<String>,
     /// How long the run took.
     pub elapsed: Duration,
     /// The MOST memory this run was measured holding, in bytes, or `None` for a run nothing
@@ -146,11 +167,15 @@ pub struct Finished {
 pub(super) struct Capture {
     /// The text kept so far.
     pub(super) text: String,
-    /// The RECORDS that text was written in, each without the line break that closed it.
+    /// The RECORDS that text was written in, each AS IT WAS WRITTEN — the break that closed
+    /// it included, and no break at all for a record the run never closed.
     records: Vec<String>,
     /// Whether the last of them is still open — written by a call that did not end on a line
     /// break, so the next write continues it.
     open: bool,
+    /// How many records had been written when the INVOKE phase began, for a capture the
+    /// initialization wrote into as well, and `None` while no invoke phase has begun on it.
+    initialized: Option<usize>,
     /// How many bytes are kept at most.
     limit: usize,
 }
@@ -162,8 +187,42 @@ impl Capture {
             text: String::new(),
             records: Vec::new(),
             open: false,
+            initialized: None,
             limit,
         }
+    }
+
+    /// Mark the instant the INVOKE phase begins: every record written so far belongs to the
+    /// initialization of the execution environment, and every record after it to the
+    /// invocation being served.
+    ///
+    /// One-shot, so the boundary is the FIRST invocation's own: a capture is never written
+    /// into by two invocations.
+    pub(super) fn begin_invocation(&mut self) {
+        if self.initialized.is_none() {
+            self.initialized = Some(self.records.len());
+            // A write the initialization never closed is a record of the initialization: what
+            // the invocation writes next is its own record rather than a continuation of one
+            // written before it was bound.
+            self.open = false;
+        }
+    }
+
+    /// How many of the records belong to the initialization: none until an invoke phase has
+    /// begun on this capture, because a run whose invoke phase never began wrote everything it
+    /// wrote as the run it is.
+    fn initialized(&self) -> usize {
+        self.initialized.unwrap_or(0).min(self.records.len())
+    }
+
+    /// The records the INITIALIZATION wrote, in order.
+    pub(super) fn init_records(&self) -> Vec<String> {
+        self.records[..self.initialized()].to_vec()
+    }
+
+    /// The records the INVOCATION itself wrote, in order.
+    pub(super) fn invocation_records(&self) -> Vec<String> {
+        self.records[self.initialized()..].to_vec()
     }
 
     /// Append `text`, stopping at the cap. Past it the capture keeps what it already has.
@@ -185,14 +244,10 @@ impl Capture {
         self.recorded(kept);
     }
 
-    /// The records the run wrote, in order.
-    pub(super) fn records(&self) -> Vec<String> {
-        self.records.clone()
-    }
-
     /// Add `kept` to those records: it continues the one still open, and a write that ends on
     /// a line break CLOSES one — which is what makes the record the unit the run wrote in
-    /// rather than the line the text breaks into.
+    /// rather than the line the text breaks into. The break stays part of the record, because
+    /// the record is the text the run wrote.
     fn recorded(&mut self, kept: &str) {
         if self.open {
             if let Some(last) = self.records.last_mut() {
@@ -203,9 +258,6 @@ impl Capture {
             self.open = true;
         }
         if kept.ends_with('\n') {
-            if let Some(last) = self.records.last_mut() {
-                last.pop();
-            }
             self.open = false;
         }
     }
@@ -245,29 +297,32 @@ mod tests {
     }
 
     /// A run's output is kept as the RECORDS it was written in: one per write the run closed
-    /// with a line break, and a line break INSIDE one write stays inside its record.
+    /// with a line break, each carrying the break that closed it, and a line break INSIDE one
+    /// write stays inside its record.
     #[test]
     fn the_capture_keeps_one_record_per_write_the_run_closed() {
         // (case, the writes the run made, the records they leave)
         let cases: &[(&str, &[&str], &[&str])] = &[
-            ("one line", &["hello\n"], &["hello"]),
+            ("one line", &["hello\n"], &["hello\n"]),
             (
                 "two lines, each written and closed",
                 &["a\n", "b\n"],
-                &["a", "b"],
+                &["a\n", "b\n"],
             ),
             (
                 "a write carrying line breaks of its own",
                 &["TypeError: boom\n    at handler\n"],
-                &["TypeError: boom\n    at handler"],
+                &["TypeError: boom\n    at handler\n"],
             ),
             (
                 "a line written in pieces, as a print writes its break apart",
                 &["hello", "\n"],
-                &["hello"],
+                &["hello\n"],
             ),
+            // A record the run never closed carries no break, because the run wrote none —
+            // which is how a runtime writes a report of several lines as ONE record.
             ("a write the run never closed", &["half"], &["half"]),
-            ("a line of its own with nothing on it", &["\n"], &[""]),
+            ("a line of its own with nothing on it", &["\n"], &["\n"]),
             ("nothing written at all", &[], &[]),
         ];
         for (case, writes, expected) in cases {
@@ -275,22 +330,76 @@ mod tests {
             for written in *writes {
                 captured(&capture).write(written);
             }
-            let actual = captured(&capture).records();
+            let actual = captured(&capture).invocation_records();
             let expected: Vec<String> = expected.iter().map(|held| (*held).to_string()).collect();
             assert_eq!(
                 actual, expected,
                 "case {case:?}: expected {expected:?}, got {actual:?}"
             );
-            // The records are the same log: each of them, closed by its own break.
-            if writes.last().is_none_or(|last| last.ends_with('\n')) {
-                let rebuilt: String = actual.iter().map(|held| format!("{held}\n")).collect();
-                let text = captured(&capture).text.clone();
-                assert_eq!(
-                    rebuilt, text,
-                    "case {case:?}: expected the records to rebuild the log, got {rebuilt:?} \
-                     against {text:?}"
-                );
+            // The records ARE the log: they are the text the run wrote, in the pieces it
+            // wrote it in.
+            let rebuilt: String = actual.concat();
+            let text = captured(&capture).text.clone();
+            assert_eq!(
+                rebuilt, text,
+                "case {case:?}: expected the records to rebuild the log, got {rebuilt:?} \
+                 against {text:?}"
+            );
+        }
+    }
+
+    /// RULE: the records written before the INVOKE phase began are the initialization's, and
+    /// every record after it the invocation's — which is what lets the output of the init
+    /// phase precede the invocation's own opening frame in the function's log.
+    #[test]
+    fn the_capture_tells_the_initializations_records_from_the_invocations() {
+        // (case, the writes before the phase began, the writes after it)
+        let cases: &[(&str, &[&str], &[&str])] = &[
+            ("a module that wrote nothing", &[], &["handled\n"]),
+            ("a module that wrote one line", &["imported\n"], &["handled\n"]),
+            (
+                "a module that wrote several",
+                &["one\n", "two\n"],
+                &["handled\n", "and more\n"],
+            ),
+            (
+                "a module whose last write it never closed",
+                &["half"],
+                &["handled\n"],
+            ),
+            ("an invocation that wrote nothing of its own", &["init\n"], &[]),
+        ];
+        for (case, before, after) in cases {
+            let capture = Arc::new(Mutex::new(Capture::new(4_096)));
+            for written in *before {
+                captured(&capture).write(written);
             }
+            captured(&capture).begin_invocation();
+            for written in *after {
+                captured(&capture).write(written);
+            }
+            let init = captured(&capture).init_records();
+            let invocation = captured(&capture).invocation_records();
+            assert_eq!(
+                init.len(),
+                before.len(),
+                "case {case:?}: expected {} initialization record(s), got {init:?}",
+                before.len()
+            );
+            assert_eq!(
+                invocation.len(),
+                after.len(),
+                "case {case:?}: expected {} record(s) of the invocation, got {invocation:?}",
+                after.len()
+            );
+            // Together they are the whole log, in the order the run wrote it.
+            let rebuilt: String = init.iter().chain(invocation.iter()).cloned().collect();
+            let text = captured(&capture).text.clone();
+            assert_eq!(
+                rebuilt, text,
+                "case {case:?}: expected the two halves to rebuild the log, got {rebuilt:?} \
+                 against {text:?}"
+            );
         }
     }
 

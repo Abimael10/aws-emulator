@@ -545,26 +545,47 @@ async fn a_served_proxy_request_leaves_its_runs_log_in_the_functions_group() {
             "case {case:?}: expected one printed line per request served ({served}), got \
              {printed:?}"
         );
-        // The handler's own line, as one event of its own: a log event carries the line it
-        // was written as, without the break that ended it.
+        // The handler's own line, as one event of its own: a log event carries the line the
+        // run wrote, which is compared here without the break that closed it.
         let expected = format!("{PRINTED_PREFIX}{}", row.seen);
         assert!(
             messages.contains(&expected.as_str()),
             "case {case:?}: expected this run's own line {expected:?} among {messages:?}"
         );
 
-        // One run writes one stream, so the group holds as many streams as runs: a repeat of
-        // the same request is a second run and not a second entry in the first one's stream.
+        // A stream belongs to the EXECUTION ENVIRONMENT that wrote it, so the runs one standing
+        // environment serves share it: what grows with the requests served is the records in
+        // that stream, counted above. So there are never MORE streams than runs, and each
+        // stream holds whole runs — every `START` in it is answered by a `REPORT`.
         let streams: Vec<&str> = {
             let mut held: Vec<&str> = events.iter().map(|(stream, _)| stream.as_str()).collect();
             held.sort_unstable();
             held.dedup();
             held
         };
-        assert_eq!(
-            streams.len(),
-            served,
-            "case {case:?}: expected one stream per request served ({served}), got {streams:?}"
+        assert!(
+            !streams.is_empty() && streams.len() <= served,
+            "case {case:?}: expected at most one stream per run served ({served}), got \
+             {streams:?}"
         );
+        for stream in &streams {
+            let records: Vec<&str> = events
+                .iter()
+                .filter(|(held, _)| held == stream)
+                .map(|(_, message)| message.as_str())
+                .collect();
+            let framed = |prefix: &str| {
+                records
+                    .iter()
+                    .filter(|message| message.starts_with(prefix))
+                    .count()
+            };
+            let (opened, reported) = (framed(START_RECORD), framed(REPORT_RECORD));
+            assert!(
+                opened >= 1 && opened == reported,
+                "case {case:?}: expected every run in {stream:?} to be bracketed by its own \
+                 framing, got {opened} opening and {reported} closing record(s) in {records:?}"
+            );
+        }
     }
 }

@@ -427,6 +427,10 @@ async fn wait_until_active(router: &MultiServiceRouter, case: &str, name: &str) 
 
 /// Every message CloudWatch Logs holds in `group`, polled until the group holds at least
 /// `at_least` of them or the polls run out.
+///
+/// Each message is ONE record of a run as the write that produced it left it, the line break
+/// that closed the write included ([`crate::lambda_log_records_delivered_under_the_roles_logs_grant`]
+/// owns that rule), so a caller comparing a record compares those bytes.
 async fn messages_in(
     router: &MultiServiceRouter,
     case: &str,
@@ -449,7 +453,7 @@ async fn messages_in(
                 events
                     .iter()
                     .filter_map(|event| event.get("message").and_then(Value::as_str))
-                    .map(str::to_string)
+                    .map(ToString::to_string)
                     .collect()
             })
             .unwrap_or_default();
@@ -937,11 +941,14 @@ async fn what_an_invocation_prints_drives_the_metric_filter_alarm_and_subscripti
         }
 
         // 5. What the runs left in the group: every line the handler printed, as an event of its
-        //    own, framed by the runtime's own opening and closing lines — one framing per run.
+        //    own, framed by the runtime's own opening and closing lines — one framing per run,
+        //    beside the one record the execution environment wrote for its own initialization.
         let printed_lines: Vec<String> =
             (0..row.lines).map(|line| error_line(&marker, line)).collect();
         let framing_per_run = 3;
-        let wanted = row.invocations * (row.lines + 1 + framing_per_run);
+        let initializations = 1;
+        let wanted =
+            row.invocations * (row.lines + 1 + framing_per_run) + initializations;
         let held = messages_in(&router, case, &group, wanted).await;
         for printed in &printed_lines {
             // Each record reaches the group as the bytes the run wrote it in, the line break

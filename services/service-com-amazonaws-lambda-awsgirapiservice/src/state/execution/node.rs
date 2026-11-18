@@ -226,12 +226,21 @@ pub fn run_against(request: &Run<'_>, clock: &Clock) -> Finished {
         None => completion,
     };
     let written = captured(&capture);
-    let (log, log_records) = (written.text.clone(), written.records());
+    let (log, log_records) = (written.text.clone(), written.invocation_records());
+    let init_records = written.init_records();
     drop(written);
     Finished {
         completion,
         log,
         log_records,
+        init_records,
+        // Every invocation of a node function initializes an execution environment of its
+        // own, because this engine settles an invocation inside the context it was started in
+        // (see this module's docs and [`super::warm_pool`]): so the init phase of this run is
+        // this run's own.
+        initialized: true,
+        init_duration: bounds.init_duration(),
+        log_stream: None,
         elapsed,
         max_memory_bytes: Some(bounds.max_memory_bytes()),
     }
@@ -516,10 +525,15 @@ fn install_host(
     // It is ONE-SHOT ([`Bounds::start`]), and the runtime takes it off the globals with the
     // rest of this surface before a line of the package is loaded.
     let phase_bounds = Arc::clone(bounds);
+    let phase_capture = Arc::clone(capture);
     globals
         .set(
             "__hostBeginInvocation",
             Func::from(move || {
+                // Everything written up to here was written by the INITIALIZATION, which is
+                // what makes the module-level output of the package precede the invocation's
+                // own opening frame in the function's log ([`Capture::begin_invocation`]).
+                captured(&phase_capture).begin_invocation();
                 // Milliseconds since the epoch as a NUMBER, which is how JavaScript states
                 // an instant: the value is far inside the integers a double holds exactly.
                 #[allow(clippy::cast_precision_loss)]
@@ -1187,6 +1201,12 @@ pub struct Bounds {
     /// run's own ([`Self::measure_memory_from_here`]), which is what the run is reported to
     /// have used ([`Self::max_memory_bytes`]).
     held: Held,
+    /// When these bounds were taken, which is the instant the INITIALIZATION of the execution
+    /// environment began: the span from here to [`Self::start`] is the init phase, which is
+    /// what the run's own report states as its `Init Duration`.
+    built: Instant,
+    /// How long that phase took, in microseconds, once the invoke phase has begun.
+    init_micros: AtomicU64,
 }
 
 impl Bounds {
@@ -1211,6 +1231,8 @@ impl Bounds {
             stopped: Mutex::new(None),
             breached: AtomicBool::new(false),
             held: Held::new(),
+            built: Instant::now(),
+            init_micros: AtomicU64::new(0),
         }
     }
 
@@ -1251,6 +1273,12 @@ impl Bounds {
         if self.spending.swap(true, Ordering::SeqCst) {
             return self.deadline_epoch_ms.load(Ordering::Relaxed);
         }
+        // How long the INITIALIZATION took, measured from the instant these bounds were
+        // taken to the instant the handler's own phase begins.
+        self.init_micros.store(
+            u64::try_from(self.built.elapsed().as_micros()).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
         *self.deadline.lock().unwrap_or_else(PoisonError::into_inner) =
             self.clock.now() + self.host_span();
         // What the handler is TOLD it has left is a host wall-clock instant rather than a
@@ -1258,6 +1286,15 @@ impl Bounds {
         let epoch_ms = super::epoch_millis(SystemTime::now() + self.wall_clock);
         self.deadline_epoch_ms.store(epoch_ms, Ordering::Relaxed);
         epoch_ms
+    }
+
+    /// How long the INITIALIZATION of this run's execution environment took, or `None` for a
+    /// run whose handler phase never began — an initialization that failed, which is not an
+    /// initialization the run reports a span for.
+    fn init_duration(&self) -> Option<Duration> {
+        self.spending
+            .load(Ordering::SeqCst)
+            .then(|| Duration::from_micros(self.init_micros.load(Ordering::Relaxed)))
     }
 
     /// When the run must be over.

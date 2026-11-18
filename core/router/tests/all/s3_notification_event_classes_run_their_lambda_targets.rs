@@ -267,7 +267,14 @@ async fn read_log(router: &MultiServiceRouter, function: &str) -> (u16, Vec<Stri
         .cloned()
         .unwrap_or_default()
         .iter()
-        .map(|event| event["message"].as_str().unwrap_or_default().to_string())
+        .map(|event| {
+            // A delivered record is closed by the line break the write that produced it ended
+            // with, which belongs to the record rather than to its text — the one statement of
+            // that in this crate
+            // ([`crate::lambda_log_records_delivered_under_the_roles_logs_grant::record_body`]).
+            let message = event["message"].as_str().unwrap_or_default();
+            record_body(message).unwrap_or(message).to_string()
+        })
         .collect();
     (status, lines)
 }

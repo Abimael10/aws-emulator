@@ -40,7 +40,7 @@ use smithy_server_runtime::MultiServiceRouter;
 
 use crate::event_source_mappings::{await_function_active, call};
 use crate::invocation_log_delivery::{
-    delivered, emulator, invoke, streams, NODE_RUNTIME, PYTHON_RUNTIME,
+    delivered, emulator, invocations_log, invoke, streams, NODE_RUNTIME, PYTHON_RUNTIME,
 };
 use crate::invoke_request_id::one_invocation_stream_at_a_time;
 
@@ -350,7 +350,10 @@ async fn the_delivered_stream_closes_on_the_report_the_invocation_stated() {
         1,
         "case {case:?}: expected the invocation to leave one stream in {group:?}, got {held:?}"
     );
-    let (lines, text) = delivered(&router, case, &group, &held[0]).await;
+    let (lines, _delivered_text) = delivered(&router, case, &group, &held[0]).await;
+    // What the group holds beside the one record the ENVIRONMENT wrote for its own
+    // initialization, which no invocation reports as its log.
+    let text = invocations_log(&lines);
     assert_eq!(
         text, reported,
         "case {case:?}: expected the delivered events to be the log the invocation reported"

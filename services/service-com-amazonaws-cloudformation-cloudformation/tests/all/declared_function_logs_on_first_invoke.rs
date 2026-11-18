@@ -354,6 +354,9 @@ pub(crate) async fn event_messages(
             events
                 .iter()
                 .filter_map(|event| {
+                    // An event's message is the LINE as the runtime wrote it, the break that
+                    // closed it included; the records are compared as lines, so the one break
+                    // comes off here.
                     event
                         .get("message")
                         .and_then(Value::as_str)
@@ -523,25 +526,29 @@ async fn a_declared_functions_log_group_is_opened_by_its_first_invocation() {
         let delivered = delivered_log(&router, &group).await;
         assert_eq!(
             delivered.len(),
-            4,
-            "case {case:?}: expected the run's three framing lines around the handler's own, got \
-             {delivered:?}"
+            5,
+            "case {case:?}: expected the record of the environment's initialization and the \
+             run's three framing lines around the handler's own, got {delivered:?}"
         );
         assert!(
-            delivered[0].starts_with(START_PREFIX),
-            "case {case:?}: expected the delivered log to open on its START line, got \
-             {delivered:?}"
+            delivered[0].starts_with("INIT_START Runtime Version: "),
+            "case {case:?}: expected the delivered log to open on the initialization of the \
+             execution environment, got {delivered:?}"
+        );
+        assert!(
+            delivered[1].starts_with(START_PREFIX),
+            "case {case:?}: expected the invocation's START line after it, got {delivered:?}"
         );
         // A node runtime delivers a console line FRAMED — the instant, the invocation's id,
         // the level, then the text — so what the handler wrote is the line's last field; a
         // python handler's `print` is delivered as the text it is.
         assert_eq!(
-            delivered[1].rsplit('\t').next().unwrap_or_default(),
+            delivered[2].rsplit('\t').next().unwrap_or_default(),
             row.written,
             "case {case:?}: expected the handler's own line, got {delivered:?}"
         );
         assert!(
-            delivered[2].starts_with(END_PREFIX) && delivered[3].starts_with(REPORT_PREFIX),
+            delivered[3].starts_with(END_PREFIX) && delivered[4].starts_with(REPORT_PREFIX),
             "case {case:?}: expected the delivered log to close on END and then REPORT, got \
              {delivered:?}"
         );

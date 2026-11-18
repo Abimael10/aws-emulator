@@ -108,6 +108,10 @@ pub struct LogTarget {
     /// The `ApplicationLogLevel` its application records are filtered at before Lambda sends
     /// them here, or `None` for a function filtered at no level at all.
     pub application_log_level: Option<String>,
+    /// The `SystemLogLevel` its PLATFORM records are filtered at before Lambda sends them
+    /// here, read and applied independently of the level above, or `None` for a function
+    /// filtered at no level at all.
+    pub system_log_level: Option<String>,
     /// What the function's execution role may do to that group.
     pub grants: LogGrants,
 }
@@ -135,6 +139,12 @@ pub fn log_target<Eng: Send + Sync + 'static>(
         // format is delivered under no filter at all whatever is stored for them.
         application_log_level: crate::state::delivers_json_records(logging)
             .then(|| crate::state::configured_application_log_level(logging))
+            .flatten(),
+        // The platform records are filtered by the OTHER level, read the same way and applied
+        // on its own: "set this property to filter the system logs for your function that
+        // Lambda sends to CloudWatch".
+        system_log_level: crate::state::delivers_json_records(logging)
+            .then(|| crate::state::configured_system_log_level(logging))
             .flatten(),
     }
 }
@@ -182,50 +192,51 @@ fn grants<Eng: Send + Sync + 'static>(
 }
 
 /// The events of one run's log: the opening frame at the instant the run started, the
-/// closing frames at the instant it finished, and every line the handler wrote in between.
+/// closing frames at the instant it finished, and every record the handler wrote in between.
 ///
-/// `opened` is how many of `lines` belong to the opening frame, and `closed` how many to the
+/// `opened` is how many of `records` belong to the opening frame, and `closed` how many to the
 /// closing one; the rest are the handler's own output, which was written while the run was
 /// going and so carries the instant the run started.
 ///
-/// Each message is the record's own text CLOSED BY THE LINE BREAK that ended the write it was
-/// made in: a run's log is a stream of newline-terminated records, and Lambda delivers each of
-/// them to CloudWatch Logs as it was written rather than stripping its terminator — the same
-/// bytes the log tail of that run carries for the record. The lines reach here without their
-/// break (`super::run_log`), so it is put back once per event, for every record alike: the
-/// platform's own frames and the handler's output.
+/// Each event's message is the RECORD as it was written — closed by the line break that ended
+/// the write it was made in, which the capture keeps and the platform's own frames carry
+/// ([`super::run_log`]). A run's log is a stream of records a client reads back as they were
+/// written, so this delivery neither strips a terminator nor adds one: the same bytes the log
+/// tail of that run carries for the record. A report a runtime wrote in ONE write it did not
+/// close carries no terminator, which is what makes it one record rather than one per line.
 #[must_use]
 pub(super) fn events(
-    lines: &[String],
+    records: &[String],
     opened: usize,
     started: SystemTime,
     elapsed: Duration,
 ) -> Vec<LogEvent> {
     let start = epoch_millis(started);
     let end = epoch_millis(started.checked_add(elapsed).unwrap_or(started)).max(start);
-    let closes_at = lines.len().saturating_sub(CLOSING_FRAME_LINES);
-    lines
+    let closes_at = records.len().saturating_sub(CLOSING_FRAME_LINES);
+    records
         .iter()
         .enumerate()
-        .map(|(index, line)| LogEvent {
+        .map(|(index, record)| LogEvent {
             timestamp: if index >= opened && index >= closes_at {
                 end
             } else {
                 start
             },
-            message: format!("{line}{RECORD_TERMINATOR}"),
+            message: record.clone(),
         })
         .collect()
 }
 
-/// How many lines close a run's log: the `END` line and the `REPORT` line
+/// How many records close a run's log: the `END` record and the `REPORT` record
 /// ([`super::run_log`]).
 const CLOSING_FRAME_LINES: usize = 2;
 
 /// What closes ONE record of a run's log: the line break the write that produced it ended with,
 /// which is part of the record a client reads back and not a separator this delivery adds
-/// between records.
-const RECORD_TERMINATOR: char = '\n';
+/// between records. It is the one statement of that terminator: the frames the platform writes
+/// itself carry it for the same reason ([`super::run_log`]).
+pub(super) const RECORD_TERMINATOR: char = '\n';
 
 /// How many events one `PutLogEvents` call carries at most, which is what AWS documents for
 /// one batch ("The maximum number of log events in a batch is 10,000") and what the model's
@@ -258,17 +269,20 @@ pub(super) async fn deliver(
     log_stream: &str,
     events: &[LogEvent],
 ) {
-    // WHICH of the run's records Lambda sends here: `ApplicationLogLevel` is the filter on
-    // "the application logs for your function that Lambda sends to CloudWatch", so a record
-    // the function's level withholds is one this delivery never writes — and the frames of
-    // the run, which state no level, are written whatever the filter is
-    // ([`super::log_records::admitted_at`]).
+    // WHICH of the run's records Lambda sends here: each level is the filter on the logs of
+    // its own kind — `ApplicationLogLevel` on "the application logs for your function that
+    // Lambda sends to CloudWatch" and `SystemLogLevel` on the system ones — so a record
+    // either level withholds is one this delivery never writes, and each judges the records of
+    // its own kind alone ([`super::log_records`]).
     let sent: Vec<&LogEvent> = events
         .iter()
         .filter(|event| {
             super::log_records::admitted_at(
                 &event.message,
                 target.application_log_level.as_deref(),
+            ) && super::log_records::system_admitted_at(
+                &event.message,
+                target.system_log_level.as_deref(),
             )
         })
         .collect();
@@ -377,35 +391,35 @@ fn already_exists(error_type: &str) -> bool {
 mod tests {
     use super::*;
 
-    /// One row of the framing table: the lines of a run's log, how many of them open it, and
-    /// the instant each event must carry.
+    /// One row of the framing table: the records of a run's log, how many of them open it,
+    /// and the instant each event must carry.
     struct Framed {
         case: &'static str,
-        /// The lines of the log, in order.
-        lines: &'static [&'static str],
+        /// The records of the log, in order and as the run wrote them.
+        records: &'static [&'static str],
         /// How many of them open it.
         opened: usize,
         /// The instant each resulting event must carry.
         expected: &'static [i64],
     }
 
-    /// Every line of a run's log becomes one event, the opening frame carrying the instant
+    /// Every record of a run's log becomes one event, the opening frame carrying the instant
     /// the run started and the closing frames the instant it finished — one row per shape of
     /// log a run can produce.
     #[test]
-    fn a_runs_log_becomes_one_event_per_line_framed_by_the_runs_own_instants() {
+    fn a_runs_log_becomes_one_event_per_record_framed_by_the_runs_own_instants() {
         let started = SystemTime::UNIX_EPOCH + Duration::from_millis(1_793_000_000_000);
         let elapsed = Duration::from_millis(250);
         let cases: &[Framed] = &[
             Framed {
                 case: "a run that wrote nothing of its own",
-                lines: &["START", "END", "REPORT"],
+                records: &["START\n", "END\n", "REPORT\n"],
                 opened: 1,
                 expected: &[1_793_000_000_000, 1_793_000_000_250, 1_793_000_000_250],
             },
             Framed {
                 case: "a run that wrote one line",
-                lines: &["START", "hello", "END", "REPORT"],
+                records: &["START\n", "hello\n", "END\n", "REPORT\n"],
                 opened: 1,
                 expected: &[
                     1_793_000_000_000,
@@ -415,8 +429,16 @@ mod tests {
                 ],
             },
             Framed {
-                case: "a run that wrote several",
-                lines: &["START", "one", "two", "three", "END", "REPORT"],
+                case: "a run that wrote several, one of them a report of several lines the run \
+                       never closed",
+                records: &[
+                    "START\n",
+                    "one\n",
+                    "two\n",
+                    "three\nand more",
+                    "END\n",
+                    "REPORT\n",
+                ],
                 opened: 1,
                 expected: &[
                     1_793_000_000_000,
@@ -430,8 +452,9 @@ mod tests {
         ];
         for row in cases {
             let (case, opened, expected) = (row.case, row.opened, row.expected);
-            let lines: Vec<String> = row.lines.iter().map(|line| (*line).to_string()).collect();
-            let built = events(&lines, opened, started, elapsed);
+            let records: Vec<String> =
+                row.records.iter().map(|record| (*record).to_string()).collect();
+            let built = events(&records, opened, started, elapsed);
             let stamps: Vec<i64> = built.iter().map(|event| event.timestamp).collect();
             assert_eq!(
                 stamps,
@@ -441,14 +464,10 @@ mod tests {
             let messages: Vec<&str> = built.iter().map(|event| event.message.as_str()).collect();
             // Every event's message is a record the run wrote, carried with the line break
             // that closed the write and no other change to it.
-            let written: Vec<String> = lines
-                .iter()
-                .map(|line| format!("{line}{RECORD_TERMINATOR}"))
-                .collect();
             assert_eq!(
                 messages,
-                written.iter().map(String::as_str).collect::<Vec<&str>>(),
-                "case {case:?}: expected each record closed by its line break, got {messages:?}"
+                records.iter().map(String::as_str).collect::<Vec<&str>>(),
+                "case {case:?}: expected each record as the run wrote it, got {messages:?}"
             );
             assert!(
                 stamps.windows(2).all(|pair| pair[0] <= pair[1]),

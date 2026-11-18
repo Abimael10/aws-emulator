@@ -64,8 +64,14 @@ const START_PREFIX: &str = "START RequestId: ";
 const END_PREFIX: &str = "END RequestId: ";
 const REPORT_PREFIX: &str = "REPORT RequestId: ";
 
-/// How many lines of framing one run leaves: the opening frame and the two closing ones.
-const FRAMING_LINES: usize = 3;
+/// How many lines of framing one run leaves in the group: the record that states the
+/// initialization of the execution environment it built, the opening frame and the two closing
+/// ones.
+const FRAMING_LINES: usize = 4;
+
+/// The record the environment's own initialization opens its log with, ahead of the opening
+/// frame of the first invocation it serves.
+const INIT_START_PREFIX: &str = "INIT_START Runtime Version: ";
 
 /// The table one handler reads, its one key attribute, the key it reads and the value stored
 /// under it.
@@ -322,16 +328,20 @@ async fn a_handlers_own_output_reaches_its_log_stream_between_the_runtimes_frame
         );
         let (lines, _) = delivered(&router, case, &group, &held[0]).await;
 
-        // The frames, and the count of lines they frame: exactly the handler's own.
+        // The frames, and the count of lines they frame: exactly the handler's own. The log of
+        // the environment the run built opens on its initialization, so the invocation's own
+        // opening frame is the record after it.
+        let initialized_at = framed_at(&lines, INIT_START_PREFIX);
         let opened = framed_at(&lines, START_PREFIX);
         let closed = framed_at(&lines, END_PREFIX);
         let reported_at = framed_at(&lines, REPORT_PREFIX);
         assert_eq!(
-            (opened, closed, reported_at),
+            (initialized_at, opened, closed, reported_at),
             (
                 Some(0),
-                Some(row.expected.len() + 1),
-                Some(row.expected.len() + 2)
+                Some(1),
+                Some(row.expected.len() + 2),
+                Some(row.expected.len() + 3)
             ),
             "case {case:?}: expected {} of the handler's own lines framed by START, END and \
              REPORT, got {lines:?}",

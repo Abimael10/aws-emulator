@@ -1000,7 +1000,21 @@ pub async fn run_invocation(
         }
     };
 
-    let invoked = answered(finished, &request_id, &reported, budget, engine, started);
+    // WHICH log stream this run's records belong to: the one the EXECUTION ENVIRONMENT that
+    // served it writes to, which is the environment's own for as long as it stands
+    // ([`warm_pool`]) — so the invocations a standing environment serves share one stream and
+    // a new environment opens one of its own. A run whose environment was built for it alone
+    // writes to the stream its own invocation composed.
+    let log_stream = log_stream_of(&reported, &finished, started);
+    let invoked = answered(
+        finished,
+        &request_id,
+        &reported,
+        budget,
+        engine,
+        started,
+        &log_stream,
+    );
     // What the invocation itself is metered by, once it has run: the time this run took and
     // the failure it came to, on the series Lambda publishes about its own invocations
     // (`super::metrics`). Published off the answer — a metric is not part of what the caller
@@ -1035,14 +1049,8 @@ pub async fn run_invocation(
     // delivery is made as the function's execution role and before this invocation is
     // answered, so a client reading the group straight after the call finds the run's lines.
     if let (Some(aws), Some(target)) = (reported.aws.as_ref(), reported.logs.as_ref()) {
-        log_delivery::deliver(
-            aws,
-            target,
-            &reported.region,
-            &log_stream_name(&reported.executed_version, &reported.request_id, started),
-            &invoked.log_events,
-        )
-        .await;
+        log_delivery::deliver(aws, target, &reported.region, &log_stream, &invoked.log_events)
+            .await;
     }
     Ok(invoked)
 }
@@ -1105,6 +1113,10 @@ impl Drop for RunAccounting {
 }
 
 /// How a finished run is reported.
+///
+/// `log_stream` is the stream the EXECUTION ENVIRONMENT that served this run writes to
+/// ([`log_stream_of`]), handed in rather than read again here so the record that names it and
+/// the delivery that writes to it cannot drift.
 fn answered(
     finished: Finished,
     request_id: &str,
@@ -1112,6 +1124,7 @@ fn answered(
     budget: Budget,
     engine: Engine,
     started: SystemTime,
+    log_stream: &str,
 ) -> Invoked {
     let (payload, function_error) = match &finished.completion {
         Completion::Returned(payload) => (payload.clone().into_bytes(), None),
@@ -1208,8 +1221,10 @@ fn answered(
     };
     let log = run_log(
         request_id,
-        &invocation.executed_version,
-        invocation.memory_size,
+        invocation,
+        // The stream the environment that served this run writes to, which the record of its
+        // initialization names as the instance it is.
+        log_stream,
         started,
         // The FORM the records of this run take, which the function's own `LoggingConfig`
         // decides ([`log_records`]): the same reading the runtime that rendered the
@@ -1220,7 +1235,7 @@ fn answered(
     Invoked {
         payload,
         function_error,
-        log_events: log_delivery::events(&log.lines, log.opened, started, finished.elapsed),
+        log_events: log_delivery::events(&log.records, log.opened, started, finished.elapsed),
         log: log.text(),
         duration: finished.elapsed,
         chunks: match &finished.completion {
@@ -1433,45 +1448,71 @@ fn sandbox_error_document(message: &str, error_type: &str) -> Vec<u8> {
     object_text(&members, (",", ":")).into_bytes()
 }
 
-/// The LOG of one run, as Lambda writes it: the invocation's start and end lines around
-/// what the handler wrote, and the report line that states what the run spent.
+/// The LOG of one run, as Lambda writes it: what the INITIALIZATION of the execution
+/// environment wrote, then the invocation's start and end lines around what the handler
+/// wrote, and the report line that states what the run spent.
 ///
 /// Every number in it is measured: the duration is the run's own, the memory size is what
 /// the run was allowed to hold, and the memory used is the most the engine running it
 /// measured it holding (see [`python`], [`node`]).
 ///
-/// It is kept as its LINES because that is what CloudWatch Logs holds it as — one event per
-/// line ([`log_delivery`]) — and the whole text an invocation answers a log tail from is
-/// those same lines.
+/// It is kept as its RECORDS because that is what CloudWatch Logs holds it as — one event per
+/// record ([`log_delivery`]) — and the whole text an invocation answers a log tail from is
+/// those same records.
 #[derive(Debug)]
 struct RunLog {
-    /// Every line of the log, in order and without its line break.
-    lines: Vec<String>,
-    /// How many of those lines OPEN the log: the framing Lambda writes before the handler's
-    /// own output.
+    /// Every record of the log, in order and AS IT WAS WRITTEN: the frames Lambda writes
+    /// itself each closed by their own break, and each record the run wrote exactly as the
+    /// run wrote it ([`outcome::Capture`]).
+    records: Vec<String>,
+    /// How many of those records are the ENVIRONMENT's rather than this invocation's: the
+    /// record that states the initialization of the execution environment, which Lambda writes
+    /// to the function's log group ahead of the first invocation that environment serves and
+    /// which is no part of what that invocation reports as its own log ([`Self::text`]).
+    environment: usize,
+    /// How many of those records OPEN the log: the framing Lambda writes before the handler's
+    /// own output, and the initialization's own output ahead of it.
     opened: usize,
 }
 
 impl RunLog {
-    /// The whole log as text, each line closed by its break.
+    /// The log THIS INVOCATION wrote, as text: its records, each on a line of its own — which
+    /// is what `LogResult` reports ("the last 4 KB of the execution log"). A record the run
+    /// closed with no break of its own still ends where the next one begins, because a client
+    /// reads the log as the records it holds.
+    ///
+    /// The record that states the initialization of the execution environment is the
+    /// ENVIRONMENT's, so it is no part of this: the output the init phase itself wrote IS,
+    /// because the invocation that built the environment is the one that paid for it.
     fn text(&self) -> String {
         let mut text = String::new();
-        for line in &self.lines {
-            text.push_str(line);
-            text.push('\n');
+        for record in &self.records[self.environment.min(self.records.len())..] {
+            text.push_str(record);
+            if !record.ends_with(log_delivery::RECORD_TERMINATOR) {
+                text.push(log_delivery::RECORD_TERMINATOR);
+            }
         }
         text
     }
 }
 
+/// One frame Lambda writes itself, as the record it is: the frame and the terminator that
+/// closes it, which is what the runtime writes to its output stream
+/// ([`log_delivery::RECORD_TERMINATOR`]).
+fn framed(frame: String) -> String {
+    format!("{frame}{}", log_delivery::RECORD_TERMINATOR)
+}
+
 fn run_log(
     request_id: &str,
-    version: &str,
-    memory_size: i32,
+    invocation: &Invocation,
+    log_stream: &str,
     started: SystemTime,
     json: bool,
     finished: &Finished,
 ) -> RunLog {
+    let version = &invocation.executed_version;
+    let memory_size = invocation.memory_size;
     let duration_ms = finished.elapsed.as_secs_f64() * 1_000.0;
     // What the run is BILLED for, in whole milliseconds: the duration rounded up, and never
     // less than the unit it is stated in. Taken from the measured elapsed time rather than
@@ -1480,19 +1521,63 @@ fn run_log(
         i64::try_from(finished.elapsed.as_micros().div_ceil(1_000).max(1)).unwrap_or(i64::MAX);
     let used_mb = max_memory_used_mb(finished.max_memory_bytes, memory_size);
     let ended = started.checked_add(finished.elapsed).unwrap_or(started);
-    let mut lines = vec![log_records::start(json, started, request_id, version)];
-    let opened = lines.len();
-    // One line of the log per RECORD the run wrote — the text of one call, line breaks of its
-    // own included ([`outcome::Finished::log_records`]) — so what the handler reported in one
-    // write is one event of the function's log group and not one event per line of it.
-    lines.extend(finished.log_records.iter().cloned());
-    lines.push(log_records::runtime_done(
+    let mut records = Vec::new();
+    // A run that BUILT the execution environment it ran in opens the environment's log with
+    // the initialization: the record that states which runtime version the environment stands
+    // on, and then whatever the module-level code of the package itself wrote. Both precede
+    // the invocation's own opening frame, which is how a client attributes module-scope output
+    // to the cold start; an invocation a standing environment served pays no initialization
+    // and writes neither.
+    if finished.initialized {
+        records.push(framed(log_records::init_start(
+            json,
+            started,
+            &log_records::Initialization {
+                initialization_type: invocation.initialization_type,
+                function_name: &invocation.function_name,
+                function_version: version,
+                // The runtime version the environment was built on, and the ARN that version
+                // is addressed by — the same reading a read of the function reports as its
+                // `RuntimeVersionConfig` (`crate::state::runtime_version_arn`).
+                runtime_version: invocation.runtime.as_deref().unwrap_or_default(),
+                runtime_version_arn: &super::runtime_version_arn(
+                    &invocation.region,
+                    invocation.runtime.as_deref().unwrap_or_default(),
+                ),
+                instance_id: log_stream,
+                // The memory an environment of this function may hold, in the bytes the
+                // record states it in: the function's own `MemorySize`, in MB.
+                instance_max_memory: i64::from(memory_size)
+                    .saturating_mul(i64::try_from(BYTES_PER_MB).unwrap_or(1)),
+            },
+        )));
+        records.extend(finished.init_records.iter().cloned());
+    }
+    // The initialization record is the one record of the ENVIRONMENT's log above: everything
+    // after it is the invocation's own.
+    let environment = usize::from(finished.initialized);
+    records.push(framed(log_records::start(
+        json,
+        started,
+        request_id,
+        // The function this invocation ran, as the frame names it: the function's own ARN,
+        // beside the version that executed — the one reading of a function's ARN this crate
+        // has (`crate::state::function_arn`).
+        &super::function_arn(&invocation.region, &invocation.function_name),
+        version,
+    )));
+    let opened = records.len();
+    // One record of the log per RECORD the run wrote — the text of one call, line breaks of
+    // its own included ([`outcome::Finished::log_records`]) — so what the handler reported in
+    // one write is one event of the function's log group and not one event per line of it.
+    records.extend(finished.log_records.iter().cloned());
+    records.push(framed(log_records::runtime_done(
         json,
         ended,
         request_id,
         &finished.completion,
-    ));
-    lines.push(log_records::report(
+    )));
+    records.push(framed(log_records::report(
         json,
         ended,
         request_id,
@@ -1502,9 +1587,19 @@ fn run_log(
             billed_ms,
             memory_size,
             used_mb,
+            // What the initialization of this run's own execution environment took, for a run
+            // that paid one: an invocation an already-initialized environment served states
+            // no such span, which is how a client tells a cold start from a warm one.
+            init_ms: finished
+                .init_duration
+                .map(|spent| spent.as_secs_f64() * 1_000.0),
         },
-    ));
-    RunLog { lines, opened }
+    )));
+    RunLog {
+        records,
+        environment,
+        opened,
+    }
 }
 
 /// Whether the records of this invocation's log are the structured ones: the function's own
@@ -1602,6 +1697,15 @@ pub fn run_heap_bytes(memory_size: i32) -> usize {
     usize::try_from(bytes).unwrap_or(usize::MAX)
 }
 
+/// The variable a managed runtime reads the function's `ApplicationLogLevel` as, and
+/// configures the language's own logging interface from.
+const APPLICATION_LOG_LEVEL_VARIABLE: &str = "AWS_LAMBDA_LOG_LEVEL";
+
+/// The variable a managed runtime reads the log STREAM of its execution environment as. It is
+/// the environment's own for as long as the environment stands, so the environments the pool
+/// keeps re-state it for every invocation they serve ([`warm_pool`]).
+pub(super) const LOG_STREAM_VARIABLE: &str = "AWS_LAMBDA_LOG_STREAM_NAME";
+
 /// The three RESERVED environment variables a managed runtime exports the invocation's own
 /// credentials in, in the order a credential's parts are named: "AWS_ACCESS_KEY_ID … the
 /// access key for your Lambda function's execution role", "AWS_SECRET_ACCESS_KEY … the secret
@@ -1676,7 +1780,7 @@ fn runtime_environment(invocation: &Invocation, started: SystemTime) -> BTreeMap
             ),
         ),
         (
-            "AWS_LAMBDA_LOG_STREAM_NAME",
+            LOG_STREAM_VARIABLE,
             log_stream_name(&invocation.executed_version, &invocation.request_id, started),
         ),
         // Which FORM the runtime renders this invocation's own records in: the function's
@@ -1724,6 +1828,24 @@ fn runtime_environment(invocation: &Invocation, started: SystemTime) -> BTreeMap
     ];
     for (name, value) in reserved {
         environment.insert((*name).to_string(), value.clone());
+    }
+    // The LEVEL the function's application records are filtered at, which the managed
+    // runtimes read as `AWS_LAMBDA_LOG_LEVEL` and configure their own logging interface from:
+    // `ApplicationLogLevel` is the filter on "the application logs for your function", so the
+    // runtime that WRITES a record is told the level and emits only the records at that level
+    // of detail and lower ([`bootstrap`], [`node::runtime`]). A function filtered at no level
+    // at all names none, so the runtime reads no level and writes every record.
+    match invocation
+        .logs
+        .as_ref()
+        .and_then(|target| target.application_log_level.clone())
+    {
+        Some(level) => {
+            environment.insert(APPLICATION_LOG_LEVEL_VARIABLE.to_string(), level);
+        }
+        None => {
+            environment.remove(APPLICATION_LOG_LEVEL_VARIABLE);
+        }
     }
     // The run's own CREDENTIALS, under the three names a managed runtime exports them as.
     // They are the runtime's to set, so whatever the environment held under those names is
@@ -1798,19 +1920,38 @@ fn runtime_environment(invocation: &Invocation, started: SystemTime) -> BTreeMap
     environment
 }
 
-/// The log stream one run writes to: the date the run started, the version it ran, and the
-/// invocation's own id — the form a CloudWatch Logs stream of a Lambda function has.
+/// The log stream one EXECUTION ENVIRONMENT writes to: the date it was opened, the version
+/// it runs, and the id of the environment itself — the form a CloudWatch Logs stream of a
+/// Lambda function has.
+///
+/// One stream per environment, which is what makes the invocations a standing environment
+/// serves share a stream and a new environment open one of its own. An environment built for
+/// one invocation alone is identified by that invocation.
 ///
 /// The date is the `YYYY/MM/DD` of the instant the run started, taken from the one
 /// timestamp rendering this crate already has ([`super::iso8601`], whose calendar
 /// arithmetic is `aws_smithy_types`'s) rather than computed here.
-fn log_stream_name(version: &str, request_id: &str, started: SystemTime) -> String {
+pub(super) fn log_stream_name(version: &str, environment_id: &str, started: SystemTime) -> String {
     let rendered = super::iso8601(started);
     let date = rendered.split('T').next().unwrap_or_default().replace('-', "/");
     format!(
         "{date}/[{version}]{}",
-        request_id.replace('-', "")
+        environment_id.replace('-', "")
     )
+}
+
+/// The stream the execution environment that served this run writes to: the environment's own
+/// where the pool that holds it decided one ([`warm_pool`]), and otherwise the one this
+/// invocation composed — an environment built for one invocation alone is identified by that
+/// invocation.
+fn log_stream_of(invocation: &Invocation, finished: &Finished, started: SystemTime) -> String {
+    finished.log_stream.clone().unwrap_or_else(|| {
+        log_stream_name(
+            &invocation.executed_version,
+            &invocation.request_id,
+            started,
+        )
+    })
 }
 
 /// A run that is still going.
@@ -1877,6 +2018,10 @@ fn release_abandoned_run() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The stream the environment serving those invocations writes to, in the form
+    /// [`log_stream_name`] composes.
+    const PROBE_LOG_STREAM: &str = "2026/10/26/[7]0123456789abcdef0123456789abcdef";
 
     /// One invocation of a Python function, as [`run_invocation`] builds one, for the tests
     /// that report on an invocation rather than run one.
@@ -2070,6 +2215,10 @@ mod tests {
                 completion: Completion::Stopped(Stop::Deadline),
                 log: String::new(),
                 log_records: Vec::new(),
+                init_records: Vec::new(),
+                initialized: true,
+                init_duration: None,
+                log_stream: None,
                 elapsed: budget.wall_clock,
                 max_memory_bytes: None,
             };
@@ -2080,6 +2229,7 @@ mod tests {
                 budget,
                 *engine,
                 SystemTime::UNIX_EPOCH,
+                PROBE_LOG_STREAM,
             );
             let parsed: ::serde_json::Value =
                 ::serde_json::from_slice(&invoked.payload).expect("the error document is JSON");
@@ -2131,6 +2281,10 @@ mod tests {
                     completion: Completion::Stopped(*stop),
                     log: String::new(),
                     log_records: Vec::new(),
+                    init_records: Vec::new(),
+                    initialized: true,
+                    init_duration: None,
+                    log_stream: None,
                     elapsed: budget.wall_clock,
                     max_memory_bytes: None,
                 };
@@ -2141,6 +2295,7 @@ mod tests {
                     budget,
                     engine,
                     SystemTime::UNIX_EPOCH,
+                    PROBE_LOG_STREAM,
                 );
                 let parsed: ::serde_json::Value =
                     ::serde_json::from_slice(&invoked.payload).expect("the document is JSON");
@@ -2200,6 +2355,10 @@ mod tests {
                     },
                     log: String::new(),
                     log_records: Vec::new(),
+                    init_records: Vec::new(),
+                    initialized: true,
+                    init_duration: None,
+                    log_stream: None,
                     elapsed: Duration::ZERO,
                     max_memory_bytes: None,
                 };
@@ -2210,6 +2369,7 @@ mod tests {
                     run_budget(3, MIN_MEMORY_SIZE_MB as i32),
                     engine,
                     SystemTime::UNIX_EPOCH,
+                    PROBE_LOG_STREAM,
                 );
                 let parsed: ::serde_json::Value = ::serde_json::from_slice(&invoked.payload)
                     .expect("the error document is JSON");

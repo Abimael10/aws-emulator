@@ -384,6 +384,7 @@ impl Prepared {
                     &bounds,
                     &capture,
                     Duration::ZERO,
+                    true,
                 )))
             }
         };
@@ -401,6 +402,7 @@ impl Prepared {
                 &bounds,
                 &capture,
                 Duration::ZERO,
+                true,
             )));
         }
         // The hook the bounds are spent through, held HERE: it stays installed and answering
@@ -442,6 +444,7 @@ impl Prepared {
                     &bounds,
                     &capture,
                     Duration::ZERO,
+                    true,
                 )))
             }
         }
@@ -451,7 +454,13 @@ impl Prepared {
     /// the handler's own phase.
     pub(super) fn invoke(&self, request: &Run<'_>, clock: &Clock) -> Finished {
         let ran = self.ran(request, clock);
-        let finished = settled(ran.completion, &ran.bounds, &ran.capture, ran.elapsed);
+        let finished = settled(
+            ran.completion,
+            &ran.bounds,
+            &ran.capture,
+            ran.elapsed,
+            ran.initialized,
+        );
         // The invocation is over, so the environment stops holding the seam it reached this
         // emulator through: an environment standing idle holds no caller's credential, and
         // the next invocation served in it brings its own.
@@ -470,6 +479,7 @@ impl Prepared {
         let ran = self.ran(request, clock);
         let bounds = Arc::clone(&ran.bounds);
         let capture = Arc::clone(&ran.capture);
+        let initialized = ran.initialized;
         let started = Instant::now();
         self.torn_down();
         settled(
@@ -477,6 +487,7 @@ impl Prepared {
             &bounds,
             &capture,
             ran.elapsed.saturating_add(started.elapsed()),
+            initialized,
         )
     }
 
@@ -522,9 +533,15 @@ impl Prepared {
                     bounds,
                     capture,
                     elapsed: started.elapsed(),
+                    initialized: !reused,
                 }
             }
         };
+        // The INIT phase of this environment is over and this invocation's own begins: what
+        // the module-level code of the package wrote while the environment was being built is
+        // the initialization's output, which precedes the invocation's opening frame in the
+        // function's log ([`Capture::begin_invocation`]).
+        captured(&capture).begin_invocation();
         let completion = self.interpreter.enter(|vm| {
             match served(vm, self, &input, request.environment, &bounds, reused) {
                 Ok(completion) => completion,
@@ -536,6 +553,7 @@ impl Prepared {
             bounds,
             capture,
             elapsed: started.elapsed(),
+            initialized: !reused,
         }
     }
 
@@ -597,6 +615,8 @@ struct Ran {
     capture: Arc<Mutex<Capture>>,
     /// How long it took.
     elapsed: Duration,
+    /// Whether this invocation paid the INITIALIZATION of the environment it ran in.
+    initialized: bool,
 }
 
 /// What an invocation brings to the environment serving it, which the host functions and the
@@ -765,6 +785,7 @@ fn settled(
     bounds: &Arc<Bounds>,
     capture: &Arc<Mutex<Capture>>,
     elapsed: Duration,
+    initialized: bool,
 ) -> Finished {
     // The stop LATCH wins over whatever the guest answered: a run whose budget was spent
     // is a stopped run even if the guest caught the exception the hook raised.
@@ -776,7 +797,15 @@ fn settled(
     Finished {
         completion,
         log: written.text.clone(),
-        log_records: written.records(),
+        log_records: written.invocation_records(),
+        init_records: written.init_records(),
+        initialized,
+        // How long this environment's initialization took is measured by the pool that holds
+        // it ([`super::warm_pool`]), which is where the span begins.
+        init_duration: None,
+        // WHICH stream the records of this run belong to is the pool's, which holds the
+        // environment they were written in ([`super::warm_pool`]).
+        log_stream: None,
         elapsed,
         max_memory_bytes: Some(bounds.max_memory_bytes()),
     }
