@@ -22,9 +22,11 @@
 //!   the same source on another domain name, is a new association — and concurrent creates
 //!   of ONE pair store exactly one record, over a table of racer counts;
 //! * a create names a STORED, PRIVATE custom domain name: a `domainNameArn` that is not an
-//!   ARN, names another kind of resource, names no stored domain name, or names a domain
-//!   name whose endpoint type is not `PRIVATE` is the modelled `BadRequestException`, and
-//!   so is a source type outside the modelled enum;
+//!   ARN, names another kind of resource, or names no stored domain name is the modelled
+//!   `BadRequestException`, and so is one that names no PRIVATE custom domain name — it
+//!   carries no `domainNameId`, or the record it resolves to has another endpoint type —
+//!   which carries AWS's own fixed sentence for that member; a source type outside the
+//!   modelled enum is refused too;
 //! * `GetDomainNameAccessAssociations` reports the stored records in creation order, one
 //!   `position` / `limit` page at a time, over page sizes across the documented range
 //!   (default 25, maximum 500), each published bound and one past each, crossed with every
@@ -46,7 +48,8 @@ use std::sync::Arc;
 
 use serde_json::{json, Value};
 use service_com_amazonaws_apigateway_backplanecontrolservice::state::{
-    PRIVATE_ENDPOINT_TYPE, REGIONAL_ENDPOINT_TYPE,
+    DOMAIN_NAME_NOT_FOUND, INVALID_PRIVATE_DOMAIN_NAME_ARN, PRIVATE_ENDPOINT_TYPE,
+    REGIONAL_ENDPOINT_TYPE,
 };
 
 use crate::domain_name_collection::created_domain;
@@ -522,6 +525,107 @@ async fn an_access_association_names_a_stored_private_custom_domain_name() {
         "case GetDomainNameAccessAssociations after the refusals: expected an empty page, \
          got {:?}",
         listed.body
+    );
+}
+
+/// RULE: `CreateDomainNameAccessAssociation`'s `domainNameArn` is typed as the ARN of a
+/// PRIVATE custom domain name — the association is created "between an access association
+/// source and a private custom domain name" — and a `domainNameId` is "supported only for
+/// private custom domain names", so a readable domain name ARN that names no private custom
+/// domain name (it carries no such id, or the record it resolves to is a domain name of
+/// another endpoint type) is the modelled `BadRequestException` carrying AWS's fixed sentence
+/// for that member, with nothing stored.
+///
+/// The rows span what the rule generalises over: the shape of the name the ARN carries with no
+/// id at all (a short name, a deeply nested name, a wildcard name), the degenerate spellings
+/// of the id separator, and the two non-private endpoint types a STORED custom domain name may
+/// have — and the refusal is the same sentence for each, which is not the sentence a private
+/// domain name ARN that answers to no record earns.
+#[tokio::test]
+async fn a_domain_name_arn_that_names_no_private_custom_domain_name_earns_one_fixed_sentence() {
+    let gateway = Gateway::new();
+    let private = private_domain(&gateway, "stored-private.example.com").await;
+
+    // The two non-private endpoint types a stored custom domain name may have: the regional
+    // one, and the edge-optimized one a create that names no endpoint type gets.
+    let regional = string_member(
+        &created_domain(
+            &gateway,
+            "regional-sentence.example.com",
+            json!({ "endpointConfiguration": { "types": [REGIONAL_ENDPOINT_TYPE] } }),
+        )
+        .await,
+        "domainNameArn",
+        "CreateDomainName(REGIONAL)",
+    );
+    let edge = string_member(
+        &created_domain(&gateway, "edge-sentence.example.com", json!({})).await,
+        "domainNameArn",
+        "CreateDomainName(no endpoint type)",
+    );
+
+    let rows: Vec<(&str, String)> = vec![
+        (
+            "a name with no domain name id",
+            apigateway_arn("/domainnames/no-id.example.com"),
+        ),
+        (
+            "a deeply nested name with no domain name id",
+            apigateway_arn("/domainnames/no.id.private.api.example.co.uk"),
+        ),
+        (
+            "a wildcard name with no domain name id",
+            apigateway_arn("/domainnames/*.example.net"),
+        ),
+        (
+            "a name whose id is empty",
+            apigateway_arn("/domainnames/no-id.example.com+"),
+        ),
+        (
+            "an id with no name before it",
+            apigateway_arn("/domainnames/+abcd1234"),
+        ),
+        ("a stored regional domain name", regional),
+        ("a stored edge-optimized domain name", edge),
+    ];
+    for (case, domain_name_arn) in &rows {
+        let answer = create_association(
+            &gateway,
+            association_body(domain_name_arn, "vpce-0123456789abcdef0"),
+        )
+        .await;
+        assert_failure(&answer, 400, BAD_REQUEST, case);
+        let message = string_member(&answer.body, "message", case);
+        assert_eq!(
+            message, INVALID_PRIVATE_DOMAIN_NAME_ARN,
+            "case {case}: expected {INVALID_PRIVATE_DOMAIN_NAME_ARN:?}, got {message:?}"
+        );
+        // It is a different condition from an ARN of this kind that answers to no record,
+        // which is what that sentence is for.
+        assert_ne!(
+            message, DOMAIN_NAME_NOT_FOUND,
+            "case {case}: expected the wrong-kind-of-ARN sentence rather than the \
+             missing-record one, got {message:?}"
+        );
+    }
+
+    // Nothing was stored, and the member DOES take the ARN of a stored private custom domain
+    // name — so the refusals above are about the values and not about the call.
+    let listed = list_associations(&gateway, "limit=500").await;
+    assert!(
+        page_items(&listed.body, "after the wrong-kind-of-ARN refusals").is_empty(),
+        "case after the wrong-kind-of-ARN refusals: expected an empty page, got {:?}",
+        listed.body
+    );
+    let created = create_association(
+        &gateway,
+        association_body(&private, "vpce-0123456789abcdef0"),
+    )
+    .await;
+    assert_eq!(
+        created.status, 201,
+        "case a stored private custom domain name: expected 201, got {} with {:?}",
+        created.status, created.body
     );
 }
 

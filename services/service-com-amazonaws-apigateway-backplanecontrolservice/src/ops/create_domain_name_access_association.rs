@@ -7,7 +7,11 @@
 //! NAME is resolved FIRST — the association is "between an access association source and a
 //! private custom domain name", so a request naming neither resource is refused for the
 //! domain name it is for, and an ARN naming no stored domain name is the modelled
-//! `BadRequestException` ([`crate::state::DOMAIN_NAME_NOT_FOUND`]). The source is then
+//! `BadRequestException` ([`crate::state::DOMAIN_NAME_NOT_FOUND`]), while a `domainNameArn`
+//! that is no ARN of a PRIVATE custom domain name — by its form, or by the endpoint type of
+//! the record it resolves to — is the modelled `BadRequestException` carrying AWS's fixed
+//! sentence for that member ([`crate::state::INVALID_PRIVATE_DOMAIN_NAME_ARN`]). The source
+//! is then
 //! resolved against the VPC endpoints Amazon EC2 holds for the account
 //! ([`crate::state::vpc_endpoints`]), because with `accessAssociationSourceType` `VPCE` the
 //! source "is the VPC endpoint ID" — so an identifier naming no endpoint is the modelled
@@ -177,11 +181,11 @@ fn resolve_domain_name(
         .and_then(|configuration| configuration.types.as_ref())
         .is_some_and(|types| types.iter().any(|kind| kind == PRIVATE_ENDPOINT_TYPE));
     if !private {
-        return Err(format!(
-            "A domain name access association may only be created for a \
-             {PRIVATE_ENDPOINT_TYPE} custom domain name, and {} is not one",
-            domain.domain_name
-        ));
+        // The record the ARN resolved to is a custom domain name of another endpoint type, so
+        // the member still names no private custom domain name: the same sentence an ARN that
+        // is not one of these ARNs by its FORM earns, because it is the same condition stated
+        // about the same member.
+        return Err(crate::state::INVALID_PRIVATE_DOMAIN_NAME_ARN.to_string());
     }
     // The domain name's OWN ARN is what the record stores and every read reports, so an
     // association names the domain name this emulator resolved rather than the spelling one
@@ -316,6 +320,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         bound_input(&input).map_err(bad_request)?;
         let domain_name_key = domain_name_key_of(&input.domain_name_arn)
             .ok_or_else(|| bad_request(crate::state::INVALID_DOMAIN_NAME_ARN.to_string()))?;
+        // The member is typed as the ARN of a PRIVATE custom domain name — this operation
+        // creates "a domain name access association resource between an access association
+        // source and a private custom domain name" — and a private record is the one that
+        // carries a `domainNameId`, so an ARN whose resource portion carries none is not one
+        // of these ARNs at all. That is decided on the request alone, before any record is
+        // looked for, and is a different answer from an ARN of this kind that answers to no
+        // stored domain name; see `crate::state::INVALID_PRIVATE_DOMAIN_NAME_ARN`.
+        if !crate::state::is_private_domain_name_key(&domain_name_key) {
+            return Err(bad_request(
+                crate::state::INVALID_PRIVATE_DOMAIN_NAME_ARN.to_string(),
+            ));
+        }
 
         let region = crate::state::request_region(ctx.parts());
 
@@ -393,9 +409,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let id = store.mint_id();
         let sequence = store.next_sequence();
         let entry = DomainNameAccessAssociationEntry {
+            // An access association IS the pair `(private custom domain name, source)`, and
+            // its ARN spells that pair: the ARN reported here is the one every later call that
+            // addresses this record — a tag read, the delete, a rejection — resolves back to
+            // it.
             domain_name_access_association_arn:
-                crate::state::domain_name_access_association_arn(&region, &id),
+                crate::state::domain_name_access_association_arn(
+                    &region,
+                    &domain_name_key,
+                    &input.access_association_source,
+                ),
             id: id.clone(),
+            domain_name_key: domain_name_key.clone(),
             domain_name_arn,
             access_association_source_type: input.access_association_source_type,
             access_association_source: input.access_association_source,

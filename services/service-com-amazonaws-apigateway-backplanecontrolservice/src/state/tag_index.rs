@@ -116,7 +116,7 @@ pub fn tagged_resources(
     for association in state.domain_name_access_associations.values() {
         rows.push((
             TaggedResource::DomainNameAccessAssociation {
-                access_association_id: association.id.clone(),
+                access_association_path: association.access_association_path(),
             },
             &association.tags,
         ));

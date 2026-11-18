@@ -9,16 +9,16 @@
 //! > between an access association source and a private custom domain name", so the DOMAIN
 //! > NAME is the resource the association is for: it is resolved against this account's own
 //! > records BEFORE the access association source is resolved against the service that owns
-//! > VPC endpoints, and a `domainNameArn` this service can read as the ARN of a custom domain
-//! > name but holds no record for is the modelled `BadRequestException` (400) carrying the
-//! > fixed sentence `Domain not found` — whatever the source the same request named says, and
-//! > with nothing stored.
+//! > VPC endpoints, and a `domainNameArn` this service can read as the ARN of a PRIVATE custom
+//! > domain name but holds no record for is the modelled `BadRequestException` (400) carrying
+//! > the fixed sentence `Domain not found` — whatever the source the same request named says,
+//! > and with nothing stored.
 //!
 //! Two things follow from that one rule and both are asserted: WHICH sentence the refusal
 //! carries, and WHICH of the two resources a request naming neither is refused for. The rows
-//! span what the rule generalises over: the form of the domain name ARN that answers to no
-//! record (a plain name, a private name's `name+id` spelling, a name in another Region, the
-//! name of a domain name that was created and then DELETED), crossed with the form of the
+//! span what the rule generalises over: the form of the private domain name ARN that answers
+//! to no record (a short name, a deeply nested name, a name in another Region, the name of a
+//! domain name that was created and then DELETED), crossed with the form of the
 //! source the same request carries (an id the account has no endpoint under, an id of an
 //! endpoint it DOES have, and a value that is not an endpoint id at all) — so no row can pass
 //! by the source happening to be refused first.
@@ -99,19 +99,19 @@ async fn the_domain_name_an_association_is_for_is_resolved_first_and_by_its_own_
     let deleted = private_domain(&gateway, "deleted.example.com").await;
     delete_domain_name(&gateway, &deleted, "a domain name that was deleted").await;
 
-    // Rows differ along the FORM of the domain name ARN that answers to no record.
+    // Rows differ along the FORM of the private domain name ARN that answers to no record.
     let absent: Vec<(String, String)> = vec![
         (
             "a domain name no record answers to".to_string(),
-            apigateway_arn("/domainnames/absent.example.com"),
-        ),
-        (
-            "a private domain name's name+id spelling, for no record".to_string(),
             apigateway_arn("/domainnames/absent.example.com+abcd1234"),
         ),
         (
+            "a deeply nested name, for no record".to_string(),
+            apigateway_arn("/domainnames/absent.private.api.example.co.uk+zzzzz99999"),
+        ),
+        (
             "a domain name of another Region".to_string(),
-            "arn:aws:apigateway:eu-west-1::/domainnames/absent.example.com".to_string(),
+            "arn:aws:apigateway:eu-west-1::/domainnames/absent.example.com+abcd1234".to_string(),
         ),
         (
             "a domain name that was created and then deleted".to_string(),

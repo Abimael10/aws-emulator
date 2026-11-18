@@ -309,9 +309,8 @@ async fn a_domain_name_arn_this_service_cannot_read_earns_one_fixed_sentence() {
 
     // Rows differ along the FORM of the unreadable value: no ARN at all, a bare domain
     // name, an ARN of too few fields, an ARN of another vendor, an API Gateway ARN of
-    // another kind of resource, an API Gateway ARN whose resource portion names no
-    // resource, and an access-association ARN whose resource portion is a domain name
-    // reference rather than an identifier this service minted.
+    // another kind of resource, and an API Gateway ARN whose resource portion names no
+    // resource.
     let unreadable: Vec<String> = vec![
         "not-a-valid-arn".to_string(),
         "api.example.com".to_string(),
@@ -319,17 +318,17 @@ async fn a_domain_name_arn_this_service_cannot_read_earns_one_fixed_sentence() {
         "arn:aws:s3:::my-bucket".to_string(),
         apigateway_arn("/restapis/abcde12345"),
         apigateway_arn("/"),
-        apigateway_arn(
-            "/domainnameaccessassociations/domainname/absent.example.com+abcd12/vpcesource/vpce-0123456789abcdef0",
-        ),
         String::new(),
     ];
 
     // …and along the MEMBER the value rides on: each of the two ARNs
     // `RejectDomainNameAccessAssociation` requires, and the `domainNameArn`
     // `CreateDomainNameAccessAssociation` takes.
-    let readable_association = apigateway_arn("/domainnameaccessassociations/dnaa1a2b3c");
-    let readable_domain = apigateway_arn("/domainnames/api.example.com");
+    let readable_association = apigateway_arn(
+        "/domainnameaccessassociations/domainname/api.example.com+abcd123456/vpcesource/\
+         vpce-0123456789abcdef0",
+    );
+    let readable_domain = apigateway_arn("/domainnames/api.example.com+abcd123456");
     for value in &unreadable {
         let on_association = reject(&gateway, value, &readable_domain).await;
         assert_refusal(

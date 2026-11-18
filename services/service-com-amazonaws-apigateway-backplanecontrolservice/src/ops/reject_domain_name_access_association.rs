@@ -1,10 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op RejectDomainNameAccessAssociation
-//! IMPLEMENTED: both ARNs are read and resolved against stored state, so a pair this
-//! service cannot read as the private custom domain name and the access association of it
-//! that the two members name answers the modelled `BadRequestException` (400) carrying
-//! AWS's fixed sentence for an unreadable domain name ARN
+//! IMPLEMENTED: both ARNs are read and resolved against stored state, and the
+//! `domainNameArn` is read FIRST and held to the ARN of a PRIVATE custom domain name —
+//! "rejects a domain name access association with a private custom domain name", so that
+//! record is what the call is about — so a pair this service cannot read as a private custom
+//! domain name and an access association of it answers the modelled `BadRequestException`
+//! (400) carrying AWS's fixed sentence for an unreadable domain name ARN
 //! ([`crate::state::INVALID_DOMAIN_NAME_ARN`]) — both members name a domain name, the
 //! second through the association's own resource portion — and a readable pair naming no
 //! association of this account answers the modelled `NotFoundException` (404) with the one
@@ -89,11 +91,9 @@ use super::types::*;
 
 use crate::state::TaggedResource;
 
-/// The ARN resource kind `domainNameAccessAssociationArn` must name: the first path
-/// segment of the operation that reads a domain name access association
-/// (`smithy_query(query="operation", operation="DeleteDomainNameAccessAssociation")`:
-/// `/domainnameaccessassociations/{domainNameAccessAssociationArn}`).
-const ACCESS_ASSOCIATION_KIND: &str = "domainnameaccessassociations";
+/// The ARN resource kind `domainNameAccessAssociationArn` must name: this service's
+/// access-association collection, as [`crate::state::ACCESS_ASSOCIATION_KIND`] spells it.
+use crate::state::ACCESS_ASSOCIATION_KIND;
 
 /// The ARN resource kind `domainNameArn` must name: the first path segment of the
 /// operation that reads a domain name (`smithy_query(query="operation",
@@ -136,6 +136,32 @@ fn arn_of_kind<'a>(
         .filter(|resource| resource.kind() == kind)
         .ok_or_else(invalid_domain_name_arn)?;
     let account = crate::state::arn_account(value).ok_or_else(invalid_domain_name_arn)?;
+    Ok((resource, account))
+}
+
+/// Read `domainNameArn` as the ARN of the PRIVATE CUSTOM DOMAIN NAME the rejection is about,
+/// with the ACCOUNT that ARN names as its owner.
+///
+/// This operation rejects "a domain name access association with a private custom domain
+/// name", so the member is typed as the ARN of one — and a private record is the one carrying
+/// a `domainNameId`, the member "supported only for private custom domain names", which is
+/// what the resource portion of such an ARN carries beside the name
+/// ([`crate::state::is_private_domain_name_key`]). A value that is no domain name ARN at all,
+/// or a domain name ARN that carries no such id, is therefore a malformed request rather than
+/// a missing resource, and earns the sentence this service states for a domain name ARN it
+/// cannot read — decided on the request alone, before any record is looked for.
+fn private_domain_name_arn(
+    value: &str,
+) -> Result<(TaggedResource, &str), RejectDomainNameAccessAssociationError> {
+    let (resource, account) = arn_of_kind(value, DOMAIN_NAME_KIND)?;
+    let readable = matches!(
+        &resource,
+        TaggedResource::DomainName { domain_name_key }
+            if crate::state::is_private_domain_name_key(domain_name_key)
+    );
+    if !readable {
+        return Err(invalid_domain_name_arn());
+    }
     Ok((resource, account))
 }
 
@@ -263,17 +289,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Both ARNs are read BEFORE the store is reached, so a request this service
         // cannot read resolves nothing: a malformed pair is a client error (400), which
         // is a different answer from a well-formed pair naming records that do not exist
-        // (404). Each member is held to the kind of resource it names, so the ARN of some
-        // other API Gateway resource is refused the way a non-ARN is. The ACCOUNT each ARN
-        // names comes off the same read, because that is what this operation decides on.
+        // (404). The `domainNameArn` is read FIRST, and held to the ARN of a PRIVATE custom
+        // domain name, because that is the resource this operation is defined on: the
+        // association it rejects is one OF that domain name. Each member is then held to the
+        // kind of resource it names, so the ARN of some other API Gateway resource is refused
+        // the way a non-ARN is. The ACCOUNT each ARN names comes off the same read, because
+        // that is what this operation decides on.
+        let (domain_name, domain_name_account) = private_domain_name_arn(&input.domain_name_arn)?;
         let (association, association_account) = arn_of_kind(
             &input.domain_name_access_association_arn,
             ACCESS_ASSOCIATION_KIND,
         )?;
-        let (domain_name, domain_name_account) =
-            arn_of_kind(&input.domain_name_arn, DOMAIN_NAME_KIND)?;
         let TaggedResource::DomainNameAccessAssociation {
-            access_association_id,
+            access_association_path,
         } = &association
         else {
             // Unreachable: `arn_of_kind` held the member to this kind above, which is the
@@ -295,27 +323,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 crate::state::NO_SUCH_ACCESS_ASSOCIATION.to_string(),
             ));
         }
-        // Which of this domain name's associations the pair names. The comparison is on the
+        // Which of this domain name's associations the pair names. An access association IS
+        // the pair `(private custom domain name, source)` its own ARN spells, so the two
+        // members correspond only when the stored record the association's ARN addresses is
+        // one of the DOMAIN NAME the `domainNameArn` resolved. The comparison is on the
         // RESOURCE each ARN addresses rather than on the ARN text, because the account field
         // is exactly what may legitimately differ between the spelling a record stores and
         // the one a request carries.
         //
-        // An ARN that answers to none of them names no association to reject — which is one
+        // A pair that answers to no stored association names none to reject — which is one
         // condition, whether the domain name has no associations at all (what the sibling
         // delete leaves behind) or has some and this is not one of them.
-        let names_one_of_them = store
-            .domain_name_access_associations
-            .values()
-            .filter(|entry| {
-                crate::state::parse_tagged_resource(&entry.domain_name_arn).as_ref()
+        let stored_key = store
+            .access_association_at(access_association_path)
+            .filter(|association| {
+                crate::state::parse_tagged_resource(&association.domain_name_arn).as_ref()
                     == Some(&domain_name)
             })
-            .any(|entry| entry.id == *access_association_id);
-        if !names_one_of_them {
+            .map(|association| association.id.clone());
+        let Some(stored_key) = stored_key else {
             return Err(not_found(
                 crate::state::NO_SUCH_ACCESS_ASSOCIATION.to_string(),
             ));
-        }
+        };
 
         // The whole distinction this operation is defined on: "To reject a domain name
         // access association with an access association source in ANOTHER AWS account, use
@@ -339,7 +369,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // record cannot both remove it.
         let removed = store
             .domain_name_access_associations
-            .remove(access_association_id)
+            .remove(&stored_key)
             .ok_or_else(|| not_found(crate::state::NO_SUCH_ACCESS_ASSOCIATION.to_string()))?;
         // The store lock is released before the outcome is recorded: the critical section
         // covers the state change only.

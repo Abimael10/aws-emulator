@@ -1669,7 +1669,7 @@ pub const NONE_BASE_PATH: &str = "(none)";
 pub fn domain_name_key(domain_name: &str, domain_name_id: Option<&str>) -> String {
     match domain_name_id {
         Some(domain_name_id) if !domain_name_id.is_empty() => {
-            format!("{domain_name}+{domain_name_id}")
+            format!("{domain_name}{DOMAIN_NAME_ID_SEPARATOR}{domain_name_id}")
         }
         _ => domain_name.to_string(),
     }
@@ -1688,6 +1688,12 @@ pub struct DomainNameAccessAssociationEntry {
     /// The identifier this record is keyed by, from
     /// [`ComAmazonawsApigatewayBackplanecontrolserviceState::mint_id`].
     pub id: String,
+    /// The [`domain_name_key`] of the private custom domain name this association is for:
+    /// one HALF of the pair that identifies the association, and the half its own ARN
+    /// carries ([`access_association_resource_path`]). Resolved from the request's
+    /// `domainNameArn` when the record is created, so a later read addresses the very
+    /// domain name this emulator bound the association to.
+    pub domain_name_key: String,
     /// The ARN of this association, as
     /// [`domain_name_access_association_arn`] spells it: assigned when the record is
     /// created and stored, so every later read reports the same value.
@@ -2622,9 +2628,12 @@ pub enum TaggedResource {
     /// `/domainnames/{domainName}` — a [`DomainNameEntry`]'s tags, where the path
     /// segment is the record's [`domain_name_key`].
     DomainName { domain_name_key: String },
-    /// `/domainnameaccessassociations/{id}` — a [`DomainNameAccessAssociationEntry`]'s
-    /// tags, where the path segment is the record's minted id.
-    DomainNameAccessAssociation { access_association_id: String },
+    /// `/domainnameaccessassociations/{portion}` — a
+    /// [`DomainNameAccessAssociationEntry`]'s tags, where the portion is how the PAIR the
+    /// association is is spelled ([`access_association_path`]). The portion is carried as the
+    /// request spelled it and resolved by lookup, so an ARN of this collection that addresses
+    /// no stored record names an association that is not there rather than a value to fix.
+    DomainNameAccessAssociation { access_association_path: String },
     /// `/clientcertificates/{clientCertificateId}` — a [`ClientCertificateEntry`]'s tags.
     ClientCertificate { client_certificate_id: String },
 }
@@ -2650,7 +2659,7 @@ impl TaggedResource {
             TaggedResource::VpcLink { .. } => "vpclinks",
             TaggedResource::UsagePlan { .. } => "usageplans",
             TaggedResource::DomainName { .. } => "domainnames",
-            TaggedResource::DomainNameAccessAssociation { .. } => "domainnameaccessassociations",
+            TaggedResource::DomainNameAccessAssociation { .. } => ACCESS_ASSOCIATION_KIND,
             TaggedResource::ClientCertificate { .. } => "clientcertificates",
         }
     }
@@ -2715,9 +2724,16 @@ pub fn parse_tagged_resource(resource_arn: &str) -> Option<TaggedResource> {
         ["domainnames", domain_name_key] => Some(TaggedResource::DomainName {
             domain_name_key: (*domain_name_key).to_string(),
         }),
-        ["domainnameaccessassociations", access_association_id] => {
+        // Any ARN of this service whose resource portion is under the access-association
+        // collection names one of those records: what the portion beyond the collection
+        // segment addresses is decided by LOOKUP, not by its spelling, so an ARN of the
+        // collection that addresses no stored record names an association that is not there.
+        // See `access_associations`.
+        [ACCESS_ASSOCIATION_KIND, access_association_path @ ..]
+            if !access_association_path.is_empty() =>
+        {
             Some(TaggedResource::DomainNameAccessAssociation {
-                access_association_id: (*access_association_id).to_string(),
+                access_association_path: access_association_path.join("/"),
             })
         }
         ["clientcertificates", client_certificate_id] => {
@@ -2747,8 +2763,8 @@ pub fn tagged_resource_path(resource: &TaggedResource) -> String {
         TaggedResource::UsagePlan { usage_plan_id } => format!("/usageplans/{usage_plan_id}"),
         TaggedResource::DomainName { domain_name_key } => format!("/domainnames/{domain_name_key}"),
         TaggedResource::DomainNameAccessAssociation {
-            access_association_id,
-        } => format!("/domainnameaccessassociations/{access_association_id}"),
+            access_association_path,
+        } => access_association_resource_path(access_association_path),
         TaggedResource::ClientCertificate {
             client_certificate_id,
         } => format!("/clientcertificates/{client_certificate_id}"),
@@ -3468,10 +3484,9 @@ impl ComAmazonawsApigatewayBackplanecontrolserviceState {
                 .map(|domain| &domain.tags)
                 .ok_or_else(|| NO_SUCH_DOMAIN_NAME.to_string()),
             TaggedResource::DomainNameAccessAssociation {
-                access_association_id,
+                access_association_path,
             } => self
-                .domain_name_access_associations
-                .get(access_association_id)
+                .access_association_at(access_association_path)
                 .map(|association| &association.tags)
                 .ok_or_else(|| NO_SUCH_ACCESS_ASSOCIATION.to_string()),
             TaggedResource::ClientCertificate {
@@ -3534,10 +3549,9 @@ impl ComAmazonawsApigatewayBackplanecontrolserviceState {
                 .map(|domain| &mut domain.tags)
                 .ok_or_else(|| NO_SUCH_DOMAIN_NAME.to_string()),
             TaggedResource::DomainNameAccessAssociation {
-                access_association_id,
+                access_association_path,
             } => self
-                .domain_name_access_associations
-                .get_mut(access_association_id)
+                .access_association_at_mut(access_association_path)
                 .map(|association| &mut association.tags)
                 .ok_or_else(|| NO_SUCH_ACCESS_ASSOCIATION.to_string()),
             TaggedResource::ClientCertificate {
@@ -4650,16 +4664,25 @@ pub fn tagged_resource_arn(region: &str, resource: &TaggedResource) -> String {
     service_arn(region, &tagged_resource_path(resource))
 }
 
-/// The ARN of the stored domain name access association addressed by `id`.
+/// The ARN of the stored domain name access association of `access_association_source`
+/// with the private custom domain name `domain_name_key`.
 ///
 /// The resource portion is the one [`parse_tagged_resource`] reads back, so the ARN this
-/// service REPORTS from a create is the ARN its readers, its tag operations and
-/// `RejectDomainNameAccessAssociation` resolve again.
-pub fn domain_name_access_association_arn(region: &str, id: &str) -> String {
+/// service REPORTS from a create is the ARN its readers, its tag operations,
+/// `DeleteDomainNameAccessAssociation` and `RejectDomainNameAccessAssociation` resolve
+/// again.
+pub fn domain_name_access_association_arn(
+    region: &str,
+    domain_name_key: &str,
+    access_association_source: &str,
+) -> String {
     tagged_resource_arn(
         region,
         &TaggedResource::DomainNameAccessAssociation {
-            access_association_id: id.to_string(),
+            access_association_path: access_association_path(
+                domain_name_key,
+                access_association_source,
+            ),
         },
     )
 }
@@ -4830,3 +4853,10 @@ pub use stringified_policy::*;
 /// name as `crate::state::…`.
 mod method_settings;
 pub use method_settings::*;
+
+/// What NAMES one domain name access association — the pair its ARN spells, how this service
+/// reads that ARN back into the pair, and the lookups that resolve the pair against the
+/// records the account holds; re-exported whole, so a handler still reaches each name as
+/// `crate::state::…`.
+mod access_associations;
+pub use access_associations::*;

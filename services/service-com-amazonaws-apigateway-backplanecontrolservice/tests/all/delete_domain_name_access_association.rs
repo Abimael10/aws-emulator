@@ -24,6 +24,9 @@
 //!   which is what makes a second delete of one record, and concurrent deletes of one
 //!   record over a table of racer counts, resolve to one success and 404s rather than to a
 //!   conflict;
+//! * the ARN that addresses one of these records spells the PAIR the association IS, so the
+//!   value a create reports is the value every later call resolves — the tag read, the
+//!   delete, and the collection that lists it;
 //! * a refused delete changes nothing a later caller sees.
 //!
 //! None of those answers is a 501: every request a caller can make against this operation
@@ -39,7 +42,7 @@ use std::sync::Arc;
 
 use serde_json::json;
 use service_com_amazonaws_apigateway_backplanecontrolservice::state::{
-    INVALID_ARN, NO_SUCH_ACCESS_ASSOCIATION,
+    INVALID_ACCESS_ASSOCIATION_ARN, NO_SUCH_ACCESS_ASSOCIATION,
 };
 
 use crate::domain_name_access_associations::{
@@ -69,9 +72,25 @@ async fn delete_association(gateway: &Gateway, arn: &str) -> Answer {
         .await
 }
 
-/// A well-formed ARN of a domain name access association of this service.
-fn association_arn(id: &str) -> String {
-    apigateway_arn(&format!("/domainnameaccessassociations/{id}"))
+/// A well-formed ARN of a domain name access association of this service: the PAIR an
+/// association IS — the private custom domain name it is for and the source that may invoke
+/// it — spelled the way this service's access-association collection spells it (the
+/// `domainNameAccessAssociationArn` a create reports is this, for the pair it stored).
+fn association_arn(domain_name_key: &str, access_association_source: &str) -> String {
+    apigateway_arn(&format!(
+        "/domainnameaccessassociations/domainname/{domain_name_key}/vpcesource/\
+         {access_association_source}"
+    ))
+}
+
+/// The `domain_name_key` an API Gateway domain name ARN carries: the name of the domain name
+/// and, for a private record, the `domainNameId` that identifies it.
+fn domain_name_key_of(domain_name_arn: &str) -> String {
+    domain_name_arn
+        .rsplit("/domainnames/")
+        .next()
+        .expect("a domain name ARN carries its key")
+        .to_string()
 }
 
 /// The `DeleteDomainName` URI that addresses the record `domain_name_arn` names.
@@ -262,12 +281,14 @@ async fn removing_an_association_releases_the_pair_and_the_domain_name_it_named(
         let case = format!("the association of {source}");
         assert_deleted(&delete_association(&gateway, &arns[index]).await, &case);
 
-        // The pair is free again: a create of the very same pair is accepted and gets its
-        // OWN ARN, so what the delete released is the pair and not just the identifier.
+        // The pair is free again: a create of the very same pair is accepted — and it is
+        // ADDRESSED the same way, because an access association IS that pair and its ARN
+        // spells it, so what the delete released is the pair itself.
         let recreated = stored_association(&gateway, &domain, source).await;
-        assert_ne!(
+        assert_eq!(
             recreated, arns[index],
-            "case {case} recreated: expected a new association ARN, got {recreated:?} again"
+            "case {case} recreated: expected the pair's own ARN {:?}, got {recreated:?}",
+            arns[index]
         );
         assert_deleted(
             &delete_association(&gateway, &recreated).await,
@@ -289,7 +310,12 @@ async fn an_arn_this_service_cannot_read_is_the_modelled_bad_request() {
 
     // Rows differ along HOW the value fails to be one of this service's access association
     // ARNs: not an ARN at all, an ARN missing fields, an ARN of another vendor, an API
-    // Gateway ARN naming another kind of resource, and an ARN with no identifier.
+    // Gateway ARN naming another kind of resource, an ARN with no resource portion at all,
+    // and ARNs of the access-association collection whose portion spells no such pair — no
+    // portion, one bare identifier, half the pair, the two halves without the segments that
+    // say which half they are, and the halves the wrong way round.
+    let stored_source = "vpce-0123456789abcdef0";
+    let stored_key = domain_name_key_of(&domain);
     let rows: Vec<(&str, String)> = vec![
         ("a value that is not an arn", "not-a-valid-arn".to_string()),
         ("a bare identifier", "dnaa-1a2b3c4d".to_string()),
@@ -315,16 +341,46 @@ async fn an_arn_this_service_cannot_read_is_the_modelled_bad_request() {
             "an arn with no identifier",
             apigateway_arn("/domainnameaccessassociations/"),
         ),
+        (
+            "an arn carrying one bare identifier",
+            apigateway_arn("/domainnameaccessassociations/dnaa1a2b3c"),
+        ),
+        (
+            "an arn carrying the domain name half alone",
+            apigateway_arn(&format!(
+                "/domainnameaccessassociations/domainname/{stored_key}"
+            )),
+        ),
+        (
+            "an arn carrying the source half alone",
+            apigateway_arn(&format!(
+                "/domainnameaccessassociations/vpcesource/{stored_source}"
+            )),
+        ),
+        (
+            "an arn carrying both halves without their segments",
+            apigateway_arn(&format!(
+                "/domainnameaccessassociations/{stored_key}/{stored_source}"
+            )),
+        ),
+        (
+            "an arn carrying the two halves the wrong way round",
+            apigateway_arn(&format!(
+                "/domainnameaccessassociations/vpcesource/{stored_source}/domainname/\
+                 {stored_key}"
+            )),
+        ),
     ];
     for (case, arn) in &rows {
         let answer = delete_association(&gateway, arn).await;
         assert_failure(&answer, 400, BAD_REQUEST, case);
-        // ONE sentence for a value this service could not read as an ARN, and it carries
-        // none of that value: the same fixed text whichever member took it.
+        // ONE sentence for a value this service could not read as the ARN of one of these
+        // records, and it carries none of that value: the same fixed text however the value
+        // failed to be one.
         assert_eq!(
             answer.body["message"].as_str(),
-            Some(INVALID_ARN),
-            "case {case}: expected the unreadable-ARN sentence, got {:?}",
+            Some(INVALID_ACCESS_ASSOCIATION_ARN),
+            "case {case}: expected the unreadable-ARN sentence for this member, got {:?}",
             answer.body["message"]
         );
     }
@@ -343,32 +399,36 @@ async fn a_well_formed_arn_naming_no_stored_association_is_the_modelled_not_foun
     let gateway = Gateway::new();
     let domain = private_domain(&gateway, "absent.example.com").await;
     let stored = stored_association(&gateway, &domain, "vpce-0123456789abcdef0").await;
-    let stored_id = stored
-        .rsplit('/')
-        .next()
-        .expect("the stored ARN carries an identifier")
-        .to_string();
+    let stored_key = domain_name_key_of(&domain);
 
-    // Rows differ along the identifier the readable ARN carries: one no record answers to,
-    // the stored one in another case, the stored one with a suffix, and the stored one with
-    // its last character dropped. Nothing about which identifier is named changes the
-    // answer while no record answers to it.
+    // Rows differ along the PAIR the readable ARN spells: a pair of a domain name no record
+    // answers to, the stored domain name with a source it has no association for, the stored
+    // pair with its source upper-cased, the stored pair with its source suffixed, and the
+    // stored pair with its domain name key one character short. Nothing about which pair is
+    // named changes the answer while no record answers to it.
     let rows: Vec<(&str, String)> = vec![
         (
-            "an identifier no record answers to",
-            association_arn("zzzzz99999"),
+            "a pair of a domain name no record answers to",
+            association_arn("nothing.example.com+zzzzz99999", "vpce-0123456789abcdef0"),
         ),
         (
-            "the stored identifier upper-cased",
-            association_arn(&stored_id.to_uppercase()),
+            "the stored domain name with another source",
+            association_arn(&stored_key, "vpce-00000000000000009"),
         ),
         (
-            "the stored identifier with a suffix",
-            association_arn(&format!("{stored_id}x")),
+            "the stored pair with its source upper-cased",
+            association_arn(&stored_key, "VPCE-0123456789ABCDEF0"),
         ),
         (
-            "the stored identifier one character short",
-            association_arn(&stored_id[..stored_id.len() - 1]),
+            "the stored pair with its source suffixed",
+            association_arn(&stored_key, "vpce-0123456789abcdef0x"),
+        ),
+        (
+            "the stored pair with its domain name key one character short",
+            association_arn(
+                &stored_key[..stored_key.len() - 1],
+                "vpce-0123456789abcdef0",
+            ),
         ),
     ];
     for (case, arn) in &rows {
@@ -520,5 +580,106 @@ async fn the_collection_a_delete_leaves_is_what_a_later_reader_sees() {
         !page_items(&once.body, "the collection read twice").is_empty(),
         "case the collection read twice: expected the records that are left, got {:?}",
         once.body
+    );
+}
+
+/// RULE: a domain name access association is "a domain name access association between an
+/// access association source and a private custom domain name", so the record IS that pair —
+/// and the ARN that addresses it spells BOTH halves of it. So the
+/// `domainNameAccessAssociationArn` a create reports is the pair's own ARN, and that one value
+/// is what every later call that addresses the record resolves: the tag read, the delete, and
+/// the collection that lists it.
+///
+/// The rows span what the rule generalises over: the shape of the private custom domain name
+/// (a short name, a deeply nested name, a wildcard name, two private records carrying ONE
+/// name — which are two domain names, so two different pairs) crossed with the two widths of
+/// VPC endpoint id EC2 mints.
+#[tokio::test]
+async fn the_arn_a_create_reports_is_the_pair_the_association_is() {
+    let gateway = Gateway::new();
+    // The two widths of the hexadecimal part of a VPC endpoint id, from EC2's own id pattern
+    // (`^vpce-([0-9a-f]{8}|[0-9a-f]{17})$`).
+    let sources = ["vpce-0a1b2c3d", "vpce-0123456789abcdef0"];
+    let names = [
+        "a.example.com",
+        "deeply.nested.private.api.example.co.uk",
+        "*.example.net",
+    ];
+
+    let mut pairs: Vec<(String, String, String)> = Vec::new();
+    for name in names {
+        for source in sources {
+            let domain = private_domain(&gateway, name).await;
+            pairs.push((
+                format!("{name} with {source}"),
+                domain,
+                (*source).to_string(),
+            ));
+        }
+    }
+    // Two private records carrying ONE name are two domain names — a `domainNameId` is
+    // "supported only for private custom domain names" and is what identifies one — so the
+    // same source with each of them is two different pairs.
+    let shared_name = "shared.example.com";
+    let first = private_domain(&gateway, shared_name).await;
+    let second = private_domain(&gateway, shared_name).await;
+    assert_ne!(
+        first, second,
+        "case two private records of one name: expected distinct domain names, got \
+         {first:?} twice"
+    );
+    for domain in [first, second] {
+        pairs.push((
+            format!("{shared_name} ({domain}) with {}", sources[0]),
+            domain,
+            sources[0].to_string(),
+        ));
+    }
+
+    let mut reported: Vec<String> = Vec::new();
+    for (case, domain, source) in &pairs {
+        let arn = stored_association(&gateway, domain, source).await;
+        let expected = association_arn(&domain_name_key_of(domain), source);
+        assert_eq!(
+            arn, expected,
+            "case {case}: expected the pair's own ARN {expected:?}, got {arn:?}"
+        );
+        // The ARN the create reported resolves the record it created, through the reader that
+        // addresses one of these records by ARN.
+        let tags = get_tags(&gateway, &arn).await;
+        assert_eq!(
+            tags.status, 200,
+            "case GetTags({case}): expected 200, got {} with {:?}",
+            tags.status, tags.body
+        );
+        reported.push(arn);
+    }
+
+    // Every pair got its own ARN, and the collection reports exactly those.
+    let listed = stored_arns(&gateway, "every stored pair").await;
+    assert_eq!(
+        listed, reported,
+        "case every stored pair: expected the reported ARNs {reported:?}, got {listed:?}"
+    );
+
+    // And the same value is what removes the record: after the delete the reader that
+    // resolved it answers the modelled not-found for that very ARN.
+    for (index, (case, _, _)) in pairs.iter().enumerate() {
+        let arn = &reported[index];
+        assert_deleted(&delete_association(&gateway, arn).await, case);
+        let tags = get_tags(&gateway, arn).await;
+        assert_failure(&tags, 404, NOT_FOUND, &format!("GetTags({case}) once deleted"));
+        assert_eq!(
+            tags.body["message"].as_str(),
+            Some(NO_SUCH_ACCESS_ASSOCIATION),
+            "case GetTags({case}) once deleted: expected {NO_SUCH_ACCESS_ASSOCIATION:?}, got \
+             {:?}",
+            tags.body["message"]
+        );
+    }
+    let listed = stored_arns(&gateway, "every pair deleted").await;
+    assert!(
+        listed.is_empty(),
+        "case every pair deleted: expected an empty page, got {listed:?}"
     );
 }
