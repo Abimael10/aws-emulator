@@ -70,13 +70,17 @@ const EVENT_TYPE: &str = "Event";
 
 /// The unpublished version, as the model spells it: the qualifier an event addressed to none
 /// belongs to.
-const LATEST: &str = "$LATEST";
+///
+/// Shared with [`crate::async_destination_topic_fan_out`]; see [`router_with_targets`].
+pub(crate) const LATEST: &str = "$LATEST";
 
 /// The `requestContext.condition` of a record for a handler that returned, and for an event
 /// whose attempts were spent — the two conditions the rows reach.
-const CONDITION_SUCCESS: &str = "Success";
+///
+/// Shared with [`crate::async_destination_topic_fan_out`]; see [`router_with_targets`].
+pub(crate) const CONDITION_SUCCESS: &str = "Success";
 /// See [`CONDITION_SUCCESS`].
-const CONDITION_RETRIES_EXHAUSTED: &str = "RetriesExhausted";
+pub(crate) const CONDITION_RETRIES_EXHAUSTED: &str = "RetriesExhausted";
 
 /// The message attributes a dead letter carries, and the `DataType` of each.
 const REQUEST_ID_ATTRIBUTE: &str = "RequestID";
@@ -115,13 +119,18 @@ def lambda_handler(event, context):
 
 /// The message the handler above raises for the event `mark` marks, which is what the dead
 /// letter's `ErrorMessage` must carry.
-fn refusal_of(mark: &str) -> String {
+///
+/// Shared with [`crate::async_destination_topic_fan_out`]; see [`router_with_targets`].
+pub(crate) fn refusal_of(mark: &str) -> String {
     format!("the handler refused {mark}")
 }
 
 /// Lambda, Amazon SQS and Amazon SNS on ONE engine: a record is delivered through the seam
 /// the invocation carries, so the queue and the topic it reaches are this emulator's own.
-fn router_with_targets(engine: &Arc<engine::InMemoryEngine>) -> MultiServiceRouter {
+///
+/// Shared with [`crate::async_destination_topic_fan_out`], which pins who RECEIVES a record a
+/// topic destination relays, rather than copied there.
+pub(crate) fn router_with_targets(engine: &Arc<engine::InMemoryEngine>) -> MultiServiceRouter {
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
     router.register_service(EmulatedService::new(Arc::clone(engine)));
@@ -255,7 +264,13 @@ fn element(document: &str, name: &str) -> Option<String> {
 }
 
 /// A queue of this account: its url and its ARN, both as the queue itself reports them.
-async fn given_queue(router: &MultiServiceRouter, case: &str, name: &str) -> (String, String) {
+///
+/// Shared with [`crate::async_destination_topic_fan_out`]; see [`router_with_targets`].
+pub(crate) async fn given_queue(
+    router: &MultiServiceRouter,
+    case: &str,
+    name: &str,
+) -> (String, String) {
     let (status, created) = sqs(router, "CreateQueue", &json!({ "QueueName": name })).await;
     assert_eq!(
         status, 200,
@@ -294,13 +309,36 @@ async fn given_topic_fanning_out(
     queue_url: &str,
     queue_arn: &str,
 ) -> String {
+    let topic_arn = given_topic(router, case, name).await;
+    subscribed_for_raw_delivery(router, case, &topic_arn, queue_url, queue_arn).await;
+    topic_arn
+}
+
+/// A topic of this account, as Amazon SNS reports its ARN.
+///
+/// Shared with [`crate::async_destination_topic_fan_out`], whose rows subscribe SEVERAL queues
+/// to one topic; see [`router_with_targets`].
+pub(crate) async fn given_topic(router: &MultiServiceRouter, case: &str, name: &str) -> String {
     let (status, created) = sns(router, "CreateTopic", &[("Name", name)]).await;
     assert_eq!(
         status, 200,
         "case {case:?}: CreateTopic {name:?} answered {status} {created}"
     );
-    let topic_arn = element(&created, "TopicArn")
-        .unwrap_or_else(|| panic!("case {case:?}: no TopicArn in {created}"));
+    element(&created, "TopicArn")
+        .unwrap_or_else(|| panic!("case {case:?}: no TopicArn in {created}"))
+}
+
+/// Subscribe the queue `queue_arn` names to the topic `topic_arn` names for RAW delivery, with
+/// that queue's own `Policy` written to admit the topic's deliveries.
+///
+/// Shared with [`crate::async_destination_topic_fan_out`]; see [`router_with_targets`].
+pub(crate) async fn subscribed_for_raw_delivery(
+    router: &MultiServiceRouter,
+    case: &str,
+    topic_arn: &str,
+    queue_url: &str,
+    queue_arn: &str,
+) {
     let policy = json!({
         "Version": "2012-10-17",
         "Statement": [{
@@ -327,7 +365,7 @@ async fn given_topic_fanning_out(
         router,
         "Subscribe",
         &[
-            ("TopicArn", topic_arn.as_str()),
+            ("TopicArn", topic_arn),
             ("Protocol", "sqs"),
             ("Endpoint", queue_arn),
             ("ReturnSubscriptionArn", "true"),
@@ -340,12 +378,15 @@ async fn given_topic_fanning_out(
         status, 200,
         "case {case:?}: Subscribe answered {status} {subscribed}"
     );
-    topic_arn
 }
 
 /// A function whose package RUNS [`HANDLER_SOURCE`], with the dead-letter target `dead_letter`
 /// names when the row asks for one, brought to `Active`. Answers its ARN.
-async fn given_function(
+///
+/// Shared with [`crate::async_destination_topic_fan_out`]; see [`router_with_targets`]. Its
+/// handler raises for an event asking it to and returns otherwise, which is what decides the
+/// outcome a record is written for.
+pub(crate) async fn given_function(
     router: &MultiServiceRouter,
     case: &str,
     name: &str,
@@ -429,7 +470,9 @@ async fn published_version(router: &MultiServiceRouter, case: &str, function: &s
 
 /// `PutFunctionEventInvokeConfig` on the qualifier `qualifier` names (the unpublished version
 /// when it names none), stating no retries and the destination slots the row asks for.
-async fn given_event_invoke_config(
+///
+/// Shared with [`crate::async_destination_topic_fan_out`]; see [`router_with_targets`].
+pub(crate) async fn given_event_invoke_config(
     router: &MultiServiceRouter,
     case: &str,
     function: &str,
@@ -472,7 +515,9 @@ async fn given_event_invoke_config(
 
 /// One asynchronous invocation of `function` at `qualifier`, which the accepting call answers
 /// `202` for.
-async fn invoke_async(
+///
+/// Shared with [`crate::async_destination_topic_fan_out`]; see [`router_with_targets`].
+pub(crate) async fn invoke_async(
     router: &MultiServiceRouter,
     case: &str,
     function: &str,
@@ -504,7 +549,14 @@ async fn invoke_async(
 
 /// One message of the queue `url` addresses, with its own message attributes, once one has
 /// arrived — or a failure saying nothing did.
-async fn awaited_message(router: &MultiServiceRouter, case: &str, what: &str, url: &str) -> Value {
+///
+/// Shared with [`crate::async_destination_topic_fan_out`]; see [`router_with_targets`].
+pub(crate) async fn awaited_message(
+    router: &MultiServiceRouter,
+    case: &str,
+    what: &str,
+    url: &str,
+) -> Value {
     let deadline = Instant::now() + BUDGET;
     loop {
         let (status, received) = sqs(
