@@ -1,13 +1,16 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! The PAYMENTS plane's session lifecycle: `CreatePaymentSession`, `GetPaymentSession`,
-//! `ListPaymentSessions` and `DeletePaymentSession`.
+//! The PAYMENTS plane: `CreatePaymentSession`, `GetPaymentSession`, `ListPaymentSessions`
+//! and `DeletePaymentSession`, plus the plane's instruments (`CreatePaymentInstrument` and
+//! `ListPaymentInstruments`, in the second half of this file).
 //!
 //! RULE: a payment session is state this service holds under the payment manager that owns
 //! it — the create mints its `paymentSessionId` and persists the user, the window and the
 //! spending limits the request asked for, every read reports that record back, the delete
 //! removes it, and a request naming a manager the account does not hold is denied before
-//! anything is read or written.
+//! anything is read or written. An instrument is the same rule over the plane's other
+//! resource: the create mints its `paymentInstrumentId` and persists the connector, the user
+//! and the details the request carried, and the listing reports those records back.
 //!
 //! Each table's rows differ along what that rule generalises over: which optional members
 //! the create carries (`limits`, `userId`, `agentName`, `clientToken`), the window's value
@@ -1181,5 +1184,841 @@ async fn a_payment_manager_the_account_does_not_hold_is_denied_on_every_operatio
         status, 200,
         "expected the held manager's session to be readable still, got {status} with \
          {still_there:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------------------
+// The same plane's INSTRUMENTS: `CreatePaymentInstrument` and `ListPaymentInstruments`.
+//
+// RULE: an instrument is state this service holds under the payment manager that owns it —
+// the create mints its `paymentInstrumentId` and persists the connector, the user and the
+// details the request asked for, the listing reports those records back narrowed by what the
+// request names, and a request naming a manager the account does not hold is denied before
+// anything is created or listed.
+//
+// The rows differ along what that rule generalises over: which member of the `LinkedAccount`
+// union an instrument is created against, which `CryptoWalletNetwork` the wallet is on, which
+// optional members the request carries, which manager and connector an instrument belongs to,
+// how a listing is narrowed, and how far the clock has moved past the create.
+// ---------------------------------------------------------------------------------------
+
+/// A second manager of the modelled form that no create ever made, in the commercial
+/// partition, so the denial cases do not all share one ARN's shape.
+const SECOND_GHOST_MANAGER_ARN: &str =
+    "arn:aws:bedrock-agentcore:us-east-1:123456789012:payment-manager/nosuchmanager-0a1b2c3d4e";
+
+/// Connector ids of the modelled `PaymentConnectorId` form (length 12..211, pattern
+/// `^([0-9a-z][-]?){1,100}-[0-9a-z]{10}$`, source: smithy_query query="operation"
+/// operation="CreatePaymentInstrument"). A payment connector is no component's resource in
+/// this emulator, so these are the caller's own values.
+const CONNECTOR: &str = "connector-0123456789";
+const OTHER_CONNECTOR: &str = "wallets-9z8y7x6w5v";
+
+/// The only `PaymentInstrumentType` the model publishes (source: smithy_query query="shape"
+/// shape="PaymentInstrumentType").
+const INSTRUMENT_TYPE: &str = "EMBEDDED_CRYPTO_WALLET";
+
+/// The two `PaymentInstrumentStatus` values this plane drives, from the enum's published list
+/// INITIATED | ACTIVE | FAILED | DELETED | BLOCKED (source: smithy_query query="shape"
+/// shape="PaymentInstrumentStatus").
+const STATUS_INITIATED: &str = "INITIATED";
+const STATUS_ACTIVE: &str = "ACTIVE";
+
+/// `clientToken`s of the modelled length (33..256) and pattern, for the instrument cases.
+const INSTRUMENT_CLIENT_TOKEN: &str = "paymentinstrumenttoken00000000001";
+const OTHER_INSTRUMENT_CLIENT_TOKEN: &str = "paymentinstrumenttoken00000000002";
+
+/// `CreatePaymentInstrument`: `POST /payments/createPaymentInstrument`.
+async fn create_instrument(
+    router: &MultiServiceRouter,
+    body: Value,
+    user_id: Option<&str>,
+    agent_name: Option<&str>,
+) -> (u16, Value) {
+    send(
+        router,
+        "/payments/createPaymentInstrument",
+        body,
+        user_id,
+        agent_name,
+    )
+    .await
+}
+
+/// `ListPaymentInstruments`: `POST /payments/listPaymentInstruments`.
+async fn list_instruments(
+    router: &MultiServiceRouter,
+    body: Value,
+    user_id: Option<&str>,
+) -> (u16, Value) {
+    send(
+        router,
+        "/payments/listPaymentInstruments",
+        body,
+        user_id,
+        None,
+    )
+    .await
+}
+
+/// The details of an embedded crypto wallet on `network` linked to `account`, as
+/// `PaymentInstrumentDetails` models them: the union's one member `embeddedCryptoWallet`,
+/// whose `linkedAccounts` holds at most one `LinkedAccount` (source: smithy_query
+/// query="closure" operation="CreatePaymentInstrument"). `extra` names one of the wallet's
+/// own optional members.
+fn wallet(network: &str, account: Value, extra: Option<(&str, &str)>) -> Value {
+    let mut details = json!({"network": network, "linkedAccounts": [account]});
+    if let Some((member, value)) = extra {
+        details[member] = json!(value);
+    }
+    json!({"embeddedCryptoWallet": details})
+}
+
+/// Whether `id` is a `paymentInstrumentId` of the modelled form: the fixed prefix, then
+/// fifteen characters of `[0-9a-zA-Z-]`, 34 in all (source: smithy_query query="shape"
+/// shape="PaymentInstrumentId").
+fn is_modelled_instrument_id(id: &str) -> bool {
+    let Some(suffix) = id.strip_prefix("payment-instrument-") else {
+        return false;
+    };
+    suffix.len() == 15
+        && suffix
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-')
+}
+
+/// How many payment instruments this emulator holds — the check that a refused or replayed
+/// create wrote nothing new.
+fn instrument_count(engine: &engine::InMemoryEngine) -> usize {
+    let state = agentcore::state::service_state(engine).expect("the service state");
+    let store = state.lock();
+    store.payment_instruments.len()
+}
+
+/// Move a stored instrument's creation instant `by` further into the past, so a case reaches
+/// the far side of the linking span without waiting for it, exactly as [`age_session`] does
+/// for a session.
+fn age_instrument(engine: &engine::InMemoryEngine, instrument_id: &str, by: Duration) {
+    let state = agentcore::state::service_state(engine).expect("the service state");
+    let mut store = state.lock();
+    let instrument = store
+        .payment_instruments
+        .get_mut(instrument_id)
+        .expect("the payment instrument that was just created");
+    instrument.created_at -= by;
+    instrument.updated_at -= by;
+}
+
+/// The `paymentInstrumentId`s a listing reported, in the order it reported them.
+fn listed_instrument_ids(body: &Value) -> Vec<String> {
+    body["paymentInstruments"]
+        .as_array()
+        .map(|page| {
+            page.iter()
+                .map(|summary| {
+                    summary["paymentInstrumentId"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .to_string()
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The `paymentInstrumentId` a create answered with.
+fn created_instrument_id(created: &Value) -> String {
+    created["paymentInstrument"]["paymentInstrumentId"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string()
+}
+
+/// One row of the instrument create table: the case name, the request body, and the two
+/// optional header values.
+type CreateInstrumentCase<'a> = (&'a str, Value, Option<&'a str>, Option<&'a str>);
+
+/// One row of the instrument listing table: the case name, the manager listed, the connector
+/// and the user the request narrows by, and the ids expected on the page.
+type ListInstrumentCase<'a> = (
+    &'a str,
+    &'a str,
+    Option<&'a str>,
+    Option<&'a str>,
+    Vec<String>,
+);
+
+/// A created payment instrument is persisted under its manager and reported back by the
+/// listing — for every member of the `LinkedAccount` union, both `CryptoWalletNetwork`
+/// values, and the optional members of the request carried and omitted.
+#[tokio::test]
+async fn a_created_payment_instrument_round_trips_through_list_payment_instruments() {
+    let Fixture {
+        router,
+        engine,
+        manager,
+        ..
+    } = emulator().await;
+
+    // `UserId` is length ..120, so 120 characters is its published bound.
+    let longest_user_id = "u".repeat(120);
+    let cases: Vec<CreateInstrumentCase<'_>> = vec![
+        (
+            "required-members-only-with-an-email-linked-account",
+            json!({
+                "paymentManagerArn": manager,
+                "paymentConnectorId": CONNECTOR,
+                "paymentInstrumentType": INSTRUMENT_TYPE,
+                "paymentInstrumentDetails": wallet(
+                    "ETHEREUM",
+                    json!({"email": {"emailAddress": "wallet.owner@example.com"}}),
+                    None,
+                ),
+            }),
+            None,
+            None,
+        ),
+        (
+            "sms-linked-account-on-solana-with-both-headers",
+            json!({
+                "paymentManagerArn": manager,
+                "paymentConnectorId": OTHER_CONNECTOR,
+                "paymentInstrumentType": INSTRUMENT_TYPE,
+                "paymentInstrumentDetails": wallet(
+                    "SOLANA",
+                    json!({"sms": {"phoneNumber": "+14155550123"}}),
+                    None,
+                ),
+            }),
+            Some("user-with-a-phone"),
+            Some("checkout-agent"),
+        ),
+        (
+            "developer-jwt-linked-account-with-a-wallet-address",
+            json!({
+                "paymentManagerArn": manager,
+                "paymentConnectorId": CONNECTOR,
+                "paymentInstrumentType": INSTRUMENT_TYPE,
+                "paymentInstrumentDetails": wallet(
+                    "ETHEREUM",
+                    json!({"developerJwt": {"kid": "key-1", "sub": "subject-1"}}),
+                    Some(("walletAddress", "0x00000000000000000000000000000000000000a1")),
+                ),
+            }),
+            Some(longest_user_id.as_str()),
+            None,
+        ),
+        (
+            "oauth2-linked-account-with-a-redirect-url-and-a-client-token",
+            json!({
+                "paymentManagerArn": manager,
+                "paymentConnectorId": OTHER_CONNECTOR,
+                "paymentInstrumentType": INSTRUMENT_TYPE,
+                "clientToken": INSTRUMENT_CLIENT_TOKEN,
+                "paymentInstrumentDetails": wallet(
+                    "SOLANA",
+                    json!({"oAuth2": {"google": {"sub": "google-subject", "emailAddress": "owner@example.com"}}}),
+                    Some(("redirectUrl", "https://wallet.example.com/linked")),
+                ),
+            }),
+            Some("oauth-user"),
+            Some("payments-agent"),
+        ),
+    ];
+
+    for (case, body, user_id, agent_name) in cases {
+        let held_before = instrument_count(&engine);
+        let (status, created) = create_instrument(&router, body.clone(), user_id, agent_name).await;
+        assert_eq!(
+            status, 201,
+            "case {case}: CreatePaymentInstrument must answer 201, got {status} with {created:?}"
+        );
+        let instrument = &created["paymentInstrument"];
+        let instrument_id = created_instrument_id(&created);
+        assert!(
+            is_modelled_instrument_id(&instrument_id),
+            "case {case}: expected a modelled paymentInstrumentId, got {instrument_id:?}"
+        );
+        assert_eq!(
+            instrument["paymentManagerArn"].as_str(),
+            Some(manager.as_str()),
+            "case {case}: expected the manager the request named, got {:?}",
+            instrument["paymentManagerArn"]
+        );
+        assert_eq!(
+            instrument["paymentConnectorId"], body["paymentConnectorId"],
+            "case {case}: expected the connector the request named, got {:?}",
+            instrument["paymentConnectorId"]
+        );
+        assert_eq!(
+            instrument["paymentInstrumentType"].as_str(),
+            Some(INSTRUMENT_TYPE),
+            "case {case}: expected the type the request named, got {:?}",
+            instrument["paymentInstrumentType"]
+        );
+        assert_eq!(
+            instrument["paymentInstrumentDetails"], body["paymentInstrumentDetails"],
+            "case {case}: expected the details the request carried, got {:?}",
+            instrument["paymentInstrumentDetails"]
+        );
+        // `PaymentInstrument$userId` is `@required` while the request's own member is
+        // optional, so an instrument created without a user belongs to none.
+        assert_eq!(
+            instrument["userId"].as_str(),
+            Some(user_id.unwrap_or_default()),
+            "case {case}: expected the user the request named, got {:?}",
+            instrument["userId"]
+        );
+        // The create's own answer is computed at the instant the instrument came into being,
+        // so the linking span still lies ahead of it.
+        assert_eq!(
+            instrument["status"].as_str(),
+            Some(STATUS_INITIATED),
+            "case {case}: expected a fresh instrument to be {STATUS_INITIATED}, got {:?}",
+            instrument["status"]
+        );
+        assert_eq!(
+            instrument["createdAt"], instrument["updatedAt"],
+            "case {case}: nothing has changed the instrument, so the two instants agree; got \
+             {:?} and {:?}",
+            instrument["createdAt"], instrument["updatedAt"]
+        );
+        assert_eq!(
+            instrument_count(&engine),
+            held_before + 1,
+            "case {case}: the create must persist exactly one instrument"
+        );
+
+        // The listing of the manager reports the instrument that was just stored, with the
+        // members `PaymentInstrumentSummary` declares read off the same record.
+        let (list_status, listed) = list_instruments(
+            &router,
+            json!({
+                "paymentManagerArn": manager,
+                "paymentConnectorId": body["paymentConnectorId"],
+            }),
+            user_id,
+        )
+        .await;
+        assert_eq!(
+            list_status, 200,
+            "case {case}: ListPaymentInstruments must answer 200, got {list_status} with \
+             {listed:?}"
+        );
+        let summary = listed["paymentInstruments"]
+            .as_array()
+            .and_then(|page| {
+                page.iter().find(|summary| {
+                    summary["paymentInstrumentId"].as_str() == Some(instrument_id.as_str())
+                })
+            })
+            .unwrap_or_else(|| {
+                panic!("case {case}: the created instrument must be listed, got {listed:?}")
+            });
+        // Every member both shapes declare, except the one the CLOCK moves: how far past the
+        // create this listing runs is not this case's subject, so the status the transition
+        // owes is asserted on its own below.
+        assert!(
+            [STATUS_INITIATED, STATUS_ACTIVE]
+                .map(Some)
+                .contains(&summary["status"].as_str()),
+            "case {case}: expected a status this plane drives, got {:?}",
+            summary["status"]
+        );
+        for member in [
+            "paymentManagerArn",
+            "paymentConnectorId",
+            "userId",
+            "paymentInstrumentType",
+            "createdAt",
+            "updatedAt",
+        ] {
+            assert_eq!(
+                summary[member], instrument[member],
+                "case {case}: the listing and the create must agree on {member}, got {:?} and \
+                 {:?}",
+                summary[member], instrument[member]
+            );
+        }
+    }
+}
+
+/// Both instrument operations resolve the payment manager against the plane that OWNS it and
+/// deny a manager the account does not hold before creating or listing anything; the denial
+/// is scoped, so a manager that IS held is still served.
+#[tokio::test]
+async fn an_unheld_payment_manager_is_denied_on_every_instrument_operation() {
+    let Fixture {
+        router,
+        engine,
+        manager,
+        ..
+    } = emulator().await;
+
+    // One real instrument, so a denied listing cannot be mistaken for an empty store.
+    let (seed_status, seeded) = create_instrument(
+        &router,
+        json!({
+            "paymentManagerArn": manager,
+            "paymentConnectorId": CONNECTOR,
+            "paymentInstrumentType": INSTRUMENT_TYPE,
+            "paymentInstrumentDetails": wallet(
+                "ETHEREUM",
+                json!({"email": {"emailAddress": "seed@example.com"}}),
+                None,
+            ),
+        }),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(
+        seed_status, 201,
+        "the seed instrument must be created, got {seed_status} with {seeded:?}"
+    );
+    let held_before = instrument_count(&engine);
+
+    for ghost in [GHOST_MANAGER_ARN, SECOND_GHOST_MANAGER_ARN] {
+        // (operation, the answer it gives for a manager nothing created)
+        let answers = [
+            (
+                "CreatePaymentInstrument",
+                create_instrument(
+                    &router,
+                    json!({
+                        "paymentManagerArn": ghost,
+                        "paymentConnectorId": CONNECTOR,
+                        "paymentInstrumentType": INSTRUMENT_TYPE,
+                        "paymentInstrumentDetails": wallet(
+                            "ETHEREUM",
+                            json!({"email": {"emailAddress": "denied@example.com"}}),
+                            None,
+                        ),
+                    }),
+                    Some("user-alice"),
+                    None,
+                )
+                .await,
+            ),
+            (
+                "ListPaymentInstruments",
+                list_instruments(&router, json!({"paymentManagerArn": ghost}), Some("user-alice"))
+                    .await,
+            ),
+        ];
+        for (operation, (status, refused)) in answers {
+            assert_eq!(
+                status, 403,
+                "case {operation} against {ghost}: expected HTTP 403, got {status} with \
+                 {refused:?}"
+            );
+            assert_eq!(
+                error_code(&refused),
+                "AccessDeniedException",
+                "case {operation} against {ghost}: expected an AccessDeniedException, got \
+                 {refused:?}"
+            );
+            assert_eq!(
+                message(&refused),
+                "Payment manager not found",
+                "case {operation} against {ghost}: expected the plane's denial sentence, got {:?}",
+                message(&refused)
+            );
+            assert_eq!(
+                instrument_count(&engine),
+                held_before,
+                "case {operation} against {ghost}: a denied call must leave the store untouched"
+            );
+        }
+    }
+
+    // The denial is scoped to the manager it named: the held one is still served.
+    let (status, listed) =
+        list_instruments(&router, json!({"paymentManagerArn": manager}), None).await;
+    assert_eq!(
+        status, 200,
+        "the held manager must still be listable after the denials, got {status} with {listed:?}"
+    );
+    assert_eq!(
+        listed_instrument_ids(&listed).len(),
+        1,
+        "the held manager's own instrument must still be listed, got {listed:?}"
+    );
+}
+
+/// A listing reports the instruments of ONE manager, narrowed by the connector and the user
+/// the request names, newest first, one page at a time; a `nextToken` this operation did not
+/// issue is refused.
+#[tokio::test]
+async fn an_instrument_listing_is_scoped_ordered_and_paged() {
+    let Fixture {
+        router,
+        manager,
+        other_manager,
+        ..
+    } = emulator().await;
+
+    // Three instruments under the first manager, across two connectors and two users, and one
+    // under the second manager, created oldest first.
+    let mut created: Vec<String> = Vec::new();
+    for (connector, user) in [
+        (CONNECTOR, "alice"),
+        (OTHER_CONNECTOR, "alice"),
+        (CONNECTOR, "bob"),
+    ] {
+        let (status, body) = create_instrument(
+            &router,
+            json!({
+                "paymentManagerArn": manager,
+                "paymentConnectorId": connector,
+                "paymentInstrumentType": INSTRUMENT_TYPE,
+                "paymentInstrumentDetails": wallet(
+                    "ETHEREUM",
+                    json!({"email": {"emailAddress": "owner@example.com"}}),
+                    None,
+                ),
+            }),
+            Some(user),
+            None,
+        )
+        .await;
+        assert_eq!(
+            status, 201,
+            "the seed instrument for {connector}/{user} must be created, got {status} with \
+             {body:?}"
+        );
+        created.push(created_instrument_id(&body));
+    }
+    let (status, elsewhere) = create_instrument(
+        &router,
+        json!({
+            "paymentManagerArn": other_manager,
+            "paymentConnectorId": CONNECTOR,
+            "paymentInstrumentType": INSTRUMENT_TYPE,
+            "paymentInstrumentDetails": wallet(
+                "SOLANA",
+                json!({"email": {"emailAddress": "elsewhere@example.com"}}),
+                None,
+            ),
+        }),
+        Some("alice"),
+        None,
+    )
+    .await;
+    assert_eq!(
+        status, 201,
+        "the other manager's instrument must be created, got {status} with {elsewhere:?}"
+    );
+    let elsewhere_id = created_instrument_id(&elsewhere);
+
+    // Newest first, so the expectations are the creation order reversed.
+    let newest_first: Vec<String> = created.iter().rev().cloned().collect();
+    // (case, manager, connector filter, user filter, the ids expected)
+    let cases: Vec<ListInstrumentCase<'_>> = vec![
+        (
+            "every-instrument-of-the-manager-newest-first",
+            &manager,
+            None,
+            None,
+            newest_first.clone(),
+        ),
+        (
+            "narrowed-to-one-connector",
+            &manager,
+            Some(CONNECTOR),
+            None,
+            vec![created[2].clone(), created[0].clone()],
+        ),
+        (
+            "narrowed-to-one-user",
+            &manager,
+            None,
+            Some("alice"),
+            vec![created[1].clone(), created[0].clone()],
+        ),
+        (
+            "narrowed-to-one-connector-and-one-user",
+            &manager,
+            Some(OTHER_CONNECTOR),
+            Some("alice"),
+            vec![created[1].clone()],
+        ),
+        (
+            "a-user-with-no-instrument-of-this-manager",
+            &manager,
+            None,
+            Some("carol"),
+            Vec::new(),
+        ),
+        (
+            "the-other-manager-sees-only-its-own",
+            &other_manager,
+            None,
+            None,
+            vec![elsewhere_id.clone()],
+        ),
+    ];
+
+    for (case, listed_manager, connector, user, expected) in cases {
+        let mut body = json!({"paymentManagerArn": listed_manager});
+        if let Some(connector) = connector {
+            body["paymentConnectorId"] = json!(connector);
+        }
+        let (status, listed) = list_instruments(&router, body, user).await;
+        assert_eq!(
+            status, 200,
+            "case {case}: expected HTTP 200, got {status} with {listed:?}"
+        );
+        assert_eq!(
+            listed_instrument_ids(&listed),
+            expected,
+            "case {case}: expected {expected:?}, got {:?}",
+            listed_instrument_ids(&listed)
+        );
+        assert!(
+            listed["nextToken"].is_null(),
+            "case {case}: one page holds the whole list, so no token follows it; got {:?}",
+            listed["nextToken"]
+        );
+    }
+
+    // One instrument per page walks the whole list, in the same order, and the last page
+    // carries no token.
+    let mut walked: Vec<String> = Vec::new();
+    let mut token: Option<String> = None;
+    loop {
+        let mut body = json!({"paymentManagerArn": manager, "maxResults": 1});
+        if let Some(token) = token.as_deref() {
+            body["nextToken"] = json!(token);
+        }
+        let (status, page) = list_instruments(&router, body, None).await;
+        assert_eq!(
+            status, 200,
+            "paging: expected HTTP 200, got {status} with {page:?}"
+        );
+        let ids = listed_instrument_ids(&page);
+        assert!(
+            ids.len() <= 1,
+            "paging: maxResults=1 bounds a page at one instrument, got {ids:?}"
+        );
+        walked.extend(ids);
+        token = page["nextToken"].as_str().map(str::to_string);
+        if token.is_none() {
+            break;
+        }
+    }
+    assert_eq!(
+        walked, newest_first,
+        "paging: expected {newest_first:?} across the pages, got {walked:?}"
+    );
+
+    // A token this operation did not issue is a bad request, not an empty page.
+    let (status, refused) = list_instruments(
+        &router,
+        json!({"paymentManagerArn": manager, "nextToken": "not-a-token-this-service-minted"}),
+        None,
+    )
+    .await;
+    assert_eq!(
+        status, 400,
+        "a foreign nextToken must be refused, got {status} with {refused:?}"
+    );
+    assert_eq!(
+        error_code(&refused),
+        "ValidationException",
+        "a foreign nextToken must be a ValidationException, got {refused:?}"
+    );
+}
+
+/// `clientToken` is an `@idempotencyToken`: a replayed token answers with the instrument it
+/// already created rather than creating a second one, and a token is scoped to the manager it
+/// was used under.
+#[tokio::test]
+async fn a_replayed_client_token_creates_no_second_instrument() {
+    let Fixture {
+        router,
+        engine,
+        manager,
+        other_manager,
+        ..
+    } = emulator().await;
+
+    let body = |manager_arn: &str, token: &str| {
+        json!({
+            "paymentManagerArn": manager_arn,
+            "paymentConnectorId": CONNECTOR,
+            "paymentInstrumentType": INSTRUMENT_TYPE,
+            "clientToken": token,
+            "paymentInstrumentDetails": wallet(
+                "ETHEREUM",
+                json!({"email": {"emailAddress": "idempotent@example.com"}}),
+                None,
+            ),
+        })
+    };
+
+    let (status, first) = create_instrument(
+        &router,
+        body(&manager, INSTRUMENT_CLIENT_TOKEN),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(
+        status, 201,
+        "the first instrument must be created, got {status} with {first:?}"
+    );
+    let first_id = created_instrument_id(&first);
+    let held = instrument_count(&engine);
+
+    let (status, replayed) = create_instrument(
+        &router,
+        body(&manager, INSTRUMENT_CLIENT_TOKEN),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(
+        status, 201,
+        "a replayed token is answered, not refused; got {status} with {replayed:?}"
+    );
+    assert_eq!(
+        created_instrument_id(&replayed),
+        first_id,
+        "a replayed token must answer with the instrument it already created, got {:?}",
+        created_instrument_id(&replayed)
+    );
+    assert_eq!(
+        instrument_count(&engine),
+        held,
+        "a replayed token must create no second instrument"
+    );
+
+    let (_, fresh) = create_instrument(
+        &router,
+        body(&manager, OTHER_INSTRUMENT_CLIENT_TOKEN),
+        None,
+        None,
+    )
+    .await;
+    assert_ne!(
+        created_instrument_id(&fresh),
+        first_id,
+        "a fresh token creates its own instrument, got {:?}",
+        created_instrument_id(&fresh)
+    );
+
+    // The same token under ANOTHER manager creates that manager's own instrument.
+    let (_, elsewhere) = create_instrument(
+        &router,
+        body(&other_manager, INSTRUMENT_CLIENT_TOKEN),
+        None,
+        None,
+    )
+    .await;
+    let elsewhere_id = created_instrument_id(&elsewhere);
+    assert_ne!(
+        elsewhere_id, first_id,
+        "a token is scoped to the manager it was used under, got {elsewhere_id:?}"
+    );
+    let (_, listed) =
+        list_instruments(&router, json!({"paymentManagerArn": other_manager}), None).await;
+    assert_eq!(
+        listed_instrument_ids(&listed),
+        vec![elsewhere_id],
+        "the other manager must hold exactly its own instrument, got {listed:?}"
+    );
+
+    // And the token used under the second manager did not displace what it remembered for the
+    // first: replayed under the FIRST manager again, it still answers with that manager's own
+    // instrument and creates nothing.
+    let held_now = instrument_count(&engine);
+    let (status, replayed_again) = create_instrument(
+        &router,
+        body(&manager, INSTRUMENT_CLIENT_TOKEN),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(
+        status, 201,
+        "the token replayed under the first manager is answered, got {status} with \
+         {replayed_again:?}"
+    );
+    assert_eq!(
+        created_instrument_id(&replayed_again),
+        first_id,
+        "a token used under a second manager must not displace what it created under the \
+         first, got {:?}",
+        created_instrument_id(&replayed_again)
+    );
+    assert_eq!(
+        instrument_count(&engine),
+        held_now,
+        "that replay must create no further instrument"
+    );
+}
+
+/// An instrument's status is read off the clock: `INITIATED` while its linking is under way,
+/// `ACTIVE` once the span has passed, with no call needed to make it so.
+#[tokio::test]
+async fn an_instrument_becomes_active_once_its_linking_span_has_passed() {
+    let Fixture {
+        router,
+        engine,
+        manager,
+        ..
+    } = emulator().await;
+
+    let (status, created) = create_instrument(
+        &router,
+        json!({
+            "paymentManagerArn": manager,
+            "paymentConnectorId": CONNECTOR,
+            "paymentInstrumentType": INSTRUMENT_TYPE,
+            "paymentInstrumentDetails": wallet(
+                "ETHEREUM",
+                json!({"email": {"emailAddress": "linking@example.com"}}),
+                None,
+            ),
+        }),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(
+        status, 201,
+        "the instrument must be created, got {status} with {created:?}"
+    );
+    let instrument_id = created_instrument_id(&created);
+    assert_eq!(
+        created["paymentInstrument"]["status"].as_str(),
+        Some(STATUS_INITIATED),
+        "the create's own answer is {STATUS_INITIATED}, got {:?}",
+        created["paymentInstrument"]["status"]
+    );
+
+    // Far past the span, so the transition is due whoever looks and however slow the host is.
+    age_instrument(
+        &engine,
+        &instrument_id,
+        agentcore::state::PAYMENT_INSTRUMENT_LINKING_SPAN * 100 + Duration::from_secs(60),
+    );
+    let (status, listed) =
+        list_instruments(&router, json!({"paymentManagerArn": manager}), None).await;
+    assert_eq!(
+        status, 200,
+        "the listing must answer 200, got {status} with {listed:?}"
+    );
+    assert_eq!(
+        listed["paymentInstruments"][0]["paymentInstrumentId"].as_str(),
+        Some(instrument_id.as_str()),
+        "the listing must report the instrument that was created, got {listed:?}"
+    );
+    assert_eq!(
+        listed["paymentInstruments"][0]["status"].as_str(),
+        Some(STATUS_ACTIVE),
+        "past the linking span the instrument is {STATUS_ACTIVE}, got {:?}",
+        listed["paymentInstruments"][0]["status"]
     );
 }

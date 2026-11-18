@@ -96,6 +96,9 @@
 //! The AgentCore PAYMENTS plane is a concern of its own too, in [`payment_sessions`]: the
 //! payment sessions `CreatePaymentSession` opened under a payment manager, what the reads
 //! of the plane report from them, and the bound it grows under ([`MAX_PAYMENT_SESSIONS`]).
+//! Its instruments are a second concern beside it, in [`payment_instruments`]: the payment
+//! instruments `CreatePaymentInstrument` created under a manager and what
+//! `ListPaymentInstruments` reports from them.
 //! A payment manager itself belongs to the CONTROL plane, so this plane resolves one
 //! against that plane's own store ([`payment_manager_resolved`]) rather than its own
 //! records, exactly as the browser plane resolves a browser.
@@ -136,6 +139,12 @@ pub use extraction_jobs::*;
 /// `CreatePaymentSession` opens under a payment manager and every later read of one reports.
 mod payment_sessions;
 pub use payment_sessions::*;
+
+/// The same plane's instruments: [`PaymentInstrumentRecord`], the payment instruments
+/// `CreatePaymentInstrument` creates under a payment manager and `ListPaymentInstruments`
+/// reports.
+mod payment_instruments;
+pub use payment_instruments::*;
 
 /// The ONE filesystem a code interpreter session's three views share:
 /// [`SandboxFilesystem`], how a RUN (a script or a command) reaches the session's workspace
@@ -472,6 +481,16 @@ pub struct ComAmazonawsBedrockagentcoreAmazonbedrockagentcoreState {
     /// a replayed token answers with that session instead of opening a second one. Bounded
     /// by [`MAX_PAYMENT_SESSION_IDEMPOTENCY_RECORDS`].
     pub payment_session_idempotency: BTreeMap<String, String>,
+    /// The payment instruments `CreatePaymentInstrument` created, keyed by the
+    /// `paymentInstrumentId` this emulator minted for each one. Bounded by
+    /// [`MAX_PAYMENT_INSTRUMENTS`]; see [`payment_instruments`].
+    pub payment_instruments: BTreeMap<String, PaymentInstrumentRecord>,
+    /// The `paymentInstrumentId` each `CreatePaymentInstrument` `clientToken` already
+    /// created, keyed by the manager the token was used under and the token itself, so a
+    /// replayed token answers with that instrument instead of creating a second one and a
+    /// token used under two managers remembers both. Bounded by
+    /// [`MAX_PAYMENT_INSTRUMENT_IDEMPOTENCY_RECORDS`].
+    pub payment_instrument_idempotency: BTreeMap<(String, String), String>,
 }
 
 impl ComAmazonawsBedrockagentcoreAmazonbedrockagentcoreState {

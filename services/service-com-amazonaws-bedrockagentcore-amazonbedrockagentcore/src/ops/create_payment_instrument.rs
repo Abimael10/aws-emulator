@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreatePaymentInstrument
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreatePaymentInstrument`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreatePaymentInstrument::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Creates a payment instrument under a payment manager: the call mints the
+//! `paymentInstrumentId`, records the connector, the user and the instrument details it
+//! asked for, and `ListPaymentInstruments` reports what was stored here.
 //!
 //! ## Shape of an operation
 //!
@@ -147,6 +141,15 @@ impl From<CreatePaymentInstrumentErrorModeled> for CreatePaymentInstrumentError 
     }
 }
 
+/// The modelled server error for an engine that does not carry this service's state, which
+/// is the only way the store can be out of reach: the handler writes nothing in that case.
+fn missing_state() -> CreatePaymentInstrumentError {
+    CreatePaymentInstrumentErrorModeled::InternalServerException(InternalServerException {
+        message: Some("the shared engine does not carry this service's state".to_string()),
+    })
+    .into()
+}
+
 /// The `CreatePaymentInstrument` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -183,18 +186,70 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreatePaymentInstrument` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreatePaymentInstrumentErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreatePaymentInstrument"))
+        // Every member this operation needs is bound into `input` by the centralized
+        // request walk, the two `@httpHeader` members included.
+        let _ = ctx;
+        // A payment manager is created through the CONTROL plane, so whether the account
+        // holds the one this request names is resolved against the component that owns it,
+        // BEFORE anything is written: an instrument under a manager the account does not
+        // hold would be an instrument nothing owns. The resolution and the sentence both
+        // live in `crate::state`; this operation only says which of its own modelled errors
+        // carries each.
+        crate::state::payment_manager_resolved(&*self.engine, &input.payment_manager_arn).map_err(
+            |denial| match denial {
+                Some(message) => CreatePaymentInstrumentErrorModeled::AccessDeniedException(
+                    AccessDeniedException {
+                        message: Some(message.to_string()),
+                    },
+                )
+                .into(),
+                None => missing_state(),
+            },
+        )?;
+        // The connector the instrument draws on is NOT resolved: a payment connector is no
+        // component's resource in this emulator, so there is nothing that could say whether
+        // the id exists, and the modelled constraints on it are already kept by the time
+        // this handler runs.
+        let state = crate::state::service_state(&*self.engine).ok_or_else(missing_state)?;
+
+        let mut store = state.lock();
+
+        // `clientToken` is an `@idempotencyToken` whose documented effect is that a token
+        // matching an earlier request is ignored rather than refused: answer with the
+        // instrument that token already created under this manager, so no second instrument
+        // is created.
+        let now = ::std::time::SystemTime::now();
+        if let Some(token) = input.client_token.as_deref() {
+            if let Some(created) =
+                store.payment_instrument_for_token(&input.payment_manager_arn, token)
+            {
+                return Ok(CreatePaymentInstrumentOutput {
+                    payment_instrument: created.instrument(now),
+                });
+            }
+        }
+
+        let seq = store.next_seq();
+        let record = crate::state::PaymentInstrumentRecord::created(
+            seq,
+            input.payment_manager_arn.clone(),
+            input.payment_connector_id.clone(),
+            // `PaymentInstrument$userId` is `@required` while the request's own `userId` is
+            // optional, and `UserId` admits the empty value: an instrument created without a
+            // user belongs to none rather than to one this emulator invented.
+            input.user_id.clone().unwrap_or_default(),
+            input.payment_instrument_type.clone(),
+            input.payment_instrument_details.clone(),
+            input.agent_name.clone(),
+            now,
+        );
+        // Built from what is about to be stored, so the response and the store cannot
+        // disagree.
+        let output = CreatePaymentInstrumentOutput {
+            payment_instrument: record.instrument(now),
+        };
+        store.insert_payment_instrument(record, input.client_token);
+
+        Ok(output)
     }
 }
