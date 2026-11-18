@@ -214,12 +214,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The `/aws` hierarchy holds AWS's own published parameters and no parameter of
         // this account ([`crate::state::public_parameters`]), so an unlabel call addressing
         // a name in it asks to change data that is not the account's: the refusal is a
-        // denial and not a miss. Decided before the store is read, because nothing in it
-        // could hold such a name.
+        // denial and not a miss, and which sentence it carries turns on where in that
+        // hierarchy the name lies
+        // ([`crate::state::public_parameters::reserved_name_refusal_message`]). Decided
+        // before the store is read, because nothing in it could hold such a name.
         if crate::state::public_parameters::is_published_name(query.name) {
             return Err(UnlabelParameterVersionErrorModeled::AccessDeniedException(
                 AccessDeniedException {
-                    message: crate::state::RESTRICTED_PARAMETER_MESSAGE.to_string(),
+                    message: crate::state::public_parameters::reserved_name_refusal_message(
+                        &*self.engine,
+                        &region,
+                        query.name,
+                    ),
                 },
             )
             .into());

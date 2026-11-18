@@ -20,12 +20,20 @@
 //! ascending name order, so filtering, paging and the resume cursor are the same for
 //! either.
 //!
-//! That hierarchy is NAMESPACES rather than an empty tree a caller may walk: a path in it
-//! that this endpoint serves no name at or under is refused with `AccessDeniedException`
-//! ([`crate::state::public_parameters::invalid_namespace_message`]) rather than answered
-//! with an empty page, which a caller would read as a namespace that exists and holds
-//! nothing. Nothing of the account is hidden by that refusal — no parameter of the account
-//! can be in that hierarchy at all.
+//! That hierarchy is NAMESPACES rather than an empty tree a caller may walk, and a read
+//! reaches a namespace from either side: a level ABOVE one holds it, and a level INSIDE one
+//! is held by it and reports the nothing that namespace holds there, as a hierarchy of the
+//! account's own parameters holding nothing does. A path in NO namespace of it is refused
+//! rather than answered with an empty page, which a caller would read as a namespace that
+//! exists and holds nothing — as `AccessDeniedException`
+//! ([`crate::state::public_parameters::invalid_namespace_message`]) when it leads toward a
+//! namespace and names none, and as the name-grammar `ValidationException`
+//! ([`crate::state::PARAMETER_NAME_REQUIREMENTS`]) when its publisher level — the level
+//! immediately below the reserved root — holds no namespace at all, because then nothing of
+//! the path names a hierarchy of that tree and what is left is a name carrying the reserved
+//! root ([`crate::state::public_parameters::leads_to_reserved_namespace`]). Nothing of the
+//! account is hidden by either refusal — no parameter of the account can be in that
+//! hierarchy at all.
 //!
 //! One hierarchy of that AWS-owned namespace is the reserved path a single read serves an
 //! Amazon Web Services Secrets Manager secret through
@@ -370,9 +378,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let published = if crate::state::public_parameters::is_published_hierarchy(path) {
             let published =
                 crate::state::public_parameters::published_records(&*self.engine, &region);
+            // The level immediately below the reserved root names the PUBLISHER of the
+            // namespaces under it, so a path whose publisher level holds none names no
+            // hierarchy of AWS's tree at all: what is left of it is a parameter name
+            // carrying the reserved root, which the name grammar refuses — the same
+            // paragraph any other path that names no hierarchy is refused with.
+            if !crate::state::public_parameters::leads_to_reserved_namespace(path, &published) {
+                return Err(crate::scaffolded::Scaffolded::validation(
+                    crate::state::PARAMETER_NAME_REQUIREMENTS.to_string(),
+                ));
+            }
             // Inside AWS's hierarchy a read reaches the NAMESPACES AWS publishes in, and
-            // nothing else: no parameter of this account can live there, so a path that is
-            // no namespace of it names nothing any caller could reach — which is a refusal
+            // nothing else: no parameter of this account can live there, so a path in no
+            // namespace of it names nothing any caller could reach — which is a refusal
             // and not an empty page.
             if !crate::state::public_parameters::is_reserved_namespace(path, &published) {
                 return Err(GetParametersByPathErrorModeled::AccessDeniedException(

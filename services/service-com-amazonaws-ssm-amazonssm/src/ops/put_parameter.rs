@@ -549,15 +549,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The `/aws` hierarchy holds AWS's own published parameters and no parameter of
         // this account ([`crate::state::public_parameters`]), so a put addressing a name in
         // it asks to write data that is not the account's: the refusal is a DENIAL, as it
-        // is for every other call that would change a name in that hierarchy, and it names
-        // the reserved name the request asked to write
-        // ([`crate::state::reserved_name_denial_message`]). Decided before the naming
-        // constraints are read off the name, because what is wrong with it is whose
-        // hierarchy it is in.
+        // is for every other call that would change a name in that hierarchy, and which
+        // sentence it carries turns on where in that hierarchy the name lies rather than on
+        // this being the write ([`crate::state::public_parameters::reserved_name_refusal_message`]).
+        // Decided before the naming constraints are read off the name, because what is
+        // wrong with it is whose hierarchy it is in.
         if crate::state::public_parameters::is_published_name(name) {
             return Err(PutParameterErrorModeled::AccessDeniedException(
                 AccessDeniedException {
-                    message: crate::state::reserved_name_denial_message(name),
+                    message: crate::state::public_parameters::reserved_name_refusal_message(
+                        &*self.engine,
+                        &crate::state::request_region(ctx.parts()),
+                        name,
+                    ),
                 },
             )
             .into());

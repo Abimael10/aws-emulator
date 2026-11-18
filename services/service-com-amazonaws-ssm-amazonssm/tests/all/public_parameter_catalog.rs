@@ -230,9 +230,11 @@ pub(super) async fn describe_image(router: &MultiServiceRouter, image_id: &str) 
 
 /// RULE: a recursive read of a hierarchy inside AWS's published namespace reports the
 /// parameters AWS publishes under it, and reports nothing that is not under it; a path
-/// inside that namespace that is no NAMESPACE of it — nothing this endpoint serves a name
-/// at or under — is refused as denied rather than answered with an empty page, because the
-/// reserved hierarchy holds only what AWS publishes there and no caller can write it.
+/// inside that namespace that is in no NAMESPACE of it — nothing this endpoint serves a name
+/// at, under or inside — is refused rather than answered with an empty page, because the
+/// reserved hierarchy holds only what AWS publishes there and no caller can write it: as
+/// denied when it leads toward a namespace, and by the name grammar when its publisher level
+/// holds no namespace at all, leaving nothing of it naming a hierarchy of that tree.
 #[tokio::test]
 async fn every_published_namespace_resolves_under_its_own_path() {
     let router = emulator();
@@ -242,8 +244,13 @@ async fn every_published_namespace_resolves_under_its_own_path() {
     enum Expect {
         /// AWS publishes parameters under this path.
         Published,
-        /// The path is no namespace of the reserved hierarchy, so the read is denied.
+        /// The path leads toward a namespace of the reserved hierarchy and names none of
+        /// them, so the read is denied.
         Denied,
+        /// Nothing of the path names a hierarchy of the reserved tree — its publisher
+        /// level, immediately below the reserved root, holds no namespace — so what is left
+        /// is a name carrying the reserved root, refused by the name grammar.
+        Malformed,
     }
 
     let rows: &[(&str, Expect)] = &[
@@ -252,21 +259,27 @@ async fn every_published_namespace_resolves_under_its_own_path() {
         (PCS_NAMESPACE, Expect::Published),
         (AMAZON_LINUX_NAMESPACE, Expect::Published),
         (WINDOWS_NAMESPACE, Expect::Published),
-        // Namespaces of the reserved hierarchy nothing is published under, at two levels.
+        // A namespace of the reserved hierarchy nothing is published under.
         ("/aws/service/no-such-published-namespace", Expect::Denied),
-        ("/aws/no-such-level", Expect::Denied),
+        // A publisher level of the reserved root that holds no namespace at all.
+        ("/aws/no-such-level", Expect::Malformed),
     ];
 
     for (path, expect) in rows {
         let case = format!("recursive listing of {path}");
-        if *expect == Expect::Denied {
+        if *expect != Expect::Published {
             let (status, refused) =
                 by_path(&router, &json!({ "Path": path, "Recursive": true })).await;
+            let expected_code = if *expect == Expect::Denied {
+                "AccessDeniedException"
+            } else {
+                "ValidationException"
+            };
             assert_eq!(
                 (status, error_code(&refused)),
-                (400, "AccessDeniedException".to_string()),
+                (400, expected_code.to_string()),
                 "case {case}: a path that is no namespace of the reserved hierarchy is \
-                 denied, got {status} {refused}"
+                 refused as {expected_code}, got {status} {refused}"
             );
             continue;
         }

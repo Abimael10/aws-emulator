@@ -926,13 +926,12 @@ pub const PARAMETER_NAME_REQUIREMENTS: &str = concat!(
     r#"Valid example: /get/parameters2-/by1./path0_."#,
 );
 
-/// What a call that would change a parameter in the hierarchy AWS reserves for its own
-/// published parameters is refused with.
+/// What a call addressed to a name in a hierarchy AWS PUBLISHES in is refused with.
 ///
 /// Fixed text naming nothing of the request: the refusal is not that the hierarchy holds
-/// no such parameter — it is that the hierarchy is not the account's to change at all
-/// ([`public_parameters`]), so a caller learns to stop rather than to retry under another
-/// name.
+/// no such parameter — it is that AWS's own published data is not the account's to read as
+/// its own or to change ([`public_parameters`]), so a caller learns to stop rather than to
+/// retry under another name.
 pub const RESTRICTED_PARAMETER_MESSAGE: &str =
     "Cannot access/update data for the restricted parameter.";
 
@@ -946,14 +945,14 @@ pub fn policies_limit_message() -> String {
     )
 }
 
-/// What a WRITE addressed to the hierarchy AWS reserves for its own published parameters is
-/// refused with.
+/// What a call addressed to a reserved name AWS publishes nothing under is refused with.
 ///
-/// The sentence names the reserved name the request asked to write, canonically (the
-/// spelling the parameter's ARN carries after its `parameter/` prefix). It is NOT
-/// [`RESTRICTED_PARAMETER_MESSAGE`], which the calls that address an EXISTING parameter of
-/// that hierarchy are refused with: the two are worded by different parts of the service
-/// and each keeps its own sentence.
+/// The sentence names the reserved name the request addressed, canonically (the spelling the
+/// parameter's ARN carries after its `parameter/` prefix). It is NOT
+/// [`RESTRICTED_PARAMETER_MESSAGE`], which a call addressed to a name in a hierarchy AWS
+/// really publishes in is refused with: which of the two a refusal carries is decided by
+/// where in the reserved hierarchy the name lies
+/// ([`public_parameters::reserved_name_refusal_message`]), not by which call asked.
 pub fn reserved_name_denial_message(name: &str) -> String {
     format!(
         "No access to reserved parameter name: {}.",

@@ -15,9 +15,10 @@
 //!
 //! A name in the hierarchy AWS reserves for its OWN published parameters
 //! ([`crate::state::public_parameters`]) is not the account's to delete, and this refusal
-//! is not that it is missing: such a call is denied
-//! ([`crate::state::RESTRICTED_PARAMETER_MESSAGE`]), so a caller learns to stop rather
-//! than to retry or recreate the name.
+//! is not that it is missing: such a call is denied, with the sentence the name's place in
+//! that hierarchy decides
+//! ([`crate::state::public_parameters::reserved_name_refusal_message`]), so a caller learns
+//! to stop rather than to retry or recreate the name.
 //!
 //! The documented wait after a delete ("wait for at least 30 seconds to create a parameter
 //! with the same name") is AWS's own propagation guidance, not a refusal this operation
@@ -197,12 +198,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The `/aws` hierarchy holds AWS's own published parameters and no parameter of
         // this account ([`crate::state::public_parameters`]), so a delete addressing a name
         // in it asks to change data that is not the account's: the refusal is a denial and
-        // not a miss. Decided before the store is read, because nothing in it could hold
-        // such a name.
+        // not a miss, and which sentence it carries turns on where in that hierarchy the
+        // name lies ([`crate::state::public_parameters::reserved_name_refusal_message`]).
+        // Decided before the store is read, because nothing in it could hold such a name.
         if crate::state::public_parameters::is_published_name(query.name) {
             return Err(DeleteParameterErrorModeled::AccessDeniedException(
                 AccessDeniedException {
-                    message: crate::state::RESTRICTED_PARAMETER_MESSAGE.to_string(),
+                    message: crate::state::public_parameters::reserved_name_refusal_message(
+                        &*self.engine,
+                        &region,
+                        query.name,
+                    ),
                 },
             )
             .into());

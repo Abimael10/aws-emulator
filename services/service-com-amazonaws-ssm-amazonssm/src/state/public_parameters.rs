@@ -67,25 +67,120 @@ pub fn is_published_hierarchy(path: &str) -> bool {
     is_published_name(path)
 }
 
-/// Whether canonical `path` names a NAMESPACE of the reserved hierarchy — one this endpoint
-/// serves names in, or a level above one.
+/// Whether canonical `path` lies in a NAMESPACE of the reserved hierarchy — one this
+/// endpoint serves names in, a level above one, or a level inside one.
 ///
 /// The reserved hierarchy is not an empty tree a caller may walk wherever it likes: it is
-/// the namespaces AWS publishes in. `published` is the catalog as this endpoint publishes
-/// it, so a path is a namespace when some published name lies at or under it; the reserved
-/// Secrets Manager reference namespace counts too, because a read of Parameter Store does
-/// serve names from it ([`super::secretsmanager_reference`]), even though no parameter is
-/// published there.
+/// the namespaces AWS publishes in. A namespace is the hierarchy a served name lies in
+/// ([`namespaces`]), and a read reaches it from either side: the levels ABOVE it, which hold
+/// it, and the levels INSIDE it, which it holds — a deeper level of a namespace that exists
+/// reports the nothing it holds at that level, exactly as a hierarchy of the account's own
+/// parameters that holds nothing does.
 ///
-/// A path anywhere else in the reserved hierarchy names nothing this endpoint has — and
+/// A path in NO namespace of the reserved hierarchy names nothing this endpoint has — and
 /// nothing the account may have, since no caller can write there — so a read of it is
 /// refused ([`invalid_namespace_message`]) rather than answered with an empty page.
 pub fn is_reserved_namespace(path: &str, published: &[ParameterRecord]) -> bool {
-    let holds = |name: &str| name == path || super::is_under_path(name, path, true);
-    holds(super::secretsmanager_reference::REFERENCE_PATH)
-        || published
-            .iter()
-            .any(|record| holds(canonical_name(&record.name)))
+    namespaces(published).iter().any(|namespace| {
+        *namespace == path
+            // The path holds the namespace: a level above it, which is read to discover it.
+            || super::is_under_path(namespace, path, true)
+            // The namespace holds the path: a level inside it, which it may hold nothing at.
+            || super::is_under_path(path, namespace, true)
+    })
+}
+
+/// Whether canonical `path`, read as a HIERARCHY, leads toward a namespace of the reserved
+/// hierarchy at all: whether the PUBLISHER level it lies under bears one
+/// ([`publisher_bears_a_namespace`]).
+///
+/// The reserved root itself lies under no publisher level and holds every one of them, so it
+/// leads toward them all. A path that leads toward a namespace is resolved against the
+/// namespaces themselves ([`is_reserved_namespace`]), so one naming none of them is refused
+/// as denied; a path that leads toward none names no hierarchy of that tree at all, so what
+/// is left of it is a parameter NAME carrying the reserved root, which the name grammar
+/// refuses ([`super::PARAMETER_NAME_REQUIREMENTS`] states that rule: a name cannot be
+/// prefixed with the reserved roots).
+pub fn leads_to_reserved_namespace(path: &str, published: &[ParameterRecord]) -> bool {
+    publisher_level(path).is_none_or(|level| publisher_bears_a_namespace(&level, published))
+}
+
+/// Whether canonical `name` lies in a hierarchy AWS PUBLISHES in: whether the publisher
+/// level it lies under bears a namespace this endpoint serves names in.
+///
+/// A name is not a hierarchy, so the reserved root alone lies in none: it is a name carrying
+/// the reserved root and nothing more. What this answers is whether a call addressed to the
+/// name addresses AWS's own published data ([`reserved_name_refusal_message`]).
+pub fn names_published_data(name: &str, published: &[ParameterRecord]) -> bool {
+    publisher_level(name).is_some_and(|level| publisher_bears_a_namespace(&level, published))
+}
+
+/// What a call addressed to `name` in the reserved hierarchy is refused with — the one
+/// statement of that sentence, for every call of this service that addresses a name there.
+///
+/// Which sentence it is turns on WHERE in the reserved hierarchy the name lies, not on which
+/// call asked: a name in a hierarchy AWS publishes in ([`names_published_data`]) addresses
+/// AWS's own published data, which is not the account's to read as its own or to change
+/// ([`super::RESTRICTED_PARAMETER_MESSAGE`]), while a name under a publisher level AWS
+/// publishes nothing under addresses no data at all — it is a parameter name carrying the
+/// reserved root, which no caller may create or reach
+/// ([`super::reserved_name_denial_message`]).
+pub fn reserved_name_refusal_message(
+    engine: &(impl Send + Sync + 'static),
+    region: &str,
+    name: &str,
+) -> String {
+    let published = published_records(engine, region);
+    if names_published_data(canonical_name(name), &published) {
+        super::RESTRICTED_PARAMETER_MESSAGE.to_string()
+    } else {
+        super::reserved_name_denial_message(name)
+    }
+}
+
+/// The publisher level canonical `path` lies under — the two levels `<reserved
+/// root>/<publisher>` of it — or `None` when it is the reserved root itself, which lies
+/// under none.
+///
+/// Below the reserved root that level names the publisher of the namespaces under it (what
+/// AWS's services publish, and the secrets this service serves through the hierarchy
+/// reserved for them); it is part of the reserved tree's shape rather than of any one
+/// namespace.
+fn publisher_level(path: &str) -> Option<String> {
+    let mut levels = path.splitn(3, '/');
+    let root = levels.next().unwrap_or_default();
+    let publisher = levels.next()?;
+    Some(format!("{root}/{publisher}"))
+}
+
+/// Whether the publisher level `level` bears a namespace this endpoint serves names in: one
+/// AT it or anywhere under it.
+fn publisher_bears_a_namespace(level: &str, published: &[ParameterRecord]) -> bool {
+    namespaces(published)
+        .iter()
+        .any(|namespace| *namespace == level || super::is_under_path(namespace, level, true))
+}
+
+/// The namespaces of the reserved hierarchy this endpoint serves names in, canonical.
+///
+/// A published name is a name IN a namespace, so the namespace is the hierarchy it lies in —
+/// "the hierarchy is the parameter name except the last part of the parameter"
+/// (`GetParametersByPathRequest$Path`) — and `published` is the catalog as this endpoint
+/// publishes it, so the set is read off the catalog rather than written down beside it. The
+/// reserved Secrets Manager reference namespace is one too, because a read of Parameter Store
+/// serves names from it ([`super::secretsmanager_reference`]) even though no parameter is
+/// published there; it is the namespace ITSELF, not the hierarchy of a name, because the
+/// names it serves are the secrets held under it.
+fn namespaces(published: &[ParameterRecord]) -> Vec<&str> {
+    let mut namespaces = vec![super::secretsmanager_reference::REFERENCE_PATH];
+    for record in published {
+        let name = canonical_name(&record.name);
+        let hierarchy = name.rsplit_once('/').map_or(name, |(above, _leaf)| above);
+        if !namespaces.contains(&hierarchy) {
+            namespaces.push(hierarchy);
+        }
+    }
+    namespaces
 }
 
 /// What a hierarchy read of a path in the reserved hierarchy that names no namespace of it
