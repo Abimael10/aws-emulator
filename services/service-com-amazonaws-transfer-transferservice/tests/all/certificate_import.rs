@@ -1172,3 +1172,231 @@ async fn a_certificates_status_follows_the_clock_into_its_window() {
         "expected ACTIVE once the clock is inside the window, got {after}"
     );
 }
+
+/// How far from the reading clock a projection row puts a window bound it wants on one
+/// side of it: a minute each way, wide enough that no row's expectation depends on how
+/// fast the host runs, and waited on by nothing — every row reads its record straight
+/// away.
+const WELL_CLEAR: f64 = 60.0;
+
+/// A whole hour, for the rows that want a bound unmistakably on one side of the clock.
+const FAR_CLEAR: f64 = 3_600.0;
+
+/// One row of the projection rule: the certificate to import, the window the request
+/// states and the `Status` every reader must then derive for that record.
+struct ProjectionCase {
+    name: &'static str,
+    /// The validity period of the certificate to generate, in whole years.
+    validity: (i32, i32),
+    /// `ActiveDate` to send, as an offset in seconds from the import; `None` sends the
+    /// member not at all, which leaves that bound at the certificate's own date.
+    active_offset: Option<f64>,
+    /// `InactiveDate` to send, on the same basis.
+    inactive_offset: Option<f64>,
+    /// The tag set to import with — 0, 1 and 3 tags across the rows.
+    tags: &'static [(&'static str, &'static str)],
+    /// The `Status` the resolved window puts the record in at any reading instant of
+    /// this test.
+    status: &'static str,
+}
+
+/// The rows, spanning the rule: each place the reading clock can sit relative to the
+/// window, reached through each source the window's bounds can come from.
+fn projection_cases() -> Vec<ProjectionCase> {
+    vec![
+        ProjectionCase {
+            name: "no bounds requested, the certificate's own period holds the clock",
+            validity: (2020, 2100),
+            active_offset: None,
+            inactive_offset: None,
+            tags: &[],
+            status: CERTIFICATE_STATUS_ACTIVE,
+        },
+        ProjectionCase {
+            name: "no bounds requested, the certificate's own period is over",
+            validity: (2000, 2001),
+            active_offset: None,
+            inactive_offset: None,
+            tags: &[],
+            status: CERTIFICATE_STATUS_INACTIVE,
+        },
+        ProjectionCase {
+            name: "no bounds requested, the certificate's own period has not begun",
+            validity: (2090, 2100),
+            active_offset: None,
+            inactive_offset: None,
+            tags: &[("env", "as2")],
+            status: CERTIFICATE_STATUS_PENDING_ROTATION,
+        },
+        ProjectionCase {
+            name: "both bounds requested around the clock",
+            validity: (2020, 2100),
+            active_offset: Some(-FAR_CLEAR),
+            inactive_offset: Some(FAR_CLEAR),
+            tags: &[("env", "as2"), ("owner", "ops"), ("tier", "1")],
+            status: CERTIFICATE_STATUS_ACTIVE,
+        },
+        ProjectionCase {
+            name: "a closing bound requested that the clock has passed",
+            validity: (2020, 2100),
+            active_offset: None,
+            inactive_offset: Some(-WELL_CLEAR),
+            tags: &[],
+            status: CERTIFICATE_STATUS_INACTIVE,
+        },
+        ProjectionCase {
+            name: "an opening bound requested that the clock has not reached",
+            validity: (2020, 2100),
+            active_offset: Some(FAR_CLEAR),
+            inactive_offset: None,
+            tags: &[("owner", "ops")],
+            status: CERTIFICATE_STATUS_PENDING_ROTATION,
+        },
+        ProjectionCase {
+            name: "an opening bound requested that the clock has passed",
+            validity: (2020, 2100),
+            active_offset: Some(-WELL_CLEAR),
+            inactive_offset: None,
+            tags: &[],
+            status: CERTIFICATE_STATUS_ACTIVE,
+        },
+    ]
+}
+
+/// RULE: a certificate reader computes its answer from the stored record AT READ TIME —
+/// `Status` is where the reading clock sits in the record's effective window
+/// `[ActiveDate, InactiveDate)`, each bound being the one the write named or, where it
+/// named none, the certificate's own `NotBeforeDate`/`NotAfterDate`, and the tag set is
+/// reported as a LIST at every size, the EMPTY one included, so "no tags" is told apart
+/// from "not reported". ONE derivation serves every reader, so `ListCertificates`
+/// carries the same window and the same status for the same record; and a read REPORTS,
+/// so reading that record again answers exactly the same projection.
+///
+/// The rows differ along where the clock sits relative to the window (inside it, before
+/// it opens, after it has closed), WHERE each bound comes from (both requested, one
+/// requested alone, or neither, leaving the certificate's own validity period) and the
+/// size of the tag set.
+#[tokio::test]
+async fn every_certificate_reader_derives_the_status_from_the_stored_window() {
+    let emulator = Emulator::new();
+    // What each row's record read as, kept for the listing check below.
+    let mut projections: Vec<(String, Value)> = Vec::new();
+
+    for case in projection_cases() {
+        let name = case.name;
+        let generated = generate(case.validity, None);
+
+        // The bounds are computed HERE, so each expectation is the value the request
+        // carried rather than one read back out of the answer.
+        let requested_active = case.active_offset.map(offset_from_now);
+        let requested_inactive = case.inactive_offset.map(offset_from_now);
+        let mut request = json!({
+            "Usage": USAGES[0],
+            "Certificate": &generated.certificate,
+            "Tags": tag_list(case.tags),
+        });
+        if case.tags.is_empty() {
+            // `Tags` is modelled `len 1..50`, so an untagged import sends no member at
+            // all — which is the row that must still READ as an empty list.
+            request.as_object_mut().expect("an object").remove("Tags");
+        }
+        if let Some(active) = requested_active {
+            request["ActiveDate"] = json!(active);
+        }
+        if let Some(inactive) = requested_inactive {
+            request["InactiveDate"] = json!(inactive);
+        }
+
+        let certificate_id = import_ok(&emulator, name, request).await;
+        let described = describe(&emulator, name, &certificate_id).await;
+
+        // The certificate's own period is reported as the material states it, and the
+        // window is the requested bound or, where none was requested, that period.
+        assert_instant(
+            name,
+            "NotBeforeDate",
+            member_of(&described, "NotBeforeDate"),
+            generated.not_before,
+        );
+        assert_instant(
+            name,
+            "NotAfterDate",
+            member_of(&described, "NotAfterDate"),
+            generated.not_after,
+        );
+        let active = requested_active.unwrap_or(generated.not_before);
+        let inactive = requested_inactive.unwrap_or(generated.not_after);
+        assert_instant(name, "ActiveDate", member_of(&described, "ActiveDate"), active);
+        assert_instant(
+            name,
+            "InactiveDate",
+            member_of(&described, "InactiveDate"),
+            inactive,
+        );
+
+        // `Status` is where the reading clock sits in exactly that window.
+        assert_eq!(
+            member_of(&described, "Status").as_str(),
+            Some(case.status),
+            "case {name:?}: expected Status {:?} for the window [{active}, {inactive}), \
+             got {described}",
+            case.status
+        );
+
+        // The tag set is reported as a list at every size, the empty one included.
+        assert_eq!(
+            member_of(&described, "Tags"),
+            &tag_list(case.tags),
+            "case {name:?}: expected the imported tag set reported as a list, got \
+             {described}"
+        );
+
+        // A read REPORTS: the same record read again answers the same projection.
+        let again = describe(&emulator, name, &certificate_id).await;
+        assert_eq!(
+            again, described,
+            "case {name:?}: a second read answered a different projection"
+        );
+
+        projections.push((certificate_id, described));
+    }
+
+    // ONE derivation serves every reader: the listing projects each record with the
+    // window and the status its own reader reports. `MaxResults`' published upper bound
+    // (range 1..1000) takes every row in one page.
+    let answer = emulator
+        .call("ListCertificates", json!({"MaxResults": 1000}))
+        .await;
+    assert_eq!(
+        answer.status, 200,
+        "expected ListCertificates 200, got {} with body {}",
+        answer.status, answer.body
+    );
+    let listed = answer
+        .get("Certificates")
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    assert_eq!(
+        listed.len(),
+        projections.len(),
+        "expected every imported certificate listed once, got {listed:?}"
+    );
+
+    for (certificate_id, described) in &projections {
+        let entry = listed
+            .iter()
+            .find(|entry| {
+                member_of(entry, "CertificateId").as_str() == Some(certificate_id.as_str())
+            })
+            .unwrap_or_else(|| panic!("certificate {certificate_id} is not listed: {listed:?}"));
+        for member in ["Status", "ActiveDate", "InactiveDate", "Arn", "Usage", "Type"] {
+            assert_eq!(
+                member_of(entry, member),
+                member_of(described, member),
+                "certificate {certificate_id}: the listing reports a different {member} than \
+                 the read ({entry} vs {described})"
+            );
+        }
+    }
+}
