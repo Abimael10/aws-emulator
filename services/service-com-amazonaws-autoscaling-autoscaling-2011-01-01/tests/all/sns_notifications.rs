@@ -41,6 +41,14 @@ use crate::support::{
     REGION,
 };
 
+/// WHICH configurations a read reports, and how it pages them, in its own file beside this
+/// one: the selection and the paging of `DescribeNotificationConfigurations`, the read this
+/// suite's rule ends at, and this suite's sibling concern. `tests/all.rs` declares one
+/// module per suite FILE, and this is that file's module; the `#[path]` points it into this
+/// suite's own directory, as that file's own declaration points into `tests/all/`.
+#[path = "sns_notifications/describe_notification_configurations.rs"]
+mod describe_notification_configurations;
+
 /// The three event types this suite configures and reads, spelled out here rather than
 /// imported, so a wrong constant in the implementation cannot make a test pass.
 const TEST_NOTIFICATION: &str = "autoscaling:TEST_NOTIFICATION";
