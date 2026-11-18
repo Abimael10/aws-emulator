@@ -64,9 +64,10 @@
 //! exactly one winner, and the loser is told to retry.
 //!
 //! An update is also what RESUMES polling, or re-targets it onto another queue, so it arms
-//! the poll loop exactly as the create does ([`crate::state::drive_sqs_pollers`]); the loop
-//! polls only the mappings that report `Enabled` at the instant of each poll, so a mapping
-//! this call paused stops being polled when the clock settles it into `Disabled`.
+//! the mapping's own poller exactly as the create does
+//! ([`crate::state::drive_sqs_pollers`]); a poller reads only while its mapping reports
+//! `Enabled` at the instant of each pass, so a mapping this call paused stops being polled
+//! when the clock settles it into `Disabled`, and its poller stands down.
 //!
 //! ## Shape of an operation
 //!

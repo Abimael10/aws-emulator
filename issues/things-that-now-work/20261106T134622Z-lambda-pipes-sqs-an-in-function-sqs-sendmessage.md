@@ -39,3 +39,25 @@ Cause 2 — expected: with the mapping disabled, a message sent to the source qu
 1. Create an SQS queue and a Lambda function whose execution role has no sqs:SendMessage grant for it; invoke the function so its handler sends a message. It succeeds and returns a message id.
 2. Create an SQS event source mapping with Enabled=false, send a message to the source queue and wait for the no-invocation window. The check is killed at 60 s with no verdict.
 3. Replay lambda__pipes__sqs.lambda-sdk-sqs-sendmessage-missing-permission-negative and lambda__pipes__sqs.sqs-esm-disabled-mapping-no-invocation-negative.
+
+## Resolution
+
+Cause 1 replays as fixed: Amazon SQS decides every queue call against the policies in force on the
+principal its credential speaks for (`services/service-com-amazonaws-sqs-amazonsqs/src/state/authorization.rs`),
+and a running handler's own SDK calls are signed as a session of the function's execution role
+(`services/service-com-amazonaws-lambda-awsgirapiservice/src/state/execution/execution_role_session.rs`),
+so an in-function `sqs:SendMessage` with no grant is refused `AccessDenied`.
+
+Cause 2: each SQS event source mapping is now polled by a poller of its OWN
+(`services/service-com-amazonaws-lambda-awsgirapiservice/src/state/sqs_poller.rs`), where one
+background loop per store used to hand every mapping's batches over in turn — so one mapping's slow
+or failing function no longer delays another mapping's deliveries, and a mapping paused with
+`Enabled=false` withholds its queue while the same mapping enabled again delivers what it withheld
+(`tests/all/event_source_mapping_independent_pollers.rs`,
+`tests/all/event_source_mapping_pause_and_resume_delivery.rs`).
+
+RESIDUAL: the recorded unit `lambda__pipes__sqs.sqs-esm-disabled-mapping-no-invocation-negative`
+still ends in "Check timed out after 60.0s", now on the key
+`…|run#30|Timeout|time.sleep(2)` rather than this report's `…|_drain_json_messages#30|…`. That key
+is owned by `issues/things-that-do-not-work/20261111T142325Z-lambda-pipes-sqs-the-disabled-re-enabled-sqs.md`,
+which is where the remaining cause of that unit is tracked.

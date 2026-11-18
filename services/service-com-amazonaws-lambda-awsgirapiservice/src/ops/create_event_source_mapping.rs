@@ -84,11 +84,12 @@
 //! per topic or per queue (see [`crate::state::polled_event_source`]).
 //!
 //! An accepted mapping on a queue also STARTS POLLING it: "Lambda reads items from the
-//! event source and invokes the function", so this call arms the poll loop
+//! event source and invokes the function", so this call arms the mapping's OWN poller
 //! ([`crate::state::drive_sqs_pollers`]) that takes each batch out of the queue and hands
-//! it to the mapping's function. Nothing waits for a poll here — the loop runs on its own
-//! clock — and what one poll does, including why an unprocessed batch is left on the queue,
-//! is documented in [`crate::state::sqs_poller`].
+//! it to the mapping's function. Nothing waits for a poll here — each mapping's poller runs
+//! on its own clock, so a mapping's deliveries wait on no other mapping — and what one poll
+//! does, including why an unprocessed batch is left on the queue, is documented in
+//! [`crate::state::sqs_poller`].
 //!
 //! ## Shape of an operation
 //!

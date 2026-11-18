@@ -368,17 +368,20 @@ struct PolicyStores {
 /// backstop for every OTHER way the task can end — the runtime shutting down, or a panic
 /// inside the poller — because a claim left behind would stop this mapping from ever being
 /// polled again.
-struct PollerClaim {
-    state: ::engine::ServiceState<ComAmazonawsLambdaAwsgirapiserviceState>,
-    uuid: String,
+///
+/// Shared with the reader of the other kind of event source ([`super::sqs_poller`]), since
+/// "one poller per mapping" is one rule whichever source the mapping names.
+pub(crate) struct PollerClaim {
+    pub(crate) state: ::engine::ServiceState<ComAmazonawsLambdaAwsgirapiserviceState>,
+    pub(crate) uuid: String,
     /// Whether this claim is still the live one. Set to `false` by [`Self::release`], so
     /// the `Drop` cannot release a claim a LATER poller has since taken.
-    held: bool,
+    pub(crate) held: bool,
 }
 
 impl PollerClaim {
     /// Release the claim through a store lock the caller already holds.
-    fn release(&mut self, store: &mut ComAmazonawsLambdaAwsgirapiserviceState) {
+    pub(crate) fn release(&mut self, store: &mut ComAmazonawsLambdaAwsgirapiserviceState) {
         if self.held {
             store.release_event_source_poller(&self.uuid);
             self.held = false;

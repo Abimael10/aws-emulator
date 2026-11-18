@@ -282,8 +282,7 @@ fn claim_sampler(store: &mut ComAmazonawsLambdaAwsgirapiserviceState) -> Option<
 
 /// Keep the running sampler's task handle, aborting the one it replaces — and only while
 /// `generation` is still the current claim, so a starter whose own sampler has already stood
-/// down installs nothing and aborts nothing (see [`super::sqs_poller::drive_sqs_pollers`],
-/// which hands its loop over the same way).
+/// down installs nothing and aborts nothing.
 fn set_sampler(
     store: &mut ComAmazonawsLambdaAwsgirapiserviceState,
     generation: u64,

@@ -2770,18 +2770,13 @@ pub struct ComAmazonawsLambdaAwsgirapiserviceState {
     /// Every event source mapping this emulator holds, keyed by its UUID so
     /// `ListEventSourceMappings` pages through them in a stable order.
     pub event_source_mappings: BTreeMap<String, EventSourceMappingRecord>,
-    /// The UUIDs of the mappings a shard-source poller is already running for, so at most
-    /// one runs per mapping; see [`Self::claim_event_source_poller`].
+    /// The UUIDs of the mappings a poller is already running for, so at most one runs per
+    /// mapping; see [`Self::claim_event_source_poller`].
     pub event_source_pollers: BTreeSet<String>,
-    /// Whether a poll loop is already running over this store's queue mappings; see
-    /// [`sqs_poller::drive_sqs_pollers`], which is the only thing that sets it.
+    /// Whether a CALLER is making the passes of this store's queue mappings itself, in which
+    /// case this service starts no poller of its own; see
+    /// [`sqs_poller::claim_poll_passes`], which is the only thing that sets it.
     pub sqs_poller_running: bool,
-    /// Which claim on that loop is the current one, so a loop standing down because nothing
-    /// polls any more releases only its OWN claim and never one a later call is holding.
-    pub sqs_poller_generation: u64,
-    /// The running poll loop's task handle, kept so the loop it replaces is aborted rather
-    /// than merely forgotten.
-    pub sqs_poller: Option<::tokio::task::JoinHandle<()>>,
     /// Whether a concurrency sampler is already running over this account; see
     /// [`concurrency_metering::drive_concurrency_metering`], which is the only thing that
     /// sets it.
@@ -3049,8 +3044,8 @@ impl ComAmazonawsLambdaAwsgirapiserviceState {
     ///
     /// `false` means a poller is already running for that mapping, so the caller starts
     /// none: an event source is polled for one function by at most one mapping, and a
-    /// mapping is polled by at most one poller, so two tasks never read the same shard on
-    /// behalf of the same mapping.
+    /// mapping is polled by at most one poller, so two tasks never read the same event
+    /// source on behalf of the same mapping.
     pub fn claim_event_source_poller(&mut self, uuid: &str) -> bool {
         self.event_source_pollers.insert(uuid.to_string())
     }

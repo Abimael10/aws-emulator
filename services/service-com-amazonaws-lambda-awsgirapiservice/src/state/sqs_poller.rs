@@ -52,7 +52,12 @@
 //!   concurrent instances that the Amazon SQS event source can invoke"
 //!   (`ScalingConfig$MaximumConcurrency`) — so a mapping draining a backlog really does run
 //!   batches concurrently up to what it configures, and the drain rate a client sized that
-//!   setting for is the one it gets.//! * DELETE. A message leaves the queue only once the invocation it was handed to has
+//!   setting for is the one it gets. Each mapping's batches also go over while every OTHER
+//!   mapping's do: "Lambda reads items from the event source and invokes the function" for
+//!   each mapping, so a mapping is a consumer of its own — one whose function is slow, or
+//!   whose invocations fail, delays no other mapping's records, however many of them this
+//!   store holds.
+//! * DELETE. A message leaves the queue only once the invocation it was handed to has
 //!   succeeded. A batch whose invocation did not succeed is left exactly where it was: its
 //!   messages come back when their visibility timeout lapses, which is precisely the case a
 //!   queue's `RedrivePolicy` exists for, and the mapping reports what the attempt came to as
@@ -79,18 +84,21 @@
 //!
 //! # How a poll is driven
 //!
-//! Nothing sleeps inside a request. The poll loop is a background task claimed once per
-//! store ([`drive_sqs_pollers`], armed by the calls that make or change a mapping) which
-//! polls, hands the runtime back for [`POLL_INTERVAL`] and polls again, and stands down as
-//! soon as the store holds no enabled queue mapping — so its lifetime is bounded by the
-//! resource it serves rather than by a timer that would leave a mapping reporting `Enabled`
-//! while nothing polls it. One wake-up's work is bounded too: at most one batch per mapping,
-//! and the store holds at most [`super::MAX_EVENT_SOURCE_MAPPINGS`] mappings. With no async
-//! runtime to spawn onto there is no task, and [`poll_due`] — which is the whole of one
-//! wake-up's work and takes the instant it is working at — can be awaited directly instead.
-//! A caller that wants the passes to be ITS OWN, made when it says so rather than on the
-//! loop's interval, takes the store's poll claim ([`claim_poll_passes`]) and then makes each
-//! pass with [`poll_passes_once`]: the same work, awaited rather than raced.
+//! Nothing sleeps inside a request. Each mapping is polled by a background task of ITS OWN,
+//! claimed once per mapping ([`drive_sqs_pollers`], armed by the calls that make or change a
+//! mapping), which polls, hands the runtime back for [`POLL_INTERVAL`] and polls again, and
+//! stands down as soon as its mapping stops wanting to be polled — so a poller's lifetime is
+//! bounded by the resource it serves rather than by a timer that would leave a mapping
+//! reporting `Enabled` while nothing polls it, and one mapping's cadence is no other
+//! mapping's business. One pass is bounded too: at most one batch per invocation the mapping
+//! may have in flight, and the store holds at most [`super::MAX_EVENT_SOURCE_MAPPINGS`]
+//! mappings, which bounds the tasks there can ever be. With no async runtime to spawn onto
+//! there is no task, and [`poll_due`] — which is one pass over every mapping of the store and
+//! takes the instant it is working at — can be awaited directly instead. A caller that wants
+//! the passes to be ITS OWN, made when it says so rather than on a poller's interval, takes
+//! the store's poll claim ([`claim_poll_passes`], which keeps those pollers from starting at
+//! all) and then makes each pass with [`poll_passes_once`]: the same work, awaited rather
+//! than raced.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -103,7 +111,7 @@ use super::batch_item_failures::{
     processed_records, read_batch_item_failures, reports_batch_item_failures, BatchReport,
 };
 use super::event_source_authorization::IamState;
-use super::event_source_poller::Clients;
+use super::event_source_poller::{Clients, PollerClaim};
 use super::metrics::{EventCounts, FunctionMetrics};
 use super::{
     service_state, ComAmazonawsLambdaAwsgirapiserviceState, EVENT_SOURCE_MAPPING_STATE_ENABLED,
@@ -282,12 +290,26 @@ impl ::std::fmt::Debug for PollSession {
     }
 }
 
-/// Start the background poll loop for this engine's mappings, if one is not already running.
+/// Start the in-process poller of every queue mapping of this engine's store that wants one,
+/// for the mappings that have none running yet.
 ///
-/// Called by the operations that make or change a mapping. At most one loop runs per store
-/// (the store carries the claim), it polls for as long as the store holds a mapping that
-/// wants polling and stands down when it does not, and with no async runtime to spawn onto
-/// there is no loop — a caller can then drive the same work through [`poll_due`].
+/// Called by the operations that make or change a mapping. At most ONE poller runs per
+/// MAPPING (the store carries that claim,
+/// [`ComAmazonawsLambdaAwsgirapiserviceState::claim_event_source_poller`]), and each of them
+/// polls its own mapping alone: a mapping is a consumer of its own event source, so what one
+/// mapping's function takes to answer is no part of what another mapping's records wait for.
+/// A poller stands down as soon as its mapping stops wanting to be polled, so none of them
+/// outlives the mapping it polls, and the store holds at most
+/// [`super::MAX_EVENT_SOURCE_MAPPINGS`] mappings, so the tasks this can ever spawn are
+/// bounded by that count. Nothing keeps a task handle: a poller ends ITSELF at its next
+/// wake-up, in the same critical section that gives its claim back ([`PollerClaim`], the
+/// claim type the reader of the other kind of event source uses too), which is what bounds
+/// its life by the resource it serves rather than by a handle somebody has to remember to
+/// abort.
+///
+/// With no async runtime to spawn onto there is no poller — a caller can then drive the same
+/// work through [`poll_due`] — and while a caller holds the store's poll claim
+/// ([`claim_poll_passes`]) this starts nothing, because the passes are that caller's to make.
 pub fn drive_sqs_pollers<Eng: Send + Sync + 'static>(
     ctx: &smithy_server_runtime::OperationContext<'_>,
     engine: &Arc<Eng>,
@@ -298,50 +320,101 @@ pub fn drive_sqs_pollers<Eng: Send + Sync + 'static>(
     let Ok(runtime) = ::tokio::runtime::Handle::try_current() else {
         return;
     };
-    let Some(generation) = claim_poller(&mut state.lock()) else {
-        return;
+    // Which mappings want a poller this call has to start: the ones that want polling and
+    // whose claim is free, each claimed here so two tasks never poll one mapping.
+    let claimed: Vec<PollerClaim> = {
+        let mut store = state.lock();
+        // A caller that drives the passes itself holds the store's claim: nothing else polls
+        // that store while it does.
+        if store.sqs_poller_running {
+            return;
+        }
+        let wanted = wanted_queue_mappings(&store);
+        wanted
+            .into_iter()
+            .filter(|uuid| store.claim_event_source_poller(uuid))
+            .map(|uuid| PollerClaim {
+                state: ::engine::ServiceState::clone(&state),
+                uuid,
+                held: true,
+            })
+            .collect()
     };
     let callback = ctx.callback().clone();
-    // The CloudWatch store this loop's work is published to, resolved once because the
-    // handle does not change.
-    let metrics = FunctionMetrics::new(super::metrics::cloudwatch_state(&**engine));
-    let engine = Arc::clone(engine);
-    let claimed = ::engine::ServiceState::clone(&state);
-    let handle = runtime.spawn(async move {
-        let mut session = PollSession::default();
-        // The loop ends when nothing polls any more, which it observes — and releases its
-        // claim in — inside one critical section.
-        while polling_wanted_or_release(&mut state.lock(), generation) {
-            // Every wake-up waits, which is what hands the runtime back between polls. No
-            // lock is held across it.
-            ::tokio::time::sleep(POLL_INTERVAL).await;
-            poll_due(
-                &callback,
-                &mut session,
-                &*engine,
-                &metrics,
-                SystemTime::now(),
-            )
-            .await;
+    for claim in claimed {
+        let callback = callback.clone();
+        let engine = Arc::clone(engine);
+        // The CloudWatch store this poller's work is published to, resolved once per poller
+        // because the handle does not change.
+        let metrics = FunctionMetrics::new(super::metrics::cloudwatch_state(&*engine));
+        runtime.spawn(async move {
+            poll_one_mapping(&callback, claim, &metrics, &*engine).await;
+        });
+    }
+}
+
+/// The poll loop of ONE mapping: a pass of its own, [`POLL_INTERVAL`] later another, until it
+/// stops wanting to be polled.
+///
+/// Its bookkeeping ([`PollSession`]) is its own, carried from each of its passes to the next,
+/// and so is its cadence: a pass of this mapping waits for nothing another mapping is doing.
+async fn poll_one_mapping<Eng: Send + Sync + 'static>(
+    callback: &smithy_server_runtime::EmbeddedEmulator,
+    mut claim: PollerClaim,
+    metrics: &FunctionMetrics,
+    engine: &Eng,
+) {
+    let mut session = PollSession::default();
+    // The store this poller's mapping lives in, held beside the claim so the claim itself can
+    // be released through a lock taken here.
+    let state = ::engine::ServiceState::clone(&claim.state);
+    loop {
+        // Every wake-up waits, which is what hands the runtime back between passes. No lock
+        // is held across it.
+        ::tokio::time::sleep(POLL_INTERVAL).await;
+        // Whether this mapping still wants polling, and the claim's release, happen in ONE
+        // critical section, which is what makes the hand-over race-free: either this poller
+        // keeps the mapping, or the call that re-arms the pollers finds the claim free and
+        // starts one of its own.
+        {
+            let mut store = state.lock();
+            if !mapping_wants_polling(&store, &claim.uuid) {
+                claim.release(&mut store);
+                return;
+            }
         }
-    });
-    // The handle is kept so the loop it replaces is aborted rather than merely forgotten.
-    set_poller(&mut claimed.lock(), generation, handle);
+        poll_mapping_due(
+            callback,
+            &mut session,
+            engine,
+            metrics,
+            SystemTime::now(),
+            Some(&claim.uuid),
+        )
+        .await;
+    }
 }
 
 /// Take the one poll claim of `engine`'s store, so the passes of its queue mappings are the
-/// CALLER's to make: `true` when this call took it, `false` when a loop already holds it.
+/// CALLER's to make: `true` when this call took it, `false` when it is already held.
 ///
-/// [`drive_sqs_pollers`] starts a background loop only for a store whose claim is free, so
-/// while this claim is held nothing but the caller polls that store: each pass is one
+/// [`drive_sqs_pollers`] starts a poller only for a store whose claim is free, so while this
+/// claim is held nothing but the caller polls that store: each pass is one
 /// [`poll_passes_once`] call, made at the instant the caller chooses rather than on a wake-up
 /// interval. That is what lets a host advance a mapping's data plane IN STEP with the calls
 /// it makes — the same work, every rule this module states, awaited instead of raced — which
 /// is otherwise impossible to do, since nothing a caller can read says whether a pass has
 /// happened yet. The claim is kept for as long as the store lives: a caller that has taken
-/// over the passes keeps making them, and no loop takes over behind it.
+/// over the passes keeps making them, and no poller takes over behind it.
 pub fn claim_poll_passes<Eng: Send + Sync + 'static>(engine: &Arc<Eng>) -> bool {
-    service_state(&**engine).is_some_and(|state| claim_poller(&mut state.lock()).is_some())
+    service_state(&**engine).is_some_and(|state| {
+        let mut store = state.lock();
+        if store.sqs_poller_running {
+            return false;
+        }
+        store.sqs_poller_running = true;
+        true
+    })
 }
 
 /// ONE pass over every queue mapping of `engine`'s store, at `now`, for a caller that makes
@@ -367,12 +440,19 @@ pub async fn poll_passes_once<Eng: Send + Sync + 'static>(
 
 /// One wake-up's work: poll every enabled queue mapping this engine holds, at `now`.
 ///
-/// For each such mapping, in turn: whatever the clock already owed on the queues is applied,
-/// the queue's `RedrivePolicy` is applied to the messages that have had every delivery it
-/// allows, a batch of at most the mapping's `BatchSize` messages is handed over, the
-/// mapping's filter criteria decide which of them the function is invoked with, and what the
-/// pass did is metered. See this module's documentation for what each step is, and why a
-/// batch no invocation accepted is left on the queue.
+/// For each such mapping: whatever the clock already owed on the queues is applied, the
+/// queue's `RedrivePolicy` is applied to the messages that have had every delivery it allows,
+/// a batch of at most the mapping's `BatchSize` messages is handed over, the mapping's filter
+/// criteria decide which of them the function is invoked with, and what the pass did is
+/// metered. See this module's documentation for what each step is, and why a batch no
+/// invocation accepted is left on the queue.
+///
+/// The pass is in three parts, and that is what makes one mapping's deliveries independent of
+/// every other's: what each mapping has to hand over is taken out of its queue mapping by
+/// mapping (the locks and this session's bookkeeping, nothing awaited), every mapping's
+/// batches are then handed to their functions AT ONCE, and what each attempt came to is
+/// recorded mapping by mapping once they are all in. So a mapping whose function takes a long
+/// time, or whose invocations fail, holds up no other mapping of the store.
 ///
 /// The two stores are never locked at the same time, and no lock is held across an
 /// invocation: each step takes one lock, finishes with it and releases it before the next
@@ -383,6 +463,24 @@ pub async fn poll_due<Eng: Send + Sync + 'static>(
     engine: &Eng,
     metrics: &FunctionMetrics,
     now: SystemTime,
+) {
+    poll_mapping_due(callback, session, engine, metrics, now, None).await;
+}
+
+/// The whole of [`poll_due`], over ONE mapping when `only` names one and over every polling
+/// mapping of the store when it names none.
+///
+/// A mapping's own poller ([`poll_one_mapping`]) names its mapping, so its pass takes nothing
+/// out of another mapping's queue and hands nothing of another mapping over; a caller driving
+/// the passes of a whole store ([`poll_passes_once`]) names none, and gets one pass over all
+/// of them.
+async fn poll_mapping_due<Eng: Send + Sync + 'static>(
+    callback: &smithy_server_runtime::EmbeddedEmulator,
+    session: &mut PollSession,
+    engine: &Eng,
+    metrics: &FunctionMetrics,
+    now: SystemTime,
+    only: Option<&str>,
 ) {
     let Some(mappings) = service_state(engine) else {
         return;
@@ -400,7 +498,9 @@ pub async fn poll_due<Eng: Send + Sync + 'static>(
     let targets = {
         let mut store = mappings.lock();
         store.materialize_all(now);
-        polling_targets(&store)
+        // A pass of ONE mapping's own poller is about that mapping alone, and costs nothing
+        // per mapping beside it.
+        polling_targets(&store, only)
     };
     let at_secs = epoch_secs(now);
     // A mapping that no longer polls — disabled, deleted, or its function no longer
@@ -409,6 +509,15 @@ pub async fn poll_due<Eng: Send + Sync + 'static>(
     let polling: ::std::collections::BTreeSet<String> =
         targets.iter().map(|target| target.uuid.clone()).collect();
     session.gathering.retain(|uuid, _| polling.contains(uuid));
+    // And it is bookkeeping of nobody's: a mapping this pass does not poll has no idle minute
+    // to claim and no run of failures to count, so what this session remembers about it is let
+    // go with it rather than kept for the life of the store.
+    session.idle_minute.retain(|uuid, _| polling.contains(uuid));
+    session.failures.retain(|uuid, _| polling.contains(uuid));
+    // What each mapping has to hand over, taken out of its queue here: this half of the pass
+    // takes the stores' locks and this session's bookkeeping, so it is done mapping by mapping
+    // and awaits nothing. The hand-over itself comes after, every mapping's at once.
+    let mut handovers: Vec<Handover> = Vec::new();
     for target in targets {
         // Lambda reads the queue ACTING AS the function's execution role, so the reads this
         // pass would make are subject to the policies in force on that role AT THIS INSTANT
@@ -473,22 +582,36 @@ pub async fn poll_due<Eng: Send + Sync + 'static>(
                 }
             })
             .collect();
-        // The client every attempt of this pass is made through, resolved ONCE: the
+        // The client every attempt of this mapping is made through, resolved ONCE: the
         // invocations below are in flight together, so none of them may hold the session the
         // client is built on.
         let client = session.clients.lambda(callback, &target.region).clone();
-        // CONCURRENTLY: each batch the mapping may have in flight is handed to the function
-        // while the others are, so a mapping configured for several concurrent instances
-        // really runs several at once (see this module's documentation).
-        let attempts = ::futures_util::future::join_all(
-            admitted
-                .iter()
-                .map(|batch| batch_attempt(&client, &target, batch, &queues, hold_seconds)),
-        )
-        .await;
-        // What each attempt came to, recorded one at a time: the queue writes and this
-        // session's own bookkeeping are the pass's, not an attempt's.
-        for (batch, attempt) in admitted.iter().zip(attempts) {
+        handovers.push(Handover {
+            target,
+            admitted,
+            counts,
+            client,
+            hold_seconds,
+        });
+    }
+
+    // CONCURRENTLY, across the mappings as well as within one: each mapping's batches are
+    // handed to its function while every other mapping's are, so one mapping's slow or
+    // failing function delays no other mapping's deliveries — a mapping is polled by its own
+    // poller, and what one function takes to answer is no part of what another mapping's
+    // records wait for.
+    let attempted = ::futures_util::future::join_all(
+        handovers
+            .iter()
+            .map(|handover| handover.hand_over(&queues)),
+    )
+    .await;
+
+    // What each attempt came to, recorded one at a time: the queue writes and this session's
+    // own bookkeeping are the pass's, not an attempt's.
+    for (handover, attempts) in handovers.iter_mut().zip(attempted) {
+        let (target, counts) = (&handover.target, &mut handover.counts);
+        for (batch, attempt) in handover.admitted.iter().zip(attempts) {
             match attempt {
                 Ok(processed) => {
                     // The messages the attempt PROCESSED leave the queue — that is what a
@@ -499,10 +622,10 @@ pub async fn poll_due<Eng: Send + Sync + 'static>(
                     counts.invoked = counts
                         .invoked
                         .saturating_add(count_of(batch.invoking.len()));
-                    delete_messages(&queues, &target, &processed);
+                    delete_messages(&queues, target, &processed);
                     counts.deleted = counts.deleted.saturating_add(count_of(processed.len()));
                     session.failures.remove(&target.uuid);
-                    record_attempt(&mappings, &target, LAST_PROCESSING_RESULT_OK);
+                    record_attempt(&mappings, target, LAST_PROCESSING_RESULT_OK);
                 }
                 Err(detail) => {
                     // Not processed: nothing is deleted, so every message comes back when
@@ -524,17 +647,58 @@ pub async fn poll_due<Eng: Send + Sync + 'static>(
                     }
                     record_attempt(
                         &mappings,
-                        &target,
+                        target,
                         LAST_PROCESSING_RESULT_FUNCTION_CALL_FAILED,
                     );
                 }
             }
         }
         if target.meters_event_counts {
-            metrics.publish_event_counts(&target.uuid, &counts, at_secs);
+            metrics.publish_event_counts(&target.uuid, counts, at_secs);
             // This pass polled, so the next idle minute is one to publish a zero for.
             session.idle_minute.remove(&target.uuid);
         }
+    }
+}
+
+/// What ONE mapping has to hand its function in this pass: the batches already taken out of
+/// its queue, what the pass has counted for them so far, and what the hand-over needs.
+///
+/// A pass builds one of these per mapping while it holds the stores' locks, and then hands
+/// every one of them over AT ONCE ([`poll_due`]).
+struct Handover {
+    /// The mapping this is the hand-over of.
+    target: PollTarget,
+    /// Its batches, with what each one's filter criteria admitted.
+    admitted: Vec<AdmittedBatch>,
+    /// What the pass has counted for this mapping so far: what it polled, and what the filter
+    /// rejected and the pass therefore deleted. The invoked and deleted counts of the attempts
+    /// are added once they are in.
+    counts: EventCounts,
+    /// The client each of its attempts is made through.
+    client: ::aws_sdk_lambda::Client,
+    /// How long the hold on each of its batches is renewed by while its attempt runs.
+    hold_seconds: i64,
+}
+
+impl Handover {
+    /// Hand every batch of this mapping to its function, each of them while the others are —
+    /// as many at once as the mapping may have invocations in flight ([`PollTarget`]'s
+    /// `in_flight_batches`) — and answer what each attempt came to, in the batches' own order.
+    async fn hand_over(
+        &self,
+        queues: &::engine::ServiceState<sqs::state::ComAmazonawsSqsAmazonsqsState>,
+    ) -> Vec<Result<Vec<String>, String>> {
+        ::futures_util::future::join_all(self.admitted.iter().map(|batch| {
+            batch_attempt(
+                &self.client,
+                &self.target,
+                batch,
+                queues,
+                self.hold_seconds,
+            )
+        }))
+        .await
     }
 }
 
@@ -1294,7 +1458,8 @@ fn count_of(messages: usize) -> u32 {
     u32::try_from(messages).unwrap_or(u32::MAX)
 }
 
-/// The queue of every mapping that is polling at this instant.
+/// The queue of every mapping that is polling at this instant, or of the ONE mapping `only`
+/// names when it names one.
 ///
 /// A mapping polls when it reports `Enabled` — "when true, the event source mapping is
 /// active. When false, Lambda pauses polling and invocation" — its event source is an Amazon
@@ -1302,13 +1467,21 @@ fn count_of(messages: usize) -> u32 {
 /// "Lambda reads items from the event source and invokes the function", so a mapping whose
 /// function cannot be invoked yet takes nothing out of the queue.
 ///
+/// `only` is what makes a pass of ONE mapping's own poller cost nothing per mapping beside
+/// it: that mapping is selected before any target is built, so the store's other mappings are
+/// never read, parsed or cloned.
+///
 /// Read it only after [`ComAmazonawsLambdaAwsgirapiserviceState::materialize_all`], so a
 /// mapping the clock has already moved into `Enabled` is polled and one it has removed is
 /// not.
-fn polling_targets(store: &ComAmazonawsLambdaAwsgirapiserviceState) -> Vec<PollTarget> {
+fn polling_targets(
+    store: &ComAmazonawsLambdaAwsgirapiserviceState,
+    only: Option<&str>,
+) -> Vec<PollTarget> {
     store
         .event_source_mappings
         .values()
+        .filter(|mapping| only.is_none_or(|uuid| mapping.uuid == uuid))
         .filter(|mapping| {
             mapping.state == EVENT_SOURCE_MAPPING_STATE_ENABLED
                 && !mapping.is_deleting()
@@ -1391,69 +1564,38 @@ fn queue_event_source(event_source_arn: Option<&str>) -> Option<&str> {
         .then_some(arn)
 }
 
-/// Claim the single poll loop for this store: the claim's GENERATION when the caller may
-/// start one, `None` when one already runs.
-fn claim_poller(store: &mut ComAmazonawsLambdaAwsgirapiserviceState) -> Option<u64> {
-    if store.sqs_poller_running {
-        return None;
-    }
-    store.sqs_poller_running = true;
-    store.sqs_poller_generation = store.sqs_poller_generation.wrapping_add(1);
-    Some(store.sqs_poller_generation)
+/// Whether the mapping `uuid` names wants a poller of its own at this instant: it is a
+/// mapping of this store, on an Amazon SQS queue, that is `Enabled` and not being deleted.
+///
+/// A mapping still SETTLING into `Enabled` counts: the state it settles into is its `Enabled`
+/// setting, and the clock owes that move, so its poller waits for it rather than standing
+/// down between the create and the move it already knows about. Whether the mapping's
+/// FUNCTION can be invoked yet is a question of each PASS ([`polling_targets`]) and not of
+/// the poller's life: a mapping whose function is not `Active` yet polls nothing and keeps
+/// its poller, which reads the queue as soon as the function is invocable.
+fn mapping_wants_polling(store: &ComAmazonawsLambdaAwsgirapiserviceState, uuid: &str) -> bool {
+    store
+        .event_source_mappings
+        .get(uuid)
+        .is_some_and(wants_polling)
 }
 
-/// Release the claim `generation` took — and ONLY that one, so a loop standing down cannot
-/// clear a claim a loop started since is holding.
-fn release_poller(store: &mut ComAmazonawsLambdaAwsgirapiserviceState, generation: u64) {
-    if store.sqs_poller_generation == generation {
-        store.sqs_poller_running = false;
-    }
+/// Every mapping of this store that wants a poller of its own ([`mapping_wants_polling`]).
+fn wanted_queue_mappings(store: &ComAmazonawsLambdaAwsgirapiserviceState) -> Vec<String> {
+    store
+        .event_source_mappings
+        .values()
+        .filter(|mapping| wants_polling(mapping))
+        .map(|mapping| mapping.uuid.clone())
+        .collect()
 }
 
-/// Keep the running loop's task handle, aborting the one it replaces.
-///
-/// Only when `generation` is still the CURRENT claim. A loop can end before its starter gets
-/// here (it releases its own claim as soon as no mapping polls), and a call that claimed the
-/// loop since then has stored a handle of its own: replacing that one would abort a live
-/// loop and leave its claim held for ever. So a stale starter installs nothing and aborts
-/// nothing — its own task has already released its claim, so it stands down on its own.
-fn set_poller(
-    store: &mut ComAmazonawsLambdaAwsgirapiserviceState,
-    generation: u64,
-    handle: ::tokio::task::JoinHandle<()>,
-) {
-    if store.sqs_poller_generation != generation {
-        return;
-    }
-    if let Some(previous) = store.sqs_poller.replace(handle) {
-        previous.abort();
-    }
-}
-
-/// Whether any mapping of this store still wants polling — and, when none does, RELEASE the
-/// claim `generation` holds.
-///
-/// Observing "nothing polls" and standing down happen in ONE critical section, which is what
-/// makes the hand-over race-free: a create holds this same lock to store its mapping BEFORE
-/// it tries to claim the loop, so either this call sees that mapping and the running loop
-/// keeps it, or the create's claim finds the flag cleared and starts a loop of its own.
-///
-/// A mapping still SETTLING into `Enabled` counts: the state it settles into is its
-/// `Enabled` setting, and the clock owes that move, so the loop waits for it rather than
-/// standing down between the create and the move it already knows about.
-fn polling_wanted_or_release(
-    store: &mut ComAmazonawsLambdaAwsgirapiserviceState,
-    generation: u64,
-) -> bool {
-    let wanted = store.event_source_mappings.values().any(|mapping| {
-        mapping.enabled
-            && !mapping.is_deleting()
-            && queue_event_source(mapping.event_source_arn.as_deref()).is_some()
-    });
-    if !wanted {
-        release_poller(store, generation);
-    }
-    wanted
+/// The ONE predicate behind both: the mapping polls an Amazon SQS queue, is `Enabled` and is
+/// not being deleted.
+fn wants_polling(mapping: &super::EventSourceMappingRecord) -> bool {
+    mapping.enabled
+        && !mapping.is_deleting()
+        && queue_event_source(mapping.event_source_arn.as_deref()).is_some()
 }
 
 #[cfg(test)]

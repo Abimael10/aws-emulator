@@ -993,6 +993,75 @@ pub(crate) async fn queue_held(router: &MultiServiceRouter, case: &str, url: &st
     messages_held(queue_message_counts(router, case, url).await)
 }
 
+/// Every body waiting on the queue `url` addresses right now, each DELETED as it is read, so
+/// a later look finds only the bodies that arrived since.
+///
+/// THE ONE reader of what a delivery left on a queue in these suites: a suite that observes a
+/// mapping through what its handler forwarded reads it this way rather than carrying a copy of
+/// the receive-and-delete pair.
+pub(crate) async fn taken_bodies(
+    router: &MultiServiceRouter,
+    case: &str,
+    url: &str,
+) -> Vec<String> {
+    let (status, answered) = call_sqs(
+        router,
+        "ReceiveMessage",
+        &json!({ "QueueUrl": url, "MaxNumberOfMessages": 10 }),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: expected ReceiveMessage on {url} to answer 200, got {status} {answered}"
+    );
+    let mut bodies = Vec::new();
+    for message in answered["Messages"].as_array().cloned().unwrap_or_default() {
+        let (status, deleted) = call_sqs(
+            router,
+            "DeleteMessage",
+            &json!({
+                "QueueUrl": url,
+                "ReceiptHandle": message["ReceiptHandle"].as_str().unwrap_or_default(),
+            }),
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected DeleteMessage on {url} to answer 200, got {status} {deleted}"
+        );
+        bodies.push(
+            message["Body"]
+                .as_str()
+                .unwrap_or_else(|| panic!("case {case:?}: a message with no Body in {answered}"))
+                .to_string(),
+        );
+    }
+    bodies
+}
+
+/// The python handler a suite deploys when the delivery itself is what it observes: it
+/// forwards each record of the event it is handed to the queue its environment names under
+/// [`RESULTS_QUEUE_URL`], so a body on that queue is one a mapping really delivered.
+///
+/// Shared for the same reason as [`taken_bodies`]: the suites over a mapping's deliveries
+/// observe them the one way.
+pub(crate) const FORWARDING_HANDLER: &str = r#"
+import os
+
+import boto3
+
+
+def lambda_handler(event, context):
+    client = boto3.client("sqs")
+    url = os.environ["RESULTS_QUEUE_URL"]
+    for record in event["Records"]:
+        client.send_message(QueueUrl=url, MessageBody=record["body"])
+    return {"forwarded": len(event["Records"])}
+"#;
+
+/// The environment variable [`FORWARDING_HANDLER`] reads the queue it forwards to from.
+pub(crate) const RESULTS_QUEUE_URL: &str = "RESULTS_QUEUE_URL";
+
 /// The `CreateEventSourceMapping` body for `function` and `event_source`, plus whatever
 /// `extras` states.
 pub(crate) fn create_request(function: &str, event_source: Option<&str>, extras: &Value) -> Value {
