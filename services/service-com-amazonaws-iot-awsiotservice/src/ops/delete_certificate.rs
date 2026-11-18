@@ -13,8 +13,9 @@
 //! status is set to ACTIVE" — and this handler maps its refusal onto the modelled error
 //! class: an id the account holds no certificate under is `ResourceNotFoundException`
 //! (HTTP 404), an `ACTIVE` certificate is `CertificateStateException` (HTTP 406), and a
-//! certificate that still holds attached policies is `DeleteConflictException`
-//! (HTTP 409), which `forceDelete` relaxes as that member documents.
+//! certificate an IoT thing still has attached — or one that still holds attached policies
+//! — is `DeleteConflictException` (HTTP 409), of which `forceDelete` relaxes the policies
+//! alone, as that member documents.
 //!
 //! Whether the caller MAY delete the certificate is not decided here: this emulator
 //! evaluates no permissions for any operation, so the modelled `UnauthorizedException` is
@@ -246,6 +247,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     "no-such-certificate"
                 }
                 Err(crate::state::CertificateDeletionRefusal::Active(_)) => "certificate-active",
+                Err(crate::state::CertificateDeletionRefusal::AttachedThings(_)) => {
+                    "things-attached"
+                }
                 Err(crate::state::CertificateDeletionRefusal::AttachedPolicies(_)) => {
                     "policies-attached"
                 }
@@ -267,7 +271,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         CertificateStateException { message },
                     )
                 }
-                crate::state::CertificateDeletionRefusal::AttachedPolicies(_) => {
+                crate::state::CertificateDeletionRefusal::AttachedThings(_)
+                | crate::state::CertificateDeletionRefusal::AttachedPolicies(_) => {
                     DeleteCertificateErrorModeled::DeleteConflictException(
                         DeleteConflictException { message },
                     )

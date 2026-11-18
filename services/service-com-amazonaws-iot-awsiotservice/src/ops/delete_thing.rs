@@ -9,6 +9,12 @@
 //! An `expectedVersion` that does not match the stored record is the modelled
 //! `VersionConflictException` (409) and deletes nothing.
 //!
+//! A thing that still has a PRINCIPAL attached is not deleted either: AWS IoT makes
+//! detach-before-delete mandatory, so while the thing-principal relation
+//! ([`crate::state::thing_principals`]) holds one for the thing, the delete is the modelled
+//! `InvalidRequestException` (400) and the record is left exactly as it was, for the caller
+//! to `DetachThingPrincipal` and delete then.
+//!
 //! A thing's JOB EXECUTIONS are not touched: they are the IoT Jobs data plane's
 //! records, keyed by the thing NAME, and that surface accepts a name the registry
 //! does not hold (see `CreateJob`). Deleting the executions of a job is `DeleteJob`'s
@@ -184,6 +190,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     )
                     .into());
                 }
+            }
+        }
+
+        // A thing a principal is still attached to is not torn out from under the
+        // credential that reaches it: the delete of one the thing-principal relation still
+        // holds an attachment for is the modelled `InvalidRequestException` (HTTP 400),
+        // naming the thing the request addressed, and the record is left untouched for the
+        // caller to detach and delete ([`crate::state::thing_principals`]). Read after the
+        // version precondition, which is about the record the caller believes it is deleting.
+        if let Some(registered) = store.things.get(&input.thing_name) {
+            if !registered.principals.is_empty() {
+                return Err(DeleteThingErrorModeled::InvalidRequestException(
+                    InvalidRequestException {
+                        message: Some(
+                            crate::state::attached_principals_thing_deletion_message(
+                                &registered.thing_name,
+                            ),
+                        ),
+                    },
+                )
+                .into());
             }
         }
 

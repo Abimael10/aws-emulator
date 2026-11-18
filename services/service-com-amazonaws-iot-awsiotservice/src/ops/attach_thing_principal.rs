@@ -1,15 +1,18 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op AttachThingPrincipal
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `AttachThingPrincipal`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`AttachThingPrincipal::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Records that the principal the request carries is attached to the thing it addresses, in
+//! the one relation this service keeps of that ([`crate::state::thing_principals`]), so
+//! `ListThingPrincipals` of that thing reports it afterwards and the two deletes the
+//! relation gates — of the thing and of the certificate — refuse while it stands.
+//!
+//! Both ends have to exist: a `thingName` the registry does not hold and a principal this
+//! account holds no certificate for are each the modelled `ResourceNotFoundException`
+//! (404), while a value that is no principal address at all, and a thing already holding as
+//! many principals as the relation takes, are the modelled `InvalidRequestException` (400).
+//! The attach is IDEMPOTENT: the pair is keyed by the resource the principal names, so
+//! repeating it leaves the same one attachment.
 //!
 //! ## Shape of an operation
 //!
@@ -151,18 +154,50 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `AttachThingPrincipal` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(AttachThingPrincipalErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("AttachThingPrincipal"))
+        // `ctx` carries request metadata only; this operation needs none of it.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(AttachThingPrincipalErrorModeled::InternalFailureException(
+                InternalFailureException {
+                    message: Some("the IoT emulator has no state store attached".to_string()),
+                },
+            )
+            .into());
+        };
+
+        // The whole decision and the whole write happen under one lock: what may refuse the
+        // attach is the account's own state — the thing, the certificate the principal names
+        // and how many principals the thing already holds — so no caller can observe the
+        // store between the check and the record.
+        let recorded = state.lock().attach_thing_principal(
+            &input.thing_name,
+            &input.principal,
+            input.thing_principal_type.as_deref(),
+        );
+
+        // Each refusal is answered as the error class the model declares for it, with the one
+        // sentence the state words it in, rather than as a hollow success.
+        if let Err(refusal) = recorded {
+            let message = Some(refusal.message());
+            return Err(match refusal {
+                crate::state::ThingPrincipalRefusal::MissingThing(_)
+                | crate::state::ThingPrincipalRefusal::NotFound(_) => {
+                    AttachThingPrincipalErrorModeled::ResourceNotFoundException(
+                        ResourceNotFoundException { message },
+                    )
+                }
+                crate::state::ThingPrincipalRefusal::Invalid(_)
+                | crate::state::ThingPrincipalRefusal::TooManyPrincipals(_) => {
+                    AttachThingPrincipalErrorModeled::InvalidRequestException(
+                        InvalidRequestException { message },
+                    )
+                }
+            }
+            .into());
+        }
+
+        // `AttachThingPrincipal` models no output members at all, so a recorded attachment is
+        // an empty 200; that it was recorded is read back through `ListThingPrincipals`.
+        Ok(AttachThingPrincipalOutput {})
     }
 }

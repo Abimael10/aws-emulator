@@ -1,15 +1,22 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DetachThingPrincipal
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DetachThingPrincipal`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DetachThingPrincipal::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Removes the attachment of the principal the request carries to the thing it addresses,
+//! from the one relation this service keeps of those
+//! ([`crate::state::thing_principals`]), so `ListThingPrincipals` of that thing stops
+//! reporting it and the deletes that relation gates stop refusing.
+//!
+//! A `thingName` the registry does not hold, and a principal this account holds no
+//! certificate for, are each the modelled `ResourceNotFoundException` (404); a value that
+//! is no principal address at all is the modelled `InvalidRequestException` (400). A
+//! principal that is NOT attached removes nothing and succeeds — the detach names no
+//! identity, so the thing holds the same attachments afterwards however often it is called.
+//!
+//! "This call is asynchronous. It might take several seconds for the detachment to
+//! propagate" is about AWS's own propagation and not about the registry: the record this
+//! relation keeps is written before the call answers, which is what the next read of it
+//! reports.
 //!
 //! ## Shape of an operation
 //!
@@ -147,18 +154,44 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DetachThingPrincipal` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DetachThingPrincipalErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DetachThingPrincipal"))
+        // `ctx` carries request metadata only; this operation needs none of it.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(DetachThingPrincipalErrorModeled::InternalFailureException(
+                InternalFailureException {
+                    message: Some("the IoT emulator has no state store attached".to_string()),
+                },
+            )
+            .into());
+        };
+
+        // The whole decision and the whole write happen under one lock, for the reason the
+        // attach takes both under one: what may refuse the detach is the account's own state.
+        let detached = state
+            .lock()
+            .detach_thing_principal(&input.thing_name, &input.principal);
+
+        if let Err(refusal) = detached {
+            let message = Some(refusal.message());
+            return Err(match refusal {
+                crate::state::ThingPrincipalRefusal::MissingThing(_)
+                | crate::state::ThingPrincipalRefusal::NotFound(_) => {
+                    DetachThingPrincipalErrorModeled::ResourceNotFoundException(
+                        ResourceNotFoundException { message },
+                    )
+                }
+                crate::state::ThingPrincipalRefusal::Invalid(_)
+                | crate::state::ThingPrincipalRefusal::TooManyPrincipals(_) => {
+                    DetachThingPrincipalErrorModeled::InvalidRequestException(
+                        InvalidRequestException { message },
+                    )
+                }
+            }
+            .into());
+        }
+
+        // `DetachThingPrincipal` models no output members at all, so the detach is an empty
+        // 200 whether or not an attachment was there to remove.
+        Ok(DetachThingPrincipalOutput {})
     }
 }

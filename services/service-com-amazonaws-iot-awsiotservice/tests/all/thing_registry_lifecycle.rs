@@ -28,6 +28,16 @@ use serde_json::{json, Map, Value};
 use service_com_amazonaws_iot_awsiotservice::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
 
+/// The deletes of a registry record that the account's own state GATES — a thing a
+/// principal is attached to, a certificate a thing is attached to, a thing group with child
+/// groups under it — and what a delete that is not gated removes, which is the other half of
+/// this crate's registry-lifecycle coverage. The `#[path]` is what keeps it a child of THIS
+/// suite rather than a second suite beside it: this crate's `tests/all.rs` declares the
+/// suites directly under `tests/all/`, and a module of a `#[path]`-declared file resolves
+/// next to that file unless it says otherwise.
+#[path = "thing_registry_lifecycle/dependent_resource_deletion.rs"]
+mod dependent_resource_deletion;
+
 /// The account id every emulated ARN carries (`emulator_server::EMULATOR_ACCOUNT_ID`).
 const ACCOUNT_ID: &str = "000000000000";
 /// The region the harness signs for unless a case names another.

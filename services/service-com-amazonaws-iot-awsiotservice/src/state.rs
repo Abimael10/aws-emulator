@@ -213,6 +213,15 @@ pub struct RegisteredThing {
     pub configuration: ThingConfiguration,
     /// The registry version of this record.
     pub version: i64,
+    /// The principals ATTACHED to this thing, keyed by the resource each one names — the
+    /// relation `AttachThingPrincipal` writes and `ListThingPrincipals` reads (see
+    /// [`thing_principals`]). Ordered, so a paginated reader over it is stable.
+    ///
+    /// It is NOT part of [`ThingConfiguration`], for the reason a group's members are not
+    /// part of a group's: which credentials reach a thing is not what the thing is
+    /// configured with, so two things reached through different certificates were
+    /// configured alike and a repeat create of one is still the same thing.
+    pub principals: BTreeMap<String, ThingPrincipalAttachment>,
 }
 
 /// The `version` a freshly registered thing carries.
@@ -238,6 +247,10 @@ impl RegisteredThing {
             thing_arn,
             configuration,
             version: FIRST_THING_VERSION,
+            // A create attaches no principal: an attachment is written by
+            // `AttachThingPrincipal`, or by the provisioning path that provisions a device
+            // with the certificate it connects as ([`thing_provisioning`]).
+            principals: BTreeMap::new(),
         }
     }
 
@@ -3142,6 +3155,18 @@ pub use thing_registration_reports::ReportObjects;
 // `crate::state::<name>`.
 pub mod thing_update;
 pub use thing_update::{AttributeUpdate, ThingUpdate, ThingUpdateRefusal};
+
+// WHICH PRINCIPALS are attached to which thing — what a thing principal is, how one is
+// resolved against this account's state, and the relation `AttachThingPrincipal`,
+// `DetachThingPrincipal` and `ListThingPrincipals` are three views of — lives in
+// `state/thing_principals.rs`, beside the thing record it hangs off. Its names are
+// re-exported here so a handler reaches them as `crate::state::<name>`.
+pub mod thing_principals;
+pub use thing_principals::{
+    attached_principals_thing_deletion_message, unsupported_thing_principal_message,
+    ResolvedThingPrincipal, ThingPrincipal, ThingPrincipalAttachment, ThingPrincipalRefusal,
+    DEFAULT_THING_PRINCIPAL_TYPE, MAX_PRINCIPALS_PER_THING,
+};
 
 // What an UPDATE of a thing GROUP record changes — the properties the request carries,
 // under the same optimistic concurrency `expectedVersion` states — lives in

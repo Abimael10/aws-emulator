@@ -278,8 +278,9 @@ struct DeclaredResource {
 ///
 /// The ARNs answered are the ARNs of records this store holds afterwards: the thing the
 /// template's thing resource describes, the certificate its certificate resource names and
-/// the policy its policy resource names — and a policy attached to that certificate, which
-/// is what provisioning a device with a policy amounts to.
+/// the policy its policy resource names — plus the two attachments provisioning a device
+/// amounts to: the policy attached to that certificate, and that certificate attached to
+/// the thing as the principal the device connects as.
 pub fn provision_template(
     store: &mut ComAmazonawsIotAwsiotserviceState,
     region: &str,
@@ -333,11 +334,25 @@ pub fn provision_template(
             return Err(ProvisioningRefusal::Resource(limit.message().to_string()));
         }
     }
+    // The device CONNECTS as that certificate, so a template declaring one provisions the
+    // thing-principal attachment too — the relation `AttachThingPrincipal` writes and
+    // `ListThingPrincipals` reads — and whether the relation will take it is read HERE, where
+    // nothing has been written, from the one place its ceiling lives
+    // ([`ComAmazonawsIotAwsiotserviceState::thing_principal_refusal_for`], which the write
+    // itself answers).
+    if let Some(certificate) = &certificate {
+        if let Some(refusal) =
+            store.thing_principal_refusal_for(&thing.thing_name, &certificate.principal)
+        {
+            return Err(ProvisioningRefusal::Resource(refusal.message()));
+        }
+    }
 
     // The thing's own write is the one that can still refuse — a name the registry holds
     // with a different configuration, a thing type it does not hold — so it is made first
     // and nothing else is written until it succeeds. Every other write below has had its
     // refusals read off the store already, so none of them can fail once this one has.
+    let thing_name = thing.thing_name.clone();
     let registered = store
         .register_thing(region, thing.thing_name, thing.configuration)
         .map_err(|refusal| ProvisioningRefusal::Resource(refusal.message()))?;
@@ -368,6 +383,14 @@ pub fn provision_template(
             certificate.certificate_arn.clone(),
         );
         provisioned.certificate_pem = Some(certificate.certificate_pem.clone());
+
+        // The provisioned thing is reached through this certificate, so the attachment is
+        // recorded in the one relation that keeps it; the plan has read its ceiling, so this
+        // cannot refuse either. It is what makes a `DeleteThing` of a provisioned device
+        // refuse until the caller detaches the certificate, exactly as AWS IoT refuses it.
+        store
+            .record_thing_principal(&thing_name, &certificate.principal, None)
+            .map_err(|refusal| ProvisioningRefusal::Resource(refusal.message()))?;
 
         // Recorded in the one relation `AttachPolicy` writes and `ListAttachedPolicies`
         // reads; the plan has read its ceilings, so this cannot refuse either.
@@ -454,6 +477,10 @@ struct PlannedCertificate {
     /// The certificate as a target of the policy-attachment relation, resolved here so the
     /// attachment a declared policy makes is admissible before anything is written.
     target: super::ResolvedPolicyTarget,
+    /// The certificate as a PRINCIPAL of the thing-principal relation, resolved here for the
+    /// same reason: the thing the template provisions is reached through this certificate,
+    /// so provisioning records that attachment too.
+    principal: super::ResolvedThingPrincipal,
 }
 
 /// Resolve one certificate declaration, or say why it provisions nothing.
@@ -513,6 +540,12 @@ fn planned_certificate(
         .resolve_policy_target(&record.certificate_arn)
         .map_err(|refusal| ProvisioningRefusal::Resource(refusal.message().to_string()))?;
 
+    // It is also the principal the provisioned THING is reached through, so what it is in
+    // the thing-principal relation ([`super::thing_principals`]) is resolved here beside it.
+    let principal = store
+        .resolve_thing_principal(&record.certificate_arn)
+        .map_err(|refusal| ProvisioningRefusal::Resource(refusal.message()))?;
+
     Ok(PlannedCertificate {
         logical_id: resource.logical_id.clone(),
         certificate_id: record.certificate_id.clone(),
@@ -520,6 +553,7 @@ fn planned_certificate(
         certificate_pem: record.certificate_pem.clone(),
         status,
         target,
+        principal,
     })
 }
 

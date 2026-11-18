@@ -1,15 +1,28 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteThingGroup
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteThingGroup`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteThingGroup::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Removes the thing group the request names from the thing-group registry
+//! ([`crate::state::ComAmazonawsIotAwsiotserviceState::thing_groups`]), so a later
+//! `DescribeThingGroup` of that name is the modelled 404 and the hierarchy no longer walks
+//! through it. A name the registry does not hold deletes nothing and still succeeds, which
+//! is why this operation models no `ResourceNotFoundException` at all
+//! (`smithy_query(query="operation",operation="DeleteThingGroup")` lists InternalFailure,
+//! InvalidRequest, Throttling and VersionConflict): the delete is idempotent.
+//!
+//! Two preconditions are read before anything is removed, and each leaves the group exactly
+//! as it was:
+//!
+//! * a group that still has CHILD groups hanging under it is the modelled
+//!   `InvalidRequestException` (400) — the hierarchy is deleted from the leaves up, so a
+//!   caller deletes the children first;
+//! * an `expectedVersion` that does not match the record's own version is the modelled
+//!   `VersionConflictException` (409), the same optimistic concurrency `UpdateThingGroup`
+//!   runs under.
+//!
+//! A DYNAMIC group is deleted through `DeleteDynamicThingGroup` instead, so naming one here
+//! is the modelled `InvalidRequestException` (400) and removes nothing — the mirror of what
+//! that operation answers for a static group.
 //!
 //! ## Shape of an operation
 //!
@@ -104,6 +117,34 @@ impl From<DeleteThingGroupErrorModeled> for DeleteThingGroupError {
     }
 }
 
+/// Record this state-changing call for attribution: the operation, the identity the request
+/// PRESENTED (the SigV4 access key id, a public identifier and never a secret), the request
+/// target, the group the call named and how the call ended.
+///
+/// A delete is the one call that makes a thing group stop existing, so without a record
+/// nothing about it is observable afterwards — the group it removed is gone. Every
+/// request-derived field goes through [`crate::state::audit_field`], which bounds it and
+/// strips the control characters that would otherwise forge a second record; the subscriber
+/// supplies the timestamp.
+fn audit(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    thing_group_name: &str,
+    outcome: &'static str,
+) {
+    let parts = ctx.parts();
+    ::tracing::info!(
+        target: "emulator::audit",
+        service = ctx.identity().signing_name(),
+        operation = "DeleteThingGroup",
+        access_key_id = %crate::state::audit_field(&::engine::extract_akid(&parts.headers)),
+        request_target =
+            %crate::state::audit_field(&format!("{} {}", parts.method, parts.uri.path())),
+        thing_group_name = %crate::state::audit_field(thing_group_name),
+        outcome,
+        "state-changing operation"
+    );
+}
+
 /// The `DeleteThingGroup` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -140,18 +181,104 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteThingGroup` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteThingGroupErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteThingGroup"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(DeleteThingGroupErrorModeled::InternalFailureException(
+                InternalFailureException {
+                    message: Some("the IoT emulator has no state store attached".to_string()),
+                },
+            )
+            .into());
+        };
+
+        // The whole decision and the whole write happen under one lock, so no caller can
+        // observe the registry between the preconditions and the removal.
+        let mut store = state.lock();
+
+        // A name the account holds no group under leaves the registry in the state the
+        // caller asked for: the delete is idempotent, so a repeat of it succeeds having
+        // removed nothing.
+        if let Some(group) = store.thing_groups.get(&input.thing_group_name) {
+            // This operation deletes STATIC groups: a dynamic group is deleted through
+            // `DeleteDynamicThingGroup`, so naming one here is the modelled
+            // `InvalidRequestException` (HTTP 400) and nothing is removed.
+            if group.dynamic_query.is_some() {
+                audit(ctx, &input.thing_group_name, "dynamic-thing-group");
+                return Err(DeleteThingGroupErrorModeled::InvalidRequestException(
+                    InvalidRequestException {
+                        message: Some(dynamic_thing_group_message(&group.thing_group_name)),
+                    },
+                )
+                .into());
+            }
+
+            // `expectedVersion` is "The expected version of the thing group to delete", so a
+            // request naming a version the record is not at is acting on a group someone
+            // else has moved: the modelled `VersionConflictException` (HTTP 409), nothing
+            // deleted, worded the way this family words a version conflict
+            // ([`crate::state::thing_group_version_conflict_message`]).
+            if let Some(expected_version) = input.expected_version {
+                if expected_version != group.version {
+                    audit(ctx, &input.thing_group_name, "version-conflict");
+                    return Err(DeleteThingGroupErrorModeled::VersionConflictException(
+                        VersionConflictException {
+                            message: Some(
+                                crate::state::thing_group_version_conflict_message(
+                                    &group.thing_group_name,
+                                ),
+                            ),
+                        },
+                    )
+                    .into());
+                }
+            }
+
+            // A group's place in the hierarchy is its own record's `parentGroupName`, so a
+            // group still named as a parent has children that would be orphaned by its
+            // removal: the modelled `InvalidRequestException` (HTTP 400), and the group —
+            // with every child under it — is left exactly as it was.
+            let children = store.child_thing_groups(&input.thing_group_name);
+            if !children.is_empty() {
+                audit(ctx, &input.thing_group_name, "child-groups-attached");
+                return Err(DeleteThingGroupErrorModeled::InvalidRequestException(
+                    InvalidRequestException {
+                        message: Some(attached_child_groups_message(&input.thing_group_name)),
+                    },
+                )
+                .into());
+            }
+
+            // The name is the group's identity and its key in the registry, so removing that
+            // entry is what makes every later reader of the registry stop reporting it — the
+            // describe path, the listings, and the hierarchy walk of any other group.
+            store.thing_groups.remove(&input.thing_group_name);
+            audit(ctx, &input.thing_group_name, "deleted");
+        } else {
+            // What the call DID is the one thing a later reader cannot recover, and "the
+            // registry held no such group" is as much of that as a removal is.
+            audit(ctx, &input.thing_group_name, "no-such-thing-group");
+        }
+
+        // `DeleteThingGroup` models no output members at all, so a successful delete is an
+        // empty 200; that the group is gone is read back through `DescribeThingGroup`.
+        Ok(DeleteThingGroupOutput {})
     }
+}
+
+/// The message AWS IoT refuses the delete of a group that still has child groups with.
+///
+/// The fixed text is the class's — including the space before the colon, which is how AWS
+/// IoT words this one — and the only variable part is the `thingGroupName` the request
+/// addressed. How many children it has is not part of it.
+fn attached_child_groups_message(thing_group_name: &str) -> String {
+    format!(
+        "Cannot delete thing group : {thing_group_name} when there are still child groups \
+         attached to it"
+    )
+}
+
+/// The message this service refuses the delete of a DYNAMIC group through this operation
+/// with: the mirror of what `DeleteDynamicThingGroup` answers for a static one, so a caller
+/// that used the wrong one of the pair is told which kind of group it named.
+fn dynamic_thing_group_message(thing_group_name: &str) -> String {
+    format!("Thing group {thing_group_name} is a dynamic thing group")
 }

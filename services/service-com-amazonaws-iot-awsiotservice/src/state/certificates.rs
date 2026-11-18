@@ -373,6 +373,17 @@ pub fn internal_certificate_status_message(new_status: &str) -> String {
     )
 }
 
+/// The message a delete refuses a certificate that still has an IoT THING attached with.
+///
+/// The same shape as [`attached_policies_deletion_message`] and for the same reason — a
+/// delete conflict is worded after the relation that holds the resource back and names the
+/// resource by its ARN, because `DetachThingPrincipal` takes the certificate as a principal
+/// ARN rather than as an id — and the relation it names is the thing-principal one
+/// ([`super::thing_principals`]).
+pub fn attached_things_deletion_message(certificate_arn: &str) -> String {
+    format!("Things must be detached before deletion (arn: {certificate_arn})")
+}
+
 /// Why a certificate was NOT deleted.
 ///
 /// Each variant names the modelled error class the refusal answers with, so the one rule
@@ -386,6 +397,9 @@ pub enum CertificateDeletionRefusal {
     /// A certificate whose status is [`CERTIFICATE_STATUS_ACTIVE`]:
     /// `CertificateStateException` (HTTP 406).
     Active(String),
+    /// A certificate that still has an IoT thing attached to it, through the
+    /// thing-principal relation: `DeleteConflictException` (HTTP 409).
+    AttachedThings(String),
     /// A certificate that still holds attached policies: `DeleteConflictException`
     /// (HTTP 409).
     AttachedPolicies(String),
@@ -395,9 +409,10 @@ impl CertificateDeletionRefusal {
     /// The message the refusal states, whichever class it names.
     pub fn message(&self) -> &str {
         match self {
-            Self::NotFound(message) | Self::Active(message) | Self::AttachedPolicies(message) => {
-                message
-            }
+            Self::NotFound(message)
+            | Self::Active(message)
+            | Self::AttachedThings(message)
+            | Self::AttachedPolicies(message) => message,
         }
     }
 }
@@ -421,11 +436,12 @@ impl super::ComAmazonawsIotAwsiotserviceState {
     /// the status rule, which that same sentence requires to hold before the force
     /// applies.
     ///
-    /// A certificate attached to an IoT THING is held back by the same rule, but nothing
-    /// in this service records a thing's principals yet (`AttachThingPrincipal` is
-    /// unimplemented), so no certificate can be in that relation and the refusal has
-    /// nothing to read: the day a thing principal is recorded, that conflict belongs
-    /// here beside this one.
+    /// A certificate attached to an IoT THING is held back by the same rule, and that
+    /// attachment is read FIRST: the force relaxes only the policies — `forceDelete` is
+    /// documented to force the deletion of a certificate that "is not attached to an IoT
+    /// thing" — so a certificate a thing still reaches through is refused whatever else is
+    /// attached to it, and the refusal names the relation the caller has to clear, the
+    /// thing-principal one ([`super::thing_principals`]).
     pub fn delete_certificate(
         &mut self,
         certificate_id: &str,
@@ -442,6 +458,19 @@ impl super::ComAmazonawsIotAwsiotserviceState {
             ));
         }
         let certificate_arn = certificate.certificate_arn.clone();
+
+        // The certificate is the PRINCIPAL a thing is reached through, so a thing that
+        // still has it attached holds the delete back whether or not the delete is forced:
+        // "Forces the deletion of a certificate if it is inactive and is not attached to an
+        // IoT thing" (`DeleteCertificate$forceDelete`) relaxes the attached POLICIES and
+        // not this. Read ahead of them, so the refusal names the attachment the caller has
+        // to clear first.
+        let principal_key = super::ThingPrincipal::Certificate(certificate_id.to_string()).key();
+        if !self.things_attached_to_principal(&principal_key).is_empty() {
+            return Err(CertificateDeletionRefusal::AttachedThings(
+                attached_things_deletion_message(&certificate_arn),
+            ));
+        }
 
         // The certificate is one target of the policy-attachment relation, under the key
         // every view of that relation records it by ([`super::PolicyTarget::key`]).
