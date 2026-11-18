@@ -12,14 +12,30 @@ use super::*;
 /// catalog is keyed on.
 ///
 /// Two rows are published as quotas OF A RESOURCE as well as of the account — the rules
-/// of one security group and the routes of one route table may be raised for an
-/// individual resource — so each names the level AWS publishes it as adjustable at and the
-/// resource type that plane applies to ([`QuotaRow::adjustable_at`]), and reports the
-/// RESOURCE scope on every record of it, because the plane the quota is counted on is the
-/// resource whichever record is read ([`QuotaRow::counted_per_resource`]).
+/// of one security group and the routes of one route table — so each names the resource
+/// type that plane applies to and the level AWS publishes the quota as adjustable at
+/// ([`QuotaRow::adjustable_at`]), which for both of them is the ACCOUNT: the value is
+/// applied to each resource, but an increase is asked for at the account level. Each also
+/// reports the RESOURCE scope on every record of it, because the plane the quota is
+/// counted on is the resource whichever record is read
+/// ([`QuotaRow::counted_per_resource`]).
 /// The planes CloudWatch publishes a count for carry that `AWS/Usage` `ResourceCount`
 /// metric, and with it the window those counts are published over; VPC's counts sit
 /// under the `EC2` service dimension, because the VPC API is served by EC2.
+///
+/// The recorded listing states the quota published under `L-5F53652F` (the Elastic IP
+/// addresses of one NAT gateway, 2), under `L-42B9C2CA` (the VPC Block Public Access
+/// exclusions of the Region, 50, NOT adjustable), under `L-CA6CC422` (the `resource` VPC
+/// endpoints of one VPC, 500) and under `L-8312C5BB` (the expiry of an unaccepted VPC
+/// peering connection request, NOT adjustable, with the hours in the quota's own text
+/// rather than in `Unit`). The prefix-list entry count, the prefix-list count, the peered
+/// Network Address Usage and the prefix-list reference count this catalog used to key on
+/// those four codes are NOT published here, and neither is the code it used to key the
+/// peering-request expiry on (`L-2C462E13`): no source available here states AWS's code
+/// for the first four or AWS's quota for the last one, so they are left to the
+/// default-quota-set gap rather than served under another quota's code. A row whose
+/// published `Description` no source available here states carries none, rather than a
+/// sentence this emulator words itself.
 pub(in crate::state) fn vpc_quotas() -> Vec<QuotaRow> {
     vec![
         // AWS publishes the IPv6 block plane of a VPC as adjustable, like the IPv4 one,
@@ -29,13 +45,12 @@ pub(in crate::state) fn vpc_quotas() -> Vec<QuotaRow> {
         quota("IPv6 CIDR blocks per VPC", 5.0)
             .code("L-085A6257")
             .describe("The maximum number of IPv6 CIDR blocks per VPC."),
-        // The rule plane of ONE security group: an increase may be asked for an
-        // individual security group as well as account-wide, the quota is counted on the
-        // security group whichever record is read, and CloudWatch publishes the count the
-        // quota is measured against.
+        // The rule plane of ONE security group: the value is applied to each security
+        // group, an increase is asked for at the account level, and CloudWatch publishes
+        // the count the quota is measured against.
         quota("Inbound or outbound rules per security group", 60.0)
             .code("L-0EA8095F")
-            .adjustable_at(LEVEL_ALL, "AWS::EC2::SecurityGroup")
+            .adjustable_at(LEVEL_ACCOUNT, "AWS::EC2::SecurityGroup")
             .counted_per_resource()
             .metric(usage_metric(
                 VPC_USAGE_SERVICE,
@@ -83,14 +98,6 @@ pub(in crate::state) fn vpc_quotas() -> Vec<QuotaRow> {
         quota("Security groups per network interface", 5.0)
             .code("L-2AFB9258")
             .describe("The maximum number of security groups per network interface."),
-        quota("Expiry time for an unaccepted VPC peering connection request", 168.0)
-            .code("L-2C462E13")
-            .unit("Hours")
-            .fixed()
-            .describe(
-                "The time, in hours, after which an unaccepted VPC peering connection \
-                 request expires.",
-            ),
         quota("Participant accounts per VPC", 100.0)
             .code("L-3248932A")
             .describe("The maximum number of accounts one VPC's subnets are shared with."),
@@ -100,12 +107,9 @@ pub(in crate::state) fn vpc_quotas() -> Vec<QuotaRow> {
         quota("Subnets per VPC", 200.0)
             .code("L-407747CB")
             .describe("The maximum number of subnets per VPC."),
-        quota("Customer-managed prefix lists per Region", 100.0)
+        quota("VPC Block Public Access exclusions per account per Region", 50.0)
             .code("L-42B9C2CA")
-            .describe(
-                "The maximum number of customer-managed prefix lists in this account in the \
-                 current Region.",
-            ),
+            .fixed(),
         quota("Versions per customer-managed prefix list", 1000.0)
             .code("L-44499CD2")
             .fixed()
@@ -125,29 +129,26 @@ pub(in crate::state) fn vpc_quotas() -> Vec<QuotaRow> {
                 "The maximum number of route tables per VPC. The main route table counts \
                  toward this quota.",
             ),
-        quota("Entries per customer-managed prefix list", 1000.0)
-            .code("L-5F53652F")
-            .describe(
-                "The maximum number of entries in one customer-managed prefix list.",
-            ),
+        quota("Elastic IP address quota per NAT gateway", 2.0).code("L-5F53652F"),
         quota("Active VPC peering connections per VPC", 50.0)
             .code("L-7E9ECCDB")
             .describe("The maximum number of active VPC peering connections per VPC."),
-        quota("References to a prefix list per resource type", 5000.0)
+        quota("Expiry time for an unaccepted VPC peering connection request", 168.0)
             .code("L-8312C5BB")
+            .fixed()
             .describe(
-                "The maximum number of references to one prefix list from the resources of \
-                 one resource type.",
+                "The time, in hours, after which an unaccepted VPC peering connection \
+                 request expires.",
             ),
         quota("IPv4 CIDR blocks per VPC", 5.0)
             .code("L-83CA0A9D")
             .describe("The maximum number of IPv4 CIDR blocks per VPC."),
         // The route plane of ONE route table, published like the security-group rules
-        // above: counted on the route table, adjustable for an individual route table as
-        // well as account-wide, and metered by the count CloudWatch publishes for it.
+        // above: the value is applied to each route table, an increase is asked for at the
+        // account level, and CloudWatch publishes the count it is measured against.
         quota("Routes per route table", 50.0)
             .code("L-93826ACB")
-            .adjustable_at(LEVEL_ALL, "AWS::EC2::RouteTable")
+            .adjustable_at(LEVEL_ACCOUNT, "AWS::EC2::RouteTable")
             .counted_per_resource()
             .metric(usage_metric(
                 VPC_USAGE_SERVICE,
@@ -181,12 +182,7 @@ pub(in crate::state) fn vpc_quotas() -> Vec<QuotaRow> {
                 "The maximum Network Address Usage of the resources in one VPC and the VPCs \
                  it is peered with in the same Region.",
             ),
-        quota("Peered Network Address Usage", 128_000.0)
-            .code("L-CA6CC422")
-            .describe(
-                "The maximum Network Address Usage of one VPC and all of the VPCs it is \
-                 peered with, across Regions.",
-            ),
+        quota("VPC endpoints of type 'resource' per VPC", 500.0).code("L-CA6CC422"),
         quota("Traffic mirror sessions per Region", 10_000.0)
             .code("L-CD17FD4B")
             .describe(

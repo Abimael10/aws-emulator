@@ -15,6 +15,15 @@ use super::*;
 /// account, the services and VPCs associated with one, and the listeners, rules and
 /// target groups a service routes through — so each row names the plane it counts. The
 /// one row published as a RATE carries the one-second window AWS publishes it over.
+///
+/// The recorded listing states the quota published under `L-87FCA9B2` (the size of one
+/// auth policy, in Kilobytes, NOT adjustable) and under `L-5FF8F9B9` (the resource
+/// configurations of the Region, 2000). The service-network count and the header-match
+/// condition count this catalog used to key on those two codes are NOT published here: no
+/// source available here states AWS's code for them, so they are left to the
+/// default-quota-set gap rather than served under another quota's code. A row whose
+/// published `Description` no source available here states carries none, rather than a
+/// sentence this emulator words itself.
 pub(in crate::state) fn vpc_lattice_quotas() -> Vec<QuotaRow> {
     vec![
         quota("Auth policies per resource", 1.0)
@@ -25,10 +34,7 @@ pub(in crate::state) fn vpc_lattice_quotas() -> Vec<QuotaRow> {
             .code("L-3DEC3B9F")
             .fixed()
             .describe("The maximum number of certificates associated with one service."),
-        quota("Header match conditions per rule", 5.0)
-            .code("L-5FF8F9B9")
-            .fixed()
-            .describe("The maximum number of header match conditions in one rule."),
+        quota("Resource configurations per AWS Region", 2000.0).code("L-5FF8F9B9"),
         quota("Listeners per service", 10.0)
             .code("L-6095700C")
             .describe("The maximum number of listeners on one service."),
@@ -42,12 +48,10 @@ pub(in crate::state) fn vpc_lattice_quotas() -> Vec<QuotaRow> {
         quota("Service network associations per service", 5.0)
             .code("L-75D4A19E")
             .describe("The maximum number of service networks one service is associated with."),
-        quota("Service networks per account", 10.0)
+        quota("Auth policy size", 10.0)
             .code("L-87FCA9B2")
-            .describe(
-                "The maximum number of service networks in this account in the current \
-                 Region.",
-            ),
+            .unit("Kilobytes")
+            .fixed(),
         quota("Service networks per VPC", 5.0)
             .code("L-89DEA27F")
             .describe("The maximum number of service networks one VPC is associated with."),

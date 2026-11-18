@@ -15,7 +15,20 @@ use super::*;
 /// serves, the shares a file gateway serves and the virtual tapes a tape gateway serves —
 /// which is why most rows are named for the plane of one gateway rather than for the
 /// account. A row that measures a capacity carries the unit AWS publishes it in rather
-/// than being a bare count.
+/// than being a bare count, except where the service names the unit IN the quota's own
+/// name and publishes `Unit` `None` for it.
+///
+/// The recorded listing states the quota published under `L-311F8856` (the largest virtual
+/// tape, 15, with the unit in the name), under `L-6D83F84B` (the cached volume gateway's
+/// upload-buffer minimum, 150), under `L-87640A7E` (the tape gateway's upload-buffer
+/// minimum, 150) and under `L-F3EDDF8C` (the tape gateway's cache minimum, 150). The
+/// stored-volume size, the virtual-tape count, the cache-disk count and the tag count this
+/// catalog used to key on those four codes are NOT published here, and neither is the code
+/// it used to key the virtual-tape size on (`L-6F75AC83`): no source available here states
+/// AWS's code for the first four or AWS's quota for the last one, so they are left to the
+/// default-quota-set gap rather than served under another quota's code. A row whose
+/// published `Description` no source available here states carries none, rather than a
+/// sentence this emulator words itself.
 pub(in crate::state) fn storagegateway_quotas() -> Vec<QuotaRow> {
     vec![
         quota("Gateways per Region", 100.0)
@@ -36,11 +49,9 @@ pub(in crate::state) fn storagegateway_quotas() -> Vec<QuotaRow> {
             .unit("TiB")
             .fixed()
             .describe("The maximum size, in TiB, of one cached volume."),
-        quota("Maximum size of a stored volume", 16.0)
+        quota("Max size of a virtual tape in TiB", 15.0)
             .code("L-311F8856")
-            .unit("TiB")
-            .fixed()
-            .describe("The maximum size, in TiB, of one stored volume."),
+            .fixed(),
         quota("Total cached volume storage per gateway", 1024.0)
             .code("L-4951D254")
             .unit("TiB")
@@ -66,15 +77,9 @@ pub(in crate::state) fn storagegateway_quotas() -> Vec<QuotaRow> {
             .unit("TiB")
             .fixed()
             .describe("The maximum size, in TiB, of one file written through a file share."),
-        quota("Virtual tapes per gateway", 1500.0)
+        quota("Cached volume gateway Upload Buffer Minimum in GiB", 150.0)
             .code("L-6D83F84B")
-            .fixed()
-            .describe("The maximum number of virtual tapes per tape gateway."),
-        quota("Maximum size of a virtual tape", 5.0)
-            .code("L-6F75AC83")
-            .unit("TiB")
-            .fixed()
-            .describe("The maximum size, in TiB, of one virtual tape."),
+            .fixed(),
         quota("Minimum size of a virtual tape", 100.0)
             .code("L-761F1680")
             .unit("Gigabytes")
@@ -94,10 +99,9 @@ pub(in crate::state) fn storagegateway_quotas() -> Vec<QuotaRow> {
             .code("L-81A6E497")
             .fixed()
             .describe("The maximum number of snapshot schedules per volume."),
-        quota("Cache disks per gateway", 20.0)
+        quota("Tape gateway Upload Buffer Minimum in GiB", 150.0)
             .code("L-87640A7E")
-            .fixed()
-            .describe("The maximum number of local disks used as cache by one gateway."),
+            .fixed(),
         quota("Upload buffer disks per gateway", 20.0)
             .code("L-96D17DE9")
             .fixed()
@@ -137,10 +141,9 @@ pub(in crate::state) fn storagegateway_quotas() -> Vec<QuotaRow> {
             .code("L-E0AEEBAC")
             .fixed()
             .describe("The maximum number of clients allowed by one NFS file share."),
-        quota("Tags per resource", 50.0)
+        quota("Tape gateway Cache Minimum in GiB", 150.0)
             .code("L-F3EDDF8C")
-            .fixed()
-            .describe("The maximum number of tags on one Storage Gateway resource."),
+            .fixed(),
         quota("Volumes per snapshot schedule", 1.0)
             .code("L-F5915598")
             .fixed()

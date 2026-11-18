@@ -11,9 +11,9 @@ use super::*;
 /// but the action's own name and the value is the same across the class: the window is one
 /// second, the usage metric is that action's `AWS/Usage` `CallCount`
 /// ([`call_count_metric`]) under the service's `AWS/Usage` display name, and the
-/// `Description` is the sentence AWS publishes for a request-rate quota with the action
-/// named in it ([`request_rate_description`]). Those are the quota's published members, so
-/// one constructor fills them and two rows of the class cannot drift apart.
+/// `Description` is the sentence this service words a request-rate quota with
+/// ([`sns_transaction_rate_description`]). Those are the quota's published members, so one
+/// constructor fills them and two rows of the class cannot drift apart.
 fn sns_transaction_rate(code: &str, api_name: &str, transactions_per_second: f64) -> QuotaRow {
     quota(
         format!("{api_name} Transactions per Second"),
@@ -22,7 +22,20 @@ fn sns_transaction_rate(code: &str, api_name: &str, transactions_per_second: f64
     .code(code)
     .period(1, "SECOND")
     .metric(call_count_metric(SNS_USAGE_SERVICE, api_name))
-    .describe(&request_rate_description(api_name))
+    .describe(&sns_transaction_rate_description(api_name))
+}
+
+/// The `Description` Amazon SNS publishes for one of its per-API transaction-rate quotas,
+/// with the action it throttles named in it.
+///
+/// SOURCE: the recorded default-quota listing of `sns`, which carries this exact sentence
+/// for the rate quota of its `CreatePlatformApplication` action. SNS words the fact as the
+/// number of TIMES AN ACTION MAY BE CALLED per second, which is not how other services
+/// word the same fact ([`request_rate_description`], [`api_rate_description`]); it is the
+/// wording of the whole SNS class, so one constructor fills it and two rows of the class
+/// cannot drift apart.
+fn sns_transaction_rate_description(api_name: &str) -> String {
+    format!("The maximum number of times the {api_name} action can be called per second.")
 }
 
 /// The name `AWS/Usage` publishes Amazon SNS's API call counts under.
@@ -44,18 +57,29 @@ const SNS_USAGE_SERVICE: &str = "SNS";
 /// [`sns_transaction_rate`]. The six that are not are the resource planes of the account
 /// — its topics, their subscriptions, and the shape of one message — which are counted
 /// rather than metered per second and so carry neither a window nor a call count.
+///
+/// The recorded listing states which action's rate is published under `L-4738DDCE`
+/// (`CreatePlatformApplication`, 900 per second), under `L-FF07E5EA`
+/// (`ConfirmSubscription`, 900 per second) and under `L-390AADBE`
+/// (`ListSubscriptionsByTopic`, published as NOT adjustable). The `GetEndpointAttributes`,
+/// `VerifySMSSandboxPhoneNumber` and `DeleteSMSSandboxPhoneNumber` rates this catalog used
+/// to key on those three codes are NOT published here, and neither are the codes it used
+/// to key those three actions on (`L-154ECCA7`, `L-039289D5`, `L-93CEC191`): no source
+/// available here states AWS's code for the first three or AWS's quota for the last three,
+/// so they are left to the default-quota-set gap rather than served under another quota's
+/// code.
 pub(in crate::state) fn sns_quotas() -> Vec<QuotaRow> {
     vec![
         sns_transaction_rate("L-01EACE54", "AddPermission", 30.0),
         sns_transaction_rate("L-038DA0E0", "CheckIfPhoneNumberIsOptedOut", 30.0),
-        sns_transaction_rate("L-039289D5", "ConfirmSubscription", 100.0),
-        sns_transaction_rate("L-154ECCA7", "CreatePlatformApplication", 15.0),
         sns_transaction_rate("L-19F66BE5", "CreatePlatformEndpoint", 15.0),
         sns_transaction_rate("L-1A43D3DB", "CreateSMSSandboxPhoneNumber", 30.0),
         sns_transaction_rate("L-21C7FFA6", "CreateTopic", 30.0),
         sns_transaction_rate("L-2EE2434F", "DeleteEndpoint", 15.0),
         sns_transaction_rate("L-2FE42A3E", "DeletePlatformApplication", 15.0),
-        sns_transaction_rate("L-390AADBE", "DeleteSMSSandboxPhoneNumber", 30.0),
+        // The three rates the recorded listing names, each under the code THAT listing
+        // publishes it under; `ListSubscriptionsByTopic` is published as NOT adjustable.
+        sns_transaction_rate("L-390AADBE", "ListSubscriptionsByTopic", 30.0).fixed(),
         sns_transaction_rate("L-4126E74A", "DeleteTopic", 30.0),
         quota("FIFO Topics per Account", 1000.0)
             .code("L-41B81227")
@@ -63,7 +87,7 @@ pub(in crate::state) fn sns_quotas() -> Vec<QuotaRow> {
                 "The maximum number of FIFO topics in this account in the current Region.",
             ),
         sns_transaction_rate("L-4659BFC2", "GetDataProtectionPolicy", 30.0),
-        sns_transaction_rate("L-4738DDCE", "GetEndpointAttributes", 15.0),
+        sns_transaction_rate("L-4738DDCE", "CreatePlatformApplication", 900.0),
         sns_transaction_rate("L-4EE37BC0", "GetPlatformApplicationAttributes", 15.0),
         sns_transaction_rate("L-61103206", "GetSMSAttributes", 30.0),
         sns_transaction_rate("L-6521CF3A", "GetSMSSandboxAccountStatus", 30.0),
@@ -75,7 +99,6 @@ pub(in crate::state) fn sns_quotas() -> Vec<QuotaRow> {
         sns_transaction_rate("L-856966E8", "ListPlatformApplications", 15.0),
         sns_transaction_rate("L-876E1222", "ListSMSSandboxPhoneNumbers", 30.0),
         sns_transaction_rate("L-93308085", "ListSubscriptions", 30.0),
-        sns_transaction_rate("L-93CEC191", "ListSubscriptionsByTopic", 30.0),
         sns_transaction_rate("L-9A72FF33", "ListTagsForResource", 100.0),
         sns_transaction_rate("L-9D5EC8F7", "ListTopics", 30.0),
         // The shape of ONE message, which AWS publishes as fixed: the attributes it may
@@ -115,6 +138,6 @@ pub(in crate::state) fn sns_quotas() -> Vec<QuotaRow> {
             .describe("The maximum number of topics in this account in the current Region."),
         sns_transaction_rate("L-F6A3071A", "Unsubscribe", 1000.0),
         sns_transaction_rate("L-F8E2BA85", "UntagResource", 100.0),
-        sns_transaction_rate("L-FF07E5EA", "VerifySMSSandboxPhoneNumber", 30.0),
+        sns_transaction_rate("L-FF07E5EA", "ConfirmSubscription", 900.0),
     ]
 }

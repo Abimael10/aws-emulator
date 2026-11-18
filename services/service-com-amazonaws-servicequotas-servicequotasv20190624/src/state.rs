@@ -565,22 +565,22 @@ impl DefaultQuota {
     /// The `QuotaContext` of a record read on `context`'s plane — the resource context
     /// named, or `None` for the account-wide record.
     ///
-    /// A quota adjustable at the account level only has no resource plane to describe,
-    /// so it carries NO context, which is what `QuotaContextInfo`'s own documentation
-    /// says of a quota managed at the account level for each Region. Any other quota
-    /// carries one, describing the plane the record answers for: `RESOURCE` scope
-    /// naming the resource asked for, or the scope the CATALOG publishes for the
-    /// quota's account-wide record ([`Self::account_record_context_scope`]) — `ACCOUNT`
-    /// for a quota whose value is managed for the account, and `RESOURCE` for one the
-    /// service publishes as a quota OF A RESOURCE whichever record is read, since the
-    /// context describes the plane the quota is COUNTED on rather than the record that
-    /// was read. A quota whose value can only ever be applied to an individual resource
-    /// has no account-wide plane to answer on ([`Self::has_plane`]), so its records
-    /// report `RESOURCE` however they were read.
+    /// A quota the catalog publishes no resource type for has no resource plane to
+    /// describe, so it carries NO context, which is what `QuotaContextInfo`'s own
+    /// documentation says of a quota managed at the account level for each Region. A
+    /// quota the catalog publishes a `ContextScopeType` for carries one however its
+    /// increase may be asked for: the context describes the plane the quota is COUNTED
+    /// on, which is a published fact of the quota rather than something derived from the
+    /// level an increase is askable at. The scope describes the plane the record answers
+    /// for: `RESOURCE` naming the resource asked for, or the scope the CATALOG publishes
+    /// for the quota's account-wide record ([`Self::account_record_context_scope`]) —
+    /// `ACCOUNT` for a quota whose value is managed for the account, and `RESOURCE` for
+    /// one the service publishes as a quota OF A RESOURCE whichever record is read. A
+    /// quota whose value can only ever be applied to an individual resource has no
+    /// account-wide plane to answer on ([`Self::has_plane`]), so its records report
+    /// `RESOURCE` however they were read.
     pub fn context_info(&self, context: Option<&str>) -> Option<QuotaContextInfo> {
-        if !self.resource_adjustable() {
-            return None;
-        }
+        self.context_scope_type.as_ref()?;
         let scope = if context.is_some() || !self.account_adjustable() {
             CONTEXT_SCOPE_RESOURCE
         } else {

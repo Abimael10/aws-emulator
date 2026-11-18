@@ -1161,7 +1161,7 @@ async fn an_invalid_request_is_refused_with_the_modelled_error() {
         (
             "an increase on a quota AWS publishes as not adjustable",
             "RequestServiceQuotaIncrease",
-            json!({"ServiceCode": "vpc", "QuotaCode": "L-2C462E13", "DesiredValue": 336.0}),
+            json!({"ServiceCode": "vpc", "QuotaCode": "L-8312C5BB", "DesiredValue": 336.0}),
             400,
             "IllegalArgumentException",
         ),

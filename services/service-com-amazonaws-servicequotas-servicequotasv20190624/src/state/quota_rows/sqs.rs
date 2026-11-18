@@ -17,6 +17,18 @@ use super::*;
 /// to have raised. A row that measures something carries the unit AWS publishes it in
 /// (bytes for a size, seconds for a window, days for a retention) rather than being a
 /// bare count.
+///
+/// The recorded listing states the quota published under `L-98134C75` (`Attributes per
+/// Message`, 10, with the sentence SQS words it with), under `L-81970B52` (`Message Size
+/// in S3 Bucket`, 2 Gigabytes), under `L-BBEFA6CF` (`Queue Policy Size`, 8192 Bytes, NOT
+/// adjustable) and under `L-BF2A6161` (`UTF-8 Queue Tag Value Length`, 256). The message
+/// size, the retention period and the two transaction rates this catalog used to key on
+/// those four codes are NOT published here, and neither are the codes it used to key the
+/// message-attribute count and the policy size on (`L-6A03DCE9`, `L-A7816957`): no source
+/// available here states AWS's code for the first four or AWS's quota for the last two, so
+/// they are left to the default-quota-set gap rather than served under another quota's
+/// code. A row whose published `Description` no source available here states carries none,
+/// rather than a sentence this emulator words itself.
 pub(in crate::state) fn sqs_quotas() -> Vec<QuotaRow> {
     vec![
         quota("Batch Entries per Batch Request", 10.0)
@@ -39,24 +51,18 @@ pub(in crate::state) fn sqs_quotas() -> Vec<QuotaRow> {
             .code("L-4FF3DAAF")
             .fixed()
             .describe("The number of in flight messages for a FIFO queue."),
-        quota("Message Attributes per Message", 10.0)
-            .code("L-6A03DCE9")
-            .fixed()
-            .describe("The number of message attributes in a message."),
         quota("Message Group ID Length", 128.0)
             .code("L-79B6240C")
             .fixed()
             .describe("The number of characters in a message group ID."),
-        quota("Message Retention Period", 14.0)
+        quota("Message Size in S3 Bucket", 2.0)
             .code("L-81970B52")
-            .unit("Days")
-            .fixed()
-            .describe("The time, in days, that a queue retains a message."),
-        quota("Message Size", 262_144.0)
+            .unit("Gigabytes")
+            .fixed(),
+        quota("Attributes per Message", 10.0)
             .code("L-98134C75")
-            .unit("Bytes")
             .fixed()
-            .describe("The size, in bytes, of a message."),
+            .describe("The number of attributes added to a message."),
         quota("In Flight Messages per Standard Queue", 120_000.0)
             .code("L-9F628B95")
             .fixed()
@@ -65,30 +71,18 @@ pub(in crate::state) fn sqs_quotas() -> Vec<QuotaRow> {
             .code("L-A01B4DF0")
             .fixed()
             .describe("The number of characters in a queue name."),
-        quota("Queue Policy Size", 8192.0)
-            .code("L-A7816957")
-            .unit("Bytes")
-            .fixed()
-            .describe("The size, in bytes, of a queue policy."),
         quota("Tags per Queue", 50.0)
             .code("L-B2A3B9D5")
             .fixed()
             .describe("The number of tags on a queue."),
-        // The two throughput planes of the service: the per-API transaction rate of a
-        // standard queue and the one a FIFO queue serves. Both are published as a RATE,
-        // so each carries the one-second window AWS publishes it over.
-        quota("Transactions per Second per API Action", 3000.0)
+        quota("Queue Policy Size", 8192.0)
             .code("L-BBEFA6CF")
-            .period(1, "SECOND")
-            .describe("The number of transactions per second for each API action."),
-        quota("FIFO Queue Transactions per Second", 3000.0)
-            .code("L-BF2A6161")
-            .period(1, "SECOND")
+            .unit("Bytes")
             .fixed()
-            .describe(
-                "The number of transactions per second that a FIFO queue serves for each \
-                 API action.",
-            ),
+            .describe("The size, in bytes, of a queue policy."),
+        quota("UTF-8 Queue Tag Value Length", 256.0)
+            .code("L-BF2A6161")
+            .fixed(),
         quota("Long Polling Wait Time", 20.0)
             .code("L-C491D5A4")
             .unit("Seconds")

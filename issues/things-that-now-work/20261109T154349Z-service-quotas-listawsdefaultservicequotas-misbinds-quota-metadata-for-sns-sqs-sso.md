@@ -1181,7 +1181,7 @@ Issue-Key: service-quotas|ListAWSDefaultServiceQuotas|2xx->2xx|$.Quotas[QuotaCod
 Issue-Key: service-quotas|ListAWSDefaultServiceQuotas|2xx->2xx|$.Quotas[QuotaCode="L-E75A2BBF"].Value
 Issue-Commit: 5b2a9eedb8fa287cac2318fd09ae07f52de03ab6
 
-# ListAWSDefaultServiceQuotas misbinds quota metadata for sns sqs sso storagegateway timestream vpc vpc-lattice wafv2 workspaces xray
+# ListAWSDefaultServiceQuotas misbinds quota metadata for sns sqs sso storagegateway timestream vpc vpc-lattice wafv2 workspaces xray (PARTIAL CLOSE: every row whose recorded facts this report QUOTES is now published under the code the recording binds it to; the rows whose recorded values the corpus withholds are filed as `issues/things-that-do-not-work/20261117T000000Z-service-quotas-listawsdefaultservicequotas-residual-misbound-rows-sns-through-xray.md`)
 
 > _Note: this issue was identified against the code base at commit `5b2a9eedb8fa287cac2318fd09ae07f52de03ab6`. If you are an issue fixer working on this, the code base you are currently working in can have drifted, so you might need to trace the issue back to the current code base._
 
@@ -1189,6 +1189,18 @@ Issue-Commit: 5b2a9eedb8fa287cac2318fd09ae07f52de03ab6
 ListAWSDefaultServiceQuotas
 
 ## Description
+PARTIAL CLOSE (added by the fixer). In all ten `ServiceCode`s, every row whose AWS-published
+facts this report QUOTES is now published under the `QuotaCode` the recording binds it to, the
+quota each of those codes used to carry is published under no code at all, and the two
+`ServiceName` divergences (Causes 3 and 7) were already correct in the current code base.
+Cause 5 (`timestream`) was likewise already bound as the recording states. The rows this report
+lists WITHOUT quoting their recorded values still diverge; they are filed, code by code and
+`ServiceCode` by `ServiceCode`, as
+`issues/things-that-do-not-work/20261117T000000Z-service-quotas-listawsdefaultservicequotas-residual-misbound-rows-sns-through-xray.md`,
+which also records what closing them needs (the recorded rows themselves — the corpus withholds
+the values, so no source available in the checkout states them). Read the `Issue-Key` list above
+as the keys of the ORIGINAL sweep, not as keys that now all match.
+
 ListAWSDefaultServiceQuotas answers 200 with a `Quotas` list whose `QuotaCode` values are AWS's, but whose per-row metadata belongs to a DIFFERENT quota of the same service code. The emulator's default-quota catalog is evidently a positional list of quota rows onto which AWS's QuotaCode strings are zipped, so `QuotaName`, `Description`, `Value`, `Unit`, `Adjustable`, `ServiceName`, `Period`, `UsageMetric` and `QuotaContext` are served for the wrong code; where AWS's row has `Period`/`UsageMetric` and the substituted row does not, those members disappear altogether. This is one defect in the catalog's keying, reproduced below on ten service codes. Each cause is its own service code and its own fixture, and all ten must be closed.
 
 General requirement for every cause: for a given `ServiceCode`, every `QuotaCode` AWS returns must carry AWS's own `QuotaName`, `Description`, `Value`, `Unit`, `Adjustable`, `GlobalQuota`, `ServiceName`, `QuotaArn`, and — when AWS models them for that quota — `Period`, `UsageMetric` and `QuotaContext`. Only the ARN's partition/region segment and pagination tokens are environment-dependent; the quota metadata is not.

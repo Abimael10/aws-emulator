@@ -313,7 +313,11 @@ const USAGE_METRIC_SERVICE_NAMES: &[(&str, &str)] = &[
     ("sns", "SNS"),
     ("timestream", "Timestream"),
     ("vpc", "EC2"),
+    // `AWS/Usage` publishes AWS WAF's API call counts under the model's id and its
+    // RESOURCE counts under the product's own name, which is what the recorded
+    // default-quota listing of `wafv2` carries on its metered row.
     ("wafv2", "WAFV2"),
+    ("wafv2", "AWS WAF"),
     ("workspaces", "WorkSpaces"),
     ("xray", "X-Ray"),
 ];

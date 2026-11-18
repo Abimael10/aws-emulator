@@ -16,7 +16,18 @@ use super::*;
 /// increase — beside the image, directory and access-control planes of the account and
 /// the request rate of each of its APIs. A rate row is built by [`request_rate`], so it
 /// carries the one-second window AWS publishes it over and the `AWS/Usage` `CallCount` of
-/// the API it throttles.
+/// the API it throttles; a bundle row is metered instead by the `AWS/Usage`
+/// `ResourceCount` of that bundle's own series, which carries the window those counts are
+/// published over ([`graphics_bundle`]).
+///
+/// The recorded listing states the quota published under `L-40A36AF9`
+/// (`Graphics.g6.4xlarge WorkSpaces`) and under `L-BD784BE1` (`Graphics.g6.16xlarge
+/// WorkSpaces`), both metered by that bundle's resource count. The connection-alias
+/// association count and the `DescribeAccount` rate this catalog used to key on those two
+/// codes are NOT published here: no source available here states AWS's code for them, so
+/// they are left to the default-quota-set gap rather than served under another quota's
+/// code. A row whose published `Description` no source available here states carries none,
+/// rather than a sentence this emulator words itself.
 pub(in crate::state) fn workspaces_quotas() -> Vec<QuotaRow> {
     let rate = |code: &str, api: &str, per_second: f64| {
         request_rate(code, WORKSPACES_USAGE_SERVICE, api, per_second)
@@ -102,10 +113,7 @@ pub(in crate::state) fn workspaces_quotas() -> Vec<QuotaRow> {
                 "The maximum number of connection aliases in this account in the current \
                  Region.",
             ),
-        quota("Connection alias associations per alias", 25.0)
-            .code("L-40A36AF9")
-            .fixed()
-            .describe("The maximum number of accounts one connection alias is shared with."),
+        graphics_bundle("L-40A36AF9", "Graphics.g6.4xlarge", "GraphicsG64xlargeWorkSpace"),
         quota("Registered directories", 50.0)
             .code("L-465DA8AF")
             .describe(
@@ -131,7 +139,11 @@ pub(in crate::state) fn workspaces_quotas() -> Vec<QuotaRow> {
         rate("L-9A67B5CB", "DeleteIpGroup", 5.0),
         rate("L-9C1F7EB2", "DeleteTags", 5.0),
         rate("L-BCACAEBC", "DeleteWorkspaceImage", 5.0),
-        rate("L-BD784BE1", "DescribeAccount", 10.0),
+        graphics_bundle(
+            "L-BD784BE1",
+            "Graphics.g6.16xlarge",
+            "GraphicsG616xlargeWorkSpace",
+        ),
         rate("L-BE9A8466", "DescribeIpGroups", 10.0),
         rate("L-C266A5F4", "DescribeTags", 10.0),
         rate("L-C76331EA", "DescribeWorkspaceBundles", 10.0),
@@ -151,3 +163,24 @@ pub(in crate::state) fn workspaces_quotas() -> Vec<QuotaRow> {
 /// It is the `Service` dimension value a `GetMetricData` query has to name for one of
 /// these counts, so it is held once here rather than spelled at each row.
 const WORKSPACES_USAGE_SERVICE: &str = "WorkSpaces";
+
+/// One Amazon WorkSpaces GRAPHICS BUNDLE quota: how many WorkSpaces of that hardware
+/// bundle the account may run in the Region.
+///
+/// SOURCE: the recorded default-quota listing of `workspaces`, which publishes such a row
+/// under the name `<Bundle> WorkSpaces`, at the zero a new account starts at, adjustable,
+/// and metered by the `AWS/Usage` `ResourceCount` of that bundle's own `Resource` series
+/// over the window those counts are published over. Those are the quota's published
+/// members, so one constructor fills them and two rows of the class cannot drift apart.
+fn graphics_bundle(code: &str, bundle: &str, usage_resource: &str) -> QuotaRow {
+    quota(format!("{bundle} WorkSpaces"), 0.0)
+        .code(code)
+        .metric(usage_metric(
+            WORKSPACES_USAGE_SERVICE,
+            &[
+                ("Class", "None"),
+                ("Resource", usage_resource),
+                ("Type", "Resource"),
+            ],
+        ))
+}

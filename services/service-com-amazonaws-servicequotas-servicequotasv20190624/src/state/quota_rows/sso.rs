@@ -20,6 +20,15 @@ use super::*;
 /// None of them is a GLOBAL quota: an IAM Identity Center instance belongs to the Region
 /// it was enabled in, so the planes of that instance are counted per Region, which is what
 /// `GlobalQuota` reports for every row here.
+///
+/// The recorded listing states the quota published under `L-2FDFC908` (the groups that may
+/// be assigned to a permission set per account or to an application, 100) and under
+/// `L-D519A297` (the Regions IAM Identity Center may be enabled in, 6). The managed-policy
+/// and trusted-token-issuer counts this catalog used to key on those two codes are NOT
+/// published here: no source available here states AWS's code for them, so they are left
+/// to the default-quota-set gap rather than served under another quota's code. A row whose
+/// published `Description` no source available here states carries none, rather than a
+/// sentence this emulator words itself.
 pub(in crate::state) fn sso_quotas() -> Vec<QuotaRow> {
     vec![
         quota("Applications per instance", 50.0)
@@ -28,13 +37,13 @@ pub(in crate::state) fn sso_quotas() -> Vec<QuotaRow> {
                 "The maximum number of applications that you can configure in an IAM \
                  Identity Center instance.",
             ),
-        quota("AWS managed policies per permission set", 20.0)
-            .code("L-2FDFC908")
-            .fixed()
-            .describe(
-                "The maximum number of AWS managed policies that you can attach to a \
-                 permission set.",
-            ),
+        quota(
+            "Total number of groups that can be assigned to a permission set per AWS \
+             account, or to an application",
+            100.0,
+        )
+        .code("L-2FDFC908")
+        .fixed(),
         quota("Customer managed policies per permission set", 20.0)
             .code("L-3C8D41A0")
             .fixed()
@@ -66,11 +75,6 @@ pub(in crate::state) fn sso_quotas() -> Vec<QuotaRow> {
                 "The maximum number of permission sets that you can provision in one AWS \
                  account.",
             ),
-        quota("Trusted token issuers per instance", 10.0)
-            .code("L-D519A297")
-            .describe(
-                "The maximum number of trusted token issuers that you can configure in an \
-                 IAM Identity Center instance.",
-            ),
+        quota("Total number of regions for IAM Identity Center", 6.0).code("L-D519A297"),
     ]
 }

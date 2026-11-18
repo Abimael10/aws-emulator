@@ -16,7 +16,7 @@
 //! facts are known only for one code, that code is what they are published under and no
 //! neighbouring row borrows them.
 
-use super::{quota, QuotaRow, LEVEL_ALL};
+use super::{quota, QuotaRow, LEVEL_ACCOUNT, LEVEL_ALL};
 use crate::ops::types::MetricInfo;
 
 // The row tables of the services whose catalogs run long enough to own a file: one module
