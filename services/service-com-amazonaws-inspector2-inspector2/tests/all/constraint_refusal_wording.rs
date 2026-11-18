@@ -39,6 +39,22 @@ const GROUP_KEY_SET: &str = "PROVIDER_REGION, PROVIDER_ORG_ID, RESOURCE_TYPE, AC
                              SCAN_STATUS_REASON, PROVIDER, ECR_REPOSITORY_NAME, \
                              SCAN_STATUS_CODE, PROVIDER_ACCOUNT_ID, SCAN_TYPE";
 
+/// `SortField`'s value set as this service lists it, carried by the `sortCriteria` of the
+/// findings surface.
+/// Source: `smithy_query(query="shape", shape="SortField")` for the membership the model
+/// declares; the service publishes it with the two in-use detail fields as well.
+const SORT_FIELD_SET: &str = "LAST_OBSERVED_AT, FINDING_STATUS, NETWORK_PROTOCOL, \
+                             INSPECTOR_SCORE, ECR_IMAGE_PUSHED_AT, RESOURCE_TYPE, \
+                             ECR_IMAGE_REGISTRY, AWS_ACCOUNT_ID, FINDING_TYPE, \
+                             ECR_IMAGE_REPOSITORY_NAME, VENDOR_SEVERITY, FIRST_OBSERVED_AT, \
+                             LAST_IN_USE_AT, COMPONENT_TYPE, IN_USE_COUNT, SEVERITY, \
+                             EPSS_SCORE, VULNERABILITY_SOURCE, VULNERABILITY_ID";
+
+/// `SortOrder`'s value set as this service lists it, the other enumerated member of the same
+/// `sortCriteria`.
+/// Source: `smithy_query(query="shape", shape="SortOrder")`.
+const SORT_ORDER_SET: &str = "DESC, ASC";
+
 /// `StringComparison`'s value set as this service lists it, carried by every `StringFilter`
 /// of the findings surface.
 /// Source: `smithy_query(query="shape", shape="StringComparison")`.
@@ -159,6 +175,21 @@ fn rows() -> Vec<Row> {
         body: json!({ "findingArns": arns }),
         message: one_error("findingArns", &finding_arn_constraints()),
     };
+    // The two enumerated members of the findings `sortCriteria`, each refused at its own
+    // nested path with its own type's whole published set. Both members are required, so a
+    // row fills the other one with a value its enum admits.
+    let sort_field = |case, field: &'static str| Row {
+        case,
+        uri: "/findings/list",
+        body: json!({ "sortCriteria": { "field": field, "sortOrder": "DESC" } }),
+        message: one_error("sortCriteria.field", &enum_value_set(SORT_FIELD_SET)),
+    };
+    let sort_order = |case, order: &'static str| Row {
+        case,
+        uri: "/findings/list",
+        body: json!({ "sortCriteria": { "field": "SEVERITY", "sortOrder": order } }),
+        message: one_error("sortCriteria.sortOrder", &enum_value_set(SORT_ORDER_SET)),
+    };
 
     vec![
         // An enumerated type at a top-level member, over three forms of bad value.
@@ -236,6 +267,17 @@ fn rows() -> Vec<Row> {
             "scanStatusCode",
             "prefix",
         ),
+        // Two enumerated members of ONE nested structure, over four forms of bad value: the
+        // sort criteria of the findings surface.
+        sort_field("a sort field in the wrong case", "severity"),
+        sort_field("a sort field no release declares", "NOT_A_REAL_SORT_FIELD"),
+        sort_field("an empty sort field", ""),
+        sort_field(
+            "a sort field that is a neighbouring type's modelled token",
+            "PACKAGE",
+        ),
+        sort_order("a sort order in the wrong case", "desc"),
+        sort_order("a sort order no release declares", "DESCENDING"),
         // A `@pattern` at a top-level member, on two operations carrying the same shape.
         report_id(
             "a report id that is not a UUID at all",
@@ -354,7 +396,7 @@ async fn a_value_inside_every_constraint_reaches_the_handler() {
     let router = router();
     // One admitted request per operation the rows refuse, each carrying the member the
     // matching row broke, filled with a value its constraints admit.
-    let served: [(&str, &str, Value, u16); 6] = [
+    let served: [(&str, &str, Value, u16); 7] = [
         (
             "an aggregation type the enum declares",
             "/findings/aggregation/list",
@@ -371,6 +413,12 @@ async fn a_value_inside_every_constraint_reaches_the_handler() {
             "a findings filter comparison the enum declares",
             "/findings/list",
             filter_on("resourceId", "PREFIX"),
+            501,
+        ),
+        (
+            "a sort criteria both of its enums declare",
+            "/findings/list",
+            json!({ "sortCriteria": { "field": "EPSS_SCORE", "sortOrder": "ASC" } }),
             501,
         ),
         (

@@ -29,7 +29,7 @@
 //!    their own requirement;
 //! 3. an enumerated type's value set is listed in the order this front door's own table of it
 //!    is walked, which is neither the model's declaration order nor sorted, over the values the
-//!    service PUBLISHES for that type ([`PUBLISHED_ENUM_VALUE_SETS`] holds the two whose
+//!    service PUBLISHES for that type ([`PUBLISHED_ENUM_VALUE_SETS`] holds the three whose
 //!    published membership is not the shipped model's);
 //! 4. the clauses of one message are ordered by the MEMBER PATH each is stated at, not by the
 //!    order the validating walk found them in, so a request breaking two members' constraints
@@ -42,7 +42,7 @@
 //! module's, as does the order rule 3 lists a set in and the `@pattern` rendering (the
 //! expression with the whole-value anchors the model wraps it in removed — the CHECK always
 //! uses the model's pattern as written). What this service states, and all it states, is WHICH
-//! values each of those two types admits, because that is a fact about this service.
+//! values each of those three types admits, because that is a fact about this service.
 //!
 //! One limit of that shared rendering, which it states too: an element set is read off the
 //! operation input schemas codegen derives from the model, and a member schema carries its own
@@ -50,11 +50,10 @@
 //! resolves, and a collection nested inside a structure keeps the element path and the one
 //! requirement its element broke.
 //!
-//! And one limit of rule 3: a type whose published membership is neither the shipped model's nor
-//! known gets the model's. The sort field of the findings surface is such a type — a recorded
-//! refusal of it lists a set that starts with the three values this order starts with and then
-//! differs, and no reading of the model says which value it adds or drops — so its clause states
-//! the values the model declares until a recording of the whole set settles it.
+//! And one limit of rule 3: a type with no row of its own is listed from the values its model
+//! declares, which is right for a type nothing is known to publish differently. A recorded
+//! refusal that lists a value the shipped enum does not declare, or omits one it does, is what
+//! settles a row — not a reading of the model, which by then is the half that is behind.
 
 use ::aws_smithy_schema::Schema;
 use ::aws_smithy_schema_server::constraints::Violation;
@@ -115,6 +114,41 @@ const PUBLISHED_GROUP_KEYS: &[&str] = &[
     "SCAN_TYPE",
 ];
 
+/// `SortField`'s admissible values as this service PUBLISHES them: the shipped model's
+/// seventeen (`smithy_query(query="shape", shape="SortField")`) plus the two finding detail
+/// fields the findings surface also sorts by — how recently a finding's package was last in
+/// use, and how many times it is in use — which the refusal of a value outside the set
+/// advertises and the shipped enum does not declare.
+///
+/// Which values a member ADMITS is not decided here — that is the enum the member targets, so
+/// the boundary still refuses a value the shipped model does not declare — and this only
+/// decides what the refusal SAYS the findings surface sorts by.
+///
+/// In the model's declaration order, for the reason [`PUBLISHED_AGGREGATION_TYPES`] states,
+/// with the two values the shipped enum does not declare last, which is where a release that
+/// adds a value to a type declares it.
+const PUBLISHED_SORT_FIELDS: &[&str] = &[
+    "AWS_ACCOUNT_ID",
+    "FINDING_TYPE",
+    "SEVERITY",
+    "FIRST_OBSERVED_AT",
+    "LAST_OBSERVED_AT",
+    "FINDING_STATUS",
+    "RESOURCE_TYPE",
+    "ECR_IMAGE_PUSHED_AT",
+    "ECR_IMAGE_REPOSITORY_NAME",
+    "ECR_IMAGE_REGISTRY",
+    "NETWORK_PROTOCOL",
+    "COMPONENT_TYPE",
+    "VULNERABILITY_ID",
+    "VULNERABILITY_SOURCE",
+    "INSPECTOR_SCORE",
+    "VENDOR_SEVERITY",
+    "EPSS_SCORE",
+    "LAST_IN_USE_AT",
+    "IN_USE_COUNT",
+];
+
 /// The enumerated types whose admissible set this service publishes other than the shipped
 /// model declares it: one row per type, the model's declared values beside the service's.
 ///
@@ -127,6 +161,7 @@ const PUBLISHED_ENUM_VALUE_SETS: &validation_message::StatedEnumValueSets<'stati
         PUBLISHED_AGGREGATION_TYPES,
     ),
     (crate::ops::types::GROUP_KEY_VALUES, PUBLISHED_GROUP_KEYS),
+    (crate::ops::types::SORT_FIELD_VALUES, PUBLISHED_SORT_FIELDS),
 ];
 
 /// Every operation INPUT shape of this service, as the schemas codegen derives from the
@@ -274,7 +309,10 @@ pub(crate) fn refused(refusal: &Refusal) -> Option<Refused> {
 
 #[cfg(test)]
 mod tests {
-    use super::{published, refused, PUBLISHED_AGGREGATION_TYPES, PUBLISHED_GROUP_KEYS};
+    use super::{
+        published, refused, PUBLISHED_AGGREGATION_TYPES, PUBLISHED_GROUP_KEYS,
+        PUBLISHED_SORT_FIELDS,
+    };
     use ::aws_smithy_schema_server::constraints::{Violation, ViolationKind};
     use ::smithy_server_runtime::Refusal;
 
@@ -320,6 +358,15 @@ mod tests {
                  PROVIDER_ACCOUNT_ID, SCAN_TYPE]",
             ),
             (
+                "the findings sort fields, which the service publishes wider",
+                crate::ops::types::SORT_FIELD_VALUES,
+                "[LAST_OBSERVED_AT, FINDING_STATUS, NETWORK_PROTOCOL, INSPECTOR_SCORE, \
+                 ECR_IMAGE_PUSHED_AT, RESOURCE_TYPE, ECR_IMAGE_REGISTRY, AWS_ACCOUNT_ID, \
+                 FINDING_TYPE, ECR_IMAGE_REPOSITORY_NAME, VENDOR_SEVERITY, FIRST_OBSERVED_AT, \
+                 LAST_IN_USE_AT, COMPONENT_TYPE, IN_USE_COUNT, SEVERITY, EPSS_SCORE, \
+                 VULNERABILITY_SOURCE, VULNERABILITY_ID]",
+            ),
+            (
                 "the findings filter comparisons",
                 crate::ops::types::STRING_COMPARISON_VALUES,
                 "[NOT_EQUALS, PREFIX, EQUALS]",
@@ -360,6 +407,14 @@ mod tests {
                 && PUBLISHED_GROUP_KEYS.len() == crate::ops::types::GROUP_KEY_VALUES.len() + 1,
             "the published group keys are the model's plus the scan-type one, got \
              {PUBLISHED_GROUP_KEYS:?}"
+        );
+        assert!(
+            PUBLISHED_SORT_FIELDS.contains(&"LAST_IN_USE_AT")
+                && PUBLISHED_SORT_FIELDS.contains(&"IN_USE_COUNT")
+                && PUBLISHED_SORT_FIELDS.len()
+                    == crate::ops::types::SORT_FIELD_VALUES.len() + 2,
+            "the published sort fields are the model's plus the two in-use ones, got \
+             {PUBLISHED_SORT_FIELDS:?}"
         );
     }
 
