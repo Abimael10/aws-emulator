@@ -284,16 +284,6 @@ fn output_key(key_prefix: Option<&str>, task_id: &str, output_format: &str) -> S
     format!("{prefix}{task_id}.{suffix}")
 }
 
-/// Where this task's output is: the object this request's bucket and [`output_key`] name.
-///
-/// `SynthesisTask$OutputUri` is the "Pathway for the output speech file", and an S3
-/// object's pathway is its URL in the Region the request was made in. It is built from the
-/// key the object is actually written at, so the location the task reports and the object
-/// its completion writes cannot drift apart.
-fn output_uri(region: &str, bucket: &str, key: &str) -> String {
-    format!("https://s3.{region}.amazonaws.com/{bucket}/{key}")
-}
-
 /// The `StartSpeechSynthesisTask` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -467,7 +457,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             output_format,
         );
         let stored = crate::state::StoredSynthesisTask {
-            output_uri: output_uri(&region, &input.output_s3_bucket_name, &output_key),
+            // `SynthesisTask$OutputUri` is the "Pathway for the output speech file", so
+            // it is the address a caller FOLLOWS to read that object: the object storage of
+            // this emulator, at the endpoint this request reached it on
+            // ([`crate::state::announced_output_uri`]), addressing the very key the
+            // delivery below writes.
+            output_uri: crate::state::announced_output_uri(
+                ctx,
+                &input.output_s3_bucket_name,
+                &output_key,
+            ),
             task_id,
             engine: engine.to_string(),
             output_format: output_format.to_string(),

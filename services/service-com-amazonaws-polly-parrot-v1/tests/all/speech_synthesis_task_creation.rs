@@ -14,10 +14,21 @@
 //! rows differ along what it generalises over — the output format (and so the output
 //! object's suffix), the engine, the text type (and so what is billed), the voice and
 //! its language, the key prefix, and the Region the call is signed for.
+//!
+//! RULE: the output location a task reports (`SynthesisTask$OutputUri`, the "Pathway for
+//! the output speech file") is an address the CALLER follows, so it is rooted at the
+//! endpoint this emulator answered the start call on — never at a host AWS publishes — with
+//! the object addressed path-style beneath it, `/<bucket>/<key-prefix><task-id>.<suffix>`.
+//! Every serialization of the task envelope reports that one location, and following it
+//! reaches the object the completed task wrote. Its rows differ along the address the
+//! caller reached the emulator at, crossed with the output format, the key prefix and the
+//! Region.
 
 use std::time::Duration;
 
 use bytes::Bytes;
+use service_common::data_plane_addressing::AWS_ENDPOINT_DNS_SUFFIXES;
+use smithy_server_runtime::UNSERVED_URL_BASE;
 
 use crate::lexicons_and_speech::{error_code, json, Polly};
 use crate::support::get_task;
@@ -77,9 +88,13 @@ fn assert_record(case: &str, reported: &serde_json::Value, expected: &Expected) 
         !task_id.is_empty(),
         "case {case:?}: the task must carry a minted TaskId, got {reported:?}"
     );
+    // The location is announced on the endpoint the call reached, which for a request
+    // addressed to one of this service's published hosts on an emulator served on no port
+    // is the base `OperationContext::endpoint` reports. The announced-location suite below
+    // is the one that varies that address.
     let expected_uri = format!(
-        "https://s3.{}.amazonaws.com/{OUTPUT_BUCKET}/{}{task_id}.{}",
-        expected.region, expected.key_prefix, expected.suffix
+        "{UNSERVED_URL_BASE}/{OUTPUT_BUCKET}/{}{task_id}.{}",
+        expected.key_prefix, expected.suffix
     );
     for (member, actual, want) in [
         ("OutputFormat", reported["OutputFormat"].as_str(), Some(expected.output_format)),
@@ -489,4 +504,337 @@ async fn a_refused_request_records_no_task() {
         "the billed count must be the text's own, body {:?}",
         json(&accepted)
     );
+}
+
+/// How long a row waits for a task to reach a terminal status, and how often it looks.
+/// Driven off what has HAPPENED rather than off one fixed wait, so a slow machine delays a
+/// row instead of breaking it.
+const TERMINAL_WAIT: Duration = Duration::from_secs(30);
+const LOOK_INTERVAL: Duration = Duration::from_millis(50);
+
+/// One addressing a caller reaches this emulator at, and the base every location announced
+/// to it is rooted at.
+struct Addressed {
+    /// What the row is about, named in every assertion.
+    case: &'static str,
+    /// The `Host` the request carries, or none at all — which leaves the request's own
+    /// absolute URI, one of this service's published hosts, as the address it named.
+    host: Option<&'static str>,
+    /// The base the location announced to that caller must be rooted at.
+    base: &'static str,
+}
+
+/// The addresses the rows reach the emulator at: its own endpoint as a loopback literal, as
+/// a loopback name on another port and as a bracketed IPv6 literal — each the only address
+/// such a client resolves, so each is handed back the very one it is talking to — and the
+/// two callers that resolve AWS's own hostnames, which on an emulator served on no port of
+/// its own are answered the base `OperationContext::endpoint` reports for it.
+fn addressed() -> [Addressed; 5] {
+    [
+        Addressed {
+            case: "the emulator's own loopback endpoint",
+            host: Some("127.0.0.1:39461"),
+            base: "https://127.0.0.1:39461",
+        },
+        Addressed {
+            case: "the same endpoint by its loopback name on another port",
+            host: Some("localhost:9297"),
+            base: "https://localhost:9297",
+        },
+        Addressed {
+            case: "the same endpoint as a bracketed IPv6 literal",
+            host: Some("[::1]:9297"),
+            base: "https://[::1]:9297",
+        },
+        Addressed {
+            case: "a caller that resolves this service's own published host",
+            host: None,
+            base: UNSERVED_URL_BASE,
+        },
+        Addressed {
+            case: "a caller that addressed the object store's own published host",
+            host: Some("s3.us-east-1.amazonaws.com"),
+            base: UNSERVED_URL_BASE,
+        },
+    ]
+}
+
+/// One output location a row asks for: where the object goes and what its key looks like.
+struct Output {
+    case: &'static str,
+    /// The Region the call is signed for — which the announced address does NOT follow.
+    region: &'static str,
+    /// The bucket the request names, which exists in that Region.
+    bucket: &'static str,
+    /// `OutputFormat`, whose own suffix the key carries.
+    output_format: &'static str,
+    /// `OutputS3KeyPrefix`, where the row names one.
+    key_prefix: Option<&'static str>,
+    /// The suffix the key must end at for that format.
+    suffix: &'static str,
+}
+
+/// The output locations the rows ask for: the root of a bucket in one Region, and a
+/// folder-like key prefix in another, in another format.
+fn outputs() -> [Output; 2] {
+    [
+        Output {
+            case: "mp3 at the root of the bucket",
+            region: "us-east-1",
+            bucket: "polly-announced-output",
+            output_format: "mp3",
+            key_prefix: None,
+            suffix: "mp3",
+        },
+        Output {
+            case: "pcm under a folder-like prefix, in another Region",
+            region: "eu-west-1",
+            bucket: "polly-announced-output-eu",
+            output_format: "pcm",
+            key_prefix: Some("out/2026/"),
+            suffix: "pcm",
+        },
+    ]
+}
+
+/// One task call signed for `region` and addressed to `host`, where the row names one.
+async fn call_from(
+    polly: &Polly,
+    region: &str,
+    host: Option<&str>,
+    method: &str,
+    path: &str,
+    body: &str,
+) -> http::Response<Bytes> {
+    let mut headers = vec![("content-type", "application/json")];
+    if let Some(host) = host {
+        headers.push(("host", host));
+    }
+    polly
+        .call_bytes_in_region(region, method, path, &headers, body.as_bytes().to_vec())
+        .await
+}
+
+/// The authority an announced URI names: what follows its scheme, up to the path.
+fn announced_authority(uri: &str) -> &str {
+    let after_scheme = uri.split_once("://").map_or(uri, |(_, rest)| rest);
+    after_scheme.split('/').next().unwrap_or_default()
+}
+
+/// The object store addressed AT the base a location was announced on: the SDK's endpoint
+/// URL is that base itself and the addressing is path-style, so the request this client
+/// makes is a `GET` of exactly the URI the task reported.
+///
+/// Built like the in-process hop a completed task writes its object through
+/// (`service_common::s3_client`), with the announced base in place of a Region's endpoint:
+/// the transport is this emulator's own, so what a fetch through it establishes is that the
+/// address the task handed out is served HERE.
+fn store_at(polly: &Polly, base: &str, region: &str) -> ::aws_sdk_s3::Client {
+    let callback = polly.callback();
+    let config = ::aws_sdk_s3::Config::builder()
+        .behavior_version(::aws_sdk_s3::config::BehaviorVersion::latest())
+        .http_client(callback.http_client())
+        .credentials_provider(callback.aws_credentials_provider())
+        .region(::aws_sdk_s3::config::Region::new(region.to_string()))
+        .endpoint_url(base)
+        .force_path_style(true)
+        .retry_config(::aws_sdk_s3::config::retry::RetryConfig::disabled())
+        .timeout_config(::aws_sdk_s3::config::timeout::TimeoutConfig::disabled())
+        .identity_cache(::aws_sdk_s3::config::IdentityCache::no_cache())
+        .stalled_stream_protection(::aws_sdk_s3::config::StalledStreamProtectionConfig::disabled())
+        .build();
+    ::aws_sdk_s3::Client::from_conf(config)
+}
+
+/// Create `bucket` in `region` through the object store itself.
+///
+/// Outside `us-east-1` a create has to name the Region it is making the bucket in — "If you
+/// don't specify a Region, the bucket is created in the US East (N. Virginia) Region
+/// (us-east-1) by default" (`CreateBucketConfiguration$LocationConstraint`).
+async fn create_bucket(polly: &Polly, region: &str, bucket: &str) {
+    let mut create = polly.s3(region).create_bucket().bucket(bucket);
+    if region != "us-east-1" {
+        create = create.create_bucket_configuration(
+            ::aws_sdk_s3::types::CreateBucketConfiguration::builder()
+                .location_constraint(::aws_sdk_s3::types::BucketLocationConstraint::from(region))
+                .build(),
+        );
+    }
+    create
+        .send()
+        .await
+        .unwrap_or_else(|error| panic!("the bucket {bucket:?} must be created: {error}"));
+}
+
+/// RULE: the output location a task reports is rooted at the endpoint this emulator answered
+/// the start call on — never at a host AWS publishes — with the object addressed path-style
+/// beneath it; every serialization of the task envelope (the start, the polled read and the
+/// listing) reports that one location, and following it reaches the object the completed
+/// task wrote.
+#[tokio::test]
+async fn the_output_location_is_announced_on_the_endpoint_the_request_reached() {
+    let polly = Polly::with_s3();
+    for output in outputs() {
+        create_bucket(&polly, output.region, output.bucket).await;
+    }
+
+    for addressing in addressed() {
+        for output in outputs() {
+            let case = format!("{} / {}", addressing.case, output.case);
+            let mut request = serde_json::json!({
+                "Text": "Hello from the emulator.",
+                "VoiceId": "Joanna",
+                "OutputFormat": output.output_format,
+                "OutputS3BucketName": output.bucket,
+            });
+            if let Some(prefix) = output.key_prefix {
+                request["OutputS3KeyPrefix"] = serde_json::Value::from(prefix);
+            }
+            let started = call_from(
+                &polly,
+                output.region,
+                addressing.host,
+                "POST",
+                "/v1/synthesisTasks",
+                &request.to_string(),
+            )
+            .await;
+            assert_eq!(
+                started.status(),
+                200,
+                "case {case:?}: the task must be created, body {:?}",
+                json(&started)
+            );
+            let reported = json(&started)["SynthesisTask"].clone();
+            let task_id = reported["TaskId"]
+                .as_str()
+                .unwrap_or_else(|| panic!("case {case:?}: no TaskId in {reported}"))
+                .to_string();
+
+            // The one location this task has: the announced base, then the bucket and the
+            // key the request's prefix, the minted id and the format's suffix spell.
+            let expected = format!(
+                "{}/{}/{}{task_id}.{}",
+                addressing.base,
+                output.bucket,
+                output.key_prefix.unwrap_or_default(),
+                output.suffix
+            );
+            assert_eq!(
+                reported["OutputUri"].as_str(),
+                Some(expected.as_str()),
+                "case {case:?}: wrong announced output location, got {reported}"
+            );
+            // ... and its host is none of the zones AWS publishes its own endpoints in
+            // (`service_common::data_plane_addressing::AWS_ENDPOINT_DNS_SUFFIXES`), whatever
+            // Region the call was signed for.
+            let host = ::service_common::data_plane_addressing::host_only(announced_authority(
+                &expected,
+            ));
+            assert!(
+                !AWS_ENDPOINT_DNS_SUFFIXES
+                    .iter()
+                    .any(|suffix| host.ends_with(suffix)),
+                "case {case:?}: an announced location must not name a host AWS publishes, \
+                 got {host:?}"
+            );
+
+            // The polled read reports that same location on every look, up to the terminal
+            // status its completion settles.
+            let looks = TERMINAL_WAIT.as_millis() / LOOK_INTERVAL.as_millis();
+            let mut terminal = serde_json::Value::Null;
+            for _ in 0..looks {
+                let read = call_from(
+                    &polly,
+                    output.region,
+                    addressing.host,
+                    "GET",
+                    &format!("/v1/synthesisTasks/{task_id}"),
+                    "",
+                )
+                .await;
+                assert_eq!(
+                    read.status(),
+                    200,
+                    "case {case:?}: the started task must read back, body {:?}",
+                    json(&read)
+                );
+                let polled = json(&read)["SynthesisTask"].clone();
+                assert_eq!(
+                    polled["OutputUri"].as_str(),
+                    Some(expected.as_str()),
+                    "case {case:?}: the read must report the task's own location, got {polled}"
+                );
+                if polled["TaskStatus"].as_str() == Some(TERMINAL_STATUS) {
+                    terminal = polled;
+                    break;
+                }
+                tokio::time::sleep(LOOK_INTERVAL).await;
+            }
+            assert_eq!(
+                terminal["TaskStatus"].as_str(),
+                Some(TERMINAL_STATUS),
+                "case {case:?}: the task never completed, last report {terminal}"
+            );
+
+            // The listing reports the same location for the same task.
+            let listed = call_from(
+                &polly,
+                output.region,
+                addressing.host,
+                "GET",
+                "/v1/synthesisTasks",
+                "",
+            )
+            .await;
+            let page = json(&listed);
+            let entry = page["SynthesisTasks"]
+                .as_array()
+                .unwrap_or_else(|| panic!("case {case:?}: the listing carries no page: {page}"))
+                .iter()
+                .find(|task| task["TaskId"].as_str() == Some(task_id.as_str()))
+                .unwrap_or_else(|| {
+                    panic!("case {case:?}: the listing must report {task_id:?}: {page}")
+                })
+                .clone();
+            assert_eq!(
+                entry["OutputUri"].as_str(),
+                Some(expected.as_str()),
+                "case {case:?}: the listing must report the task's own location, got {entry}"
+            );
+
+            // Following the announced location reaches the object: the address is dialed as
+            // it was handed out — its base is the endpoint, the bucket and key are its path
+            // — and the object store of THIS emulator answers it with the written output.
+            let path = expected
+                .strip_prefix(addressing.base)
+                .and_then(|path| path.strip_prefix('/'))
+                .unwrap_or_else(|| panic!("case {case:?}: {expected:?} is not rooted at the base"));
+            let (bucket, key) = path
+                .split_once('/')
+                .unwrap_or_else(|| panic!("case {case:?}: {path:?} addresses no object"));
+            let object = store_at(&polly, addressing.base, output.region)
+                .get_object()
+                .bucket(bucket)
+                .key(key)
+                .send()
+                .await
+                .unwrap_or_else(|error| {
+                    panic!("case {case:?}: following {expected:?} must reach the object: {error}")
+                });
+            let body = object
+                .body
+                .collect()
+                .await
+                .unwrap_or_else(|error| {
+                    panic!("case {case:?}: the object's body must be readable: {error}")
+                })
+                .into_bytes();
+            assert!(
+                !body.is_empty(),
+                "case {case:?}: following {expected:?} must serve the task's output, got {} bytes",
+                body.len()
+            );
+        }
+    }
 }

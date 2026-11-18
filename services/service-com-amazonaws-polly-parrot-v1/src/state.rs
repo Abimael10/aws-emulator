@@ -41,6 +41,11 @@ use std::time::{Duration, Instant, SystemTime};
 /// reached.
 pub mod task_completion;
 
+/// WHERE a task's output is announced: the address this emulator serves that object at.
+mod output_location;
+
+pub use output_location::announced_output_uri;
+
 /// The key one stored lexicon sits under: the Region it was put in, then its name.
 ///
 /// A lexicon is a REGIONAL resource, so its name alone does not identify it: the
