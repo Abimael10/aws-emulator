@@ -23,12 +23,13 @@ http = { workspace = true }
 # re-orders what the publisher declared (a dependency list is reported in declared order).
 serde_json = { workspace = true, features = ["raw_value"] }
 tracing = { workspace = true }
-# Stable, content-derived suffixes for the asset-bucket and KMS-key ARNs a domain
-# reports (SHA-256 of the domain's account/region/name), so the same domain reports the
-# same ARNs on every read. Also the SHA-256 and SHA-512 of a published asset.
+# Content-derived, stable identifiers and digests: the opaque ids this service's refusals
+# name a resource by (SHA-256 of the resource's account/region/name, so the same resource
+# reports the same id on every read), the `revision` of a stored resource policy, and the
+# SHA-256 and SHA-512 of a published asset.
 sha2 = { workspace = true }
-# Hex encoding for those ARN suffixes, for the opaque `nextToken` cursors and for the
-# hex digests an asset's `hashes` map and `assetSHA256` are spelled in.
+# Hex encoding for those identifiers and digests, for the opaque `nextToken` cursors and for
+# the hex digests an asset's `hashes` map and `assetSHA256` are spelled in.
 hex = { workspace = true }
 # `arn`: the one parse of a caller-supplied `resourceArn`, so this service agrees with
 # every other on which ARNs name its own resources and what an ARN's fields are.
