@@ -269,18 +269,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
-        // Every accepted connection moves to the non-terminal `pending` now, with the clock
-        // owing it `available`; the span is never zero, so a caller describing the
-        // connections straight after this call still sees the transient state.
+        // Every accepted connection, and the endpoint it is of, move to the non-terminal
+        // `pending` now with the clock owing them `available` — through the one writer of an
+        // acceptance, so the state the consumer reads off its endpoint and the state the
+        // owner reads off the connection cannot drift apart. The span is never zero, so a
+        // caller describing the connections straight after this call still sees the transient
+        // state.
         for endpoint_id in accepted {
-            if let Some(connection) = store.vpc_endpoint_connections.get_mut(&endpoint_id) {
-                connection.vpc_endpoint_state =
-                    Some(state::VPC_ENDPOINT_STATE_PENDING.to_string());
-            }
-            store.vpc_endpoint_connection_moves.insert(
-                endpoint_id,
-                state::PendingStateMove::starting_now(state::VPC_ENDPOINT_STATE_AVAILABLE),
-            );
+            store.accept_vpc_endpoint_connection(&endpoint_id);
         }
 
         Ok(AcceptVpcEndpointConnectionsOutput {

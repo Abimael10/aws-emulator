@@ -577,6 +577,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(state::invalid_service_name(service_name));
         }
 
+        // The endpoint SERVICE the name resolved to, where it is one of the ACCOUNT's own
+        // configurations rather than one the Region publishes — read through the one
+        // resolution of such a service ([`crate::state::account_endpoint_service_record_of`]),
+        // which is what the question above resolved the name against. "When a consumer
+        // creates an endpoint to your service, a connection request is sent to you" (the
+        // PrivateLink User Guide's "Manage endpoint connection requests"): an endpoint to a
+        // service with an OWNER records the connection that owner acts on, and whether the
+        // owner must accept it before the endpoint comes into service is what the
+        // configuration's `AcceptanceRequired` says.
+        let account_service =
+            state::account_endpoint_service_record_of(&store, &service_region, service_name);
+
         // "The type of endpoint" (`VpcEndpointType`) has to be one the endpoint can REACH the
         // service through ("the type of service", `ServiceDetail$ServiceType`): a gateway
         // endpoint reaches a service only through that service's route-table prefix list and
@@ -909,6 +921,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if !store.has_vpc_endpoint_capacity() {
             return Err(state::vpc_endpoint_limit_exceeded());
         }
+        // An endpoint to one of the account's own services also stores the CONNECTION its
+        // owner acts on, so that store's ceiling is asked here too — before anything is
+        // written, so this create never leaves behind an endpoint whose service holds no
+        // connection for it.
+        if account_service.is_some() && !store.has_vpc_endpoint_connection_capacity(1) {
+            return Err(state::vpc_endpoint_limit_exceeded());
+        }
         // What this request would retain: the record itself and its tags (what
         // `insert_vpc_endpoint` charges), the caller-chosen policy, service name and client
         // token, and an upper bound on the derived DNS names of an interface endpoint.
@@ -1067,13 +1086,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The record itself. It is stored in the state this call ANSWERS with — the
         // terminal one for an endpoint that stands up nothing, the non-terminal one for an
-        // endpoint whose network interfaces are still being provisioned
-        // ([`created_state`]) — and "Indicates whether the endpoint is being managed by its
+        // endpoint whose network interfaces are still being provisioned, and the one an
+        // endpoint waiting for its service's owner sits in ([`created_state`]) — and
+        // "Indicates whether the endpoint is being managed by its
         // service" (`RequesterManaged`) is false for one a caller created. Every ID LIST the
         // endpoint has is reported as a list — the ids the request named for it, empty where it
         // named none — while a member that is not a list is set only for a type that has one,
         // so a gateway endpoint does not report an address type it has none of.
-        let created_state = created_state(gateway);
+        let acceptance_required = account_service
+            .as_ref()
+            .is_some_and(|service| service.acceptance_required);
+        let created_state = created_state(gateway, acceptance_required);
         let endpoint = VpcEndpoint {
             vpc_endpoint_type: Some(endpoint_type.clone()),
             vpc_id: Some(input.vpc_id.clone()),
@@ -1140,8 +1163,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // — the same span, off the same monotonic clock, as every other move this store
         // owes. The span is never zero, so a caller that reads the endpoint straight after
         // this call still sees it `pending`. An endpoint this call already answered
-        // `available` owes no move at all ([`created_state`]).
-        if created_state != state::VPC_ENDPOINT_STATE_AVAILABLE {
+        // `available` owes no move at all, and neither does one waiting for the owner of its
+        // service to answer its connection request: that is an action rather than an instant
+        // ([`created_state`]).
+        if created_state == state::VPC_ENDPOINT_STATE_PENDING {
             store.vpc_endpoint_moves.insert(
                 endpoint_id.clone(),
                 state::PendingStateMove::starting_now(state::VPC_ENDPOINT_STATE_AVAILABLE),
@@ -1221,13 +1246,65 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 stored.dns_entries = Some(entries);
             }
         }
-        // Each endpoint network interface names the endpoint it serves, and is managed by
-        // the service rather than by the caller — "Indicates whether the interface is being
-        // managed by Amazon" (`NetworkInterface$RequesterManaged`).
-        for network_interface_id in &network_interface_ids {
-            if let Some(stored) = store.network_interfaces.get_mut(network_interface_id) {
-                stored.description = Some(format!("VPC Endpoint Interface {endpoint_id}"));
-                stored.requester_managed = Some(true);
+        // Each endpoint network interface names the endpoint it serves, is managed by the
+        // service rather than by the caller, and is HELD by the endpoint for as long as the
+        // endpoint exists — recorded through the one seam that records it
+        // ([`crate::state::ComAmazonawsEc2Amazonec2State::hold_endpoint_network_interfaces`]).
+        store.hold_endpoint_network_interfaces(&endpoint_id, &network_interface_ids);
+        // The CONNECTION the owner of the service acts on, for an endpoint to one of the
+        // account's own endpoint services: "when a consumer creates an endpoint to your
+        // service, a connection request is sent to you" (the PrivateLink User Guide's "Manage
+        // endpoint connection requests"), and that request is what
+        // `DescribeVpcEndpointConnections` reports and what
+        // `AcceptVpcEndpointConnections` / `RejectVpcEndpointConnections` act on — so an
+        // endpoint to such a service is never one its service knows nothing about. It carries
+        // the state the endpoint itself is in and the load balancers the service is behind,
+        // read off the one record describe reports each from, and goes in through the one
+        // writer of a connection, whose ceiling was asked before anything was written.
+        if let Some(service) = account_service.as_ref() {
+            let endpoint_dns_entries = store
+                .vpc_endpoints
+                .get(&endpoint_id)
+                .and_then(|stored| stored.dns_entries.clone())
+                .unwrap_or_default();
+            let behind = store.vpc_endpoint_services.get(&service.service_id);
+            let network_load_balancer_arns = behind
+                .and_then(|configuration| configuration.network_load_balancer_arns.clone())
+                .unwrap_or_default();
+            let gateway_load_balancer_arns = behind
+                .and_then(|configuration| configuration.gateway_load_balancer_arns.clone())
+                .unwrap_or_default();
+            store.insert_vpc_endpoint_connection(state::VpcEndpointConnectionSpec {
+                service_id: service.service_id.clone(),
+                vpc_endpoint_id: endpoint_id.clone(),
+                // "The ID of the Amazon Web Services account that owns the VPC endpoint"
+                // (`VpcEndpointConnection$VpcEndpointOwner`): the account this emulator
+                // serves, which is the account that just created it.
+                vpc_endpoint_owner: ::engine::emulator_account_id().to_string(),
+                vpc_endpoint_state: created_state.to_string(),
+                creation_timestamp: SystemTime::now(),
+                vpc_endpoint_region: region.clone(),
+                ip_address_type: interface.then(|| ip_address_type.to_string()),
+                dns_entries: endpoint_dns_entries,
+                network_load_balancer_arns,
+                gateway_load_balancer_arns,
+                // A payer responsibility is a setting of the endpoint something modified; a
+                // create asks for none, so the connection carries none.
+                payer_responsibilities: Vec::new(),
+                // The tags belong to the endpoint the request tagged, not to the connection
+                // its service holds for it.
+                tags: Vec::new(),
+            });
+            // A service that waived acceptance accepts it itself — "if you don't enable
+            // acceptance required, endpoint connections are automatically accepted" (the same
+            // guide) — so the connection is in the endpoint's own non-terminal state with the
+            // clock owing it `available`, exactly as the endpoint is. One the owner must
+            // answer owes nothing: that is an action rather than an instant.
+            if created_state == state::VPC_ENDPOINT_STATE_PENDING {
+                store.vpc_endpoint_connection_moves.insert(
+                    endpoint_id.clone(),
+                    state::PendingStateMove::starting_now(state::VPC_ENDPOINT_STATE_AVAILABLE),
+                );
             }
         }
         if let Some(token) = input.client_token.clone() {
@@ -1262,8 +1339,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// contrast, is only in service once the endpoint network interfaces it stood up in its
 /// subnets are, so it is answered in the non-terminal `pending` state with the move to
 /// `available` owed by the clock (see the caller).
-fn created_state(gateway: bool) -> &'static str {
-    if gateway {
+///
+/// An endpoint to a service whose owner must ACCEPT the connection is in neither: "when a
+/// consumer creates an endpoint to your service, a connection request is sent to you" (the
+/// PrivateLink User Guide's "Manage endpoint connection requests"), and until that request is
+/// answered the endpoint is `pendingAcceptance` — an ACTION rather than an instant, so
+/// nothing is owed on it and it stays there until the owner accepts or rejects it
+/// (`ComAmazonawsEc2Amazonec2State::accept_vpc_endpoint_connection` /
+/// `reject_vpc_endpoint_connection`).
+fn created_state(gateway: bool, acceptance_required: bool) -> &'static str {
+    if acceptance_required {
+        crate::state::VPC_ENDPOINT_STATE_PENDING_ACCEPTANCE
+    } else if gateway {
         crate::state::VPC_ENDPOINT_STATE_AVAILABLE
     } else {
         crate::state::VPC_ENDPOINT_STATE_PENDING

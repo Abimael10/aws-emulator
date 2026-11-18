@@ -190,12 +190,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         }
         // "You must detach the network interface before you can delete it"
-        // (`DeleteNetworkInterface`), so an interface an attachment still holds is refused
-        // and stays exactly where it was.
-        if store
-            .network_interface_attachment(network_interface_id)
-            .is_some()
-        {
+        // (`DeleteNetworkInterface`), and an interface the SERVICE that created it manages
+        // for a resource of the account is held by that resource — so an interface anything
+        // still holds is refused and stays exactly where it was. Asked through the one
+        // definition of held this crate has, which is also what the status a describe reports
+        // follows, so a delete cannot refuse an interface a describe calls free, or remove
+        // one it calls `in-use`.
+        if store.network_interface_is_held(network_interface_id) {
             return Err(state::network_interface_in_use(network_interface_id));
         }
 

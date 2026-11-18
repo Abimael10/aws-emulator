@@ -186,6 +186,11 @@ impl ComAmazonawsEc2Amazonec2State {
                 let assigned = self.assign_amazon_public_ipv4(&network_interface_id, &region);
                 if let Some(instance) = self.instances.get_mut(instance_id) {
                     instance.public_ip = assigned;
+                    // The address is Amazon's and belongs to the RUNNING instance: a stop
+                    // releases it and a later start is given a fresh one
+                    // ([`crate::state::instance_mapped_public_ipv4`]), which is what this
+                    // records.
+                    instance.mapped_public_ipv4 = true;
                 }
             }
         }

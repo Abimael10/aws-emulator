@@ -402,6 +402,35 @@ impl ComAmazonawsEc2Amazonec2State {
             .filter(|attachment| !attachment_is_detached(attachment))
     }
 
+    /// Whether anything HOLDS the network interface `network_interface_id` — an attachment,
+    /// or the service that manages it for a resource of the account.
+    ///
+    /// A READ ONLY, and the one definition of "held" this crate has: it is what
+    /// `NetworkInterface$Status` reports ([`NETWORK_INTERFACE_STATUS_IN_USE`] against
+    /// [`NETWORK_INTERFACE_STATUS_AVAILABLE`]) and what a delete refuses
+    /// ([`network_interface_in_use`]), so the status a describe reports and the refusal a
+    /// delete answers cannot disagree about one interface.
+    ///
+    /// Two things can hold one. An ATTACHMENT does — "you must detach the network interface
+    /// before you can delete it" (`DeleteNetworkInterface`) — unless it has been taken away
+    /// ([`Self::network_interface_attachment`]). So does the SERVICE that created the
+    /// interface to serve a resource of the account, for as long as that resource exists:
+    /// "indicates whether the interface is being managed by Amazon Web Services"
+    /// (`NetworkInterface$RequesterManaged`) is exactly the interface a caller does not
+    /// manage, and the resource it serves — an interface VPC endpoint and its endpoint
+    /// network interfaces — is what releases it when that resource is deleted.
+    pub fn network_interface_is_held(&self, network_interface_id: &str) -> bool {
+        if self
+            .network_interface_attachment(network_interface_id)
+            .is_some()
+        {
+            return true;
+        }
+        self.network_interfaces
+            .get(network_interface_id)
+            .is_some_and(|interface| interface.requester_managed == Some(true))
+    }
+
     /// Whether `attachment_id` is a network interface attachment id this service could have
     /// ISSUED, which is what an operation that resolves a `NetworkInterfaceAttachmentId`
     /// reads one as.

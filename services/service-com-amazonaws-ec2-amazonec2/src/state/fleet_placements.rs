@@ -449,6 +449,8 @@ impl ComAmazonawsEc2Amazonec2State {
             // A public address comes from a default-VPC subnet or an Elastic IP, neither of
             // which this slice models — the same answer `RunInstances` gives.
             public_ip: None,
+            // …so Amazon maps no public address to it either.
+            mapped_public_ipv4: false,
             // An instance AWS has just launched is `pending`; the clock owes it `running`,
             // on the same span as every other transition of this crate.
             state: InstanceStateName::Pending,

@@ -82,6 +82,118 @@ impl ComAmazonawsEc2Amazonec2State {
             .insert(vpc_endpoint_id, connection);
         Some(vpc_endpoint_connection_id)
     }
+
+    /// Take the connection of the endpoint `vpc_endpoint_id` out of the store, with the move
+    /// the clock still owed it, and answer the record that was removed.
+    ///
+    /// The exact reverse of [`Self::insert_vpc_endpoint_connection`]: the bytes the record
+    /// held go back to the budget on the terms they were taken on
+    /// ([`vpc_endpoint_connection_payload_bytes`]), and nothing is left owed on a connection
+    /// the store no longer holds. The ONE removal path, so the two deletes a connection can
+    /// go with — the endpoint it is OF, and the service it is TO — give back exactly what the
+    /// insert took.
+    pub fn remove_vpc_endpoint_connection(
+        &mut self,
+        vpc_endpoint_id: &str,
+    ) -> Option<VpcEndpointConnection> {
+        let connection = self.vpc_endpoint_connections.remove(vpc_endpoint_id)?;
+        self.release_stored_bytes(vpc_endpoint_connection_payload_bytes(&connection));
+        self.vpc_endpoint_connection_moves.remove(vpc_endpoint_id);
+        Some(connection)
+    }
+
+    /// Record that the owner of the endpoint service ACCEPTED the connection request of the
+    /// endpoint `vpc_endpoint_id`.
+    ///
+    /// "Accepts connection requests to your VPC endpoint service"
+    /// (`AcceptVpcEndpointConnections`): the acceptance is what brings the endpoint into
+    /// service, so the connection AND the endpoint it is of leave `pendingAcceptance` for the
+    /// non-terminal [`VPC_ENDPOINT_STATE_PENDING`] with the clock owing each
+    /// [`VPC_ENDPOINT_STATE_AVAILABLE`] — the span is never zero, so a caller that reads
+    /// either straight after the acceptance still sees the transient state.
+    ///
+    /// The ONE writer of an acceptance, so the state the consumer reads off its endpoint and
+    /// the state the owner reads off the connection cannot drift apart. An endpoint this
+    /// store holds no record of — one of another account, which only the connection is
+    /// stored for — moves nothing but its connection.
+    pub fn accept_vpc_endpoint_connection(&mut self, vpc_endpoint_id: &str) {
+        if let Some(connection) = self.vpc_endpoint_connections.get_mut(vpc_endpoint_id) {
+            connection.vpc_endpoint_state = Some(VPC_ENDPOINT_STATE_PENDING.to_string());
+        }
+        self.vpc_endpoint_connection_moves.insert(
+            vpc_endpoint_id.to_string(),
+            PendingStateMove::starting_now(VPC_ENDPOINT_STATE_AVAILABLE),
+        );
+        if let Some(endpoint) = self.vpc_endpoints.get_mut(vpc_endpoint_id) {
+            endpoint.state = Some(VPC_ENDPOINT_STATE_PENDING.to_string());
+        }
+        self.vpc_endpoint_moves.insert(
+            vpc_endpoint_id.to_string(),
+            PendingStateMove::starting_now(VPC_ENDPOINT_STATE_AVAILABLE),
+        );
+    }
+
+    /// Record that the owner of the endpoint service REJECTED the connection request of the
+    /// endpoint `vpc_endpoint_id`.
+    ///
+    /// "Rejects VPC endpoint connection requests to your VPC endpoint service"
+    /// (`RejectVpcEndpointConnections`): the refusal is the owner's answer rather than a span
+    /// of the clock, so the connection and the endpoint it is of reach the TERMINAL
+    /// [`VPC_ENDPOINT_STATE_REJECTED`] at once and nothing is owed on either afterwards — a
+    /// rejected endpoint never comes into service, which is what a consumer polling it has to
+    /// be able to see.
+    ///
+    /// The mirror of [`Self::accept_vpc_endpoint_connection`], and the ONE writer of a
+    /// rejection for the same reason.
+    pub fn reject_vpc_endpoint_connection(&mut self, vpc_endpoint_id: &str) {
+        if let Some(connection) = self.vpc_endpoint_connections.get_mut(vpc_endpoint_id) {
+            connection.vpc_endpoint_state = Some(VPC_ENDPOINT_STATE_REJECTED.to_string());
+        }
+        self.vpc_endpoint_connection_moves.remove(vpc_endpoint_id);
+        if let Some(endpoint) = self.vpc_endpoints.get_mut(vpc_endpoint_id) {
+            endpoint.state = Some(VPC_ENDPOINT_STATE_REJECTED.to_string());
+        }
+        self.vpc_endpoint_moves.remove(vpc_endpoint_id);
+    }
+
+    /// Give the endpoint network interfaces `network_interface_ids` to the interface VPC
+    /// endpoint `endpoint_id` they serve.
+    ///
+    /// "When you create an interface endpoint, we create an endpoint network interface in
+    /// the subnet" (the PrivateLink User Guide's "Interface endpoints"): such an interface is
+    /// the ENDPOINT's, not the caller's, so it names the endpoint it serves
+    /// ([`vpc_endpoint_interface_description`]), is one "being managed by Amazon Web
+    /// Services" (`NetworkInterface$RequesterManaged`) and is HELD by that endpoint for as
+    /// long as the endpoint exists — which is what `in-use` means
+    /// ([`ComAmazonawsEc2Amazonec2State::network_interface_is_held`], the one definition of
+    /// held this crate has) and why only deleting the endpoint releases it.
+    ///
+    /// The ONE place that is recorded, so the create of an endpoint and a modify that adds a
+    /// subnet to one leave the same interface behind. An id this store holds no interface for
+    /// is skipped.
+    pub fn hold_endpoint_network_interfaces(
+        &mut self,
+        endpoint_id: &str,
+        network_interface_ids: &[String],
+    ) {
+        for network_interface_id in network_interface_ids {
+            if let Some(stored) = self.network_interfaces.get_mut(network_interface_id) {
+                stored.description = Some(vpc_endpoint_interface_description(endpoint_id));
+                stored.requester_managed = Some(true);
+                stored.status = Some(NETWORK_INTERFACE_STATUS_IN_USE.to_string());
+            }
+        }
+    }
+}
+
+/// The description EC2 gives the endpoint network interface serving the endpoint
+/// `endpoint_id`: `VPC Endpoint Interface <vpce-id>`, the sentence AWS was recorded reporting
+/// for one, with the endpoint's own id as its one variable part.
+///
+/// One spelling for every path that creates such an interface
+/// ([`ComAmazonawsEc2Amazonec2State::hold_endpoint_network_interfaces`]).
+pub fn vpc_endpoint_interface_description(endpoint_id: &str) -> String {
+    format!("VPC Endpoint Interface {endpoint_id}")
 }
 
 /// The bytes one stored VPC endpoint connection holds: the fixed overhead of the record

@@ -592,6 +592,8 @@ pub fn launch_host_instance<Eng: Send + Sync + 'static>(
         private_ip: launch.management_ip.to_string(),
         // A host is reached over the VLAN subnets, never over a public address.
         public_ip: None,
+        // …so Amazon maps no public address to it when it starts either.
+        mapped_public_ipv4: false,
         // Just launched: `pending`, with the move to `running` the clock owes it on
         // EC2's own span — the host's own CREATING -> CREATED runs on Amazon EVS's.
         state: ec2::InstanceStateName::Pending,

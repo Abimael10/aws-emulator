@@ -493,6 +493,17 @@ pub struct InstanceRecord {
     pub private_ip: String,
     pub private_dns_name: String,
     pub public_ip: Option<String>,
+    /// Whether this instance is one AMAZON maps a public IPv4 address to — the launch asked
+    /// for one, or the subnet it is in assigns one ("indicates whether instances launched in
+    /// this subnet receive a public IPv4 address", `Subnet$MapPublicIpOnLaunch`).
+    ///
+    /// Held because such an address belongs to the RUNNING instance: it is released when the
+    /// instance stops and a different one is assigned when it starts again
+    /// ([`crate::state::instance_mapped_public_ipv4`]), so what has to survive the stop is
+    /// the fact that this instance gets one rather than the address itself. An instance whose
+    /// public address is an Elastic IP the account allocated is NOT one of these: that
+    /// allocation outlives the running instance.
+    pub mapped_public_ipv4: bool,
     pub state: InstanceStateName,
     /// The next state the clock owes this instance, if any.
     pub pending_transition: Option<PendingTransition>,

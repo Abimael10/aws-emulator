@@ -236,6 +236,11 @@ fn remove_endpoint(store: &mut crate::state::ComAmazonawsEc2Amazonec2State, endp
     // A route pointing at the endpoint is a route to nothing once the endpoint is gone; an
     // endpoint is reported as a route's `GatewayId`, whichever route table holds it.
     store.drop_routes_to_gateway(endpoint_id);
+    // The connection the endpoint had to one of the account's own endpoint services goes with
+    // it too: a connection naming an endpoint the store no longer holds would be reported as
+    // a connection from nothing. Through the one removal path, so the bytes it held go back on
+    // the terms they were taken on.
+    store.remove_vpc_endpoint_connection(endpoint_id);
     for network_interface_id in endpoint.network_interface_ids.iter().flatten() {
         // The exact reverse of the insert the create made: it gives the interface's private
         // address and its bytes back as well.

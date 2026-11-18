@@ -287,6 +287,8 @@ pub fn launch<Eng: Send + Sync + 'static>(
             // A public address comes from a default-VPC subnet or an Elastic IP,
             // neither of which is modelled.
             public_ip: None,
+            // …so Amazon maps no public address to it when it starts either.
+            mapped_public_ipv4: false,
             // A launched instance is `pending` and becomes `running` on Amazon EC2's own
             // clock, so a caller that describes it straight away still sees `pending` —
             // the same transient state the group reports it `Pending` for.

@@ -3240,14 +3240,7 @@ pub fn endpoint_service_name_is_offered(
     // The account's own services first: the cheapest source, and the one a name of either
     // family may sit in. A configuration is offered in the Region it is hosted in, which is the
     // Region describe reports it for.
-    if store
-        .vpc_endpoint_services
-        .values()
-        .filter_map(account_endpoint_service_record)
-        .any(|service| {
-            service.service_name == service_name && service.service_region.as_str() == region
-        })
-    {
+    if account_endpoint_service_record_of(store, region, service_name).is_some() {
         return true;
     }
     // A name whose own Region label is not the Region hosting the service names nothing: the
@@ -3650,13 +3643,41 @@ pub fn account_endpoint_service_record(
     })
 }
 
+/// The account's OWN endpoint service called `service_name` and hosted in `region`, or `None`
+/// when no service configuration this account holds is that service.
+///
+/// The ONE resolution of "which of my endpoint services is this name", so the create that
+/// resolves a name against the account's own services
+/// ([`endpoint_service_name_is_offered`]) and the create that then records a connection to
+/// the service it named read exactly one record — and the owner, the id and the
+/// `AcceptanceRequired` the connection is recorded under are the ones describe reports.
+pub fn account_endpoint_service_record_of(
+    store: &ComAmazonawsEc2Amazonec2State,
+    region: &str,
+    service_name: &str,
+) -> Option<EndpointServiceRecord> {
+    store
+        .vpc_endpoint_services
+        .values()
+        .filter_map(account_endpoint_service_record)
+        .find(|service| {
+            service.service_name == service_name && service.service_region.as_str() == region
+        })
+}
+
 /// An endpoint that is in service, as [`VPC_ENDPOINT_STATE_VALUES`] spells it.
 pub const VPC_ENDPOINT_STATE_AVAILABLE: &str = "available";
-
 /// An endpoint that has been created, or accepted, and is not in service yet: the
 /// non-terminal state the clock owes [`VPC_ENDPOINT_STATE_AVAILABLE`], as
 /// [`VPC_ENDPOINT_STATE_VALUES`] spells it.
 pub const VPC_ENDPOINT_STATE_PENDING: &str = "pending";
+
+/// An endpoint whose connection the owner of the service it is to REFUSED, as
+/// [`VPC_ENDPOINT_STATE_VALUES`] spells it.
+///
+/// TERMINAL: the refusal is the owner's answer rather than a span of the clock, so nothing is
+/// owed on a connection that reaches it and a later call finds it exactly here.
+pub const VPC_ENDPOINT_STATE_REJECTED: &str = "rejected";
 
 /// What one stored VPC endpoint connection is created with, beside the connection id the
 /// store mints itself.

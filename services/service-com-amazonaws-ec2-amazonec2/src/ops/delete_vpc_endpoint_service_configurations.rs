@@ -325,12 +325,9 @@ fn remove_endpoint_service(
         .iter()
         .map(|connection| connection.vpc_endpoint_id.clone())
     {
-        if let Some(connection) = store.vpc_endpoint_connections.remove(&vpc_endpoint_id) {
-            store.release_stored_bytes(state::vpc_endpoint_connection_payload_bytes(&connection));
-        }
-        // The move the clock still owed that connection is owed no longer: the connection
-        // went with the service.
-        store.vpc_endpoint_connection_moves.remove(&vpc_endpoint_id);
+        // Through the one removal path, which gives the record's bytes back and forgets the
+        // move the clock still owed it: the connection went with the service.
+        store.remove_vpc_endpoint_connection(&vpc_endpoint_id);
     }
     let tokens: Vec<String> = store
         .vpc_endpoint_service_client_tokens

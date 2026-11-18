@@ -1294,6 +1294,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // launch asked its primary interface for one — assigned with that interface,
                 // below, so the instance and the interface report one address.
                 public_ip: None,
+                // Whether Amazon maps one to this instance is decided where that address is
+                // assigned, with the interface it goes to below.
+                mapped_public_ipv4: false,
                 state: InstanceStateName::Pending,
                 pending_transition: Some(PendingTransition::starting_now(
                     InstanceStateName::Running,

@@ -1440,14 +1440,19 @@ impl ComAmazonawsEc2Amazonec2State {
         let retained_bytes =
             network_interface_spec_bytes(&spec).saturating_add(STORED_RECORD_OVERHEAD_BYTES);
         // "The status of the network interface" (`NetworkInterface$Status`): an interface
-        // something holds is `in-use`, one attached to nothing is `available`, and an
-        // attachment that has reached `detached` holds nothing. Derived here rather than
-        // taken from the writer, so a stored interface cannot claim to be `available` while
-        // something holds it — a create, which attaches nothing, always gets `available`.
+        // something holds is `in-use` and one nothing holds is `available`. Derived here
+        // rather than taken from the writer, so a stored interface cannot claim to be
+        // `available` while something holds it — and derived on the same terms a later read
+        // asks ([`ComAmazonawsEc2Amazonec2State::network_interface_is_held`]): an attachment
+        // that has not been taken away holds it, and so does the SERVICE that created it to
+        // serve a resource of the account, for as long as that resource exists. A create the
+        // CALLER made for itself attaches nothing and names no such service, so it always
+        // gets `available`.
         let held = spec
             .attachment
             .as_ref()
-            .is_some_and(|attachment| !attachment_is_detached(attachment));
+            .is_some_and(|attachment| !attachment_is_detached(attachment))
+            || spec.requester.is_some();
         let status = if held {
             NETWORK_INTERFACE_STATUS_IN_USE
         } else {

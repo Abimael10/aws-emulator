@@ -2620,6 +2620,13 @@ pub use instance_console::*;
 pub mod instance_boots;
 pub use instance_boots::*;
 
+/// The public IPv4 address AMAZON maps to a RUNNING instance: released at the instant a stop
+/// completes and freshly assigned at the instant a start does, an Elastic IP the account
+/// allocated being left where it is. A SUBMODULE for the same reason [`image_usage_reports`]
+/// is one. Nothing is re-exported from it: both seams are the clock's, reached only by
+/// [`ComAmazonawsEc2Amazonec2State::materialize_due_transitions`].
+pub mod instance_mapped_public_ipv4;
+
 /// The PROGRAM an instance's own user data gives its guest to run at boot — the commands
 /// cloud-init runs on every boot and the ones it runs once. A SUBMODULE for the same reason
 /// [`image_usage_reports`] is one.

@@ -411,6 +411,10 @@ impl ComAmazonawsEc2Amazonec2State {
     /// `StartVpcEndpointServicePrivateDnsVerification` began, which carries an endpoint
     /// service's private DNS name out of `pendingVerification`
     /// ([`Self::materialize_due_private_dns_name_verifications`]).
+    ///
+    /// So is the public IPv4 address Amazon maps to a RUNNING instance: the address is
+    /// released at the instant a stop completes and a fresh one assigned at the instant a
+    /// start does ([`crate::state::instance_mapped_public_ipv4`]).
     pub fn materialize_due_transitions(&mut self) {
         let now = Instant::now();
         // The one clock-owed REMOVAL: a recycled AMI whose retention period has run out was
@@ -442,6 +446,12 @@ impl ComAmazonawsEc2Amazonec2State {
         // at `terminated` has no transition left to apply, so a later sweep collects nothing
         // for it and cannot free an address a new holder has since been given.
         let mut released: Vec<String> = Vec::new();
+        // The instances whose STOP and whose START completed in this sweep: a mapped public
+        // IPv4 address is released at the first instant and a fresh one assigned at the
+        // second ([`crate::state::instance_mapped_public_ipv4`]), and both are applied after
+        // this walk because each reaches the account's interfaces as well as the instance.
+        let mut stopped: Vec<String> = Vec::new();
+        let mut started: Vec<String> = Vec::new();
         for instance in self.instances.values_mut() {
             let due = instance
                 .pending_transition
@@ -456,6 +466,11 @@ impl ComAmazonawsEc2Amazonec2State {
                 // freed the address for reuse and a later launch may be given it.
                 if state == InstanceStateName::Terminated {
                     released.push(instance.private_ip.clone());
+                }
+                match state {
+                    InstanceStateName::Stopped => stopped.push(instance.instance_id.clone()),
+                    InstanceStateName::Running => started.push(instance.instance_id.clone()),
+                    _ => {}
                 }
             }
             // The monitoring move the clock owes the same instance: `pending` -> `enabled`
@@ -474,6 +489,17 @@ impl ComAmazonawsEc2Amazonec2State {
         }
         for address in released {
             self.release_private_ip(&address);
+        }
+        // "The public IPv4 address is released when you stop… your instance" and a new one is
+        // assigned when it starts again (the EC2 User Guide's "Public IPv4 addresses"): both
+        // were owed at the instant the move above completed, whether or not anybody called
+        // again. An Elastic IP the account allocated is left associated, which is what makes
+        // it survive a stop.
+        for instance_id in stopped {
+            self.release_mapped_public_ipv4(&instance_id);
+        }
+        for instance_id in started {
+            self.assign_mapped_public_ipv4(&instance_id);
         }
         // Which instances are ON a Dedicated Host follows from the states just applied: an
         // instance that has reached `terminated` — or `stopped` — has left the host it was

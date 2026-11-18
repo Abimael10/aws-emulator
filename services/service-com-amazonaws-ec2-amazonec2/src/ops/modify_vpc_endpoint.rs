@@ -1028,15 +1028,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 }
             }
         }
-        // Each endpoint network interface names the endpoint it serves, and is managed by the
-        // service rather than by the caller — "Indicates whether the interface is being
-        // managed by Amazon" (`NetworkInterface$RequesterManaged`).
-        for network_interface_id in &added_interface_ids {
-            if let Some(stored) = store.network_interfaces.get_mut(network_interface_id) {
-                stored.description = Some(format!("VPC Endpoint Interface {endpoint_id}"));
-                stored.requester_managed = Some(true);
-            }
-        }
+        // Each endpoint network interface names the endpoint it serves, is managed by the
+        // service rather than by the caller, and is HELD by the endpoint — through the one
+        // seam that records it, the same one the create goes through.
+        store.hold_endpoint_network_interfaces(endpoint_id, &added_interface_ids);
 
         // "(Interface endpoint) The IDs of the subnets from which to remove the endpoint"
         // (`RemoveSubnetIds`): the interface that subnet was served through goes with it,
