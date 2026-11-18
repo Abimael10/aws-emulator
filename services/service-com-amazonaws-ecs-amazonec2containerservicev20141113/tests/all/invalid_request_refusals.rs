@@ -24,7 +24,7 @@ use serde_json::{json, Value};
 
 use crate::ecs_wire::{
     create_cluster, identity_document, identity_document_signature, list, ok, refusal, service,
-    string, ACCOUNT, SIGNED_REGION,
+    string, ACCOUNT, IDENTITY_PAIR_NOT_VALID, SIGNED_REGION,
 };
 
 /// The cluster every request below names.
@@ -39,9 +39,8 @@ const INVALID_PARAMETER: &str = "InvalidParameterException";
 const CLIENT_EXCEPTION: &str = "ClientException";
 
 /// What ECS says when the identity document and the signature presented with it are not
-/// the pair that vouches for one EC2 instance.
-const IDENTITY_NOT_VALID: &str =
-    "The identity document and identity document signature were not valid.";
+/// the pair that vouches for one EC2 instance, as the shared harness holds that sentence.
+const IDENTITY_NOT_VALID: &str = IDENTITY_PAIR_NOT_VALID;
 
 /// What ECS says when a value WAS presented as the identity document but is not one at
 /// all: the document is refused as a whole, with no field of its body named back, because

@@ -32,7 +32,7 @@ use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 use std::sync::Arc;
 
-use crate::ecs_wire::{iam, list, ok, ACCOUNT, SIGNED_REGION};
+use crate::ecs_wire::{iam, list, ok, xml_element, ACCOUNT, SIGNED_REGION};
 
 /// The error code an authorization refusal carries (`AccessDeniedException`, `@httpError
 /// 403`).
@@ -152,15 +152,6 @@ async fn sts(
         "case {case:?}: expected STS {action} to answer 200, got {status} with {text}"
     );
     text
-}
-
-/// The text of the first `<element>` of an awsQuery XML body.
-fn xml_element(body: &str, element: &str) -> Option<String> {
-    let open = format!("<{element}>");
-    let close = format!("</{element}>");
-    let start = body.find(&open)? + open.len();
-    let end = body[start..].find(&close)? + start;
-    Some(body[start..end].to_string())
 }
 
 /// One role session a row calls as: the access key id its requests are signed with, and the

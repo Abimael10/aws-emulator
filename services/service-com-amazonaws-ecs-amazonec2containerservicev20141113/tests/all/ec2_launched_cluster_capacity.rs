@@ -35,16 +35,38 @@
 //! different clusters of the account, and one the account does not hold), the INSTANCE TYPE
 //! the capacity comes from (two sizes, which is what the reported resources are read off),
 //! and user data that configures no cluster at all — including none at all.
+//!
+//! # The registration the AGENT itself makes
+//!
+//! A second rule, over the same estate
+//! ([`a_machine_registers_with_the_identity_document_its_own_metadata_publishes`]):
+//!
+//! > The (`instanceIdentityDocument`, `instanceIdentityDocumentSignature`) pair an
+//! > instance's OWN metadata service publishes to its guest is the pair
+//! > `RegisterContainerInstance` accepts — the document is read inside the machine ("this
+//! > document can be found by running the following command from the instance", followed by
+//! > a `curl` of the link-local address, `RegisterContainerInstanceRequest$
+//! > instanceIdentityDocument`) and registers that machine as an `ACTIVE` container
+//! > instance with its agent connected, reporting the EC2 instance id the document names.
+//!
+//! Its rows differ along what that rule generalises over: WHICH machine publishes the pair
+//! (two instance types, two Availability Zones of the Region) and the FORM the guest's read
+//! takes (the IMDSv1 `GET`, on an instance whose launch makes a session token optional, and
+//! the IMDSv2 token request followed by a read presenting that token, on one whose launch
+//! requires a token and on one that leaves the requirement to its AMI).
 
 use std::collections::BTreeSet;
 use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
+// The instance metadata service's own address, paths and headers, read from the service that
+// PUBLISHES the identity document to a guest rather than written here.
+use service_com_amazonaws_ec2_amazonec2::state as ec2_state;
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::ecs_wire::{
-    count, create_cluster, ec2, ec2_element, ec2_form, emulator_with_ec2, list, ok, string,
-    SIGNED_REGION,
+    count, create_cluster, ec2, ec2_element, ec2_form, emulator_with_ec2, list, ok, refusal,
+    string, xml_element, ACCOUNT, IDENTITY_PAIR_NOT_VALID, SIGNED_REGION,
 };
 use crate::task_lifecycle::container;
 
@@ -705,5 +727,355 @@ async fn capacity_comes_from_instances_amazon_ec2_itself_holds() {
         instance_id,
         "case {case:?}: expected Amazon EC2 to hold the instance the cluster reports capacity \
          for, got {described}"
+    );
+}
+
+/// The cluster the registrations the AGENT itself makes below join, so what those
+/// registrations report cannot be read out of the table above.
+const IDENTITY_CLUSTER: &str = "identityfleet";
+
+/// The Amazon VPC the machines that publish an identity document are launched into.
+const IDENTITY_VPC_CIDR: &str = "10.90.0.0/16";
+
+/// The marker the boot script writes the SIGNATURE under, so the value the guest read can be
+/// told from the rest of the console. The document itself goes to the console as the guest
+/// read it, exactly as the documented read spells that read, and is found by its own JSON.
+const SIGNATURE_MARKER: &str = "IDENTITY signature";
+
+/// How long a session token a guest asks for is to be good for, in the header that request
+/// states its lifetime in (`ec2_state::METADATA_TOKEN_TTL_HEADER`).
+const TOKEN_LIFETIME_SECONDS: u32 = 21_600;
+
+/// The address an instance's metadata service is published at, with the scheme a documented
+/// read names it under — read from the service that PUBLISHES it rather than written here.
+fn metadata_address() -> String {
+    format!("http://{}", ec2_state::metadata_address())
+}
+
+/// One row of the identity table: the machine whose guest publishes the pair, and the FORM
+/// its guest reads the metadata service in.
+struct IdentityRow {
+    case: &'static str,
+    /// The instance type the machine is of.
+    instance_type: &'static str,
+    /// The letter of the Availability Zone it is launched into, which is what the `region`
+    /// member of its own document is derived from.
+    zone_suffix: &'static str,
+    /// The address range of the subnet in that zone.
+    subnet_cidr: &'static str,
+    /// The `HttpTokens` its launch states, or `None` for a launch that states none — in
+    /// which case the AMI's own IMDS requirement decides it
+    /// (`RegisterImageRequest$ImdsSupport`: an image whose support is `v2.0` launches the
+    /// instance with `HttpTokens` `required`).
+    stated_tokens: Option<&'static str>,
+    /// Whether its guest asks for a session token and presents it on each read (IMDSv2),
+    /// rather than reading without one (IMDSv1).
+    presents_token: bool,
+}
+
+const IDENTITY_ROWS: [IdentityRow; 3] = [
+    IdentityRow {
+        case: "the documented read, on a small instance whose launch makes a token optional",
+        instance_type: SMALL_TYPE,
+        zone_suffix: "a",
+        subnet_cidr: "10.90.0.0/20",
+        stated_tokens: Some("optional"),
+        presents_token: false,
+    },
+    IdentityRow {
+        case: "a read presenting a token, on a larger instance in another zone of the Region",
+        instance_type: LARGE_TYPE,
+        zone_suffix: "b",
+        subnet_cidr: "10.90.16.0/20",
+        stated_tokens: None,
+        presents_token: true,
+    },
+    IdentityRow {
+        case: "the same read on an instance whose launch requires a token",
+        instance_type: LARGE_TYPE,
+        zone_suffix: "a",
+        subnet_cidr: "10.90.32.0/20",
+        stated_tokens: Some("required"),
+        presents_token: true,
+    },
+];
+
+/// The user data whose program reads this machine's own identity document and the signature
+/// published beside it, base64 as a launch carries it.
+fn identity_read_user_data(presents_token: bool) -> String {
+    use ::base64::Engine as _;
+
+    let address = metadata_address();
+    let client = ec2_state::METADATA_CLIENT;
+    let mut script = String::from("#!/bin/bash\n");
+    // "If the state is `required`, you must send a session token with any instance metadata
+    // retrieval requests", so a guest reading that way asks for one first and presents it on
+    // each read.
+    let presented = if presents_token {
+        script.push_str(&format!(
+            "TOKEN=$({client} -X PUT {address}{path} -H \"{header}: \
+             {TOKEN_LIFETIME_SECONDS}\")\n",
+            path = ec2_state::METADATA_TOKEN_PATH,
+            header = ec2_state::METADATA_TOKEN_TTL_HEADER,
+        ));
+        format!(" -H \"{}: $TOKEN\"", ec2_state::METADATA_TOKEN_HEADER)
+    } else {
+        String::new()
+    };
+    // The documented read, trailing separator included, as
+    // `RegisterContainerInstanceRequest$instanceIdentityDocument` spells it.
+    script.push_str(&format!(
+        "{client} -s{presented} {address}{}/ > /dev/console\n",
+        ec2_state::IDENTITY_DOCUMENT_PATH
+    ));
+    script.push_str(&format!(
+        "echo \"{SIGNATURE_MARKER} $({client} -s{presented} {address}{})\" > /dev/console\n",
+        ec2_state::IDENTITY_SIGNATURE_PATH
+    ));
+    ::base64::engine::general_purpose::STANDARD.encode(script)
+}
+
+/// Launch the machine of `row` into `subnet` and answer the instance id Amazon EC2 minted.
+async fn launch_identity_source(
+    router: &MultiServiceRouter,
+    row: &IdentityRow,
+    subnet: &str,
+) -> String {
+    let user_data = identity_read_user_data(row.presents_token);
+    let mut params: Vec<(&str, &str)> = vec![
+        ("ImageId", IMAGE_ID),
+        ("InstanceType", row.instance_type),
+        ("SubnetId", subnet),
+        ("MinCount", "1"),
+        ("MaxCount", "1"),
+        ("UserData", user_data.as_str()),
+    ];
+    if let Some(tokens) = row.stated_tokens {
+        params.push(("MetadataOptions.HttpTokens", tokens));
+    }
+    let launched = ec2_form(router, "RunInstances", &params, row.case).await;
+    ec2_element(&launched, "instanceId", row.case)
+}
+
+/// One instance's console as the text its guest wrote, empty until that guest has come up.
+async fn console_text(router: &MultiServiceRouter, instance_id: &str, case: &str) -> String {
+    use ::base64::Engine as _;
+
+    let answered = ec2_form(
+        router,
+        "GetConsoleOutput",
+        &[("InstanceId", instance_id), ("Latest", "true")],
+        case,
+    )
+    .await;
+    let Some(encoded) = xml_element(&answered, "output") else {
+        return String::new();
+    };
+    let bytes = ::base64::engine::general_purpose::STANDARD
+        .decode(encoded.trim())
+        .unwrap_or_else(|error| {
+            panic!("case {case:?}: the console output must be base64 ({error}): {encoded:?}")
+        });
+    String::from_utf8(bytes)
+        .unwrap_or_else(|error| panic!("case {case:?}: the console must be UTF-8: {error}"))
+}
+
+/// The (document, signature) pair the metadata service of `instance_id` published to its
+/// guest, looked for until the guest has come up and read it: a boot is owed to the CLOCK, so
+/// the case waits for the console to carry the pair rather than for a span to pass.
+async fn published_identity(
+    router: &MultiServiceRouter,
+    instance_id: &str,
+    case: &str,
+) -> (String, String) {
+    let deadline = Instant::now() + POLL_BUDGET;
+    loop {
+        let text = console_text(router, instance_id, case).await;
+        let document = text
+            .lines()
+            .map(str::trim)
+            .find(|line| line.starts_with('{'))
+            .map(str::to_string);
+        let signature = text
+            .lines()
+            .filter_map(|line| line.trim().strip_prefix(SIGNATURE_MARKER))
+            .map(|read| read.trim().to_string())
+            .next_back();
+        match (document, signature) {
+            (Some(document), Some(signature)) if !signature.is_empty() => {
+                return (document, signature)
+            }
+            _ => assert!(
+                Instant::now() < deadline,
+                "case {case:?}: expected the guest to read its own identity document and the \
+                 signature published beside it, got the console {text:?}"
+            ),
+        }
+        tokio::time::sleep(POLL_INTERVAL).await;
+    }
+}
+
+/// RULE: the pair an instance's OWN metadata service publishes to its guest is the pair
+/// `RegisterContainerInstance` accepts, and the registration it earns is that machine —
+/// `ACTIVE`, agent connected, reporting the EC2 instance id the document names.
+#[tokio::test]
+async fn a_machine_registers_with_the_identity_document_its_own_metadata_publishes() {
+    let case = "the published identity document";
+    let router = emulator_with_ec2();
+    create_cluster(&router, IDENTITY_CLUSTER, case).await;
+    let vpc = ec2_element(
+        &ec2_form(
+            &router,
+            "CreateVpc",
+            &[("CidrBlock", IDENTITY_VPC_CIDR)],
+            case,
+        )
+        .await,
+        "vpcId",
+        case,
+    );
+
+    // Every row's machine is launched FIRST: each guest comes up on its own clock, so the
+    // whole table costs one span rather than one per row.
+    let mut launched: Vec<(&IdentityRow, String)> = Vec::new();
+    for row in &IDENTITY_ROWS {
+        let zone = format!("{SIGNED_REGION}{}", row.zone_suffix);
+        let subnet = ec2_element(
+            &ec2_form(
+                &router,
+                "CreateSubnet",
+                &[
+                    ("VpcId", vpc.as_str()),
+                    ("CidrBlock", row.subnet_cidr),
+                    ("AvailabilityZone", zone.as_str()),
+                ],
+                row.case,
+            )
+            .await,
+            "subnetId",
+            row.case,
+        );
+        let instance_id = launch_identity_source(&router, row, &subnet).await;
+        launched.push((row, instance_id));
+    }
+
+    for (row, instance_id) in &launched {
+        let case = row.case;
+        let (document, signature) = published_identity(&router, instance_id, case).await;
+        // The pair comes from the machine itself: nothing here writes a document.
+        let parsed: Value = serde_json::from_str(&document).unwrap_or_else(|error| {
+            panic!("case {case:?}: the published document must be JSON ({error}): {document:?}")
+        });
+        for (member, expected) in [
+            ("instanceId", instance_id.as_str()),
+            ("accountId", ACCOUNT),
+            ("region", SIGNED_REGION),
+        ] {
+            assert_eq!(
+                parsed[member].as_str(),
+                Some(expected),
+                "case {case:?}: expected the published document's {member} to be \
+                 {expected:?}, got {parsed}"
+            );
+        }
+
+        let registered = ok(
+            &router,
+            "RegisterContainerInstance",
+            json!({
+                "cluster": IDENTITY_CLUSTER,
+                "instanceIdentityDocument": document,
+                "instanceIdentityDocumentSignature": signature,
+            }),
+            case,
+        )
+        .await;
+        let instance = &registered["containerInstance"];
+        let arn = string(instance, "containerInstanceArn", case);
+        assert_eq!(
+            instance["status"].as_str(),
+            Some(ACTIVE),
+            "case {case:?}: expected the registration to be {ACTIVE}, got {registered}"
+        );
+        assert_eq!(
+            instance["agentConnected"].as_bool(),
+            Some(true),
+            "case {case:?}: expected the registering agent to be connected, got {registered}"
+        );
+        assert_eq!(
+            instance["ec2InstanceId"].as_str(),
+            Some(instance_id.as_str()),
+            "case {case:?}: expected the registration to name the machine the document \
+             describes, got {registered}"
+        );
+
+        // It is the cluster's own capacity afterwards, reading back as the same machine.
+        let described = ok(
+            &router,
+            "DescribeContainerInstances",
+            json!({ "cluster": IDENTITY_CLUSTER, "containerInstances": [arn.clone()] }),
+            case,
+        )
+        .await;
+        let read = list(&described, "containerInstances", case)
+            .into_iter()
+            .next()
+            .unwrap_or_else(|| {
+                panic!("case {case:?}: expected the registration back, got {described}")
+            });
+        assert_eq!(
+            read["ec2InstanceId"].as_str(),
+            Some(instance_id.as_str()),
+            "case {case:?}: expected the stored instance to keep the machine's id, got \
+             {described}"
+        );
+        assert_eq!(
+            read["status"].as_str(),
+            Some(ACTIVE),
+            "case {case:?}: expected the stored instance to be {ACTIVE}, got {described}"
+        );
+        let arns = listed(&router, IDENTITY_CLUSTER, case).await;
+        assert!(
+            arns.contains(&arn),
+            "case {case:?}: expected the cluster to list the registration {arn:?}, got {arns:?}"
+        );
+    }
+
+    // Each machine is ONE container instance of the cluster, which is what makes these
+    // registrations its capacity.
+    let counted = registered_count(&router, IDENTITY_CLUSTER, case).await;
+    assert_eq!(
+        counted,
+        IDENTITY_ROWS.len() as i64,
+        "case {case:?}: expected the cluster to count every registered machine, got {counted}"
+    );
+
+    // The negative control, so the rows above cannot pass against a handler that accepts
+    // whatever it is given: the document the first machine published, presented WITHOUT the
+    // signature published beside it, vouches for nothing and registers nothing — a
+    // registration is the PAIR.
+    let (row, instance_id) = &launched[0];
+    let unsigned = "the published document with no signature";
+    let (document, _) = published_identity(&router, instance_id, row.case).await;
+    let (code, message) = refusal(
+        &router,
+        "RegisterContainerInstance",
+        json!({
+            "cluster": IDENTITY_CLUSTER,
+            "instanceIdentityDocument": document,
+        }),
+        unsigned,
+    )
+    .await;
+    assert_eq!(
+        (code.as_str(), message.as_str()),
+        ("InvalidParameterException", IDENTITY_PAIR_NOT_VALID),
+        "case {unsigned:?}: expected the modelled refusal of the pair, got {code:?} with \
+         {message:?}"
+    );
+    let after = registered_count(&router, IDENTITY_CLUSTER, case).await;
+    assert_eq!(
+        after, counted,
+        "case {unsigned:?}: a refused registration must register nothing, got {after}"
     );
 }

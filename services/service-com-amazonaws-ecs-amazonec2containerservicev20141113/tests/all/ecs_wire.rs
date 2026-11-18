@@ -20,6 +20,13 @@ pub(crate) const SIGNED_REGION: &str = "us-west-2";
 /// The canonical account id every emulator ARN carries (`engine::EMULATOR_ACCOUNT_ID`).
 pub(crate) const ACCOUNT: &str = "000000000000";
 
+/// What Amazon ECS says when the identity document a registration presents and the
+/// signature presented with it are not the pair that vouches for one EC2 instance: the PAIR
+/// is what is reported, so the sentence names neither of the two values. Held here because
+/// more than one suite registers a container instance and asserts this refusal.
+pub(crate) const IDENTITY_PAIR_NOT_VALID: &str =
+    "The identity document and identity document signature were not valid.";
+
 /// Long enough for every clock-owed transition the start of an `awsvpc` task takes to
 /// fall due: Amazon ECS creates and attaches the interface such a task is allocated, one
 /// `state::INTERFACE_STEP_SPAN` per documented step of
@@ -895,15 +902,16 @@ pub(crate) async fn ec2_form(
 /// The text of the FIRST `<name>` element of an `ec2Query` response — the minted id a
 /// create answers with.
 pub(crate) fn ec2_element(xml: &str, name: &str, case: &str) -> String {
+    xml_element(xml, name).unwrap_or_else(|| panic!("case {case:?}: no <{name}> in {xml}"))
+}
+
+/// The text of the FIRST `<name>` element of an XML body — an `ec2Query` or `awsQuery`
+/// response — and `None` for a body carrying none, such as the console of a guest that has
+/// written nothing yet. [`ec2_element`] is the form for an element that must be there.
+pub(crate) fn xml_element(xml: &str, name: &str) -> Option<String> {
     let open = format!("<{name}>");
     let close = format!("</{name}>");
-    let start = xml
-        .find(&open)
-        .unwrap_or_else(|| panic!("case {case:?}: no <{name}> in {xml}"))
-        + open.len();
-    let end = xml[start..]
-        .find(&close)
-        .unwrap_or_else(|| panic!("case {case:?}: no </{name}> in {xml}"))
-        + start;
-    xml[start..end].to_string()
+    let start = xml.find(&open)? + open.len();
+    let end = xml[start..].find(&close)? + start;
+    Some(xml[start..end].to_string())
 }
