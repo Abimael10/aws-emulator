@@ -999,7 +999,40 @@ impl StoredZone {
         }
     }
 
-    /// The `Features` a hosted-zone read reports for this zone.
+    /// The `HostedZone` an account-wide hosted-zone LISTING projects for this
+    /// zone.
+    ///
+    /// The same zone as [`StoredZone::to_hosted_zone`] in every member but
+    /// `Features`: a listing enumerates the account's zones and reports each
+    /// one's feature POSTURE — the status of every feature the zone has,
+    /// including a feature that is merely off and one nobody has configured —
+    /// while a single-zone projection (the create, the read, the comment update)
+    /// echoes only the features CONFIGURED on the zone. So a zone the
+    /// public-DNS fallback feature has never been enabled on reports that
+    /// feature's off status in the listing, whether the zone is public or
+    /// private, and the statuses a listing reports are still read off the zone
+    /// itself rather than fixed per operation.
+    pub fn to_listed_hosted_zone(&self) -> HostedZone {
+        HostedZone {
+            features: Some(self.to_listed_hosted_zone_features()),
+            ..self.to_hosted_zone()
+        }
+    }
+
+    /// The `Features` a hosted-zone LISTING reports for this zone: the features
+    /// configured on it, plus the posture of the features it holds without
+    /// having been configured — see [`StoredZone::to_listed_hosted_zone`].
+    pub fn to_listed_hosted_zone_features(&self) -> HostedZoneFeatures {
+        HostedZoneFeatures {
+            // A state every zone HAS, on or off, so every listed zone reports
+            // it: see [`StoredZone::public_dns_fallback_posture`].
+            public_dns_fallback_status: Some(self.public_dns_fallback_posture().to_string()),
+            ..self.to_hosted_zone_features()
+        }
+    }
+
+    /// The `Features` a SINGLE-zone projection — the create, the read, the
+    /// comment update — reports for this zone.
     ///
     /// The container itself is ALWAYS reported — Route 53 projects the
     /// `Features` structure on every hosted zone it answers with — so a client
@@ -1011,7 +1044,9 @@ impl StoredZone {
     /// `AcceleratedRecoveryStatus` has no status until
     /// `UpdateHostedZoneFeatures` has configured the zone and `FailureReasons`
     /// stays absent because no features change this store accepts fails. A zone
-    /// holding neither therefore reports the container empty.
+    /// holding neither therefore reports the container empty. What an
+    /// account-wide listing reports instead is
+    /// [`StoredZone::to_listed_hosted_zone_features`].
     pub fn to_hosted_zone_features(&self) -> HostedZoneFeatures {
         HostedZoneFeatures {
             accelerated_recovery_status: self
@@ -1027,9 +1062,9 @@ impl StoredZone {
         }
     }
 
-    /// The public-DNS fallback status a hosted-zone read reports for this zone:
-    /// the on status while the zone has the feature turned on, the off status
-    /// while it does not, and NOTHING for a zone the feature does not apply to.
+    /// The public-DNS fallback status a SINGLE-zone projection reports for this
+    /// zone: its posture while the feature applies to the zone, and NOTHING for
+    /// a zone it does not apply to.
     ///
     /// Falling back to public DNS is a feature of a zone that is ANSWERED on the
     /// public internet, so only a public zone has a status for it. A private
@@ -1046,11 +1081,25 @@ impl StoredZone {
         if self.private_zone {
             return None;
         }
-        Some(if self.public_dns_fallback_enabled {
+        Some(self.public_dns_fallback_posture())
+    }
+
+    /// The public-DNS fallback posture of this zone: the on status while the
+    /// zone has the feature turned on, the off status while it does not.
+    ///
+    /// Every zone HAS the feature on or off, so every zone has a posture, which
+    /// is what an account-wide listing reports for it (see
+    /// [`StoredZone::to_listed_hosted_zone`]); whether a single-zone projection
+    /// reports it is [`StoredZone::public_dns_fallback_status`]'s question.
+    /// Derived from the zone's own state, like [`StoredZone::serve_signature`]
+    /// beside it, so whatever turns the feature on moves what every read reports
+    /// by itself.
+    pub fn public_dns_fallback_posture(&self) -> &'static str {
+        if self.public_dns_fallback_enabled {
             PUBLIC_DNS_FALLBACK_ENABLED
         } else {
             PUBLIC_DNS_FALLBACK_DISABLED
-        })
+        }
     }
 
     /// Whether accelerated recovery is the setting the zone holds or is moving

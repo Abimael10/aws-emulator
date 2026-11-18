@@ -6,13 +6,18 @@
 //! The rule under test: `HostedZone$Features` is part of the shape Route 53
 //! projects, so every operation answering with a hosted zone carries the
 //! container, and the container reports one child per feature status that zone
-//! HOLDS, read from the zone's own state — the public-DNS fallback status on a
-//! zone the feature applies to, which is a zone answered on the public internet
-//! and so never a private one, plus `AcceleratedRecoveryStatus` once an accepted
-//! `UpdateHostedZoneFeatures` has configured one. A client deserialising
-//! `HostedZone` into a strict shape therefore always finds the member, a feature
-//! a zone HAS is never reported as an empty container, and a zone holding no
-//! feature status reports the container empty rather than inventing one.
+//! HOLDS, read from the zone's own state. What counts as held depends on the
+//! projection: a SINGLE-zone projection (the create, the read, the comment
+//! update) echoes the features CONFIGURED on the zone — the public-DNS fallback
+//! status on a zone the feature applies to, which is a zone answered on the
+//! public internet and so never a private one, plus `AcceleratedRecoveryStatus`
+//! once an accepted `UpdateHostedZoneFeatures` has configured one — while an
+//! account-wide LISTING reports each listed zone's feature POSTURE, so every
+//! zone it lists carries the fallback status, private ones included. A client
+//! deserialising `HostedZone` into a strict shape therefore always finds the
+//! member, a feature a zone holds is never reported as an empty container, and
+//! a zone holding no feature status reports the container empty rather than
+//! inventing one.
 //!
 //! One zone read by one operation is ONE row of that class, so the tables below
 //! span it: zones differing in label count, in public/private, in whether they
@@ -20,6 +25,13 @@
 //! asserted on EVERY operation that projects a `HostedZone` — the create, the
 //! single read, the comment update and both listings — because the rule is
 //! about the projection of the shape, not about one operation.
+//!
+//! On the account-wide listing the statuses are asserted zone by zone and page
+//! by page: a listing projects many zones at once, so the last test pairs each
+//! `HostedZone` with the container serialised INSIDE it, over page sizes and
+//! over zones whose feature state differs, where a zone's held status reported
+//! as an empty container, or filled from another zone's state, would otherwise
+//! pass unnoticed.
 //!
 //! Every test drives the service through the real router, using the SAME
 //! harness the sibling hosted-zone suites use, so what is asserted is the
@@ -29,7 +41,9 @@ use std::time::{Duration, Instant};
 
 use smithy_server_runtime::MultiServiceRouter;
 
-use service_com_amazonaws_route53_awsdnsv20130401::state::ACCELERATED_RECOVERY_ENABLING;
+use service_com_amazonaws_route53_awsdnsv20130401::state::{
+    ACCELERATED_RECOVERY_ENABLED, ACCELERATED_RECOVERY_ENABLING,
+};
 
 use crate::hosted_zone_records::{call, create_zone_body, escape_xml, Reply};
 use crate::resource_tags::element_text;
@@ -191,6 +205,84 @@ fn element_names(block: &str) -> Vec<&str> {
     names
 }
 
+/// The contents of every `<HostedZone>` element in a body, in document order.
+///
+/// Read out of the RAW body for the same reason [`features_blocks`] is, but per
+/// ZONE rather than per container: the statuses a listing reports for a zone are
+/// the children of THAT zone's container, so pairing a zone with its own
+/// statuses means reading them inside the element the zone is projected as.
+/// `<HostedZone>` and the `<HostedZones>` wrapper around it are told apart by
+/// the closing angle bracket.
+fn hosted_zone_blocks(body: &str) -> Vec<&str> {
+    let mut blocks = Vec::new();
+    let mut rest = body;
+    while let Some(at) = rest.find("<HostedZone>") {
+        let inner = &rest[at + "<HostedZone>".len()..];
+        let end = inner
+            .find("</HostedZone>")
+            .unwrap_or_else(|| panic!("a HostedZone element must be closed; body {body}"));
+        blocks.push(&inner[..end]);
+        rest = &inner[end..];
+    }
+    blocks
+}
+
+/// The `(Name, contents of Features)` pair of every hosted zone a body
+/// projects, in document order.
+fn zone_features(case: &str, body: &str) -> Vec<(String, String)> {
+    hosted_zone_blocks(body)
+        .into_iter()
+        .map(|zone| {
+            let name = element_text(zone, "Name").unwrap_or_else(|| {
+                panic!("case {case:?}: every projected hosted zone carries its Name; zone {zone:?}")
+            });
+            let features = element_text(zone, "Features").unwrap_or_else(|| {
+                panic!(
+                    "case {case:?}: every projected hosted zone carries its Features \
+                     container; zone {zone:?}"
+                )
+            });
+            (name, features)
+        })
+        .collect()
+}
+
+/// The form Route 53 reports a hosted zone's name in: the fully qualified name,
+/// so a name given without the trailing dot is reported with one.
+fn canonical_name(requested: &str) -> String {
+    if requested.ends_with('.') {
+        requested.to_string()
+    } else {
+        format!("{requested}.")
+    }
+}
+
+/// What one zone of the listing holds, and therefore what its own `Features`
+/// container must report: the name it is reported under, its public-DNS
+/// fallback status (`None` for a zone the feature does not apply to) and its
+/// accelerated-recovery status (`None` while nothing has configured it).
+struct Held {
+    name: String,
+    fallback: Option<&'static str>,
+    accelerated: Option<&'static str>,
+}
+
+/// Assert one zone's `Features` container is a STRUCTURE carrying THAT zone's
+/// statuses: the ones it holds as children, each a modelled member, and — the
+/// divergence this file exists for — never the empty element for a zone that
+/// holds a status at all.
+fn assert_zone_features(case: &str, held: &Held, block: &str) {
+    if held.fallback.is_some() || held.accelerated.is_some() {
+        assert!(
+            !element_names(block).is_empty(),
+            "case {case:?}: zone {:?} holds a feature status, so its Features container must \
+             carry it as a child element, got the empty container {block:?}",
+            held.name
+        );
+    }
+    assert_features(case, block, held.accelerated, held.fallback);
+}
+
 /// `GetHostedZone` for one zone.
 async fn get_zone(router: &MultiServiceRouter, zone_id: &str) -> Reply {
     call(router, "GET", &format!("/2013-04-01/hostedzone/{zone_id}"), "").await
@@ -298,12 +390,13 @@ fn zone_rows() -> [ZoneRow; 6] {
 #[tokio::test]
 async fn every_hosted_zone_projection_carries_the_features_container() {
     // The rule: the `Features` container is serialised for every projected
-    // hosted zone, carrying the status of each feature the zone holds — for a
-    // public zone nothing has configured, the public-DNS fallback status alone,
-    // and for a private one, which that feature does not apply to, nothing. The
-    // rows span the zones; each one is asserted on the create, the single read
-    // and the comment update, and the listings are asserted over all of them at
-    // once.
+    // hosted zone, carrying the status of each feature the zone holds — on a
+    // single-zone projection, for a public zone nothing has configured, the
+    // public-DNS fallback status alone, and for a private one, which that
+    // feature does not apply to, nothing. The rows span the zones; each one is
+    // asserted on the create, the single read and the comment update, and the
+    // listings, which report each zone's posture, are asserted over all of them
+    // at once.
     let router = router();
     let rows = zone_rows();
     let mut ids = Vec::new();
@@ -351,9 +444,10 @@ async fn every_hosted_zone_projection_carries_the_features_container() {
         ids.push(zone_id);
     }
 
-    // The same projection on both LIST paths: one container per listed zone, and
-    // the fallback status on exactly the zones the feature applies to.
-    let public_zones = rows.iter().filter(|row| !row.private).count();
+    // Both LIST paths: one container per listed zone, each reporting that
+    // zone's feature POSTURE — so the fallback status on every listed zone,
+    // private ones included, which is what an enumeration of the account
+    // reports where a single-zone read echoes only what was configured.
     for (case, uri) in [
         ("ListHostedZones", "/2013-04-01/hostedzone"),
         (
@@ -374,9 +468,10 @@ async fn every_hosted_zone_projection_carries_the_features_container() {
             .collect::<Vec<String>>();
         assert_eq!(
             reporting.len(),
-            public_zones,
-            "case {case:?}: expected the {public_zones} public zones of the listing to \
-             report {PUBLIC_DNS_FALLBACK_STATUS}, got {reporting:?}; body {}",
+            ids.len(),
+            "case {case:?}: expected every one of the {} listed zones to report \
+             {PUBLIC_DNS_FALLBACK_STATUS}, got {reporting:?}; body {}",
+            ids.len(),
             listed.body
         );
         for seen in &reporting {
@@ -530,12 +625,13 @@ fn fallback_status(block: &str) -> Option<String> {
 async fn every_hosted_zone_projection_reports_the_zones_public_dns_fallback_status() {
     // The other half of the container rule, and the one an empty `<Features/>`
     // breaks: a feature status a zone HOLDS is reported as a child of the
-    // container by EVERY projection of that zone, with the value read off the
-    // zone's own state — and a zone that holds none reports none. Public DNS
-    // fallback is a feature of a zone answered on the public internet, so every
-    // public row of the table reports it and every private row reports nothing,
-    // on the create, the single read, the comment update and both listings, and
-    // all of them agree.
+    // container by every projection of that zone, with the value read off the
+    // zone's own state. On a single-zone projection a zone holds the public-DNS
+    // fallback status only where the feature applies — a zone answered on the
+    // public internet — so every public row of the table reports it on the
+    // create, the single read and the comment update while every private row
+    // reports nothing, and all of them agree; both listings report each listed
+    // zone's posture, so there every row reports it.
     let router = router();
     let rows = zone_rows();
     let mut ids = Vec::new();
@@ -585,10 +681,9 @@ async fn every_hosted_zone_projection_reports_the_zones_public_dns_fallback_stat
         ids.push(zone_id);
     }
 
-    // Both listings report it for every zone the feature applies to, so a client
-    // enumerating the account's zones reads each public zone's fallback state off
-    // the listing.
-    let public_zones = rows.iter().filter(|row| !row.private).count();
+    // Both listings report it for EVERY zone they list, private ones included,
+    // so a client enumerating the account's zones reads each zone's fallback
+    // posture off the listing.
     for (case, uri) in [
         ("ListHostedZones", "/2013-04-01/hostedzone"),
         ("ListHostedZonesByName", "/2013-04-01/hostedzonesbyname"),
@@ -605,9 +700,10 @@ async fn every_hosted_zone_projection_reports_the_zones_public_dns_fallback_stat
             .collect::<Vec<String>>();
         assert_eq!(
             reporting,
-            vec![FEATURE_OFF.to_string(); public_zones],
-            "case {case:?}: expected {public_zones} listed zones to report \
-             {FEATURE_OFF:?} for {PUBLIC_DNS_FALLBACK_STATUS}, got {reporting:?}; body {}",
+            vec![FEATURE_OFF.to_string(); ids.len()],
+            "case {case:?}: expected all {} listed zones to report {FEATURE_OFF:?} for \
+             {PUBLIC_DNS_FALLBACK_STATUS}, got {reporting:?}; body {}",
+            ids.len(),
             listed.body
         );
     }
@@ -641,4 +737,156 @@ async fn every_hosted_zone_projection_reports_the_zones_public_dns_fallback_stat
         "a configured public zone must still report {FEATURE_OFF:?} for \
          {PUBLIC_DNS_FALLBACK_STATUS}, got {seen:?}; body {body}"
     );
+}
+
+#[tokio::test]
+async fn every_page_of_the_listing_pairs_each_zone_with_its_own_feature_statuses() {
+    // The same rule where a client meets it on the account-wide listing, zone by
+    // zone and page by page: each projected zone's Features container reports
+    // THAT zone's feature statuses as child elements, so a zone holding a status
+    // can never be reported as the empty container and no zone can be handed
+    // another zone's statuses. The rows span the zones of the table (label
+    // count, public or private, commented or not), the page sizes the listing is
+    // walked with (unpaged, and pages shorter than, equal to and longer than the
+    // remainder) and the feature states a listed zone can be in: a configured
+    // accelerated recovery, a fallback status the feature applies to, and a zone
+    // holding neither.
+    let router = router();
+    let rows = zone_rows();
+    // What each zone holds — the expectation every page is checked against.
+    let mut expected: Vec<Held> = Vec::new();
+    // The zones whose features were configured, so the test can wait for the
+    // setting to have settled before the listing is asserted on.
+    let mut configured_ids: Vec<(&str, String)> = Vec::new();
+
+    for (index, row) in rows.iter().enumerate() {
+        let created = create_zone(
+            &router,
+            row.name,
+            &format!("features-listed-{index}"),
+            row.extra,
+        )
+        .await;
+        assert_eq!(
+            created.status, 201,
+            "case {:?}: expected 201 from CreateHostedZone, got {} with body {}",
+            row.case, created.status, created.body
+        );
+        // Both recovery features of the container serve a zone answered on the
+        // public internet, so the public rows are the ones configured here and
+        // the ones with a fallback status, while the private rows hold neither:
+        // the table then spans the feature states a listed zone can be in.
+        let public = !row.extra.contains("<PrivateZone>true</PrivateZone>");
+        if public {
+            let reply = update_features(&router, &bare_zone_id(&created), true).await;
+            assert_eq!(
+                reply.status, 200,
+                "case {:?}: expected 200 from UpdateHostedZoneFeatures, got {} with body {}",
+                row.case, reply.status, reply.body
+            );
+            configured_ids.push((row.case, bare_zone_id(&created)));
+        }
+        expected.push(Held {
+            name: canonical_name(row.name),
+            // The listing reports a posture for every zone, private ones
+            // included — unlike the single-zone read asserted above.
+            fallback: Some(FEATURE_OFF),
+            accelerated: public.then_some(ACCELERATED_RECOVERY_ENABLED),
+        });
+    }
+
+    // Looked for until each configured zone has settled, so what the listing
+    // must report below is one fixed status rather than whatever the propagation
+    // span happens to be showing on this host.
+    for (case, zone_id) in &configured_ids {
+        let (status, body) = settled_status(&router, zone_id).await;
+        assert_eq!(
+            status.as_deref(),
+            Some(ACCELERATED_RECOVERY_ENABLED),
+            "case {case:?}: the configured zone must reach {ACCELERATED_RECOVERY_ENABLED}, \
+             got {status:?}; body {body}"
+        );
+    }
+
+    for page_size in [None, Some(1), Some(2), Some(rows.len() + 1)] {
+        let case = match page_size {
+            Some(size) => format!("the listing walked with maxitems={size}"),
+            None => "the unpaged listing".to_string(),
+        };
+        let mut walked: Vec<(String, String)> = Vec::new();
+        let mut marker: Option<String> = None;
+        let mut pages = 0;
+        loop {
+            let mut query = String::new();
+            if let Some(size) = page_size {
+                query.push_str(&format!("?maxitems={size}"));
+            }
+            if let Some(resume) = &marker {
+                query.push(if query.is_empty() { '?' } else { '&' });
+                query.push_str(&format!("marker={resume}"));
+            }
+            let page = call(
+                &router,
+                "GET",
+                &format!("/2013-04-01/hostedzone{query}"),
+                "",
+            )
+            .await;
+            assert_eq!(
+                page.status, 200,
+                "case {case:?}: expected 200, got {} with body {}",
+                page.status, page.body
+            );
+            let on_page = zone_features(&case, &page.body);
+            assert!(
+                page_size.is_none_or(|size| on_page.len() <= size),
+                "case {case:?}: a page held {} zone(s); body {}",
+                on_page.len(),
+                page.body
+            );
+            for (name, block) in &on_page {
+                let held = expected
+                    .iter()
+                    .find(|held| &held.name == name)
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "case {case:?}: the listing reported a zone {name:?} nothing \
+                             created; body {}",
+                            page.body
+                        )
+                    });
+                assert_zone_features(&case, held, block);
+            }
+            walked.extend(on_page);
+            pages += 1;
+            assert!(
+                pages <= rows.len() + 2,
+                "case {case:?}: paging did not terminate after {pages} page(s)"
+            );
+            if page.first("IsTruncated") != Some("true") {
+                break;
+            }
+            marker = Some(
+                page.first("NextMarker")
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "case {case:?}: a truncated page must carry a NextMarker; body {}",
+                            page.body
+                        )
+                    })
+                    .to_string(),
+            );
+        }
+
+        // Every zone of the account is reported exactly once, each with its own
+        // statuses: paging neither drops a zone nor the statuses it holds.
+        let mut reported: Vec<&str> = walked.iter().map(|(name, _)| name.as_str()).collect();
+        reported.sort_unstable();
+        let mut wanted: Vec<&str> = expected.iter().map(|held| held.name.as_str()).collect();
+        wanted.sort_unstable();
+        assert_eq!(
+            reported, wanted,
+            "case {case:?}: paging must report every zone of the account exactly once"
+        );
+    }
 }

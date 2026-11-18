@@ -298,7 +298,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 next = Some(zone);
                 break;
             }
-            hosted_zones.push(zone.to_hosted_zone());
+            // The same LISTING projection the account-wide listing uses: a zone
+            // this enumeration reports carries its feature posture.
+            hosted_zones.push(zone.to_listed_hosted_zone());
         }
 
         Ok(ListHostedZonesByNameOutput {
