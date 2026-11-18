@@ -46,6 +46,22 @@ pub(super) const SDK_SERVICE_NAMES: &[(&str, &str, SdkDiagnostic)] = &[
         "ApplicationAutoScaling",
         SdkDiagnostic::Attempts,
     ),
+    // CloudWatch Application Signals' SDK names it by that model's own `sdkId` VERBATIM, the
+    // space included (`Application Signals`, `smithy_query(query="service_info")` on that
+    // service's model), and words its diagnostic with the refused OPERATION and that service's
+    // error code in it, as the recorded `ResourceStatusReason` of a failed
+    // `AWS::ApplicationSignals::InstrumentationConfig` carries it (in the behavioral corpus
+    // `simparity-behavioral-aws-v1`, check `application-signals__cloudformation.deploy-\
+    // application-signals-instrumentation-config-missing-code-unit-rejected`, whose reason
+    // reads `<the service's sentence> (Service: Application Signals; Operation:
+    // CreateInstrumentationConfiguration; Status Code: 400; …)`). The three resource types this
+    // emulator provisions over this signing name are all that service's
+    // ([`provisioner::application_signals`]).
+    (
+        "application-signals",
+        "Application Signals",
+        SdkDiagnostic::Operation,
+    ),
     // Amazon Braket's SDK names it by that model's own `sdkId` (`Braket`), and words its
     // diagnostic with the refused OPERATION and that service's error code in it, as the
     // recorded `ResourceStatusReason` of a failed `AWS::Braket::SpendingLimit` carries it (in

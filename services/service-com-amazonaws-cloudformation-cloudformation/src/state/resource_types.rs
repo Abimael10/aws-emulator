@@ -85,7 +85,9 @@ use super::template::{
     ACMPCA_CERTIFICATE_AUTHORITY_ACTIVATION, ACMPCA_PERMISSION, AMPLIFYUIBUILDER_COMPONENT,
     AMPLIFYUIBUILDER_FORM, AMPLIFYUIBUILDER_THEME, AMPLIFY_APP, AMPLIFY_BRANCH,
     APIGATEWAY_ACCOUNT,
-    APIGATEWAY_BASE_PATH_MAPPING, APIGATEWAY_DOMAIN_NAME, BACKUP_GATEWAY_HYPERVISOR,
+    APIGATEWAY_BASE_PATH_MAPPING, APIGATEWAY_DOMAIN_NAME,
+    APPLICATION_SIGNALS_GROUPING_CONFIGURATION, APPLICATION_SIGNALS_INSTRUMENTATION_CONFIG,
+    APPLICATION_SIGNALS_SERVICE_LEVEL_OBJECTIVE, BACKUP_GATEWAY_HYPERVISOR,
     BRAKET_SPENDING_LIMIT,
     CLEANROOMSML_TRAINING_DATASET,
     CLOUDFRONT_CONNECTION_FUNCTION, CLOUDFRONT_CONNECTION_GROUP, CLOUDFRONT_FUNCTION,
@@ -252,6 +254,16 @@ pub const AWS_RESOURCE_TYPES: &[&str] = &[
     "AWS::ApplicationAutoScaling::ScalingPolicy",
     // Amazon CloudWatch Application Insights
     "AWS::ApplicationInsights::Application",
+    // Amazon CloudWatch Application Signals. The three types this emulator creates in that
+    // service itself (`super::provisioner`): the service level objective its
+    // `CreateServiceLevelObjective` makes, the one grouping configuration per account its
+    // `PutGroupingConfiguration` keeps, and the dynamic instrumentation point its
+    // `CreateInstrumentationConfiguration` records. The namespace's other published types have
+    // no entry yet — a catalogued type with no provisioner deploys as declared-only, which
+    // would report a stack resource nothing created.
+    APPLICATION_SIGNALS_SERVICE_LEVEL_OBJECTIVE,
+    APPLICATION_SIGNALS_GROUPING_CONFIGURATION,
+    APPLICATION_SIGNALS_INSTRUMENTATION_CONFIG,
     // AWS AppSync
     crate::state::template::APPSYNC_API,
     "AWS::AppSync::ApiKey",

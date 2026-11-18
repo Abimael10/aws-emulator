@@ -106,6 +106,8 @@ fn removed_location() -> Value {
 fn bystander_location() -> Value {
     json!({
         "Language": "Python",
+        // The module the function lives in, which a Python location is required to name.
+        "CodeUnit": "pricing.quote",
         "FilePath": "src/pricing/quote.py",
         "LineNumber": 7
     })

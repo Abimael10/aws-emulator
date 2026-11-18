@@ -150,6 +150,108 @@ pub const BRAKET_ARN_NAMESPACE: &str = "braket";
 /// for it, from that same pattern.
 pub(super) const BRAKET_SPENDING_LIMIT_PATH: &str = "spending-limit";
 
+/// The `AWS::<cloudFormationName>::<Resource>` types of the three CloudWatch Application
+/// Signals resources a template declares. The middle segment is that model's own
+/// `awsService.sdkId` (`Application Signals`) with its space closed up, as the resource-type
+/// namespace publishes it.
+///
+/// * a SERVICE LEVEL OBJECTIVE — the objective `CreateServiceLevelObjective` makes under the
+///   `Name` the declaration states. "Ref returns the ARN", which that service builds from its
+///   own namespace, the Region and that name (`ServiceLevelObjectiveArn`:
+///   `^arn:(aws|aws-us-gov):application-signals:[^:]*:[^:]*:slo/<name>$`), so the identity IS
+///   computable from the template and [`identity_is_service_assigned`] does not name the type;
+/// * a GROUPING CONFIGURATION — the one configuration `PutGroupingConfiguration` keeps per
+///   account and Region ("Creates or updates the grouping configuration for this account"), so
+///   a stack declares at most one and its identity is the account's rather than a name of its
+///   own ([`APPLICATION_SIGNALS_GROUPING_CONFIGURATION_ATTRIBUTES`]);
+/// * an INSTRUMENTATION CONFIG — the dynamic instrumentation point
+///   `CreateInstrumentationConfiguration` records for one code location. That service MINTS its
+///   ARN around the LOCATION HASH it computes (`InstrumentationConfigurationArn`:
+///   `^arn:[^:]+:application-signals:[^:]+:[0-9]{12}:instrumentationConfig/.+/[0-9a-f]{16}$`),
+///   which no naming rule could compute, so [`identity_is_service_assigned`] names this one.
+pub const APPLICATION_SIGNALS_SERVICE_LEVEL_OBJECTIVE: &str =
+    "AWS::ApplicationSignals::ServiceLevelObjective";
+pub const APPLICATION_SIGNALS_GROUPING_CONFIGURATION: &str =
+    "AWS::ApplicationSignals::GroupingConfiguration";
+pub const APPLICATION_SIGNALS_INSTRUMENTATION_CONFIG: &str =
+    "AWS::ApplicationSignals::InstrumentationConfig";
+
+/// CloudWatch Application Signals' ARN namespace, which is that model's own
+/// `awsService.arnNamespace` (`application-signals`) — the namespace both an SLO's ARN and an
+/// instrumentation configuration's carry.
+pub const APPLICATION_SIGNALS_ARN_NAMESPACE: &str = "application-signals";
+
+/// The resource path an SLO's ARN carries before the objective's name, and the one an
+/// instrumentation configuration's carries before its four identity parts, from each member's
+/// own pattern above.
+pub(super) const APPLICATION_SIGNALS_SLO_PATH: &str = "slo";
+pub(super) const APPLICATION_SIGNALS_INSTRUMENTATION_CONFIG_PATH: &str = "instrumentationConfig";
+
+/// Every `Fn::GetAtt` attribute an [`APPLICATION_SIGNALS_SERVICE_LEVEL_OBJECTIVE`] publishes,
+/// in the sorted order a resource's own attribute map holds them in: the read-only values the
+/// `ServiceLevelObjective` record carries beside the configuration a declaration states.
+///
+/// The ARN is the one these naming rules compute — both this service and that one build it from
+/// the account id this emulator mints, the Region and the objective's name — and the rest are
+/// Application Signals' own: the two instants its clock recorded, which of the two indicators
+/// the objective was created with and the metric source it derived from that indicator. Each of
+/// those stands in ([`service_assigned_document`]) until
+/// [`crate::state::provisioner`] has reported what that service really answered.
+pub(super) const APPLICATION_SIGNALS_SLO_ATTRIBUTES: &[&str] = &[
+    "Arn",
+    "CreatedTime",
+    "EvaluationType",
+    "LastUpdatedTime",
+    "MetricSourceType",
+];
+
+/// The one attribute of [`APPLICATION_SIGNALS_SLO_ATTRIBUTES`] these naming rules compute
+/// rather than stand in for, which is also what the type's `Ref` returns.
+pub(super) const APPLICATION_SIGNALS_SLO_ARN_ATTRIBUTE: &str = "Arn";
+
+/// Every `Fn::GetAtt` attribute an [`APPLICATION_SIGNALS_GROUPING_CONFIGURATION`] publishes,
+/// in the sorted order a resource's own attribute map holds them in: the account whose
+/// configuration it is — the one identifier that service addresses a grouping configuration by
+/// (`ListGroupingAttributeDefinitions$AwsAccountId`), which is also what this type's `Ref`
+/// returns — and the instant it recorded for the configuration
+/// (`GroupingConfiguration$UpdatedAt`).
+///
+/// The account id is a value these naming rules compute; the instant is that service's clock,
+/// so it stands in ([`service_assigned_document`]) until [`crate::state::provisioner`] has
+/// reported what `PutGroupingConfiguration` answered.
+pub(super) const APPLICATION_SIGNALS_GROUPING_CONFIGURATION_ATTRIBUTES: &[&str] =
+    &["AwsAccountId", "UpdatedAt"];
+
+/// The attribute of [`APPLICATION_SIGNALS_GROUPING_CONFIGURATION_ATTRIBUTES`] that carries the
+/// account whose configuration the resource is, which is the identity a `Ref` to one resolves
+/// to.
+pub(super) const APPLICATION_SIGNALS_ACCOUNT_ID_ATTRIBUTE: &str = "AwsAccountId";
+
+/// Every `Fn::GetAtt` attribute an [`APPLICATION_SIGNALS_INSTRUMENTATION_CONFIG`] publishes, in
+/// the sorted order a resource's own attribute map holds them in: the three values the created
+/// record carries that no declaration states — the ARN that service minted, the instant its
+/// clock recorded and the `LocationHash` it computed from the location.
+pub(super) const APPLICATION_SIGNALS_INSTRUMENTATION_CONFIG_ATTRIBUTES: &[&str] =
+    &["Arn", "CreatedAt", "LocationHash"];
+
+/// The attribute of [`APPLICATION_SIGNALS_INSTRUMENTATION_CONFIG_ATTRIBUTES`] that carries the
+/// ARN that service minted, which is the identity a `Ref` to one resolves to.
+pub(super) const APPLICATION_SIGNALS_INSTRUMENTATION_CONFIG_ARN_ATTRIBUTE: &str = "Arn";
+
+/// How many lowercase hexadecimal characters an instrumentation configuration's `LocationHash`
+/// carries: `LocationHash`'s own `@length(min: 16, max: 16)`, which the ARN pattern repeats as
+/// its `[0-9a-f]{16}` final segment. The stand-in identity is built to that width
+/// ([`return_values`]) so a value standing in for one is the shape that service answers.
+pub(super) const APPLICATION_SIGNALS_LOCATION_HASH_CHARS: usize = 16;
+
+/// The properties an instrumentation configuration's identity is spelled from, in the order
+/// the ARN carries them after the service and the environment: the declaration states all
+/// four, and the fourth — the location — is what that service hashes.
+pub(super) const APPLICATION_SIGNALS_SERVICE_PROPERTY: &str = "Service";
+pub(super) const APPLICATION_SIGNALS_ENVIRONMENT_PROPERTY: &str = "Environment";
+pub(super) const APPLICATION_SIGNALS_SIGNAL_TYPE_PROPERTY: &str = "SignalType";
+pub(super) const APPLICATION_SIGNALS_LOCATION_PROPERTY: &str = "Location";
+
 /// The `AWS::<cloudFormationName>::<Resource>` type of an AWS Elemental MEDIACONVERT
 /// CERTIFICATE ASSOCIATION: the trust between an AWS Certificate Manager certificate and the
 /// account's MediaConvert service, which that service's own `AssociateCertificate` makes and

@@ -256,12 +256,19 @@ fn cases() -> Vec<Case> {
             ])),
         },
         Case {
-            // Only the members the model marks `@required`: `Language` and `FilePath`.
+            // Only the members the model marks `@required` (`Language` and `FilePath`), plus
+            // the `CodeUnit` a Python location is required to name.
             label: "probe, required code-location members only",
             instrumentation_type: PROBE,
             service: "inventory",
             environment: "ec2:production",
-            location: code_location("Python", json!({ "FilePath": "app/inventory/stock.py" })),
+            location: code_location(
+                "Python",
+                json!({
+                    "CodeUnit": "app.inventory.stock",
+                    "FilePath": "app/inventory/stock.py",
+                }),
+            ),
             description: None,
             attribute_filters: None,
             capture_configuration: capture(1),

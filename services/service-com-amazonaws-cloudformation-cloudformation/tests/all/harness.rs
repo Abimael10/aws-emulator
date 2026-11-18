@@ -316,6 +316,17 @@ pub fn router_with_engine() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>)
             &engine,
         )),
     );
+    // CloudWatch Application Signals, for the
+    // `AWS::ApplicationSignals::ServiceLevelObjective`, the
+    // `AWS::ApplicationSignals::GroupingConfiguration` and the
+    // `AWS::ApplicationSignals::InstrumentationConfig` a stack really creates there, so a suite
+    // that deploys one reads the objective, the account's grouping attribute definitions and
+    // the instrumentation point back through that service's own wire.
+    router.register_service(
+        service_com_amazonaws_applicationsignals_applicationsignals::EmulatedService::new(
+            Arc::clone(&engine),
+        ),
+    );
     // AWS Cloud Map, for the `AWS::ServiceDiscovery::HttpNamespace`,
     // `::PublicDnsNamespace`, `::PrivateDnsNamespace`, `::Service` and `::Instance` a stack
     // really creates there, so a suite that deploys a namespace's estate reads every one of

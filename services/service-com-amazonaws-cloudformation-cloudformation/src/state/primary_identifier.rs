@@ -95,6 +95,15 @@ pub(crate) fn identifying_return_value(resource_type: &str) -> Option<&'static s
         // ("Ref returns the spending limit ARN"), which is the handle every spending-limit
         // API takes — the type declares no name a client could name one by.
         BRAKET_SPENDING_LIMIT => "SpendingLimitArn",
+        // An Application Signals service level objective and an instrumentation config are
+        // each identified by the ARN that type's `Ref` returns — the objective's is the one
+        // every SLO operation takes as its `Id`, the configuration's the one its create
+        // answered. A GROUPING CONFIGURATION is identified by the ACCOUNT whose configuration
+        // it is: there is one per account and Region, its create takes no identifier at all,
+        // and `AwsAccountId` is the one member that service's own read of one narrows by.
+        APPLICATION_SIGNALS_SERVICE_LEVEL_OBJECTIVE
+        | APPLICATION_SIGNALS_INSTRUMENTATION_CONFIG => "Arn",
+        APPLICATION_SIGNALS_GROUPING_CONFIGURATION => "AwsAccountId",
         // A Clean Rooms ML training dataset, identified by the ARN that service minted for it
         // ("Ref returns the training dataset ARN"), which is the `trainingDatasetArn` every
         // call on one takes; the type's own `Name` is only what the dataset is called.

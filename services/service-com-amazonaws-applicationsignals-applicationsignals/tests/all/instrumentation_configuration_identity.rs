@@ -173,10 +173,14 @@ fn cases() -> Vec<Case> {
             environment: "ec2:production",
             location: json!({
                 "Language": "Python",
+                // The module the function lives in, which a Python location is required to
+                // name.
+                "CodeUnit": "app.pricing.quote",
                 "FilePath": "app/pricing/quote.py",
             }),
             other_location: json!({
                 "Language": "Python",
+                "CodeUnit": "app.pricing.discount",
                 "FilePath": "app/pricing/discount.py",
             }),
             stored_type: PROBE,

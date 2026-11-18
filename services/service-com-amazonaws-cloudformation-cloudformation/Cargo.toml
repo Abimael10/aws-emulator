@@ -289,6 +289,13 @@ service-com-amazonaws-eks-awswesleyfrontend = { workspace = true }
 # the graph and the snapshot the stack published are read back through that service's own
 # wire.
 service-com-amazonaws-neptunegraph-amazonneptunegraph = { workspace = true }
+# CloudWatch Application Signals, for the `AWS::ApplicationSignals::ServiceLevelObjective`,
+# `::GroupingConfiguration` and `::InstrumentationConfig` a stack really creates there
+# (`state::provisioner::application_signals`): a suite that deploys one must have its owning
+# service mounted beside CloudFormation, or the create is refused and the stack fails — and the
+# objective, the configuration and the instrumentation point the stack published are read back
+# through that service's own wire.
+service-com-amazonaws-applicationsignals-applicationsignals = { workspace = true }
 # AWS Cloud Map, for the `AWS::ServiceDiscovery::HttpNamespace`, `::PublicDnsNamespace`,
 # `::PrivateDnsNamespace`, `::Service` and `::Instance` a stack really creates there
 # (`state::provisioning::service_discovery`): a suite that deploys one must have its owning

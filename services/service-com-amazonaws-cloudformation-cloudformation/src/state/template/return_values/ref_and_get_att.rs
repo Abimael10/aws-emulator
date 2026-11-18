@@ -1734,6 +1734,122 @@ pub(crate) fn return_values(
             attributes.insert("SpendingLimitArn".to_string(), arn.clone());
             (arn, attributes)
         }
+        // CloudWatch Application Signals' own control plane: the service level objective an
+        // `AWS::ApplicationSignals::ServiceLevelObjective` declares. "Ref returns the ARN",
+        // which that service builds from its own namespace, the Region and the objective's
+        // NAME — the same ARN this computes, since both are built from the one account id this
+        // emulator mints (`slo_arn` in that service's own state module) — so the identity is
+        // computable here and `identity_is_service_assigned` does not name the type. The four
+        // read-only values beside it are Application Signals' own (the two instants of its
+        // clock, which of the two indicators the objective was created with, and the metric
+        // source that indicator names), so each stands in until `super::provisioning` has
+        // reported what that service really answered
+        // ([`super::provisioner::Provisioner::ApplicationSignalsServiceLevelObjective`]).
+        APPLICATION_SIGNALS_SERVICE_LEVEL_OBJECTIVE => {
+            let arn = ::emulator_server::emulator_arn(
+                APPLICATION_SIGNALS_ARN_NAMESPACE,
+                region,
+                &format!("{APPLICATION_SIGNALS_SLO_PATH}/{name}"),
+            );
+            attributes.insert(
+                APPLICATION_SIGNALS_SLO_ARN_ATTRIBUTE.to_string(),
+                arn.clone(),
+            );
+            for attribute in APPLICATION_SIGNALS_SLO_ATTRIBUTES
+                .iter()
+                .filter(|attribute| **attribute != APPLICATION_SIGNALS_SLO_ARN_ATTRIBUTE)
+            {
+                attributes.insert(
+                    (*attribute).to_string(),
+                    service_assigned_document(name, attribute),
+                );
+            }
+            (arn, attributes)
+        }
+        // The grouping configuration an `AWS::ApplicationSignals::GroupingConfiguration`
+        // declares. `PutGroupingConfiguration` keeps ONE configuration per account and Region
+        // ("Creates or updates the grouping configuration for this account") and takes no
+        // identifier for it, and the read that reports one narrows by `AwsAccountId` — so the
+        // resource's identity is the account whose configuration it is, not a name of its own,
+        // and a second declaration of the type in the same account names the same resource.
+        // Its `UpdatedAt` is that service's clock and stands in until `super::provisioning`
+        // has reported what the put answered
+        // ([`super::provisioner::Provisioner::ApplicationSignalsGroupingConfiguration`]).
+        APPLICATION_SIGNALS_GROUPING_CONFIGURATION => {
+            let account_id = ::emulator_server::emulator_account_id().to_string();
+            attributes.insert(
+                APPLICATION_SIGNALS_ACCOUNT_ID_ATTRIBUTE.to_string(),
+                account_id.clone(),
+            );
+            for attribute in APPLICATION_SIGNALS_GROUPING_CONFIGURATION_ATTRIBUTES
+                .iter()
+                .filter(|attribute| **attribute != APPLICATION_SIGNALS_ACCOUNT_ID_ATTRIBUTE)
+            {
+                attributes.insert(
+                    (*attribute).to_string(),
+                    service_assigned_document(name, attribute),
+                );
+            }
+            (account_id, attributes)
+        }
+        // The instrumentation point an `AWS::ApplicationSignals::InstrumentationConfig`
+        // declares. `CreateInstrumentationConfiguration` takes no identifier for it and
+        // answers the ARN it minted, which carries the service, the environment, the signal
+        // type and the `LocationHash` that service computed from the LOCATION — a hash no
+        // naming rule computes, which is what [`identity_is_service_assigned`] names this type
+        // for. The value here is therefore a STAND-IN of that form: the three parts the
+        // declaration states, and a stable digest of the declared location at the width that
+        // member carries, re-pointed at the ARN the create really answered
+        // ([`super::provisioner::Provisioner::ApplicationSignalsInstrumentationConfig`]). The
+        // instant and the hash itself are that service's too, so both stand in beside it.
+        APPLICATION_SIGNALS_INSTRUMENTATION_CONFIG => {
+            let mut declared_part = |property: &str| {
+                properties
+                    .get(property)
+                    .and_then(|value| text(value, scope, 0, budget))
+                    .unwrap_or_default()
+            };
+            let service = declared_part(APPLICATION_SIGNALS_SERVICE_PROPERTY);
+            let environment = declared_part(APPLICATION_SIGNALS_ENVIRONMENT_PROPERTY);
+            let signal_type = declared_part(APPLICATION_SIGNALS_SIGNAL_TYPE_PROPERTY);
+            // The location is a STRUCTURE rather than a scalar, so what the stand-in hashes is
+            // the declaration's own spelling of it, under the NAME CloudFormation computed for
+            // this resource: stable for one declaration, and different for two — so two
+            // declarations that state the same location, or that state none at all, never stand
+            // in under one identity while the create that settles it is still to come.
+            let location = properties
+                .get(APPLICATION_SIGNALS_LOCATION_PROPERTY)
+                .map(ToString::to_string)
+                .unwrap_or_default();
+            let arn = ::emulator_server::emulator_arn(
+                APPLICATION_SIGNALS_ARN_NAMESPACE,
+                region,
+                &format!(
+                    "{APPLICATION_SIGNALS_INSTRUMENTATION_CONFIG_PATH}/{service}/{environment}/\
+                     {signal_type}/{}",
+                    crate::state::stable_identifier_digits(
+                        &format!("{name}/{location}"),
+                        APPLICATION_SIGNALS_LOCATION_HASH_CHARS
+                    )
+                ),
+            );
+            attributes.insert(
+                APPLICATION_SIGNALS_INSTRUMENTATION_CONFIG_ARN_ATTRIBUTE.to_string(),
+                arn.clone(),
+            );
+            for attribute in APPLICATION_SIGNALS_INSTRUMENTATION_CONFIG_ATTRIBUTES
+                .iter()
+                .filter(|attribute| {
+                    **attribute != APPLICATION_SIGNALS_INSTRUMENTATION_CONFIG_ARN_ATTRIBUTE
+                })
+            {
+                attributes.insert(
+                    (*attribute).to_string(),
+                    service_assigned_document(name, attribute),
+                );
+            }
+            (arn, attributes)
+        }
         // Clean Rooms ML's own control plane: the training dataset an
         // `AWS::CleanRoomsML::TrainingDataset` declares. "Ref returns the training dataset ARN"
         // (the type's primary identifier); Fn::GetAtt reads `TrainingDatasetArn`. That service

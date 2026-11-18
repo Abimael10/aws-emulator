@@ -229,6 +229,9 @@ fn cases() -> Vec<Case> {
             instrumentation_type: PROBE,
             location: json!({
                 "Language": "Python",
+                // The module the function lives in, which a Python location is required to
+                // name.
+                "CodeUnit": "app.handlers.orders",
                 "FilePath": "app/handlers/orders.py"
             }),
         },
@@ -267,6 +270,7 @@ fn cases() -> Vec<Case> {
             instrumentation_type: BREAKPOINT,
             location: json!({
                 "Language": "Python",
+                "CodeUnit": "billing.invoice",
                 "FilePath": "billing/invoice.py",
                 "LineNumber": 7
             }),

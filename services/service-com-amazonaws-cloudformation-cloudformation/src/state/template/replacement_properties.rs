@@ -18,6 +18,13 @@ use super::*;
 /// ([`crate::state::provisioning::reconcile`]).
 pub fn replacement_deletes_first(resource_type: &str) -> bool {
     resource_type == EC2_SUBNET_ROUTE_TABLE_ASSOCIATION
+        // An Application Signals instrumentation configuration is the same case: one code
+        // location holds at most one configuration — a create at a location that already has
+        // one is refused as a conflict ("If a configuration already exists for the same
+        // service, environment, signal type, and location, this operation returns a conflict
+        // instead of overwriting it") — so a replacement that keeps the location cannot create
+        // the new record while the old one is there.
+        || resource_type == APPLICATION_SIGNALS_INSTRUMENTATION_CONFIG
 }
 
 /// The properties of this type a resource cannot take a NEW VALUE for while it goes on
@@ -66,6 +73,29 @@ pub fn replacement_properties(resource_type: &str) -> &'static [&'static str] {
         // the limit's amount and its period and no device at all, so a declaration naming
         // another device asks for a different limit.
         BRAKET_SPENDING_LIMIT => &["DeviceArn"],
+        // An Application Signals instrumentation configuration keeps everything it was created
+        // with: "configurations are immutable after creation"
+        // (`CreateInstrumentationConfiguration`), and that service publishes no call that
+        // changes one at all — so a declaration restating any property asks for a DIFFERENT
+        // configuration, which CloudFormation replaces. Its own four identity dimensions (the
+        // service, the environment, the signal type and the location) are among them for the
+        // same reason every other property is: the record the create wrote is the whole of the
+        // resource. (A GROUPING CONFIGURATION needs no entry: `PutGroupingConfiguration` is
+        // documented "Creates or updates the grouping configuration for this account", so a
+        // changed declaration reaches the configuration in place. An SLO needs none either:
+        // every property of it beside its name is a member of `UpdateServiceLevelObjective`.)
+        APPLICATION_SIGNALS_INSTRUMENTATION_CONFIG => &[
+            "AttributeFilters",
+            "CaptureConfiguration",
+            "Description",
+            "Environment",
+            "ExpiresAt",
+            "InstrumentationType",
+            "Location",
+            "Service",
+            "SignalType",
+            "Tags",
+        ],
         // Clean Rooms ML publishes no call that changes a training dataset at all: the
         // dataset's description, the role it reads its data with and the datasets themselves
         // are all fixed when `CreateTrainingDataset` records it, so a declaration restating one

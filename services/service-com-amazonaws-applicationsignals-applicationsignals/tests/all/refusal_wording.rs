@@ -132,6 +132,9 @@ fn cases() -> Vec<Case> {
                 "InstrumentationType": PROBE,
                 "Location": { "CodeLocation": {
                     "Language": "Python",
+                    // The module the function lives in, which a Python location is required
+                    // to name.
+                    "CodeUnit": "app.orders",
                     "FilePath": "app/orders.py"
                 }},
                 "CaptureConfiguration": { "CodeCapture": { "CaptureLimits": {} } }

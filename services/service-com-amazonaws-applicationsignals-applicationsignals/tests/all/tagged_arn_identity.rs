@@ -136,6 +136,9 @@ fn configuration_case(
         environment,
         location: json!({
             "Language": language,
+            // The module, package or namespace the code lives in, which a Python location is
+            // required to name and every other language's location may.
+            "CodeUnit": "example.cart",
             "ClassName": "Cart",
             "FilePath": "src/main/java/com/example/Cart.java",
             "LineNumber": 142,

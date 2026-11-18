@@ -557,6 +557,19 @@ impl Provisioner {
             Self::BraketSpendingLimit => {
                 describe_braket_spending_limit(ctx, region, physical_resource_id).await
             }
+            // Application Signals' own reads: the objective by the ARN it is addressed by, the
+            // account's grouping configuration by the read that reports this account's
+            // definitions, and the instrumentation point by the identity the stack holds for
+            // it.
+            Self::ApplicationSignalsServiceLevelObjective => {
+                describe_slo(ctx, region, physical_resource_id).await
+            }
+            Self::ApplicationSignalsGroupingConfiguration => {
+                describe_grouping_configuration(ctx, region).await
+            }
+            Self::ApplicationSignalsInstrumentationConfig => {
+                describe_instrumentation_config(ctx, region, resource).await
+            }
             // Clean Rooms ML's own read of the dataset, by the ARN it minted.
             Self::CleanRoomsMlTrainingDataset => {
                 describe_training_dataset(ctx, region, physical_resource_id).await

@@ -201,6 +201,8 @@ fn cases() -> Vec<Case> {
             label: "Python, a ClassName",
             code_location: json!({
                 "Language": "Python",
+                // The module the class lives in, which a Python location is required to name.
+                "CodeUnit": "app.checkout.cart",
                 "ClassName": "Cart",
                 "FilePath": "app/checkout/cart.py",
                 "LineNumber": 1,

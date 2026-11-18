@@ -178,6 +178,9 @@ impl Definition {
             "Location": {
                 "CodeLocation": {
                     "Language": self.language,
+                    // The module, package or namespace the code lives in, which a Python
+                    // location is required to name and every other language's location may.
+                    "CodeUnit": "example.fixture",
                     "FilePath": self.file_path,
                     "LineNumber": self.line_number,
                 }

@@ -479,7 +479,9 @@ use super::template::{
     AOSS_SECURITY_POLICY, AOSS_VPC_ENDPOINT, APIGATEWAY_BASE_PATH_MAPPING, APIGATEWAY_DOMAIN_NAME, APIGATEWAYV2_API,
     APIGATEWAYV2_API_MAPPING, APIGATEWAYV2_AUTHORIZER, APIGATEWAYV2_DEPLOYMENT,
     APIGATEWAYV2_DOMAIN_NAME, APIGATEWAYV2_INTEGRATION, APIGATEWAYV2_ROUTE,
-    APIGATEWAYV2_STAGE, BACKUP_GATEWAY_HYPERVISOR, BACKUP_PLAN, BACKUP_SELECTION, BACKUP_VAULT,
+    APIGATEWAYV2_STAGE, APPLICATION_SIGNALS_GROUPING_CONFIGURATION,
+    APPLICATION_SIGNALS_INSTRUMENTATION_CONFIG, APPLICATION_SIGNALS_SERVICE_LEVEL_OBJECTIVE,
+    BACKUP_GATEWAY_HYPERVISOR, BACKUP_PLAN, BACKUP_SELECTION, BACKUP_VAULT,
     BATCH_COMPUTE_ENVIRONMENT,
     BATCH_JOB_DEFINITION, BATCH_JOB_QUEUE, BATCH_SERVICE_ENVIRONMENT, BEDROCK_DATA_SOURCE,
     BEDROCK_FLOW,
@@ -1099,6 +1101,25 @@ pub(super) enum Provisioner {
     /// the `spendingLimitArn` the type publishes — the handle every spending-limit API takes
     /// — so it is read off that create's own answer and is the identity a `Ref` resolves to.
     BraketSpendingLimit,
+    /// `AWS::ApplicationSignals::ServiceLevelObjective`: the objective CloudWatch Application
+    /// Signals' own `CreateServiceLevelObjective` makes under the name the template states,
+    /// `UpdateServiceLevelObjective` changes and `DeleteServiceLevelObjective` removes. Its
+    /// ARN carries that name, so it is the identity the naming rules already compute for the
+    /// type — the `Id` every call on an objective takes ([`application_signals`]).
+    ApplicationSignalsServiceLevelObjective,
+    /// `AWS::ApplicationSignals::GroupingConfiguration`: the ONE grouping configuration that
+    /// service keeps per account and Region, which `PutGroupingConfiguration` is documented to
+    /// create or update and `DeleteGroupingConfiguration` removes. The put is therefore this
+    /// type's create and its update alike, and neither call takes an identifier: the resource
+    /// is the account's own configuration.
+    ApplicationSignalsGroupingConfiguration,
+    /// `AWS::ApplicationSignals::InstrumentationConfig`: the dynamic instrumentation point
+    /// that service's own `CreateInstrumentationConfiguration` records for one code location
+    /// and `DeleteInstrumentationConfiguration` removes. A configuration is immutable after
+    /// creation, so the type has no update arm; that service MINTS the ARN the type publishes —
+    /// around the `LocationHash` it computes — so it is read off that create's own answer and
+    /// is the identity a `Ref` resolves to.
+    ApplicationSignalsInstrumentationConfig,
     /// `AWS::CleanRoomsML::TrainingDataset`: the metadata record Clean Rooms ML's own
     /// `CreateTrainingDataset` makes for a Glue table, which `DeleteTrainingDataset` removes by
     /// the `trainingDatasetArn` that service minted — the ARN this type's `Ref` returns and
@@ -1402,6 +1423,15 @@ pub(super) fn provisioner_for(resource_type: &str) -> Option<Provisioner> {
             Some(Provisioner::BedrockAgentCoreWorkloadIdentity)
         }
         BRAKET_SPENDING_LIMIT => Some(Provisioner::BraketSpendingLimit),
+        APPLICATION_SIGNALS_SERVICE_LEVEL_OBJECTIVE => {
+            Some(Provisioner::ApplicationSignalsServiceLevelObjective)
+        }
+        APPLICATION_SIGNALS_GROUPING_CONFIGURATION => {
+            Some(Provisioner::ApplicationSignalsGroupingConfiguration)
+        }
+        APPLICATION_SIGNALS_INSTRUMENTATION_CONFIG => {
+            Some(Provisioner::ApplicationSignalsInstrumentationConfig)
+        }
         CLEANROOMSML_TRAINING_DATASET => Some(Provisioner::CleanRoomsMlTrainingDataset),
         AMPLIFYUIBUILDER_COMPONENT => Some(Provisioner::AmplifyUiBuilderComponent),
         AMPLIFYUIBUILDER_FORM => Some(Provisioner::AmplifyUiBuilderForm),
@@ -2091,6 +2121,23 @@ impl Provisioner {
             // declaration asks for.
             Self::BraketSpendingLimit => {
                 create_braket_spending_limit(ctx, region, resource, propagated).await
+            }
+            // `AWS::ApplicationSignals::ServiceLevelObjective` publishes `Tags`, and
+            // `CreateServiceLevelObjective` takes the `TagList` of its own, so an objective a
+            // stack creates carries the tags CloudFormation gives it beside the ones the
+            // declaration asks for. The same holds for an
+            // `AWS::ApplicationSignals::InstrumentationConfig`, whose create takes a `TagList`
+            // too. A GROUPING CONFIGURATION publishes no `Tags` property and its put takes no
+            // tag member at all — it is the account's own configuration rather than a named
+            // resource — so no tags are propagated to one.
+            Self::ApplicationSignalsServiceLevelObjective => {
+                create_slo(ctx, region, resource, propagated).await
+            }
+            Self::ApplicationSignalsGroupingConfiguration => {
+                put_grouping_configuration(ctx, region, resource, &resource.properties).await
+            }
+            Self::ApplicationSignalsInstrumentationConfig => {
+                create_instrumentation_config(ctx, region, resource, propagated).await
             }
             // `AWS::CleanRoomsML::TrainingDataset` publishes `Tags`, which
             // `CreateTrainingDataset` takes as its own tag MAP, so a dataset a stack creates
@@ -3290,6 +3337,20 @@ impl Provisioner {
                     .await
                     .map(Some)
             }
+            // The objective's own update, which takes every member of the create but the
+            // name; and the grouping configuration's PUT, documented "Creates or updates the
+            // grouping configuration for this account", so the call that created it is the
+            // call that applies a changed declaration to it. An INSTRUMENTATION CONFIG has no
+            // arm here on purpose: "configurations are immutable after creation", so every
+            // property of that type replaces the resource rather than changing it.
+            Self::ApplicationSignalsServiceLevelObjective => {
+                update_slo(ctx, region, resource, declared).await
+            }
+            Self::ApplicationSignalsGroupingConfiguration => {
+                put_grouping_configuration(ctx, region, resource, declared)
+                    .await
+                    .map(Some)
+            }
             Self::BraketSpendingLimit => update_braket_spending_limit(ctx, region, resource, declared)
                 .await
                 .map(Some),
@@ -4160,6 +4221,20 @@ impl Provisioner {
             Self::BraketSpendingLimit => {
                 delete_braket_spending_limit(ctx, region, physical_resource_id).await
             }
+            // The objective is deleted by the ARN it is addressed by, which is this resource's
+            // physical id; the account's grouping configuration by the one call that takes it
+            // away, which carries no identifier; and the instrumentation point by the identity
+            // the stack holds for it — the four dimensions its declaration states and the
+            // location hash that service computed.
+            Self::ApplicationSignalsServiceLevelObjective => {
+                delete_slo(ctx, region, physical_resource_id).await
+            }
+            Self::ApplicationSignalsGroupingConfiguration => {
+                delete_grouping_configuration(ctx, region).await
+            }
+            Self::ApplicationSignalsInstrumentationConfig => {
+                delete_instrumentation_config(ctx, region, resource).await
+            }
             // The delete addresses the dataset by the ARN Clean Rooms ML minted for it.
             Self::CleanRoomsMlTrainingDataset => {
                 delete_training_dataset(ctx, region, physical_resource_id).await
@@ -4284,6 +4359,11 @@ mod bedrock_flows;
 /// the return-value catalogue key their entries for those types by.
 pub(crate) mod sagemaker_resources;
 mod braket_spending_limits;
+/// The CloudWatch Application Signals arms: the service level objective, the account's
+/// grouping configuration and the dynamic instrumentation point a template declares there,
+/// created in the service that owns them so a client's own reads — and the SDKs that fetch an
+/// instrumentation configuration — resolve what the stack publishes.
+mod application_signals;
 /// The Clean Rooms ML TRAINING DATASET arms: the dataset an
 /// `AWS::CleanRoomsML::TrainingDataset` declares, recorded in the service that owns it so a
 /// client's own reads resolve the ARN the stack publishes.
@@ -4436,6 +4516,7 @@ use bedrock_data_sources::*;
 use bedrock_flows::*;
 use sagemaker_resources::*;
 use braket_spending_limits::*;
+use application_signals::*;
 use cleanrooms_ml_training_datasets::*;
 use backup_gateway_hypervisors::*;
 use amplify_ui_builder::*;

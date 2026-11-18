@@ -270,6 +270,18 @@ pub fn published_attribute_names(resource_type: &str) -> &'static [&'static str]
         // service's own report of the limit rather than from here, exactly as a knowledge
         // base's instants do.
         BRAKET_SPENDING_LIMIT => &["SpendingLimitArn"],
+        // An Application Signals service level objective publishes the ARN these naming rules
+        // compute from its name beside the four read-only values that service decides; a
+        // GROUPING CONFIGURATION publishes the one instant its put recorded; and an
+        // INSTRUMENTATION CONFIG publishes the ARN, the instant and the location hash that
+        // service answered for the point it recorded.
+        APPLICATION_SIGNALS_SERVICE_LEVEL_OBJECTIVE => APPLICATION_SIGNALS_SLO_ATTRIBUTES,
+        APPLICATION_SIGNALS_GROUPING_CONFIGURATION => {
+            APPLICATION_SIGNALS_GROUPING_CONFIGURATION_ATTRIBUTES
+        }
+        APPLICATION_SIGNALS_INSTRUMENTATION_CONFIG => {
+            APPLICATION_SIGNALS_INSTRUMENTATION_CONFIG_ATTRIBUTES
+        }
         // A training dataset publishes the ARN Clean Rooms ML minted for it, which is the one
         // return value these naming rules compute a stand-in for before it exists; its
         // `Status` is that service's own to report and reaches the resource off its report of
@@ -767,6 +779,17 @@ pub fn identity_is_service_assigned(resource_type: &str) -> bool {
         // That ARN is also what every call on a limit takes (`UpdateSpendingLimit` and
         // `DeleteSpendingLimit` each address one by it).
         || resource_type == BRAKET_SPENDING_LIMIT
+        // An Application Signals INSTRUMENTATION CONFIG is one more:
+        // `CreateInstrumentationConfiguration` takes no identifier for the configuration — the
+        // declaration states the service, the environment, the signal type and the code
+        // location — and answers the ARN that service minted, whose final segment is the
+        // `LocationHash` it computed from that location (16 lowercase hexadecimal characters,
+        // which no name CloudFormation decides is). That ARN is what the type's `Ref` returns,
+        // so the identity in force is the one that service answered. (A SERVICE LEVEL
+        // OBJECTIVE is NOT one of them: its ARN carries the objective's own name, which the
+        // naming rules compute; nor is a GROUPING CONFIGURATION, whose identity is the account
+        // the configuration belongs to.)
+        || resource_type == APPLICATION_SIGNALS_INSTRUMENTATION_CONFIG
         // A CLEAN ROOMS ML training dataset is one more: `CreateTrainingDataset` takes no
         // identifier for the dataset — the declaration states its name, the role that reads
         // the data and the datasets themselves — and answers the `trainingDatasetArn` that

@@ -2955,6 +2955,13 @@ pub const IMPLEMENTED_RESOURCE_TYPES: &[&str] = &[
     APIGATEWAYV2_API,
     APIGATEWAYV2_API_MAPPING,
     APIGATEWAYV2_DOMAIN_NAME,
+    // The three CloudWatch Application Signals types, publishing the read-only values that
+    // service reports for each: the objective's ARN and the values it settles, the one instant
+    // the account's grouping configuration carries, and the ARN, instant and location hash of
+    // an instrumentation point.
+    APPLICATION_SIGNALS_SERVICE_LEVEL_OBJECTIVE,
+    APPLICATION_SIGNALS_GROUPING_CONFIGURATION,
+    APPLICATION_SIGNALS_INSTRUMENTATION_CONFIG,
     BACKUP_VAULT,
     BATCH_COMPUTE_ENVIRONMENT,
     BATCH_JOB_QUEUE,

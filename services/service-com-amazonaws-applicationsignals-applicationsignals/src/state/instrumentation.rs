@@ -1093,6 +1093,39 @@ pub(super) const CODE_LOCATION_PATH_STEP: &str = "codeLocation";
 /// (`smithy_query(query="doc",shape="CodeLocation",member="ClassName")`).
 pub(super) const CLASS_NAME_REQUIRED_FOR_LANGUAGE: &str = "Java";
 
+/// The `ProgrammingLanguage` a code location must name a `CodeUnit` for.
+///
+/// A Python instrumentation point is a function in a MODULE — `CodeUnit` is "the package,
+/// module, or namespace that contains the target code"
+/// (`smithy_query(query="doc",shape="CodeLocation",member="CodeUnit")`) — and a Python
+/// location naming none names no module to find the function in, so this service refuses the
+/// create. The member is modelled OPTIONAL, because the requirement holds for exactly this one
+/// value of the sibling `Language`, which the model cannot express.
+pub(super) const CODE_UNIT_REQUIRED_FOR_LANGUAGE: &str = "Python";
+
+/// The member of `CodeLocation` that requirement is about, spelled as this service's own
+/// refusal names it.
+pub(super) const CODE_UNIT_MEMBER: &str = "CodeUnit";
+
+/// How this service words a code location that omits the member its LANGUAGE requires: the
+/// member, the requirement and the language it holds for, and nothing of the value the request
+/// carried.
+///
+/// One sentence, with the member and the language as its variable parts, so the requirement
+/// reads the same whichever member a language requires.
+///
+/// It is a BARE sentence rather than the constraint-clause envelope the `ClassName` requirement
+/// below is worded in, because that is how this refusal is recorded (the behavioral corpus'
+/// `application-signals__cloudformation.deploy-application-signals-instrumentation-config-\
+/// missing-code-unit-rejected`, whose resource failure reason quotes `CodeUnit is required for
+/// Python locations` followed by that service's SDK diagnostic). Nothing records the wording of
+/// the `ClassName` one, so the two are deliberately NOT unified on inference: the suite that
+/// pins each is the authority on it (`code_location_code_unit.rs`,
+/// `code_location_class_name.rs`).
+pub(super) fn required_for_language(member: &str, language: &str) -> String {
+    format!("{member} is required for {language} locations")
+}
+
 /// The refusal a `CodeLocation` carried under `member_path` earns, or `None` when it meets
 /// every requirement its members document.
 ///
@@ -1120,10 +1153,22 @@ pub fn code_location_refusal(member_path: &str, code: &CodeLocation) -> Option<S
 }
 
 /// [`code_location_refusal`] for the `Location` union a create names the instrumentation
-/// point with.
+/// point with, plus the one requirement that holds of a location being RECORDED rather than
+/// resolved: a Python location must name the `CodeUnit` its function lives in
+/// ([`CODE_UNIT_REQUIRED_FOR_LANGUAGE`]).
+///
+/// That one is enforced on the CREATE alone, because it is about the point this service stores:
+/// the reads and the delete HASH the location they are given to look a record up by, and a
+/// location they hold no record for is a 404 rather than a malformed instrumentation point
+/// ([`identified_location_refusal`]).
 pub fn location_refusal(location: &Location) -> Option<String> {
     match location {
-        Location::CodeLocation(code) => code_location_refusal(LOCATION_MEMBER_PATH, code),
+        Location::CodeLocation(code) => {
+            if code.language == CODE_UNIT_REQUIRED_FOR_LANGUAGE && code.code_unit.is_none() {
+                return Some(required_for_language(CODE_UNIT_MEMBER, &code.language));
+            }
+            code_location_refusal(LOCATION_MEMBER_PATH, code)
+        }
     }
 }
 

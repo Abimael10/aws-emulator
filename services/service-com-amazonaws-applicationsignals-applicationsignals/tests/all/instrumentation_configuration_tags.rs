@@ -195,6 +195,7 @@ pub(crate) fn cases() -> Vec<Case> {
             environment: "ec2:production",
             location: json!({
                 "Language": "Python",
+                "CodeUnit": "app.pricing.quote",
                 "FilePath": "app/pricing/quote.py",
                 "MethodName": "quote",
             }),
