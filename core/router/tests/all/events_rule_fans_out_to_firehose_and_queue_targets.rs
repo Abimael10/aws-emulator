@@ -33,6 +33,11 @@
 //! The Region, the wire encoder and the IAM role builder are the ones
 //! `events_rule_firehose_target_delivery.rs` already holds for this same set of services, so
 //! both suites sign for one Region and build a role one way.
+//!
+//! The publication's own values, the per-service wire helpers, the queue builder and the
+//! waits below are `pub(crate)` in turn, so a suite driving the SAME fan-out over the same
+//! five services — `events_rule_target_input_overrides_fan_out_independently.rs` — calls them
+//! rather than restating them: one publication, one encoder and one set of waits for both.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -52,17 +57,17 @@ const DELIVERY_ROLE: &str = "fanout-firehose-delivery-role";
 
 /// The source and detail type every rule below matches on, and the detail the single published
 /// event carries.
-const SOURCE: &str = "com.demo.fanout";
-const DETAIL_TYPE: &str = "Order Teed";
-const ORDER_ID: &str = "A-7";
+pub(crate) const SOURCE: &str = "com.demo.fanout";
+pub(crate) const DETAIL_TYPE: &str = "Order Teed";
+pub(crate) const ORDER_ID: &str = "A-7";
 
 /// The service principal EventBridge assumes a target's role as, and the one a queue's policy
 /// has to admit for a queue leg to be delivered.
-const EVENTS_PRINCIPAL: &str = "events.amazonaws.com";
+pub(crate) const EVENTS_PRINCIPAL: &str = "events.amazonaws.com";
 
 /// The call each leg performs, which that leg's own authorization has to admit.
-const PUT_RECORD_ACTION: &str = "firehose:PutRecord";
-const SEND_MESSAGE_ACTION: &str = "sqs:SendMessage";
+pub(crate) const PUT_RECORD_ACTION: &str = "firehose:PutRecord";
+pub(crate) const SEND_MESSAGE_ACTION: &str = "sqs:SendMessage";
 
 /// The status a delivery stream has to report before a record may be put into it
 /// (`DeliveryStreamDescription$DeliveryStreamStatus`).
@@ -72,10 +77,10 @@ const ACTIVE: &str = "ACTIVE";
 /// message — is waited for before a row fails: far longer than the emulator's own spans, so a
 /// loaded machine does not fail a row the clock would have served. Nothing here waits a fixed
 /// time: every wait looks again until the condition it waits on holds.
-const DEADLINE: Duration = Duration::from_secs(60);
+pub(crate) const DEADLINE: Duration = Duration::from_secs(60);
 
 /// How long between two looks while waiting for one of those conditions.
-const LOOK_AGAIN: Duration = Duration::from_millis(50);
+pub(crate) const LOOK_AGAIN: Duration = Duration::from_millis(50);
 
 /// The order one row writes its two targets in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -200,7 +205,12 @@ async fn rpc(
 }
 
 /// One EventBridge operation (`awsJson1_1`) that must succeed.
-async fn events(router: &MultiServiceRouter, case: &str, operation: &str, body: Value) -> Value {
+pub(crate) async fn events(
+    router: &MultiServiceRouter,
+    case: &str,
+    operation: &str,
+    body: Value,
+) -> Value {
     rpc(
         router,
         case,
@@ -213,7 +223,12 @@ async fn events(router: &MultiServiceRouter, case: &str, operation: &str, body: 
 }
 
 /// One Firehose operation (`awsJson1_1`) that must succeed.
-async fn firehose(router: &MultiServiceRouter, case: &str, operation: &str, body: Value) -> Value {
+pub(crate) async fn firehose(
+    router: &MultiServiceRouter,
+    case: &str,
+    operation: &str,
+    body: Value,
+) -> Value {
     rpc(
         router,
         case,
@@ -226,7 +241,12 @@ async fn firehose(router: &MultiServiceRouter, case: &str, operation: &str, body
 }
 
 /// One Amazon SQS operation (`awsJson1_0`) that must succeed.
-async fn sqs(router: &MultiServiceRouter, case: &str, operation: &str, body: Value) -> Value {
+pub(crate) async fn sqs(
+    router: &MultiServiceRouter,
+    case: &str,
+    operation: &str,
+    body: Value,
+) -> Value {
     rpc(
         router,
         case,
@@ -240,7 +260,7 @@ async fn sqs(router: &MultiServiceRouter, case: &str, operation: &str, body: Val
 
 /// The queue `name`, carrying the policy `grants` describes when one is named; answers its url
 /// and the ARN a target names it by.
-async fn given_queue(
+pub(crate) async fn given_queue(
     router: &MultiServiceRouter,
     case: &str,
     name: &str,
@@ -270,13 +290,21 @@ async fn given_queue(
     (url, arn)
 }
 
-/// Every key the bucket holds under `prefix`, read through `ListObjectsV2`.
-async fn keys_under(router: &MultiServiceRouter, case: &str, prefix: &str) -> Vec<String> {
+/// Every key `bucket` holds under `prefix`, read through `ListObjectsV2`.
+///
+/// The bucket is a PARAMETER rather than this file's own, so a suite driving the same fan-out
+/// into a bucket of its own calls this one wait on the Amazon S3 leg rather than restating it.
+pub(crate) async fn keys_under(
+    router: &MultiServiceRouter,
+    case: &str,
+    bucket: &str,
+    prefix: &str,
+) -> Vec<String> {
     let (status, body) = send(
         router,
         "s3",
         "GET",
-        &format!("/{BUCKET}?list-type=2&prefix={prefix}"),
+        &format!("/{bucket}?list-type=2&prefix={prefix}"),
         &[],
         Vec::new(),
     )
@@ -291,17 +319,22 @@ async fn keys_under(router: &MultiServiceRouter, case: &str, prefix: &str) -> Ve
     keys
 }
 
-/// Everything the bucket holds under `prefix`, concatenated in key order, once at least one
+/// Everything `bucket` holds under `prefix`, concatenated in key order, once at least one
 /// object is there — or a failure naming the row once [`DEADLINE`] has passed.
-async fn delivered_object(router: &MultiServiceRouter, case: &str, prefix: &str) -> String {
+pub(crate) async fn delivered_object(
+    router: &MultiServiceRouter,
+    case: &str,
+    bucket: &str,
+    prefix: &str,
+) -> String {
     let deadline = Instant::now() + DEADLINE;
     loop {
-        let keys = keys_under(router, case, prefix).await;
+        let keys = keys_under(router, case, bucket, prefix).await;
         if !keys.is_empty() {
             let mut body = Vec::new();
             for key in &keys {
                 let (status, bytes) =
-                    send(router, "s3", "GET", &format!("/{BUCKET}/{key}"), &[], Vec::new()).await;
+                    send(router, "s3", "GET", &format!("/{bucket}/{key}"), &[], Vec::new()).await;
                 assert_eq!(
                     status,
                     200,
@@ -321,7 +354,7 @@ async fn delivered_object(router: &MultiServiceRouter, case: &str, prefix: &str)
 }
 
 /// Up to ten message bodies the queue at `url` holds, draining them.
-async fn received(router: &MultiServiceRouter, case: &str, url: &str) -> Vec<String> {
+pub(crate) async fn received(router: &MultiServiceRouter, case: &str, url: &str) -> Vec<String> {
     let answer = sqs(
         router,
         case,
@@ -342,7 +375,11 @@ async fn received(router: &MultiServiceRouter, case: &str, url: &str) -> Vec<Str
 
 /// The message bodies the queue at `url` holds once at least one is there — or a failure
 /// naming the row once [`DEADLINE`] has passed.
-async fn delivered_messages(router: &MultiServiceRouter, case: &str, url: &str) -> Vec<String> {
+pub(crate) async fn delivered_messages(
+    router: &MultiServiceRouter,
+    case: &str,
+    url: &str,
+) -> Vec<String> {
     let deadline = Instant::now() + DEADLINE;
     loop {
         let bodies = received(router, case, url).await;
@@ -360,7 +397,7 @@ async fn delivered_messages(router: &MultiServiceRouter, case: &str, url: &str) 
 /// Wait until the stream `name` reports [`ACTIVE`], which is when a record may be put into
 /// it — rather than waiting a span the emulator chose, which is not a condition a client can
 /// read.
-async fn given_an_active_stream(router: &MultiServiceRouter, case: &str, name: &str) {
+pub(crate) async fn given_an_active_stream(router: &MultiServiceRouter, case: &str, name: &str) {
     let deadline = Instant::now() + DEADLINE;
     loop {
         let described = firehose(
@@ -389,7 +426,7 @@ async fn given_an_active_stream(router: &MultiServiceRouter, case: &str, name: &
 /// `document` must be the envelope this suite published, read by MEMBER rather than as text:
 /// EventBridge hands a target the whole envelope, whose `source`, `detail-type` and `detail`
 /// are the publication's own (`PutEventsRequestEntry`).
-fn assert_carries_the_envelope(case: &str, leg: &str, document: &str) {
+pub(crate) fn assert_carries_the_envelope(case: &str, leg: &str, document: &str) {
     let envelope: Value = serde_json::from_str(document).unwrap_or_else(|error| {
         panic!(
             "case {case:?}: the {leg} leg receives one JSON envelope, got {document:?} \
@@ -416,7 +453,7 @@ fn assert_carries_the_envelope(case: &str, leg: &str, document: &str) {
 }
 
 /// The emulator the suite drives: the five services the fan-out spans, on ONE engine.
-fn emulator() -> MultiServiceRouter {
+pub(crate) fn emulator() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
@@ -582,7 +619,7 @@ async fn a_rule_fans_one_event_out_to_its_firehose_and_queue_targets() {
     // The legs that DELIVER first: a delivered object is the barrier the absences below are
     // judged against, so an empty prefix is an absence rather than a delivery still in flight.
     for row in rows.iter().filter(|row| row.expect_object) {
-        let body = delivered_object(&router, row.case, &format!("{}/", row.name)).await;
+        let body = delivered_object(&router, row.case, BUCKET, &format!("{}/", row.name)).await;
         assert_carries_the_envelope(row.case, "stream", &body);
     }
     for (row, url) in rows.iter().zip(&queue_urls).filter(|(row, _)| row.expect_message) {
@@ -599,7 +636,7 @@ async fn a_rule_fans_one_event_out_to_its_firehose_and_queue_targets() {
     // And the legs whose own authorization withholds the call deliver nothing — while the
     // other leg of the SAME rule delivered above.
     for row in rows.iter().filter(|row| !row.expect_object) {
-        let keys = keys_under(&router, row.case, &format!("{}/", row.name)).await;
+        let keys = keys_under(&router, row.case, BUCKET, &format!("{}/", row.name)).await;
         assert!(
             keys.is_empty(),
             "case {:?}: a stream leg the target's role bars reaches no stream, so its \
