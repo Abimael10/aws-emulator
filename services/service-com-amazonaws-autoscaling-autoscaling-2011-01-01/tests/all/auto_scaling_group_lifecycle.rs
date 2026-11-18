@@ -2041,6 +2041,254 @@ async fn instances_still_terminating_occupy_the_group_ceiling() {
     }
 }
 
+/// The hook every group of the headroom suite below holds its terminations at, and the
+/// policy each one is asked to perform.
+const HEADROOM_HOOK: &str = "hold-the-terminations";
+const HEADROOM_POLICY: &str = "raise-past-the-headroom";
+
+/// The whole sentence this service answers `ScalingActivityInProgressFault` with when the
+/// instances an earlier change is still taking out of service are what blocks this one.
+///
+/// Written out here rather than taken from the service's own builder — a test asserting the
+/// implementation's literal asserts nothing — with the group's name as its one variable
+/// part.
+fn still_terminating_message(group: &str) -> String {
+    format!(
+        "The AutoScalingGroup {group} still holds instances from an earlier scaling activity: \
+         retry once they have finished terminating"
+    )
+}
+
+/// What the group holds, read from the store: how many instances, and what it can still
+/// launch beside them.
+fn held_and_headroom(engine: &Arc<engine::InMemoryEngine>, group: &str) -> (usize, i32) {
+    let state = autoscaling::state::service_state(&**engine).expect("the service store");
+    let state = state.lock();
+    let stored = state
+        .groups
+        .get(group)
+        .unwrap_or_else(|| panic!("the group {group:?} must be stored"));
+    (stored.instances.len(), stored.launch_headroom())
+}
+
+/// The headroom the per-group ceiling leaves decides a capacity change AT ITS BOUNDARY, at
+/// every door that changes a group's size.
+///
+/// The instances a group is still taking out of service are instances it holds, so what it
+/// may still launch is the ceiling minus everything it holds: a change needing one launch
+/// more than that is refused with the modelled `ScalingActivityInProgressFault`, a change
+/// needing exactly that many is performed, and the group that performed it holds exactly a
+/// ceiling's worth — never more. Each row holds a different number of instances on their way
+/// out, so the boundary under test is a different figure in each, and every row drives the
+/// three doors that apply the rule: the desired-capacity set, the group update and the policy
+/// execution.
+///
+/// The instances are kept on their way out by a TERMINATION LIFECYCLE HOOK, the modelled way
+/// a termination waits: nothing the clock owes moves a held instance on, so no leg here races
+/// a transient span however slow the host is, and the state each assertion is about holds for
+/// as long as the assertions take.
+#[tokio::test]
+async fn the_ceiling_headroom_decides_a_capacity_change_at_every_door() {
+    let engine = new_engine();
+    let router = router_with(engine.clone());
+
+    let ceiling = autoscaling::state::MAX_GROUP_CAPACITY;
+    let stored_ceiling = usize::try_from(ceiling).expect("the ceiling fits");
+    let full = ceiling.to_string();
+
+    // How many instances the group is still taking out of service: the rule generalises over
+    // that count, so each row's boundary is a different figure.
+    for leaving in [1, 2, 5] {
+        let case = format!("{leaving} instance(s) still leaving the group");
+        let name = format!("asg-headroom-{leaving}");
+        let leaving_stored = usize::try_from(leaving).expect("the row's count fits");
+        let leaving_text = leaving.to_string();
+        let (status, body) = query(
+            &router,
+            "CreateAutoScalingGroup",
+            &[
+                ("AutoScalingGroupName", name.as_str()),
+                LAUNCH_SOURCE,
+                ("MinSize", "0"),
+                ("MaxSize", full.as_str()),
+                ("DesiredCapacity", leaving_text.as_str()),
+                ("AvailabilityZones.member.1", "us-west-2a"),
+            ],
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: CreateAutoScalingGroup: got {status}: {body}"
+        );
+
+        // A hook for the scale-in transition, so the instances the next change takes out of
+        // service wait at it rather than leaving on the clock.
+        let (status, body) = query(
+            &router,
+            "PutLifecycleHook",
+            &[
+                ("AutoScalingGroupName", name.as_str()),
+                ("LifecycleHookName", HEADROOM_HOOK),
+                (
+                    "LifecycleTransition",
+                    autoscaling::state::TRANSITION_TERMINATING,
+                ),
+                (
+                    "DefaultResult",
+                    autoscaling::state::LIFECYCLE_ACTION_CONTINUE,
+                ),
+            ],
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: PutLifecycleHook: got {status}: {body}"
+        );
+
+        let headroom = ceiling - leaving;
+        let past_headroom = (headroom + 1).to_string();
+        let at_headroom = headroom.to_string();
+        // A simple-scaling policy that asks for one launch MORE than the group will have
+        // room for, so the policy door is asked for the same change the two capacity doors
+        // are.
+        let (status, body) = query(
+            &router,
+            "PutScalingPolicy",
+            &[
+                ("AutoScalingGroupName", name.as_str()),
+                ("PolicyName", HEADROOM_POLICY),
+                ("PolicyType", "SimpleScaling"),
+                ("AdjustmentType", "ChangeInCapacity"),
+                ("ScalingAdjustment", past_headroom.as_str()),
+            ],
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: PutScalingPolicy: got {status}: {body}"
+        );
+
+        // Scale all the way in: every instance the group holds is now leaving it, waiting at
+        // that hook, and still stored.
+        let (status, body) = query(
+            &router,
+            "SetDesiredCapacity",
+            &[
+                ("AutoScalingGroupName", name.as_str()),
+                ("DesiredCapacity", "0"),
+            ],
+        )
+        .await;
+        assert_eq!(status, 200, "case {case:?}: scaling in: got {status}: {body}");
+        poll_until_every_instance_is(
+            &router,
+            &name,
+            autoscaling::state::LIFECYCLE_TERMINATING_WAIT,
+            leaving_stored,
+        )
+        .await;
+        let (held, reported_headroom) = held_and_headroom(&engine, &name);
+        assert_eq!(
+            (held, reported_headroom),
+            (leaving_stored, headroom),
+            "case {case:?}: the instances on their way out are held and occupy the ceiling"
+        );
+
+        // One launch past the headroom, at every door that changes a group's size.
+        let doors: [(&str, Vec<(&str, &str)>); 3] = [
+            (
+                "SetDesiredCapacity",
+                vec![
+                    ("AutoScalingGroupName", name.as_str()),
+                    ("DesiredCapacity", past_headroom.as_str()),
+                ],
+            ),
+            (
+                "UpdateAutoScalingGroup",
+                vec![
+                    ("AutoScalingGroupName", name.as_str()),
+                    ("DesiredCapacity", past_headroom.as_str()),
+                ],
+            ),
+            (
+                "ExecutePolicy",
+                vec![
+                    ("AutoScalingGroupName", name.as_str()),
+                    ("PolicyName", HEADROOM_POLICY),
+                ],
+            ),
+        ];
+        for (door, params) in doors {
+            let (status, body) = query(&router, door, &params).await;
+            assert_eq!(
+                status, 400,
+                "case {case:?}: {door} asking for {past_headroom} must be refused, got {status}: \
+                 {body}"
+            );
+            assert!(
+                body.contains("<Code>ScalingActivityInProgress</Code>"),
+                "case {case:?}: {door} must answer the ScalingActivityInProgress code, got {body}"
+            );
+            let message = tag_value(&body, "Message");
+            assert_eq!(
+                message,
+                still_terminating_message(&name),
+                "case {case:?}: {door} must answer the whole sentence, got {message:?}"
+            );
+            let (held, _) = held_and_headroom(&engine, &name);
+            assert_eq!(
+                held, leaving_stored,
+                "case {case:?}: {door} refused, so nothing was allocated, got {held} instances"
+            );
+        }
+
+        // The headroom ITSELF fits: it is performed, and the group then holds exactly a
+        // ceiling's worth of instances — the ones still leaving plus the ones just launched.
+        let (status, body) = query(
+            &router,
+            "SetDesiredCapacity",
+            &[
+                ("AutoScalingGroupName", name.as_str()),
+                ("DesiredCapacity", at_headroom.as_str()),
+            ],
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: asking for {at_headroom} fits beside them, got {status}: {body}"
+        );
+        let (held, reported_headroom) = held_and_headroom(&engine, &name);
+        assert_eq!(
+            (held, reported_headroom),
+            (stored_ceiling, 0),
+            "case {case:?}: the group holds exactly a ceiling's worth and can launch no more"
+        );
+        // And that is what a client reads back over the wire.
+        let (status, body) = query(
+            &router,
+            "DescribeAutoScalingGroups",
+            &[("AutoScalingGroupNames.member.1", name.as_str())],
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: DescribeAutoScalingGroups: got {status}: {body}"
+        );
+        let capacity = tag_value(&body, "DesiredCapacity");
+        assert_eq!(
+            capacity, at_headroom,
+            "case {case:?}: the group must report the capacity it was set to, got {capacity:?}"
+        );
+        let reported = tag_values(&body, "InstanceId");
+        assert_eq!(
+            reported.len(),
+            stored_ceiling,
+            "case {case:?}: the group must report a ceiling's worth of instances, got {}",
+            reported.len()
+        );
+    }
+}
+
 /// A member whose value set the model documents is refused outside that set,
 /// rather than stored and echoed back.
 #[tokio::test]
