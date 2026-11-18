@@ -44,6 +44,13 @@
 //! so a create while the caller's region already holds one is refused rather than
 //! stored ([`ONE_INTEGRATION_PER_ACCOUNT_MESSAGE`]) and a delete is what frees the
 //! slot.
+//!
+//! The one fact in here that this service does NOT hold is the telemetry configuration of
+//! the account's own resources, which the telemetry-config audit reports: a resource belongs
+//! to the service that owns it, so [`resource_telemetry`] reads each one's configuration
+//! where its owner holds it instead of this module keeping a copy that could disagree.
+
+pub mod resource_telemetry;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::{SystemTime, UNIX_EPOCH};

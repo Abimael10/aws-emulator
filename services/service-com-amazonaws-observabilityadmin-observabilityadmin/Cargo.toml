@@ -40,6 +40,13 @@ regex = "1.12"
 # integration-scoped refusals read the resource field of a requested `Arn` from
 # (`arn::resource`) rather than splitting the value here again.
 service-common = { path = "../common" }
+# The AWS SDK for Amazon EC2, driven over the in-process callback
+# (`OperationContext::callback`): a telemetry configuration is a fact about the resource of
+# ANOTHER service, so the telemetry-config audit reads this account's instances, VPCs and
+# flow logs through Amazon EC2's own API (`state::resource_telemetry`) rather than out of
+# this crate's store. Only the generated client is needed — the emulator supplies the
+# transport.
+aws-sdk-ec2 = { version = "1", default-features = false }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
@@ -47,6 +54,13 @@ emulator-core-build-support = { workspace = true }
 [dev-dependencies]
 sha2 = { workspace = true }
 hex = { workspace = true }
+# Amazon EC2 is mounted beside this service on one engine where a suite is about the
+# telemetry-config AUDIT: the audit reads the instances and VPCs it reports from EC2's own
+# API (`state::resource_telemetry`), so without EC2 mounted there is nothing to audit.
+service-com-amazonaws-ec2-amazonec2 = { workspace = true }
+# `percent-encoding`: those EC2 setup calls travel as `application/x-www-form-urlencoded`, so
+# each component is encoded by this crate rather than by a hand-written escaper.
+percent-encoding = "2"
 
 [lints]
 workspace = true

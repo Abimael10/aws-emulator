@@ -28,14 +28,22 @@
 //! 4. the account's feature and its organization's are separate features;
 //! 5. a `Start` whose multi-region scope the model forbids is a 400
 //!    `ValidationException`, and a redundant `Stop` is an idempotent no-op.
+//!
+//! The last section of this file is about the telemetry-config AUDIT — `ListResourceTelemetry`,
+//! "a list of telemetry configurations for Amazon Web Services resources supported by
+//! telemetry config" — which is the same feature's read over the account's RESOURCES rather
+//! than over the feature itself: see the rule stated above that section.
 
+use std::sync::Arc;
 use std::time::Duration;
 
+use percent_encoding::{utf8_percent_encode, NON_ALPHANUMERIC};
 use serde_json::{json, Value};
 use service_com_amazonaws_observabilityadmin_observabilityadmin::state::{
     ComAmazonawsObservabilityadminObservabilityadminState, EVALUATION_TRANSITION_DELAY_MS,
     MAX_TELEMETRY_FEATURE_REGIONS,
 };
+use smithy_server_runtime::MultiServiceRouter;
 
 // The wire harness this test binary already has: one emulator mounted exactly as the
 // router mounts it, a signed request, and the response accessors. Imported rather
@@ -832,6 +840,407 @@ async fn an_enrichment_status_read_changes_nothing() {
             (status, member(&body, "Status").as_deref()),
             (200, Some("Running")),
             "read {read}: expected a read to leave the feature Running, got {status} {body:?}"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The telemetry-config AUDIT: ListResourceTelemetry
+// ---------------------------------------------------------------------------
+//
+// The rule these cases pin: an audit reports one telemetry configuration per resource of a
+// supported type the account holds in the region the request was signed for, each carrying
+// the state the service that OWNS the resource holds for that kind of telemetry, and the
+// request only narrows and pages that report. The resources are Amazon EC2's, so EC2 is
+// mounted beside this service on one engine and every identifier and every telemetry state
+// below is one EC2 itself handed out.
+//
+// The resource-backed walk over the whole surface — paging, the identifier-prefix filter and
+// the audit following a resource whose telemetry is turned off or which is deleted — lives in
+// `core/router/tests/all/observabilityadmin_resource_telemetry.rs`, because it drives several
+// services; what is here is this operation's own contract: the configuration it computes, the
+// order the requested types put it in, and the requests it refuses.
+
+/// The EC2 API version a client sends in an ec2Query body.
+const EC2_API_VERSION: &str = "2016-11-15";
+
+/// The AMI the launches below run from, in the long form EC2 issues AMI ids in.
+const AMI: &str = "ami-0123456789abcdef0";
+
+/// `AWS::EC2::Instance` and `AWS::EC2::VPC`, two `ResourceType` values
+/// (`smithy_query(query="shape", shape="ResourceType")`).
+const INSTANCE_TYPE: &str = "AWS::EC2::Instance";
+const VPC_TYPE: &str = "AWS::EC2::VPC";
+
+/// The `TelemetrySourceType` value `AWS::EC2::VPC` correlates with.
+const VPC_FLOW_LOGS: &str = "VPC_FLOW_LOGS";
+
+/// The tag the fixture puts on the monitored instance, for the row that narrows by tag.
+const AUDIT_TAG_KEY: &str = "TelemetryAudited";
+const AUDIT_TAG_VALUE: &str = "yes";
+
+/// This service and Amazon EC2 over ONE shared engine: the audit reads the resources it
+/// reports from EC2's own API, so without EC2 mounted there is nothing to audit.
+fn audited_emulator() -> Emulator {
+    let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
+    let mut router = MultiServiceRouter::new();
+    router.set_request_authentication(false);
+    router.register_service(
+        service_com_amazonaws_observabilityadmin_observabilityadmin::EmulatedService::new(
+            Arc::clone(&engine),
+        ),
+    );
+    router.register_service(service_com_amazonaws_ec2_amazonec2::EmulatedService::new(
+        Arc::clone(&engine),
+    ));
+    Emulator { router, engine }
+}
+
+/// POST one ec2Query action that must succeed, answered with its XML body.
+///
+/// The body is `application/x-www-form-urlencoded`, so each VALUE is percent-encoded by the
+/// `percent-encoding` crate rather than by hand; the field names below are plain identifiers
+/// and dots, which that form carries literally.
+async fn ec2(emulator: &Emulator, action: &str, params: &[(&str, &str)]) -> String {
+    let mut body = format!("Action={action}&Version={EC2_API_VERSION}");
+    for (name, value) in params {
+        let value = utf8_percent_encode(value, NON_ALPHANUMERIC);
+        body.push_str(&format!("&{name}={value}"));
+    }
+    let request = http::Request::builder()
+        .method("POST")
+        .uri("/")
+        .header("host", format!("ec2.{HOME_REGION}.amazonaws.com"))
+        .header("content-type", "application/x-www-form-urlencoded")
+        .header(
+            "authorization",
+            format!(
+                "AWS4-HMAC-SHA256 Credential=AKIDOBSTEST/20260101/{HOME_REGION}/ec2/\
+                 aws4_request, SignedHeaders=host, Signature=0000"
+            ),
+        )
+        .body(bytes::Bytes::from(body))
+        .expect("a well-formed test request");
+    let response = emulator.router.dispatch(request).await;
+    let status = response.status().as_u16();
+    let answer = String::from_utf8_lossy(response.body()).to_string();
+    assert_eq!(
+        status, 200,
+        "setup: EC2 {action} must succeed, got {status} with {answer}"
+    );
+    answer
+}
+
+/// The text of the first `<name>…</name>` element of an XML answer. A reader, not an XML
+/// parser, and only for the documents this emulator itself produced.
+fn xml_element(body: &str, name: &str) -> String {
+    let open = format!("<{name}>");
+    let close = format!("</{name}>");
+    let start = body
+        .find(&open)
+        .map(|at| at + open.len())
+        .unwrap_or_else(|| panic!("no <{name}> element in {body}"));
+    let end = body[start..]
+        .find(&close)
+        .map(|at| at + start)
+        .unwrap_or_else(|| panic!("no </{name}> element in {body}"));
+    body[start..end].to_string()
+}
+
+/// Launch one instance, with detailed monitoring on or off, and answer its id.
+async fn launch_instance(emulator: &Emulator, monitored: bool, tagged: bool) -> String {
+    let monitoring = monitored.to_string();
+    let mut params = vec![
+        ("ImageId", AMI),
+        ("MinCount", "1"),
+        ("MaxCount", "1"),
+        // "Specifies whether detailed monitoring is enabled for the instance"
+        // (`RunInstancesRequest$Monitoring`).
+        ("Monitoring.Enabled", monitoring.as_str()),
+    ];
+    if tagged {
+        params.extend([
+            ("TagSpecification.1.ResourceType", "instance"),
+            ("TagSpecification.1.Tag.1.Key", AUDIT_TAG_KEY),
+            ("TagSpecification.1.Tag.1.Value", AUDIT_TAG_VALUE),
+        ]);
+    }
+    xml_element(&ec2(emulator, "RunInstances", &params).await, "instanceId")
+}
+
+/// Create one VPC and answer its id.
+async fn create_vpc(emulator: &Emulator, cidr: &str) -> String {
+    xml_element(
+        &ec2(emulator, "CreateVpc", &[("CidrBlock", cidr)]).await,
+        "vpcId",
+    )
+}
+
+/// One `ListResourceTelemetry` call that must succeed, as the configurations it reported.
+async fn audit(emulator: &Emulator, case: &str, body: &Value) -> Vec<Value> {
+    let (status, answer) = call(emulator, HOME_REGION, "/ListResourceTelemetry", body).await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: expected HTTP 200, got {status} {answer:?}"
+    );
+    assert_eq!(
+        member(&answer, "NextToken"),
+        None,
+        "case {case:?}: the resources of these cases fit one page, so the audit carries no \
+         NextToken, got {answer:?}"
+    );
+    answer
+        .get("TelemetryConfigurations")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default()
+}
+
+/// The configuration the audit reported for the resource `identifier` names.
+fn audited(configurations: &[Value], case: &str, identifier: &str) -> Value {
+    configurations
+        .iter()
+        .find(|entry| member(entry, "ResourceIdentifier").as_deref() == Some(identifier))
+        .cloned()
+        .unwrap_or_else(|| {
+            panic!("case {case:?}: no configuration for {identifier} in {configurations:?}")
+        })
+}
+
+/// The `TelemetryConfigurationState` a resource whose ONE audited kind of telemetry is
+/// `audited` and in `state` must carry: every other modelled `TelemetryType` is
+/// `NotApplicable` (`smithy_query(query="shape", shape="TelemetryType,TelemetryState")`).
+fn expected_telemetry_state(audited: &str, state: &str) -> Value {
+    let entries: Vec<(String, Value)> = ["Insights", "Logs", "Metrics", "Traces"]
+        .into_iter()
+        .map(|telemetry_type| {
+            let value = if telemetry_type == audited {
+                state
+            } else {
+                "NotApplicable"
+            };
+            (telemetry_type.to_string(), Value::String(value.to_string()))
+        })
+        .collect();
+    Value::Object(entries.into_iter().collect())
+}
+
+/// An audit computes each resource's telemetry configuration from what EC2 holds for it: an
+/// instance's detailed monitoring and a VPC's flow logs, with every other kind of telemetry
+/// `NotApplicable`, the tags its owner holds, and the caller's own account.
+#[tokio::test]
+async fn the_resource_telemetry_audit_reports_what_ec2_holds_for_each_resource() {
+    let emulator = audited_emulator();
+    let monitored = launch_instance(&emulator, true, true).await;
+    let unmonitored = launch_instance(&emulator, false, false).await;
+    let vpc = create_vpc(&emulator, "10.90.0.0/16").await;
+
+    // (case, the resource, the telemetry type audited for it, its state, the source type)
+    let rows: [(&str, &str, &str, &str, Option<&str>); 3] = [
+        (
+            "an instance with detailed monitoring",
+            &monitored,
+            "Metrics",
+            "Enabled",
+            None,
+        ),
+        (
+            "an instance without it",
+            &unmonitored,
+            "Metrics",
+            "Disabled",
+            None,
+        ),
+        (
+            "a VPC with no flow log",
+            &vpc,
+            "Logs",
+            "Disabled",
+            Some(VPC_FLOW_LOGS),
+        ),
+    ];
+
+    let configurations = audit(&emulator, "the whole audit", &json!({})).await;
+    for (case, identifier, telemetry_type, state, source_type) in rows {
+        let entry = audited(&configurations, case, identifier);
+        assert_eq!(
+            entry.get("TelemetryConfigurationState"),
+            Some(&expected_telemetry_state(telemetry_type, state)),
+            "case {case:?}: expected {telemetry_type} {state} and every other telemetry type \
+             NotApplicable, got {entry:?}"
+        );
+        assert_eq!(
+            member(&entry, "AccountIdentifier").as_deref(),
+            Some(ACCOUNT),
+            "case {case:?}: expected the caller's own account, got {entry:?}"
+        );
+        assert_eq!(
+            member(&entry, "TelemetrySourceType").as_deref(),
+            source_type,
+            "case {case:?}: expected TelemetrySourceType {source_type:?}, got {entry:?}"
+        );
+    }
+    assert_eq!(
+        audited(&configurations, "the tagged instance", &monitored).get("ResourceTags"),
+        Some(&json!({ AUDIT_TAG_KEY: AUDIT_TAG_VALUE })),
+        "expected the tags EC2 holds on the instance, got {configurations:?}"
+    );
+    assert_eq!(
+        audited(&configurations, "the untagged instance", &unmonitored).get("ResourceTags"),
+        Some(&json!({})),
+        "expected no tags for an instance EC2 holds none for, got {configurations:?}"
+    );
+}
+
+/// `ResourceTypes` selects the types the audit reports and decides the ORDER it reports them
+/// in — "if this parameter is provided, the service returns the resources in the same order
+/// as specified in the request" — and the tag and telemetry-state filters narrow it to the
+/// resources that satisfy them.
+#[tokio::test]
+async fn the_resource_telemetry_audit_reports_the_types_the_request_asks_for_in_its_order() {
+    let emulator = audited_emulator();
+    let monitored = launch_instance(&emulator, true, true).await;
+    let unmonitored = launch_instance(&emulator, false, false).await;
+    create_vpc(&emulator, "10.90.0.0/16").await;
+
+    /// The resource types an audit reported, in report order and without the repeats that
+    /// several resources of one type make.
+    fn type_sequence(configurations: &[Value]) -> Vec<String> {
+        let mut sequence: Vec<String> = Vec::new();
+        for entry in configurations {
+            let reported = member(entry, "ResourceType").unwrap_or_default();
+            if sequence.last() != Some(&reported) {
+                sequence.push(reported);
+            }
+        }
+        sequence
+    }
+
+    // (case, the types the request names, the type sequence the audit must report)
+    let rows: [(&str, Vec<&str>, Vec<&str>); 4] = [
+        ("one type", vec![VPC_TYPE], vec![VPC_TYPE]),
+        ("the other type", vec![INSTANCE_TYPE], vec![INSTANCE_TYPE]),
+        (
+            "both, VPCs first",
+            vec![VPC_TYPE, INSTANCE_TYPE],
+            vec![VPC_TYPE, INSTANCE_TYPE],
+        ),
+        (
+            "both, instances first",
+            vec![INSTANCE_TYPE, VPC_TYPE],
+            vec![INSTANCE_TYPE, VPC_TYPE],
+        ),
+    ];
+    for (case, requested, expected) in rows {
+        let configurations =
+            audit(&emulator, case, &json!({ "ResourceTypes": requested })).await;
+        assert_eq!(
+            type_sequence(&configurations),
+            expected,
+            "case {case:?}: expected the requested order {expected:?}, got {:?}",
+            type_sequence(&configurations)
+        );
+        assert!(
+            configurations.iter().all(|entry| {
+                member(entry, "ResourceType")
+                    .is_some_and(|reported| requested.contains(&reported.as_str()))
+            }),
+            "case {case:?}: expected only the requested types, got {configurations:?}"
+        );
+    }
+
+    // (case, the narrowing request, the resources it must report)
+    let narrowed: [(&str, Value, Vec<&String>); 3] = [
+        (
+            "the telemetry state of the monitored instance",
+            json!({ "TelemetryConfigurationState": { "Metrics": "Enabled" } }),
+            vec![&monitored],
+        ),
+        (
+            "the telemetry state of the unmonitored one",
+            json!({ "TelemetryConfigurationState": { "Metrics": "Disabled" } }),
+            vec![&unmonitored],
+        ),
+        (
+            "the tag EC2 holds on one instance",
+            json!({ "ResourceTags": { AUDIT_TAG_KEY: AUDIT_TAG_VALUE } }),
+            vec![&monitored],
+        ),
+    ];
+    for (case, request, expected) in narrowed {
+        let configurations = audit(&emulator, case, &request).await;
+        let reported: Vec<String> = configurations
+            .iter()
+            .filter_map(|entry| member(entry, "ResourceIdentifier"))
+            .collect();
+        let expected: Vec<String> = expected.into_iter().cloned().collect();
+        assert_eq!(
+            reported, expected,
+            "case {case:?}: expected {expected:?}, got {reported:?}"
+        );
+    }
+}
+
+/// A request the model does not admit is refused, and the refusal is this operation's own
+/// modelled `ValidationException` — never a page of resources chosen by a value the model
+/// does not carry.
+#[tokio::test]
+async fn the_resource_telemetry_audit_refuses_a_request_the_model_does_not_admit() {
+    let emulator = audited_emulator();
+
+    // (case, the request, the status it must be answered with)
+    let rows: [(&str, Value, u16); 7] = [
+        (
+            "a resource type no resource could be of",
+            json!({ "ResourceTypes": ["AWS::Nothing::Here"] }),
+            400,
+        ),
+        (
+            "a next token that is not hex",
+            json!({ "NextToken": "not-a-token" }),
+            400,
+        ),
+        (
+            "hex that decodes to something this operation never issued",
+            json!({ "NextToken": "6162" }),
+            400,
+        ),
+        // The modelled `ListResourceTelemetryMaxResults` range is 1..50, so each published
+        // bound is served and each value one past it is refused.
+        ("the smallest page the model admits", json!({ "MaxResults": 1 }), 200),
+        ("the largest page the model admits", json!({ "MaxResults": 50 }), 200),
+        ("a page size below that range", json!({ "MaxResults": 0 }), 400),
+        ("a page size above it", json!({ "MaxResults": 51 }), 400),
+    ];
+
+    for (case, request, expected) in rows {
+        let (status, body) = call(&emulator, HOME_REGION, "/ListResourceTelemetry", &request).await;
+        assert_eq!(
+            status, expected,
+            "case {case:?}: expected HTTP {expected}, got {status} {body:?}"
+        );
+        if expected == 400 {
+            assert_eq!(
+                error_code(&body),
+                "ValidationException",
+                "case {case:?}: expected the modelled ValidationException, got {body:?}"
+            );
+        }
+    }
+}
+
+/// An audit on an emulator with no owning service to ask reports NO configuration for those
+/// resource types: a read that could not be made says nothing about what the account holds,
+/// so it is answered as an empty audit rather than as a failure or as invented resources.
+#[tokio::test]
+async fn an_audit_with_no_owning_service_to_ask_reports_no_configuration() {
+    let emulator = emulator();
+    for read in 0..2 {
+        let case = format!("read {read}");
+        let configurations = audit(&emulator, &case, &json!({})).await;
+        assert!(
+            configurations.is_empty(),
+            "case {case:?}: expected no configuration at all, got {configurations:?}"
         );
     }
 }

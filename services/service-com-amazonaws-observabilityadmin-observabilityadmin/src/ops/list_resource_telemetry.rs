@@ -1,15 +1,23 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListResourceTelemetry
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListResourceTelemetry`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Reports the telemetry configuration of every resource the telemetry-config audit
+//! discovers in the caller's account in the region the request was signed for, one
+//! `@paginated` page at a time, narrowed by the request's filters. A pure read: it writes
+//! nothing, here or in any service it asks.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListResourceTelemetry::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Each configuration is READ where the service that owns the resource holds it
+//! ([`crate::state::resource_telemetry`]) — a telemetry configuration is a fact about
+//! another service's resource, not a record of this one — so a resource this emulator does
+//! not hold is reported for by nothing and a resource whose telemetry was turned on a moment
+//! ago is audited in the state it is in now.
+//!
+//! The request narrows that audit, and every filter is a conjunct: `ResourceTypes` selects
+//! the types and also decides the ORDER the page reports them in ("if this parameter is
+//! provided, the service returns the resources in the same order as specified in the
+//! request"), `ResourceIdentifierPrefix` the resources whose identifier starts with it,
+//! `ResourceTags` the resources carrying every tag pair, and `TelemetryConfigurationState`
+//! the resources whose telemetry is in every state it names.
 //!
 //! ## Shape of an operation
 //!
@@ -132,6 +140,56 @@ impl From<ListResourceTelemetryErrorModeled> for ListResourceTelemetryError {
     }
 }
 
+/// The largest page this operation will ever build, and the page size applied when the
+/// request omits `MaxResults`.
+///
+/// It is the maximum of the modelled `ListResourceTelemetryMaxResults` range (1..50), which
+/// the centralized walk already refuses values outside of — but this handler does not depend
+/// on that: the size is clamped to this constant here, so the page it allocates is decided
+/// by the server, never by the request.
+const MAX_PAGE_SIZE: usize = 50;
+
+/// What separates the two halves of a page token: the resource type and the resource
+/// identifier of the configuration the NEXT page starts at. A unit separator, which neither
+/// a `ResourceType` value nor any resource identifier can carry.
+const PAGE_TOKEN_SEPARATOR: char = '\u{1f}';
+
+/// A page token naming the configuration the NEXT page starts at.
+///
+/// `NextToken` is modelled opaque, so the pair is hex-encoded rather than handed back in the
+/// clear — this makes the token opaque to a caller, not secret: hex is trivially reversible
+/// and the token carries nothing beyond a resource type and a resource identifier the same
+/// caller can already read off the page it came with.
+fn encode_page_token(resource_type: &str, resource_identifier: &str) -> String {
+    hex::encode(format!(
+        "{resource_type}{PAGE_TOKEN_SEPARATOR}{resource_identifier}"
+    ))
+}
+
+/// The resource type and identifier a page token names, or a 400 refusal when the token is
+/// not one this operation issued — which it can tell because the type it carries has to be a
+/// modelled `ResourceType` value and the identifier cannot be empty.
+fn decode_page_token(token: &str) -> Result<(String, String), ListResourceTelemetryError> {
+    hex::decode(token)
+        .ok()
+        .and_then(|bytes| String::from_utf8(bytes).ok())
+        .and_then(|decoded| {
+            let (resource_type, resource_identifier) = decoded.split_once(PAGE_TOKEN_SEPARATOR)?;
+            (RESOURCE_TYPE_VALUES.contains(&resource_type) && !resource_identifier.is_empty())
+                .then(|| (resource_type.to_string(), resource_identifier.to_string()))
+        })
+        .ok_or_else(|| {
+            ListResourceTelemetryErrorModeled::ValidationException(ValidationException {
+                message: Some(
+                    "NextToken is not a pagination token issued by ListResourceTelemetry"
+                        .to_string(),
+                ),
+                ..Default::default()
+            })
+            .into()
+        })
+}
+
 /// The `ListResourceTelemetry` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -168,18 +226,116 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListResourceTelemetry` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListResourceTelemetryErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListResourceTelemetry"))
+        // The telemetry configurations this operation reports are facts about OTHER
+        // services' resources, so they are read through `ctx`'s in-process callback rather
+        // than out of this service's own store: there is nothing on the engine for this
+        // operation to read or write.
+        let _ = &self.engine;
+
+        // Every member that targets a modelled enum carries one of that enum's values. The
+        // centralized walk refuses the rest, and this handler states the same rule itself so
+        // the ordering below can never be keyed on a type no resource could be of.
+        if let Some(resource_types) = input.resource_types.as_deref() {
+            for (index, resource_type) in resource_types.iter().enumerate() {
+                if let Some(rejection) = crate::state::enum_rejection(
+                    &format!("ResourceTypes[{index}]"),
+                    Some(resource_type.as_str()),
+                    RESOURCE_TYPE_VALUES,
+                ) {
+                    return Err(ListResourceTelemetryErrorModeled::ValidationException(
+                        ValidationException {
+                            message: Some(rejection),
+                            ..Default::default()
+                        },
+                    )
+                    .into());
+                }
+            }
+        }
+
+        // The page size is the server's own decision: clamped into 1..=MAX_PAGE_SIZE
+        // whatever the request asked for, so no allocation below is sized by input.
+        let page_size = input.max_results.map_or(MAX_PAGE_SIZE, |requested| {
+            requested.clamp(1, MAX_PAGE_SIZE as i32) as usize
+        });
+        let start = input
+            .next_token
+            .as_deref()
+            .map(decode_page_token)
+            .transpose()?;
+
+        let region = crate::state::request_region(ctx.parts());
+        let requested_types = input.resource_types.clone().unwrap_or_default();
+
+        // The audit itself: every discovered resource's configuration, read where its owner
+        // holds it. Narrowed to the requested types, so a request asking about one type does
+        // not read the owners of the others.
+        let mut audited = crate::state::resource_telemetry::discovered(
+            ctx,
+            &region,
+            &requested_types.iter().cloned().collect(),
+        )
+        .await;
+
+        // "If this parameter is provided, the service returns the resources in the same
+        // order as specified in the request" (`ResourceTypes`): the requested order is the
+        // report's order, and within one type the resources stay in the identifier order the
+        // audit put them in. A request naming no types keeps the audit's own order.
+        let rank = |resource_type: &str| match requested_types
+            .iter()
+            .position(|requested| requested == resource_type)
+        {
+            Some(position) => position,
+            None if requested_types.is_empty() => {
+                crate::state::resource_telemetry::type_rank(resource_type)
+            }
+            // A type the request did not ask about is not reported at all, so its rank only
+            // has to be stable and last.
+            None => requested_types.len(),
+        };
+        audited.sort_by_key(|record| rank(&record.resource_type));
+
+        // Every other filter is a conjunct over one resource's own configuration.
+        let prefix = input.resource_identifier_prefix.unwrap_or_default();
+        let tags = input.resource_tags.unwrap_or_default();
+        let states = input.telemetry_configuration_state.unwrap_or_default();
+        let selected = audited.into_iter().filter(|record| {
+            record.resource_identifier.starts_with(&prefix)
+                && record.carries_tags(&tags)
+                && record.carries_telemetry_states(&states)
+        });
+
+        // The page starts at the configuration the token named, or at the first one ordered
+        // after it when the resource it named is gone by now — so a resource deleted between
+        // two pages ends a walk rather than restarting it.
+        let page_start = start.map(|(resource_type, resource_identifier)| {
+            (rank(&resource_type), resource_identifier)
+        });
+        let remaining = selected.skip_while(|record| {
+            page_start.as_ref().is_some_and(|(start_rank, start_id)| {
+                (rank(&record.resource_type), &record.resource_identifier)
+                    < (*start_rank, start_id)
+            })
+        });
+
+        let mut telemetry_configurations = Vec::with_capacity(page_size);
+        let mut next_token = None;
+        for record in remaining {
+            // The first configuration that does not fit becomes the next page's start, and
+            // only then is a `NextToken` emitted — the last page carries none.
+            if telemetry_configurations.len() == page_size {
+                next_token = Some(encode_page_token(
+                    &record.resource_type,
+                    &record.resource_identifier,
+                ));
+                break;
+            }
+            telemetry_configurations.push(record.configuration());
+        }
+
+        Ok(ListResourceTelemetryOutput {
+            telemetry_configurations: Some(telemetry_configurations),
+            next_token,
+        })
     }
 }
