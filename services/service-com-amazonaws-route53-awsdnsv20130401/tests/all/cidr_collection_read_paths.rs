@@ -12,6 +12,10 @@
 //!    enumerates collections and keys them by ARN finds the row for a collection it holds.
 //!    The table spans the collection name's length and character classes and the version
 //!    counter, because the layout holds for every collection — not merely for a renamed one.
+//!    Each row is also read off the collection it names at the moment of the read, so a
+//!    listing taken after the account's holdings have MOVED reconciles by ARN to exactly
+//!    the collections the account holds then: a moved version counter under the same ARN,
+//!    no row for a collection that was deleted, a row for one created afterwards.
 //! 2. An existing collection ENUMERATES its blocks: `ListCidrBlocks` answers HTTP 200 with
 //!    a `CidrBlocks` container carrying one row per block the request selects, and no row
 //!    where it selects none — a location a change has emptied, a location the collection
@@ -282,6 +286,138 @@ async fn the_create_and_the_listing_report_one_collection_under_one_arn() {
          {listed_arn:?}; body {}",
         reply.body
     );
+}
+
+// ---------------------------------------------------------------------------
+// The rows a listing reports once the account's holdings have moved
+// ---------------------------------------------------------------------------
+
+/// `DeleteCidrCollection` for the collection `id`, as the model binds it:
+/// `DELETE /2013-04-01/cidrcollection/{id}`.
+async fn delete_collection(router: &MultiServiceRouter, id: &str) -> Reply {
+    call(
+        router,
+        "DELETE",
+        &format!("/2013-04-01/cidrcollection/{id}"),
+        "",
+    )
+    .await
+}
+
+/// Assert the listing reports exactly `held` and nothing else, each row carried
+/// under its own ARN in Route 53's layout — the reconciliation a client does when
+/// it enumerates the account and matches the rows to the collections it holds.
+async fn assert_listing_reconciles(
+    router: &MultiServiceRouter,
+    case: &str,
+    held: &[ListedCollection],
+) {
+    let (reply, listed) = listed_collections(router).await;
+    for row in held {
+        let found = listed.iter().find(|candidate| candidate.arn == row.arn);
+        assert_eq!(
+            found,
+            Some(row),
+            "case {case:?}: the listing must carry the collection the account holds under its \
+             own ARN {:?}, got {found:?} among {listed:?}; body {}",
+            row.arn,
+            reply.body
+        );
+        // The ARN the response actually carried, read out of the row it reported.
+        assert_collection_arn(case, found.map_or("", |row| row.arn.as_str()), &row.id);
+    }
+    assert_eq!(
+        listed.len(),
+        held.len(),
+        "case {case:?}: the listing must report the {} collection(s) the account holds and \
+         nothing else, got {listed:?}; body {}",
+        held.len(),
+        reply.body
+    );
+}
+
+#[tokio::test]
+async fn the_listing_keys_each_row_to_the_collection_state_at_the_time_of_the_read() {
+    // The same rule where a client meets it over TIME: every row is read off the
+    // collection it names, so each listing reconciles by ARN to exactly the
+    // collections the account holds at that moment. The steps below are the ways
+    // the account's holdings move — a change that moves one collection's version
+    // counter, a change that moves another's, a delete that takes a collection
+    // away and a create that adds one afterwards — and the listing is reconciled
+    // after each of them, so a row carrying a counter, a name or an ARN the store
+    // no longer holds cannot pass.
+    let router = router();
+    // The collections differ in the length and character classes `CollectionName`
+    // admits (`len 1..64, pattern ^[0-9A-Za-z_\-]+$`), so the rows the listing is
+    // reconciled against are not one renamed collection.
+    let mut held: Vec<ListedCollection> = Vec::new();
+    for name in ["r", "moved-ranges", "spare_ranges_2"] {
+        let id = create_collection(&router, name).await;
+        held.push(ListedCollection {
+            arn: format!("{COLLECTION_ARN_PREFIX}{id}"),
+            id,
+            name: name.to_string(),
+            // "A sequential counter that Route 53 sets to 1 when you create a CIDR
+            // collection and increments by 1 each time you update settings for the
+            // CIDR collection."
+            version: "1".to_string(),
+        });
+    }
+    assert_listing_reconciles(&router, "the collections as created", &held).await;
+
+    // A change moves ONE collection's version counter; the row for it must report
+    // the moved counter under the same ARN, and no other row may move.
+    for (case, index, block, version) in [
+        ("one collection changed once", 1usize, "198.51.100.0/24", "2"),
+        ("the same collection changed again", 1, "198.51.101.0/24", "3"),
+        ("another collection changed", 2, "203.0.113.0/24", "2"),
+    ] {
+        let applied = change_collection(
+            &router,
+            &held[index].id,
+            None,
+            &change("east", PUT, &[block]),
+        )
+        .await;
+        assert_eq!(
+            applied.status, 200,
+            "case {case:?}: expected 200 from ChangeCidrCollection, got {} with body {}",
+            applied.status, applied.body
+        );
+        held[index].version = version.to_string();
+        assert_listing_reconciles(&router, case, &held).await;
+    }
+
+    // A collection that holds nothing is taken away, so its ARN keys no row of the
+    // listing any more while every collection beside it is still reported as it was.
+    let removed = held.remove(0);
+    let deleted = delete_collection(&router, &removed.id).await;
+    assert_eq!(
+        deleted.status, 200,
+        "case \"a deleted collection\": expected 200 from DeleteCidrCollection, got {} with \
+         body {}",
+        deleted.status, deleted.body
+    );
+    assert_listing_reconciles(&router, "a deleted collection", &held).await;
+    let (reply, listed) = listed_collections(&router).await;
+    assert!(
+        !listed.iter().any(|row| row.arn == removed.arn),
+        "case \"a deleted collection\": the ARN {:?} must key no row once the collection is \
+         gone, got {listed:?}; body {}",
+        removed.arn,
+        reply.body
+    );
+
+    // ...and a collection created afterwards keys its own row, so the listing is
+    // the account's holdings rather than the set it was first read with.
+    let id = create_collection(&router, "later-ranges").await;
+    held.push(ListedCollection {
+        arn: format!("{COLLECTION_ARN_PREFIX}{id}"),
+        id,
+        name: "later-ranges".to_string(),
+        version: "1".to_string(),
+    });
+    assert_listing_reconciles(&router, "a collection created after the delete", &held).await;
 }
 
 // ---------------------------------------------------------------------------

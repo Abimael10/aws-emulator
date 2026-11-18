@@ -27,11 +27,12 @@
 //! about the projection of the shape, not about one operation.
 //!
 //! On the account-wide listing the statuses are asserted zone by zone and page
-//! by page: a listing projects many zones at once, so the last test pairs each
-//! `HostedZone` with the container serialised INSIDE it, over page sizes and
-//! over zones whose feature state differs, where a zone's held status reported
-//! as an empty container, or filled from another zone's state, would otherwise
-//! pass unnoticed.
+//! by page: a listing projects many zones at once, so the last tests pair each
+//! `HostedZone` with the container serialised INSIDE it, over page sizes, over
+//! every SELECTION the listing's own filters narrow it to, and over zones whose
+//! feature state differs, where a zone's held status reported as an empty
+//! container, or filled from another zone's state, would otherwise pass
+//! unnoticed.
 //!
 //! Every test drives the service through the real router, using the SAME
 //! harness the sibling hosted-zone suites use, so what is asserted is the
@@ -47,6 +48,10 @@ use service_com_amazonaws_route53_awsdnsv20130401::state::{
 
 use crate::hosted_zone_records::{call, create_zone_body, escape_xml, Reply};
 use crate::resource_tags::element_text;
+// The reusable delegation set one of the listing's selections narrows to is seeded
+// and read through the sibling suite's harness rather than a second copy of its
+// request bodies.
+use crate::reusable_delegation_sets::{bare_set_id, create_set, delegation_set_element, set_of};
 
 /// How long a test keeps looking for an accepted features update to have
 /// settled before it gives up. Generous: the service's own span is far shorter,
@@ -889,4 +894,217 @@ async fn every_page_of_the_listing_pairs_each_zone_with_its_own_feature_statuses
             "case {case:?}: paging must report every zone of the account exactly once"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// The statuses every SELECTION of the listing reports
+// ---------------------------------------------------------------------------
+
+/// The one value `HostedZoneType` declares, from
+/// `smithy_query(query="shape", shape="com.amazonaws.route53#HostedZoneType")`:
+/// the `hostedzonetype` filter narrows the listing to the account's PRIVATE
+/// zones.
+const PRIVATE_HOSTED_ZONE: &str = "PrivateHostedZone";
+
+/// One zone the selection test seeds, and what the listing has to report for it:
+/// the name it is listed under, the `config` block it was created with and
+/// whether it is private — which decides which selections carry it.
+struct SelectedZone {
+    case: &'static str,
+    name: &'static str,
+    config: String,
+    private: bool,
+    /// Whether the zone was created in the reusable delegation set the test
+    /// made, which is what the `delegationsetid` selection narrows to.
+    in_set: bool,
+}
+
+impl SelectedZone {
+    /// What this zone's own `Features` container must report wherever the
+    /// listing projects it: a posture for the public-DNS fallback feature on
+    /// every listed zone, private ones included, and no accelerated-recovery
+    /// status while nothing has configured one.
+    fn held(&self) -> Held {
+        Held {
+            name: canonical_name(self.name),
+            fallback: Some(FEATURE_OFF),
+            accelerated: None,
+        }
+    }
+}
+
+/// Assert one selection of the listing reports exactly `expected` (by zone name)
+/// and pairs each reported zone with ITS OWN feature statuses.
+async fn assert_selection_reports(
+    router: &MultiServiceRouter,
+    case: &str,
+    query: &str,
+    expected: &[&SelectedZone],
+) {
+    let listed = call(router, "GET", &format!("/2013-04-01/hostedzone{query}"), "").await;
+    assert_eq!(
+        listed.status, 200,
+        "case {case:?}: expected 200 from ListHostedZones{query}, got {} with body {}",
+        listed.status, listed.body
+    );
+    let reported = zone_features(case, &listed.body);
+    let mut names: Vec<&str> = reported.iter().map(|(name, _)| name.as_str()).collect();
+    names.sort_unstable();
+    let wanted: Vec<String> = expected.iter().map(|zone| canonical_name(zone.name)).collect();
+    let mut wanted_names: Vec<&str> = wanted.iter().map(String::as_str).collect();
+    wanted_names.sort_unstable();
+    assert_eq!(
+        names, wanted_names,
+        "case {case:?}: expected the selection to report {wanted_names:?}, got {names:?}; body {}",
+        listed.body
+    );
+    for (name, block) in &reported {
+        let zone = expected
+            .iter()
+            .find(|zone| &canonical_name(zone.name) == name)
+            .unwrap_or_else(|| {
+                panic!(
+                    "case {case:?}: the selection reported a zone {name:?} it was not asked \
+                     for; body {}",
+                    listed.body
+                )
+            });
+        assert_zone_features(&format!("{case} / {}", zone.case), &zone.held(), block);
+    }
+}
+
+#[tokio::test]
+async fn every_selection_of_the_zone_listing_pairs_each_zone_with_its_feature_statuses() {
+    // The listing's rule holds for every SELECTION of it, not only for the
+    // unnarrowed read: each row is projected from the zone it names, so whichever
+    // zones a request selects, each of them carries its own statuses as children
+    // of its `Features` container. The selections below are the ones the model
+    // binds — the whole listing, the `hostedzonetype` filter, the
+    // `delegationsetid` filter and a page resumed at a `marker` — over zones
+    // differing in label count, in public/private, in whether they carry a
+    // comment and in whether they were created in a reusable delegation set.
+    let router = router();
+    let created_set = create_set(&router, "features-selection-set", None).await;
+    assert_eq!(
+        created_set.status, 201,
+        "seeding the delegation set: expected 201, got {} with body {}",
+        created_set.status, created_set.body
+    );
+    let set_id = bare_set_id(&set_of(&created_set, "the delegation set").id).to_string();
+
+    let zones = [
+        SelectedZone {
+            case: "a public zone created in the reusable delegation set",
+            name: "selected-in-set.example.com",
+            config: delegation_set_element(&set_id),
+            private: false,
+            in_set: true,
+        },
+        SelectedZone {
+            case: "a three-label public zone with a comment, outside the set",
+            name: "zone.sub.selected.example.net",
+            config: "<HostedZoneConfig><Comment>selected</Comment></HostedZoneConfig>".to_string(),
+            private: false,
+            in_set: false,
+        },
+        SelectedZone {
+            case: "a private zone with one VPC",
+            name: "selected-private.example.com",
+            config: "<HostedZoneConfig><PrivateZone>true</PrivateZone></HostedZoneConfig>\
+                     <VPC><VPCRegion>us-east-1</VPCRegion><VPCId>vpc-1a2b3c4d</VPCId></VPC>"
+                .to_string(),
+            private: true,
+            in_set: false,
+        },
+    ];
+    for (index, zone) in zones.iter().enumerate() {
+        let created = create_zone(
+            &router,
+            zone.name,
+            &format!("features-selection-{index}"),
+            &zone.config,
+        )
+        .await;
+        assert_eq!(
+            created.status, 201,
+            "case {:?}: expected 201 from CreateHostedZone, got {} with body {}",
+            zone.case, created.status, created.body
+        );
+    }
+
+    let all: Vec<&SelectedZone> = zones.iter().collect();
+    let private: Vec<&SelectedZone> = zones.iter().filter(|zone| zone.private).collect();
+    let in_set: Vec<&SelectedZone> = zones.iter().filter(|zone| zone.in_set).collect();
+    for (case, query, expected) in [
+        ("the whole listing", String::new(), all.clone()),
+        (
+            "the private-zone selection",
+            format!("?hostedzonetype={PRIVATE_HOSTED_ZONE}"),
+            private,
+        ),
+        (
+            "the delegation-set selection",
+            format!("?delegationsetid={set_id}"),
+            in_set,
+        ),
+    ] {
+        assert_selection_reports(&router, case, &query, &expected).await;
+    }
+
+    // A page RESUMED at a marker is a selection too: the zone the first page
+    // reports and the zones behind the marker each carry their own statuses, and
+    // the two pages together are the whole listing. The expectation comes from
+    // the UNNARROWED listing's own order, which the zones are stored in, rather
+    // than from the page under test.
+    let whole = call(&router, "GET", "/2013-04-01/hostedzone", "").await;
+    assert_eq!(
+        whole.status, 200,
+        "case \"the listing order\": expected 200, got {} with body {}",
+        whole.status, whole.body
+    );
+    let order: Vec<String> = zone_features("the listing order", &whole.body)
+        .into_iter()
+        .map(|(name, _)| name)
+        .collect();
+    assert_eq!(
+        order.len(),
+        zones.len(),
+        "case \"the listing order\": expected the {} seeded zones, got {order:?}; body {}",
+        zones.len(),
+        whole.body
+    );
+    let zone_named = |name: &str| -> &SelectedZone {
+        all.iter()
+            .copied()
+            .find(|zone| canonical_name(zone.name) == name)
+            .unwrap_or_else(|| panic!("the listing reported a zone {name:?} nothing created"))
+    };
+    let on_first = vec![zone_named(&order[0])];
+    let resumed: Vec<&SelectedZone> = order[1..].iter().map(|name| zone_named(name)).collect();
+
+    let first = call(&router, "GET", "/2013-04-01/hostedzone?maxitems=1", "").await;
+    assert_eq!(
+        first.status, 200,
+        "case \"the first page\": expected 200, got {} with body {}",
+        first.status, first.body
+    );
+    let marker = first
+        .first("NextMarker")
+        .unwrap_or_else(|| {
+            panic!(
+                "case \"the first page\": a listing of {} zones served one at a time must carry \
+                 a NextMarker; body {}",
+                zones.len(),
+                first.body
+            )
+        })
+        .to_string();
+    assert_selection_reports(&router, "the first page", "?maxitems=1", &on_first).await;
+    assert_selection_reports(
+        &router,
+        "the page resumed at the marker",
+        &format!("?marker={marker}"),
+        &resumed,
+    )
+    .await;
 }
