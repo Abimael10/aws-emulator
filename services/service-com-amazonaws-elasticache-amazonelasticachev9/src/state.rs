@@ -2596,8 +2596,15 @@ pub const USER_QUOTA: usize = 100;
 /// only a longer one is refused. The model constrains `UserId` with
 /// `@length(min: 1)` and a pattern only, so the upper bound is enforced here, by
 /// every operation that NAMES a user and can report the modelled
-/// `InvalidParameterValueException` — before the id is looked up, because an id
-/// the service would never have stored names no user to look up.
+/// `InvalidParameterValueException`.
+///
+/// An operation that merely RESOLVES a user id applies it BEFORE the lookup,
+/// because an id the service would never have stored names no user to look up
+/// and there is no other rule for that operation to reach. A CREATE applies it
+/// LAST instead, after every rule the model states for its request: a bound of
+/// the service's own must not pre-empt a refusal the request earns under a
+/// modelled rule, or the caller is handed an error code its request did not
+/// earn.
 ///
 /// The refusal carries the service's own recorded wording, "User id length must
 /// be less than 40.", which states the bound loosely; the BOUND is the

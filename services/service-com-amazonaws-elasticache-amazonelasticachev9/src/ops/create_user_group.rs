@@ -177,22 +177,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         };
 
-        // The identifier the group will be STORED under, checked before anything
-        // else: a `UserGroupId` past the bound the service states for it is one
-        // no modify or delete would resolve afterwards, so a create that stored
-        // it would leave a group nothing could change or remove
-        // (`crate::service::identifier_length_rules::user_group_id_refusal`).
-        if let Some(message) =
-            crate::service::identifier_length_rules::user_group_id_refusal(&input.user_group_id)
-        {
-            return Err(CreateUserGroupErrorModeled::InvalidParameterValueException(
-                InvalidParameterValueException {
-                    message: Some(message),
-                },
-            )
-            .into());
-        }
-
         // "Sets the engine listed in a user group. The options are valkey or
         // redis": access control is a Valkey / Redis OSS feature, so an engine
         // without it has no user groups to create — the capability rule the
@@ -349,6 +333,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(CreateUserGroupErrorModeled::DefaultUserRequired(
                 DefaultUserRequired {
                     message: Some(crate::state::DEFAULT_USER_REQUIRED_MESSAGE.to_string()),
+                },
+            )
+            .into());
+        }
+
+        // LAST, once every rule the model states for this request has been
+        // satisfied: the identifier the group would be STORED under. The service
+        // states a length bound for `UserGroupId` that the model does not — no
+        // `@length` and no `@pattern` — and it states it on the operations that
+        // RESOLVE an id before they look one up, because there is no other rule
+        // for them to reach; a create has the rules of its own request to judge
+        // first, so its own bound is what it judges last, and a refusal the
+        // request earns under a modelled rule is never pre-empted by it
+        // (`crate::service::identifier_length_rules::user_group_id_refusal`).
+        // The bound still holds here, so an id this create stores is one a later
+        // modify or delete resolves rather than a group nothing could remove.
+        if let Some(message) =
+            crate::service::identifier_length_rules::user_group_id_refusal(&input.user_group_id)
+        {
+            return Err(CreateUserGroupErrorModeled::InvalidParameterValueException(
+                InvalidParameterValueException {
+                    message: Some(message),
                 },
             )
             .into());

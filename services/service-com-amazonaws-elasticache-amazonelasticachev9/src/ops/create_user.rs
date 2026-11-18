@@ -181,21 +181,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `UserId`: "This value is stored as a lowercase string", so that is the
         // identity the store is keyed by and every later lookup resolves against.
         // Its `@length`/`@pattern` are modelled, so the boundary validator has
-        // already refused an id that cannot name a user.
+        // already refused an id that cannot name a user. The upper bound the
+        // service adds to them is NOT the model's, so it is judged last; see
+        // below.
         let user_id = input.user_id.to_ascii_lowercase();
-
-        // The upper bound on a user id the model does not express; see
-        // `crate::state::user_id_rejection`. Checked before anything else looks
-        // at the id, so an id the service would never store is refused for what
-        // it is rather than for what it collides with.
-        if let Some(message) = crate::state::user_id_rejection(&user_id) {
-            return Err(CreateUserErrorModeled::InvalidParameterValueException(
-                InvalidParameterValueException {
-                    message: Some(message),
-                },
-            )
-            .into());
-        }
 
         // "The options are valkey or redis": RBAC is a Valkey / Redis OSS feature,
         // so a cluster engine that has no ACLs has no access control to configure —
@@ -333,6 +322,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         "This account already holds the maximum of {} users.",
                         crate::state::USER_QUOTA
                     )),
+                },
+            )
+            .into());
+        }
+
+        // LAST, once every rule the model states for this request has been
+        // satisfied: the upper bound on a user id the model does not express and
+        // the member's documentation does not state either ("The ID of the user.
+        // This value is stored as a lowercase string."), which the service adds
+        // to the modelled ones — see `crate::state::user_id_rejection`. A bound
+        // of the service's OWN must not pre-empt a refusal the request earns
+        // under a rule the API models as its own error class, so the caller is
+        // told which modelled rule it broke; the operations that merely RESOLVE a
+        // user id still apply it first, there being no other rule for them to
+        // reach. The bound holds here, so an id this create stores is one a later
+        // call can address.
+        if let Some(message) = crate::state::user_id_rejection(&user_id) {
+            return Err(CreateUserErrorModeled::InvalidParameterValueException(
+                InvalidParameterValueException {
+                    message: Some(message),
                 },
             )
             .into());

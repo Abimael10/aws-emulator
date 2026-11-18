@@ -86,6 +86,12 @@ pub const MAX_USER_GROUP_ID_LEN: usize = 40;
 /// Stated once so the create that STORES a group id, the modify and the delete that resolve
 /// one cannot drift about which ids the service accepts: a create that stored an id the
 /// delete refuses would leave a group nothing could remove.
+///
+/// WHERE each operation applies it differs, because this bound is the service's own and not
+/// the model's: an operation that RESOLVES an id applies it before the lookup, there being no
+/// other rule for it to reach, while the create applies it LAST — after every rule the model
+/// states for its request, so a refusal the request earns under a modelled rule (a membership
+/// that names no `default` user, say) is answered as that rule rather than as this one.
 pub fn user_group_id_refusal(user_group_id: &str) -> Option<String> {
     (user_group_id.chars().count() > MAX_USER_GROUP_ID_LEN)
         .then(|| format!("User group id length must be less than {MAX_USER_GROUP_ID_LEN}."))
