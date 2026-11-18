@@ -366,7 +366,7 @@ async fn given_target(
 /// the way a client reads it: Amazon SQS's protocol is query-compatible, so a refusal
 /// carries the Query code in a header of its own beside the modelled name in the
 /// body, and the Query code is the one an SDK surfaces.
-async fn refusal_code(router: &MultiServiceRouter, case: &str, url: &str) -> String {
+pub(crate) async fn refusal_code(router: &MultiServiceRouter, case: &str, url: &str) -> String {
     let answered = sqs_response(
         router,
         "SendMessage",
