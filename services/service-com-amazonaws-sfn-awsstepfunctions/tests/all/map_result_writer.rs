@@ -282,7 +282,7 @@ impl Chain {
     }
 
     /// Poll one execution until it is no longer `RUNNING`.
-    async fn settled(&self, execution_arn: &str, case: &str) -> Value {
+    pub(crate) async fn settled(&self, execution_arn: &str, case: &str) -> Value {
         let began = Instant::now();
         loop {
             let described = self
@@ -300,7 +300,7 @@ impl Chain {
     }
 
     /// The ARN of the one Map Run `execution_arn` started.
-    async fn map_run_arn(&self, execution_arn: &str, case: &str) -> String {
+    pub(crate) async fn map_run_arn(&self, execution_arn: &str, case: &str) -> String {
         let listed = self
             .sfn("ListMapRuns", &json!({ "executionArn": execution_arn }))
             .await;
@@ -319,7 +319,7 @@ impl Chain {
 
     /// Every child workflow execution of one Map Run, as `DescribeExecution` reports
     /// it, keyed by the `id` member of the input its item carried.
-    async fn children(&self, map_run_arn: &str) -> Map<String, Value> {
+    pub(crate) async fn children(&self, map_run_arn: &str) -> Map<String, Value> {
         let listed = self
             .sfn(
                 "ListExecutions",
@@ -352,7 +352,7 @@ impl Chain {
     }
 
     /// `DescribeMapRun` for one Map Run.
-    async fn map_run(&self, map_run_arn: &str) -> Value {
+    pub(crate) async fn map_run(&self, map_run_arn: &str) -> Value {
         self.sfn("DescribeMapRun", &json!({ "mapRunArn": map_run_arn }))
             .await
     }

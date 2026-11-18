@@ -13,17 +13,29 @@
 //! own client raises. An operation whose answer this emulator does not read as that
 //! operation's output members is not run, and nothing is synthesised for it.
 //!
+//! The call is made wherever the `Task` state SITS, which the last table below is
+//! about: in the child branch of a DISTRIBUTED `Map` state, each item's own call
+//! decides that item's child execution, so a map over items some of whose objects are
+//! not there is a Map Run with a real succeeded/failed split weighed against the
+//! state's tolerated-failure threshold, and a redrive of its parent re-runs exactly the
+//! items whose own call had failed.
+//!
 //! The rows span what the rule generalises over: what the object holds (a JSON
 //! document, plain text, an empty object), which operation the `Resource` names (a
-//! read, a write, one that is not read as output members) and whether the object is
-//! there at all.
+//! read, a write, one that is not read as output members), whether the object is
+//! there at all and — for the Map table — how many items there are, which of them
+//! address an object nobody stored, and how the threshold is stated.
 //!
 //! The harness is `crate::map_result_writer`'s: `tests/all.rs` is this binary's crate
 //! root, so this suite drives the same three services through it.
 
+use std::time::{Duration, Instant};
+
 use serde_json::{json, Value};
 
-use service_com_amazonaws_sfn_awsstepfunctions::state::asl::RUNTIME_ERROR;
+use service_com_amazonaws_sfn_awsstepfunctions::state::asl::{
+    RUNTIME_ERROR, TOLERATED_FAILURE_ERROR,
+};
 
 use crate::map_result_writer::{every_action, Chain, BUCKET};
 
@@ -243,5 +255,296 @@ async fn an_s3_call_that_cannot_be_served_says_so() {
                 .is_some_and(|cause| !cause.is_empty()),
             "case {case:?}: the failure says what happened, got {described:?}"
         );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The same call inside a DISTRIBUTED `Map` state's child branch
+// ---------------------------------------------------------------------------
+
+/// The error name S3's own client raises for a key that is not there, which is what the
+/// table above pins for a top-level task and the one below pins for an item's own.
+const NO_SUCH_KEY: &str = "S3.NoSuchKeyException";
+
+/// How long a row waits for a Map Run to have counted every one of its items.
+const MAP_RUN_PATIENCE: Duration = Duration::from_secs(60);
+
+/// A state machine whose one DISTRIBUTED `Map` state runs an `s3:getObject` task for
+/// every item, over the key that item carries, with the tolerated-failure members
+/// `tolerance` declares.
+fn mapping_over_reads(items: Value, tolerance: Value) -> Value {
+    let Value::Object(tolerance) = tolerance else {
+        panic!("expected an object of Map members, got {tolerance:?}")
+    };
+    let mut state = json!({
+        "Type": "Map",
+        "Items": items,
+        "ItemProcessor": {
+            "ProcessorConfig": { "Mode": "DISTRIBUTED", "ExecutionType": "STANDARD" },
+            "StartAt": "Gate",
+            "States": {
+                "Gate": {
+                    "Type": "Task",
+                    "Resource": "arn:aws:states:::aws-sdk:s3:getObject",
+                    "Parameters": { "Bucket": BUCKET, "Key.$": "$.key" },
+                    "ResultSelector": { "body.$": "$.Body" },
+                    "End": true,
+                },
+            },
+        },
+        "End": true,
+    });
+    for (member, value) in tolerance {
+        state[member] = value;
+    }
+    json!({ "StartAt": "Fan", "States": { "Fan": state } })
+}
+
+/// What the object one item addresses holds.
+fn held(item: usize) -> String {
+    json!({ "item": item }).to_string()
+}
+
+/// Poll `DescribeMapRun` until the run has stopped running and every one of its items
+/// has been counted, which is the condition the counts below are read at: an item is
+/// counted from the instant its own iteration finished, so the run is asked again
+/// rather than waited out.
+async fn counted(chain: &Chain, map_run_arn: &str, case: &str) -> Value {
+    let began = Instant::now();
+    loop {
+        let described = chain.map_run(map_run_arn).await;
+        let running = described.get("status").and_then(Value::as_str) == Some("RUNNING");
+        let pending = described
+            .pointer("/itemCounts/pending")
+            .and_then(Value::as_i64);
+        if !running && pending == Some(0) {
+            return described;
+        }
+        assert!(
+            began.elapsed() < MAP_RUN_PATIENCE,
+            "case {case:?}: expected the Map Run to stop running with every item counted, \
+             got {described:?}"
+        );
+        ::tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
+/// One count of a described Map Run.
+fn count(described: &Value, member: &str) -> Option<i64> {
+    described
+        .pointer(&format!("/itemCounts/{member}"))
+        .and_then(Value::as_i64)
+}
+
+/// One row of the Map table: how many items the state iterates, which of them address
+/// an object nobody stored, and the tolerated-failure members the state declares.
+struct MapRow {
+    case: &'static str,
+    count: usize,
+    missing: &'static [usize],
+    tolerance: Value,
+}
+
+/// An `aws-sdk:s3:getObject` task in the child branch of a DISTRIBUTED `Map` state is
+/// called for every item, so each item's own call decides its child execution: the
+/// items whose object is there SUCCEED with the object's bytes, the ones whose object is
+/// not there FAIL with the error S3's own client raises, the Map Run counts that split,
+/// and a redrive of the parent — once the missing objects are stored — re-runs exactly
+/// the items whose call had failed, the others keeping the executions they ran as.
+///
+/// The rows differ along how many items there are, which of them are missing their
+/// object (the first, the last, several scattered through the run) and how the state
+/// states its failure budget (none at all, a percentage, a count), each row's failures
+/// being past that budget so the parent is redrivable at all.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn each_item_of_a_distributed_map_runs_its_own_sdk_s3_call() {
+    let rows = [
+        MapRow {
+            case: "one item of three has no object, and the state tolerates no failure",
+            count: 3,
+            missing: &[1],
+            tolerance: json!({}),
+        },
+        MapRow {
+            case: "the first and the last of four, past a tolerated percentage",
+            count: 4,
+            missing: &[0, 3],
+            tolerance: json!({ "ToleratedFailurePercentage": 25 }),
+        },
+        MapRow {
+            case: "three of nine scattered through the run, past a tolerated count",
+            count: 9,
+            missing: &[2, 4, 7],
+            tolerance: json!({ "ToleratedFailureCount": 2 }),
+        },
+    ];
+
+    let chain = Chain::new();
+    chain.bucket(BUCKET).await;
+    let role_arn = chain.role("SdkMapRole", &every_action()).await;
+    for (index, row) in rows.iter().enumerate() {
+        let case = row.case;
+        // One object per item that is meant to succeed; an item in `missing` addresses
+        // a key nothing stored, which is what makes that item's own call fail.
+        let keys: Vec<String> = (0..row.count)
+            .map(|item| format!("map/{index}/item-{item}"))
+            .collect();
+        for (item, key) in keys.iter().enumerate() {
+            if !row.missing.contains(&item) {
+                chain.object(key, &held(item)).await;
+            }
+        }
+        let items: Vec<Value> = keys
+            .iter()
+            .enumerate()
+            .map(|(item, key)| json!({ "id": item, "key": key }))
+            .collect();
+        let definition = mapping_over_reads(Value::Array(items), row.tolerance.clone());
+        let machine = chain
+            .machine(&format!("sdk-map-{index}"), &definition, &role_arn)
+            .await;
+        let (execution, described) = chain.ran(&machine, &json!({}), case).await;
+        // More items failed than the state tolerates, so the state's own error is the
+        // threshold one rather than any one item's.
+        assert_eq!(
+            (
+                described.get("status").and_then(Value::as_str),
+                described.get("error").and_then(Value::as_str),
+            ),
+            (Some("FAILED"), Some(TOLERATED_FAILURE_ERROR)),
+            "case {case:?}: expected the failures to be weighed against the state's threshold, \
+             got {described:?}"
+        );
+
+        let map_run_arn = chain.map_run_arn(&execution, case).await;
+        let first = counted(&chain, &map_run_arn, case).await;
+        let failed = row.missing.len() as i64;
+        let total = row.count as i64;
+        assert_eq!(
+            (
+                first.get("status").and_then(Value::as_str),
+                count(&first, "succeeded"),
+                count(&first, "failed"),
+                count(&first, "total"),
+            ),
+            (Some("FAILED"), Some(total - failed), Some(failed), Some(total)),
+            "case {case:?}: expected the Map Run to count the split the calls decided, \
+             got {first:?}"
+        );
+
+        let before = chain.children(&map_run_arn).await;
+        assert_eq!(
+            before.len(),
+            row.count,
+            "case {case:?}: every item ran as a child execution, got {before:?}"
+        );
+        for item in 0..row.count {
+            let child = &before[&item.to_string()];
+            let missing = row.missing.contains(&item);
+            let expected = match missing {
+                true => "FAILED",
+                false => "SUCCEEDED",
+            };
+            assert_eq!(
+                child.get("status").and_then(Value::as_str),
+                Some(expected),
+                "case {case:?}: item {item} ended {expected}, got {child:?}"
+            );
+            match missing {
+                // The item's own call was made and S3 itself refused it, so the child
+                // carries that service's error — not a report that nothing was run.
+                true => {
+                    let error = child.get("error").and_then(Value::as_str);
+                    assert_eq!(
+                        error,
+                        Some(NO_SUCH_KEY),
+                        "case {case:?}: item {item}'s own call was refused by S3, got {child:?}"
+                    );
+                    assert_ne!(
+                        error,
+                        Some(RUNTIME_ERROR),
+                        "case {case:?}: item {item}'s integration must be dispatched rather \
+                         than reported as work nothing ran, got {child:?}"
+                    );
+                }
+                // ...and an item whose object is there puts out the bytes S3 answered.
+                false => {
+                    let output: Value = child
+                        .get("output")
+                        .and_then(Value::as_str)
+                        .map(|text| serde_json::from_str(text).expect("a child's output is JSON"))
+                        .unwrap_or_else(|| {
+                            panic!("case {case:?}: expected item {item} to put out {child:?}")
+                        });
+                    assert_eq!(
+                        output.get("body").and_then(Value::as_str),
+                        Some(held(item).as_str()),
+                        "case {case:?}: item {item} read the object S3 holds, got {output:?}"
+                    );
+                }
+            }
+        }
+
+        // The objects the failed items addressed are stored — what a caller redriving
+        // such a run puts right — and the parent is redriven.
+        for item in row.missing {
+            chain.object(&keys[*item], &held(*item)).await;
+        }
+        chain
+            .sfn("RedriveExecution", &json!({ "executionArn": execution }))
+            .await;
+        let described = chain.settled(&execution, case).await;
+        assert_eq!(
+            (
+                described.get("status").and_then(Value::as_str),
+                described.get("redriveCount").and_then(Value::as_i64),
+            ),
+            (Some("SUCCEEDED"), Some(1)),
+            "case {case:?}: expected the redriven run to succeed, got {described:?}"
+        );
+
+        let after_run = counted(&chain, &map_run_arn, case).await;
+        assert_eq!(
+            (
+                after_run.get("status").and_then(Value::as_str),
+                count(&after_run, "succeeded"),
+                count(&after_run, "failed"),
+                after_run.get("redriveCount").and_then(Value::as_i64),
+            ),
+            (Some("SUCCEEDED"), Some(total), Some(0), Some(1)),
+            "case {case:?}: expected the same Map Run to count every item succeeded, \
+             got {after_run:?}"
+        );
+
+        let after = chain.children(&map_run_arn).await;
+        assert_eq!(
+            after.len(),
+            row.count,
+            "case {case:?}: the redriven run holds the same items, got {after:?}"
+        );
+        for item in 0..row.count {
+            let id = item.to_string();
+            let (was, now) = (&before[&id], &after[&id]);
+            assert_eq!(
+                now.get("status").and_then(Value::as_str),
+                Some("SUCCEEDED"),
+                "case {case:?}: item {item} succeeded on the redriven attempt, got {now:?}"
+            );
+            let ran_again = was.get("executionArn") != now.get("executionArn");
+            assert_eq!(
+                ran_again,
+                row.missing.contains(&item),
+                "case {case:?}: item {item} ran again exactly if its own call had failed: \
+                 was {was:?}, now {now:?}"
+            );
+            if !ran_again {
+                assert_eq!(
+                    (was.get("startDate"), was.get("output")),
+                    (now.get("startDate"), now.get("output")),
+                    "case {case:?}: item {item} had succeeded, so its work is not repeated: \
+                     was {was:?}, now {now:?}"
+                );
+            }
+        }
     }
 }
