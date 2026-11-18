@@ -1,14 +1,24 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! The WORDING of the refusal that reports no view exists for the ARN a request named.
+//! The WORDING of the refusals this service states for a request it will not serve: the
+//! one that reports no view exists for the ARN a request named, and the one that reports a
+//! request BODY the model's own rules do not admit.
 //!
-//! The class is one fact — "the `ViewArn` you gave resolves to no view this account
-//! holds" — so every operation that resolves a view ARN against the store and reports
-//! that fact says it with the same fixed sentence, followed by the ARN the REQUEST
+//! The view-not-found class is one fact — "the `ViewArn` you gave resolves to no view this
+//! account holds" — so every operation that resolves a view ARN against the store and
+//! reports that fact says it with the same fixed sentence, followed by the ARN the REQUEST
 //! carried, verbatim and unaltered. The rows below span every way a well-formed view ARN
 //! can fail to resolve, and the published maximum length of the member that carries it,
 //! so the message is shown to be a template over the request rather than text tied to one
 //! value.
+//!
+//! The body-rejection class is the other way round: a body that breaks ANY rule the model
+//! declares is one answer, carrying nothing from the request at all. Its rows span the
+//! operations that bind members to the body, the constraint classes those members declare
+//! (a range, a string length, a collection size, an absent required member) and both sides
+//! of each published bound, so the sentence is shown to belong to the class rather than to
+//! one member or one value — while a rule the model states only in prose, and a value the
+//! request carries outside its body, keep the wording that names what failed.
 //!
 //! Every assertion goes over the wire: the suite mounts this service on a
 //! [`MultiServiceRouter`] over one shared engine and dispatches restJson1 requests at
@@ -424,5 +434,363 @@ async fn every_operation_words_a_missing_view_the_same_way() {
             Some(BTreeMap::<String, String>::new().len()),
             "case {case:?}: a resource that exists answers an empty tag map, got {tags}"
         );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// A body the model's own rules do not admit is one fixed sentence
+// ---------------------------------------------------------------------------
+
+/// The WHOLE message this service's body rejection carries. Spelled out here rather than
+/// imported, because the sentence itself is the requirement: it names neither the member
+/// that failed nor the value the request submitted, so there is no variable part.
+const INVALID_REQUEST_BODY: &str = "Invalid request body";
+
+/// The minimum every paginated input's `MaxResults` declares
+/// (`smithy_query(query="shape",shape="ListResourcesInput,SearchInput,ListIndexesInput,ListViewsInput,GetResourceExplorerSetupInput")`
+/// -> `MaxResults` `range {min: 1, max: …}`). Spelled out independently of the crate's
+/// own constants, so a wrong bound in `src/` fails here rather than agreeing with itself.
+const MAX_RESULTS_MIN: i64 = 1;
+
+/// The published maximum of `ListResourcesInput$MaxResults` and `SearchInput$MaxResults`,
+/// from the same query.
+const QUERY_MAX_RESULTS_MAX: i64 = 1000;
+
+/// The published maximum of `ListIndexesInput$MaxResults` and
+/// `GetResourceExplorerSetupInput$MaxResults`.
+const INDEX_MAX_RESULTS_MAX: i64 = 100;
+
+/// The published maximum of `ListViewsInput$MaxResults`.
+const VIEWS_MAX_RESULTS_MAX: i64 = 50;
+
+/// `ListResourcesInput$NextToken` is `length {min: 1, max: 2048}`, so the empty string is
+/// outside it (`smithy_query(query="shape",shape="ListResourcesInput")` -> `NextToken`).
+const EMPTY_NEXT_TOKEN: &str = "";
+
+/// `ListResourcesInput$ViewArn` is `length {min: 0, max: 1000}` — a BODY member, unlike
+/// the `@httpLabel` `resourceArn` of the tagging routes
+/// (`smithy_query(query="shape",shape="ListResourcesInput")` -> `ViewArn`).
+const LIST_RESOURCES_VIEW_ARN_MAX: usize = 1000;
+
+/// `BatchGetViewInput$ViewArns` is a list of `length {min: 1, max: 20}`
+/// (`smithy_query(query="shape",shape="BatchGetViewInput")`).
+const VIEW_ARNS_MIN: usize = 1;
+const VIEW_ARNS_MAX: usize = 20;
+
+/// `ListIndexesInput$Regions` is a list of `length {min: 0, max: 20}`
+/// (`smithy_query(query="shape",shape="ListIndexesInput")`).
+const REGIONS_MAX: usize = 20;
+
+/// A `TaskId` inside the `^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`
+/// pattern `GetResourceExplorerSetupInput` declares for it, so the rows that break a
+/// DIFFERENT member of that input break only the one they are about.
+const WELL_FORMED_TASK_ID: &str = "3f6b9d21-47ac-4e58-9b02-5c1d8e734a6f";
+
+/// One request whose BODY breaks a rule the model declares, with the text its refusal must
+/// not carry: the member at fault and the value the request submitted.
+struct BadBody {
+    case: String,
+    operation: &'static str,
+    body: Value,
+    withheld: Vec<String>,
+}
+
+/// One such row.
+fn bad(case: impl Into<String>, operation: &'static str, body: Value, withheld: &[&str]) -> BadBody {
+    BadBody {
+        case: case.into(),
+        operation,
+        body,
+        withheld: withheld.iter().map(|text| (*text).to_string()).collect(),
+    }
+}
+
+/// A string of exactly `length` `v` characters: a `ViewArn` past its member's published
+/// maximum is about the LENGTH of the value, not about what it names.
+fn padded(length: usize) -> String {
+    "v".repeat(length)
+}
+
+/// Every request body this service refuses, spanning the operations that bind members to
+/// the body, the constraint classes those members declare, and the values on the refused
+/// side of each published bound.
+fn bad_bodies() -> Vec<BadBody> {
+    let mut rows = Vec::new();
+
+    // A page size, for each operation that takes one and each published maximum the model
+    // declares — the refused side of both ends of the range, and each end of the member's
+    // own `integer` range, which is as far past the bound as a value can be sent.
+    let page_sizes: [(&'static str, Value, i64); 5] = [
+        ("ListResources", json!({}), QUERY_MAX_RESULTS_MAX),
+        ("Search", json!({ "QueryString": "" }), QUERY_MAX_RESULTS_MAX),
+        ("ListIndexes", json!({}), INDEX_MAX_RESULTS_MAX),
+        ("ListViews", json!({}), VIEWS_MAX_RESULTS_MAX),
+        (
+            "GetResourceExplorerSetup",
+            json!({ "TaskId": WELL_FORMED_TASK_ID }),
+            INDEX_MAX_RESULTS_MAX,
+        ),
+    ];
+    for (operation, base, max) in page_sizes {
+        for value in [
+            MAX_RESULTS_MIN - 1,
+            -MAX_RESULTS_MIN,
+            max + 1,
+            max + 1000,
+            i64::from(i32::MAX),
+            i64::from(i32::MIN),
+        ] {
+            let mut body = base.clone();
+            body["MaxResults"] = json!(value);
+            rows.push(bad(
+                format!("{operation} MaxResults {value}, outside 1..={max}"),
+                operation,
+                body,
+                &[&value.to_string(), "MaxResults", "maxResults"],
+            ));
+        }
+    }
+
+    // A string length: both members of a query that carry one, and the `ClientToken` of a
+    // create.
+    rows.push(bad(
+        "ListResources NextToken shorter than its minimum of 1",
+        "ListResources",
+        json!({ "NextToken": EMPTY_NEXT_TOKEN }),
+        &["NextToken", "nextToken"],
+    ));
+    rows.push(bad(
+        format!(
+            "ListResources ViewArn one character past its maximum of \
+             {LIST_RESOURCES_VIEW_ARN_MAX}"
+        ),
+        "ListResources",
+        json!({ "ViewArn": padded(LIST_RESOURCES_VIEW_ARN_MAX + 1) }),
+        &["ViewArn", "viewArn", "vvv"],
+    ));
+    rows.push(bad(
+        "CreateView ClientToken shorter than its minimum of 1",
+        "CreateView",
+        json!({ "ViewName": "token-length", "ClientToken": "" }),
+        &["ClientToken", "clientToken"],
+    ));
+    rows.push(bad(
+        "UpdateView ViewArn shorter than its minimum of 1",
+        "UpdateView",
+        json!({ "ViewArn": "" }),
+        &["ViewArn", "viewArn"],
+    ));
+
+    // A collection size: a list shorter than its minimum, and one longer than its maximum.
+    rows.push(bad(
+        format!("BatchGetView ViewArns shorter than its minimum of {VIEW_ARNS_MIN}"),
+        "BatchGetView",
+        json!({ "ViewArns": Vec::<String>::new() }),
+        &["ViewArns", "viewArns"],
+    ));
+    rows.push(bad(
+        format!("BatchGetView ViewArns one past its maximum of {VIEW_ARNS_MAX}"),
+        "BatchGetView",
+        json!({ "ViewArns": vec![padded(8); VIEW_ARNS_MAX + 1] }),
+        &["ViewArns", "viewArns", "vvv"],
+    ));
+    rows.push(bad(
+        format!("ListIndexes Regions one past its maximum of {REGIONS_MAX}"),
+        "ListIndexes",
+        json!({ "Regions": vec![padded(6); REGIONS_MAX + 1] }),
+        &["Regions", "regions", "vvv"],
+    ));
+
+    // A required BODY member the request omits: found while READING the body rather than
+    // while walking the value it built, and the same failure of the same check to a caller.
+    rows.push(bad(
+        "Search with no QueryString, which its input requires",
+        "Search",
+        json!({}),
+        &["QueryString", "queryString"],
+    ));
+    rows.push(bad(
+        "CreateView with no ViewName, which its input requires",
+        "CreateView",
+        json!({}),
+        &["ViewName", "viewName"],
+    ));
+    rows.push(bad(
+        "UpdateView with no ViewArn, which its input requires",
+        "UpdateView",
+        json!({}),
+        &["ViewArn", "viewArn"],
+    ));
+
+    rows
+}
+
+/// A request BODY that breaks any rule the model declares for the operation's input is
+/// refused with HTTP 400, the modelled `ValidationException` code and ONE fixed sentence,
+/// which carries neither the member at fault nor the value the request submitted — while
+/// every value the model DOES admit, each published bound included, is served.
+///
+/// The rows span the operations that bind members to the body, the constraint classes the
+/// model declares over those members (an integer range, a string length, a collection
+/// size, an absent required member) and the values just outside and just inside each
+/// published bound. The recorded case — a page size one past the maximum of 1000 — is one
+/// row of the first table.
+#[tokio::test]
+async fn a_body_outside_the_models_own_rules_is_refused_with_one_fixed_sentence() {
+    let emulator = Emulator::new();
+    let region = "us-east-1";
+    // Turning the Region on leaves it an index and a default view, so every row below is
+    // refused (or served) for what its BODY carries and not for want of a view to query.
+    create_index(&emulator, region, "invalid-request-body").await;
+    let held_view = create_view(&emulator, region, "body-rules").await;
+
+    for row in bad_bodies() {
+        let answer = emulator.call(region, row.operation, row.body.clone()).await;
+        answer.failed(&row.case, 400, "ValidationException");
+        assert_eq!(
+            answer.error_message(),
+            INVALID_REQUEST_BODY,
+            "case {:?}: a refused body carries this service's one fixed sentence, got {}",
+            row.case,
+            answer.body
+        );
+        let rendered = answer.body.to_string();
+        for text in &row.withheld {
+            assert!(
+                !rendered.contains(text.as_str()),
+                "case {:?}: the refusal states neither the member nor the value, so it \
+                 cannot carry {text:?}, got {rendered}",
+                row.case
+            );
+        }
+    }
+
+    // The other side of every bound: the values the model admits are served, so the
+    // sentence above belongs to what the model refuses and not to the member itself.
+    let served: Vec<(String, &str, Value)> = vec![
+        (
+            format!("ListResources MaxResults at its minimum of {MAX_RESULTS_MIN}"),
+            "ListResources",
+            json!({ "MaxResults": MAX_RESULTS_MIN }),
+        ),
+        (
+            format!("ListResources MaxResults at its maximum of {QUERY_MAX_RESULTS_MAX}"),
+            "ListResources",
+            json!({ "MaxResults": QUERY_MAX_RESULTS_MAX }),
+        ),
+        (
+            format!("Search MaxResults at its minimum of {MAX_RESULTS_MIN}"),
+            "Search",
+            json!({ "QueryString": "", "MaxResults": MAX_RESULTS_MIN }),
+        ),
+        (
+            format!("Search MaxResults at its maximum of {QUERY_MAX_RESULTS_MAX}"),
+            "Search",
+            json!({ "QueryString": "", "MaxResults": QUERY_MAX_RESULTS_MAX }),
+        ),
+        (
+            format!("ListIndexes MaxResults at its maximum of {INDEX_MAX_RESULTS_MAX}"),
+            "ListIndexes",
+            json!({ "MaxResults": INDEX_MAX_RESULTS_MAX }),
+        ),
+        (
+            format!("ListViews MaxResults at its maximum of {VIEWS_MAX_RESULTS_MAX}"),
+            "ListViews",
+            json!({ "MaxResults": VIEWS_MAX_RESULTS_MAX }),
+        ),
+        (
+            format!("ListIndexes Regions at its maximum of {REGIONS_MAX}"),
+            "ListIndexes",
+            json!({ "Regions": vec![region.to_string(); REGIONS_MAX] }),
+        ),
+        (
+            format!("BatchGetView ViewArns at its minimum of {VIEW_ARNS_MIN}"),
+            "BatchGetView",
+            json!({ "ViewArns": vec![held_view.clone(); VIEW_ARNS_MIN] }),
+        ),
+        (
+            format!("BatchGetView ViewArns at its maximum of {VIEW_ARNS_MAX}"),
+            "BatchGetView",
+            json!({ "ViewArns": vec![held_view.clone(); VIEW_ARNS_MAX] }),
+        ),
+        (
+            format!(
+                "ListResources ViewArn at its maximum length of \
+                 {LIST_RESOURCES_VIEW_ARN_MAX}"
+            ),
+            "ListResources",
+            json!({ "ViewArn": held_view.clone() }),
+        ),
+    ];
+    for (case, operation, body) in served {
+        emulator.call(region, operation, body).await.ok(&case);
+    }
+}
+
+/// The sentence above belongs to the BODY-schema check alone: a rule the model states only
+/// in prose is refused by the operation that owns it, naming the member at fault — the
+/// discriminator a client has, since every one of these refusals carries the same
+/// `ValidationException` code.
+///
+/// (A value this service's model binds OUTSIDE a body — the `@httpLabel` `resourceArn` and
+/// the `@httpQuery` `tagKeys` of the tagging routes — declares no constraint beyond
+/// `required`, and a request that omits a required query parameter matches no route at
+/// all, so there is no URI-bound constraint refusal to state here.)
+#[tokio::test]
+async fn a_rule_the_model_states_in_prose_keeps_the_wording_that_names_it() {
+    let emulator = Emulator::new();
+    let region = "us-east-1";
+    create_index(&emulator, region, "rules-outside-the-body").await;
+
+    // A filter string carrying free-form text: a restriction `ListResourcesInput$Filters`
+    // documents in prose, which no constraint in the model expresses, so the operation
+    // refuses it and names the member it is about.
+    let case = "ListResources with a free-form term in its filter string";
+    let answer = emulator
+        .call(
+            region,
+            "ListResources",
+            json!({ "Filters": { "FilterString": "orders" } }),
+        )
+        .await;
+    answer.failed(case, 400, "ValidationException");
+    let message = answer.error_message();
+    assert!(
+        message != INVALID_REQUEST_BODY && message.contains("Filters.FilterString"),
+        "case {case:?}: a prose rule is refused naming the member it is about, got \
+         {message:?}"
+    );
+
+    // A tag filter through a view that does not include the `tags` property: another rule
+    // of the operation's own, which names the filter at fault.
+    let plain = create_view(&emulator, region, "no-tags-property").await;
+    let case = "ListResources filtering on tags through a view without the property";
+    let answer = emulator
+        .call(
+            region,
+            "ListResources",
+            json!({ "ViewArn": plain, "Filters": { "FilterString": "tag:stage=prod" } }),
+        )
+        .await;
+    answer.failed(case, 400, "ValidationException");
+    let message = answer.error_message();
+    assert!(
+        message != INVALID_REQUEST_BODY && message.contains("not included in the view"),
+        "case {case:?}: a prose rule is refused naming what it is about, got {message:?}"
+    );
+
+    // The positive control: the same operation serves the requests that break no rule, so
+    // the refusals above are about the request and not about the call.
+    for (case, body) in [
+        (
+            "ListResources with a filter prefix",
+            json!({ "Filters": { "FilterString": "service:sqs" } }),
+        ),
+        (
+            "ListResources through the view without the tags property",
+            json!({ "ViewArn": plain, "Filters": { "FilterString": "service:sqs" } }),
+        ),
+    ] {
+        emulator.call(region, "ListResources", body).await.ok(case);
     }
 }
