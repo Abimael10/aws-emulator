@@ -713,8 +713,11 @@ async fn a_qualifier_holding_no_configuration_has_none_to_read_update_or_delete(
         }
     }
 
-    // A function this store holds no record of at all is a different absence, and names the
-    // function rather than the configuration.
+    // A function this store holds no record of at all is a DIFFERENT absence, and the
+    // sentence states that the function is not there, naming nothing of the request — which
+    // is what tells the two refusals apart (the whole rule, over every operation on this
+    // resource and every form of identifier, is
+    // `event_invoke_config_absent_target.rs`).
     let missing = get_config(&router, "event-invoke-nowhere", None).await;
     assert_eq!(
         missing.status,
@@ -725,11 +728,8 @@ async fn a_qualifier_holding_no_configuration_has_none_to_read_update_or_delete(
     );
     assert_eq!(
         missing.string("Message").or_else(|| missing.string("message")),
-        Some(format!(
-            "Function not found: {}",
-            function_arn("event-invoke-nowhere")
-        )),
-        "expected the function-not-found sentence, got {}",
+        Some("The function doesn't exist.".to_string()),
+        "expected the function-does-not-exist sentence, got {}",
         missing.text()
     );
 

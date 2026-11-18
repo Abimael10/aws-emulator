@@ -204,7 +204,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 return Err(invalid_parameter(message))
             }
             // The resolver's own sentence NAMES the function it resolved the request's
-            // reference to; this operation's does not (see [`FUNCTION_DOES_NOT_EXIST`]), so
+            // reference to; this resource's does not (see
+            // `crate::state::FUNCTION_DOES_NOT_EXIST_MESSAGE`), so
             // the 404 is re-worded here rather than carried through. A Region this endpoint
             // does not serve is not a function it could not find: it is settled before the
             // lookup, so it is stated as itself.
@@ -275,19 +276,6 @@ fn invalid_parameter(message: String) -> ListFunctionEventInvokeConfigsError {
     .into()
 }
 
-/// This operation's WHOLE sentence for a function it cannot resolve the request's
-/// `FunctionName` to.
-///
-/// It states that the function is not there and nothing of the request: not the name the
-/// caller sent, and not the ARN this service resolved it to — unlike the sentence the
-/// function operations of the earlier Lambda API dates carry, which appends that ARN
-/// (`crate::state::resolve_function`'s `Function not found: <arn>`). Recorded behaviour:
-/// corpus `simparity-wire-aws-v1`, fixture
-/// `function-event-invoke-config-qualifier-error-paths`, step `task#5`, where this operation
-/// on a function nobody created is answered `404 ResourceNotFoundException` with `Message`
-/// exactly this.
-const FUNCTION_DOES_NOT_EXIST: &str = "The function doesn't exist.";
-
 /// The modelled 404 for a function this emulator does not hold.
 fn not_found(message: String) -> ListFunctionEventInvokeConfigsError {
     ListFunctionEventInvokeConfigsErrorModeled::ResourceNotFoundException(
@@ -299,18 +287,19 @@ fn not_found(message: String) -> ListFunctionEventInvokeConfigsError {
     .into()
 }
 
-/// The modelled 404 for an identifier that resolved to nothing: the Region refusal when the
-/// identifier named a Region this endpoint does not serve
-/// (`crate::state::unreachable_region_message`), else this operation's own sentence for a
-/// function it does not hold.
+/// The modelled 404 for an identifier that resolved to nothing, worded by the ONE reading
+/// every operation on an asynchronous-invocation configuration shares
+/// (`crate::state::absent_event_invoke_config_target_message`): the Region refusal when the
+/// identifier named a Region this endpoint does not serve, else the sentence for a function
+/// this emulator does not hold.
 fn unreachable_region_or_absent(
     function_name: &str,
     region: &str,
 ) -> ListFunctionEventInvokeConfigsError {
-    not_found(
-        crate::state::unreachable_region_message(function_name, region)
-            .unwrap_or_else(|| FUNCTION_DOES_NOT_EXIST.to_string()),
-    )
+    not_found(crate::state::absent_event_invoke_config_target_message(
+        function_name,
+        region,
+    ))
 }
 
 /// The modelled 500 for a failure of the store itself.

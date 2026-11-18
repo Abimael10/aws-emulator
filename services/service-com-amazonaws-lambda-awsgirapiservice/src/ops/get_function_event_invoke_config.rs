@@ -187,8 +187,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The `FunctionName`/`Qualifier` pair names the function, version or alias whose
         // configuration is reported, resolved exactly the way the write that stored it
         // resolved the same pair, so every documented way of naming one reads the one
-        // configuration it holds.
-        let (record, qualifier) = crate::state::resolve_function(
+        // configuration it holds — and refused, where it names none of them, with this
+        // resource's own sentence rather than the one that names the ARN the reference
+        // resolved to (`crate::state::FUNCTION_DOES_NOT_EXIST_MESSAGE`).
+        let (record, qualifier) = crate::state::resolve_event_invoke_config_target(
             &mut store,
             &input.function_name,
             input.qualifier.as_deref(),

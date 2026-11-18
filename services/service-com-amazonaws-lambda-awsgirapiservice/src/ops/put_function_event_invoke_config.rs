@@ -218,8 +218,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // alias": the `FunctionName`/`Qualifier` pair names the one the configuration
         // belongs to, resolved exactly the way every other operation on this service
         // resolves that pair, and a request naming no qualifier addresses the unpublished
-        // version, which is what resolution defaults to.
-        let (record, qualifier) = crate::state::resolve_function(
+        // version, which is what resolution defaults to. A pair naming no function, version
+        // or alias is refused with this resource's own sentence rather than with the one
+        // that names the ARN the reference resolved to
+        // (`crate::state::FUNCTION_DOES_NOT_EXIST_MESSAGE`).
+        let (record, qualifier) = crate::state::resolve_event_invoke_config_target(
             &mut store,
             &input.function_name,
             input.qualifier.as_deref(),

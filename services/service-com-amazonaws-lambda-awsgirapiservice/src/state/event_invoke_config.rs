@@ -39,6 +39,67 @@ pub fn no_event_invoke_config_message(function_arn: &str) -> String {
     format!("The function {function_arn} doesn't have an EventInvokeConfig")
 }
 
+/// The WHOLE sentence an operation on an asynchronous-invocation configuration refuses a
+/// `FunctionName`/`Qualifier` pair naming no function, version or alias with.
+///
+/// It states that the function is not there and nothing of the request: not the name the
+/// caller sent, and not the ARN this service resolved it to — unlike the sentence the
+/// function operations of the earlier Lambda API dates carry
+/// (`super::resolve_function`'s `Function not found: <arn>`). Recorded behaviour: corpus
+/// `simparity-wire-aws-v1`, fixture `function-event-invoke-config-qualifier-error-paths`
+/// step `task#5` (the list form, on a function nobody created) and fixture
+/// `lambda-async-invoke-destinations` step `task#10` (the update form, on a qualifier the
+/// function does not have), each answered `404 ResourceNotFoundException` with `Message`
+/// exactly this.
+pub const FUNCTION_DOES_NOT_EXIST_MESSAGE: &str = "The function doesn't exist.";
+
+/// Resolve the `FunctionName`/`Qualifier` pair an operation on an asynchronous-invocation
+/// configuration addresses, to the record holding that configuration and the qualifier it
+/// is keyed under.
+///
+/// The pair is read exactly as every other operation on this service reads one
+/// ([`super::resolve_function`]), so one resource is reached however it is addressed and a
+/// configuration written under one spelling is read back under any other. Only the REFUSAL
+/// differs: these operations word the absence of the addressed function, version or alias
+/// as [`FUNCTION_DOES_NOT_EXIST_MESSAGE`], rather than as the sentence that names the ARN
+/// the reference resolved to.
+///
+/// Two refusals are carried through as themselves, because neither is a resource that could
+/// not be found: a `FunctionName` in none of the documented forms, which is a fact about the
+/// request settled before anything is looked up, and an identifier naming a Region this
+/// endpoint does not serve ([`super::unreachable_region_message`]), which states the two
+/// Regions that disagree.
+pub fn resolve_event_invoke_config_target<'a>(
+    store: &'a mut super::ComAmazonawsLambdaAwsgirapiserviceState,
+    function_name: &str,
+    qualifier: Option<&str>,
+    region: &str,
+    now: SystemTime,
+) -> Result<(&'a mut super::FunctionRecord, String), super::ResolveFailure> {
+    super::resolve_function(store, function_name, qualifier, region, now).map_err(|failure| {
+        match failure {
+            super::ResolveFailure::NotFound(_) => super::ResolveFailure::NotFound(
+                absent_event_invoke_config_target_message(function_name, region),
+            ),
+            malformed => malformed,
+        }
+    })
+}
+
+/// The sentence an operation on an asynchronous-invocation configuration refuses an
+/// identifier that resolved to NOTHING with.
+///
+/// The ONE place that choice is made, so every operation on this resource words it the same
+/// way: the Region sentence when the identifier named a Region this endpoint does not serve
+/// ([`super::unreachable_region_message`]), else [`FUNCTION_DOES_NOT_EXIST_MESSAGE`]. The
+/// resolver above calls it for the four operations that address ONE configuration; the
+/// listing, which takes no `Qualifier` and so cannot use that resolver, calls it directly.
+#[must_use]
+pub fn absent_event_invoke_config_target_message(function_name: &str, region: &str) -> String {
+    super::unreachable_region_message(function_name, region)
+        .unwrap_or_else(|| FUNCTION_DOES_NOT_EXIST_MESSAGE.to_string())
+}
+
 /// The `FunctionArn` a configuration is reported on: the function's ARN qualified by the
 /// qualifier the configuration belongs to.
 ///
