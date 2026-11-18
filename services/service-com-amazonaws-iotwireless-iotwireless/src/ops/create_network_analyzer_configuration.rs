@@ -270,12 +270,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // An id repeated in one request is tracked once: a configuration holds a SET of
         // resources, which is what `UpdateNetworkAnalyzerConfiguration`'s add/remove
-        // members address.
+        // members address. The description and the trace settings are stored FULLY
+        // SPECIFIED — an unset description as the empty string, an unset trace setting at
+        // its default — so the reader answers with every member the service settled here
+        // rather than only the ones this request happened to carry.
         let mut configuration = crate::state::NetworkAnalyzerConfiguration {
             name: input.name.clone(),
             arn: crate::state::network_analyzer_configuration_arn(&region, &input.name),
-            description: input.description.clone(),
-            trace_content: input.trace_content.clone(),
+            description: input.description.clone().unwrap_or_default(),
+            trace_content: crate::state::stored_trace_content(input.trace_content.as_ref()),
             tags: input.tags.clone().unwrap_or_default(),
             ..Default::default()
         };

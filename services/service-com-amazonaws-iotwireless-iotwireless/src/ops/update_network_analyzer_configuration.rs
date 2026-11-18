@@ -278,12 +278,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // it omitted leaves the stored value as it was — so changing only the log level
         // keeps the configuration's description and the frame-info settings beside it.
         if let Some(description) = input.description {
-            configuration.description = Some(description);
+            configuration.description = description;
         }
         if let Some(trace_content) = input.trace_content {
-            let stored = configuration
-                .trace_content
-                .get_or_insert_with(Default::default);
+            let stored = &mut configuration.trace_content;
             if let Some(log_level) = trace_content.log_level {
                 stored.log_level = Some(log_level);
             }

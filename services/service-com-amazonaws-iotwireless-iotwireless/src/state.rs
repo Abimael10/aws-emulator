@@ -1473,12 +1473,18 @@ pub fn multicast_group_not_found(id: &str) -> ResourceNotFoundException {
 /// The three tracked-resource lists hold the ids in the order they were first added, so
 /// a reader reports them in the order the caller built them up in, and each id appears
 /// at most once however many times it is added.
+///
+/// `description` and `trace_content` are NOT optional, because a stored configuration is
+/// fully specified: the create settles every trace setting the request left out at that
+/// setting's default ([`stored_trace_content`]) and an unset description at the empty
+/// string, so every later read reports all of them and a get/modify/update round trip
+/// cannot lose a setting the caller never saw.
 #[derive(Debug, Clone, Default)]
 pub struct NetworkAnalyzerConfiguration {
     pub name: String,
     pub arn: String,
-    pub description: Option<String>,
-    pub trace_content: Option<TraceContent>,
+    pub description: String,
+    pub trace_content: TraceContent,
     /// `WirelessDeviceId`s this configuration tracks.
     pub wireless_devices: Vec<String>,
     /// `WirelessGatewayId`s this configuration tracks.
@@ -1488,15 +1494,52 @@ pub struct NetworkAnalyzerConfiguration {
     pub tags: Vec<Tag>,
 }
 
+/// The setting a trace-content member carries when the request that stored the
+/// configuration left it unset: tracing OFF.
+///
+/// It is the one value all three members share:
+/// `smithy_query(query="shape", shape="TraceContent")` targets `WirelessDeviceFrameInfo`
+/// (ENABLED | DISABLED), `LogLevel` (INFO | ERROR | DISABLED) and `MulticastFrameInfo`
+/// (ENABLED | DISABLED), so a setting nobody asked for traces nothing.
+pub const TRACE_SETTING_DISABLED: &str = "DISABLED";
+
+/// The trace content a configuration STORES for the `TraceContent` a create carried:
+/// every member the request set, and [`TRACE_SETTING_DISABLED`] for every member it left
+/// unset — including the case of a request that carried no `TraceContent` at all.
+///
+/// A stored configuration therefore always carries all three settings, so its reader
+/// reports a fully specified trace content and a get/modify/update round trip cannot drop
+/// a setting the caller never saw.
+pub fn stored_trace_content(requested: Option<&TraceContent>) -> TraceContent {
+    let requested = requested.cloned().unwrap_or_default();
+    let settled = |member: Option<String>| Some(member.unwrap_or_else(default_trace_setting));
+    TraceContent {
+        wireless_device_frame_info: settled(requested.wireless_device_frame_info),
+        log_level: settled(requested.log_level),
+        multicast_frame_info: settled(requested.multicast_frame_info),
+    }
+}
+
+/// [`TRACE_SETTING_DISABLED`] as an owned value.
+fn default_trace_setting() -> String {
+    TRACE_SETTING_DISABLED.to_string()
+}
+
 /// The `ResourceNotFoundException` body for a network analyzer configuration the account
 /// does not hold.
 ///
 /// One function, so every operation that addresses a configuration by `Name` — its
-/// reader and its updater — refuses a missing one with the same body, worded the way
-/// [`resource_not_found`] words this error class for every kind this service addresses by
-/// an identifier.
+/// reader, its updater and its delete — refuses a missing one with the same body: the
+/// sentence this service words this error class with around the `ConfigurationName` the
+/// request addressed, which is its only variable part, and the two optional members the
+/// model merely permits (`ResourceId`, `ResourceType`) left unset, which is how this
+/// service answers the configuration lookup.
 pub fn network_analyzer_configuration_not_found(name: &str) -> ResourceNotFoundException {
-    resource_not_found("NetworkAnalyzerConfiguration", name)
+    ResourceNotFoundException {
+        message: Some(format!("Configuration {name} is not exist")),
+        resource_id: None,
+        resource_type: None,
+    }
 }
 
 /// The most wireless devices one network analyzer configuration tracks.
@@ -1876,10 +1919,9 @@ pub struct ComAmazonawsIotwirelessIotwirelessState {
 /// last resort rather than a behaviour change: at most one token is recorded per stored
 /// resource, a resource's tokens are dropped with it where its delete is implemented
 /// (`forget_*_tokens_for`, which the destination, wireless-device, device-profile,
-/// service-profile, multicast-group, FUOTA-task, wireless-gateway and
-/// wireless-gateway-task-definition deletes call — the network-analyzer-configuration
-/// delete is still scaffolded, so that one map releases a token only when the whole
-/// store is dropped), and each
+/// service-profile, multicast-group, FUOTA-task, wireless-gateway,
+/// wireless-gateway-task-definition and network-analyzer-configuration deletes call),
+/// and each
 /// token cap equals its resource ceiling — so the map can only reach `cap` when every
 /// entry in it names a resource the store accepted and the resource store is itself
 /// full, which the create already refuses before it gets here. Eviction exists so the
@@ -2329,6 +2371,32 @@ impl ComAmazonawsIotwirelessIotwirelessState {
             MAX_NETWORK_ANALYZER_CONFIGURATION_TOKENS,
             token,
             record,
+        );
+    }
+
+    /// Take network analyzer configuration `name` out of the store, together with the
+    /// idempotency tokens that minted it.
+    ///
+    /// `None` for a name the store does not hold, which is what lets the delete refuse an
+    /// unknown `ConfigurationName` from the same call that removes a known one. The tokens
+    /// go because a token must not outlive the resource it names, and the name is free for
+    /// another configuration to claim once this one is gone.
+    pub fn remove_network_analyzer_configuration(
+        &mut self,
+        name: &str,
+    ) -> Option<NetworkAnalyzerConfiguration> {
+        let removed = self.network_analyzer_configurations.remove(name)?;
+        self.forget_network_analyzer_configuration_tokens_for(name);
+        Some(removed)
+    }
+
+    /// Drop every idempotency token that minted network analyzer configuration `name`, so
+    /// a token never outlives the resource it names.
+    pub fn forget_network_analyzer_configuration_tokens_for(&mut self, name: &str) {
+        forget_tokens_for(
+            &mut self.network_analyzer_configuration_tokens,
+            &mut self.network_analyzer_configuration_token_order,
+            name,
         );
     }
 

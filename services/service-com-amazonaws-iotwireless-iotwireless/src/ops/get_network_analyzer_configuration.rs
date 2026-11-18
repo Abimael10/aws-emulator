@@ -182,8 +182,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         Ok(GetNetworkAnalyzerConfigurationOutput {
             arn: Some(configuration.arn.clone()),
             name: Some(configuration.name.clone()),
-            description: configuration.description.clone(),
-            trace_content: configuration.trace_content.clone(),
+            // The description and the trace settings are REPORTED, not omitted: the
+            // configuration carries a settled value for each of them (the empty string
+            // for a description nobody set, the default for a trace setting nobody set),
+            // so a client reading them unconditionally sees what the service stored and a
+            // get/modify/update round trip cannot lose a setting it never saw.
+            description: Some(configuration.description.clone()),
+            trace_content: Some(configuration.trace_content.clone()),
             // A tracked-resource list is REPORTED, not omitted, when the configuration
             // tracks nothing of that kind: an empty list is this reader's answer about
             // what the configuration tracks, the same answer every later read gives

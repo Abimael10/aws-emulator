@@ -15,6 +15,13 @@
 //!   over the modelled `LogLevel`, `WirelessDeviceFrameInfo` and `MulticastFrameInfo`
 //!   catalogs, both presence states of every optional member, and a name at its
 //!   published length ceiling;
+//! * a stored configuration is FULLY SPECIFIED: the create settles a description the
+//!   request left out at the empty string and every trace setting it left out at that
+//!   setting's default, so the reader reports all of them, at create and after an update
+//!   that mentions neither;
+//! * `DeleteNetworkAnalyzerConfiguration` removes the configuration, so every later
+//!   operation that addresses the name is the modelled 404 and the name is free to claim
+//!   again;
 //! * a configuration holds a SET of tracked resources: an id given twice is tracked
 //!   once, `UpdateNetworkAnalyzerConfiguration` adds the ids it is told to add and drops
 //!   the ids it is told to remove, and a configuration that tracks nothing of a kind
@@ -44,6 +51,7 @@ use service_com_amazonaws_iotwireless_iotwireless::state::{
 
 use super::destination_and_wireless_device_lifecycle::{call, error_code, router, ACCOUNT, REGION};
 use super::multicast_group_lifecycle::call_signed_for;
+use super::multicast_group_update_and_delete::{call_with_headers, Answer};
 
 /// `LogLevel`'s modelled values — the model-generated constant, so the suite and the
 /// service cannot drift apart.
@@ -62,6 +70,77 @@ const MULTICAST_FRAME_INFOS: &[&str] =
 /// Source: `smithy_query(query="operation",
 /// operation="CreateNetworkAnalyzerConfiguration")`.
 const NAME_MAX_LEN: usize = 1024;
+
+/// The setting a trace-content member carries when the create left it unset: tracing off.
+/// Source: `smithy_query(query="shape", shape="TraceContent")` — `DISABLED` is the one
+/// value `WirelessDeviceFrameInfo` (ENABLED | DISABLED), `LogLevel`
+/// (INFO | ERROR | DISABLED) and `MulticastFrameInfo` (ENABLED | DISABLED) all carry.
+const UNSET_TRACE_SETTING: &str = "DISABLED";
+
+/// The trace content a stored configuration must report for the `TraceContent` a create
+/// carried: every member the request set, and [`UNSET_TRACE_SETTING`] for every member it
+/// left unset — including a create that carried no `TraceContent` at all.
+fn settled_trace_content(requested: Option<&Value>) -> Value {
+    let member = |name: &str| {
+        requested
+            .and_then(|content| content.get(name).cloned())
+            .unwrap_or_else(|| json!(UNSET_TRACE_SETTING))
+    };
+    json!({
+        "WirelessDeviceFrameInfo": member("WirelessDeviceFrameInfo"),
+        "LogLevel": member("LogLevel"),
+        "MulticastFrameInfo": member("MulticastFrameInfo"),
+    })
+}
+
+/// The sentence this service words the configuration not-found refusal with, around the
+/// `ConfigurationName` the refused request addressed.
+fn not_found_message(name: &str) -> String {
+    format!("Configuration {name} is not exist")
+}
+
+async fn delete_config(router: &MultiServiceRouter, name: &str) -> Answer {
+    call_with_headers(
+        router,
+        Method::DELETE,
+        &format!("/network-analyzer-configurations/{name}"),
+        None,
+    )
+    .await
+}
+
+/// The refusal every configuration-addressing operation gives for a `Name` the account
+/// does not hold: 404 `ResourceNotFoundException`, the error shape named in
+/// `x-amzn-errortype`, and the service's sentence for this error class around the
+/// requested name.
+fn assert_not_found(case: &str, operation: &str, name: &str, answered: &Answer) {
+    assert_eq!(
+        answered.status,
+        StatusCode::NOT_FOUND,
+        "case {case:?}: expected 404 from {operation}, got {} {}",
+        answered.status,
+        answered.body
+    );
+    assert_eq!(
+        error_code(&answered.body),
+        "ResourceNotFoundException",
+        "case {case:?}: expected ResourceNotFoundException from {operation}, got {}",
+        answered.body
+    );
+    assert_eq!(
+        answered.error_type, "ResourceNotFoundException",
+        "case {case:?}: expected {operation} to name the error shape in x-amzn-errortype, \
+         got {:?}",
+        answered.error_type
+    );
+    let expected = not_found_message(name);
+    assert_eq!(
+        answered.body["Message"].as_str(),
+        Some(expected.as_str()),
+        "case {case:?}: expected the not-found sentence {expected:?} from {operation}, got {}",
+        answered.body
+    );
+}
 
 async fn create_config(router: &MultiServiceRouter, body: Value) -> (StatusCode, Value) {
     call(
@@ -254,7 +333,8 @@ async fn a_network_analyzer_configuration_round_trips_through_get() {
     let groups = seed_groups(&router, 2).await;
 
     let mut cases = vec![
-        // Nothing but the required member: every optional member must come back absent.
+        // Nothing but the required member: the stored configuration is still fully
+        // specified, so the reader reports a description and all three trace settings.
         Case {
             case: "name-only",
             name: "NacNameOnly".to_string(),
@@ -420,20 +500,23 @@ async fn a_network_analyzer_configuration_round_trips_through_get() {
             case.name,
             fetched["Name"]
         );
+        // A stored configuration is fully specified, so the reader reports a description
+        // for one the create never set (the empty string) and all three trace settings,
+        // the ones this create left unset at their default.
+        let expected_description = case.description.clone().unwrap_or_default();
         assert_eq!(
             fetched.get("Description").cloned(),
-            case.description.as_ref().map(|text| json!(text)),
-            "case {:?}: expected Description {:?}, got {:?}",
+            Some(json!(expected_description)),
+            "case {:?}: expected Description {expected_description:?}, got {:?}",
             case.case,
-            case.description,
             fetched.get("Description")
         );
+        let expected_trace = settled_trace_content(case.trace_content.as_ref());
         assert_eq!(
             fetched.get("TraceContent").cloned(),
-            case.trace_content.clone(),
-            "case {:?}: expected TraceContent {:?}, got {:?}",
+            Some(expected_trace.clone()),
+            "case {:?}: expected TraceContent {expected_trace}, got {:?}",
             case.case,
-            case.trace_content,
             fetched.get("TraceContent")
         );
         assert_tracked(
@@ -715,6 +798,102 @@ async fn an_update_replaces_only_the_members_the_request_carries() {
     }
 }
 
+/// A trace setting the service settled at create survives an update that does not mention
+/// it, and the reader keeps reporting all three settings — so a caller can confirm a
+/// setting it applied, and an update meant to preserve one is not indistinguishable from
+/// one that cleared it.
+#[tokio::test]
+async fn a_settled_trace_setting_survives_an_update_that_does_not_mention_it() {
+    let router = router();
+
+    // (case, the TraceContent the create carries, the PATCH body that follows it)
+    let cases: Vec<(&str, Option<Value>, Value)> = vec![
+        (
+            "no trace content at all, the description patched",
+            None,
+            json!({ "Description": "patched" }),
+        ),
+        (
+            "the log level alone, the description patched",
+            Some(json!({ "LogLevel": LOG_LEVELS[1] })),
+            json!({ "Description": "patched" }),
+        ),
+        (
+            "the device frame info alone, the log level patched",
+            Some(json!({ "WirelessDeviceFrameInfo": WIRELESS_DEVICE_FRAME_INFOS[1] })),
+            json!({ "TraceContent": { "LogLevel": LOG_LEVELS[2] } }),
+        ),
+        (
+            "the multicast frame info alone, nothing patched",
+            Some(json!({ "MulticastFrameInfo": MULTICAST_FRAME_INFOS[1] })),
+            json!({}),
+        ),
+        (
+            "two settings, the third patched",
+            Some(json!({
+                "LogLevel": LOG_LEVELS[0],
+                "WirelessDeviceFrameInfo": WIRELESS_DEVICE_FRAME_INFOS[1],
+            })),
+            json!({ "TraceContent": { "MulticastFrameInfo": MULTICAST_FRAME_INFOS[1] } }),
+        ),
+    ];
+
+    for (index, (case, trace_content, patch)) in cases.iter().enumerate() {
+        let name = format!("NacSettled{index}");
+        let mut body = json!({ "Name": name });
+        if let Some(trace_content) = trace_content {
+            body["TraceContent"] = trace_content.clone();
+        }
+        let (status, created) = create_config(&router, body).await;
+        assert_eq!(
+            status,
+            StatusCode::CREATED,
+            "case {case:?}: expected 201, got {status} {created}"
+        );
+
+        let settled = settled_trace_content(trace_content.as_ref());
+        let (_, fetched) = get_config(&router, &name).await;
+        assert_eq!(
+            fetched["TraceContent"], settled,
+            "case {case:?}: expected the settled TraceContent {settled} right after the \
+             create, got {:?}",
+            fetched["TraceContent"]
+        );
+
+        let (status, answered) = update_config(&router, &name, patch.clone()).await;
+        assert_eq!(
+            status,
+            StatusCode::NO_CONTENT,
+            "case {case:?}: expected 204 from the patch, got {status} {answered}"
+        );
+
+        // Only the settings the patch mentioned move; the rest keep the value the create
+        // settled them at.
+        let mut expected = settled.clone();
+        if let Some(patched) = patch.get("TraceContent").and_then(Value::as_object) {
+            for (member, value) in patched {
+                expected[member] = value.clone();
+            }
+        }
+        let expected_description = patch
+            .get("Description")
+            .cloned()
+            .unwrap_or_else(|| json!(""));
+        let (_, fetched) = get_config(&router, &name).await;
+        assert_eq!(
+            fetched["TraceContent"], expected,
+            "case {case:?}: expected TraceContent {expected} after the patch, got {:?}",
+            fetched["TraceContent"]
+        );
+        assert_eq!(
+            fetched["Description"], expected_description,
+            "case {case:?}: expected Description {expected_description} after the patch, \
+             got {:?}",
+            fetched["Description"]
+        );
+    }
+}
+
 /// Every tracked id is a reference resolved against real state: an id no resource holds
 /// is the modelled 404, whether the create or the update names it, and the refused call
 /// persists nothing.
@@ -837,35 +1016,219 @@ async fn a_tracked_id_is_resolved_against_real_state() {
 }
 
 /// A name the store does not hold is the modelled 404 from every operation that addresses
-/// a configuration by it.
+/// a configuration by it, worded with the service's sentence for this error class around
+/// the requested name.
 #[tokio::test]
 async fn a_name_the_store_does_not_hold_is_a_404() {
     let router = router();
 
     for case in ["NacMissing", "x", &"n".repeat(NAME_MAX_LEN)] {
-        let (status, refused) = get_config(&router, case).await;
+        let answered = call_with_headers(
+            &router,
+            Method::GET,
+            &format!("/network-analyzer-configurations/{case}"),
+            None,
+        )
+        .await;
+        assert_not_found(case, "GetNetworkAnalyzerConfiguration", case, &answered);
+
+        let answered = call_with_headers(
+            &router,
+            Method::PATCH,
+            &format!("/network-analyzer-configurations/{case}"),
+            Some(json!({ "Description": "whatever" })),
+        )
+        .await;
+        assert_not_found(case, "UpdateNetworkAnalyzerConfiguration", case, &answered);
+
+        let answered = delete_config(&router, case).await;
+        assert_not_found(case, "DeleteNetworkAnalyzerConfiguration", case, &answered);
+    }
+}
+
+/// A delete is observable: the configuration is gone from every operation that addresses
+/// it, the configurations it was stored beside are untouched, and the name is free for a
+/// fresh create.
+#[tokio::test]
+async fn deleting_a_configuration_is_observable_by_the_next_read() {
+    let router = router();
+    seed_destination(&router, "NacDeleteDest").await;
+    let devices = seed_devices(&router, "NacDeleteDest", 1).await;
+
+    // (case, the create body, whether the configuration is patched before being deleted)
+    let cases: Vec<(&str, Value, bool)> = vec![
+        (
+            "every member set",
+            json!({
+                "Name": "NacDeleteFull",
+                "Description": "delete me",
+                "TraceContent": {
+                    "LogLevel": LOG_LEVELS[0],
+                    "WirelessDeviceFrameInfo": WIRELESS_DEVICE_FRAME_INFOS[0],
+                    "MulticastFrameInfo": MULTICAST_FRAME_INFOS[0],
+                },
+                "WirelessDevices": [devices[0].clone()],
+            }),
+            false,
+        ),
+        (
+            "the required member alone",
+            json!({ "Name": "NacDeleteNameOnly" }),
+            false,
+        ),
+        (
+            "patched before the delete",
+            json!({ "Name": "Nac_Delete_Patched", "Description": "before" }),
+            true,
+        ),
+        (
+            "name at the ceiling",
+            json!({ "Name": "d".repeat(NAME_MAX_LEN) }),
+            false,
+        ),
+    ];
+
+    // One configuration nothing in this test deletes: a delete removes the name it
+    // addresses and nothing else.
+    let (status, kept) = create_config(&router, json!({ "Name": "NacDeleteKept" })).await;
+    assert_eq!(
+        status,
+        StatusCode::CREATED,
+        "seeding the kept configuration: expected 201, got {status} {kept}"
+    );
+
+    for (case, body, patch_first) in &cases {
+        let name = body["Name"].as_str().expect("a Name").to_string();
+        let (status, created) = create_config(&router, body.clone()).await;
         assert_eq!(
             status,
-            StatusCode::NOT_FOUND,
-            "case {case:?}: expected 404 from the reader, got {status} {refused}"
+            StatusCode::CREATED,
+            "case {case:?}: expected 201, got {status} {created}"
         );
+        if *patch_first {
+            let (status, patched) =
+                update_config(&router, &name, json!({ "Description": "after" })).await;
+            assert_eq!(
+                status,
+                StatusCode::NO_CONTENT,
+                "case {case:?}: expected 204 from the patch, got {status} {patched}"
+            );
+        }
+
+        let answered = delete_config(&router, &name).await;
         assert_eq!(
-            error_code(&refused),
-            "ResourceNotFoundException",
-            "case {case:?}: expected ResourceNotFoundException, got {refused}"
+            answered.status,
+            StatusCode::NO_CONTENT,
+            "case {case:?}: expected 204 from the delete, got {} {}",
+            answered.status,
+            answered.body
         );
 
-        let (status, refused) =
-            update_config(&router, case, json!({ "Description": "whatever" })).await;
+        // Every operation that addresses the deleted name now refuses it, and a second
+        // delete is refused too: the record is gone, not tombstoned into a live answer.
+        let answered = call_with_headers(
+            &router,
+            Method::GET,
+            &format!("/network-analyzer-configurations/{name}"),
+            None,
+        )
+        .await;
+        assert_not_found(case, "GetNetworkAnalyzerConfiguration", &name, &answered);
+        let answered = call_with_headers(
+            &router,
+            Method::PATCH,
+            &format!("/network-analyzer-configurations/{name}"),
+            Some(json!({ "Description": "ghost" })),
+        )
+        .await;
+        assert_not_found(case, "UpdateNetworkAnalyzerConfiguration", &name, &answered);
+        let answered = delete_config(&router, &name).await;
+        assert_not_found(case, "DeleteNetworkAnalyzerConfiguration", &name, &answered);
+
+        // The name is free again, and what the fresh create stores is all the reader
+        // reports: nothing of the deleted configuration survives under the same name.
+        let (status, recreated) = create_config(&router, json!({ "Name": name })).await;
         assert_eq!(
             status,
-            StatusCode::NOT_FOUND,
-            "case {case:?}: expected 404 from the update, got {status} {refused}"
+            StatusCode::CREATED,
+            "case {case:?}: the name must be free after the delete, got {status} {recreated}"
+        );
+        let (status, fetched) = get_config(&router, &name).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "case {case:?}: expected 200 from the re-created configuration, got {status} \
+             {fetched}"
         );
         assert_eq!(
-            error_code(&refused),
-            "ResourceNotFoundException",
-            "case {case:?}: expected ResourceNotFoundException, got {refused}"
+            fetched["Description"],
+            json!(""),
+            "case {case:?}: the re-created configuration must carry its own description, \
+             got {:?}",
+            fetched["Description"]
+        );
+        assert_tracked(case, "WirelessDevices", &[], &fetched);
+    }
+
+    let (status, fetched) = get_config(&router, "NacDeleteKept").await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the configuration no call deleted must still resolve, got {status} {fetched}"
+    );
+}
+
+/// A deleted configuration releases the `ClientRequestToken` that minted it: the token
+/// names no live resource any more, so replaying it creates a configuration again rather
+/// than replaying an answer about one that is gone.
+#[tokio::test]
+async fn a_deleted_configuration_releases_its_idempotency_token() {
+    let router = router();
+
+    for (case, token) in [
+        ("hyphenated token", "nac-delete-token-1"),
+        ("token with underscores", "nac_delete_token_2"),
+    ] {
+        let name = format!("NacTokenDelete{}", token.replace(['-', '_'], ""));
+        let body = json!({
+            "Name": name,
+            "Description": "tokened",
+            "ClientRequestToken": token,
+        });
+        let (status, first) = create_config(&router, body.clone()).await;
+        assert_eq!(
+            status,
+            StatusCode::CREATED,
+            "case {case:?}: expected 201, got {status} {first}"
+        );
+
+        let answered = delete_config(&router, &name).await;
+        assert_eq!(
+            answered.status,
+            StatusCode::NO_CONTENT,
+            "case {case:?}: expected 204 from the delete, got {} {}",
+            answered.status,
+            answered.body
+        );
+
+        let (status, replayed) = create_config(&router, body.clone()).await;
+        assert_eq!(
+            status,
+            StatusCode::CREATED,
+            "case {case:?}: replaying the token of a deleted configuration must create it \
+             again, got {status} {replayed}"
+        );
+        let (status, fetched) = get_config(&router, &name).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "case {case:?}: expected 200 after the replay, got {status} {fetched}"
+        );
+        assert_eq!(
+            fetched["Description"],
+            json!("tokened"),
+            "case {case:?}: expected the replayed create's description, got {:?}",
+            fetched["Description"]
         );
     }
 }
