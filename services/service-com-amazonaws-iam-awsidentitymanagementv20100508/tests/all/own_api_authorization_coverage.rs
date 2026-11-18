@@ -302,7 +302,8 @@ async fn an_operation_nothing_allows_is_refused() {
                 "because no identity-based policy allows the {} action",
                 row.iam_action
             )),
-            "case {case:?}: expected the refusal to end at the reason, got {message:?}"
+            "case {case:?}: expected the refusal to state why the grant was withheld, got \
+             {message:?}"
         );
     }
 }

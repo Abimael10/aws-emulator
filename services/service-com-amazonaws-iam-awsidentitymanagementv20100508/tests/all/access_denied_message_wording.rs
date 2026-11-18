@@ -145,7 +145,9 @@ fn cases(policy_arn: &str) -> Vec<Case> {
             reason: no_allow("iam:ListGroups"),
         },
         // Another collection and another action, to show the resource form moves nothing
-        // but the resource the refusal names.
+        // but the resource the refusal names — this is the action an assumed-role session is
+        // refused on in
+        // `core/router/tests/all/eks_pod_identity_credentials_are_scoped_to_the_role.rs`.
         Case {
             case: "implicit deny listing roles",
             policies: Vec::new(),
@@ -356,7 +358,7 @@ fn cases(policy_arn: &str) -> Vec<Case> {
         // A grant for the refused action itself whose CONDITION does not hold at the
         // instant of the call: the statement was read and does not apply, which is again
         // the withholding — so these two rows are worded exactly as their no-document
-        // twins above are, each as its own action is.
+        // twins above are.
         Case {
             case: "withheld tag listing, the caller's grant not yet in effect",
             policies: vec![(
@@ -559,6 +561,9 @@ async fn a_refusal_names_the_decision_and_points_at_its_authorization_details() 
     let router = router();
     target_user(&router).await;
     let policy_arn = managed_policy(&router).await;
+    // The id each row's refusal pointed at, so no two rows are pointed at under one id:
+    // the pointer names THAT request's evaluation, and these rows are different requests.
+    let mut pointed_at: Vec<(&str, String)> = Vec::new();
 
     for (row, case) in cases(&policy_arn).into_iter().enumerate() {
         let user_name = format!("denied{row}");
@@ -603,12 +608,21 @@ async fn a_refusal_names_the_decision_and_points_at_its_authorization_details() 
         let clause = message
             .strip_prefix(&sentence)
             .expect("the sentence the shared assertion just matched");
-        assert!(
-            authorization_details_id(clause).is_some(),
-            "case {:?}: expected the refusal to point at the authorization details of the \
-             request, got {clause:?} after the reason",
-            case.case
-        );
+        let id = authorization_details_id(clause).unwrap_or_else(|| {
+            panic!(
+                "case {:?}: expected the refusal to point at the authorization details of \
+                 the request, got {clause:?} after the reason",
+                case.case
+            )
+        });
+        if let Some((earlier, _)) = pointed_at.iter().find(|(_, seen)| seen == id) {
+            panic!(
+                "case {:?}: expected its own authorization id, got {id:?} — the one case \
+                 {earlier:?} was pointed at under",
+                case.case
+            );
+        }
+        pointed_at.push((case.case, id.to_string()));
     }
 }
 
@@ -680,17 +694,17 @@ async fn the_same_refused_call_is_worded_identically_every_time() {
             &keyings,
         ),
     ] {
-        let expected = format!(
+        let sentence = format!(
             "User: {caller} is not authorized to perform: {iam_action} on resource: \
              {named_as} {}",
             no_allow(iam_action),
         );
         let mut ids: Vec<String> = Vec::new();
         for (attempt, message) in messages.iter().enumerate() {
-            let clause = message.strip_prefix(&expected).unwrap_or_else(|| {
+            let clause = message.strip_prefix(&sentence).unwrap_or_else(|| {
                 panic!(
                     "case {action} attempt {attempt}: expected every refusal of the same \
-                     call to open {expected:?}, got {message:?}"
+                     call to open {sentence:?}, got {message:?}"
                 )
             });
             let pointed_at = authorization_details_id(clause).unwrap_or_else(|| {

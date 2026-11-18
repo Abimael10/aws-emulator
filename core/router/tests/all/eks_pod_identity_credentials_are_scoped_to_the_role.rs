@@ -466,7 +466,8 @@ fn exchange(
 /// pod-bound token — is handed a session of the association's role, and that session may do
 /// exactly what the role's identity-based policies (narrowed by the association's session
 /// policy) allow: served where they allow the call, refused HTTP 403 `AccessDenied` naming
-/// the session, the action, the resource and the reason where they do not.
+/// the session, the action, the resource and the reason, and pointing at the authorization
+/// details of the request, where they do not.
 #[test]
 fn a_pod_identity_credential_from_the_published_endpoint_carries_the_roles_permissions() {
     std::thread::Builder::new()

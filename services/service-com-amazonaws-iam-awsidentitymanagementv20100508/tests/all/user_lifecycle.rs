@@ -403,13 +403,13 @@ pub(crate) fn assert_access_denied_message(
              resource and to close with the reason {expected:?}, got {actual:?}"
         );
     };
-    let pointed_at = authorization_details_id(rest);
-    assert!(
-        pointed_at.is_some(),
-        "case {case:?}: expected the refusal to continue with the authorization-details \
-         pointer, got {rest:?} after the reason"
-    );
-    pointed_at.unwrap_or_default().to_string()
+    let Some(pointed_at) = authorization_details_id(rest) else {
+        panic!(
+            "case {case:?}: expected the refusal to continue with the authorization-details \
+             pointer, naming one id in both of its slots, got {rest:?} after the reason"
+        );
+    };
+    pointed_at.to_string()
 }
 
 /// The fixed text of the clause a refusal continues with, up to the authorization id: the
