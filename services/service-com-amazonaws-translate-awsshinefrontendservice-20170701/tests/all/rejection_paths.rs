@@ -17,11 +17,73 @@
 use serde_json::{json, Value};
 
 use service_com_amazonaws_translate_awsshinefrontendservice_20170701::ops::types::DISPLAY_LANGUAGE_CODE_VALUES;
-use service_com_amazonaws_translate_awsshinefrontendservice_20170701::state::DISPLAY_LANGUAGE_CODE_VALUE_SET;
 
 use crate::terminology_lifecycle::{
     call, error_code, expected_arn, import, message, router, string_at, ACCOUNT, EN_FR_CSV,
 };
+
+/// The envelope a request refused for one broken constraint is stated in.
+fn one_violation(clause: &str) -> String {
+    format!("1 validation error detected: {clause}")
+}
+
+/// The clause stating that `value`, submitted at `path`, is outside the
+/// enumerated type's accepted-value set — the set listed as the service lists
+/// it.
+fn enum_clause(value: &str, path: &str, value_set: &str) -> String {
+    format!(
+        "Value '{value}' at '{path}' failed to satisfy constraint: Member must satisfy enum \
+         value set: {value_set}"
+    )
+}
+
+/// The clause stating that `value`, submitted at `path`, does not match the
+/// expression the member's values have to match.
+fn pattern_clause(value: &str, path: &str, expression: &str) -> String {
+    format!(
+        "Value '{value}' at '{path}' failed to satisfy constraint: Member must satisfy regular \
+         expression pattern: {expression}"
+    )
+}
+
+/// The base64 encoding `awsJson1_1` carries a blob member in.
+fn blob(file: &[u8]) -> String {
+    aws_smithy_types::base64::encode(file)
+}
+
+/// A `CreateParallelData` request whose members are all inside their
+/// constraints, for a test to break exactly one of them.
+fn parallel_data_body(name: &str) -> Value {
+    json!({
+        "Name": name,
+        "ClientToken": "client-token-1",
+        "ParallelDataConfig": {"S3Uri": "s3://bucket-one/corpus.tsv", "Format": "TSV"},
+    })
+}
+
+/// An `ImportTerminology` request whose members are all inside their
+/// constraints, for a test to break exactly one of them.
+fn import_terminology_body(name: &str) -> Value {
+    json!({
+        "Name": name,
+        "MergeStrategy": "OVERWRITE",
+        "TerminologyData": {"File": blob(EN_FR_CSV), "Format": "CSV"},
+    })
+}
+
+/// A `StartTextTranslationJob` request whose members are all inside their
+/// constraints, for a test to break exactly one of them.
+fn translation_job_body(name: &str) -> Value {
+    json!({
+        "JobName": name,
+        "InputDataConfig": {"S3Uri": "s3://bucket-one/in/", "ContentType": "text/plain"},
+        "OutputDataConfig": {"S3Uri": "s3://bucket-one/out/"},
+        "DataAccessRoleArn": "arn:aws:iam::123456789012:role/translate-batch",
+        "SourceLanguageCode": "en",
+        "TargetLanguageCodes": ["fr"],
+        "ClientToken": "client-token-2",
+    })
+}
 
 /// The documented size limit on a translation request's text, in BYTES: "The
 /// text string can be a maximum of 10,000 bytes long"
@@ -335,56 +397,126 @@ async fn a_missing_terminology_refusal_names_the_resource_the_operation_addresse
     );
 }
 
-/// An out-of-set `DisplayLanguageCode` is refused with the accepted value set
-/// stated in the order this service emits it — the SET is the model's, the ORDER
-/// is the service's, and only the rejected value varies with the request.
+/// An out-of-set enum value is refused with the accepted-value set listed in
+/// the order this service's front door lists it — the SET is the model's, the
+/// ORDER follows from the values themselves, so every member targeting one
+/// enumerated type reads alike and only the rejected value varies with the
+/// request.
+///
+/// The rows span the operations and the depths such a member is carried at: a
+/// top-level member, a member of a nested structure, and two types declaring
+/// the same three values in different orders — which are listed identically,
+/// because the listing belongs to the value set and not to the declaration.
 #[tokio::test]
-async fn the_enum_refusal_states_the_value_set_in_the_services_order() {
-    // The set the service states is exactly the set the model declares
-    // (`DISPLAY_LANGUAGE_CODE_VALUES` is generated from it), so the two can
-    // only ever differ in order.
-    let mut declared: Vec<&str> = DISPLAY_LANGUAGE_CODE_VALUES.to_vec();
-    declared.sort_unstable();
-    let mut stated: Vec<&str> = DISPLAY_LANGUAGE_CODE_VALUE_SET.to_vec();
-    stated.sort_unstable();
+async fn the_enum_refusal_lists_the_value_set_in_the_order_the_service_states_it() {
+    struct Row {
+        case: &'static str,
+        operation: &'static str,
+        body: Value,
+        path: &'static str,
+        value: &'static str,
+        /// The accepted-value set as a clause lists it. Source for the values:
+        /// `smithy_query(query="shape", shape="com.amazonaws.translate#<Enum>")`.
+        value_set: &'static str,
+    }
+
+    let mut bad_format = parallel_data_body("enum-parallel-data");
+    bad_format["ParallelDataConfig"]["Format"] = json!("XLIFF");
+    let mut bad_directionality = import_terminology_body("enum-terms");
+    bad_directionality["TerminologyData"]["Directionality"] = json!("BI");
+    let mut bad_strategy = import_terminology_body("enum-strategy-terms");
+    bad_strategy["MergeStrategy"] = json!("APPEND");
+
+    let rows = [
+        Row {
+            case: "DisplayLanguageCode, a top-level member",
+            operation: "ListLanguages",
+            body: json!({"DisplayLanguageCode": "xx"}),
+            path: "displayLanguageCode",
+            value: "xx",
+            value_set: "[de, zh-TW, pt, ko, en, it, fr, zh, es, ja]",
+        },
+        Row {
+            case: "TerminologyDataFormat, a top-level member",
+            operation: "GetTerminology",
+            body: json!({"Name": "ghost-terms", "TerminologyDataFormat": "XLIFF"}),
+            path: "terminologyDataFormat",
+            value: "XLIFF",
+            value_set: "[CSV, TSV, TMX]",
+        },
+        Row {
+            case: "ParallelDataFormat, nested in a structure member",
+            operation: "CreateParallelData",
+            body: bad_format,
+            path: "parallelDataConfig.format",
+            value: "XLIFF",
+            value_set: "[CSV, TSV, TMX]",
+        },
+        Row {
+            case: "Directionality, nested in a structure member",
+            operation: "ImportTerminology",
+            body: bad_directionality,
+            path: "terminologyData.directionality",
+            value: "BI",
+            value_set: "[UNI, MULTI]",
+        },
+        Row {
+            case: "MergeStrategy, a one-value type",
+            operation: "ImportTerminology",
+            body: bad_strategy,
+            path: "mergeStrategy",
+            value: "APPEND",
+            value_set: "[OVERWRITE]",
+        },
+        Row {
+            case: "Formality, nested in a structure member",
+            operation: "TranslateText",
+            body: json!({
+                "Text": "hello there",
+                "SourceLanguageCode": "en",
+                "TargetLanguageCode": "fr",
+                "Settings": {"Formality": "CASUAL"},
+            }),
+            path: "settings.formality",
+            value: "CASUAL",
+            value_set: "[FORMAL, INFORMAL]",
+        },
+    ];
+
+    // The order is not the model's declaration order, so the rows above cannot
+    // be reading one list against itself.
     assert_eq!(
-        stated, declared,
-        "the stated value set must hold exactly the model's values, got {stated:?}"
-    );
-    assert_ne!(
-        DISPLAY_LANGUAGE_CODE_VALUE_SET, DISPLAY_LANGUAGE_CODE_VALUES,
-        "the service's order is not the model's declaration order, so the check above \
-         must not be comparing one list with itself"
+        DISPLAY_LANGUAGE_CODE_VALUES.join(", "),
+        "de, en, es, fr, it, ja, ko, pt, zh, zh-TW",
+        "the model declares this type's values in a different order from the one a clause \
+         lists them in"
     );
 
-    let expected_set = DISPLAY_LANGUAGE_CODE_VALUE_SET.join(", ");
     let router = router();
-
-    // Rejected values: a code no language uses, another one, and two values
-    // that differ from a declared one only in case.
-    for value in ["zz", "qq", "EN", "zh-tw"] {
-        let (status, body) = call(
-            &router,
-            "ListLanguages",
-            &json!({"DisplayLanguageCode": value}),
-        )
-        .await;
-        assert_eq!(status, 400, "case {value:?}: got {status} {body}");
+    for row in &rows {
+        let (status, answered) = call(&router, row.operation, &row.body).await;
         assert_eq!(
-            message(&body),
-            format!(
-                "1 validation error detected: Value '{value}' at 'displayLanguageCode' \
-                 failed to satisfy constraint: Member must satisfy enum value set: \
-                 [{expected_set}]"
-            ),
-            "case {value:?}: got {body}"
+            status, 400,
+            "case {:?}: expected a constraint refusal, got {status} {answered}",
+            row.case
+        );
+        assert_eq!(
+            error_code(&answered),
+            "ValidationException",
+            "case {:?}: got {answered}",
+            row.case
+        );
+        let expected = one_violation(&enum_clause(row.value, row.path, row.value_set));
+        let reported = message(&answered);
+        assert_eq!(
+            reported, expected,
+            "case {:?}: expected {expected:?}, got {reported:?}",
+            row.case
         );
     }
 
-    // Every value the model declares is admitted past that validation. The
-    // operation itself is still a scaffold (its own stub issue covers standing
-    // it up), so the refusal it answers with must be the scaffold's, never the
-    // value-set one.
+    // A value the model declares is admitted past that validation, whatever the
+    // order the set is listed in.
     for value in DISPLAY_LANGUAGE_CODE_VALUES {
         let (_, body) = call(
             &router,
@@ -395,6 +527,154 @@ async fn the_enum_refusal_states_the_value_set_in_the_services_order() {
         assert!(
             !message(&body).contains("enum value set"),
             "case {value:?}: a declared value must not be refused by the value set, got {body}"
+        );
+    }
+}
+
+/// A value outside a member's `@pattern` is refused with the expression quoted
+/// as this API publishes it: WITHOUT the `^`/`$` pair the model writes around it
+/// to turn a find into a whole-value match. The rule holds for every
+/// pattern-constrained member of the service, so the rows span four operations
+/// and both depths such a member is carried at.
+#[tokio::test]
+async fn the_pattern_refusal_quotes_the_expression_without_whole_value_anchors() {
+    struct Row {
+        case: &'static str,
+        operation: &'static str,
+        body: Value,
+        path: &'static str,
+        value: &'static str,
+        /// The expression a clause quotes: the member's `@pattern` without the
+        /// whole-value pair. Source for each pattern:
+        /// `smithy_query(query="shape", shape="com.amazonaws.translate#<Shape>")`.
+        expression: &'static str,
+    }
+
+    let mut bad_token = parallel_data_body("pattern-parallel-data");
+    bad_token["ClientToken"] = json!("client token 3");
+    let mut bad_uri = parallel_data_body("pattern-uri-parallel-data");
+    bad_uri["ParallelDataConfig"]["S3Uri"] = json!("https://example.com/corpus.tsv");
+    let mut bad_key = import_terminology_body("pattern-terms");
+    bad_key["EncryptionKey"] = json!({"Type": "KMS", "Id": "not a key id!"});
+    let mut bad_role = translation_job_body("pattern-job");
+    bad_role["DataAccessRoleArn"] = json!("arn:aws:iam::123456789012:user/not-a-role");
+    let mut bad_content_type = translation_job_body("pattern-content-type-job");
+    bad_content_type["InputDataConfig"]["ContentType"] = json!("plain text");
+
+    let rows = [
+        Row {
+            case: "a terminology name, a top-level member",
+            operation: "GetTerminology",
+            body: json!({"Name": "ghost terms!"}),
+            path: "name",
+            value: "ghost terms!",
+            expression: r"([A-Za-z0-9-]_?)+",
+        },
+        Row {
+            case: "a pagination token, a top-level member",
+            operation: "ListLanguages",
+            body: json!({"NextToken": "caf\u{e9}"}),
+            path: "nextToken",
+            value: "caf\u{e9}",
+            expression: r"\p{ASCII}{0,8192}",
+        },
+        Row {
+            case: "an idempotency token, a top-level member",
+            operation: "CreateParallelData",
+            body: bad_token,
+            path: "clientToken",
+            value: "client token 3",
+            expression: r"[a-zA-Z0-9-]+",
+        },
+        Row {
+            case: "an object-storage URI, nested in a structure member",
+            operation: "CreateParallelData",
+            body: bad_uri,
+            path: "parallelDataConfig.s3Uri",
+            value: "https://example.com/corpus.tsv",
+            expression: r"s3://[a-z0-9][\.\-a-z0-9]{1,61}[a-z0-9](/.*)?",
+        },
+        Row {
+            case: "an encryption key id, nested in a structure member",
+            operation: "ImportTerminology",
+            body: bad_key,
+            path: "encryptionKey.id",
+            value: "not a key id!",
+            expression: r"(arn:aws((-us-gov)|(-iso)|(-iso-b)|(-cn))?:kms:)?([a-z]{2}-[a-z]+(-[a-z]+)?-\d:)?(\d{12}:)?(((key/)?[a-zA-Z0-9-_]+)|(alias/[a-zA-Z0-9:/_-]+))",
+        },
+        Row {
+            case: "a role ARN, a top-level member",
+            operation: "StartTextTranslationJob",
+            body: bad_role,
+            path: "dataAccessRoleArn",
+            value: "arn:aws:iam::123456789012:user/not-a-role",
+            expression: r"arn:aws(-[^:]+)?:iam::[0-9]{12}:role/.+",
+        },
+        Row {
+            case: "a content type, nested in a structure member",
+            operation: "StartTextTranslationJob",
+            body: bad_content_type,
+            path: "inputDataConfig.contentType",
+            value: "plain text",
+            expression: r"[-\w.]+\/[-\w.+]+",
+        },
+    ];
+
+    let router = router();
+    for row in &rows {
+        let (status, answered) = call(&router, row.operation, &row.body).await;
+        assert_eq!(
+            status, 400,
+            "case {:?}: expected a constraint refusal, got {status} {answered}",
+            row.case
+        );
+        assert_eq!(
+            error_code(&answered),
+            "ValidationException",
+            "case {:?}: got {answered}",
+            row.case
+        );
+        let expected = one_violation(&pattern_clause(row.value, row.path, row.expression));
+        let reported = message(&answered);
+        assert_eq!(
+            reported, expected,
+            "case {:?}: expected {expected:?}, got {reported:?}",
+            row.case
+        );
+        // Stated plainly, because it is the whole point of the rendering: the
+        // quoted expression carries neither end of the model's anchor pair.
+        assert!(
+            !reported.contains(&format!("pattern: ^{}$", row.expression)),
+            "case {:?}: the quoted expression must carry no whole-value anchors, got \
+             {reported:?}",
+            row.case
+        );
+    }
+
+    // Every one of those members ACCEPTS a value its expression admits: the
+    // rendering above changed what a refusal says, not what is refused.
+    for (case, operation, body) in [
+        (
+            "an admitted idempotency token",
+            "CreateParallelData",
+            parallel_data_body("pattern-ok-parallel-data"),
+        ),
+        (
+            "an admitted encryption key id",
+            "ImportTerminology",
+            import_terminology_body("pattern-ok-terms"),
+        ),
+        (
+            "an admitted role ARN",
+            "StartTextTranslationJob",
+            translation_job_body("pattern-ok-job"),
+        ),
+    ] {
+        let (_, answered) = call(&router, operation, &body).await;
+        assert!(
+            !message(&answered).contains("regular expression pattern"),
+            "case {case:?}: a value the expression admits must not be refused by it, got \
+             {answered}"
         );
     }
 }

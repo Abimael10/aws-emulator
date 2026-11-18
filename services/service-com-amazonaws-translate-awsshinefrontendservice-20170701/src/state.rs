@@ -146,19 +146,6 @@ pub const MAX_TAGS_PER_RESOURCE: usize = 50;
 /// rule and its own modelled refusal.
 pub const MAX_TEXT_BYTES: usize = 10_000;
 
-/// The values `DisplayLanguageCode` declares (`smithy_query
-/// shape=DisplayLanguageCode`), in the order this service renders an
-/// accepted-value set into a constraint-violation message.
-///
-/// The set is the model's; the ORDER is the service's own — neither sorted nor
-/// the model's declaration order — and it is part of the fixed text of that
-/// message, so a caller parsing the accepted values out of a refusal reads the
-/// list the service really emits. `tests/all/rejection_paths.rs` pins this list
-/// to the same ten codes the model declares, so it can only ever differ from
-/// the model in order.
-pub const DISPLAY_LANGUAGE_CODE_VALUE_SET: &[&str] =
-    &["de", "zh-TW", "pt", "ko", "en", "it", "fr", "zh", "es", "ja"];
-
 /// `MaxResultsInteger`'s ceiling, which is also the page size a listing uses
 /// when the request names none (`range 1..500`).
 pub const MAX_LIST_PAGE_SIZE: i32 = 500;
