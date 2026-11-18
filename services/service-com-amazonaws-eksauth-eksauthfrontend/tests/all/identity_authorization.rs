@@ -25,6 +25,13 @@
 //!
 //! The principals are made with IAM's and STS's OWN operations over the same engine, so the
 //! documents this service reads are the ones those services wrote.
+//!
+//! Two further tables span the rule along the axes the ones above hold fixed: WHICH KIND of
+//! principal a call speaks for (a session of an assumed role, an IAM user's own long-term
+//! access key, the account's own published credential), each sending ONE identical request the
+//! service itself would refuse on its input — so the code a caller is answered with is shown to
+//! be decided by the caller and not by the request; and the PERMISSIONS BOUNDARY in force on
+//! the principal, which caps what its own documents grant.
 
 use std::sync::Arc;
 
@@ -642,5 +649,376 @@ async fn the_accounts_own_credential_is_not_bounded_by_this_decision() {
             "case {case:?}: expected the exchange to be served, got {}",
             reply.body
         );
+    }
+}
+
+/// One identity-based policy document carrying several statements, each `(effect, actions,
+/// resource)` — what a boundary that allows one thing and denies another needs, and what a
+/// single-statement [`statement`] cannot express.
+fn statements(entries: &[(&str, &[&str], &str)]) -> String {
+    let listed: Vec<Value> = entries
+        .iter()
+        .map(|(effect, actions, resource)| {
+            json!({"Effect": effect, "Action": actions, "Resource": resource})
+        })
+        .collect();
+    json!({"Version": "2012-10-17", "Statement": listed}).to_string()
+}
+
+/// Create an IAM user carrying `policies` as its inline policies and one long-term access key
+/// of its own, and answer that key with the ARN a refusal must blame the user by — what
+/// `iam:GetUser` holds for it, read back from the operation that made it.
+async fn iam_user(aws: &Emulator, user_name: &str, policies: &[String]) -> Principal {
+    let created = aws
+        .query(
+            "iam",
+            "2010-05-08",
+            "CreateUser",
+            &[("UserName", user_name.to_string())],
+        )
+        .await;
+    for (index, policy) in policies.iter().enumerate() {
+        aws.query(
+            "iam",
+            "2010-05-08",
+            "PutUserPolicy",
+            &[
+                ("UserName", user_name.to_string()),
+                ("PolicyName", format!("inline-{index}")),
+                ("PolicyDocument", policy.clone()),
+            ],
+        )
+        .await;
+    }
+    let key = aws
+        .query(
+            "iam",
+            "2010-05-08",
+            "CreateAccessKey",
+            &[("UserName", user_name.to_string())],
+        )
+        .await;
+    Principal {
+        access_key_id: xml_element(&key, "AccessKeyId")
+            .unwrap_or_else(|| panic!("CreateAccessKey answers an AccessKeyId, got {key}")),
+        arn: xml_element(&created, "Arn")
+            .unwrap_or_else(|| panic!("CreateUser answers the user's Arn, got {created}")),
+    }
+}
+
+/// Put `document` in force as the permissions boundary of the role `role_name`, through IAM's
+/// own operations: a boundary is attached as a MANAGED policy, so the document is created as
+/// one first and the role is capped by its ARN.
+async fn attach_boundary(aws: &Emulator, role_name: &str, policy_name: &str, document: &str) {
+    let created = aws
+        .query(
+            "iam",
+            "2010-05-08",
+            "CreatePolicy",
+            &[
+                ("PolicyName", policy_name.to_string()),
+                ("PolicyDocument", document.to_string()),
+            ],
+        )
+        .await;
+    let policy_arn = xml_element(&created, "Arn")
+        .unwrap_or_else(|| panic!("CreatePolicy answers the policy's Arn, got {created}"));
+    aws.query(
+        "iam",
+        "2010-05-08",
+        "PutRolePermissionsBoundary",
+        &[
+            ("RoleName", role_name.to_string()),
+            ("PermissionsBoundary", policy_arn),
+        ],
+    )
+    .await;
+}
+
+/// What kind of principal a call speaks for — the thing the decision resolves before it can
+/// read any document at all.
+#[derive(Debug, Clone, Copy)]
+enum CallerKind {
+    /// A session STS minted for an assumed role: the permissions are the ROLE's.
+    RoleSession,
+    /// An IAM user's own long-term access key: the permissions are the USER's.
+    IamUser,
+    /// The account's own published credential, which holds no IAM policies.
+    AccountCredential,
+}
+
+/// One row of the caller table: who sends the ONE identical request, and the refusal that
+/// request must be answered with because of who sent it.
+struct CallerRow {
+    case: &'static str,
+    kind: CallerKind,
+    /// The documents in force on the principal, where it can carry any.
+    policies: fn() -> Vec<String>,
+    /// The reason clause IAM's refusal must carry, or `None` when this caller is admitted and
+    /// the answer is decided by the REQUEST instead.
+    refused: Option<fn() -> String>,
+}
+
+/// THE RULE, along the KIND of caller: the code a request is answered with is decided by the
+/// CALLER's permissions, taken before the request's own input is read — so one identical
+/// request the service would refuse on its input is answered `AccessDeniedException` for a
+/// principal no readable document allows (and for one an explicit `Deny` names), and answered
+/// on its INPUT for every principal that may perform the action. A session of an assumed role,
+/// an IAM user's own long-term key and the account's own published credential are each resolved
+/// to the principal they speak for, so the decision is about the principal rather than about
+/// the credential's form.
+///
+/// The request is the same in every row and is one the service itself refuses: it addresses a
+/// cluster name the modelled pattern accepts and this account does not hold, and carries a
+/// value that is not a JSON Web Token at all.
+#[tokio::test]
+async fn the_code_an_identical_request_is_answered_with_is_decided_by_the_caller() {
+    let rows: &[CallerRow] = &[
+        CallerRow {
+            case: "a role session an explicit deny of this action refuses",
+            kind: CallerKind::RoleSession,
+            policies: || {
+                vec![
+                    statement("Allow", &["*"], "*"),
+                    statement("Deny", &[ACTION], "*"),
+                ]
+            },
+            refused: Some(|| EXPLICIT_DENY.to_string()),
+        },
+        CallerRow {
+            case: "a role session an explicit deny of this whole service refuses",
+            kind: CallerKind::RoleSession,
+            policies: || vec![statement("Deny", &["eks-auth:*"], "*")],
+            refused: Some(|| EXPLICIT_DENY.to_string()),
+        },
+        CallerRow {
+            case: "a role session carrying no document at all",
+            kind: CallerKind::RoleSession,
+            policies: Vec::new,
+            refused: Some(no_policy_allows),
+        },
+        CallerRow {
+            case: "a role session allowed every action",
+            kind: CallerKind::RoleSession,
+            policies: || vec![statement("Allow", &["*"], "*")],
+            refused: None,
+        },
+        CallerRow {
+            case: "a role session allowed exactly this action",
+            kind: CallerKind::RoleSession,
+            policies: || vec![statement("Allow", &[ACTION], "*")],
+            refused: None,
+        },
+        CallerRow {
+            case: "an IAM user signing with its own key, refused by an explicit deny",
+            kind: CallerKind::IamUser,
+            policies: || {
+                vec![
+                    statement("Allow", &["*"], "*"),
+                    statement("Deny", &[ACTION], "*"),
+                ]
+            },
+            refused: Some(|| EXPLICIT_DENY.to_string()),
+        },
+        CallerRow {
+            case: "an IAM user signing with its own key, carrying no document at all",
+            kind: CallerKind::IamUser,
+            policies: Vec::new,
+            refused: Some(no_policy_allows),
+        },
+        CallerRow {
+            case: "an IAM user signing with its own key, allowed this action",
+            kind: CallerKind::IamUser,
+            policies: || vec![statement("Allow", &[ACTION], "*")],
+            refused: None,
+        },
+        CallerRow {
+            case: "the account's own published credential",
+            kind: CallerKind::AccountCredential,
+            policies: Vec::new,
+            refused: None,
+        },
+    ];
+
+    // The cluster the identical request addresses: a name the modelled pattern accepts that the
+    // seeded account does not hold, so no row's verdict can come from a stored record.
+    let addressed = cluster_resource(REGION, OTHER_CLUSTER);
+    for (index, row) in rows.iter().enumerate() {
+        let aws = Emulator::seeded();
+        let caller = match row.kind {
+            CallerKind::RoleSession => {
+                assumed_role(&aws, &format!("bogus-caller-{index}"), &(row.policies)()).await
+            }
+            CallerKind::IamUser => {
+                iam_user(&aws, &format!("bogus-user-{index}"), &(row.policies)()).await
+            }
+            // Neither STS nor IAM holds a record for this key, so it speaks for the account
+            // itself, which no refusal below names.
+            CallerKind::AccountCredential => Principal {
+                access_key_id: ACCOUNT_KEY.to_string(),
+                arn: String::new(),
+            },
+        };
+        let reply = aws
+            .assume_as(&caller.access_key_id, OTHER_CLUSTER, MALFORMED_TOKEN)
+            .await;
+        match row.refused {
+            Some(reason) => {
+                assert_eq!(
+                    reply.verdict(),
+                    format!("{CLIENT_ERROR_STATUS} {ACCESS_DENIED}"),
+                    "case {:?}: expected the modelled authorization refusal, got {}",
+                    row.case,
+                    reply.body
+                );
+                assert_eq!(
+                    reply.message,
+                    not_authorized(&caller.arn, &addressed, &reason()),
+                    "case {:?}: expected IAM's sentence naming {caller_arn:?}, got {message:?}",
+                    row.case,
+                    caller_arn = caller.arn,
+                    message = reply.message
+                );
+            }
+            None => {
+                // The caller may perform the action, so the request is read — and this one
+                // breaks the constraint the model declares on the token.
+                assert_eq!(
+                    reply.verdict(),
+                    format!("{CLIENT_ERROR_STATUS} {INVALID_PARAMETER}"),
+                    "case {:?}: expected the request-shape refusal, got {}",
+                    row.case,
+                    reply.body
+                );
+                assert!(
+                    reply.message.contains("Value at 'token'"),
+                    "case {:?}: expected the refusal to name the member it refused, got {:?}",
+                    row.case,
+                    reply.message
+                );
+                assert!(
+                    !reply.body.contains(MALFORMED_TOKEN),
+                    "case {:?}: the token is @sensitive and must not be quoted back, got {}",
+                    row.case,
+                    reply.body
+                );
+            }
+        }
+        assert_eq!(
+            aws.sessions(),
+            0,
+            "case {:?}: a request refused on either ground mints no session",
+            row.case
+        );
+    }
+}
+
+/// The reason clause for a grant the caller's permissions boundary does not also allow: "a
+/// permissions boundary sets the maximum permissions that an identity-based policy can grant"
+/// (IAM, permissions boundaries), so a boundary that states nothing about the action withholds
+/// it.
+fn no_boundary_allows() -> String {
+    format!("because no permissions boundary allows the {ACTION} action")
+}
+
+/// The reason clause for a grant an explicit `Deny` in the boundary refuses — a fact about that
+/// document, so the sentence names it rather than the principal's own policies.
+const BOUNDARY_EXPLICIT_DENY: &str = "with an explicit deny in a permissions boundary";
+
+/// One row of the boundary table: the boundary document in force on the caller's role, and
+/// what the call must be answered with under it.
+struct BoundaryRow {
+    case: &'static str,
+    /// The boundary document, built from the cluster ARN the call addresses so a row can scope
+    /// the ceiling to exactly that resource.
+    boundary: fn(&str) -> String,
+    /// The reason clause a refusal must carry, or `None` when the exchange must be served.
+    refused: Option<fn() -> String>,
+}
+
+/// THE RULE, along the document that CAPS a principal: the permissions boundary in force on the
+/// caller is part of the decision, so a boundary that allows the action lets the grant through,
+/// one that states nothing about it withholds the grant its own policies gave, and an explicit
+/// `Deny` in it refuses the call. Every row's role carries the same wildcard grant, so only the
+/// boundary differs — and the request is one the service serves, so an admitted row proves the
+/// exchange still happens.
+#[tokio::test]
+async fn the_permissions_boundary_caps_what_the_callers_own_policies_grant() {
+    let rows: &[BoundaryRow] = &[
+        BoundaryRow {
+            case: "a boundary allowing this service's actions",
+            boundary: |_| statement("Allow", &["eks-auth:*"], "*"),
+            refused: None,
+        },
+        BoundaryRow {
+            case: "a boundary allowing exactly this action on this cluster",
+            boundary: |cluster| statement("Allow", &[ACTION], cluster),
+            refused: None,
+        },
+        BoundaryRow {
+            case: "a boundary allowing this action on another cluster only",
+            boundary: |_| statement("Allow", &[ACTION], &cluster_resource(REGION, OTHER_CLUSTER)),
+            refused: Some(no_boundary_allows),
+        },
+        BoundaryRow {
+            case: "a boundary stating nothing about this service",
+            boundary: |_| statement("Allow", &["eks:*"], "*"),
+            refused: Some(no_boundary_allows),
+        },
+        BoundaryRow {
+            case: "a boundary denying this action beside allowing every other",
+            boundary: |_| statements(&[("Allow", &["*"], "*"), ("Deny", &[ACTION], "*")]),
+            refused: Some(|| BOUNDARY_EXPLICIT_DENY.to_string()),
+        },
+    ];
+
+    let addressed = cluster_resource(REGION, CLUSTER);
+    for (index, row) in rows.iter().enumerate() {
+        let case = row.case;
+        let aws = Emulator::seeded();
+        let role_name = format!("bounded-caller-{index}");
+        let caller = assumed_role(&aws, &role_name, &[statement("Allow", &["*"], "*")]).await;
+        attach_boundary(
+            &aws,
+            &role_name,
+            &format!("boundary-{index}"),
+            &(row.boundary)(&addressed),
+        )
+        .await;
+        let token = aws.issued_token();
+        let reply = aws.assume_as(&caller.access_key_id, CLUSTER, &token).await;
+        match row.refused {
+            Some(reason) => {
+                assert_eq!(
+                    reply.verdict(),
+                    format!("{CLIENT_ERROR_STATUS} {ACCESS_DENIED}"),
+                    "case {case:?}: expected the modelled authorization refusal, got {}",
+                    reply.body
+                );
+                assert_eq!(
+                    reply.message,
+                    not_authorized(&caller.arn, &addressed, &reason()),
+                    "case {case:?}: expected IAM's sentence, got {:?}",
+                    reply.message
+                );
+                assert_eq!(
+                    aws.sessions(),
+                    0,
+                    "case {case:?}: a capped call mints no session"
+                );
+            }
+            None => {
+                assert_eq!(
+                    reply.status, 200,
+                    "case {case:?}: expected a caller its boundary permits to be served, got {}",
+                    reply.body
+                );
+                assert_eq!(
+                    aws.sessions(),
+                    1,
+                    "case {case:?}: an exchange that was served records its session"
+                );
+            }
+        }
     }
 }
