@@ -18,9 +18,11 @@
 //! where that minute began before the range did, that minute having no other instant to be
 //! reported at.**
 //!
-//! So the storage granularity decides both the span a range is judged against and the bucket a
-//! datapoint is reported at: a regular-resolution datapoint stands for the minute it is stored
-//! in, not for the instant inside that minute it happened to be published at.
+//! So the storage granularity decides what a range is judged against, which PERIODS the
+//! datapoint is served to, and the bucket it is reported at: a regular-resolution datapoint
+//! stands for the minute it is stored in, not for the instant inside that minute it happened to
+//! be published at, and a read at a period finer than that minute is served no datapoint of it
+//! at all (the `metric_storage_resolution` suite holds that half of the rule).
 //!
 //! The rows differ along what the rule generalises over: where inside its minute the observation
 //! is published (the first second, the middle, and the last second — the phase that decides
@@ -219,13 +221,18 @@ async fn a_read_selects_by_the_publish_instant_and_reports_at_the_stored_bucket(
 
         // The bucket the rule puts the observation in: the period window of its own publish
         // instant where the sub-minute detail is stored, and the whole minute it was published
-        // in otherwise. Every period here divides a minute, so the two agree at one minute.
-        let expected_stamp = if resolution == Some(1) {
+        // in otherwise. Every period here divides a minute, so the two agree at one minute. A
+        // read at a period FINER than the granularity the series is stored at is served no
+        // datapoint at all: the series holds none at it
+        // (`crate::state::windows_by_unit`, and the `metric_storage_resolution` suite).
+        let expected: Vec<(f64, f64)> = if resolution == Some(1) {
             #[allow(clippy::cast_precision_loss)]
             let span = period as f64;
-            (stamp / span).floor() * span
+            vec![((stamp / span).floor() * span, VALUE)]
+        } else if period >= 60 {
+            vec![(base, VALUE)]
         } else {
-            base
+            Vec::new()
         };
 
         for (reader, got) in [
@@ -253,10 +260,9 @@ async fn a_read_selects_by_the_publish_instant_and_reports_at_the_stored_bucket(
             ),
         ] {
             assert_eq!(
-                got,
-                vec![(expected_stamp, VALUE)],
+                got, expected,
                 "case {case:?}: expected {reader} to report the one published observation as \
-                 ({expected_stamp}, {VALUE}), got {got:?}"
+                 {expected:?}, got {got:?}"
             );
         }
     }
@@ -274,7 +280,8 @@ async fn a_range_the_stored_span_does_not_reach_selects_nothing() {
 
     // (case, the StorageResolution published, whether the span it is stored as reaches the
     // range) — the span that reaches it holds the observation, and reports it under that
-    // span's own start.
+    // span's own start, at every period the series is stored at or coarser: a read at a finer
+    // period is served no datapoint of it at all.
     let rows: [(&str, Option<i64>, bool); 3] = [
         ("high resolution", Some(1), false),
         ("regular resolution", Some(60), true),
@@ -289,7 +296,8 @@ async fn a_range_the_stored_span_does_not_reach_selects_nothing() {
             // minute: the minute the observation is stored in reaches into the range; the
             // second it is stored in does not.
             publish(&router, &metric, resolution, base + 50.0).await;
-            let expected: Vec<(f64, f64)> = if reaches {
+            let expected: Vec<(f64, f64)> = if reaches && (resolution == Some(1) || period >= 60)
+            {
                 vec![(base, VALUE)]
             } else {
                 Vec::new()

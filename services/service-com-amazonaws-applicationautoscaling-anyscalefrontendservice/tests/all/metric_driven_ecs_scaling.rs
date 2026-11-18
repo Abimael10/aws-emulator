@@ -378,6 +378,13 @@ async fn a_metric_driven_policy_scales_an_ecs_service_running_on_launched_ec2_ca
                     "MetricName": FED_METRIC,
                     "Dimensions": [{"Name": "ServiceName", "Value": SERVICE}],
                     "Value": PUBLISHED_VALUE,
+                    // The alarms above are evaluated on a sub-minute period, which a series is
+                    // readable at only when it is STORED at that resolution: "Data points with
+                    // a period of less than 60 seconds are available only for custom metrics
+                    // defined with a StorageResolution of 1"
+                    // (`MetricDatum$StorageResolution`), a regular-resolution datapoint holding
+                    // no sub-minute detail at all.
+                    "StorageResolution": 1,
                 }],
             }),
         )

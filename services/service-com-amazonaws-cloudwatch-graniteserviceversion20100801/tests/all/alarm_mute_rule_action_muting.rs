@@ -426,7 +426,14 @@ async fn an_active_mute_rule_mutes_the_actions_a_targeted_alarm_s_transition_fir
         }
 
         // The transition itself: the state the alarm moves to is what selects the actions it
-        // fires, muted or not.
+        // fires, muted or not. A COMPOSITE alarm's state is derived from its children's
+        // current states, so creating it already settles it into the state its rule computes
+        // and fires that state's own actions — before any mute rule exists. What this row is
+        // about is the transition BELOW, so anything that first settling delivered is drained
+        // first.
+        if row.composite {
+            let _settled = delivered(&emulator, &queue_url, 1, QUIET_READS).await;
+        }
         set_alarm_state(&emulator, &alarm_name, row.forced_state).await;
 
         // "the targeted alarms continue to evaluate metrics and transition between states"
@@ -457,6 +464,15 @@ async fn an_active_mute_rule_mutes_the_actions_a_targeted_alarm_s_transition_fir
                     item.get("HistorySummary")
                         .and_then(Value::as_str)
                         .is_some_and(|summary| summary.contains("executed action"))
+                        // The actions of THIS row's transition: an earlier settling of the
+                        // alarm into another state fired that state's own actions, which no
+                        // mute rule of this row was in force for.
+                        && item
+                            .get("HistoryData")
+                            .and_then(Value::as_str)
+                            .is_some_and(|data| {
+                                data.contains(&format!("\"stateValue\":\"{}\"", row.forced_state))
+                            })
                 })
                 .collect();
             assert!(

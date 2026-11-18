@@ -324,16 +324,20 @@ impl EvaluationBudget {
 /// still report the state it forced, and the state is nevertheless taken back with no further
 /// call.
 ///
-/// What takes it back is the alarm's own next evaluation, brought forward of that alarm's
-/// period the way every transient state of this emulator is: the span is SECONDS, long enough
-/// that it outlives more than the next datapoint — a forced state is an input to every alarm
-/// whose rule READS this one ("The alarms specified in a composite alarm's rule expression can
-/// include metric alarms", `PutCompositeAlarm`), and each of those parents is owed its own
-/// evaluation a span after the force ([`super::COMPOSITE_EVALUATION_DELAY_SECS`]), so a force
-/// an arriving datapoint could reclaim at once would be a state nothing could ever read —
-/// and short enough that a client WAITING for the alarm to come back to its actual state, so
-/// that the transition it asks for next is a transition at all, gets there inside one session.
-const FORCED_STATE_SECS: f64 = 3.0;
+/// What takes it back is the alarm's own next evaluation, which is one of that alarm's PERIODS
+/// away ("the length, in seconds, used each time the metric specified in MetricName is
+/// evaluated", `PutMetricAlarmInput$Period`) — so the span is the alarm's period, capped here.
+/// The CAP is this emulator's own choice: one minute, the cadence a standard-resolution series
+/// is evaluated at and the shortest period `Period` admits above its sub-minute values, so an
+/// alarm of any longer period holds a forced state for that minute rather than for its own
+/// hours. It is what a CLIENT DRIVING A SCENARIO through forced states needs: a forced state is
+/// an input to every alarm whose rule READS this one ("The alarms specified in a composite
+/// alarm's rule expression can include metric alarms", `PutCompositeAlarm`), so it has to
+/// outlive the client's own round trips — the watch it keeps on the parent to see that the rule
+/// does NOT hold yet, and the force it then puts on the next child — or no client could ever
+/// observe the rule coming to hold. It is bounded all the same, so a client WAITING for the
+/// alarm to come back to its actual state gets there inside one session.
+const FORCED_STATE_SECS: f64 = 60.0;
 
 /// How one evaluated window's datapoint stands against the alarm's threshold.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

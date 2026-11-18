@@ -15,11 +15,13 @@
 //! key of that ARN at all.
 //!
 //! Every refused row asserts the same two things the recorded behaviour asserts: the refusal a
-//! client branches on — one wire error code for EVERY usability failure, in the request's own
-//! status class, rather than one of the three modelled 400 faults whose sentences those refusals
-//! carry — and that the association did NOT take effect, so `GetDataset` still reports what it
-//! reported before the call. The one modelled fault this operation does answer, for a key ARN
-//! addressed in another Region, is covered by the `datasets` suite.
+//! client branches on — one wire error code for EVERY failure of the dry run, in the request's
+//! own status class, rather than one of the three modelled 400 faults whose sentences describe
+//! those conditions — and that the association did NOT take effect, so `GetDataset` still
+//! reports what it reported before the call. The dry run does not report WHICH of its checks
+//! failed, so every outcome but the key's own state carries one sentence naming the key
+//! (`crate::state::dataset_kms_key::unable_to_validate_message`) and a key KMS holds in a state
+//! that admits no cryptographic operation carries the other one.
 //!
 //! The emulator and the KMS wire calls come from the suite that drives this service's OTHER
 //! decision over a customer managed key (`sns_action_publish_grant`), so KMS is mounted and asked
@@ -50,10 +52,10 @@ const DOCUMENTED_PERMISSIONS: [&str; 5] = [
 /// usability failure surfaces as, rather than one per failure mode.
 const DENIED_CODE: &str = "AccessDenied";
 
-/// The fault this operation declares for a `KmsKeyArn` that resolves to no key at all
-/// (`smithy_query(query="operation",operation="AssociateDatasetKmsKey")`), which is what an
-/// identifier naming no key is answered with whether the Region or the key itself is missing.
-const NOT_FOUND_CODE: &str = "KmsKeyNotFoundException";
+/// The permissions a caller of this operation holds on the key beside this service's own: "The
+/// calling principal must have kms:Decrypt permission on the key." (`AssociateDatasetKmsKey`) —
+/// what the rows that DENY the caller take away.
+const CALLER_PERMISSION: &str = "kms:Decrypt";
 
 /// An ARN of the form `AssociateDatasetKmsKeyInput$KmsKeyArn` requires, for the rows whose key
 /// AWS KMS holds nothing for.
@@ -130,11 +132,44 @@ async fn reported_key(emulator: &Emulator, case: &str) -> Option<String> {
 enum Expected {
     /// The key is usable, so the association takes effect and the dataset reports it.
     Associated,
-    /// The key EXISTS and this service cannot use it: the one refusal every usability failure
-    /// carries, and the phrase of its message that says what has to be repaired.
-    Denied(&'static str),
-    /// The identifier resolves to no key at all, which is the modelled fault for it.
-    NotFound,
+    /// The dry run did not pass on the KEY: the one refusal every such failure carries, in the
+    /// request's own status class, and which sentence of the two that refusal states.
+    Denied(Sentence),
+    /// The dry run did not pass on the CALLER's own authority over the key: the same wire code,
+    /// in the status an authorization failure carries.
+    DeniedToTheCaller,
+}
+
+/// Which sentence a refusal states — the ones the dry run tells apart. Each is the text the
+/// behavioural recordings of this operation compare exactly, written out here rather than read
+/// off the implementation's own constants.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Sentence {
+    /// The key could not be validated for the association, whichever check found that.
+    NotValidated,
+    /// KMS holds the key in a state that admits no cryptographic operation.
+    Disabled,
+    /// The authorization refusal of the dry run run with the CALLER's own credentials, over the
+    /// calling principal and the key.
+    TheCallersOwn,
+}
+
+impl Sentence {
+    /// The whole message this sentence states about `key_arn`, as the service words it.
+    fn message(self, key_arn: &str) -> String {
+        match self {
+            Self::NotValidated => format!(
+                "Unable to validate KMS key {key_arn}. Verify the key exists and the key policy \
+                 grants kms:DescribeKey to the CloudWatch service principal."
+            ),
+            Self::Disabled => format!("KMS key {key_arn} is disabled."),
+            Self::TheCallersOwn => format!(
+                "User: {} is not authorized to perform: kms:Decrypt on resource: {key_arn} \
+                 with an explicit deny in a resource-based policy",
+                service_common::caller_principal::ambient_user_arn()
+            ),
+        }
+    }
 }
 
 /// How a row sets its key up.
@@ -166,6 +201,8 @@ enum Policy {
     ViaThisService,
     /// The same grant scoped to ANOTHER service's endpoint, which this use is not made through.
     ViaAnotherService,
+    /// The documented permissions, with the CALLER's own `kms:Decrypt` denied outright.
+    DocumentedWithTheCallerDenied,
 }
 
 impl Policy {
@@ -198,25 +235,20 @@ impl Policy {
                     "kms:ViaService": format!("sns.{DEFAULT_REGION}.amazonaws.com"),
                 }}}),
             )]),
+            // The caller of this emulator is the principal its own published credential speaks
+            // for, which is what `sts:GetCallerIdentity` reports for such a request.
+            Self::DocumentedWithTheCallerDenied => key_policy(vec![
+                service_statement("Allow", json!(DOCUMENTED_PERMISSIONS), json!({})),
+                key_statement(
+                    "Deny",
+                    json!({"AWS": service_common::caller_principal::ambient_user_arn()}),
+                    json!(CALLER_PERMISSION),
+                    json!({}),
+                ),
+            ]),
         }
     }
 }
-
-/// The phrase a refusal of a key whose policy withholds the use carries ("the key policy does not
-/// grant Amazon CloudWatch the permissions it needs to use the key", `KmsAccessDeniedException`).
-const POLICY_PHRASE: &str = "the key policy does not grant Amazon CloudWatch";
-
-/// The phrase a refusal of a key no cryptographic operation can be performed under carries
-/// (`KmsKeyDisabledException`).
-const DISABLED_PHRASE: &str = "is disabled or pending deletion";
-
-/// The phrase a refusal of a key data cannot be sealed under carries
-/// (`AssociateDatasetKmsKeyInput$KmsKeyArn`: "It must be a symmetric encryption KMS key").
-const SPEC_PHRASE: &str = "must be a symmetric encryption KMS key";
-
-/// The phrase a refusal of a key AWS KMS holds nothing for carries
-/// (`KmsKeyNotFoundException`: "The specified … key could not be found").
-const NOT_FOUND_PHRASE: &str = "could not be found";
 
 /// Set `key` up in KMS and answer the ARN the association names.
 async fn given(emulator: &Emulator, case: &str, key: Key) -> String {
@@ -247,11 +279,11 @@ async fn given(emulator: &Emulator, case: &str, key: Key) -> String {
 #[tokio::test]
 async fn an_association_takes_effect_only_for_a_key_this_service_can_use() {
     // (the case, how the key is set up, what the association must answer)
-    let rows: [(&str, Key, Expected); 9] = [
+    let rows: [(&str, Key, Expected); 10] = [
         (
             "a key whose policy names only the account root",
             Key::WithPolicy(Policy::AccountRootOnly),
-            Expected::Denied(POLICY_PHRASE),
+            Expected::Denied(Sentence::NotValidated),
         ),
         (
             "a key whose policy grants the documented permissions",
@@ -266,7 +298,7 @@ async fn an_association_takes_effect_only_for_a_key_this_service_can_use() {
         (
             "a key whose policy denies one documented permission outright",
             Key::WithPolicy(Policy::DocumentedWithExplicitDeny),
-            Expected::Denied(POLICY_PHRASE),
+            Expected::Denied(Sentence::NotValidated),
         ),
         (
             "a key granted through this service's own endpoint",
@@ -276,22 +308,27 @@ async fn an_association_takes_effect_only_for_a_key_this_service_can_use() {
         (
             "a key granted only through another service's endpoint",
             Key::WithPolicy(Policy::ViaAnotherService),
-            Expected::Denied(POLICY_PHRASE),
+            Expected::Denied(Sentence::NotValidated),
+        ),
+        (
+            "a key whose policy denies the CALLER the one operation it needs",
+            Key::WithPolicy(Policy::DocumentedWithTheCallerDenied),
+            Expected::DeniedToTheCaller,
         ),
         (
             "a permissioned key that has been disabled",
             Key::Disabled,
-            Expected::Denied(DISABLED_PHRASE),
+            Expected::Denied(Sentence::Disabled),
         ),
         (
             "a permissioned asymmetric key",
             Key::Asymmetric,
-            Expected::Denied(SPEC_PHRASE),
+            Expected::Denied(Sentence::NotValidated),
         ),
         (
             "an ARN KMS holds no key for",
             Key::Unheld,
-            Expected::NotFound,
+            Expected::Denied(Sentence::NotValidated),
         ),
     ];
 
@@ -314,7 +351,7 @@ async fn an_association_takes_effect_only_for_a_key_this_service_can_use() {
                     "case {case:?}: the dataset must report the key it was associated with"
                 );
             }
-            Expected::Denied(phrase) => {
+            Expected::Denied(sentence) => {
                 assert_eq!(
                     status, 400,
                     "case {case:?}: expected HTTP 400, got {status} with {answered}"
@@ -325,9 +362,11 @@ async fn an_association_takes_effect_only_for_a_key_this_service_can_use() {
                     "case {case:?}: expected the {DENIED_CODE} code, got {answered}"
                 );
                 let message = error_message(&answered);
-                assert!(
-                    message.contains(phrase),
-                    "case {case:?}: expected a refusal naming {phrase:?}, got {message:?}"
+                assert_eq!(
+                    message,
+                    sentence.message(&key_arn),
+                    "case {case:?}: expected the {sentence:?} sentence naming the key, got \
+                     {message:?}"
                 );
                 assert_eq!(
                     reported_key(&emulator, case).await,
@@ -335,20 +374,23 @@ async fn an_association_takes_effect_only_for_a_key_this_service_can_use() {
                     "case {case:?}: a refused association must leave the dataset with no key"
                 );
             }
-            Expected::NotFound => {
+            Expected::DeniedToTheCaller => {
                 assert_eq!(
-                    status, 400,
-                    "case {case:?}: expected HTTP 400, got {status} with {answered}"
+                    status, 403,
+                    "case {case:?}: expected HTTP 403, got {status} with {answered}"
                 );
                 assert_eq!(
                     error_code(&answered),
-                    NOT_FOUND_CODE,
-                    "case {case:?}: expected the {NOT_FOUND_CODE} fault, got {answered}"
+                    DENIED_CODE,
+                    "case {case:?}: expected the {DENIED_CODE} code, got {answered}"
                 );
+                // The authorization refusal over the calling principal and the key, which is
+                // what the dry run run with the caller's credentials answers.
                 let message = error_message(&answered);
-                assert!(
-                    message.contains(NOT_FOUND_PHRASE),
-                    "case {case:?}: expected a refusal naming {NOT_FOUND_PHRASE:?}, got \
+                assert_eq!(
+                    message,
+                    Sentence::TheCallersOwn.message(&key_arn),
+                    "case {case:?}: expected the refusal of the caller's own dry run, got \
                      {message:?}"
                 );
                 assert_eq!(
@@ -375,29 +417,40 @@ enum Repair {
 /// about the request.
 #[tokio::test]
 async fn the_same_call_succeeds_once_the_key_is_repaired() {
-    // (the case, how the key starts out, how its owner repairs it, the phrase the first refusal
-    //  carries)
-    let rows: [(&str, Key, Repair, &str); 2] = [
+    // (the case, how the key starts out, how its owner repairs it, the sentence the first
+    //  refusal states, the status it carries)
+    let rows: [(&str, Key, Repair, Sentence, u16); 3] = [
         (
             "a key policy that grants this service nothing",
             Key::WithPolicy(Policy::AccountRootOnly),
             Repair::GrantTheServicePrincipal,
-            POLICY_PHRASE,
+            Sentence::NotValidated,
+            400,
+        ),
+        (
+            // The caller's own dry run is the one refused in the authorization class, with the
+            // authorization refusal over the calling principal and the key.
+            "a key policy that denies the caller the operation it needs",
+            Key::WithPolicy(Policy::DocumentedWithTheCallerDenied),
+            Repair::GrantTheServicePrincipal,
+            Sentence::TheCallersOwn,
+            403,
         ),
         (
             "a permissioned key that has been disabled",
             Key::Disabled,
             Repair::EnableTheKey,
-            DISABLED_PHRASE,
+            Sentence::Disabled,
+            400,
         ),
     ];
 
-    for (case, key, repair, phrase) in rows {
+    for (case, key, repair, sentence, refused_status) in rows {
         let emulator = emulator_with_kms();
         let key_arn = given(&emulator, case, key).await;
         let (status, answered) = associate(&emulator, &key_arn).await;
         assert_eq!(
-            status, 400,
+            status, refused_status,
             "case {case:?}: expected the unrepaired key to be refused, got {status} with \
              {answered}"
         );
@@ -407,9 +460,10 @@ async fn the_same_call_succeeds_once_the_key_is_repaired() {
             "case {case:?}: expected the {DENIED_CODE} code, got {answered}"
         );
         let message = error_message(&answered);
-        assert!(
-            message.contains(phrase),
-            "case {case:?}: expected a refusal naming {phrase:?}, got {message:?}"
+        assert_eq!(
+            message,
+            sentence.message(&key_arn),
+            "case {case:?}: expected the {sentence:?} sentence naming the key, got {message:?}"
         );
 
         match repair {

@@ -166,10 +166,13 @@ async fn the_composite_alarm_configuration_round_trips_through_describe_alarms()
     );
     // "When this operation creates an alarm, the alarm state is immediately set to
     // INSUFFICIENT_DATA." — read back straight away, before the evaluation is due.
+    // A composite alarm's state is derived from its children's current states, so the first
+    // read already reports the rule over them: the suppressor exists but is in no ALARM state
+    // and the rule's child is in none either, so the rule is false and the alarm is in OK.
     assert_eq!(
         text(&alarm, "StateValue").as_deref(),
-        Some("INSUFFICIENT_DATA"),
-        "a newly created composite alarm starts in INSUFFICIENT_DATA, got {alarm}"
+        Some("OK"),
+        "a new composite alarm's first read reports the rule over its children, got {alarm}"
     );
     assert!(
         alarm.get("AlarmConfigurationUpdatedTimestamp").is_some()
@@ -356,14 +359,17 @@ async fn the_alarm_rule_decides_the_composite_alarm_state() {
         ("the FALSE literal", "FALSE".to_string(), "OK"),
     ];
 
-    for (index, (case, rule, _)) in cases.iter().enumerate() {
+    for (index, (case, rule, expected)) in cases.iter().enumerate() {
         put_composite_alarm(&router, &format!("composite-{index}"), rule).await;
         let alarm = composite_alarm(&router, &format!("composite-{index}")).await;
+        // A composite alarm's state is DERIVED from its children's current states, so the
+        // first read of a newly created one already reports the rule applied to them: "the
+        // alarm is then evaluated and its state is set appropriately" (`PutCompositeAlarm`).
         assert_eq!(
             text(&alarm, "StateValue").as_deref(),
-            Some("INSUFFICIENT_DATA"),
-            "case {case:?}: a composite alarm reports INSUFFICIENT_DATA until its first \
-             evaluation is due, got {alarm}"
+            Some(*expected),
+            "case {case:?} (rule {rule:?}): a composite alarm's first read reports the rule over \
+             its children, got {alarm}"
         );
     }
 
@@ -860,10 +866,15 @@ async fn actions_are_suppressed_while_the_suppressor_alarm_is_in_alarm() {
 
     set_alarm_state(&router, "maintenance", "OK").await;
     let released = composite_alarm(&router, "suppressed").await;
+    // "The maximum time in seconds that the composite alarm waits after suppressor alarm goes
+    // out of the ALARM state" (`CompositeAlarm$ActionsSuppressorExtensionPeriod`) — the
+    // suppression does not end with the suppressor leaving ALARM: it holds for that period,
+    // reported under the value the model declares for it, and ends when the period does
+    // (`crate::state::composite_suppression`).
     assert_eq!(
-        released.get("ActionsSuppressedBy"),
-        None,
-        "the suppressor leaving ALARM releases the suppression, got {released}"
+        text(&released, "ActionsSuppressedBy").as_deref(),
+        Some("ExtensionPeriod"),
+        "the suppressor leaving ALARM opens the extension period, got {released}"
     );
 }
 

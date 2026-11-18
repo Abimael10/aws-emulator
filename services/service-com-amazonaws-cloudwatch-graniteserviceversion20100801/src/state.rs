@@ -134,6 +134,13 @@ pub mod dataset_kms_key;
 /// The one in-process KMS client this service asks another service's facts about a key through.
 pub(crate) mod kms_in_process;
 
+/// How the metric-stream switches refuse a `Names` entry outside the constraints the list's
+/// element shape declares.
+pub mod metric_stream_names;
+
+/// Whether a composite alarm's actions are SUPPRESSED, and by which of the modelled reasons.
+pub mod composite_suppression;
+
 /// The usage telemetry this service publishes about its own API: the `CallCount` series every
 /// served call is counted into.
 pub mod usage;
@@ -144,6 +151,10 @@ pub use statistics::*;
 /// reads it. Re-exported below, so a handler reaches it as `crate::state::…` like every other
 /// part of this store.
 pub mod alarm_rule;
+
+/// How a composite alarm's state is COMPUTED from the alarms its rule references: the
+/// evaluation passes this store makes, and the one evaluation of one alarm they are made of.
+mod composite_evaluation;
 
 pub use alarm_rule::*;
 
@@ -1060,7 +1071,9 @@ pub fn retention_secs_at_period(period: i32) -> f64 {
 /// range selects is every datapoint whose STORED SPAN — the span its own `StorageResolution`
 /// aggregates it into ([`StoredDatum::aggregated_instant`] to that instant plus
 /// [`StoredDatum::aggregated_span`]): the whole minute for a regular-resolution datapoint and
-/// its own second for a high-resolution one — reaches into `[start, end)`. A regular-resolution
+/// its own second for a high-resolution one — reaches into `[start, end)`, and whose storage
+/// granularity is one `period` can be read at: a period FINER than that granularity selects
+/// nothing, because the series holds no detail at it. A regular-resolution
 /// datapoint stands for the minute it is stored in rather than for the instant inside that
 /// minute it happened to be published at, so a range that opens or closes part way through that
 /// minute holds it, and it is reported under the whole minute either way — which may be an
@@ -1098,6 +1111,19 @@ pub fn windows_by_unit<'a>(
         // that whole span rather than the instant inside it the observation was published at.
         let instant = datum.aggregated_instant();
         if instant >= end || instant + datum.aggregated_span() <= start {
+            continue;
+        }
+        // A read at a period FINER than the granularity the datapoint is stored at has no
+        // datapoint to answer with: "Setting this to 1 specifies this metric as a
+        // high-resolution metric, so that CloudWatch stores the metric with sub-minute
+        // resolution down to one second. Setting this to 60 specifies this metric as regular
+        // resolution, which CloudWatch stores at 1-minute resolution."
+        // (`MetricDatum$StorageResolution`) — a regular-resolution datapoint holds no
+        // sub-minute detail, so a sub-minute period over it is a period the series was never
+        // stored at, and the storage granularity is part of what a read selects by. A period
+        // at or above that granularity reads the datapoint as usual, which is how a
+        // high-resolution series answers a one-minute query.
+        if datum.aggregated_span() > span {
             continue;
         }
         if unit.is_some_and(|wanted| datum.unit() != wanted) {
@@ -1295,9 +1321,17 @@ pub struct StoredCompositeAlarm {
     ///
     /// "When this operation creates an alarm, the alarm state is immediately set to
     /// INSUFFICIENT_DATA. The alarm is then evaluated and its state is set appropriately."
-    /// (`PutCompositeAlarm`) — so a write starts a span during which the alarm still reports
-    /// the state the write left it in, and the evaluation becomes due at its end.
+    /// (`PutCompositeAlarm`) — the state the write leaves is `INSUFFICIENT_DATA` and the
+    /// evaluation is owed from the write itself, a composite alarm's state being a value
+    /// DERIVED from its children's current states rather than a transition a clock owes.
     pub evaluation_due_secs: f64,
+    /// The instant, in epoch seconds, at which the EXTENSION PERIOD this alarm's action
+    /// suppression is in ends; `None` when it is in none.
+    ///
+    /// Opened by the evaluation that sees the suppressor alarm leave `ALARM` while it was
+    /// suppressing this alarm's actions, and read by every later evaluation until it passes
+    /// ([`composite_suppression`]).
+    pub actions_suppressed_until_secs: Option<f64>,
     /// The states of the alarms this one's rule references, as they stood when
     /// `SetAlarmState` last forced this alarm's state; `None` when the alarm's state is its
     /// own evaluated one.
@@ -3191,17 +3225,6 @@ pub const LOW_SAMPLE_COUNT_PERCENTILE_OPTIONS: [&str; 2] = ["evaluate", "ignore"
 /// are suppressed because the suppressor alarm is in `ALARM`" (`CompositeAlarm$ActionsSuppressedBy`).
 pub const ACTIONS_SUPPRESSED_BY_ALARM: &str = "Alarm";
 
-/// How long after a write a composite alarm's rule evaluation is owed.
-///
-/// `PutCompositeAlarm` creates an alarm in `INSUFFICIENT_DATA` and documents that "the alarm
-/// is then evaluated and its state is set appropriately", so the evaluated state is NOT due
-/// at the instant of the write: a caller reading straight after the write still sees the
-/// `INSUFFICIENT_DATA` the write left behind. CloudWatch publishes no duration for that
-/// gap, so this span is the emulator's own choice inside the framework's 250-750 ms window
-/// for a transition the clock owes, and it is never slept on \u2014 the due instant is stored and
-/// the evaluation is materialised by the first call that happens at or after it.
-pub const COMPOSITE_EVALUATION_DELAY_SECS: f64 = 0.5;
-
 /// The modelled maximum length of `StateReasonData`: `CompositeAlarm$StateReasonData` and
 /// `MetricAlarm$StateReasonData` both target `StateReasonData`, a string with
 /// `@length 0..4000`.
@@ -3487,19 +3510,16 @@ impl ComAmazonawsCloudwatchGraniteserviceversion20100801State {
     /// Make every COMPOSITE alarm whose rule reads the alarm `name` DUE for evaluation at
     /// `now_secs`.
     ///
-    /// A composite alarm's state is its rule over the states of the alarms the rule names, so
-    /// its evaluation is owed from the moment one of those states changes — a span later
-    /// ([`COMPOSITE_EVALUATION_DELAY_SECS`], the same span its own write owes it), the same
-    /// principle as [`Self::make_alarms_due`] for the datapoints a metric alarm reads. The
-    /// clock the call that materialised the child's transition started is then what materialises
-    /// the parent's and delivers the actions the parent's transition fires, rather than
-    /// whatever call happens to read the parent next. A composite alarm no rule input touched
-    /// keeps the instant it carries.
+    /// A composite alarm's state is its rule over the states of the alarms the rule names — a
+    /// value DERIVED from them rather than a transition a clock owes — and it "is evaluated
+    /// continuously" from them, so its evaluation is owed from the moment one of those states
+    /// changes rather than a span after it: the call that materialised the child's transition
+    /// materialises the parent's too and delivers the actions it fires. A composite alarm no
+    /// rule input touched keeps the instant it carries.
     pub fn make_parents_due(&mut self, name: &str, now_secs: f64) {
-        let due = now_secs + COMPOSITE_EVALUATION_DELAY_SECS;
         for stored in self.composite_alarms.values_mut() {
             if stored.child_names.iter().any(|child| child == name) {
-                stored.evaluation_due_secs = stored.evaluation_due_secs.min(due);
+                stored.evaluation_due_secs = stored.evaluation_due_secs.min(now_secs);
             }
         }
     }
@@ -3834,215 +3854,6 @@ impl ComAmazonawsCloudwatchGraniteserviceversion20100801State {
             .is_some_and(|data| !data.is_empty())
     }
 
-    /// Materialise every composite-alarm rule evaluation the clock has already made due.
-    ///
-    /// A composite alarm's state is not a value a caller writes: it is "the rule that this
-    /// alarm uses to evaluate its alarm state" (`CompositeAlarm$AlarmRule`) applied to the
-    /// states of the alarms the rule references, so it is COMPUTED here from the alarms the
-    /// store holds. The write is one the clock owed: each evaluation becomes due
-    /// [`COMPOSITE_EVALUATION_DELAY_SECS`] after the call that configured the alarm, and
-    /// from then on the outcome depends only on the stored alarm states — so whichever call
-    /// materialises it, every later caller sees the same thing.
-    pub fn evaluate_composite_alarms(
-        &mut self,
-        now_secs: f64,
-        budget: &mut alarm_evaluation::EvaluationBudget,
-    ) {
-        // A composite alarm's rule can reference another composite alarm, so one alarm's new
-        // state can change its parent's outcome too; one pass settles one level of that
-        // chain. The number of passes is bounded by [`MAX_COMPOSITE_EVALUATION_PASSES`] as
-        // well as by the number of composite alarms, and the NODES one call may evaluate are
-        // bounded by [`MAX_COMPOSITE_EVALUATION_NODES`] — so the work ONE call can do is
-        // bounded whatever the store holds, rather than growing with the alarms times the size
-        // of their rules. An evaluation the budget stops is not answered wrongly, only
-        // settled later: it stays due, and the next call carries it (the evaluation is
-        // idempotent). The pass bound is also what stops a CYCLE of composite alarms: "the
-        // evaluation of composite alarms stops if CloudWatch detects a cycle in the
-        // evaluation path."
-        // The composite alarms are a PASS of their own, owed its first evaluation whatever the
-        // metric-alarm pass before it has already spent
-        // ([`alarm_evaluation::EvaluationBudget::start_pass`]), so a store whose metric alarms
-        // keep one request busy cannot leave its composite alarms in the state their last
-        // write left behind.
-        budget.start_pass();
-        let passes = self
-            .composite_alarms
-            .len()
-            .min(MAX_COMPOSITE_EVALUATION_PASSES);
-        let mut nodes = MAX_COMPOSITE_EVALUATION_NODES;
-        for _ in 0..passes {
-            if budget.spent()
-                || !self.evaluate_composite_alarms_once(now_secs, &mut nodes, budget)
-                || nodes == 0
-            {
-                break;
-            }
-        }
-    }
-
-    /// One evaluation pass over every composite alarm, reporting whether any alarm's state
-    /// value changed. Alarms are visited in the order their evaluations came due
-    /// ([`alarm_evaluation::due_order`]), and the pass stops as soon as `nodes` or the
-    /// request's own `budget` is spent.
-    ///
-    /// Only an alarm whose evaluation the clock has already made DUE is charged, so the one
-    /// evaluation a pass is owed is spent on an alarm that has one to settle rather than on
-    /// whichever name happens to come first.
-    fn evaluate_composite_alarms_once(
-        &mut self,
-        now_secs: f64,
-        nodes: &mut usize,
-        budget: &mut alarm_evaluation::EvaluationBudget,
-    ) -> bool {
-        let ordered = alarm_evaluation::due_order(
-            self.composite_alarms
-                .iter()
-                .map(|(name, stored)| (name.as_str(), stored.evaluation_due_secs)),
-        );
-        let mut changed = false;
-        for name in ordered {
-            if *nodes == 0 || budget.spent() {
-                break;
-            }
-            if !self.composite_alarm_evaluation_due(&name, now_secs) {
-                continue;
-            }
-            budget.charge_alarm();
-            changed |= self.evaluate_composite_alarm(&name, now_secs, nodes);
-            budget.settled_one();
-        }
-        changed
-    }
-
-    /// Whether the composite alarm `name` has an evaluation the clock has already made due.
-    fn composite_alarm_evaluation_due(&self, name: &str, now_secs: f64) -> bool {
-        self.composite_alarms
-            .get(name)
-            .is_some_and(|stored| now_secs >= stored.evaluation_due_secs)
-    }
-
-    /// Evaluate ONE composite alarm, reporting whether its state value changed.
-    ///
-    /// The alarm's rule nodes are charged to `budget`, and an alarm whose evaluation the
-    /// remaining budget cannot pay for is left for a later call.
-    fn evaluate_composite_alarm(
-        &mut self,
-        name: &str,
-        now_secs: f64,
-        budget: &mut usize,
-    ) -> bool {
-        // Everything this evaluation reads is read before anything is written.
-        let Some(stored) = self.composite_alarms.get(name) else {
-            return false;
-        };
-        if now_secs < stored.evaluation_due_secs {
-            return false;
-        }
-        // A rule carries at least one node, so every evaluation costs something and the
-        // budget always advances.
-        let cost = stored.rule_nodes.max(1);
-        if cost > *budget {
-            return false;
-        }
-        *budget -= cost;
-        let rule = &stored.rule;
-        let previous = AlarmStateSnapshot::of_composite_alarm(&stored.alarm);
-        let forced = stored.forced_child_states.clone();
-        let suppressor = stored.alarm.actions_suppressor.clone();
-        let child_states = self.child_alarm_states(&stored.child_names);
-        // The pairs the forced-state snapshot is compared against: a state a caller forced
-        // stands until a CHILD's state changes, which is what this comparison detects.
-        let children: Vec<(String, Option<String>)> = child_states
-            .iter()
-            .map(|child| (child.name.clone(), child.state_value.clone()))
-            .collect();
-        // "It returns to its actual state only once any of its children alarms change state."
-        // (`SetAlarmState`) — until then the state a caller forced stands.
-        let forced_stands = forced.is_some_and(|snapshot| snapshot == children);
-        let evaluated = rule.evaluate(&|reference| self.alarm_state_value(reference));
-        // "Actions will be suppressed if the suppressor alarm is in the ALARM state."
-        // (`CompositeAlarm$ActionsSuppressor`) — a reported fact about the suppressor's
-        // current state, so it is derived here rather than stored by the writer.
-        let suppressed = suppressor
-            .as_deref()
-            .filter(|suppressor| {
-                self.alarm_state_value(suppressor).as_deref() == Some(ALARM_STATE_ALARM)
-            })
-            .map(|suppressor| {
-                format!(
-                    "Actions suppressed by alarm {}",
-                    alarm_rule_reference_name(suppressor)
-                )
-            });
-
-        let state = if evaluated {
-            ALARM_STATE_ALARM
-        } else {
-            ALARM_STATE_OK
-        };
-        let summary = format!(
-            "Alarm updated from {} to {state}",
-            previous
-                .state_value
-                .as_deref()
-                .unwrap_or(ALARM_STATE_INSUFFICIENT_DATA)
-        );
-
-        let Some(stored) = self.composite_alarms.get_mut(name) else {
-            return false;
-        };
-        stored.alarm.actions_suppressed_by = suppressed
-            .as_ref()
-            .map(|_| ACTIONS_SUPPRESSED_BY_ALARM.to_string());
-        stored.alarm.actions_suppressed_reason = suppressed;
-        if forced_stands {
-            return false;
-        }
-        // The evaluated state has taken over from any state a caller forced.
-        stored.forced_child_states = None;
-        if stored.alarm.state_value.as_deref() == Some(state) {
-            return false;
-        }
-        stored.alarm.state_value = Some(state.to_string());
-        stored.alarm.state_reason = Some(composite_state_reason(
-            latest_child_transition(&child_states),
-            evaluated,
-            state,
-        ));
-        stored.alarm.state_reason_data = Some(composite_state_reason_data(&child_states));
-        stored.alarm.state_updated_timestamp = Some(to_timestamp(now_secs));
-        // "The timestamp of the last change to the alarm's StateValue."
-        // (`CompositeAlarm$StateTransitionedTimestamp`) — this call changed it.
-        stored.alarm.state_transitioned_timestamp = Some(to_timestamp(now_secs));
-        let updated = AlarmStateSnapshot::of_composite_alarm(&stored.alarm);
-        // The actions this transition fires, queued for the call that materialised it to
-        // deliver: "the actions to execute when this alarm transitions to the ALARM state"
-        // holds for a composite alarm exactly as it does for a metric alarm.
-        let notification = alarm_actions::AlarmNotification::of_composite_transition(
-            &stored.alarm,
-            &child_states,
-            &previous,
-            now_secs,
-        );
-        let item = AlarmHistoryItem {
-            alarm_name: Some(name.to_string()),
-            alarm_contributor_id: None,
-            alarm_type: Some(ALARM_TYPE_COMPOSITE.to_string()),
-            timestamp: Some(to_timestamp(now_secs)),
-            history_item_type: Some("StateUpdate".to_string()),
-            history_summary: Some(summary),
-            history_data: Some(state_transition_history_data(&previous, &updated)),
-            alarm_contributor_attributes: None,
-        };
-        self.record_history(name, now_secs, item);
-        // This alarm's new state is an input to every composite alarm whose rule reads it, so
-        // their evaluations are owed from this instant too.
-        self.make_parents_due(name, now_secs);
-        if let Some(notification) = notification {
-            self.enqueue_notification(notification, now_secs);
-        }
-        true
-    }
 }
 
 /// One child of a composite alarm's rule, as the parent's explanation of its own state and

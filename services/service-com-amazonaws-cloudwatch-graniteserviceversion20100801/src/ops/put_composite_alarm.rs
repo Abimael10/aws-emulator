@@ -565,11 +565,20 @@ fn write_composite_alarm(
             child_names: children,
             rule,
             tags,
-            // The evaluation this write owes is due a span after it, so the alarm a
-            // caller reads straight back still carries the state this write left.
-            evaluation_due_secs: now + crate::state::COMPOSITE_EVALUATION_DELAY_SECS,
+            // "When this operation creates an alarm, the alarm state is immediately set to
+            // INSUFFICIENT_DATA. The alarm is then evaluated and its state is set
+            // appropriately." (`PutCompositeAlarm`) — a composite alarm's state is not a
+            // transition a clock owes but a value DERIVED from its children's current states,
+            // which the rule can be applied to the moment the rule is stored. So the evaluation
+            // is owed from this write itself: the state this write leaves is
+            // INSUFFICIENT_DATA, and the first read of the alarm reports the rule over the
+            // children it already had.
+            evaluation_due_secs: now,
             // The stored state is this write's own, not one `SetAlarmState` forced.
             forced_child_states: None,
+            // No evaluation has seen a suppressor leave `ALARM` for this alarm yet, so no
+            // extension period is in force (`crate::state::composite_suppression`).
+            actions_suppressed_until_secs: None,
         },
     );
     store.record_history(

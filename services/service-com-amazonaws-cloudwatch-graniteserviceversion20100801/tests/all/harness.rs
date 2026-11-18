@@ -41,18 +41,28 @@ pub fn wait_for_evaluation() {
 /// Long enough for the evaluation that takes back a state `SetAlarmState` forced to be due.
 ///
 /// A forced state stands until the alarm's next SCHEDULED evaluation
-/// (`crate::state::alarm_evaluation`'s `FORCED_STATE_SECS`), which is SECONDS rather than the
-/// sub-second window every other transition this store's clock owes: it has to outlive the
-/// evaluations the force itself makes due, so a composite alarm's rule is evaluated over the
-/// state the caller forced. A test that wants the state RECLAIMED waits past the top of that
-/// span.
-pub const PAST_FORCED_STATE_SPAN: Duration = Duration::from_millis(10_500);
+/// (`crate::state::alarm_evaluation`'s `FORCED_STATE_SECS`), which is one of that alarm's own
+/// PERIODS rather than the sub-second window every other transition this store's clock owes:
+/// it has to outlive the round trips of a client driving a scenario through forced states, so
+/// a composite alarm's rule can be evaluated over the states that client forced on its
+/// children. A test that wants the state RECLAIMED waits past the top of that span, which is
+/// the cap that applies to every period at or above one minute.
+pub const PAST_FORCED_STATE_SPAN: Duration = Duration::from_millis(61_000);
 
 /// Wait for the evaluation that reclaims a forced state to be due.
 ///
 /// A blocking sleep, for the same reason as [`wait_for_evaluation`].
 pub fn wait_for_forced_state_reclaim() {
     std::thread::sleep(PAST_FORCED_STATE_SPAN);
+}
+
+/// The same wait for an alarm of `period_secs`, whose forced state stands for ONE of its own
+/// periods rather than for the cap above: a suite driving a short-period alarm waits past that
+/// alarm's span instead of past every alarm's, so what it then grades is the series as it
+/// stood rather than a minute later.
+pub fn wait_for_forced_state_reclaim_of(period_secs: f64) {
+    let span = Duration::from_secs_f64(period_secs) + Duration::from_millis(1_000);
+    std::thread::sleep(span.min(PAST_FORCED_STATE_SPAN));
 }
 
 /// Wait until at least `room` seconds are left of the `period`-second window the clock is in.

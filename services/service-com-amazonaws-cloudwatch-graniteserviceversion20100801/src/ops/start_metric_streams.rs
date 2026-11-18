@@ -198,3 +198,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         Ok(StartMetricStreamsOutput {})
     }
 }
+
+/// The refusal this operation owes for a `Names` entry outside the bounds the list's element
+/// shape declares, or `None` for a request whose entries that shape admits.
+///
+/// Worded ahead of the framework's constraint walk — which states such a finding at the ELEMENT
+/// with the one bound it broke, where AWS states it at the LIST member with the element shape's
+/// whole set and the list the request carried — through the one judgement both metric-stream
+/// switches share ([`crate::state::metric_stream_names`]). The same function the wrapper that
+/// mounts it uses is the only place this refusal is built, so the two switches cannot word one
+/// request two ways.
+pub fn names_constraint_refusal(input: &StartMetricStreamsInput) -> Option<StartMetricStreamsError> {
+    crate::state::metric_stream_names::constraint_refusal(
+        &input.names,
+        input,
+        super::types::START_METRIC_STREAMS_INPUT_SCHEMA,
+    )
+    .map(crate::scaffolded::Scaffolded::validation_error)
+}

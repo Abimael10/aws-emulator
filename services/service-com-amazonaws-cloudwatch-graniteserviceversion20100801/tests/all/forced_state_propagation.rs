@@ -140,21 +140,20 @@ async fn a_composite_rule_is_evaluated_over_the_state_a_caller_forced_on_its_chi
             .await;
         }
 
-        // The composite's own evaluation is owed a span after the write that configured it and
-        // after each child's transition, so the state it reports until then is the one its
-        // creation left it in.
-        assert_eq!(
-            composite_state(&router, &name).await,
-            "INSUFFICIENT_DATA",
-            "case {case:?}: a composite alarm reports INSUFFICIENT_DATA until its first \
-             evaluation is due"
-        );
-        wait_for_evaluation();
+        // A composite alarm's state is its rule over its children's CURRENT states, derived
+        // rather than owed by a clock, so the first read after the forces already reports it.
         let evaluated = composite_state(&router, &name).await;
         assert_eq!(
             evaluated, expected,
             "case {case:?} (rule {rule:?}, children {forced:?}): expected the rule to put the \
              composite in {expected}, got {evaluated:?}"
+        );
+        wait_for_evaluation();
+        let again = composite_state(&router, &name).await;
+        assert_eq!(
+            again, expected,
+            "case {case:?}: the state the rule computed must hold over the span a forced child \
+             state stands for, got {again:?}"
         );
     }
 }

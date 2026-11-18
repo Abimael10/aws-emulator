@@ -269,6 +269,27 @@ pub fn refusal<Eng: Send + Sync + 'static>(
     ))
 }
 
+/// Every spelling of the principal THIS REQUEST speaks for, as a resource-based policy of
+/// another service would name it: the principal's own ARN, the role behind an assumed-role
+/// session, and the two spellings that stand for the whole ACCOUNT the credential belongs to —
+/// the account root ARN and the bare account id, through which a resource policy delegates a
+/// resource to the identity-based policies of that account.
+///
+/// Public because a handler that asks ANOTHER service's resource policy what this caller may do
+/// — the key policy of the customer managed key a dataset association names
+/// ([`crate::state::dataset_kms_key`]) — needs the same principal this gate resolves, so the
+/// principal a refusal blames and the principal a key policy is read for cannot differ.
+pub fn calling_principals<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    ctx: &OperationContext<'_>,
+) -> Vec<String> {
+    let mut principals = caller(engine, ctx).principals;
+    let account = ::emulator_server::emulator_account_id().to_string();
+    principals.push(::emulator_server::emulator_arn("iam", "", "root"));
+    principals.push(account);
+    principals
+}
+
 /// The principal a request speaks for, and everything the decision is made from.
 #[derive(Debug, Clone)]
 struct Caller {

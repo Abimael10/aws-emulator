@@ -920,7 +920,7 @@ async fn a_forced_state_holds_until_the_next_evaluation_is_due() {
         Some("ALARM"),
         "the datapoint must not cut the forced span short, got {still_forced}"
     );
-    crate::harness::wait_for_forced_state_reclaim();
+    crate::harness::wait_for_forced_state_reclaim_of(f64::from(SHORTEST_PERIOD_SECS));
     let described = ok(&router, "DescribeAlarms", &json!({"AlarmNames": ["forced"]})).await;
     assert_eq!(
         described["MetricAlarms"][0]

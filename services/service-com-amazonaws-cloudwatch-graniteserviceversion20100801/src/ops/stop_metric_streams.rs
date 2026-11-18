@@ -200,3 +200,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         Ok(StopMetricStreamsOutput {})
     }
 }
+
+/// The refusal this operation owes for a `Names` entry outside the bounds the list's element
+/// shape declares, the mirror of `StartMetricStreams`' own: both switches take the same member
+/// and state the same refusal through the one judgement they share
+/// ([`crate::state::metric_stream_names`]).
+pub fn names_constraint_refusal(input: &StopMetricStreamsInput) -> Option<StopMetricStreamsError> {
+    crate::state::metric_stream_names::constraint_refusal(
+        &input.names,
+        input,
+        super::types::STOP_METRIC_STREAMS_INPUT_SCHEMA,
+    )
+    .map(crate::scaffolded::Scaffolded::validation_error)
+}

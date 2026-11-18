@@ -8,11 +8,12 @@
 //!
 //! The association is conditioned on the key being one this service can really use, which is
 //! AWS KMS's own account of that key and is asked of KMS rather than assumed
-//! ([`crate::state::dataset_kms_key`]): a key KMS holds none of is refused as not found, and a
-//! key it holds but this service cannot seal data under — one in a state that admits no
-//! cryptographic operation, one that is not a symmetric encryption key, one whose key policy
-//! grants this service's principal nothing — is refused with the wire error code AWS answers
-//! both usability failures with, leaving the dataset's existing association untouched.
+//! ([`crate::state::dataset_kms_key`]): the key has to exist, be in a state that admits
+//! cryptographic operations, be a symmetric encryption key, and have a key policy that grants
+//! both this service's principal and the CALLER the operations the dry run performs. Every
+//! outcome of that dry run but the key's own state is refused with one sentence under the wire
+//! code AWS answers them with, leaving the dataset's existing association untouched, and a key
+//! ARN naming another account is refused as the invalid parameter it is.
 //!
 //! ## Shape of an operation
 //!
@@ -216,51 +217,78 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         }
 
-        // "It must be in the same Amazon Web Services Region as the dataset."
-        // (`AssociateDatasetKmsKeyInput$KmsKeyArn`) — a key of another Region is one this
-        // dataset cannot be encrypted with, and that is what the not-found refusal reports, in
-        // the words its own shape documents.
+        // "It must be in the same Amazon Web Services Region as the dataset." and the ARN's
+        // account segment names the account the key belongs to: a key of ANOTHER ACCOUNT is one
+        // this association can never be validated against, which is a judgement of the REQUEST
+        // rather than of any key — so it is refused as the invalid parameter it is, naming the
+        // caller's own account and the account the ARN named, before KMS is asked anything.
+        let key_arn = ::service_common::arn::parse(&input.kms_key_arn);
+        let caller_account = ::emulator_server::emulator_account_id();
+        if let Some(account) = key_arn
+            .map(|arn| arn.account)
+            .filter(|account| *account != caller_account)
+        {
+            return Err(crate::scaffolded::Scaffolded::validation_error(
+                crate::state::dataset_kms_key::key_account_mismatch_message(
+                    account,
+                    caller_account,
+                ),
+            ));
+        }
+
+        // A key of another Region is one this dataset cannot be encrypted with, and nothing
+        // about it can be validated here either, so it is answered with the one sentence every
+        // outcome of the dry run that is not the key's own state carries.
         let key_region = ::service_common::arn::region_of(&input.kms_key_arn, KMS_ARN_NAMESPACE);
         if key_region != Some(region.as_str()) {
-            return Err(key_not_found());
+            return Err(not_validated(&input.kms_key_arn));
         }
 
         // "Before completing the association, Amazon CloudWatch validates the key by performing
         // a series of dry-run KMS operations." — whether the key exists, what state and kind it
-        // is, and what its key policy grants this service are AWS KMS's own facts, asked of KMS
-        // ([`crate::state::dataset_kms_key`]) rather than invented here. A key this service
-        // cannot use leaves the dataset exactly as it was: "If any of these checks on the new key
-        // fails, the operation fails and the existing key association (if any) remains
-        // unchanged."
+        // is, what its key policy grants this service and what it grants the CALLER are AWS KMS's
+        // own facts, asked of KMS ([`crate::state::dataset_kms_key`]) rather than invented here. A
+        // key this service cannot use leaves the dataset exactly as it was: "If any of these
+        // checks on the new key fails, the operation fails and the existing key association (if
+        // any) remains unchanged."
         //
-        // Every one of those USABILITY failures is answered in the WIRE CODE this service is
-        // recorded answering them with — `AccessDenied`, with the status the request's own class
-        // carries — rather than in one of the two modelled shapes whose sentences they carry
-        // (`KmsAccessDeniedException`, `KmsKeyDisabledException`, both 400): the dry run does not
-        // report WHICH of its checks failed as a distinct class, so those shapes are deliberately
-        // unreachable from here and what tells a caller which precondition to repair is the
-        // sentence. An identifier that resolves to NO key is not a usability failure and keeps
-        // the modelled fault the model declares for it ([`key_not_found`]).
-        // `dataset_kms_key_preconditions` pins both.
+        // Every failure of the dry run is answered in the WIRE CODE this service is recorded
+        // answering them with — `AccessDenied`, with the status the request's own class carries —
+        // rather than in one of the modelled shapes whose sentences describe them
+        // (`KmsAccessDeniedException`, `KmsKeyDisabledException`, `KmsKeyNotFoundException`): the
+        // dry run does not report WHICH of its checks failed as a distinct class, so those shapes
+        // are deliberately unreachable from here and what tells a caller which precondition to
+        // repair is the sentence. `dataset_kms_key_preconditions` pins both.
+        let caller_principals =
+            crate::service::authorization::calling_principals(&*self.engine, ctx);
         match crate::state::dataset_kms_key::key_condition(
             ctx.callback(),
             &region,
             &input.kms_key_arn,
+            &caller_principals,
         )
         .await
         {
             crate::state::dataset_kms_key::KeyCondition::Usable
             // Nothing KMS stated, so nothing about the key withholds the association.
             | crate::state::dataset_kms_key::KeyCondition::Unknown => {}
-            crate::state::dataset_kms_key::KeyCondition::NotFound => {
-                // AWS KMS holding no key for that ARN is the same answer as an ARN addressed in
-                // another Region: the identifier resolves to no key this dataset can be
-                // encrypted with, which is the fault the model declares for it. Only the
-                // USABILITY failures below are collapsed into one code.
-                return Err(key_not_found())
-            }
-            crate::state::dataset_kms_key::KeyCondition::Unusable(refusal) => {
-                return Err(crate::scaffolded::Scaffolded::denied_request(refusal))
+            crate::state::dataset_kms_key::KeyCondition::Unusable(unusable) => {
+                let refusal = unusable.message(
+                    &input.kms_key_arn,
+                    caller_principals.first().map_or("", String::as_str),
+                );
+                // What was refused decides the STATUS the one wire code travels under: a
+                // condition of the KEY is a fault of the request (400), while the dry run run
+                // "with the caller's credentials" is the caller's own authority over the key,
+                // which the recordings of this operation answer in the authorization layer's
+                // class (403) — the one status other than 400 they show for it, recorded with
+                // the sentences for each class in the resolution note of
+                // `issues/things-that-now-work/20261031T235853Z-cloudwatch-7-net-new-root-causes-associatedatasetkmskey-validates.md`.
+                return Err(if unusable.is_the_callers_authority() {
+                    crate::scaffolded::Scaffolded::access_denied(refusal)
+                } else {
+                    crate::scaffolded::Scaffolded::denied_request(refusal)
+                });
             }
         }
 
@@ -303,27 +331,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// The ARN namespace of Amazon Web Services KMS, the vendor field a `KmsKeyArn` carries.
 const KMS_ARN_NAMESPACE: &str = "kms";
 
-/// The refusal of a `KmsKeyArn` that resolves to no key this dataset can be encrypted with:
-/// one addressed in another Region, and one AWS KMS holds no key for. Both are judgements of
-/// the identifier rather than of the key's usability, so both carry the fault the model declares
-/// for them; only a key that EXISTS and cannot be used is answered under the one code every
-/// usability failure surfaces as.
-fn key_not_found() -> AssociateDatasetKmsKeyError {
-    AssociateDatasetKmsKeyErrorModeled::KmsKeyNotFoundException(KmsKeyNotFoundException {
-        message: KEY_NOT_FOUND_REFUSAL.to_string(),
-    })
-    .into()
-}
-
-/// What this operation refuses a key it cannot use with, in the words its own error shape
-/// documents: "The specified Amazon Web Services Key Management Service (Amazon Web Services
-/// KMS) key could not be found. Verify that the key Amazon Resource Name (ARN) is correct, that
-/// the key exists, and that it is in the same Amazon Web Services Region as the resource."
-/// (`KmsKeyNotFoundException`).
+/// The refusal of a `KmsKeyArn` the dry run could not validate for this association: one
+/// addressed in another Region, one AWS KMS holds no key for, one whose policy admits this
+/// service or the caller nothing, and one that is not the kind data can be sealed under.
 ///
-/// A fixed sentence: it states what to check rather than echoing the key the request carried,
-/// which is the ARN the caller already has.
-const KEY_NOT_FOUND_REFUSAL: &str =
-    "The specified Amazon Web Services Key Management Service (Amazon Web Services KMS) key \
-     could not be found. Verify that the key Amazon Resource Name (ARN) is correct, that the \
-     key exists, and that it is in the same Amazon Web Services Region as the resource.";
+/// One code and one sentence for all of them, because the dry run does not report which of its
+/// checks failed ([`crate::state::dataset_kms_key::Unusable`]); the key the request named is the
+/// sentence's one variable part.
+fn not_validated(key_arn: &str) -> AssociateDatasetKmsKeyError {
+    crate::scaffolded::Scaffolded::denied_request(
+        crate::state::dataset_kms_key::unable_to_validate_message(key_arn),
+    )
+}

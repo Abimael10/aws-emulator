@@ -835,12 +835,13 @@ const CROSSED_WITHIN: Duration = Duration::from_secs(180);
 /// See [`CROSSED_WITHIN`].
 const LOOK_AGAIN: Duration = Duration::from_millis(100);
 
-/// The `Period` the alarm below is evaluated on, in seconds: a sub-minute cadence
-/// `PutMetricAlarm` admits ("Valid values are 10, 20, 30, and any multiple of 60"), whose
-/// window closes promptly while the evaluation range still reaches back past the minute a
-/// regular-resolution datapoint is stored at — so the burst the stage served is inside that
-/// range however long this machine takes to look again.
-const ALARM_PERIOD: i64 = 30;
+/// The `Period` the alarm below is evaluated on, in seconds: the finest cadence the series it
+/// grades can be read at. `PutMetricAlarm` admits sub-minute values ("Valid values are 10, 20,
+/// 30, and any multiple of 60"), but only "for metrics that are stored by a PutMetricData call
+/// with a StorageResolution of 1" — and this stage's series is published at the regular
+/// resolution, which holds no sub-minute detail at all, so one minute is the shortest window
+/// an evaluation of it can grade.
+const ALARM_PERIOD: i64 = 60;
 
 /// `PutMetricAlarm` over the `5XXError` series of one api's `live` stage, as a client that
 /// pages on a 5xx rate writes it.

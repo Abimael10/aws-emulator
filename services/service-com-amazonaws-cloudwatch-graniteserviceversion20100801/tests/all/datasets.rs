@@ -413,7 +413,7 @@ async fn an_association_outside_the_callers_own_scope_is_refused_and_writes_noth
             "default".to_string(),
             key_arn("eu-west-1", "f0e1d2c3-b4a5-4968-8778-69a5b4c3d2e1"),
             400,
-            "KmsKeyNotFoundException",
+            "AccessDenied",
         ),
         (
             "a key of the Region the dataset is NOT in",
@@ -421,7 +421,21 @@ async fn an_association_outside_the_callers_own_scope_is_refused_and_writes_noth
             "default".to_string(),
             key_arn("us-east-1", "1a2b3c4d-5e6f-4a7b-8c9d-0e1f2a3b4c5d"),
             400,
-            "KmsKeyNotFoundException",
+            "AccessDenied",
+        ),
+        (
+            // The ARN's ACCOUNT segment is the one half of a key ARN this operation judges as
+            // the invalid parameter it is, rather than as a key the dry run could not validate.
+            // The body names the request-validation class, whose legacy query code — the one a
+            // query-compatible client branches on — is `ValidationError`
+            // (`crate::service::query_compatible_errors::VALIDATION`).
+            "a key of another account",
+            "us-east-1",
+            "default".to_string(),
+            "arn:aws:kms:us-east-1:123456789012:key/1a2b3c4d-5e6f-4a7b-8c9d-0e1f2a3b4c5d"
+                .to_string(),
+            400,
+            "ValidationException",
         ),
     ];
 

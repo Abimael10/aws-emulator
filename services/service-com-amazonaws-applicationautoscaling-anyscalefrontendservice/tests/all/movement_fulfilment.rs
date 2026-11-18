@@ -556,6 +556,13 @@ async fn an_alarm_driven_step_scaling_movement_waits_on_the_ecs_service_it_scale
                         "MetricName": METRIC_NAME,
                         "Dimensions": [{"Name": "ServiceName", "Value": SERVICE}],
                         "Value": PUBLISHED_VALUE,
+                        // The alarm above is evaluated on a sub-minute period, which a series
+                        // is readable at only when it is STORED at that resolution: "Data
+                        // points with a period of less than 60 seconds are available only for
+                        // custom metrics defined with a StorageResolution of 1"
+                        // (`MetricDatum$StorageResolution`), a regular-resolution datapoint
+                        // holding no sub-minute detail at all.
+                        "StorageResolution": 1,
                     }],
                 }),
             )

@@ -242,6 +242,31 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
                 ),
             ),
         );
+        // The two metric-stream SWITCHES word a `Names` entry outside the bounds the list's
+        // element shape declares the way AWS words one — at the list member, quoting the list
+        // and naming the element shape's whole set — which the framework's own walk cannot do,
+        // so the refusal is taken on the way IN ([`RefusingAValueFirst`]) from the one judgement
+        // both of them share (`crate::state::metric_stream_names`).
+        overridden.add_operation(
+            "StartMetricStreams",
+            served(
+                &engine,
+                RefusingAValueFirst::new(
+                    crate::ops::start_metric_streams::StartMetricStreams::new(Arc::clone(&engine)),
+                    crate::ops::start_metric_streams::names_constraint_refusal,
+                ),
+            ),
+        );
+        overridden.add_operation(
+            "StopMetricStreams",
+            served(
+                &engine,
+                RefusingAValueFirst::new(
+                    crate::ops::stop_metric_streams::StopMetricStreams::new(Arc::clone(&engine)),
+                    crate::ops::stop_metric_streams::names_constraint_refusal,
+                ),
+            ),
+        );
         // `GetMetricWidgetImage` publishes a per-call PAYLOAD limit ("Up to 100 KB uncompressed
         // payload"), which is a bound on the request's own body rather than on any member's
         // value, so it is judged on the way in and answered in the transport layer's own class

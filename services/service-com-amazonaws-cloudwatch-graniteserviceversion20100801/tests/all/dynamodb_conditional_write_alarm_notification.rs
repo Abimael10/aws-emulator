@@ -62,17 +62,17 @@ const OK: &str = "OK";
 const NOT_BREACHING: &str = "notBreaching";
 
 /// The alarm's period and how many of them it grades: the shortest cadence an alarm may be
-/// evaluated on — "Valid values are 10, 20, 30, and any multiple of 60"
+/// evaluated on for a series stored at STANDARD resolution — "Valid values are 10, 20, 30, and
+/// any multiple of 60. … Be sure to specify 10, 20, or 30 only for metrics that are stored by a
+/// PutMetricData call with a StorageResolution of 1"
 /// (`smithy_query(query="doc",shape="PutMetricAlarmInput",member="Period")`) — with the
 /// one-period look-back a client writes for "any refusal now".
 ///
-/// The shortest one on purpose. An alarm grades only the periods that have CLOSED, so how long
-/// a published refusal waits for the evaluation that grades it is at most one period: naming the
-/// shortest cadence is what keeps that wait off the clock of every build, and nothing asserted
-/// here depends on how wide the period is — the refusals of a row are stored at the granularity
-/// of the series DynamoDB publishes them on and so fall in ONE window of whichever cadence the
-/// alarm names.
-const PERIOD: i64 = 10;
+/// The series DynamoDB publishes is stored at standard resolution, which holds no sub-minute
+/// detail at all, so a shorter cadence would grade no datapoint of it: one minute is the finest
+/// period it can be read or alarmed at. Nothing asserted here depends on how wide the period is
+/// — the refusals of a row fall in ONE window of it.
+const PERIOD: i64 = 60;
 const EVALUATION_PERIODS: i64 = 1;
 
 /// The partition key every row addresses, the version the seeded item carries, and the version
@@ -341,6 +341,11 @@ async fn an_alarm_over_a_tables_refused_conditional_writes_transitions_on_those_
         .await;
     }
 
+    // Every row's refusals are published BEFORE any alarm is waited on, so the window that
+    // holds them is one window for all of them: the first wait below is the one that waits for
+    // it to close, and every row after it is graded on the same boundary rather than on one of
+    // its own.
+    let mut watched: Vec<(&Row, &String, String, String)> = Vec::new();
     for (index, (row, table)) in ROWS.iter().zip(&tables).enumerate() {
         let case = row.case;
         let (topic, queue_url) =
@@ -382,7 +387,11 @@ async fn an_alarm_over_a_tables_refused_conditional_writes_transitions_on_those_
              to carry {} refusal(s), got {counted}",
             row.refusals
         );
+        watched.push((row, table, alarm, queue_url));
+    }
 
+    for (row, table, alarm, queue_url) in watched {
+        let case = row.case;
         if row.breaches {
             let state = until_state(&emulator, &alarm, ALARM).await;
             assert_eq!(

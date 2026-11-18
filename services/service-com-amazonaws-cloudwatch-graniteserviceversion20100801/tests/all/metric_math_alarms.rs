@@ -699,9 +699,14 @@ async fn an_array_asking_for_more_work_than_one_resolution_does_is_refused() {
 async fn a_newly_created_alarm_reports_the_un_evaluated_seed_reason() {
     let router = build_router();
 
-    // Every kind of alarm this service writes seeds the same un-evaluated state, so the rule
-    // is asserted over all three rather than over the one the issue cited.
-    for kind in [AlarmKind::Metric, AlarmKind::Composite, AlarmKind::Log] {
+    // Every kind of alarm whose state an EVALUATION of its own decides seeds the same
+    // un-evaluated state, so the rule is asserted over both rather than over the one the issue
+    // cited. A COMPOSITE alarm is left out: its state is not evaluated from data of its own but
+    // DERIVED from its children's current states, which the rule can be applied to the moment
+    // the rule is stored — so its first read already reports the rule's own reason rather than
+    // the seed ("the alarm is then evaluated and its state is set appropriately",
+    // `PutCompositeAlarm`, and the `composite_alarms` suite).
+    for kind in [AlarmKind::Metric, AlarmKind::Log] {
         let name = format!("seeded-{}", kind.alarm_type());
         kind.create(&router, &name, Some(false)).await;
         let alarm = described_alarm(&router, kind, &name)
@@ -713,4 +718,17 @@ async fn a_newly_created_alarm_reports_the_un_evaluated_seed_reason() {
             "case {kind:?}: expected the service's un-evaluated seed reason, got {alarm}"
         );
     }
+
+    // The composite alarm's own first read: the rule over the children it already had, with the
+    // reason that evaluation reached rather than the seed.
+    let name = "seeded-composite";
+    AlarmKind::Composite.create(&router, name, Some(false)).await;
+    let alarm = described_alarm(&router, AlarmKind::Composite, name)
+        .await
+        .unwrap_or_else(|| panic!("DescribeAlarms reports no alarm {name}"));
+    let reason = alarm.get("StateReason").and_then(Value::as_str);
+    assert!(
+        reason.is_some_and(|reason| reason.contains("the composite alarm's rule evaluated to")),
+        "expected the composite alarm's first read to report the rule it applied, got {alarm}"
+    );
 }

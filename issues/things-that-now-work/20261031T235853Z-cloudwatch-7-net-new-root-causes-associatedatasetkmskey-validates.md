@@ -123,3 +123,46 @@ Cause 5: PutMetricData with MetricData=[{valid datum}, {MetricName:..., Values:[
 Cause 6: PutMetricStream, then StopMetricStreams(Names=['x'*300]) and StartMetricStreams(Names=['x'*300]); compare Error.Code and Error.Message.
 
 Cause 7: GetMetricData with a MetricDataQueries entry whose MetricStat.Unit is 'Furlongs'; compare Error.Message's enum value set ordering.
+
+## Resolution
+
+18 of the 21 recorded checks pass. Causes 2, 5 and 7 were already correct by the time this was
+picked up (their checks pass untouched). Causes 3, 4 and 6 are closed, and 8 of the 11 checks of
+cause 1 are.
+
+What the checks of cause 1 turned out to require, beyond what the Description above states — each
+quoted from the assertion the replay prints for that check, which is the only place the corpus
+states it:
+
+* the refusal of a key the dry run could not validate carries the message
+  `Unable to validate KMS key <arn>. Verify the key exists and the key policy grants
+  kms:DescribeKey to the CloudWatch service principal.` (the checks that compare it:
+  -nonexistent-key-rejected, -missing-permission-denied, -reassociation-conflict-rejected,
+  duplicate-kms-association-rejected, kms-key-access-errors — all passing), and a key in a state
+  that admits no cryptographic operation carries `KMS key <arn> is disabled.`
+  (`assert message == f"KMS key {key_arn} is disabled."`, both disabled-key checks — passing).
+  Neither is the paragraph the modelled `Kms*` shapes document; those paragraphs are shape
+  documentation, and answering them is what the checks were failing on.
+* an ARN whose account segment is not the caller's own is `ValidationError` with
+  `KMS key account <key account> does not match caller account <caller account>` — passing.
+* the dry run run with the CALLER's own credentials is answered with HTTP **403**, not 400:
+  `assert seen_status == 403, f"expected HTTP 403 for AccessDenied, got {seen_status}"`
+  (-access-denied; -access-denied-rejected and -caller-missing-permission-rejected assert the
+  same). That is the one place a status other than 400 is recorded for this operation, and the
+  wire code is `AccessDenied` there too.
+
+STILL OPEN, one message on three checks: -access-denied, -access-denied-rejected and
+-caller-missing-permission-rejected now get the recorded class (AccessDenied), the recorded
+status (403) and the recorded effect (the association untouched, the identical call accepted once
+the key policy admits the caller), and fail only on the SENTENCE. Each compares
+`message.partition(" KMS request id: ")[0]` against a string the corpus does not disclose, so all
+that is known about AWS's message for this class is that it ends with a KMS request id. Four
+groundable wordings were tried and none is the one it holds: this operation's own recorded
+`Unable to validate KMS key …` sentence; the IAM refusal of `kms:Decrypt` over the caller and the
+key with the resource-policy explicit-deny clause — the clause of the reading this service
+refuses on, which is what the emulator now answers; the same with
+`because no resource-based policy allows the kms:Decrypt action`; and the identity-policy clause
+another service of this tree is recorded relaying for a refused `kms:Decrypt`
+(`issues/things-that-now-work/20261028T021654Z-sfn-4-net-new-behavioral-root-causes-asl.md`).
+A fifth wording would be invented, so that one comparison stays red rather than being fitted to
+the check.

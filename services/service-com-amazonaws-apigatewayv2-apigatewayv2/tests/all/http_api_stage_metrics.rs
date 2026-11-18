@@ -89,18 +89,20 @@ const HANDLER_SOURCE: &str = "import json\n\
 /// ([`ALARM_PERIOD_SECONDS`]) and one evaluation away at most. The deadline is far above that
 /// span, so a row that never reaches its state fails on what it last read instead of hanging;
 /// nothing here measures how long it took.
-const SETTLES_WITHIN: Duration = Duration::from_secs(60);
+const SETTLES_WITHIN: Duration = Duration::from_secs(180);
 /// See [`SETTLES_WITHIN`].
 const LOOK_AGAIN: Duration = Duration::from_millis(100);
 
 /// The `Period` every row's alarm is evaluated on, in seconds.
 ///
-/// The shortest an alarm may be evaluated on ("Valid values are 10, 20, 30, and any multiple of
-/// 60", `smithy_query(query="doc",shape="PutMetricAlarmInput",member="Period")`), because what
-/// these rows are about is WHICH traffic the stage's series carries and not how wide the window
-/// folding it is: the narrowest window is the one whose close — the instant a verdict over it
-/// becomes due — a row waits the least for.
-const ALARM_PERIOD_SECONDS: i64 = 10;
+/// The shortest an alarm over THIS series may be evaluated on: `Period` admits sub-minute
+/// values ("Valid values are 10, 20, 30, and any multiple of 60",
+/// `smithy_query(query="doc",shape="PutMetricAlarmInput",member="Period")`) but only "for
+/// metrics that are stored by a PutMetricData call with a StorageResolution of 1", and the
+/// stage's series is published at the regular resolution, which holds no sub-minute detail at
+/// all — so one minute is the narrowest window an evaluation of it can grade, and what these
+/// rows are about is WHICH traffic the series carries rather than how wide that window is.
+const ALARM_PERIOD_SECONDS: i64 = 60;
 
 /// The window every metric read covers, in seconds, and the period it is read at: generous on
 /// both sides, so no row depends on where in a minute the suite runs.
@@ -467,6 +469,11 @@ const ROWS: &[Row] = &[
 
 #[tokio::test]
 async fn the_traffic_a_stage_serves_decides_the_alarm_declared_over_its_series() {
+    // Every row's traffic is served BEFORE any of the alarms is waited on: an alarm grades a
+    // period only once that period has CLOSED, and the rows' traffic lands in one and the same
+    // period of the clock — so the first wait below is the one that waits for it to close and
+    // every row after it is graded on the same boundary rather than on one of its own.
+    let mut graded: Vec<(&Row, MultiServiceRouter, String)> = Vec::new();
     for row in ROWS {
         let case = row.case;
         // A fresh emulator per row, so the series its alarm grades hold only its own traffic.
@@ -529,15 +536,19 @@ async fn the_traffic_a_stage_serves_decides_the_alarm_declared_over_its_series()
             row.metric,
             row.published
         );
+        graded.push((row, router, name));
+    }
 
-        let reached = awaited_state(&router, &name, row.state).await;
+    for (row, router, name) in &graded {
+        let case = row.case;
+        let reached = awaited_state(router, name, row.state).await;
         assert_eq!(
             reached, row.state,
             "case {case:?} (ActionsEnabled={}): expected the alarm to reach {} from the \
              traffic the stage served, got {reached:?}",
             row.actions_enabled, row.state
         );
-        let transitions = recorded_transitions(&router, &name).await;
+        let transitions = recorded_transitions(router, name).await;
         assert!(
             transitions.iter().any(|state| state == row.state),
             "case {case:?}: expected the move to {} to be recorded in the alarm's history, got \
