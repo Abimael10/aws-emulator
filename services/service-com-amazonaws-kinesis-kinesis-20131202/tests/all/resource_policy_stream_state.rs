@@ -17,9 +17,15 @@
 //! The recorded flows these were derived from call each of the three operations once, on ONE
 //! stream in `CREATING`, addressed by its stream ARN — each one row of the tables below. The
 //! rows differ along what the rule generalises over: the OPERATION called, the lifecycle STATE
-//! the stream is in (the two states that refuse, and the two that serve), the ARN FORM the
-//! request addresses the resource by (the stream's own ARN and a consumer's), and whether the
-//! stream carries a policy when the call arrives.
+//! the stream is in (every value `StreamStatus` takes: the two that refuse, and the two that
+//! serve), the ARN FORM the request addresses the resource by (the stream's own ARN and a
+//! consumer's), and whether the stream carries a policy when the call arrives.
+//!
+//! Because the gate is the stream's state AT THE TIME OF THE CALL, the refusal is transient: a
+//! client that keeps looking is served as soon as the transition the create armed falls due,
+//! and the very same call refuses again once a removal is accepted. Both halves are driven
+//! here too, through the READ — the operation whose refusal a client uses as the readiness
+//! signal to retry on.
 //!
 //! The wire harness, the ARN builders and the policy helpers are [`crate::stream_tags`]' and
 //! [`crate::resource_policies`]', reused rather than copied.
@@ -31,7 +37,7 @@ use service_com_amazonaws_kinesis_kinesis_20131202::state::{
 
 use crate::resource_policies::{account, assert_refused, delete, get, policy_for, put, reported_policy};
 use crate::resource_policy_absence::EMPTY_POLICY_DOCUMENT;
-use crate::stream_tags::{past_activation, stream_arn, Emulator, REGION};
+use crate::stream_tags::{poll_until, poll_until_active, stream_arn, Emulator, REGION};
 
 /// The modelled error every one of these refusals is carried in.
 const IN_USE: &str = "ResourceInUseException";
@@ -95,6 +101,20 @@ async fn assert_refused_with_the_sentence(
     );
 }
 
+/// The `StreamStatus` the stream named `name` reports, so a case asserts the state it claims to
+/// have placed the stream in before it calls the operation under test.
+async fn reported_status(emulator: &Emulator, case: &str, name: &str) -> String {
+    let summary = emulator
+        .ok(case, "DescribeStreamSummary", &json!({ "StreamName": name }))
+        .await;
+    summary
+        .get("StreamDescriptionSummary")
+        .and_then(|description| description.get("StreamStatus"))
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string()
+}
+
 /// What the store holds in the policy slot of `arn`: `Some(document)` for a resource carrying
 /// one, `None` for a resource carrying none. Read from the very store the handlers write, so a
 /// refused call's effect on it — there must be none — is what a case can assert.
@@ -138,9 +158,9 @@ async fn a_creating_stream_refuses_every_resource_policy_operation() {
 
     // ... and once every one of those streams is ready, the read is served and reports the
     // empty document: nothing was attached behind the refusals.
-    tokio::time::sleep(past_activation()).await;
     for operation in POLICY_OPERATIONS {
         let name = format!("creating-{}", operation.to_lowercase());
+        poll_until_active(&emulator, &name, &name).await;
         let arn = stream_arn(REGION, &name);
         let (status, read) = get(&emulator, REGION, &arn).await;
         assert_eq!(
@@ -167,7 +187,9 @@ async fn a_deleting_stream_refuses_every_resource_policy_operation() {
     for name in &names {
         creating_stream(&emulator, name).await;
     }
-    tokio::time::sleep(past_activation()).await;
+    for name in &names {
+        poll_until_active(&emulator, name, name).await;
+    }
 
     for (operation, name) in POLICY_OPERATIONS.iter().zip(&names) {
         let arn = stream_arn(REGION, name);
@@ -209,7 +231,7 @@ async fn a_consumer_arn_is_gated_by_the_stream_that_holds_it() {
     let emulator = Emulator::new();
     let name = "consumer-arn-gate";
     creating_stream(&emulator, name).await;
-    tokio::time::sleep(past_activation()).await;
+    poll_until_active(&emulator, name, name).await;
     let stream = stream_arn(REGION, name);
 
     let registered = emulator
@@ -286,7 +308,7 @@ async fn an_active_or_updating_stream_serves_every_resource_policy_operation() {
             &json!({ "StreamName": name, "ShardCount": 2 }),
         )
         .await;
-    tokio::time::sleep(past_activation()).await;
+    poll_until_active(&emulator, name, name).await;
     let arn = stream_arn(REGION, name);
 
     for round in [STREAM_ACTIVE, STREAM_UPDATING] {
@@ -307,15 +329,7 @@ async fn an_active_or_updating_stream_serves_every_resource_policy_operation() {
         }
 
         // The state the case claims to be in is the state the stream reports.
-        let summary = emulator
-            .ok(round, "DescribeStreamSummary", &json!({ "StreamName": name }))
-            .await;
-        let reported = summary
-            .get("StreamDescriptionSummary")
-            .and_then(|description| description.get("StreamStatus"))
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_string();
+        let reported = reported_status(&emulator, round, name).await;
         assert_eq!(
             reported, round,
             "case {round}: expected the stream to be in that state when the calls arrive, got \
@@ -341,4 +355,211 @@ async fn an_active_or_updating_stream_serves_every_resource_policy_operation() {
             "case {round}: expected the detach to be served, got {status} with body {response}"
         );
     }
+}
+
+/// Every value `StreamStatus` takes, beside whether a resource-policy call is available for a
+/// stream in it. The catalog is the model's own
+/// (`smithy_query(query="shape",shape="StreamStatus")` -> `CREATING`, `DELETING`, `ACTIVE`,
+/// `UPDATING`), so a state this service grows a stream into later has no row here and fails
+/// the table rather than passing unnoticed.
+const STATUS_CATALOG: &[(&str, bool)] = &[
+    (STREAM_CREATING, false),
+    (STREAM_DELETING, false),
+    (STREAM_ACTIVE, true),
+    (STREAM_UPDATING, true),
+];
+
+/// Bring the stream named `name` into `status`, attaching a policy to it wherever the attach is
+/// available in that state, and answer its ARN beside the document it ends up carrying.
+///
+/// A transitional state is reached by ARMING the transition and returning straight away, so the
+/// stream is inside it when the caller's request arrives. The rows that end up refusing are set
+/// up with their policy slot OCCUPIED wherever an attach can reach it, which is what makes the
+/// table say the state decides the call rather than the slot.
+async fn stream_in_status(
+    emulator: &Emulator,
+    name: &str,
+    status: &str,
+) -> (String, Option<String>) {
+    // Two shards, so the shard-count change the `UPDATING` row arms has somewhere to go.
+    emulator
+        .ok(
+            name,
+            "CreateStream",
+            &json!({ "StreamName": name, "ShardCount": 2 }),
+        )
+        .await;
+    let arn = stream_arn(REGION, name);
+    if status == STREAM_CREATING {
+        return (arn, None);
+    }
+    poll_until_active(emulator, name, name).await;
+
+    let attached = policy_for(&arn, status, "kinesis:GetRecords");
+    let (http_status, response) = put(emulator, REGION, &arn, &attached).await;
+    assert_eq!(
+        http_status, 200,
+        "case {name}: the attach on the ready stream must be served, got {http_status} with \
+         body {response}"
+    );
+
+    match status {
+        STREAM_ACTIVE => {}
+        // A shard-count change leaves the stream `UPDATING` until the re-tiling falls due.
+        STREAM_UPDATING => {
+            emulator
+                .ok(
+                    name,
+                    "UpdateShardCount",
+                    &json!({
+                        "StreamName": name,
+                        "TargetShardCount": 4,
+                        "ScalingType": "UNIFORM_SCALING",
+                    }),
+                )
+                .await;
+        }
+        // An accepted removal leaves it `DELETING` until the release falls due.
+        STREAM_DELETING => {
+            emulator
+                .ok(name, "DeleteStream", &json!({ "StreamName": name }))
+                .await;
+        }
+        other => panic!("case {other}: this suite places no stream in that state"),
+    }
+    (arn, Some(attached))
+}
+
+/// The READ over the whole `StreamStatus` catalog: exactly the two states the operation is
+/// available in report the stored document, and every other state the stream can be in is
+/// refused with the one sentence — whether the slot holds a document (the removal rows) or
+/// holds none (the create row), which is what shows the gate stands ahead of the policy lookup.
+/// A refused read reports no `Policy` at all and leaves the slot exactly as it found it.
+#[tokio::test]
+async fn the_read_is_decided_by_the_streams_status_over_the_whole_catalog() {
+    let emulator = Emulator::new();
+
+    for (status, serves) in STATUS_CATALOG {
+        let name = format!("read-in-{}", status.to_lowercase());
+        let (arn, carried) = stream_in_status(&emulator, &name, status).await;
+
+        // The state the row claims to have placed the stream in is the state it reports.
+        let reported = reported_status(&emulator, &name, &name).await;
+        assert_eq!(
+            &reported, status,
+            "case {name}: expected the stream to be in that state when the read arrives, got \
+             {reported}"
+        );
+
+        let (http_status, response) = get(&emulator, REGION, &arn).await;
+        if *serves {
+            // A row the read is available for had its policy attached while the stream served,
+            // so there IS a document to report: a row that forgot to attach one fails here
+            // rather than silently comparing the empty document against itself.
+            let expected = carried.clone().unwrap_or_else(|| {
+                panic!("case {name}: a serving row must have attached a document to report")
+            });
+            assert_eq!(
+                reported_policy(&name, http_status, &response),
+                expected,
+                "case {name}: expected the document the stream carries, got {response}"
+            );
+        } else {
+            assert_refused(
+                &name,
+                http_status,
+                &response,
+                IN_USE,
+                &not_ready_sentence(&name, status),
+            );
+            assert!(
+                response.get("Policy").is_none(),
+                "case {name}: a refused read must report no policy at all, got {response}"
+            );
+            assert_eq!(
+                stored_policy(&emulator, &name, &arn),
+                carried,
+                "case {name}: a refused read must leave the stored slot as it found it"
+            );
+        }
+    }
+}
+
+/// The refusal is the stream's state AT THE TIME OF THE CALL, which makes it the readiness
+/// signal a client retries on: the read refuses while the create is still in flight, is served
+/// once that transition falls due — reporting the policy the stream really carries, with none of
+/// the error members the refusal carried — and refuses again the moment a removal is accepted,
+/// with the attached document still stored behind the refusal.
+#[tokio::test]
+async fn a_refused_read_clears_when_the_stream_becomes_ready_and_returns_when_it_stops_being() {
+    let emulator = Emulator::new();
+    let name = "read-readiness-signal";
+    creating_stream(&emulator, name).await;
+    let arn = stream_arn(REGION, name);
+
+    // Inside the transition the create armed: refused, with the modelled error rather than a
+    // policy-shaped success.
+    let (http_status, response) = get(&emulator, REGION, &arn).await;
+    assert_refused(
+        name,
+        http_status,
+        &response,
+        IN_USE,
+        &not_ready_sentence(name, STREAM_CREATING),
+    );
+    assert!(
+        response.get("Policy").is_none(),
+        "case {name}: a refused read must report no policy at all, got {response}"
+    );
+
+    // The retry loop a client runs against AWS: look again until the read stops refusing.
+    poll_until(name, "the policy read stops refusing the stream", || async {
+        get(&emulator, REGION, &arn).await.0 == 200
+    })
+    .await;
+
+    // What it is served reports the policy the stream really carries — none, since every attach
+    // inside that window was refused — and carries no error members.
+    let (http_status, served) = get(&emulator, REGION, &arn).await;
+    assert_eq!(
+        reported_policy(name, http_status, &served),
+        EMPTY_POLICY_DOCUMENT,
+        "case {name}: expected the empty document for a stream carrying no policy, got {served}"
+    );
+    assert!(
+        served.get("__type").is_none() && served.get("message").is_none(),
+        "case {name}: a served read carries no error members, got {served}"
+    );
+
+    // An attach from here on round-trips byte for byte ...
+    let attached = policy_for(&arn, "AfterReadiness", "kinesis:PutRecord");
+    let (http_status, response) = put(&emulator, REGION, &arn, &attached).await;
+    assert_eq!(
+        http_status, 200,
+        "case {name}: expected the attach to be served, got {http_status} with body {response}"
+    );
+    let (http_status, read) = get(&emulator, REGION, &arn).await;
+    assert_eq!(
+        reported_policy(name, http_status, &read),
+        attached,
+        "case {name}: expected the document the attach carried, got {read}"
+    );
+
+    // ... and the moment the stream leaves a serving state the very same read refuses again.
+    emulator
+        .ok(name, "DeleteStream", &json!({ "StreamName": name }))
+        .await;
+    let (http_status, response) = get(&emulator, REGION, &arn).await;
+    assert_refused(
+        name,
+        http_status,
+        &response,
+        IN_USE,
+        &not_ready_sentence(name, STREAM_DELETING),
+    );
+    assert_eq!(
+        stored_policy(&emulator, name, &arn).as_deref(),
+        Some(attached.as_str()),
+        "case {name}: a refused read must leave the attached document alone"
+    );
 }
