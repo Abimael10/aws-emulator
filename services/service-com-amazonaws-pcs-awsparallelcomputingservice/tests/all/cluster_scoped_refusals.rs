@@ -34,6 +34,16 @@
 //! against every form of cluster identifier at each published bound of its length, each
 //! naming children that exist and children nothing holds.
 
+/// What the generated-ID form of a `clusterIdentifier` that resolves to nothing earns, over
+/// the widths that form admits and across the state a refused child create must not leave.
+///
+/// Declared here rather than in `tests/all.rs`, which declares the suites directly under
+/// `tests/all/`: a file deeper than that is declared by its own parent module, which this
+/// suite is. The `#[path]` is relative to this file's own directory, and is needed because
+/// `tests/all.rs` pulled this file in with a `#[path]` of its own.
+#[path = "cluster_scoped_refusals/absent_generated_cluster_id.rs"]
+mod absent_generated_cluster_id;
+
 use serde_json::{json, Value};
 use service_com_amazonaws_pcs_awsparallelcomputingservice::service::wire::CLIENT_ERROR_STATUS;
 use service_com_amazonaws_pcs_awsparallelcomputingservice::state::MAX_TAGS_PER_RESOURCE;
