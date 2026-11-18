@@ -24,7 +24,10 @@
 //! Whether a placement EXISTS is EC2's answer too: a firewall endpoint can only be
 //! instantiated in a VPC and subnets the calling account holds, so the ids a request carries
 //! are resolved against EC2 ([`resolve`]) before anything is stored, and the operation that
-//! asked refuses a request naming one this account cannot reach.
+//! asked refuses a request naming one this account cannot reach. Whether an endpoint is still
+//! IN USE is EC2's answer for the same reason — the route tables that send traffic to it are
+//! EC2's resource ([`still_routed`]) — so deleting a firewall whose endpoints a route table
+//! still names is refused rather than leaving that route pointing at nothing.
 //!
 //! An ask EC2 does not answer at all is an ask this emulator could not make: there was no EC2
 //! in this process (the assembled emulator mounts every service, so this is a process running
@@ -276,6 +279,94 @@ pub async fn instantiate_all(
         }
     }
     created
+}
+
+/// The EC2 route-table filter that selects the tables holding a route whose target is one of
+/// the named gateways (`route.gateway-id`).
+///
+/// A firewall endpoint is reported as a route's `GatewayId` — the modelled `Route` carries no
+/// member of its own for a VPC endpoint — so this is the filter that answers "which route
+/// tables still send traffic to these endpoints".
+const ROUTE_GATEWAY_FILTER: &str = "route.gateway-id";
+
+/// The firewall endpoints of `endpoint_ids` a VPC route table still routes traffic to, in the
+/// order they were asked about.
+///
+/// "You can check whether a firewall is in use by reviewing the route tables for the
+/// Availability Zones where you have firewall subnet mappings … When the route tables no
+/// longer use the firewall endpoints, you can remove the firewall safely" (`DeleteFirewall`):
+/// an endpoint a route table still points at is in use, and removing it would leave that route
+/// pointing at nothing. The route tables are Amazon EC2's resource, so the question is asked
+/// THERE, through the same in-process callback the rest of this module uses.
+///
+/// Empty where EC2 answered nothing (see the module docs) and where nothing was asked about:
+/// a refusal of this service's is grounded in what EC2 answered, so an unanswered ask holds
+/// nothing back. `endpoint_ids` is bounded HERE the way [`instantiate_all`] bounds its own
+/// list — one endpoint per Availability Zone a firewall spans — so a longer list is asked
+/// about not at all rather than turned into an unbounded filter.
+pub async fn still_routed(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    endpoint_ids: &[String],
+) -> Vec<String> {
+    if endpoint_ids.is_empty() || endpoint_ids.len() > crate::state::MAX_AVAILABILITY_ZONES {
+        return Vec::new();
+    }
+    let Some(client) = ec2_client(ctx, region) else {
+        unrouted("there is no Amazon EC2 in this process to ask");
+        return Vec::new();
+    };
+    let filter = ::aws_sdk_ec2::types::Filter::builder()
+        .name(ROUTE_GATEWAY_FILTER)
+        .set_values(Some(endpoint_ids.to_vec()))
+        .build();
+    let answer = client.describe_route_tables().filters(filter).send().await;
+    let tables = match answer {
+        Ok(output) => output.route_tables,
+        Err(error) => {
+            unrouted(&::aws_smithy_types::error::display::DisplayErrorContext(&error).to_string());
+            return Vec::new();
+        }
+    };
+    let targeted: ::std::collections::HashSet<&str> = tables
+        .iter()
+        .flatten()
+        .flat_map(|table| table.routes())
+        .filter_map(::aws_sdk_ec2::types::Route::gateway_id)
+        .collect();
+    endpoint_ids
+        .iter()
+        .filter(|endpoint_id| targeted.contains(endpoint_id.as_str()))
+        .cloned()
+        .collect()
+}
+
+/// Trace route tables Amazon EC2 answered nothing about, which holds no firewall endpoint back
+/// (see the module docs).
+///
+/// At `warn`: a deployment where this ask does not answer is one where no endpoint can be found
+/// to be in use, which is worth seeing. `why` is this service's own text or what the SDK
+/// reported, never a caller value.
+fn unrouted(why: &str) {
+    ::tracing::warn!(
+        why = %why,
+        "the route tables that still send traffic to a firewall's endpoints were not read in \
+         Amazon EC2"
+    );
+}
+
+/// The refusal message for a delete that would take away firewall endpoints a VPC route table
+/// still routes traffic to, naming those endpoints.
+///
+/// The ids are the endpoints the request's own firewall carries and the route tables still
+/// point at ([`still_routed`]), in the order they were asked about, so the caller is told which
+/// routes to remove first.
+pub fn still_routed_message(endpoint_ids: &[String]) -> String {
+    format!(
+        "Unable to fulfill request because the following related VPC endpoint(s) still exist \
+         in route table(s): [{endpoints}]",
+        endpoints = endpoint_ids.join(", "),
+    )
 }
 
 /// Ask Amazon EC2 to delete the firewall endpoints `endpoint_ids` names, as the attachment

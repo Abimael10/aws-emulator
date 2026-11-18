@@ -4,7 +4,8 @@
 //! IMPLEMENTED: removes the stored `FirewallRecord` so later reads miss it, deletes the
 //! firewall endpoints it carried in Amazon EC2 (`crate::state::firewall_endpoints`),
 //! releases
-//! its firewall policy association, and refuses a delete-protected firewall.
+//! its firewall policy association, and refuses a delete-protected firewall and one whose
+//! endpoints a VPC route table still sends traffic to.
 //!
 //! ## Shape of an operation
 //!
@@ -182,6 +183,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // gone. The Region is the one the request is signed for, as every other firewall
         // call reads it.
         let region = crate::state::request_region(ctx);
+        // "You can check whether a firewall is in use by reviewing the route tables … When
+        // the route tables no longer use the firewall endpoints, you can remove the firewall
+        // safely" (`DeleteFirewall`): an endpoint a route table still sends traffic to is in
+        // use, so the delete is refused rather than taking that endpoint away and leaving the
+        // route pointing at nothing. The route tables are Amazon EC2's, so they are read
+        // THERE, before anything of this service's is removed.
+        let still_routed = crate::state::firewall_endpoints::still_routed(
+            ctx,
+            &region,
+            &self.routable_endpoints(&input),
+        )
+        .await;
+        if !still_routed.is_empty() {
+            return Err(DeleteFirewallErrorModeled::InvalidRequestException(
+                InvalidRequestException {
+                    message: Some(crate::state::firewall_endpoints::still_routed_message(
+                        &still_routed,
+                    )),
+                },
+            )
+            .into());
+        }
         let (deleted, removed) = self.remove_firewall(&input)?;
         crate::state::firewall_endpoints::remove(ctx, &region, removed).await;
         Ok(deleted)
@@ -189,6 +212,39 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 }
 
 impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> DeleteFirewall<Eng> {
+    /// The firewall endpoints this delete would take away in Amazon EC2 — read BEFORE anything
+    /// is removed, so EC2's route tables can be asked whether they still send traffic to any
+    /// of them.
+    ///
+    /// Empty where the delete is refused for a reason of its own — a request naming neither
+    /// member or a mismatched pair, a firewall the store does not hold, or one protected
+    /// against deletion: [`DeleteFirewall::remove_firewall`] answers that refusal, and a
+    /// request refused on its own terms is not also asked about its routes.
+    ///
+    /// A READ: the guard is taken and dropped here, so the hop that follows holds none. The ids
+    /// are SORTED, the record keying its attachments by Availability Zone rather than in any
+    /// order, so the refusal below names them the same way for two identical requests.
+    fn routable_endpoints(&self, input: &DeleteFirewallInput) -> Vec<String> {
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Vec::new();
+        };
+        let state = state.lock();
+        let Ok(key) = state.resolve_firewall(
+            input.firewall_name.as_deref(),
+            input.firewall_arn.as_deref(),
+        ) else {
+            return Vec::new();
+        };
+        let mut endpoint_ids = state
+            .firewalls
+            .get(&key)
+            .filter(|record| !record.delete_protection)
+            .map(crate::state::FirewallRecord::instantiated_endpoints)
+            .unwrap_or_default();
+        endpoint_ids.sort();
+        endpoint_ids
+    }
+
     /// Remove the firewall the request names, and answer the response alongside the firewall
     /// endpoints Amazon EC2 is to delete.
     ///

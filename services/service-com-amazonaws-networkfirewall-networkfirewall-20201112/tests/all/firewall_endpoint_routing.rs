@@ -24,7 +24,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 
-use crate::harness::{string_at, Harness};
+use crate::harness::{error_code, error_message, string_at, Harness};
 
 /// The `VpcEndpointType` a firewall endpoint is reported with
 /// (`smithy_query(query="shape",shape="VpcEndpointType")` on the EC2 model: one of `Gateway`,
@@ -1044,5 +1044,366 @@ async fn an_endpoint_id_ec2_holds_no_endpoint_for_is_refused_by_the_same_read() 
                 vpc = network.vpc_id
             );
         }
+    }
+}
+
+/// The FIXED text of the refusal a delete of a firewall whose endpoints are still routed
+/// carries; the ids the call found still routed are what fills the bracket after it.
+const STILL_ROUTED_PREFIX: &str = "Unable to fulfill request because the following related \
+                                   VPC endpoint(s) still exist in route table(s): [";
+
+/// What a route the row creates matches on, which the rule generalises over: a route names its
+/// target whichever destination family it matches on
+/// (`CreateRouteRequest$DestinationCidrBlock` / `$DestinationIpv6CidrBlock`).
+#[derive(Debug, Clone, Copy)]
+enum Destination {
+    /// An IPv4 block.
+    Ipv4(&'static str),
+    /// An IPv6 block.
+    Ipv6(&'static str),
+}
+
+/// One route a row asks for: the attachment whose endpoint it targets (its index in the row's
+/// subnet list), which of the row's route tables it goes in, and what it matches on.
+#[derive(Debug, Clone, Copy)]
+struct Routed {
+    endpoint: usize,
+    table: usize,
+    destination: Destination,
+}
+
+/// Add the route `routed` to `tables`, pointing it at `endpoint_ids[routed.endpoint]`, and
+/// assert EC2 accepted it.
+async fn add_route(
+    ec2: &::aws_sdk_ec2::Client,
+    case: &str,
+    tables: &[String],
+    endpoint_ids: &[String],
+    routed: Routed,
+) {
+    let table = &tables[routed.table];
+    let endpoint_id = &endpoint_ids[routed.endpoint];
+    let request = ec2
+        .create_route()
+        .route_table_id(table)
+        .vpc_endpoint_id(endpoint_id);
+    let request = match routed.destination {
+        Destination::Ipv4(block) => request.destination_cidr_block(block),
+        Destination::Ipv6(block) => request.destination_ipv6_cidr_block(block),
+    };
+    let created = request.send().await.unwrap_or_else(|error| {
+        panic!(
+            "case {case:?}: EC2 must route {destination:?} through {endpoint_id} in {table}: \
+             {error:?}",
+            destination = routed.destination
+        )
+    });
+    assert_eq!(
+        created.r#return(),
+        Some(true),
+        "case {case:?}: expected CreateRoute for {destination:?} -> {endpoint_id} to answer \
+         return=true, got {created:?}",
+        destination = routed.destination
+    );
+}
+
+/// Take the route `routed` back out of `tables`, so nothing routes to that endpoint any more.
+async fn drop_route(
+    ec2: &::aws_sdk_ec2::Client,
+    case: &str,
+    tables: &[String],
+    routed: Routed,
+) {
+    let table = &tables[routed.table];
+    let request = ec2.delete_route().route_table_id(table);
+    let request = match routed.destination {
+        Destination::Ipv4(block) => request.destination_cidr_block(block),
+        Destination::Ipv6(block) => request.destination_ipv6_cidr_block(block),
+    };
+    request.send().await.unwrap_or_else(|error| {
+        panic!(
+            "case {case:?}: EC2 must take the route {destination:?} back out of {table}: \
+             {error:?}",
+            destination = routed.destination
+        )
+    });
+}
+
+/// RULE: a firewall endpoint a VPC route table still sends traffic to is IN USE, so a
+/// `DeleteFirewall` that would take it away is refused — HTTP 400 `InvalidRequestException`
+/// naming exactly those of the firewall's endpoints a route still targets — and the firewall,
+/// its attachments and its endpoints all survive the refusal; once no route names them, the
+/// same delete is accepted and the endpoints go with it.
+///
+/// "You can check whether a firewall is in use by reviewing the route tables for the
+/// Availability Zones where you have firewall subnet mappings … When the route tables no longer
+/// use the firewall endpoints, you can remove the firewall safely" (`DeleteFirewall`).
+///
+/// The table spans what the rule generalises over: HOW MANY of the firewall's endpoints a route
+/// names (none, one, two of three, all of them), WHICH attachment's endpoint is named (the
+/// first subnet's, the last subnet's), what the route matches on (every address, a narrower
+/// IPv4 block, an IPv6 block), and how many route tables of the VPC carry those routes (one
+/// shared table, one table each).
+#[tokio::test]
+async fn a_firewall_whose_endpoints_are_still_routed_cannot_be_deleted() {
+    struct Case {
+        name: &'static str,
+        vpc_cidr: &'static str,
+        subnet_cidrs: &'static [&'static str],
+        /// How many route tables the row creates in the VPC.
+        tables: usize,
+        routes: &'static [Routed],
+    }
+    let cases = [
+        Case {
+            name: "no-route-names-the-endpoints",
+            vpc_cidr: "10.71.0.0/16",
+            subnet_cidrs: &["10.71.1.0/24", "10.71.2.0/24"],
+            tables: 1,
+            routes: &[],
+        },
+        Case {
+            name: "the-first-subnets-endpoint-takes-every-address",
+            vpc_cidr: "10.72.0.0/16",
+            subnet_cidrs: &["10.72.1.0/24", "10.72.2.0/24"],
+            tables: 1,
+            routes: &[Routed {
+                endpoint: 0,
+                table: 0,
+                destination: Destination::Ipv4(EVERY_DESTINATION),
+            }],
+        },
+        Case {
+            name: "the-last-subnets-endpoint-takes-a-narrower-block",
+            vpc_cidr: "10.73.0.0/16",
+            subnet_cidrs: &["10.73.1.0/24", "10.73.2.0/24"],
+            tables: 1,
+            routes: &[Routed {
+                endpoint: 1,
+                table: 0,
+                destination: Destination::Ipv4("10.73.9.0/24"),
+            }],
+        },
+        Case {
+            name: "both-endpoints-from-one-table-one-over-ipv6",
+            vpc_cidr: "10.74.0.0/16",
+            subnet_cidrs: &["10.74.1.0/24", "10.74.2.0/24"],
+            tables: 1,
+            routes: &[
+                Routed {
+                    endpoint: 0,
+                    table: 0,
+                    destination: Destination::Ipv4(EVERY_DESTINATION),
+                },
+                Routed {
+                    endpoint: 1,
+                    table: 0,
+                    destination: Destination::Ipv6("2001:db8::/32"),
+                },
+            ],
+        },
+        Case {
+            name: "two-of-three-endpoints-from-a-table-each",
+            vpc_cidr: "10.75.0.0/16",
+            subnet_cidrs: &["10.75.1.0/24", "10.75.2.0/24", "10.75.3.0/24"],
+            tables: 2,
+            routes: &[
+                Routed {
+                    endpoint: 0,
+                    table: 0,
+                    destination: Destination::Ipv4(EVERY_DESTINATION),
+                },
+                Routed {
+                    endpoint: 2,
+                    table: 1,
+                    destination: Destination::Ipv4("10.75.9.0/24"),
+                },
+            ],
+        },
+    ];
+
+    for case in cases {
+        let harness = Harness::with_ec2();
+        let ec2 = harness.ec2();
+        let network = create_network(&ec2, case.name, case.vpc_cidr, case.subnet_cidrs).await;
+        let mut tables = vec![network.route_table_id.clone()];
+        while tables.len() < case.tables {
+            let created = ec2
+                .create_route_table()
+                .vpc_id(&network.vpc_id)
+                .send()
+                .await
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "case {name:?}: EC2 must create a second route table: {error:?}",
+                        name = case.name
+                    )
+                });
+            tables.push(
+                created
+                    .route_table()
+                    .and_then(::aws_sdk_ec2::types::RouteTable::route_table_id)
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "case {name:?}: CreateRouteTable must report the table it minted",
+                            name = case.name
+                        )
+                    })
+                    .to_string(),
+            );
+        }
+
+        let firewall = format!("{}-fw", case.name);
+        let (status, created) =
+            create_firewall(&harness, &firewall, &network.vpc_id, &network.subnet_ids).await;
+        assert_eq!(
+            status, 200,
+            "case {name:?}: expected the firewall to be created, got HTTP {status} with \
+             {created:?}",
+            name = case.name
+        );
+        let described = ready_firewall(&harness, case.name, &firewall).await;
+        let published = attachments(&described);
+        // The endpoints in the row's own subnet order, so a row names an attachment by where
+        // its subnet sits rather than by an id it cannot know.
+        let endpoint_ids: Vec<String> = case
+            .subnet_cidrs
+            .iter()
+            .enumerate()
+            .map(|(index, _)| {
+                let subnet_id = &network.subnet_ids[index];
+                published
+                    .iter()
+                    .find(|(subnet, _)| subnet == subnet_id)
+                    .map(|(_, endpoint_id)| endpoint_id.clone())
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "case {name:?}: expected an attachment in {subnet_id}, got \
+                             {published:?}",
+                            name = case.name
+                        )
+                    })
+            })
+            .collect();
+
+        for routed in case.routes {
+            add_route(&ec2, case.name, &tables, &endpoint_ids, *routed).await;
+        }
+        let mut still_routed: Vec<String> = case
+            .routes
+            .iter()
+            .map(|routed| endpoint_ids[routed.endpoint].clone())
+            .collect();
+        still_routed.sort();
+        still_routed.dedup();
+
+        let (status, body) = harness
+            .call("DeleteFirewall", &json!({ "FirewallName": firewall }))
+            .await;
+        if still_routed.is_empty() {
+            // The negative control: nothing routes to this firewall, so the delete is the
+            // plain one and takes every endpoint with it.
+            assert_eq!(
+                status, 200,
+                "case {name:?}: expected a firewall nothing routes to to be deleted, got HTTP \
+                 {status} with {body:?}",
+                name = case.name
+            );
+            let held = endpoint_ids_in_vpc(&ec2, case.name, &network.vpc_id).await;
+            assert!(
+                held.is_empty(),
+                "case {name:?}: expected the deleted firewall's endpoints to be gone, EC2 holds \
+                 {held:?}",
+                name = case.name
+            );
+            continue;
+        }
+
+        assert_eq!(
+            (status, error_code(&body).as_str()),
+            (400, "InvalidRequestException"),
+            "case {name:?}: expected 400 InvalidRequestException for a firewall still routed \
+             to, got HTTP {status} with {body:?}",
+            name = case.name
+        );
+        let message = error_message(&body);
+        assert!(
+            message.starts_with(STILL_ROUTED_PREFIX) && message.ends_with(']'),
+            "case {name:?}: expected the refusal to read {STILL_ROUTED_PREFIX}…], got \
+             {message:?}",
+            name = case.name
+        );
+        for endpoint_id in &still_routed {
+            assert!(
+                message.contains(endpoint_id.as_str()),
+                "case {name:?}: expected the refusal to name the still-routed {endpoint_id}, \
+                 got {message:?}",
+                name = case.name
+            );
+        }
+        for endpoint_id in &endpoint_ids {
+            if still_routed.contains(endpoint_id) {
+                continue;
+            }
+            assert!(
+                !message.contains(endpoint_id.as_str()),
+                "case {name:?}: expected the refusal NOT to name {endpoint_id}, which no route \
+                 targets, got {message:?}",
+                name = case.name
+            );
+        }
+
+        // The refused delete left the firewall and every one of its endpoints exactly where
+        // they were, so the caller can remove the routes and try again.
+        let after = harness
+            .ok("DescribeFirewall", &json!({ "FirewallName": firewall }))
+            .await;
+        let mut surviving = attachments(&after);
+        surviving.sort();
+        let mut expected = published.clone();
+        expected.sort();
+        assert_eq!(
+            surviving, expected,
+            "case {name:?}: expected the refused delete to leave the attachments alone",
+            name = case.name
+        );
+        let held = endpoint_ids_in_vpc(&ec2, case.name, &network.vpc_id).await;
+        assert_eq!(
+            held,
+            endpoint_ids.iter().cloned().collect::<BTreeSet<String>>(),
+            "case {name:?}: expected EC2 to still hold every endpoint of the firewall whose \
+             delete was refused",
+            name = case.name
+        );
+
+        // And once no route names them, the very same delete is accepted.
+        for routed in case.routes {
+            drop_route(&ec2, case.name, &tables, *routed).await;
+        }
+        for endpoint_id in &endpoint_ids {
+            let routing = tables_routing_to(&ec2, case.name, endpoint_id).await;
+            assert!(
+                routing.is_empty(),
+                "case {name:?}: expected no table to route to {endpoint_id} once the routes \
+                 were removed, got {routing:?}",
+                name = case.name
+            );
+        }
+        let (status, body) = harness
+            .call("DeleteFirewall", &json!({ "FirewallName": firewall }))
+            .await;
+        assert_eq!(
+            status, 200,
+            "case {name:?}: expected the delete to be accepted once nothing routed to the \
+             firewall, got HTTP {status} with {body:?}",
+            name = case.name
+        );
+        let held = endpoint_ids_in_vpc(&ec2, case.name, &network.vpc_id).await;
+        assert!(
+            held.is_empty(),
+            "case {name:?}: expected the deleted firewall's endpoints to be gone, EC2 holds \
+             {held:?}",
+            name = case.name
+        );
     }
 }
