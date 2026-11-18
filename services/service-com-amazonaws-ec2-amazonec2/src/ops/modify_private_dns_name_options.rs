@@ -1,15 +1,22 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ModifyPrivateDnsNameOptions
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ModifyPrivateDnsNameOptions`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ModifyPrivateDnsNameOptions::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Modifies the instance hostname options of ONE instance ([`crate::state::InstanceDetail`],
+//! the settings part of that instance's record), where `DescribeInstances` reports them back
+//! as `Instance$PrivateDnsNameOptions`.
+//!
+//! Each member of the request names one option: a value sets it, and a member the request
+//! leaves out leaves that option exactly as it stands — which for an option no call has ever
+//! set is the on-launch option of the SUBNET the instance runs in
+//! (`Subnet$PrivateDnsNameOptionsOnLaunch`), read off that subnet by the one projection
+//! `DescribeInstances` reports the set through.
+//!
+//! An `InstanceId` this account holds no instance for is refused with the generic
+//! `UnknownResource` rather than the `InvalidInstanceID.Malformed` / `.NotFound` pair most of
+//! this service's readers of one named instance split an unresolvable id into: which refusal
+//! an operation answers is a fact of that operation, and this one's is what its recorded
+//! contract call carries.
 //!
 //! ## Shape of an operation
 //!
@@ -75,6 +82,8 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+use crate::scaffolded::Scaffolded;
+use crate::state;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -126,6 +135,12 @@ impl<Eng> ModifyPrivateDnsNameOptions<Eng> {
     }
 }
 
+/// The request member a hostname type outside the `HostnameType` catalog is refused by name
+/// with: `ModifyPrivateDnsNameOptionsRequest$PrivateDnsHostnameType`, the parameter the
+/// caller wrote — a launch carries the same word as `PrivateDnsNameOptions.HostnameType` and
+/// so names `HostnameType` in its own refusal.
+const PRIVATE_DNS_HOSTNAME_TYPE: &str = "PrivateDnsHostnameType";
+
 impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_runtime::Operation
     for ModifyPrivateDnsNameOptions<Eng>
 {
@@ -143,18 +158,80 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ModifyPrivateDnsNameOptions` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ModifyPrivateDnsNameOptionsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ModifyPrivateDnsNameOptions"))
+        // Which instance's hostname options change is a fact of the id the request names,
+        // and the options themselves come off the request: nothing here depends on the
+        // request's headers or URI.
+        let _ = ctx;
+
+        // "The type of hostname for EC2 instances" (`$PrivateDnsHostnameType`), resolved
+        // against the catalog of its own modelled enum — so what reaches the store is a
+        // catalog member, never the request's own text. That RESOLUTION is why the call is
+        // here: a word outside the catalog is already refused by the modelled enum before
+        // this handler runs, so the ordering decides nothing. `None` is "the request left
+        // this member out", which asks for no change.
+        let hostname_type = state::requested_word(
+            PRIVATE_DNS_HOSTNAME_TYPE,
+            input.private_dns_hostname_type.as_deref(),
+            HOSTNAME_TYPE_VALUES,
+        )?;
+
+        let service_state = state::require_service_state(&*self.engine)?;
+        let mut store = service_state.lock();
+        // Which state an instance is in is a fact of where the clock stands, so every move
+        // it already owed is materialised before one is read: the refusal below is answered
+        // from the state the instance is in now, not the one it was left in.
+        store.materialize_due_transitions();
+
+        // Malformed before unknown is the split MOST of this service's readers of one named
+        // instance draw; this operation's validator draws NONE: an `InstanceId` it cannot
+        // resolve is the generic `UnknownResource`, whatever form the value is in, which is
+        // what the recorded contract call for this operation answers
+        // (`ec2.op-contract-modify-private-dns-name-options`, whose probe of an id this
+        // account holds no instance for asserts that code). So the id is resolved here
+        // rather than through [`state::require_instance_record`], which words the two
+        // halves the other operations were recorded answering.
+        // The record the write lands on is resolved ONCE: every refusal below is answered
+        // from it, and neither of them reads the store again, so the instance is looked up
+        // one time rather than once per step.
+        let Some(instance) = store.instances.get_mut(&input.instance_id) else {
+            return Err(Scaffolded::unknown_resource(&input.instance_id));
+        };
+        // An instance on its way to `terminated`, or already there, has no hostname left to
+        // answer DNS queries for, so there are no hostname options on it to modify; the
+        // transient states this service's own lifecycle spans (`pending`, `stopping`) are on
+        // their way to exactly `running` and `stopped`, so they never refuse a modify.
+        if instance.state.is_terminating() {
+            return Err(Scaffolded::incorrect_instance_state(
+                &input.instance_id,
+                "modified",
+            ));
+        }
+
+        // DryRun sits after every refusal above and before the one write: "if you have the
+        // required permissions, the error response is DryRunOperation" (`$DryRun`), so a
+        // request that would have been refused is refused with that reason instead, and one
+        // that would have succeeded leaves the instance's options exactly where they were.
+        if input.dry_run == Some(true) {
+            return Err(Scaffolded::dry_run_operation());
+        }
+
+        let detail = &mut instance.detail;
+        // Exactly the options the request named are written; every other one is left as it
+        // stands, which for one no call has set is the subnet's own on-launch option.
+        if let Some(hostname_type) = hostname_type {
+            detail.private_dns_hostname_type = Some(hostname_type);
+        }
+        if let Some(enabled) = input.enable_resource_name_dns_a_record {
+            detail.private_dns_a_record = Some(enabled);
+        }
+        if let Some(enabled) = input.enable_resource_name_dns_aaaa_record {
+            detail.private_dns_aaaa_record = Some(enabled);
+        }
+
+        // "Returns `true` if the request succeeds; otherwise, it returns an error"
+        // (`$Return`): the write above is the request succeeding.
+        Ok(ModifyPrivateDnsNameOptionsOutput {
+            r#return: Some(true),
+        })
     }
 }

@@ -592,6 +592,33 @@ impl<E> Scaffolded<E> {
         )
     }
 
+    /// `UnknownResource` (HTTP 400): the request named a resource this account holds none
+    /// of, on an operation whose validator does NOT split an id it cannot read from one it
+    /// can read but resolves to nothing.
+    ///
+    /// The generic not-found class, beside the per-kind
+    /// [`Self::invalid_instance_id_not_found`] / [`Self::invalid_instance_id_malformed`]
+    /// pair: which of them an operation answers is a fact of that operation, recorded by
+    /// its caller, and `crate::ops::modify_private_dns_name_options` is recorded answering
+    /// this one for an `InstanceId` it cannot resolve, whatever form that value is in.
+    ///
+    /// The sentence names the CALLER's own account and the value the request sent, in the
+    /// template the recorded refusal carries — "User (<account>) does not own a resource
+    /// <id> ." — so neither the resource KIND nor any state of this service is part of it,
+    /// and the id is bounded by the one echo every refusal of this crate quotes a request
+    /// value through.
+    pub fn unknown_resource(resource_id: &str) -> Self {
+        Self::service_error(
+            "UnknownResource",
+            400,
+            format!(
+                "User ({}) does not own a resource {} .",
+                ::engine::emulator_account_id(),
+                crate::state::echoed_resource_id(resource_id)
+            ),
+        )
+    }
+
     /// `RequestLimitExceeded` (HTTP 503): the request asked for more work than the
     /// service will do in one call.
     pub fn request_limit_exceeded(message: impl Into<String>) -> Self {
