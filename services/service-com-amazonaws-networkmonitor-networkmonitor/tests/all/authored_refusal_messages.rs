@@ -30,13 +30,26 @@
 //! TCP protocol.`, `The aggregation period must be one of [30, 60].`, `<state>
 //! is not a valid probe status.`): those keep their recorded sentence and are
 //! pinned by `validation_message_wording` and `update_probe`.
+//!
+//! THE OTHER BRANCH of the same rule is covered here, because nothing else
+//! pins it: a refusal whose subject is a COUNT OF STORED RESOURCES — how many
+//! monitors this service keeps — echoes no submitted value and names no member
+//! path, because the count it refuses on sits in the store and in no member of
+//! the request, so there is nothing for a clause to be built from. Such a
+//! refusal states the whole sentence for the limit that was reached, naming the
+//! limit and neither the count nor the ceiling, exactly as the probe-count
+//! ceilings do (`probes_per_monitor_limit`, `probes_per_subnet_limit`): a client
+//! reads which quota it exceeded and nothing about how the service that refused
+//! it is built.
 
 use serde_json::Value;
+use smithy_server_runtime::MultiServiceRouter;
 
 use super::monitor_and_probe::{
-    call, create_monitor, create_probe, error_code, error_message, list_monitors, page_names,
-    probe_json, router, string_at,
+    call, create_monitor, create_probe, error_code, error_message, get_monitor, list_monitors,
+    name_of_length, page_names, probe_json, router, string_at,
 };
+use super::region_isolation::call_in;
 
 /// Every value the model's `MonitorState` enum admits
 /// (`smithy_query(query="shape",shape="MonitorState")` ->
@@ -530,5 +543,282 @@ async fn an_authored_refusal_is_built_like_a_modelled_one() {
                 "case {case:?} ({kind}): no refusal carries Rust Debug quoting, got {message:?}"
             );
         }
+    }
+}
+
+/// The ceiling this service applies to the monitors it keeps
+/// (`crate::state::MAX_MONITORS`), counted over the whole store rather than per
+/// region.
+const MAX_MONITORS: usize = 500;
+
+/// The sentence a create past that ceiling is refused with
+/// (`crate::state::MONITORS_MESSAGE`).
+const MONITORS_LIMIT_MESSAGE: &str = "Maximum monitors limit exceeded.";
+
+/// The sentences the SIBLING count ceilings of this service are refused with
+/// (`crate::state::PROBES_PER_MONITOR_MESSAGE`,
+/// `crate::state::PROBES_PER_SUBNET_MESSAGE`, pinned over the wire by
+/// `probes_per_monitor_limit` and `probes_per_subnet_limit`): the family
+/// [`MONITORS_LIMIT_MESSAGE`] belongs to, each naming the limit that was
+/// reached and neither the count nor the ceiling.
+const COUNT_LIMIT_MESSAGES: &[&str] = &[
+    "Maximum probes per monitor limit exceeded.",
+    "Maximum probes per subnet limit exceeded.",
+];
+
+/// The modelled error a create past the monitor ceiling answers with, and its
+/// status (`smithy_query(query="shape",shape="ServiceQuotaExceededException")`
+/// -> `errorKind: client`, `httpError: 402`, documented "This request exceeds a
+/// service quota").
+const QUOTA_CODE: &str = "ServiceQuotaExceededException";
+const QUOTA_STATUS: u16 = 402;
+
+/// The regions the store-wide case spreads its monitors over: a request's
+/// region is the one in its SigV4 credential scope, so these are published AWS
+/// region names, and the third is one no monitor was ever created in.
+const CEILING_REGIONS: &[&str] = &["us-west-2", "us-east-1", "eu-central-1"];
+
+/// Assert that `body` is the refusal of a count ceiling this service applies:
+/// the modelled quota error, its status, and the whole sentence for the limit
+/// that was reached — which carries no count, nothing about how the service
+/// that refused it is built, and the same shape as every sibling ceiling's
+/// sentence.
+fn assert_count_ceiling_refusal(case: &str, status: u16, body: &Value, expected: &str) {
+    assert_eq!(
+        status, QUOTA_STATUS,
+        "case {case:?}: expected HTTP {QUOTA_STATUS}, got {status} {body:?}"
+    );
+    assert_eq!(
+        error_code(body),
+        QUOTA_CODE,
+        "case {case:?}: expected {QUOTA_CODE}, got {body:?}"
+    );
+    let message = error_message(body);
+    assert_eq!(
+        message, expected,
+        "case {case:?}: expected message {expected:?}, got {message:?}"
+    );
+    assert!(
+        !message.chars().any(|c| c.is_ascii_digit()),
+        "case {case:?}: a count ceiling states the limit, never the count it reached, got \
+         {message:?}"
+    );
+    // The sentence shape every count ceiling of this service shares, so a
+    // caller reading the refusal of one reads the refusal of the others.
+    assert!(
+        message.starts_with("Maximum ") && message.ends_with(" limit exceeded."),
+        "case {case:?}: expected the sentence family of {COUNT_LIMIT_MESSAGES:?}, got {message:?}"
+    );
+    assert!(
+        !message.contains('"'),
+        "case {case:?}: a refusal must carry no Rust Debug quoting, got {message:?}"
+    );
+}
+
+/// Create `count` monitors named `<prefix>-<n>` in `region`, each accepted, so
+/// the store is left holding exactly that many more.
+async fn fill_monitors(router: &MultiServiceRouter, region: &str, prefix: &str, count: usize) {
+    for index in 0..count {
+        let name = format!("{prefix}-{index:04}");
+        let body = format!(r#"{{"monitorName":"{name}"}}"#);
+        let (status, created) = call_in(router, region, "POST", "/monitors", Some(&body)).await;
+        assert_eq!(
+            status, 200,
+            "setup CreateMonitor {name:?} in {region} expected 200, got {status} {created:?}"
+        );
+    }
+}
+
+/// A create that would take this service past how many monitors it keeps is
+/// refused with the whole sentence for the limit it reached — never with a
+/// clause, a count or anything about how the service that refused it is built —
+/// and stores nothing.
+///
+/// The table spans the requests that can arrive at a store already holding the
+/// ceiling's worth of monitors: the shortest name the model admits, one at its
+/// length maximum, names drawn from the rest of the admitted alphabet, a create
+/// naming the documented `aggregationPeriod`, one carrying tags, one carrying an
+/// idempotency token nothing has used, and ones asking for inline probes. None
+/// of those changes which limit was reached, so every row reads the same.
+#[tokio::test]
+async fn a_create_past_the_monitor_ceiling_is_stated_as_the_limit_it_reached() {
+    let longest_name = name_of_length(200);
+    // (case, monitorName, the rest of the request body)
+    let refused: Vec<(&str, String, String)> = vec![
+        (
+            "the reported case: a fresh name",
+            "one-too-many".to_string(),
+            String::new(),
+        ),
+        (
+            "the shortest name the model admits",
+            "a".to_string(),
+            String::new(),
+        ),
+        (
+            "a name at the modelled length maximum",
+            longest_name.clone(),
+            String::new(),
+        ),
+        (
+            "a name of digits, hyphens and underscores",
+            "9_edge-7_Probe".to_string(),
+            String::new(),
+        ),
+        (
+            "a create naming the documented aggregationPeriod",
+            "with-period".to_string(),
+            r#","aggregationPeriod":30"#.to_string(),
+        ),
+        (
+            "a create carrying tags",
+            "with-tags".to_string(),
+            r#","tags":{"team":"net"}"#.to_string(),
+        ),
+        (
+            "a create carrying an idempotency token nothing has used",
+            "with-token".to_string(),
+            r#","clientToken":"8ca0f1be-0d6e-4f3a-9b6c-9c0b2f6d1111""#.to_string(),
+        ),
+        (
+            "a create asking for one inline probe",
+            "with-probe".to_string(),
+            format!(r#","probes":[{}]"#, probe_json("10.0.0.1", "ICMP", "")),
+        ),
+        (
+            "a create asking for several inline probes",
+            "with-probes".to_string(),
+            format!(
+                r#","probes":[{},{}]"#,
+                probe_json("10.0.0.2", "ICMP", ""),
+                probe_json("10.0.0.3", "TCP", r#","destinationPort":443"#)
+            ),
+        ),
+    ];
+
+    let router = router();
+    fill_monitors(&router, "us-west-2", "held", MAX_MONITORS).await;
+
+    for (case, name, rest) in &refused {
+        let body = format!(r#"{{"monitorName":"{name}"{rest}}}"#);
+        let (status, body) = create_monitor(&router, &body).await;
+        assert_count_ceiling_refusal(case, status, &body, MONITORS_LIMIT_MESSAGE);
+        // A refused create stores nothing: the monitor it named was never made.
+        let (status, missing) = get_monitor(&router, name).await;
+        assert_eq!(
+            status, 404,
+            "case {case:?}: a refused create stores no monitor, got {status} {missing:?}"
+        );
+        assert_eq!(
+            error_code(&missing),
+            "ResourceNotFoundException",
+            "case {case:?}: expected ResourceNotFoundException, got {missing:?}"
+        );
+    }
+}
+
+/// The refusal is about the COUNT the store holds, not about the name a request
+/// sent: freeing one slot makes the very next create succeed, the one after it
+/// is refused again with the same sentence, and a name the store already holds
+/// is still the conflict refusal rather than this one.
+#[tokio::test]
+async fn the_monitor_ceiling_refuses_on_the_count_and_not_on_the_name() {
+    let router = router();
+    fill_monitors(&router, "us-west-2", "held", MAX_MONITORS).await;
+
+    let (status, refused) = create_monitor(&router, r#"{"monitorName":"first-past"}"#).await;
+    assert_count_ceiling_refusal("at the ceiling", status, &refused, MONITORS_LIMIT_MESSAGE);
+
+    // A name the store already holds is decided by the name, so it keeps its own
+    // refusal: the count ceiling answers only a create that would add a monitor.
+    let (status, conflict) = create_monitor(&router, r#"{"monitorName":"held-0000"}"#).await;
+    assert_eq!(
+        status, 409,
+        "a stored name must stay a conflict at the ceiling, got {status} {conflict:?}"
+    );
+    assert_eq!(
+        error_code(&conflict),
+        "ConflictException",
+        "a stored name must stay a conflict at the ceiling, got {conflict:?}"
+    );
+
+    // One slot freed, one create accepted — and the monitor it made is readable.
+    let (status, deleted) = call(&router, "DELETE", "/monitors/held-0000", None).await;
+    assert_eq!(
+        status, 200,
+        "expected DeleteMonitor 200, got {status} {deleted:?}"
+    );
+    let (status, created) = create_monitor(&router, r#"{"monitorName":"took-the-slot"}"#).await;
+    assert_eq!(
+        status, 200,
+        "the freed slot must take one create, got {status} {created:?}"
+    );
+    let (status, got) = get_monitor(&router, "took-the-slot").await;
+    assert_eq!(
+        status, 200,
+        "expected the created monitor to be readable, got {status} {got:?}"
+    );
+    assert_eq!(
+        string_at(&got, "monitorName"),
+        "took-the-slot",
+        "expected the created monitor to be reported back, got {got:?}"
+    );
+
+    // The slot is taken again, so the next create reads exactly as the first did.
+    let (status, refused_again) = create_monitor(&router, r#"{"monitorName":"second-past"}"#).await;
+    assert_count_ceiling_refusal(
+        "at the ceiling again",
+        status,
+        &refused_again,
+        MONITORS_LIMIT_MESSAGE,
+    );
+}
+
+/// The count the ceiling refuses on is the STORE's, across every region it
+/// holds: monitors spread over two regions reach it together, and the refusal
+/// reads the same in each of them and in a region that holds none.
+#[tokio::test]
+async fn the_monitor_ceiling_counts_every_region_of_the_store() {
+    let router = router();
+    let half = MAX_MONITORS / 2;
+    fill_monitors(&router, CEILING_REGIONS[0], "west", half).await;
+    fill_monitors(&router, CEILING_REGIONS[1], "east", MAX_MONITORS - half).await;
+
+    for region in CEILING_REGIONS {
+        let body = format!(r#"{{"monitorName":"past-in-{region}"}}"#);
+        let (status, refused) = call_in(&router, region, "POST", "/monitors", Some(&body)).await;
+        assert_count_ceiling_refusal(region, status, &refused, MONITORS_LIMIT_MESSAGE);
+    }
+
+    // Each region still reports the monitors it holds, so the refusal cost
+    // nothing that was already there — and reports only its OWN, so the two
+    // halves reached the ceiling together rather than either one alone.
+    for (region, prefix, other_prefix) in [
+        (CEILING_REGIONS[0], "west", "east"),
+        (CEILING_REGIONS[1], "east", "west"),
+    ] {
+        let (status, listed) = call_in(&router, region, "GET", "/monitors?maxResults=1", None).await;
+        assert_eq!(
+            status, 200,
+            "expected ListMonitors 200 in {region}, got {status} {listed:?}"
+        );
+        assert_eq!(
+            page_names(&listed),
+            vec![format!("{prefix}-0000")],
+            "expected {region} to still report its own monitors, got {listed:?}"
+        );
+        let (status, missing) = call_in(
+            &router,
+            region,
+            "GET",
+            &format!("/monitors/{other_prefix}-0000"),
+            None,
+        )
+        .await;
+        assert_eq!(
+            status, 404,
+            "expected {region} to hold none of the other region's monitors, got {status} \
+             {missing:?}"
+        );
     }
 }

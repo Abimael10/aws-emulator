@@ -48,7 +48,11 @@
 //! reads exactly like the one the boundary validator renders for a modelled
 //! constraint. A refusal whose AWS sentence is known as a whole
 //! ([`TCP_PORT_REQUIRED_MESSAGE`], [`aggregation_period_message`],
-//! [`monitor_not_found_message`]) keeps that sentence instead.
+//! [`monitor_not_found_message`]) keeps that sentence instead — as does the
+//! refusal of a COUNT ceiling ([`PROBES_PER_SUBNET_MESSAGE`],
+//! [`PROBES_PER_MONITOR_MESSAGE`], [`MONITORS_MESSAGE`]), where what was
+//! exceeded is a count of STORED resources that no member of the request
+//! carries, so there is no submitted value for a clause to be built from.
 
 use std::collections::BTreeMap;
 use std::net::IpAddr;
@@ -213,7 +217,9 @@ pub const MAX_PAGE_SIZE: usize = 25;
 /// `ServiceQuotaExceededException` past this point rather than growing without
 /// bound. It bounds the store as a whole, across every region it holds. AWS
 /// enforces a per-account, per-region monitor quota of its own and answers that
-/// same modelled error.
+/// same modelled error, stated as [`MONITORS_MESSAGE`]: the ceiling's VALUE is
+/// this emulator's, what the refusal SAYS is the limit that was reached, so the
+/// value never reaches the wire.
 pub const MAX_MONITORS: usize = 500;
 
 /// The most probes this emulator keeps in ONE monitor. An EMULATOR-CHOSEN
@@ -243,6 +249,19 @@ pub const PROBES_PER_SUBNET_MESSAGE: &str = "Maximum probes per subnet limit exc
 /// every probe-count ceiling, so a caller catching the refusal of one catches
 /// the refusal of the other.
 pub const PROBES_PER_MONITOR_MESSAGE: &str = "Maximum probes per monitor limit exceeded.";
+
+/// The same, for the monitors this service keeps ([`MAX_MONITORS`]).
+///
+/// A whole sentence rather than a constraint clause, for the reason its
+/// siblings are, and for one more: what was exceeded is a count of STORED
+/// monitors, which no member of the request carries, so there is no submitted
+/// value and no member path for a clause to be built from. Like them it names
+/// the limit that was reached and neither the count nor the ceiling, so a
+/// caller is told which quota it exceeded and nothing about how the service
+/// that refused it is built. The class is the `ServiceQuotaExceededException`
+/// the model declares for a request that "exceeds a service quota", which is
+/// what a create past this ceiling is.
+pub const MONITORS_MESSAGE: &str = "Maximum monitors limit exceeded.";
 
 /// The most `clientToken` records this emulator keeps. An EMULATOR-CHOSEN
 /// ceiling: the key is a string the CALLER picks, so this is the one store whose
@@ -1158,6 +1177,21 @@ pub fn check_probes_per_monitor(
     let held = existing.map_or(0, |monitor| monitor.probes.len());
     if held.saturating_add(requested) > MAX_PROBES_PER_MONITOR {
         return Err(PROBES_PER_MONITOR_MESSAGE.to_string());
+    }
+    Ok(())
+}
+
+/// Check the ceiling on how many monitors this service keeps ([`MAX_MONITORS`])
+/// for a request that would ADD one to the `held` the store already holds.
+/// `Err` carries [`MONITORS_MESSAGE`].
+///
+/// Here rather than in the handler, so the ceiling and the sentence that states
+/// it stay in one place exactly as [`check_probes_per_monitor`] keeps the
+/// probe-count ceilings and theirs: every path that would add a monitor reaches
+/// the same decision and states the same refusal.
+pub fn check_monitor_count(held: usize) -> Result<(), String> {
+    if held.saturating_add(1) > MAX_MONITORS {
+        return Err(MONITORS_MESSAGE.to_string());
     }
     Ok(())
 }

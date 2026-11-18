@@ -53,7 +53,13 @@ fn authorization(region: &str) -> String {
 
 /// Send one request signed for `region` and return its status and parsed JSON
 /// body (`Value::Null` for an empty body).
-async fn call_in(
+///
+/// `pub(crate)`, because the region a request addresses is read off its SigV4
+/// credential scope in ONE place: a suite about a rule that spans regions (the
+/// store-wide monitor ceiling in `authored_refusal_messages`) signs its
+/// requests through this one builder rather than keeping a copy that could
+/// drift from it.
+pub(crate) async fn call_in(
     router: &MultiServiceRouter,
     region: &str,
     method: &str,

@@ -14,6 +14,10 @@
 //! has satisfied the probe rules on its own
 //! ([`crate::state::validate_probe_spec`]), so a request that is both malformed
 //! and too long is refused by the clause naming the member it got wrong.
+//! A create that would take this service past how many monitors it keeps
+//! ([`crate::state::check_monitor_count`]) is the modelled 402
+//! `ServiceQuotaExceededException`, stated as the sentence for the limit it
+//! reached ([`crate::state::MONITORS_MESSAGE`]) and storing nothing.
 //! A second create naming a monitor that already exists is a RETRY only when it
 //! repeats the idempotency token recorded for that create
 //! ([`crate::state::ComAmazonawsNetworkmonitorNetworkmonitorState::monitor_minted_by_token`],
@@ -363,13 +367,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         }
-        if store.monitor_count() >= crate::state::MAX_MONITORS {
+        // The ceiling on the store as a whole is refused the way every other
+        // count ceiling this service applies is
+        // (`crate::state::check_monitor_count`): the whole sentence stated for
+        // the limit that was reached, naming neither the count nor the ceiling,
+        // so this refusal too names nothing this emulator generated.
+        if let Err(message) = crate::state::check_monitor_count(store.monitor_count()) {
             return Err(CreateMonitorErrorModeled::ServiceQuotaExceededException(
                 ServiceQuotaExceededException {
-                    message: Some(format!(
-                        "this emulator keeps at most {} monitors",
-                        crate::state::MAX_MONITORS
-                    )),
+                    message: Some(message),
                 },
             )
             .into());
