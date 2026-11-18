@@ -340,12 +340,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     }
 }
 
-/// How an ARN this Region holds no distribution configuration under is reported: the sentence
-/// this service's configuration resources carry, quoting the ARN the request named.
+/// How an ARN this Region holds no distribution configuration under is reported: as the
+/// required resource it is, naming the kind its ARN identifies and the ARN the request
+/// carried.
 fn not_found(arn: &str) -> UpdateDistributionConfigurationError {
     UpdateDistributionConfigurationErrorModeled::ResourceNotFoundException(
         ResourceNotFoundException {
-            message: Some(crate::state::resource_arn_not_found_message(arn)),
+            message: Some(crate::state::required_resource_not_found_message(arn)),
         },
     )
     .into()

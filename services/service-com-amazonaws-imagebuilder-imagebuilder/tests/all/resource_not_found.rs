@@ -13,14 +13,13 @@
 //! (`ResourceNotFoundException`, HTTP 404), and WHICH SENTENCE it carries follows the FAMILY
 //! of the resource the ARN names rather than what the call does with it:
 //!
-//! * the authoring and build resources — components, recipes, pipelines, images and
-//!   workflows — are reported as the required resource they are: "The following required
-//!   resource '<Kind>' cannot be found: '<arn>'.", naming the kind the ARN identifies. One
-//!   answer for every lookup of them: a read, a delete, a policy write, a tagging write, and
-//!   the reference resolution of a create.
-//! * the two CONFIGURATION resources — infrastructure and distribution — are reported by
-//!   quoting the ARN the request carried: "The resource ARN '<arn>' was not found.", which
-//!   names no kind.
+//! * every family but one — components, recipes, pipelines, images, workflows and the
+//!   DISTRIBUTION configuration — is reported as the required resource it is: "The following
+//!   required resource '<Kind>' cannot be found: '<arn>'.", naming the kind the ARN
+//!   identifies. One answer for every lookup of them: a read, a delete, an update, a policy
+//!   write, a tagging write, and the reference resolution of a create.
+//! * the INFRASTRUCTURE configuration is the single family reported by quoting the ARN the
+//!   request carried: "The resource ARN '<arn>' was not found.", which names no kind.
 //!
 //! The TAG LISTING is the one lookup answered by another layer and so by another class: it
 //! reports an ARN that resolves to nothing as the resource-tagging layer's own
@@ -168,9 +167,9 @@ fn assert_reported_missing(
     );
 }
 
-/// Assert `status` and the answer are the not-found report the rule requires for one of the
-/// two CONFIGURATION resources: HTTP 404, the same modelled error type, and the message that
-/// quotes `arn` and names no kind.
+/// Assert `status` and the answer are the not-found report the rule requires for an
+/// INFRASTRUCTURE configuration: HTTP 404, the same modelled error type, and the message
+/// that quotes `arn` and names no kind.
 fn assert_arn_not_found(case: &str, status: u16, body: &Value, arn: &str) {
     assert_not_found_shape(case, status, body);
     let expected = format!("The resource ARN '{arn}' was not found.");
@@ -318,6 +317,26 @@ async fn create_configuration(router: &MultiServiceRouter, region: &str, name: &
     text(&case, &answer, "infrastructureConfigurationArn")
 }
 
+/// `CreateDistributionConfiguration` for `name` in `region`, answering its ARN.
+async fn create_distribution(router: &MultiServiceRouter, region: &str, name: &str) -> String {
+    let body = json!({
+        "name": name,
+        "clientToken": format!("token-{region}-{name}"),
+        "distributions": [{ "region": region, "amiDistributionConfiguration": {} }],
+    });
+    let case = format!("create the distribution configuration {name} in {region}");
+    let (status, answer) = call_in(
+        router,
+        region,
+        "PUT",
+        "/CreateDistributionConfiguration",
+        Some(&body),
+    )
+    .await;
+    let answer = assert_ok(&case, status, answer);
+    text(&case, &answer, "distributionConfigurationArn")
+}
+
 /// The ARN one build version of the component `normalized` carries in `region`.
 fn component_arn(region: &str, normalized: &str, version: &str, build: u32) -> String {
     format!("arn:aws:imagebuilder:{region}:{ACCOUNT}:component/{normalized}/{version}/{build}")
@@ -333,14 +352,19 @@ fn configuration_arn(region: &str, normalized: &str) -> String {
     format!("arn:aws:imagebuilder:{region}:{ACCOUNT}:infrastructure-configuration/{normalized}")
 }
 
+/// The ARN the distribution configuration `normalized` carries in `region`.
+fn distribution_arn(region: &str, normalized: &str) -> String {
+    format!("arn:aws:imagebuilder:{region}:{ACCOUNT}:distribution-configuration/{normalized}")
+}
+
 /// Which not-found class a lookup's answer carries.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum MissingReport {
-    /// This service's own modelled not-found error for one of the two CONFIGURATION
-    /// resources, quoting the ARN the request carried.
+    /// This service's own modelled not-found error for an INFRASTRUCTURE configuration,
+    /// quoting the ARN the request carried.
     ConfigurationArn,
-    /// This service's own modelled not-found error for one of the authoring and build
-    /// resources, naming the kind and the ARN.
+    /// This service's own modelled not-found error for a resource of every other family,
+    /// naming the kind and the ARN.
     RequiredResource,
     /// The resource-tagging layer's own class, whose sentence is fixed text.
     TaggingPlane,
@@ -478,6 +502,40 @@ fn lookups_of(case: &str, region: &'static str, resource_type: &'static str, arn
                 MissingReport::ConfigurationArn,
             );
         }
+        "DistributionConfiguration" => {
+            push(
+                "GetDistributionConfiguration",
+                "GET",
+                format!("/GetDistributionConfiguration?distributionConfigurationArn={arn}"),
+                None,
+                MissingReport::RequiredResource,
+            );
+            push(
+                "DeleteDistributionConfiguration",
+                "DELETE",
+                format!("/DeleteDistributionConfiguration?distributionConfigurationArn={arn}"),
+                None,
+                MissingReport::RequiredResource,
+            );
+            // `UpdateDistributionConfiguration` takes the ARN in a body, beside the
+            // `clientToken` and the `distributions` list its model requires of every one of
+            // its requests
+            // (`smithy_query(query="operation",operation="UpdateDistributionConfiguration")`).
+            // The token stays inside the modelled 64-character bound, so what the row
+            // observes is the lookup rather than a constraint refusal.
+            let name = arn.rsplit('/').next().unwrap_or(arn);
+            push(
+                "UpdateDistributionConfiguration",
+                "PUT",
+                "/UpdateDistributionConfiguration".to_string(),
+                Some(json!({
+                    "distributionConfigurationArn": arn,
+                    "clientToken": format!("update-{region}-{name}"),
+                    "distributions": [{ "region": region, "amiDistributionConfiguration": {} }],
+                })),
+                MissingReport::RequiredResource,
+            );
+        }
         other => panic!("case {case:?}: no lookup is declared for the resource type {other:?}"),
     }
     // The tagging pair takes the ARN of ANY kind, in the URI path, and is answered by the
@@ -516,6 +574,7 @@ async fn an_arn_that_resolves_to_nothing_is_reported_missing_by_every_lookup() {
     let component = create_component(&router, REGION, "present-component", "1.0.0").await;
     let recipe = create_recipe(&router, REGION, "present-recipe").await;
     let configuration = create_configuration(&router, REGION, "Present Infra").await;
+    let distribution = create_distribution(&router, REGION, "present-distribution").await;
 
     // Each row is an ARN that resolves to nothing, and why. The reasons span the whole
     // rule: a resource nothing ever created, a stored resource reached from another
@@ -578,12 +637,31 @@ async fn an_arn_that_resolves_to_nothing_is_reported_missing_by_every_lookup() {
             "InfrastructureConfiguration",
             configuration.clone(),
         ),
+        (
+            "a distribution configuration nothing created".to_string(),
+            "DistributionConfiguration",
+            distribution_arn(REGION, "absent-distribution"),
+        ),
+        (
+            "a distribution name that only resembles a stored one".to_string(),
+            "DistributionConfiguration",
+            distribution_arn(REGION, "present-distribution-2"),
+        ),
+        (
+            "a stored distribution configuration read from another Region's endpoint".to_string(),
+            "DistributionConfiguration",
+            distribution.clone(),
+        ),
     ];
 
     for (case, resource_type, arn) in &absent {
         // A row naming a STORED resource is the one asked from the other Region's
         // endpoint; every other row is asked from the Region that holds its neighbours.
-        let region = if arn == &component || arn == &recipe || arn == &configuration {
+        let region = if arn == &component
+            || arn == &recipe
+            || arn == &configuration
+            || arn == &distribution
+        {
             OTHER_REGION
         } else {
             REGION
@@ -607,6 +685,7 @@ async fn an_arn_that_resolves_to_nothing_is_reported_missing_by_every_lookup() {
         ("the stored component", &component),
         ("the stored image recipe", &recipe),
         ("the stored configuration", &configuration),
+        ("the stored distribution configuration", &distribution),
     ] {
         let (status, body) = call_in(
             &router,
@@ -627,11 +706,13 @@ async fn an_arn_that_resolves_to_nothing_is_reported_missing_by_every_lookup() {
 async fn a_read_or_a_repeat_delete_after_a_delete_reports_the_resource_missing() {
     let router = emulator();
 
-    // Create a component and a recipe, prove both read back, then delete each and prove
-    // every later lookup of them reports them missing — the read-after-delete and the
-    // mutate-after-delete of the same ARN.
+    // Create a component, a recipe and both configurations, prove each reads back, then
+    // delete each and prove every later lookup of them reports them missing — the
+    // read-after-delete and the mutate-after-delete of the same ARN.
     let component = create_component(&router, REGION, "lifecycle-component", "1.0.0").await;
     let recipe = create_recipe(&router, REGION, "lifecycle-recipe").await;
+    let configuration = create_configuration(&router, REGION, "Lifecycle Infra").await;
+    let distribution = create_distribution(&router, REGION, "lifecycle-distribution").await;
 
     let (status, read) = call_in(
         &router,
@@ -651,6 +732,26 @@ async fn a_read_or_a_repeat_delete_after_a_delete_reports_the_resource_missing()
     )
     .await;
     assert_ok("the recipe before the delete", status, read);
+    let (status, read) = call_in(
+        &router,
+        REGION,
+        "GET",
+        &format!(
+            "/GetInfrastructureConfiguration?infrastructureConfigurationArn={configuration}"
+        ),
+        None,
+    )
+    .await;
+    assert_ok("the infrastructure configuration before the delete", status, read);
+    let (status, read) = call_in(
+        &router,
+        REGION,
+        "GET",
+        &format!("/GetDistributionConfiguration?distributionConfigurationArn={distribution}"),
+        None,
+    )
+    .await;
+    assert_ok("the distribution configuration before the delete", status, read);
 
     let (status, deleted) = call_in(
         &router,
@@ -670,10 +771,40 @@ async fn a_read_or_a_repeat_delete_after_a_delete_reports_the_resource_missing()
     )
     .await;
     assert_ok("the component delete", status, deleted);
+    let (status, deleted) = call_in(
+        &router,
+        REGION,
+        "DELETE",
+        &format!(
+            "/DeleteInfrastructureConfiguration?infrastructureConfigurationArn={configuration}"
+        ),
+        None,
+    )
+    .await;
+    assert_ok("the infrastructure configuration delete", status, deleted);
+    let (status, deleted) = call_in(
+        &router,
+        REGION,
+        "DELETE",
+        &format!("/DeleteDistributionConfiguration?distributionConfigurationArn={distribution}"),
+        None,
+    )
+    .await;
+    assert_ok("the distribution configuration delete", status, deleted);
 
     for (case, resource_type, arn) in [
         ("the deleted component", "Component", &component),
         ("the deleted image recipe", "ImageRecipe", &recipe),
+        (
+            "the deleted infrastructure configuration",
+            "InfrastructureConfiguration",
+            &configuration,
+        ),
+        (
+            "the deleted distribution configuration",
+            "DistributionConfiguration",
+            &distribution,
+        ),
     ] {
         for lookup in lookups_of(case, REGION, resource_type, arn) {
             let (status, body) = call_in(

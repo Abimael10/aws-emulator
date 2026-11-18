@@ -248,8 +248,8 @@ fn required_resource_message(resource_type: &str, arn: &str) -> String {
     format!("The following required resource '{resource_type}' cannot be found: '{arn}'.")
 }
 
-/// The not-found report the two CONFIGURATION resources carry, quoting the ARN the request
-/// named.
+/// The not-found report the INFRASTRUCTURE configuration carries, quoting the ARN the
+/// request named.
 fn configuration_not_found_message(arn: &str) -> String {
     format!("The resource ARN '{arn}' was not found.")
 }
@@ -470,7 +470,7 @@ async fn a_resource_a_pipeline_reaches_is_deleted_only_once_the_pipeline_is_gone
                 read: "/GetDistributionConfiguration?distributionConfigurationArn=",
                 echoed: "distributionConfigurationArn",
                 dependency: dependency_message(&distribution),
-                missing: configuration_not_found_message(&distribution),
+                missing: required_resource_message("DistributionConfiguration", &distribution),
             },
         };
 
@@ -1138,4 +1138,169 @@ async fn an_ami_the_account_cannot_see_is_reported_missing_before_a_recipe_is_st
     let (status, created) =
         create_image_recipe(&alone, "unresolved-recipe", "1.0.0", &component).await;
     assert_ok("an AMI ID with no Amazon EC2 to ask", status, created);
+}
+
+/// RULE: a create this service refuses stores NOTHING, so no resource the refused request
+/// referenced is held by a dependency afterwards and the teardown of all of them — the
+/// infrastructure configuration, then the image recipe, then the component beneath it —
+/// succeeds, each delete echoing the ARN it removed.
+///
+/// The rows span why the create was refused: a value one of its parameters does not admit,
+/// a parameter group the request left incomplete, a reference that resolves to nothing, and
+/// the dry run that reports what the real create would have done without doing it.
+#[tokio::test]
+async fn a_refused_pipeline_create_leaves_every_resource_it_named_deletable() {
+    // (case, the refusal's status, the error class it carries)
+    let rows: [(&str, u16, &str); 6] = [
+        (
+            "a cron expression the parser cannot read",
+            400,
+            "InvalidParameterValueException",
+        ),
+        (
+            "a cron month field that is not a month",
+            400,
+            "InvalidParameterValueException",
+        ),
+        (
+            "a value that is no schedule expression at all",
+            400,
+            "InvalidParameterValueException",
+        ),
+        (
+            "a request naming no recipe at all",
+            400,
+            "MissingParametersException",
+        ),
+        (
+            "a distribution configuration reference that resolves to nothing",
+            404,
+            "ResourceNotFoundException",
+        ),
+        ("a dry run", 412, "DryRunOperationException"),
+    ];
+
+    for (case, expected_status, expected_code) in rows {
+        // Each row tears down its own store, so what the deletes below answer is decided by
+        // this row's refused create alone.
+        let router = emulator();
+        let component = create_component(&router, "teardown-component").await;
+        let (status, created) =
+            create_image_recipe(&router, "teardown-recipe", "1.0.0", &component).await;
+        let created = assert_ok(&format!("{case}, the image recipe"), status, created);
+        let recipe = text(&format!("{case}, the image recipe"), &created, "imageRecipeArn");
+        let configuration = create_infrastructure_configuration(&router, "Teardown Config").await;
+
+        let mut body = Map::new();
+        body.insert("name".to_string(), json!("teardown-pipeline"));
+        body.insert("clientToken".to_string(), json!("teardown-pipeline"));
+        body.insert(
+            "infrastructureConfigurationArn".to_string(),
+            json!(configuration.clone()),
+        );
+        match case {
+            "a cron expression the parser cannot read" => {
+                body.insert("imageRecipeArn".to_string(), json!(recipe.clone()));
+                body.insert(
+                    "schedule".to_string(),
+                    json!({"scheduleExpression": "cron(not valid)"}),
+                );
+            }
+            "a cron month field that is not a month" => {
+                body.insert("imageRecipeArn".to_string(), json!(recipe.clone()));
+                body.insert(
+                    "schedule".to_string(),
+                    json!({"scheduleExpression": "cron(0 10 * SMARCH ? *)"}),
+                );
+            }
+            "a value that is no schedule expression at all" => {
+                body.insert("imageRecipeArn".to_string(), json!(recipe.clone()));
+                body.insert(
+                    "schedule".to_string(),
+                    json!({"scheduleExpression": "nightly"}),
+                );
+            }
+            // "You must specify exactly one recipe for the pipeline": a request naming
+            // neither of the two members names no recipe.
+            "a request naming no recipe at all" => {}
+            "a distribution configuration reference that resolves to nothing" => {
+                body.insert("imageRecipeArn".to_string(), json!(recipe.clone()));
+                body.insert(
+                    "distributionConfigurationArn".to_string(),
+                    json!(arn_of("distribution-configuration", "absent-teardown", "")),
+                );
+            }
+            _ => {
+                body.insert("imageRecipeArn".to_string(), json!(recipe.clone()));
+                body.insert("dryRun".to_string(), json!(true));
+            }
+        }
+
+        let (status, refused) = call(
+            &router,
+            "PUT",
+            "/CreateImagePipeline",
+            Some(&Value::Object(body)),
+        )
+        .await;
+        assert_eq!(
+            status, expected_status,
+            "case {case:?}: expected the create to be refused with HTTP {expected_status}, got \
+             {status} with {refused}"
+        );
+        let code = error_code(case, &refused);
+        assert_eq!(
+            code, expected_code,
+            "case {case:?}: expected {expected_code:?}, got {code:?} with {refused}"
+        );
+
+        // The refused create minted nothing: the ARN it would have taken names no pipeline.
+        let pipeline = arn_of("image-pipeline", "teardown-pipeline", "");
+        let (status, missing) = call(
+            &router,
+            "GET",
+            &format!("/GetImagePipeline?imagePipelineArn={pipeline}"),
+            None,
+        )
+        .await;
+        assert_refused(
+            &format!("{case}, the pipeline it would have created"),
+            status,
+            &missing,
+            404,
+            "ResourceNotFoundException",
+            &required_resource_message("ImagePipeline", &pipeline),
+        );
+
+        // So nothing holds the three resources the refused request named, and the whole
+        // teardown succeeds in dependency order.
+        for (member, uri, arn) in [
+            (
+                "infrastructureConfigurationArn",
+                format!(
+                    "/DeleteInfrastructureConfiguration?infrastructureConfigurationArn={configuration}"
+                ),
+                configuration.clone(),
+            ),
+            (
+                "imageRecipeArn",
+                format!("/DeleteImageRecipe?imageRecipeArn={recipe}"),
+                recipe.clone(),
+            ),
+            (
+                "componentBuildVersionArn",
+                format!("/DeleteComponent?componentBuildVersionArn={component}"),
+                component.clone(),
+            ),
+        ] {
+            let (status, deleted) = call(&router, "DELETE", &uri, None).await;
+            assert_deleted(
+                &format!("{case}, the delete of {arn}"),
+                status,
+                &deleted,
+                member,
+                &arn,
+            );
+        }
+    }
 }

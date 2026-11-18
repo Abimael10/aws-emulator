@@ -186,7 +186,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(
                 GetDistributionConfigurationErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {
-                        message: Some(crate::state::resource_arn_not_found_message(
+                        // A distribution configuration this Region holds nothing under is
+                        // reported as the required resource it is, naming the kind its ARN
+                        // identifies — the same sentence a reference to one resolves to
+                        // when it reaches nothing.
+                        message: Some(crate::state::required_resource_not_found_message(
                             &input.distribution_configuration_arn,
                         )),
                     },

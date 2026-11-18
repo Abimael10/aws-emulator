@@ -198,7 +198,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(
                 DeleteDistributionConfigurationErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {
-                        message: Some(crate::state::resource_arn_not_found_message(
+                        // Reported as the required resource it is, the same sentence a read
+                        // of one and a reference to one carry.
+                        message: Some(crate::state::required_resource_not_found_message(
                             &input.distribution_configuration_arn,
                         )),
                     },

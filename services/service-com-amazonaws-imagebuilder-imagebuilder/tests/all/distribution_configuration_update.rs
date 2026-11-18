@@ -549,7 +549,8 @@ async fn an_arn_naming_no_configuration_is_reported_missing() {
         );
         let (status, answer) = update_in(&router, REGION, &body).await;
         assert_refused(case, status, &answer, 404, "ResourceNotFoundException");
-        let expected = format!("The resource ARN '{arn}' was not found.");
+        let expected =
+            format!("The following required resource 'DistributionConfiguration' cannot be found: '{arn}'.");
         let actual = error_message(case, &answer);
         assert_eq!(
             actual, expected,
