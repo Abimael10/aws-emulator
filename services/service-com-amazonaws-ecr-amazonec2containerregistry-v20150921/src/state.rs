@@ -3592,6 +3592,10 @@ pub fn honours_exclusion_filters(setting: &str) -> bool {
 /// cannot express the pairing, so both the operations that write this configuration
 /// check it here, through one rule.
 ///
+/// The refusal is stated in the clause every refused parameter of this service is stated
+/// in ([`exclusion_filters_not_allowed`]): the rule holds across two members, and the one
+/// the request may not have sent is the parameter at fault.
+///
 /// The converse is NOT refused: a `*_WITH_EXCLUSION` setting carrying no filter excludes
 /// nothing, which is exactly its plain counterpart's behaviour rather than a
 /// contradiction.
@@ -3600,10 +3604,7 @@ pub fn check_exclusion_filters(
     filters: &[ImageTagMutabilityExclusionFilter],
 ) -> Result<(), Fault> {
     if !filters.is_empty() && !honours_exclusion_filters(setting) {
-        return Err(Fault::InvalidParameter(format!(
-            "imageTagMutabilityExclusionFilters cannot be specified with the {setting} \
-             image tag mutability setting"
-        )));
+        return Err(exclusion_filters_not_allowed(setting));
     }
     Ok(())
 }
@@ -4692,6 +4693,12 @@ pub mod signing;
 pub mod replication;
 mod image_scan;
 mod layer_download;
+/// The two refusals of a rule ACROSS members this registry raises, worded in the clause
+/// [`invalid_parameter_at`] states every refused parameter in, in
+/// `state/parameter_clause.rs`. Declared and re-exported here, so a handler reaches it as
+/// `crate::state::…` like every other part of this store.
+mod parameter_clause;
+pub use parameter_clause::*;
 /// What ECR judges about a `repositoryName` a request addresses an existing repository by,
 /// in `state/repository_name.rs`. Declared and re-exported here, so a handler reaches it as
 /// `crate::state::…` like every other part of this store.

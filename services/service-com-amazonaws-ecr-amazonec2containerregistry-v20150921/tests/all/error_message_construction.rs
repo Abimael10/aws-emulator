@@ -11,13 +11,14 @@
 //! 2. a layer-upload diagnostic states what a client needs to recover — the byte the
 //!    upload expects next on a non-contiguous part, and nothing but the verdict on a
 //!    digest that does not match;
-//! 3. a parameter ECR validates ITSELF — one the request carries, and an ARN it must
-//!    RESOLVE wherever it carries one — is named by its API label (not the validating
-//!    walk's path to it) and its constraint stated in ECR's own words: an expression with
-//!    no escape a regular expression does not need, and prose for such an ARN. (A value
-//!    the model-driven walk caught — a member inside a NESTED structure, or a parameter
-//!    whose value the registry only RECORDS — keeps that walk's path and wording; that
-//!    half of the rule is pinned in `parameter_constraint_clauses.rs`.)
+//! 3. a parameter whose value class ECR polices ITSELF — the repository-name and
+//!    account-id classes, plus an ARN it must RESOLVE wherever the request carries one —
+//!    is named by its API label (not the validating walk's path to it) and its constraint
+//!    stated in ECR's own words: an expression with no escape a regular expression does
+//!    not need, and prose for such an ARN. (A `@pattern` of every other value class keeps
+//!    the model-driven walk's wording over the expression ECR publishes for that class,
+//!    and a member inside a NESTED structure keeps the walk's path too; that half of the
+//!    rule is pinned in `parameter_constraint_clauses.rs`.)
 //! 4. a refusal caused by a per-resource state names the resource that refused.
 //!
 //! Each suite is a TABLE whose rows differ along what its rule generalises over — the
@@ -488,27 +489,22 @@ async fn a_digest_that_does_not_match_is_refused_with_the_verdict_alone() {
 const REPOSITORY_NAME_EXPRESSION: &str =
     r"[a-z0-9]+((\.|_|__|-+)[a-z0-9]+)*(/[a-z0-9]+((\.|_|__|-+)[a-z0-9]+)*)*";
 
-/// The same for `PullThroughCacheRuleRepositoryPrefix`, whose `@pattern` escapes two
-/// slashes — one inside the namespace group and the optional trailing one (same
-/// `smithy_query` call, `shape="PullThroughCacheRuleRepositoryPrefix"`).
-const PREFIX_EXPRESSION: &str =
-    r"([a-z0-9]+((\.|_|__|-+)[a-z0-9]+)*(/[a-z0-9]+((\.|_|__|-+)[a-z0-9]+)*)*/?|ROOT)";
-
 /// A `credentialArn` long enough to clear `CredentialArn`'s `@length(50..612)` while
 /// naming no `ecr-pullthroughcache/` secret, so the `@pattern` is what refuses it.
 const WRONG_NAMESPACE_SECRET: &str =
     "arn:aws:secretsmanager:eu-west-1:000000000000:secret:not-the-pull-through-namespace";
 
-/// A parameter ECR validates itself is stated as the MEMBER at fault — never the
-/// validating walk's path to the value — with the constraint in ECR's own words: an ARN it
-/// must RESOLVE in prose naming the value, every other `@pattern` as the expression
-/// with no escape a regular expression does not need, and every other constraint
-/// unchanged.
+/// A parameter whose value class ECR POLICES ITSELF is stated as the MEMBER at fault —
+/// never the validating walk's path to the value — with the constraint in ECR's own
+/// words: an ARN it must RESOLVE in prose naming the value, the `@pattern` of such a class
+/// as the expression with no escape a regular expression does not need, and every other
+/// constraint unchanged.
 ///
-/// Every row is such a parameter: one the request CARRIES (a top-level member, or an
-/// element of one of its lists, which is a value of that same parameter) or an ARN naming
-/// a resource the operation has to reach, which ECR checks the form of wherever the
-/// request carries it.
+/// Every row is such a parameter: one the request CARRIES whose class ECR polices (the
+/// repository-name and account-id classes) or an ARN naming a resource the operation has
+/// to reach, which ECR checks the form of wherever the request carries it. A class the
+/// MODEL-DRIVEN walk states instead keeps the model's own spelling, escapes included, and
+/// is pinned in `parameter_constraint_clauses.rs`.
 ///
 /// The rows differ along what the rule generalises over: which constraint failed
 /// (`@pattern` on a plain string, on an ARN, `@length`, `@required`), where the member
@@ -548,13 +544,6 @@ async fn a_parameter_ecr_validates_itself_is_stated_as_aws_states_it() {
             json!({"repositoryNames": ["well-formed", "ALSO-Upper"]}),
             "repositoryName",
             format!("must satisfy regular expression '{REPOSITORY_NAME_EXPRESSION}'"),
-        ),
-        (
-            "a pull through cache rule prefix outside its pattern",
-            "DeletePullThroughCacheRule",
-            json!({"ecrRepositoryPrefix": "Not A Prefix"}),
-            "ecrRepositoryPrefix",
-            format!("must satisfy regular expression '{PREFIX_EXPRESSION}'"),
         ),
         (
             // The expression of the account-id class is stated BARE: whether ECR delimits

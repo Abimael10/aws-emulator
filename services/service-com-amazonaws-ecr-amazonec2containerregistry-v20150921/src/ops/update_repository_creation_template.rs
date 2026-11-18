@@ -203,7 +203,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // Only the KMS encryption types take a key of the caller's: AES256 encrypts with
         // Amazon S3-managed keys, so a `kmsKey` beside it cannot be honoured. The model
-        // cannot express the pairing, so it is checked here — as the create does.
+        // cannot express the pairing, so it is checked here — as the create does, and
+        // stated in the same clause.
         if let Some(encryption) = input.encryption_configuration.as_ref() {
             if encryption
                 .kms_key
@@ -212,9 +213,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 && encryption.encryption_type == crate::state::S3_MANAGED_ENCRYPTION_TYPE
             {
                 return Err(invalid_parameter(
-                    "encryptionConfiguration.kmsKey cannot be specified with the AES256 \
-                     encryption type"
-                        .to_string(),
+                    crate::state::encryption_key_not_for_type_clause(&encryption.encryption_type),
                 )
                 .into());
             }

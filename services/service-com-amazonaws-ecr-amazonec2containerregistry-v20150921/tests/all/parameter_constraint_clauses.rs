@@ -5,17 +5,17 @@
 //! Every refusal below already carries the right HTTP status (400); what these suites pin
 //! is the error class and the clause, which ECR builds from the request and the model to
 //! one template — `Invalid parameter at '<parameter>' failed to satisfy constraint:
-//! '<constraint>'`. Six rules, one suite each:
+//! '<constraint>'`. Eight rules, one suite each:
 //!
 //! 1. a value this registry does not recognise, where the modelled shape declares NO
 //!    enum, fails a stable constraint phrase about the parameter — never a value set the
 //!    model does not declare, and never this emulator's own catalogue of what it serves;
-//! 2. which validator caught the value decides how both halves are spelled: a parameter
-//!    ECR validates itself (one the request carries, and an ARN it must RESOLVE wherever
-//!    the request carries one) is named by its API label with the constraint in ECR's own
-//!    words, while a value the model-driven walk caught — a member of a NESTED structure,
-//!    or a parameter whose value the registry only RECORDS — keeps that walk's path and
-//!    the `@pattern` as the model declares it;
+//! 2. the two halves of the clause are decided independently: the parameter is named by
+//!    its API label where the request CARRIES it and by the validating walk's path where
+//!    it is a member of a NESTED structure, while the constraint is worded by whichever
+//!    validator HOLDS the rule the value broke — ECR's own words for a value class it
+//!    polices itself, or an ARN it must RESOLVE, and the model-driven walk's wording for
+//!    every other class;
 //! 3. which operations police `RepositoryName`'s `@pattern` is ECR's own per-OPERATION
 //!    fact: a listing LOOKS the name up, so a name no repository carries — a registry-
 //!    qualified image reference passed where a name belongs included — is the modelled
@@ -26,10 +26,14 @@
 //!    the values' own hash table is walked, not the order the model declares;
 //! 5. whether the expression ECR publishes for a value class is DELIMITED inside the
 //!    clause belongs to the class: the account-id class is stated bare, the
-//!    repository-name classes delimited;
+//!    repository-name class delimited;
 //! 6. a list ECR reads no value out of is refused at the LIST member with the element's
 //!    requirement nested in the collection form, while a list whose values it resolves is
-//!    refused one value at a time under the singular of its name.
+//!    refused one value at a time under the singular of its name;
+//! 7. a `@pattern` is quoted as the validator that HOLDS the value class states it, and
+//!    the expression quoted is the one ECR publishes for that class;
+//! 8. a rule across two members, which no modelled constraint can express, is refused in
+//!    the same clause, naming the member that may not have been sent.
 //!
 //! Each suite is a TABLE whose rows differ along what its rule generalises over — the
 //! shape of the unrecognised value and the operation asked, which constraint failed and
@@ -41,7 +45,7 @@
 use serde_json::{json, Value};
 use service_com_amazonaws_ecr_amazonec2containerregistry_v20150921::state::ACCOUNT_SETTINGS;
 
-use crate::wire::{call, emulator, REGISTRY_ID};
+use crate::wire::{call, emulator, ok, REGISTRY_ID};
 
 /// The error code ECR states a refused parameter with: the client-input error 57 of this
 /// model's 58 operations declare.
@@ -142,13 +146,15 @@ async fn an_unrecognised_account_setting_name_states_a_constraint_the_model_decl
 const REPOSITORY_NAME_EXPRESSION: &str =
     r"[a-z0-9]+((\.|_|__|-+)[a-z0-9]+)*(/[a-z0-9]+((\.|_|__|-+)[a-z0-9]+)*)*";
 
-/// `PullThroughCacheRuleRepositoryPrefix`'s `@pattern` as ECR'S OWN validation publishes
-/// it, by the same two rules as [`REPOSITORY_NAME_EXPRESSION`].
+/// `Prefix`'s `@pattern` as THE MODEL declares it — anchors and `\/` escapes included,
+/// because the expression ECR publishes for the namespace-prefix class is the model's own
+/// spelling, and the model-driven walk is what states this class.
 ///
-/// `smithy_query(query="shape", shape="PullThroughCacheRuleRepositoryPrefix")` gives
-/// `^([a-z0-9]+((\.|_|__|-+)[a-z0-9]+)*(\/[a-z0-9]+((\.|_|__|-+)[a-z0-9]+)*)*\/?|ROOT)$`.
-const PREFIX_EXPRESSION: &str =
-    r"([a-z0-9]+((\.|_|__|-+)[a-z0-9]+)*(/[a-z0-9]+((\.|_|__|-+)[a-z0-9]+)*)*/?|ROOT)";
+/// `smithy_query(query="shape", shape="Prefix")` gives this expression, and
+/// `shape="PullThroughCacheRuleRepositoryPrefix"` — the prefix a pull through cache rule
+/// is keyed by — gives the same one, so the two members are one value class.
+const PREFIX_PATTERN: &str =
+    r"^([a-z0-9]+((\.|_|__|-+)[a-z0-9]+)*(\/[a-z0-9]+((\.|_|__|-+)[a-z0-9]+)*)*\/?|ROOT)$";
 
 /// `SigningRepositoryFilterValue`'s `@pattern` as THE MODEL declares it — anchors
 /// included, because the model-driven walk states the expression it was given.
@@ -189,9 +195,11 @@ fn wildcard_filter(filter: &str) -> Value {
     json!({"filter": filter, "filterType": "WILDCARD_MATCH"})
 }
 
-/// A refused parameter is stated by whichever validator caught it: ECR's own validation
-/// names the API parameter and states the constraint in ECR's words, and the model-driven
-/// walk names the path it descended and states the model's own `@pattern`.
+/// A refused parameter is NAMED by where the request carries it and its constraint WORDED
+/// by whichever validator holds the rule: the API parameter for a value the request
+/// carries and the path the walk descended for a member of a nested structure, with the
+/// constraint in ECR's own words for a value class it polices itself and in the
+/// model-driven walk's wording for every other.
 ///
 /// The rows differ along what the rule generalises over: where the member sits (a
 /// top-level member, an element of a top-level list, a member of a structure nested in a
@@ -351,19 +359,21 @@ async fn a_refused_parameter_is_stated_by_the_validator_that_caught_it() {
         ),
         (
             // A collection whose name is the `-es` plural of its parameter, so undoing the
-            // plural is more than dropping an `s`.
+            // plural is more than dropping an `s`. The namespace-prefix class is one the
+            // model-driven walk states, so the clause names the API parameter and quotes
+            // the model's own expression.
             "an element of a list whose name takes the -es plural",
             "DescribePullThroughCacheRules",
             json!({"ecrRepositoryPrefixes": ["Not A Prefix"]}),
             "ecrRepositoryPrefix".to_string(),
-            format!("must satisfy regular expression '{PREFIX_EXPRESSION}'"),
+            format!("Member must satisfy regular expression pattern: {PREFIX_PATTERN}"),
         ),
         (
             "an element of the shortest such list name",
             "DescribeRepositoryCreationTemplates",
             json!({"prefixes": ["Not A Prefix"]}),
             "prefix".to_string(),
-            format!("must satisfy regular expression '{PREFIX_EXPRESSION}'"),
+            format!("Member must satisfy regular expression pattern: {PREFIX_PATTERN}"),
         ),
     ];
 
@@ -729,14 +739,15 @@ async fn a_value_outside_an_enumerated_type_states_the_set_in_the_stated_order()
 const REGISTRY_ID_EXPRESSION: &str = "[0-9]{12}";
 
 /// The expression ECR states for the account-id class is stated BARE, with nothing around
-/// it inside the clause's own quotes, while the repository-name classes' expression is
+/// it inside the clause's own quotes, while the repository-name class's expression is
 /// delimited — the difference belongs to the value class and not to the member, the
 /// operation or the constraint.
 ///
 /// The rows differ along what the rule generalises over: how the account id is malformed
 /// (too few digits, too many, a letter among them, a separator, no characters at all) and
-/// which operation carries the parameter, crossed against the two classes whose expression
-/// IS delimited. The recorded instance is an account id on `DescribeRepositories`.
+/// which operation carries the parameter, crossed against the class whose expression IS
+/// delimited, at the top level of a request and as one value of a list. The recorded
+/// instance is an account id on `DescribeRepositories`.
 #[tokio::test]
 async fn the_account_id_expression_is_stated_bare_and_a_repository_name_delimited() {
     // Every value here fails `^[0-9]{12}$` and nothing else in its request does.
@@ -768,7 +779,7 @@ async fn the_account_id_expression_is_stated_bare_and_a_repository_name_delimite
         }
     }
 
-    // The other half of the rule: the classes whose expression ECR DOES delimit, so the
+    // The other half of the rule: the class whose expression ECR DOES delimit, so the
     // bare form above is the account-id class's and not every parameter's.
     let delimited: Vec<(&str, &str, Value, &str, String)> = vec![
         (
@@ -779,11 +790,11 @@ async fn the_account_id_expression_is_stated_bare_and_a_repository_name_delimite
             format!("must satisfy regular expression '{REPOSITORY_NAME_EXPRESSION}'"),
         ),
         (
-            "a pull through cache rule prefix",
-            "DeletePullThroughCacheRule",
-            json!({"ecrRepositoryPrefix": "Not A Prefix"}),
-            "ecrRepositoryPrefix",
-            format!("must satisfy regular expression '{PREFIX_EXPRESSION}'"),
+            "one value of a list of repository names",
+            "DescribeRepositories",
+            json!({"repositoryNames": ["well-formed", "ALSO-Upper"]}),
+            "repositoryName",
+            format!("must satisfy regular expression '{REPOSITORY_NAME_EXPRESSION}'"),
         ),
     ];
     for (case, operation, request, parameter, constraint) in delimited {
@@ -889,4 +900,287 @@ async fn a_list_this_registry_reads_no_value_of_is_refused_at_the_list_member() 
         &format!("must satisfy regular expression '{REPOSITORY_NAME_EXPRESSION}'"),
     )
     .await;
+}
+
+/// `LayerDigest`'s expression as ECR PUBLISHES it: the `<algorithm>:<hex>` form with no
+/// anchors, where `smithy_query(query="shape", shape="LayerDigest")` spells the class
+/// anchored (`^[a-zA-Z0-9-_+.]+:[a-fA-F0-9]+$`). ECR quotes the expression its own
+/// validator holds for the class, which is this one.
+const LAYER_DIGEST_EXPRESSION: &str = "[a-zA-Z0-9-_+.]+:[a-fA-F0-9]+";
+
+/// `RepositoryFilter$filter`'s expression as ECR PUBLISHES it: the `*` wildcard admitted
+/// in every character class and the length the value may run to as a leading lookahead.
+///
+/// `smithy_query(query="shape", shape="RepositoryFilter")` spells the class
+/// `^(?:[a-z0-9]+(?:[._-][a-z0-9]*)*/)*[a-z0-9]*(?:[._-][a-z0-9]*)*$` with its length as a
+/// separate `@length(2..256)`, so the model and the service disagree about this one class;
+/// what ECR quotes back is the expression it publishes, which is what these rows pin.
+const REPLICATION_FILTER_EXPRESSION: &str =
+    "^(?=.{1,256}$)(?:[a-z0-9*]+(?:[._-][a-z0-9*]*)*/)*[a-z0-9*]*(?:[._-][a-z0-9*]*)*$";
+
+/// One replication rule: a destination in `region` and the filters it carries.
+fn replication_rule(region: &str, filters: Vec<&str>) -> Value {
+    let filters: Vec<Value> = filters
+        .into_iter()
+        .map(|filter| json!({"filter": filter, "filterType": "PREFIX_MATCH"}))
+        .collect();
+    json!({
+        "destinations": [{"region": region, "registryId": REGISTRY_ID}],
+        "repositoryFilters": filters,
+    })
+}
+
+/// A `@pattern` is quoted as the validator that HOLDS the value class states it: the
+/// classes ECR polices in its own code as the expression ECR publishes for them, with no
+/// `Member` in front of it, and every other class in the model-driven walk's wording over
+/// the expression ECR publishes for that class — which is the model's own spelling except
+/// where the two disagree.
+///
+/// The rows differ along what the rule generalises over: which value class the member
+/// targets (a namespace prefix, a layer digest, a replication repository filter, a
+/// repository name, an account id), where the member sits (a top-level member, an element
+/// of a top-level list, a member of a structure nested two lists deep — at the first index
+/// and at the second, so a position cannot be mistaken for a name), and which operation
+/// carries it: a class is quoted the same way wherever it is carried. The three recorded
+/// instances are marked.
+#[tokio::test]
+async fn a_pattern_is_quoted_as_the_validator_holding_its_class_states_it() {
+    // (case, operation, request, the parameter the clause names, the constraint it states)
+    let rows: Vec<(&str, &str, Value, String, String)> = vec![
+        (
+            // The recorded instance: the namespace-prefix class, which the model-driven
+            // walk states even though `prefix` is a parameter the request carries.
+            "a namespace prefix on the operation that creates a template",
+            "CreateRepositoryCreationTemplate",
+            json!({"prefix": "Not A Prefix", "appliedFor": ["REPLICATION"]}),
+            "prefix".to_string(),
+            format!("Member must satisfy regular expression pattern: {PREFIX_PATTERN}"),
+        ),
+        (
+            "the same class on the operation that updates one",
+            "UpdateRepositoryCreationTemplate",
+            json!({"prefix": "Not A Prefix"}),
+            "prefix".to_string(),
+            format!("Member must satisfy regular expression pattern: {PREFIX_PATTERN}"),
+        ),
+        (
+            // The same expression through the other member that targets it: the prefix a
+            // pull through cache rule is keyed by, which the model spells identically.
+            "a pull through cache rule prefix",
+            "DeletePullThroughCacheRule",
+            json!({"ecrRepositoryPrefix": "Not A Prefix"}),
+            "ecrRepositoryPrefix".to_string(),
+            format!("Member must satisfy regular expression pattern: {PREFIX_PATTERN}"),
+        ),
+        (
+            // The recorded instance: the layer-digest class, whose published expression
+            // carries no anchors.
+            "a layer digest on the operation that hands out a download URL",
+            "GetDownloadUrlForLayer",
+            json!({"repositoryName": "well-formed", "layerDigest": "not-a-digest"}),
+            "layerDigest".to_string(),
+            format!("Member must satisfy regular expression pattern: {LAYER_DIGEST_EXPRESSION}"),
+        ),
+        (
+            // One value of a list of the SAME class, reached through the operation whose
+            // list member targets it: the class is quoted the same way either way.
+            "one value of a list of layer digests",
+            "CompleteLayerUpload",
+            json!({
+                "repositoryName": "well-formed",
+                "uploadId": "00000000-0000-0000-0000-000000000000",
+                "layerDigests": ["sha256:abc123", "not a digest"],
+            }),
+            "layerDigest".to_string(),
+            format!("Member must satisfy regular expression pattern: {LAYER_DIGEST_EXPRESSION}"),
+        ),
+        (
+            // The recorded instance: the replication-filter class, in the second filter
+            // of the second rule, so the clause states the position the walk descended.
+            "a replication repository filter, in the second rule's second filter",
+            "PutReplicationConfiguration",
+            json!({"replicationConfiguration": {"rules": [
+                replication_rule("us-west-2", vec!["team/app"]),
+                replication_rule("eu-west-2", vec!["team/app", "Team/App"]),
+            ]}}),
+            "replicationConfiguration.rules.2.member.repositoryFilters.2.member.filter"
+                .to_string(),
+            format!("Member must satisfy regular expression pattern: {REPLICATION_FILTER_EXPRESSION}"),
+        ),
+        (
+            "the same class in the first rule's only filter",
+            "PutReplicationConfiguration",
+            json!({"replicationConfiguration": {"rules": [
+                replication_rule("us-west-2", vec!["Team/App"]),
+            ]}}),
+            "replicationConfiguration.rules.1.member.repositoryFilters.1.member.filter"
+                .to_string(),
+            format!("Member must satisfy regular expression pattern: {REPLICATION_FILTER_EXPRESSION}"),
+        ),
+        (
+            // The other side of the rule: a class ECR DOES police itself keeps ECR's own
+            // wording, so the wording above is the class's and not every member's.
+            "a repository name, a class ECR polices itself",
+            "CreateRepository",
+            json!({"repositoryName": "Invalid_Name"}),
+            "repositoryName".to_string(),
+            format!("must satisfy regular expression '{REPOSITORY_NAME_EXPRESSION}'"),
+        ),
+        (
+            "an account id, the other class ECR polices itself",
+            "DescribeImages",
+            json!({"repositoryName": "well-formed", "registryId": "not-an-account"}),
+            "registryId".to_string(),
+            format!("must satisfy regular expression {REGISTRY_ID_EXPRESSION}"),
+        ),
+    ];
+
+    let router = emulator();
+    for (case, operation, request, parameter, constraint) in rows {
+        assert_clause(&router, case, operation, &request, &parameter, &constraint).await;
+    }
+}
+
+/// A `kmsKey` beside the encryption type that encrypts with Amazon S3-managed keys, and
+/// exclusion filters beside a tag-mutability setting that excludes nothing, are rules
+/// across two members that no `@pattern` can express — and each is refused in the same
+/// parameter clause every refused input of this service is stated in, naming the member
+/// that may not have been sent and the setting the request asked for.
+///
+/// The rows differ along what the rule generalises over: which cross-member rule was
+/// broken, which value of the request the inner sentence takes (the encryption type, and
+/// each of the two settings that have no exclusion to apply), and which operation carries
+/// the configuration — the repository's own and a creation template's, created and
+/// updated. The two recorded instances are marked.
+#[tokio::test]
+async fn a_rule_across_members_is_refused_in_the_parameter_clause() {
+    /// The clause for a key sent beside `encryption_type`.
+    fn key_refused(encryption_type: &str) -> String {
+        clause(
+            "encryptionConfiguration",
+            &format!(
+                "Invalid encryption configuration: Encryption key should not be set for \
+                 {encryption_type} encryption."
+            ),
+        )
+    }
+
+    /// The clause for exclusion filters sent beside the setting `setting`.
+    fn filters_refused(setting: &str) -> String {
+        clause(
+            "imageTagMutabilityExclusionFilters",
+            &format!(
+                "ImageTagMutabilityExclusionFilters are not allowed when imageTagMutability \
+                 is set as {setting}"
+            ),
+        )
+    }
+
+    let key = format!("arn:aws:kms:eu-west-1:{REGISTRY_ID}:key/abcd");
+    let filters = json!([{"filterType": "WILDCARD", "filter": "release-*"}]);
+    // (case, operation, request, the clause expected)
+    let rows: Vec<(&str, &str, Value, String)> = vec![
+        (
+            // The recorded instance.
+            "a key beside the S3-managed type on a repository",
+            "CreateRepository",
+            json!({"repositoryName": "aes-with-key", "encryptionConfiguration": {
+                "encryptionType": "AES256",
+                "kmsKey": key,
+            }}),
+            key_refused("AES256"),
+        ),
+        (
+            "the same pairing on the operation that creates a template",
+            "CreateRepositoryCreationTemplate",
+            json!({
+                "prefix": "aes-with-key",
+                "appliedFor": ["REPLICATION"],
+                "encryptionConfiguration": {"encryptionType": "AES256", "kmsKey": key},
+            }),
+            key_refused("AES256"),
+        ),
+        (
+            "the same pairing on the operation that updates one",
+            "UpdateRepositoryCreationTemplate",
+            json!({
+                "prefix": "present",
+                "encryptionConfiguration": {"encryptionType": "AES256", "kmsKey": key},
+            }),
+            key_refused("AES256"),
+        ),
+        (
+            // The recorded instance.
+            "filters beside the setting that lets every tag be overwritten",
+            "PutImageTagMutability",
+            json!({
+                "repositoryName": "present",
+                "imageTagMutability": "MUTABLE",
+                "imageTagMutabilityExclusionFilters": filters,
+            }),
+            filters_refused("MUTABLE"),
+        ),
+        (
+            // The other setting with no exclusion to apply: the inner sentence names the
+            // setting the request asked for, so it is not one spelling for both.
+            "filters beside the setting that lets none be overwritten",
+            "PutImageTagMutability",
+            json!({
+                "repositoryName": "present",
+                "imageTagMutability": "IMMUTABLE",
+                "imageTagMutabilityExclusionFilters": filters,
+            }),
+            filters_refused("IMMUTABLE"),
+        ),
+        (
+            "the same rule on the operation that creates a repository",
+            "CreateRepository",
+            json!({
+                "repositoryName": "filters-without-exclusion",
+                "imageTagMutability": "MUTABLE",
+                "imageTagMutabilityExclusionFilters": filters,
+            }),
+            filters_refused("MUTABLE"),
+        ),
+    ];
+
+    let router = emulator();
+    // The repository and the template the rows address: a cross-member rule is refused
+    // about the request, so the resources it names exist and no row is answered a
+    // not-found instead.
+    ok(
+        &router,
+        "the repository under test",
+        "CreateRepository",
+        &json!({"repositoryName": "present"}),
+    )
+    .await;
+    ok(
+        &router,
+        "the template under test",
+        "CreateRepositoryCreationTemplate",
+        &json!({"prefix": "present", "appliedFor": ["REPLICATION"]}),
+    )
+    .await;
+
+    for (case, operation, request, expected) in rows {
+        let answer = call(&router, operation, &request).await;
+        assert_eq!(
+            answer.status, 400,
+            "case {case:?}: expected HTTP 400 from {operation}, got {} with {:?}",
+            answer.status, answer.body
+        );
+        assert_eq!(
+            answer.error_code(),
+            INVALID_PARAMETER,
+            "case {case:?}: expected {INVALID_PARAMETER} from {operation}, got {:?}",
+            answer.body
+        );
+        assert_eq!(
+            answer.message(),
+            expected,
+            "case {case:?}: expected the clause {expected:?}, got {:?}",
+            answer.message()
+        );
+    }
 }

@@ -243,14 +243,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             });
         // Only the KMS encryption types take a key: AES256 encrypts the repository with
         // an Amazon S3-managed key, so a `kmsKey` beside it cannot be honoured. The
-        // model cannot express the pairing, so it is checked here.
+        // model cannot express the pairing, so it is checked here, and stated in the
+        // clause every refused parameter of this service is stated in.
         if encryption.kms_key.is_some()
             && encryption.encryption_type == crate::state::S3_MANAGED_ENCRYPTION_TYPE
         {
-            return Err(fault_error(crate::state::Fault::InvalidParameter(
-                "encryptionConfiguration.kmsKey cannot be specified with the AES256 \
-                 encryption type"
-                    .to_string(),
+            return Err(fault_error(crate::state::encryption_key_not_for_type(
+                &encryption.encryption_type,
             ))
             .into());
         }

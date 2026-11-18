@@ -128,37 +128,35 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
 /// The clause ECR states for one refused input member: the parameter at fault and the
 /// constraint it failed.
 ///
-/// ECR words every such clause `Invalid parameter at '<parameter>' failed to satisfy
-/// constraint: '<constraint>'` and fills both halves from the request and the model, so
-/// they are reproduced from the violation here rather than written out per member. WHICH
-/// validator caught the value decides how each half is SPELLED, and the recorded corpus
-/// shows ECR using both spellings:
+/// ECR words every such clause through [`crate::state::parameter_constraint`] and fills
+/// both halves from the request and the model, so they are reproduced from the violation
+/// here rather than written out per member. The two halves are decided INDEPENDENTLY, and
+/// the recorded corpus shows each of them taking either form:
 ///
-/// * a parameter ECR validates ITSELF is named by its API label alone
-///   ([`member_at_fault`]) and its constraint is stated in ECR's own words: the
-///   expression as ECR publishes it (`… at 'repositoryName' … 'must satisfy regular
-///   expression '[a-z0-9]+…''`), or prose for an ARN-valued member (`… at
-///   'signingProfileArn' … 'The signing profile ARN '<value>' must be well formed''`).
-///   That is every parameter the request CARRIES — a top-level member, or an element of
-///   one of its collections, which is one VALUE of that same parameter and is named by it
-///   in the singular — plus, wherever the request carries one, an ARN ECR has to RESOLVE
-///   to a resource before the call can do its work, because ECR checks such an ARN's form
-///   itself.
-/// * a value the MODEL-DRIVEN walk caught keeps that walk's own rendering: the dotted
-///   path it descended, collection steps included, and the `@pattern` exactly as the
-///   model declares it, anchors and all — `… at
-///   'signingConfiguration.rules.1.member.repositoryFilters.1.member.filter' failed to
-///   satisfy constraint: 'Member must satisfy regular expression pattern: ^(?:[a-z0-9*]+…$'`.
-///   That is every member of a structure NESTED in the request, and also a parameter the
-///   request carries whose value ECR only RECORDS, with nothing of its own to check it
-///   against ([`names_an_iam_principal`]).
+/// * WHICH parameter the clause names follows from WHERE in the request the value sits. A
+///   parameter the request CARRIES ([`carried_parameter`]) is named by its API label
+///   ([`member_at_fault`]) — a top-level member, or an element of one of its collections,
+///   which is one VALUE of that same parameter and is named by it in the singular. A
+///   member of a structure NESTED in the request has no API label of its own, so it is
+///   named by the path the validating walk descended to it, collection steps included
+///   (`… at 'signingConfiguration.rules.1.member.repositoryFilters.1.member.filter' …`).
+/// * HOW the constraint reads follows from WHOSE RULE the value broke. Every constraint
+///   but one is stated in the `Member must …` wording the model-driven walk states a
+///   modelled constraint in, whatever the member's position — a `@length` on a top-level
+///   member included. The exception is a `@pattern`, which ECR words its own way for the
+///   value classes it polices in its OWN code ([`EXPRESSIONS_ECR_POLICES_ITSELF`]): the
+///   expression as ECR publishes it, with no `Member` in front of it (`… at
+///   'repositoryName' … 'must satisfy regular expression '[a-z0-9]+…''`). Every other
+///   class keeps the walk's `Member must satisfy regular expression pattern: <expression>`
+///   ([`pattern_requirement`]) over the expression ECR publishes for that class
+///   ([`policed`]).
 ///
-/// Only a `@pattern` is worded differently by the two: every other constraint is "Member
-/// must …" either way, so only the parameter label can differ for it.
-///
-/// One parameter is named by neither: a LIST ECR reads no value out of
-/// ([`element_constraint`]) has no one value to refuse, so its clause names the list
-/// itself and nests what each element must satisfy.
+/// Two refusals are worded by neither rule. An ARN ECR has to RESOLVE to a resource before
+/// the call can do its work is one ECR checks the form of itself, wherever the request
+/// carries it, and it says so in prose naming the kind of ARN and the value that is not
+/// one ([`arn_constraint`]) rather than quoting an expression. And a LIST ECR reads no
+/// value out of ([`element_constraint`]) has no one value to refuse, so its clause names
+/// the list itself and nests what each element must satisfy.
 ///
 /// A violation kind neither wording knows (the enum is `#[non_exhaustive]`) keeps the
 /// framework's own clause, which states the same two facts in its own words.
@@ -177,11 +175,10 @@ fn clause(violation: &Violation) -> String {
     if let Some((collection, requirement)) = element_constraint(violation) {
         return stated(collection, &requirement);
     }
-    let by_ecr = caught_by_ecr(violation);
-    let Some(requirement) = requirement(&violation.kind, by_ecr) else {
+    let Some(requirement) = requirement(&violation.kind) else {
         return violation.message();
     };
-    let parameter = if by_ecr {
+    let parameter = if carried_parameter(&violation.path) {
         member
     } else {
         ::std::borrow::Cow::Borrowed(violation.path.as_str())
@@ -189,33 +186,19 @@ fn clause(violation: &Violation) -> String {
     stated(&parameter, &requirement)
 }
 
-/// Whether ECR'S OWN validation is what caught this value, which is what decides how both
-/// halves of the clause are spelled.
-///
-/// A parameter the request CARRIES ([`carried_parameter`]) is ECR's own to validate —
-/// except when nothing of ECR's checks it: the value of a member the registry only
-/// RECORDS is left to the model's constraint, and that is what the model-driven walk
-/// states.
-fn caught_by_ecr(violation: &Violation) -> bool {
-    if let ViolationKind::Pattern(pattern) = &violation.kind {
-        if names_an_iam_principal(pattern) {
-            return false;
-        }
-    }
-    carried_parameter(&violation.path)
-}
-
-/// The clause itself, the one place its template is written.
+/// The clause itself, in the one place this service words a refused parameter into it
+/// ([`crate::state::parameter_constraint`]), so the boundary walk's refusal and a
+/// handler's refusal of a rule the model cannot express read as one form.
 fn stated(parameter: &str, constraint: &str) -> String {
-    format!("Invalid parameter at '{parameter}' failed to satisfy constraint: '{constraint}'")
+    crate::state::parameter_constraint(parameter, constraint)
 }
 
-/// The constraint half of a clause. `by_ecr` is whether ECR's own validation caught the
-/// value, which changes the wording of ONE constraint: a `@pattern` ECR checks itself is
-/// stated as the expression ECR publishes ([`as_stated`]), while the model-driven walk
-/// states the model's own pattern in the framework's wording. `None` for a kind neither
-/// states, so the caller can keep the framework's whole clause.
-fn requirement(kind: &ViolationKind, by_ecr: bool) -> Option<String> {
+/// The constraint half of a clause: the `Member must …` wording the model-driven walk
+/// states a modelled constraint in, except for a `@pattern` of a value class ECR polices
+/// itself ([`polices_itself`]), which is stated as the expression ECR publishes
+/// ([`stated_expression`]). `None` for a kind neither states, so the caller can keep the
+/// framework's whole clause.
+fn requirement(kind: &ViolationKind) -> Option<String> {
     Some(match kind {
         ViolationKind::MissingRequiredMember => "Member must not be null".to_string(),
         ViolationKind::MinLength(min) => {
@@ -230,10 +213,10 @@ fn requirement(kind: &ViolationKind, by_ecr: bool) -> Option<String> {
         ViolationKind::MaxValue(max) => {
             format!("Member must have value less than or equal to {max}")
         }
-        // The one requirement NOT worded "Member must …": a parameter ECR validates
-        // itself has its expression stated the way ECR publishes it. Deliberate — do not
-        // "align" it with the arms around it.
-        ViolationKind::Pattern(pattern) if by_ecr => stated_expression(pattern),
+        // The one requirement NOT worded "Member must …": a value class ECR polices in
+        // its own code has its expression stated the way ECR publishes it. Deliberate —
+        // do not "align" it with the arms around it.
+        ViolationKind::Pattern(pattern) if polices_itself(pattern) => stated_expression(pattern),
         ViolationKind::Pattern(pattern) => pattern_requirement(policed(pattern)),
         // The value set is stated in the order the admissible values' own HASH TABLE is
         // walked rather than the order the model declares them in: the front door this
@@ -259,6 +242,35 @@ fn requirement(kind: &ViolationKind, by_ecr: bool) -> Option<String> {
 /// differently.
 fn pattern_requirement(expression: &str) -> String {
     format!("Member must satisfy regular expression pattern: {expression}")
+}
+
+/// The expressions of the value classes ECR polices in its OWN code, as THE MODEL spells
+/// them: the classes whose `@pattern` a refusal states in ECR's own words rather than in
+/// the model-driven walk's.
+///
+/// These are the two values ECR has to READ before a call can do its work — the name it
+/// resolves a repository by and the account id it resolves a registry by — and the
+/// recorded refusals state each of them as the expression ECR publishes for the class
+/// (`… 'must satisfy regular expression '[a-z0-9]+…''`,
+/// `… 'must satisfy regular expression [0-9]{12}'`). Every other class the recorded
+/// refusals show — a namespace prefix, a layer digest, a repository filter, an ARN the
+/// registry only records — is stated in the walk's wording with the expression ECR
+/// publishes for it, whether the member sits at the top level of the request or inside a
+/// nested structure.
+///
+/// Keyed on the EXPRESSION, exactly as [`policed`] is, so a class is stated the same way
+/// for every member targeting it and on every operation that carries one.
+/// `smithy_query(query="shape", shape="RepositoryName")` and `shape="RegistryId"` give the
+/// two spellings listed here.
+const EXPRESSIONS_ECR_POLICES_ITSELF: [&str; 2] = [
+    r"^[a-z0-9]+((\.|_|__|-+)[a-z0-9]+)*(\/[a-z0-9]+((\.|_|__|-+)[a-z0-9]+)*)*$",
+    "^[0-9]{12}$",
+];
+
+/// Whether `pattern` constrains a value class ECR polices in its own code
+/// ([`EXPRESSIONS_ECR_POLICES_ITSELF`]).
+fn polices_itself(pattern: &str) -> bool {
+    EXPRESSIONS_ECR_POLICES_ITSELF.contains(&pattern)
 }
 
 /// The expressions ECR states BARE — the expression alone inside the clause's own quotes,
@@ -329,7 +341,7 @@ fn element_constraint(violation: &Violation) -> Option<(&str, String)> {
     }
     let requirement = match &violation.kind {
         ViolationKind::Pattern(pattern) => pattern_requirement(&as_stated(policed(pattern))),
-        kind => requirement(kind, false)?,
+        kind => requirement(kind)?,
     };
     Some((
         collection,
@@ -337,17 +349,17 @@ fn element_constraint(violation: &Violation) -> Option<(&str, String)> {
     ))
 }
 
-/// Whether `path` names a parameter the request CARRIES, which is what ECR validates in
-/// its own code: a top-level member (`repositoryName`), or an element of a top-level
+/// Whether `path` names a parameter the request CARRIES, which is what the API gives a
+/// label of its own: a top-level member (`repositoryName`), or an element of a top-level
 /// collection (`repositoryNames.2.member`), which is one value of that same parameter.
-/// A member of a structure NESTED in the request is not — nothing of ECR's own names it,
-/// and the model-driven walk reports it under the path it descended.
+/// A member of a structure NESTED in the request is not — the API names no such member on
+/// its own, and the model-driven walk reports it under the path it descended.
 fn carried_parameter(path: &str) -> bool {
     !named_member(path).contains('.')
 }
 
-/// The member a refusal names when ECR's own validation caught the value: the member at
-/// fault ITSELF, not the path the validating walk descended to reach it
+/// The member a refusal names when the API gives the value a label of its own: the member
+/// at fault ITSELF, not the path the validating walk descended to reach it
 /// (`signingProfileArn`, not `signingConfiguration.rules.1.member.signingProfileArn`).
 ///
 /// The steps from a collection into an element are dropped off the end first
@@ -434,16 +446,70 @@ const REPOSITORY_GLOB_EXPRESSION: &str =
 /// validator does not state back to a caller.
 const SEPARATOR_CLASS_GLOB_SPELLING: &str = r"^[a-z0-9*](?:[._\-/a-z0-9*]?[a-z0-9*]+)*$";
 
+/// The expression ECR PUBLISHES for a LAYER DIGEST — the `<algorithm>:<hex>` form a layer
+/// blob, and the manifest of an image, is addressed by.
+///
+/// `smithy_query(query="shape", shape="LayerDigest")` spells the class ANCHORED
+/// (`^[a-zA-Z0-9-_+.]+:[a-fA-F0-9]+$`); the expression ECR's own validator holds for it,
+/// and quotes back to a caller, carries no anchors. Both spellings admit the same values
+/// under a total match, so the expression a refusal quotes is the published one.
+const LAYER_DIGEST_EXPRESSION: &str = "[a-zA-Z0-9-_+.]+:[a-fA-F0-9]+";
+
+/// The spelling of the layer-digest class this model carries, which ECR's validator does
+/// not state back to a caller.
+const ANCHORED_LAYER_DIGEST_SPELLING: &str = "^[a-zA-Z0-9-_+.]+:[a-fA-F0-9]+$";
+
+/// The expression ECR PUBLISHES for a REPLICATION repository filter — the value a
+/// replication rule's `repositoryFilters` entry carries.
+///
+/// A `PREFIX_MATCH` filter may carry the `*` wildcard, and the expression ECR publishes
+/// admits it in every character class, with the length the value may run to as a leading
+/// lookahead. `smithy_query(query="shape", shape="RepositoryFilterValue")` spells the
+/// class without the wildcard and states its length as a separate `@length(2..256)`, so
+/// the model and the service disagree about this one class, and the published expression
+/// is the one a refusal quotes.
+///
+/// What this emulator CHECKS a filter against is still the model's spelling: the boundary
+/// walk is driven by the model's own constraints, and the lookahead this expression opens
+/// with is not one the walk's regular-expression engine compiles. The two spellings
+/// therefore disagree about the values carrying `*`, which are narrower here than at ECR;
+/// that acceptance gap is carried as its own issue
+/// (`20261118T120000Z-ecr-putreplicationconfiguration-refuses-a-wildcard-repository-filter-aws-accepts`),
+/// while a value either spelling refuses is refused with the published one quoted, which
+/// is what the recorded refusal carries.
+const REPLICATION_FILTER_EXPRESSION: &str =
+    "^(?=.{1,256}$)(?:[a-z0-9*]+(?:[._-][a-z0-9*]*)*/)*[a-z0-9*]*(?:[._-][a-z0-9*]*)*$";
+
+/// The spelling of the replication-filter class this model carries, which ECR's validator
+/// does not state back to a caller.
+const MODELLED_REPLICATION_FILTER_SPELLING: &str =
+    "^(?:[a-z0-9]+(?:[._-][a-z0-9]*)*/)*[a-z0-9]*(?:[._-][a-z0-9]*)*$";
+
+/// The value classes whose expression ECR PUBLISHES differently from how this model spells
+/// it, as the pair (the model's spelling, the one ECR states).
+///
+/// Keyed on the EXPRESSION rather than on a member, an operation or a constraint, so the
+/// expression a refusal quotes belongs to the value class: every member targeting the
+/// class is refused with the same one. A class absent from this table is published exactly
+/// as the model spells it, which is what the recorded refusals of this service's other
+/// classes show.
+const PUBLISHED_EXPRESSIONS: [(&str, &str); 3] = [
+    (SEPARATOR_CLASS_GLOB_SPELLING, REPOSITORY_GLOB_EXPRESSION),
+    (ANCHORED_LAYER_DIGEST_SPELLING, LAYER_DIGEST_EXPRESSION),
+    (
+        MODELLED_REPLICATION_FILTER_SPELLING,
+        REPLICATION_FILTER_EXPRESSION,
+    ),
+];
+
 /// The expression ECR polices for the value class `pattern` constrains: `pattern` itself
-/// for all but the one class this model spells twice, where the spelling ECR publishes
-/// stands in for the equivalent one. Keyed on the expression, so it holds for every
-/// member targeting that shape rather than for one operation's member.
+/// for every class the model spells the way ECR publishes it, and the published spelling
+/// for the classes it does not ([`PUBLISHED_EXPRESSIONS`]).
 fn policed(pattern: &str) -> &str {
-    if pattern == SEPARATOR_CLASS_GLOB_SPELLING {
-        REPOSITORY_GLOB_EXPRESSION
-    } else {
-        pattern
-    }
+    PUBLISHED_EXPRESSIONS
+        .iter()
+        .find(|(modelled, _)| *modelled == pattern)
+        .map_or(pattern, |(_, published)| *published)
 }
 
 /// A `@pattern` expression as ECR'S OWN validation states it, which differs from how the
