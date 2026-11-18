@@ -214,16 +214,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let in_cooldown = group.in_cooldown(now);
 
         if desired_capacity < min_size {
-            return Err(crate::scaffolded::Scaffolded::validation_error(format!(
-                "New SetDesiredCapacity value {desired_capacity} is below min value {min_size} \
-                 for the AutoScalingGroup: {name}"
-            )));
+            return Err(crate::scaffolded::Scaffolded::validation_error(
+                crate::state::capacity_outside_bounds_message(
+                    desired_capacity,
+                    crate::state::CapacityBound::Min(min_size),
+                ),
+            ));
         }
         if desired_capacity > max_size {
-            return Err(crate::scaffolded::Scaffolded::validation_error(format!(
-                "New SetDesiredCapacity value {desired_capacity} is above max value {max_size} \
-                 for the AutoScalingGroup: {name}"
-            )));
+            return Err(crate::scaffolded::Scaffolded::validation_error(
+                crate::state::capacity_outside_bounds_message(
+                    desired_capacity,
+                    crate::state::CapacityBound::Max(max_size),
+                ),
+            ));
         }
         // The check above is against the group's own stored maximum, so it is
         // relative: the absolute ceiling is what bounds the instances this call

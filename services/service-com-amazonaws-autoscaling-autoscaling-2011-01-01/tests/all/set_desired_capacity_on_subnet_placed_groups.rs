@@ -422,7 +422,7 @@ async fn an_unacceptable_capacity_is_refused_within_the_model() {
             group: "bounded",
             desired_capacity: "3",
             message: "New SetDesiredCapacity value 3 is above max value 2 for the \
-                      AutoScalingGroup: bounded"
+                      AutoScalingGroup."
                 .to_string(),
         },
         RefusalCase {
@@ -430,7 +430,7 @@ async fn an_unacceptable_capacity_is_refused_within_the_model() {
             group: "bounded",
             desired_capacity: "0",
             message: "New SetDesiredCapacity value 0 is below min value 1 for the \
-                      AutoScalingGroup: bounded"
+                      AutoScalingGroup."
                 .to_string(),
         },
         RefusalCase {

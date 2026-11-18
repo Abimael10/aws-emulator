@@ -3506,6 +3506,36 @@ pub fn min_size_breach_message(desired_capacity: i32, min_size: i32, terminating
     }
 }
 
+/// Which of the two bounds a group is configured with a requested capacity crossed, and
+/// the value of that bound as the group holds it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CapacityBound {
+    /// The group's `MinSize`, which the requested capacity is below.
+    Min(i32),
+    /// The group's `MaxSize`, which the requested capacity is above.
+    Max(i32),
+}
+
+/// The sentence a capacity change is refused with when the capacity it asks for falls
+/// outside the bounds the group is configured with.
+///
+/// Fixed text around exactly TWO variable parts — the capacity the request named and the
+/// bound of the group it crossed — and nothing else: the sentence ends in a period after
+/// `AutoScalingGroup`, naming neither the group nor the account nor any other value, so a
+/// caller that classifies the bounds error by this sentence sees the same text for every
+/// group.
+#[must_use]
+pub fn capacity_outside_bounds_message(desired_capacity: i32, bound: CapacityBound) -> String {
+    let (relation, limit) = match bound {
+        CapacityBound::Min(min_size) => ("below min", min_size),
+        CapacityBound::Max(max_size) => ("above max", max_size),
+    };
+    format!(
+        "New SetDesiredCapacity value {desired_capacity} is {relation} value {limit} for the \
+         AutoScalingGroup."
+    )
+}
+
 /// The sentence Amazon EC2 Auto Scaling states for `ScalingActivityInProgressFault` when
 /// the instances an earlier change of the group is still taking out of service are what
 /// blocks this one.

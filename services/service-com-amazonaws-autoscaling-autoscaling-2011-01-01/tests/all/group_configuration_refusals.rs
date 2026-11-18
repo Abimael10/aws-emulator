@@ -10,7 +10,7 @@
 //! * a group is placed only in Availability Zones its Region HAS, by either spelling (the
 //!   zone's name or its id);
 //! * a group launches only from a launch template the account HOLDS, wherever the launch
-//!   source names it;
+//!   source names it, and only from a VERSION of it the template holds;
 //! * an instance maintenance policy states a lower healthy threshold for every upper one,
 //!   and the two are at most 100 apart;
 //! * one instance type has at most one override in a mixed instances policy;
@@ -480,6 +480,280 @@ async fn a_group_launches_only_from_a_launch_template_the_account_holds() {
         assert!(
             !group_exists(&router, &name).await,
             "case {case:?}: the refused create must leave no group"
+        );
+    }
+}
+
+/// One row of the launch-template-VERSION table: the case, the prefix the specification is
+/// carried under, which half of it names the template, the `Version` the row states (`None`
+/// for a row that states none) and whether the request is served.
+struct VersionCase {
+    case: &'static str,
+    prefix: &'static str,
+    by_id: bool,
+    version: Option<&'static str>,
+    served: bool,
+}
+
+/// Mint ONE more version of the launch template `name`, through Amazon EC2's own writer, and
+/// answer the number it was given.
+///
+/// A template that holds two versions is what lets a row name the version after the first,
+/// the one past the last the template ever minted, and the two words that float on whichever
+/// version is current.
+fn mint_another_version(engine: &Arc<engine::InMemoryEngine>, name: &str) -> i64 {
+    let launch_template_id = held_template_id(engine, name);
+    let state = ec2::service_state(&**engine).expect("the EC2 store is mounted on this engine");
+    let mut store = state.lock();
+    store
+        .insert_launch_template_version(
+            &launch_template_id,
+            ec2::LaunchTemplateVersionSpec {
+                created_by: engine::emulator_arn("iam", "", "root"),
+                create_time: std::time::SystemTime::now(),
+                version_description: None,
+                data: service_com_amazonaws_ec2_amazonec2::ops::types::RequestLaunchTemplateData::default(),
+            },
+        )
+        .expect("the account must be able to hold a second version of this launch template")
+}
+
+/// RULE: a group launches from ONE VERSION of a launch template, so the version its launch
+/// source names must be one the template HOLDS — a number the template minted, or one of the
+/// two words that float on the version in force. A version the template never minted is
+/// refused with Amazon EC2's own sentence for the half that did not resolve, naming the
+/// version and the template's id, and leaves no group.
+#[tokio::test]
+async fn a_group_launches_only_from_a_launch_template_version_the_account_holds() {
+    const OWN_TEMPLATE: &str = "LaunchTemplate";
+    const POLICY_TEMPLATE: &str = "MixedInstancesPolicy.LaunchTemplate.LaunchTemplateSpecification";
+    let rows: &[VersionCase] = &[
+        VersionCase {
+            case: "no version at all: the group launches from the default version",
+            prefix: OWN_TEMPLATE,
+            by_id: false,
+            version: None,
+            served: true,
+        },
+        VersionCase {
+            case: "the template's first version",
+            prefix: OWN_TEMPLATE,
+            by_id: false,
+            version: Some("1"),
+            served: true,
+        },
+        VersionCase {
+            case: "the version minted after the first",
+            prefix: OWN_TEMPLATE,
+            by_id: false,
+            version: Some("2"),
+            served: true,
+        },
+        VersionCase {
+            case: "the word that floats on the default version",
+            prefix: OWN_TEMPLATE,
+            by_id: false,
+            version: Some("$Default"),
+            served: true,
+        },
+        VersionCase {
+            case: "the word that floats on the latest version",
+            prefix: OWN_TEMPLATE,
+            by_id: true,
+            version: Some("$Latest"),
+            served: true,
+        },
+        VersionCase {
+            case: "one past the last version the template minted",
+            prefix: OWN_TEMPLATE,
+            by_id: false,
+            version: Some("3"),
+            served: false,
+        },
+        VersionCase {
+            case: "far past the last version, on a template named by its id",
+            prefix: OWN_TEMPLATE,
+            by_id: true,
+            version: Some("99"),
+            served: false,
+        },
+        VersionCase {
+            case: "below the first version a template can carry",
+            prefix: OWN_TEMPLATE,
+            by_id: false,
+            version: Some("0"),
+            served: false,
+        },
+        VersionCase {
+            case: "a held version of the launch template of a mixed instances policy",
+            prefix: POLICY_TEMPLATE,
+            by_id: false,
+            version: Some("2"),
+            served: true,
+        },
+        VersionCase {
+            case: "an absent version of the launch template of a mixed instances policy",
+            prefix: POLICY_TEMPLATE,
+            by_id: false,
+            version: Some("99"),
+            served: false,
+        },
+    ];
+
+    for (index, row) in rows.iter().enumerate() {
+        let (router, engine) = emulator();
+        let held_id = held_template_id(&engine, TEMPLATE);
+        let minted = mint_another_version(&engine, TEMPLATE);
+        assert_eq!(
+            minted, 2,
+            "case {:?}: the harness must leave the template holding versions 1 and 2",
+            row.case
+        );
+        let name = format!("asg-template-version-{index}");
+        // Each row states its OWN launch source, so the base create's launch template is
+        // replaced rather than added to.
+        let mut params: Vec<(String, String)> = base_create(&name)
+            .into_iter()
+            .filter(|(key, _)| key != "LaunchTemplate.LaunchTemplateName")
+            .collect();
+        let (half, value) = if row.by_id {
+            ("LaunchTemplateId", held_id.clone())
+        } else {
+            ("LaunchTemplateName", TEMPLATE.to_string())
+        };
+        params.push(p(&format!("{}.{half}", row.prefix), value));
+        if let Some(version) = row.version {
+            params.push(p(&format!("{}.Version", row.prefix), version));
+        }
+
+        let (status, body) = query(&router, "CreateAutoScalingGroup", &borrowed(&params)).await;
+        if row.served {
+            assert_eq!(
+                status, 200,
+                "case {:?}: a version the template holds must be accepted, got {status}: {body}",
+                row.case
+            );
+            assert!(
+                group_exists(&router, &name).await,
+                "case {:?}: the accepted create must leave a group",
+                row.case
+            );
+            // A version the request pinned by NUMBER is the version the group reports back,
+            // which is what makes the accepted row a round trip rather than a 200.
+            if let Some(version) = row
+                .version
+                .filter(|version| version.parse::<i64>().is_ok() && row.prefix == OWN_TEMPLATE)
+            {
+                let (_, described) = query(
+                    &router,
+                    "DescribeAutoScalingGroups",
+                    &[("AutoScalingGroupNames.member.1", name.as_str())],
+                )
+                .await;
+                assert_eq!(
+                    tag_value(&described, "Version"),
+                    version,
+                    "case {:?}: the group must report the version it was pinned to, got \
+                     {described}",
+                    row.case
+                );
+            }
+            continue;
+        }
+        assert_eq!(
+            status, 400,
+            "case {:?}: expected the version to be refused, got {status}: {body}",
+            row.case
+        );
+        assert_eq!(
+            tag_value(&body, "Code"),
+            "ValidationError",
+            "case {:?}: expected ValidationError, got {body}",
+            row.case
+        );
+        let requested = row.version.expect("a refused row states a version");
+        assert_eq!(
+            message(&body),
+            format!(
+                "Could not find the specified version {requested} for the launch template with \
+                 ID {held_id}."
+            ),
+            "case {:?}: expected Amazon EC2's own sentence for the version half",
+            row.case
+        );
+        assert!(
+            !group_exists(&router, &name).await,
+            "case {:?}: the refused create must leave no group",
+            row.case
+        );
+    }
+}
+
+/// RULE: the same version resolution guards an UPDATE, and a refused update leaves the group
+/// on the launch-template version it was already running.
+#[tokio::test]
+async fn an_update_onto_an_absent_launch_template_version_is_refused() {
+    let (router, engine) = emulator();
+    let held_id = held_template_id(&engine, TEMPLATE);
+    mint_another_version(&engine, TEMPLATE);
+    let group = "asg-template-version-update";
+    let (status, body) = create(
+        &router,
+        group,
+        &[p("LaunchTemplate.Version", "1".to_string())],
+    )
+    .await;
+    assert_eq!(status, 200, "the group must be created, got {status}: {body}");
+
+    // (case, the version the update names, whether it is served, the version the group runs
+    // afterwards)
+    let rows: &[(&str, &str, bool, &str)] = &[
+        ("onto the second version the template holds", "2", true, "2"),
+        ("onto a version the template never minted", "7", false, "2"),
+        ("onto a version below the first", "0", false, "2"),
+        ("back onto the first version", "1", true, "1"),
+    ];
+    for (case, version, served, running) in rows {
+        let (status, body) = query(
+            &router,
+            "UpdateAutoScalingGroup",
+            &[
+                ("AutoScalingGroupName", group),
+                ("LaunchTemplate.LaunchTemplateName", TEMPLATE),
+                ("LaunchTemplate.Version", version),
+            ],
+        )
+        .await;
+        if *served {
+            assert_eq!(
+                status, 200,
+                "case {case:?}: expected the update to be served, got {status}: {body}"
+            );
+        } else {
+            assert_eq!(
+                status, 400,
+                "case {case:?}: expected the update to be refused, got {status}: {body}"
+            );
+            assert_eq!(
+                message(&body),
+                format!(
+                    "Could not find the specified version {version} for the launch template \
+                     with ID {held_id}."
+                ),
+                "case {case:?}: expected Amazon EC2's own sentence for the version half"
+            );
+        }
+        let (_, described) = query(
+            &router,
+            "DescribeAutoScalingGroups",
+            &[("AutoScalingGroupNames.member.1", group)],
+        )
+        .await;
+        assert_eq!(
+            tag_value(&described, "Version"),
+            *running,
+            "case {case:?}: the group must run the version the last SERVED request left it on, \
+             got {described}"
         );
     }
 }

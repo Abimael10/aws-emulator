@@ -376,14 +376,16 @@ async fn created_group_members_read_back_as_created() {
             case: "a launch template instead of a launch configuration",
             params: vec![
                 ("LaunchTemplate.LaunchTemplateName", "lt-1"),
-                ("LaunchTemplate.Version", "2"),
+                // The version the harness's template holds: a group launches from a version
+                // the template HAS, so a number past them is refused rather than stored.
+                ("LaunchTemplate.Version", "1"),
                 ("MinSize", "2"),
                 ("MaxSize", "2"),
                 ("AvailabilityZones.member.1", "us-west-2a"),
             ],
             expected: vec![
                 ("LaunchTemplateName", "lt-1"),
-                ("Version", "2"),
+                ("Version", "1"),
                 ("DesiredCapacity", "2"),
             ],
             instances: 2,

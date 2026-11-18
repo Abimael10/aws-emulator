@@ -570,7 +570,9 @@ async fn a_group_cannot_be_created_from_a_launch_configuration() {
         &[
             ("AutoScalingGroupName", "asg-from-template"),
             ("LaunchTemplate.LaunchTemplateName", "lt-1"),
-            ("LaunchTemplate.Version", "3"),
+            // The version the harness's template holds: a group launches from a version the
+            // template HAS.
+            ("LaunchTemplate.Version", "1"),
             ("MinSize", "0"),
             ("MaxSize", "1"),
             ("AvailabilityZones.member.1", "us-west-2a"),

@@ -24,6 +24,7 @@
 
 use ::std::collections::BTreeSet;
 
+use ::service_com_amazonaws_ec2_amazonec2::scaffolded::Scaffolded as Ec2Refusal;
 use ::service_com_amazonaws_ec2_amazonec2::state as ec2;
 
 use crate::ops::types::{
@@ -219,8 +220,8 @@ pub fn launch_source_error<E>(
     (stated != 1).then(|| Scaffolded::validation_error(ONE_LAUNCH_SOURCE_MESSAGE))
 }
 
-/// The refusal for a launch source naming a launch template the account does not hold, or
-/// `None` when every template it names resolves.
+/// The refusal for a launch source naming a launch template — or a VERSION of one — the
+/// account does not hold, or `None` when every reference it names resolves.
 ///
 /// A launch template is Amazon EC2's resource, and Amazon EC2 Auto Scaling resolves the one a
 /// group launches from when the group is configured — which is why a group reports both
@@ -254,22 +255,82 @@ pub fn unresolvable_launch_template_error<Eng: Send + Sync + 'static, E>(
     let store = state.lock();
     references
         .into_iter()
-        .find(|reference| !reference.resolves(&store))
-        .map(|reference| Scaffolded::validation_error(reference.refusal()))
+        .find_map(|reference| reference.refusal(&store))
+        .map(Scaffolded::validation_error)
+}
+
+/// ONE launch-template reference a launch source carries: the template it names, and the
+/// version of it the group would launch from.
+#[derive(Debug, Clone)]
+struct TemplateReference {
+    /// How the specification names the template.
+    template: TemplateIdentity,
+    /// The `Version` the specification states, as it wrote it, or `None` when it states
+    /// none: "the default value is `$Default`"
+    /// (`smithy_query(query="shape",shape="LaunchTemplateSpecification")`), which is the
+    /// version a group naming no version launches from.
+    version: Option<String>,
+}
+
+impl TemplateReference {
+    /// The reference `specification` carries, or `None` when it names no template — the
+    /// empty string names none either.
+    fn of(specification: &LaunchTemplateSpecification) -> Option<Self> {
+        Some(Self {
+            template: TemplateIdentity::of(specification)?,
+            version: specification
+                .version
+                .as_deref()
+                .filter(|version| !version.is_empty())
+                .map(::std::string::ToString::to_string),
+        })
+    }
+
+    /// What AWS answers a request whose launch source carries this reference, or `None`
+    /// when the account holds the launch-template version it names.
+    ///
+    /// Both halves are resolved, because a group launches from ONE VERSION of one template:
+    /// a version the template never minted is a launch source the group could never launch
+    /// from, exactly as a template the account does not hold is. Either way the sentence is
+    /// Amazon EC2's own for the half that did not resolve, surfaced as this service's
+    /// refusal and not re-worded — the version half read from Amazon EC2's own resolution of
+    /// it ([`ec2::resolve_launch_template_version`], the one reading of that member in the
+    /// tree), so the two services cannot disagree about which version a word names or about
+    /// how a caller is told it does not exist.
+    fn refusal(&self, store: &ec2::ComAmazonawsEc2Amazonec2State) -> Option<String> {
+        let Some(record) = self.template.record(store) else {
+            return Some(self.template.absent_template_refusal());
+        };
+        let version = self
+            .version
+            .as_deref()
+            .unwrap_or(ec2::LAUNCH_TEMPLATE_VERSION_DEFAULT);
+        match ec2::resolve_launch_template_version::<()>(record, version) {
+            Ok(_) => None,
+            Err(Ec2Refusal::ServiceError(refusal)) => Some(refusal.message),
+            // The resolution answers nothing but that refusal; a version it could not place
+            // is unusable all the same, and the sentence for the version half is Amazon
+            // EC2's own either way.
+            Err(_) => Some(ec2::specified_launch_template_version_not_found_message(
+                record.launch_template_id(),
+                version,
+            )),
+        }
+    }
 }
 
 /// How ONE launch-template specification names its template: "you must specify either a
 /// `LaunchTemplateId` or a `LaunchTemplateName`" (`LaunchTemplateSpecification`).
 #[derive(Debug, Clone)]
-enum TemplateReference {
+enum TemplateIdentity {
     /// The template's id, as the specification's `LaunchTemplateId` states it.
     Id(String),
     /// The template's name, as its `LaunchTemplateName` states it.
     Name(String),
 }
 
-impl TemplateReference {
-    /// The reference `specification` carries, or `None` when it carries neither half — the
+impl TemplateIdentity {
+    /// The identity `specification` carries, or `None` when it carries neither half — the
     /// empty string names no template either.
     fn of(specification: &LaunchTemplateSpecification) -> Option<Self> {
         if let Some(id) = specification
@@ -286,20 +347,25 @@ impl TemplateReference {
         Some(Self::Name(name.to_string()))
     }
 
-    /// Whether the account's own Amazon EC2 store holds the launch template this reference
-    /// names, looked up by the half the specification stated — the same two lookups Amazon
-    /// EC2 resolves its own launch-template references by.
-    fn resolves(&self, store: &ec2::ComAmazonawsEc2Amazonec2State) -> bool {
+    /// The launch template of the account's own Amazon EC2 store this identity names, looked
+    /// up by the half the specification stated — the same two lookups Amazon EC2 resolves its
+    /// own launch-template references by — or `None` when the account holds none.
+    fn record<'store>(
+        &self,
+        store: &'store ec2::ComAmazonawsEc2Amazonec2State,
+    ) -> Option<&'store ec2::LaunchTemplateRecord> {
         match self {
-            Self::Id(id) => store.launch_templates.contains_key(id),
-            Self::Name(name) => store.launch_template_id_for_name(name).is_some(),
+            Self::Id(id) => store.launch_templates.get(id),
+            Self::Name(name) => store
+                .launch_template_id_for_name(name)
+                .and_then(|id| store.launch_templates.get(&id)),
         }
     }
 
-    /// What AWS answers a request whose launch source names this template: the sentence
-    /// Amazon EC2 — the service that holds launch templates, and the one Amazon EC2 Auto
-    /// Scaling resolves the specification against — words for the half the request stated,
-    /// surfaced as this service's own refusal.
+    /// What AWS answers a request whose launch source names a template the account does not
+    /// hold: the sentence Amazon EC2 — the service that holds launch templates, and the one
+    /// Amazon EC2 Auto Scaling resolves the specification against — words for the half the
+    /// request stated, surfaced as this service's own refusal.
     ///
     /// An ID the account holds no template under is not an id of a launch template at all,
     /// which is the sentence Amazon EC2 states for an id it cannot read
@@ -308,7 +374,7 @@ impl TemplateReference {
     /// under is the sentence Amazon EC2 states for that (its
     /// `invalid_launch_template_name_not_found`), which names no value because a request names
     /// one name and the service does not repeat it back.
-    fn refusal(&self) -> String {
+    fn absent_template_refusal(&self) -> String {
         match self {
             Self::Id(id) => format!("Malformed launch template Id: {id}"),
             Self::Name(_) => {

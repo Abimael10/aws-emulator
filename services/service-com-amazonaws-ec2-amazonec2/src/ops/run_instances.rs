@@ -452,29 +452,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     // value of $Default uses the default version of the launch template.
                     // Default: The default version of the launch template"
                     // (`LaunchTemplateSpecification$Version`), resolved through the one
-                    // reading of that member this crate has. Only its VERSION-NOT-FOUND
-                    // verdict is re-worded here, in this operation's own recorded sentence
-                    // (`crate::state::specified_launch_template_version_not_found`): a
-                    // launch that pinned a version the template never minted is told which
-                    // version of which template could not be found.
-                    let version = match crate::state::resolve_launch_template_version(
-                        record,
-                        requested_version,
-                    ) {
-                        Ok(version) => version,
-                        Err(crate::scaffolded::Scaffolded::ServiceError(refusal))
-                            if refusal.code
-                                == crate::state::INVALID_LAUNCH_TEMPLATE_ID_VERSION_NOT_FOUND =>
-                        {
-                            return Err(
-                                crate::state::specified_launch_template_version_not_found(
-                                    &launch_template_id,
-                                    requested_version,
-                                ),
-                            );
-                        }
-                        Err(refusal) => return Err(refusal),
-                    };
+                    // reading of that member this crate has — which refuses a version the
+                    // template never minted in the sentence a launch answers
+                    // (`crate::state::specified_launch_template_version_not_found`): the
+                    // caller is told which version of which template could not be found.
+                    let version =
+                        crate::state::resolve_launch_template_version(record, requested_version)?;
                     // The pair this launch resolved, kept for the two system tags every
                     // instance it mints carries.
                     launched_template = Some((launch_template_id.clone(), version));

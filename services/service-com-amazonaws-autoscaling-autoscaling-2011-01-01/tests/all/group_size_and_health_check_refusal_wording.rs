@@ -18,13 +18,19 @@
 //!   (`smithy_query(query="doc",shape="AutoScalingGroup",member="HealthCheckType")`), a
 //!   free string the service validates itself, so the refusal is the one machine-readable
 //!   statement of the set it accepts: the fixed sentence `Valid health check types are:
-//!   [EC2, ELB, EBS, VPC_LATTICE].`, carrying nothing from the request.
+//!   [EC2, ELB, EBS, VPC_LATTICE].`, carrying nothing from the request;
+//! * a capacity change asks for a capacity the group's OWN bounds admit, so one outside them
+//!   is refused `New SetDesiredCapacity value <n> is above max value <MaxSize> for the
+//!   AutoScalingGroup.` (or `below min value <MinSize>`) — the requested capacity and the
+//!   bound it crossed being the only variable parts, with no group named.
 //!
 //! The rows span what each rule generalises over: which side of the range the capacity
 //! misses and by how much, whether the bounds come from the create's own members or from
-//! the group the update is applied to, and which health check type is named — one word
+//! the group the update is applied to, which health check type is named — one word
 //! outside the set, a word of the set in the wrong case, a comma-separated list with one
-//! unknown entry — beside the comma-separated forms the service accepts.
+//! unknown entry — beside the comma-separated forms the service accepts, and, for the
+//! capacity change, the bound crossed, the distance from it, the bounds being equal and the
+//! group's own name, which no refusal carries.
 
 use crate::support::{borrowed, p, query, tag_value, xml_unescape};
 
@@ -418,6 +424,163 @@ fn sizes_of(described: &str) -> (String, String, String) {
         tag_value(described, "MaxSize"),
         tag_value(described, "DesiredCapacity"),
     )
+}
+
+/// The fixed text `SetDesiredCapacity` refuses a capacity outside the bounds the group is
+/// configured with: the capacity the request asked for and the bound of the group it
+/// crossed, and nothing else — the sentence ends in a period after `AutoScalingGroup` and
+/// names neither the group nor any other value.
+fn expected_capacity_bound_sentence(desired: i32, relation: &str, bound: i32) -> String {
+    format!(
+        "New SetDesiredCapacity value {desired} is {relation} value {bound} for the \
+         AutoScalingGroup."
+    )
+}
+
+/// One row of the capacity-bound table: the bounds the group is created with, the capacity
+/// the change asks for, and either the bound it crosses (`relation`, `bound`) or `None` for a
+/// capacity the group can serve.
+struct CapacityBoundRow {
+    case: &'static str,
+    /// The group's own name, which the refusal must NOT carry whatever it is.
+    group: &'static str,
+    min: i32,
+    max: i32,
+    desired: i32,
+    crossed: Option<(&'static str, i32)>,
+}
+
+/// RULE: `SetDesiredCapacity` refuses a capacity outside the group's own bounds with the
+/// fixed sentence for the bound it crossed, carrying the requested capacity and that bound
+/// and nothing else; the group keeps the capacity it had.
+#[tokio::test]
+async fn a_capacity_outside_the_groups_bounds_is_refused_with_the_bound_sentence() {
+    let rows = [
+        CapacityBoundRow {
+            case: "one above a maximum of one",
+            group: "capacity-bound",
+            min: 0,
+            max: 1,
+            desired: 2,
+            crossed: Some(("above max", 1)),
+        },
+        CapacityBoundRow {
+            case: "far above a maximum of zero",
+            group: "a-group-whose-name-is-considerably-longer-than-the-others",
+            min: 0,
+            max: 0,
+            desired: 9,
+            crossed: Some(("above max", 0)),
+        },
+        CapacityBoundRow {
+            case: "below a minimum of two",
+            group: "bound2",
+            min: 2,
+            max: 5,
+            desired: 1,
+            crossed: Some(("below min", 2)),
+        },
+        CapacityBoundRow {
+            case: "below bounds that are equal",
+            group: "capacity.bound-3",
+            min: 3,
+            max: 3,
+            desired: 0,
+            crossed: Some(("below min", 3)),
+        },
+        CapacityBoundRow {
+            case: "the maximum itself, which is inside the bounds",
+            group: "capacity-at-max",
+            min: 0,
+            max: 2,
+            desired: 2,
+            crossed: None,
+        },
+        CapacityBoundRow {
+            case: "the minimum itself, which is inside the bounds",
+            group: "capacity-at-min",
+            min: 1,
+            max: 3,
+            desired: 1,
+            crossed: None,
+        },
+    ];
+
+    for row in &rows {
+        let engine = crate::support::new_engine();
+        let router = crate::support::router_with(engine);
+        let case = row.case;
+        // The group starts at its own minimum, so a refused change is visible as the
+        // capacity it left behind.
+        let params = [
+            p("AutoScalingGroupName", row.group),
+            p(LAUNCH_SOURCE.0, LAUNCH_SOURCE.1),
+            p(ZONE.0, ZONE.1),
+            p("MinSize", row.min.to_string()),
+            p("MaxSize", row.max.to_string()),
+            p("DesiredCapacity", row.min.to_string()),
+        ];
+        let (status, body) = query(&router, "CreateAutoScalingGroup", &borrowed(&params)).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: the group must be created, got {status}: {body}"
+        );
+
+        let (status, body) = query(
+            &router,
+            "SetDesiredCapacity",
+            &[
+                ("AutoScalingGroupName", row.group),
+                ("DesiredCapacity", row.desired.to_string().as_str()),
+            ],
+        )
+        .await;
+        let expected_capacity = match row.crossed {
+            None => {
+                assert_eq!(
+                    status, 200,
+                    "case {case:?}: a capacity inside the bounds must be served, got {status}: \
+                     {body}"
+                );
+                row.desired
+            }
+            Some((relation, bound)) => {
+                assert_eq!(
+                    status, 400,
+                    "case {case:?}: expected the capacity to be refused, got {status}: {body}"
+                );
+                assert_eq!(
+                    refusal(&body),
+                    (
+                        "ValidationError".to_string(),
+                        expected_capacity_bound_sentence(row.desired, relation, bound)
+                    ),
+                    "case {case:?}: expected the capacity-bound sentence, got {body}"
+                );
+                assert!(
+                    !xml_unescape(&tag_value(&body, "Message")).contains(row.group),
+                    "case {case:?}: the sentence names no group, got {body}"
+                );
+                row.min
+            }
+        };
+
+        let (status, described) = query(
+            &router,
+            "DescribeAutoScalingGroups",
+            &[("AutoScalingGroupNames.member.1", row.group)],
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: DescribeAutoScalingGroups expected 200, got {status}: {described}"
+        );
+        assert_eq!(
+            tag_value(&described, "DesiredCapacity"),
+            expected_capacity.to_string(),
+            "case {case:?}: expected the capacity the answered change left, got {described}"
+        );
+    }
 }
 
 /// One row of the health check table: the value named, and whether the service accepts it.

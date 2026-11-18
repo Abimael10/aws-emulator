@@ -42,6 +42,38 @@ const PINNED_VERSION: &str = "1";
 /// The zone the groups in this suite place their instances in.
 const ZONE: &str = "us-west-2a";
 
+/// Mint versions of the launch template `template` until it holds `version`, through Amazon
+/// EC2's own writer.
+///
+/// A group launches from a version the launch template HAS — the service resolves the
+/// specification against Amazon EC2's own store when the group is configured — so a row that
+/// pins a version past the template's first needs that version to exist before the group is
+/// created.
+fn hold_version_up_to(engine: &Arc<engine::InMemoryEngine>, template: &str, version: i64) {
+    let state = ec2::service_state(&**engine).expect("the EC2 store is mounted on this engine");
+    let mut store = state.lock();
+    let launch_template_id = store
+        .launch_template_id_for_name(template)
+        .unwrap_or_else(|| panic!("the account must hold a launch template named {template:?}"));
+    while store
+        .launch_templates
+        .get(&launch_template_id)
+        .is_some_and(|record| !record.versions.contains_key(&version))
+    {
+        store
+            .insert_launch_template_version(
+                &launch_template_id,
+                ec2::LaunchTemplateVersionSpec {
+                    created_by: engine::emulator_arn("iam", "", "root"),
+                    create_time: std::time::SystemTime::now(),
+                    version_description: None,
+                    data: ec2_service::ops::types::RequestLaunchTemplateData::default(),
+                },
+            )
+            .expect("the account must be able to hold another version of this template");
+    }
+}
+
 /// The sentence a rollback of a group with nothing in progress is refused with.
 fn nothing_in_progress_message(name: &str) -> String {
     format!("No in progress or baking Instance Refresh found for Auto Scaling group {name}.")
@@ -577,8 +609,16 @@ async fn a_rollback_with_nothing_to_reverse_is_refused() {
     ];
 
     for (index, row) in rows.iter().enumerate() {
-        let router = router_with(new_engine());
+        let engine = new_engine();
+        let router = router_with(Arc::clone(&engine));
         let name = name_of(index);
+        // A row that pins a numbered version needs the template to hold it.
+        if let Some(version) = row
+            .group_version
+            .and_then(|version| version.parse::<i64>().ok())
+        {
+            hold_version_up_to(&engine, LAUNCH_TEMPLATE, version);
+        }
         create_group(&router, &name, 1, LAUNCH_TEMPLATE, row.group_version).await;
         match row.before {
             Before::NoRefresh => {}
