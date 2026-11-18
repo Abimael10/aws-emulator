@@ -23,6 +23,13 @@ use crate::support::{new_engine, query, router_with, tag_value, tag_values};
 use autoscaling::state;
 use service_com_amazonaws_autoscaling_autoscaling_2011_01_01 as autoscaling;
 
+// `DescribeAutoScalingInstances`, the account's own read of its Auto Scaling instances: what
+// it reports for each group's members, which ids filter it and how it pages. Its own file
+// under this suite's directory, declared here because a file one level down is declared by
+// its parent module rather than by the target's root.
+#[path = "account_level_reads_publish_service_data/auto_scaling_instances.rs"]
+mod auto_scaling_instances;
+
 /// The launch source every group in this suite is created from: a launch TEMPLATE,
 /// because no account can create a launch configuration
 /// (`CreateLaunchConfiguration` is refused with `UnsupportedOperation`).
