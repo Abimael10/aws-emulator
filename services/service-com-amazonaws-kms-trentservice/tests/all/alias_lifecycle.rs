@@ -800,15 +800,17 @@ async fn list_aliases_reports_every_binding_in_creation_order_and_pages() {
         );
     }
 
-    // The published page bound is accepted; one past it is refused, and so is a marker
-    // this service did not mint.
-    let answer = list_aliases(&router, &json!({"Limit": 100})).await;
+    // The page bound the wire imposes is the modelled range of `LimitType`
+    // (`@range(min: 1, max: 1000)`), which every `Limit` member of this service targets:
+    // a value inside it is served and one past it is refused — see
+    // `tests/all/listing_page_limit_bound.rs`.
+    let answer = list_aliases(&router, &json!({"Limit": 1000})).await;
     assert_eq!(
         listed_names("limit at the published bound", &answer),
         all,
         "case limit at the published bound: expected every alias, got {answer}"
     );
-    let (status, code) = failure(&router, "ListAliases", &json!({"Limit": 101})).await;
+    let (status, code) = failure(&router, "ListAliases", &json!({"Limit": 1001})).await;
     assert_eq!(
         status, 400,
         "case one past the published bound: expected HTTP 400, got {status} ({code})"

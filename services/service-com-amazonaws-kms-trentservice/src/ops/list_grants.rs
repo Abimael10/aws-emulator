@@ -215,20 +215,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
-        // "If you include a value, it must be between 1 and 100, inclusive"
-        // (`smithy_query(query="doc",shape="ListGrantsRequest",member="Limit")`).
-        // `LimitType`'s modelled range is 1..1000 — it is shared with the other
-        // listings — so the boundary validator passes a value this operation's own
-        // documented bound refuses; the refusal names the member and the constraint.
-        if let Some(limit) = input.limit {
-            if limit > MAX_LIMIT {
-                return Err(crate::scaffolded::Scaffolded::validation(format!(
-                    "Value '{limit}' at 'limit' failed to satisfy constraint: Member must \
-                     have value less than or equal to {MAX_LIMIT}"
-                )));
-            }
-        }
-
         // "You can specify either GranteePrincipal or GranteeServicePrincipal, but not
         // both"
         // (`smithy_query(query="doc",shape="ListGrantsRequest",member="GranteePrincipal")`).
@@ -344,11 +330,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // "If you do not include a value, it defaults to 50." A `Limit` that reached
-        // here is already within 1..=MAX_LIMIT — the modelled `LimitType` range floors
-        // it at 1 and the check above refuses anything larger — so the clamp only
-        // carries that bound into the `usize` the page size needs.
-        let limit =
-            usize::try_from(input.limit.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT)).unwrap_or(1);
+        // here is already within the modelled `LimitType` range — the boundary validator
+        // floors it at 1 and refuses anything past
+        // [`crate::state::MAX_PAGE_LIMIT`] — so the clamp only carries that bound into
+        // the `usize` the page size needs.
+        let limit = usize::try_from(
+            input
+                .limit
+                .unwrap_or(DEFAULT_LIMIT)
+                .clamp(1, crate::state::MAX_PAGE_LIMIT),
+        )
+        .unwrap_or(1);
         let page: Vec<GrantListEntry> = listed
             .iter()
             .skip(start)
@@ -385,7 +377,3 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// include a value, it defaults to 50."
 /// (`smithy_query(query="doc",shape="ListGrantsRequest",member="Limit")`).
 const DEFAULT_LIMIT: i32 = 50;
-
-/// The largest page this operation accepts: "If you include a value, it must be
-/// between 1 and 100, inclusive." (same member's documentation).
-const MAX_LIMIT: i32 = 100;

@@ -588,6 +588,13 @@ pub(crate) fn contains(haystack: &[u8], needle: &[u8]) -> bool {
         && haystack.windows(needle.len()).any(|window| window == needle)
 }
 
+/// The `ValidationException` envelope the framework renders a SINGLE constraint violation
+/// in, with `clause` as that violation — the counted prefix a constraint refusal carries,
+/// written once for every suite that asserts one.
+pub(crate) fn one_violation(clause: &str) -> String {
+    format!("1 validation error detected: {clause}")
+}
+
 /// A symmetric encryption key in the `Enabled` state.
 pub(crate) async fn enabled_key(router: &MultiServiceRouter) -> Value {
     create_key(router, &json!({"Description": "round trip"})).await

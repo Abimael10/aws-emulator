@@ -379,16 +379,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // "a specified resource [that] is not valid for this operation"
         // (`smithy_query(query="doc",shape="UnsupportedOperationException")`), whatever
         // usage it carries.
+        //
+        // The refusal carries NO message: this is the class KMS answers with an empty
+        // one, and what a message would have to say — which key spec was named and that
+        // it has no public half — the caller already knows from the key it named. The
+        // code is the whole of the answer.
         let family = crate::state::key_spec_profile(&key.key_spec).map(|profile| profile.family());
         if family != Some(crate::state::FAMILY_ASYMMETRIC) {
             return Err(GetPublicKeyErrorModeled::UnsupportedOperationException(
-                UnsupportedOperationException {
-                    message: Some(format!(
-                        "{} has KeySpec {}, which is not an asymmetric KMS key; only an \
-                         asymmetric KMS key has a public key to download.",
-                        key.arn, key.key_spec
-                    )),
-                },
+                UnsupportedOperationException { message: None },
             )
             .into());
         }
@@ -432,17 +431,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             encryption_algorithms: key.algorithms_under(crate::state::KEY_USAGE_ENCRYPT_DECRYPT),
             signing_algorithms: key.algorithms_under(crate::state::KEY_USAGE_SIGN_VERIFY),
             key_agreement_algorithms: key.algorithms_under(crate::state::KEY_USAGE_KEY_AGREEMENT),
+            encapsulation_algorithms: key
+                .algorithms_under(crate::state::KEY_USAGE_ENCAPSULATE_DECAPSULATE),
         })
     }
 }
 
 /// The `KeyUsage` values a key with a public half can carry: "valid values for
 /// asymmetric key pairs are ENCRYPT_DECRYPT, SIGN_VERIFY, and KEY_AGREEMENT" (the
-/// `KeyUsage` output member of this operation).
+/// `KeyUsage` output member of this operation), together with the key-encapsulation
+/// usage, whose public half is the encapsulation key a party encapsulating to this key
+/// needs.
 const PUBLIC_KEY_USAGES: &[&str] = &[
     crate::state::KEY_USAGE_ENCRYPT_DECRYPT,
     crate::state::KEY_USAGE_SIGN_VERIFY,
     crate::state::KEY_USAGE_KEY_AGREEMENT,
+    crate::state::KEY_USAGE_ENCAPSULATE_DECAPSULATE,
 ];
 
 /// The state store is missing, or the public key could not be encoded: a server fault

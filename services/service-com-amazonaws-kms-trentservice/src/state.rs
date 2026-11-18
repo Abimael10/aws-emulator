@@ -59,6 +59,7 @@ mod ed25519ph;
 mod grants;
 mod import;
 mod macs;
+mod ml_kem;
 mod multi_region;
 mod pagination;
 mod signatures;
@@ -68,6 +69,7 @@ pub use cryptography::*;
 pub use grants::*;
 pub use import::*;
 pub use macs::*;
+pub use ml_kem::*;
 pub use multi_region::*;
 pub use pagination::*;
 pub use signatures::*;
@@ -176,6 +178,11 @@ pub const KEY_USAGE_GENERATE_VERIFY_MAC: &str = "GENERATE_VERIFY_MAC";
 /// NIST-standard elliptic curve key pairs, specify `SIGN_VERIFY` or `KEY_AGREEMENT`"
 /// (`smithy_query(query="doc",shape="CreateKeyRequest",member="KeyUsage")`).
 pub const KEY_USAGE_KEY_AGREEMENT: &str = "KEY_AGREEMENT";
+
+/// The `KeyUsageType` of a key-encapsulation key
+/// (`smithy_query(shape="KeyUsageType")`): the usage an `ML_KEM_*` key spec carries, and
+/// the one `Encapsulate` and `Decapsulate` require of the key they name.
+pub const KEY_USAGE_ENCAPSULATE_DECAPSULATE: &str = "ENCAPSULATE_DECAPSULATE";
 
 /// The default `KeySpec`: "The default value, SYMMETRIC_DEFAULT, creates a KMS key
 /// with a 256-bit AES-GCM key"
@@ -2646,6 +2653,11 @@ impl Cmk {
     /// holds: a symmetric or HMAC key, a key still waiting for imported material, or a
     /// key pair of a spec no library reachable from here generates.
     pub fn public_key(&self) -> Option<Vec<u8>> {
+        // A key-encapsulation key's public half is its ENCAPSULATION key, derived from
+        // the decapsulation key this store holds by the mechanism itself.
+        if let Some(pair) = self.material.ml_kem() {
+            return pair.public_key_spki();
+        }
         public_key_spki(&self.key_spec, self.material.private_key_pkcs8()?)
     }
 
@@ -3124,12 +3136,14 @@ impl Cmk {
                 .contains(&self.key_spec.as_str())
                 .then(|| self.key_spec.clone()),
             key_spec: Some(self.key_spec.clone()),
-            // Each of these four lists "is present only when the KeyUsage of the
+            // Each of these five lists "is present only when the KeyUsage of the
             // KMS key is" the matching one (`smithy_query(shape="KeyMetadata")`),
             // and which algorithms it names follows from the key's spec.
             encryption_algorithms: self.algorithms_under(KEY_USAGE_ENCRYPT_DECRYPT),
             signing_algorithms: self.algorithms_under(KEY_USAGE_SIGN_VERIFY),
             key_agreement_algorithms: self.algorithms_under(KEY_USAGE_KEY_AGREEMENT),
+            encapsulation_algorithms: self
+                .algorithms_under(KEY_USAGE_ENCAPSULATE_DECAPSULATE),
             multi_region: Some(self.is_multi_region()),
             // Both members are projected from the one topology record, so which key
             // of the set this is, which Region holds the primary and which hold the
@@ -3484,6 +3498,9 @@ pub struct KeySpecProfile {
     pub mac_algorithms: &'static [&'static str],
     /// `KeyAgreementAlgorithms`, for usage `KEY_AGREEMENT`.
     pub key_agreement_algorithms: &'static [&'static str],
+    /// The key-encapsulation mechanisms a key of this spec supports, for usage
+    /// `ENCAPSULATE_DECAPSULATE`. Empty when the spec cannot encapsulate.
+    pub encapsulation_algorithms: &'static [&'static str],
     /// The key material a key of this spec is minted with.
     pub material: MaterialKind,
 }
@@ -3497,6 +3514,7 @@ impl KeySpecProfile {
             KEY_USAGE_SIGN_VERIFY => self.signing_algorithms,
             KEY_USAGE_GENERATE_VERIFY_MAC => self.mac_algorithms,
             KEY_USAGE_KEY_AGREEMENT => self.key_agreement_algorithms,
+            KEY_USAGE_ENCAPSULATE_DECAPSULATE => self.encapsulation_algorithms,
             _ => &[],
         };
         (!algorithms.is_empty()).then_some(algorithms)
@@ -3516,6 +3534,7 @@ impl KeySpecProfile {
             KEY_USAGE_ENCRYPT_DECRYPT,
             KEY_USAGE_GENERATE_VERIFY_MAC,
             KEY_USAGE_KEY_AGREEMENT,
+            KEY_USAGE_ENCAPSULATE_DECAPSULATE,
         ]
         .into_iter()
         .filter(|usage| self.supports(usage))
@@ -3534,7 +3553,7 @@ impl KeySpecProfile {
         match self.material {
             MaterialKind::Aes256 => "symmetric",
             MaterialKind::Hmac(_) => "HMAC",
-            MaterialKind::KeyPair => "asymmetric",
+            MaterialKind::KeyPair | MaterialKind::MlKemKeyPair => "asymmetric",
         }
     }
 }
@@ -3552,6 +3571,10 @@ pub enum MaterialKind {
     /// An asymmetric key pair, of the key pair the spec names (see
     /// [`generate_key_pair`]).
     KeyPair,
+    /// An ML-KEM key pair, of the parameter set the spec names (see
+    /// [`MlKemKeyPair::generate`]). Held apart from [`Self::KeyPair`] because its
+    /// private half is the mechanism's own key object rather than a PKCS#8 encoding.
+    MlKemKeyPair,
 }
 
 impl MaterialKind {
@@ -3564,7 +3587,7 @@ impl MaterialKind {
         match self {
             Self::Aes256 => Some(MATERIAL_LEN),
             Self::Hmac(len) => Some(*len),
-            Self::KeyPair => None,
+            Self::KeyPair | Self::MlKemKeyPair => None,
         }
     }
 }
@@ -3609,6 +3632,15 @@ pub enum KeyMaterial {
     /// The bytes never leave this process: the private half of a KMS key "never leaves
     /// KMS unencrypted" (`smithy_query(query="doc",shape="CreateKey")`).
     PrivateKeyPkcs8(Vec<u8>),
+    /// The ML-KEM key pair of a KEY-ENCAPSULATION KMS key, held as the mechanism's own
+    /// key object ([`MlKemKeyPair`]) rather than as bytes, so the private half cannot be
+    /// handed out: the only ways out of it are the public encapsulation key and the two
+    /// directions of the mechanism.
+    ///
+    /// Behind an `Arc` so a multi-Region replica key holds the SAME pair as the primary
+    /// key it was replicated from, which is what makes a ciphertext encapsulated in one
+    /// Region decapsulate in another.
+    MlKem(::std::sync::Arc<MlKemKeyPair>),
     /// No key material, because the caller asked for a key with none: "To create a
     /// KMS key with no key material (for imported key material), set this value to
     /// EXTERNAL"
@@ -3641,6 +3673,7 @@ impl KeyMaterial {
             Self::Hmac(_)
             | Self::KeyPairNotGenerated
             | Self::PrivateKeyPkcs8(_)
+            | Self::MlKem(_)
             | Self::AwaitingImport => None,
         }
     }
@@ -3654,6 +3687,21 @@ impl KeyMaterial {
             Self::Aes256(_)
             | Self::Hmac(_)
             | Self::KeyPairNotGenerated
+            | Self::MlKem(_)
+            | Self::AwaitingImport => None,
+        }
+    }
+
+    /// The ML-KEM key pair behind a key-encapsulation KMS key, or `None` for material of
+    /// any other kind — the one seam `Encapsulate`, `Decapsulate` and the public-key
+    /// download reach the mechanism through.
+    pub fn ml_kem(&self) -> Option<&MlKemKeyPair> {
+        match self {
+            Self::MlKem(pair) => Some(pair),
+            Self::Aes256(_)
+            | Self::Hmac(_)
+            | Self::KeyPairNotGenerated
+            | Self::PrivateKeyPkcs8(_)
             | Self::AwaitingImport => None,
         }
     }
@@ -3670,6 +3718,9 @@ impl KeyMaterial {
             Self::Aes256(material) => (b"aes256", material),
             Self::Hmac(material) => (b"hmac", material),
             Self::PrivateKeyPkcs8(material) => (b"pkcs8", material),
+            // Derived from the pair's PUBLIC half, so the private key is fed to nothing
+            // but the mechanism itself.
+            Self::MlKem(pair) => return pair.digest(),
             Self::KeyPairNotGenerated | Self::AwaitingImport => return None,
         };
         Some(sha256_hex(&[b"kms-key-material\0", kind, b"\0", bytes]))
@@ -3688,7 +3739,7 @@ impl KeyMaterial {
         match kind {
             MaterialKind::Aes256 => Some(Self::Aes256(bytes.try_into().ok()?)),
             MaterialKind::Hmac(_) => Some(Self::Hmac(bytes.to_vec())),
-            MaterialKind::KeyPair => None,
+            MaterialKind::KeyPair | MaterialKind::MlKemKeyPair => None,
         }
     }
 }
@@ -3956,6 +4007,11 @@ pub fn mint_material(profile: &KeySpecProfile) -> Option<KeyMaterial> {
         MaterialKind::KeyPair => Some(KeyMaterial::PrivateKeyPkcs8(
             generate_key_pair(profile.key_spec)?.private_key_pkcs8,
         )),
+        // The key pair of a key-encapsulation key, whose private half stays inside the
+        // mechanism's own key object.
+        MaterialKind::MlKemKeyPair => Some(KeyMaterial::MlKem(::std::sync::Arc::new(
+            MlKemKeyPair::generate(profile.key_spec)?,
+        ))),
     }
 }
 
@@ -4016,6 +4072,11 @@ const RSA_ENCRYPTION_ALGORITHMS: &[&str] = &[
 /// which every spec that can derive a shared secret supports.
 const ECDH: &[&str] = &["ECDH"];
 
+/// The only `KeyEncapsulationAlgorithm`
+/// (`smithy_query(shape="KeyEncapsulationAlgorithm")`), which every spec that can
+/// encapsulate a shared secret supports.
+const ML_KEM: &[&str] = &[ENCAPSULATION_ALGORITHM_ML_KEM];
+
 /// No algorithms: the spec does not support that usage.
 const NONE: &[&str] = &[];
 
@@ -4029,6 +4090,7 @@ const KEY_SPEC_PROFILES: &[KeySpecProfile] = &[
         signing_algorithms: NONE,
         mac_algorithms: NONE,
         key_agreement_algorithms: NONE,
+        encapsulation_algorithms: NONE,
         material: MaterialKind::Aes256,
     },
     // HMAC keys (symmetric): each spec supports the one MAC algorithm over the
@@ -4039,6 +4101,7 @@ const KEY_SPEC_PROFILES: &[KeySpecProfile] = &[
         signing_algorithms: NONE,
         mac_algorithms: &["HMAC_SHA_224"],
         key_agreement_algorithms: NONE,
+        encapsulation_algorithms: NONE,
         material: MaterialKind::Hmac(28),
     },
     KeySpecProfile {
@@ -4047,6 +4110,7 @@ const KEY_SPEC_PROFILES: &[KeySpecProfile] = &[
         signing_algorithms: NONE,
         mac_algorithms: &["HMAC_SHA_256"],
         key_agreement_algorithms: NONE,
+        encapsulation_algorithms: NONE,
         material: MaterialKind::Hmac(32),
     },
     KeySpecProfile {
@@ -4055,6 +4119,7 @@ const KEY_SPEC_PROFILES: &[KeySpecProfile] = &[
         signing_algorithms: NONE,
         mac_algorithms: &["HMAC_SHA_384"],
         key_agreement_algorithms: NONE,
+        encapsulation_algorithms: NONE,
         material: MaterialKind::Hmac(48),
     },
     KeySpecProfile {
@@ -4063,6 +4128,7 @@ const KEY_SPEC_PROFILES: &[KeySpecProfile] = &[
         signing_algorithms: NONE,
         mac_algorithms: &["HMAC_SHA_512"],
         key_agreement_algorithms: NONE,
+        encapsulation_algorithms: NONE,
         material: MaterialKind::Hmac(64),
     },
     // Asymmetric RSA key pairs (encryption and decryption -or- signing and
@@ -4073,6 +4139,7 @@ const KEY_SPEC_PROFILES: &[KeySpecProfile] = &[
         signing_algorithms: RSA_SIGNING_ALGORITHMS,
         mac_algorithms: NONE,
         key_agreement_algorithms: NONE,
+        encapsulation_algorithms: NONE,
         material: MaterialKind::KeyPair,
     },
     KeySpecProfile {
@@ -4081,6 +4148,7 @@ const KEY_SPEC_PROFILES: &[KeySpecProfile] = &[
         signing_algorithms: RSA_SIGNING_ALGORITHMS,
         mac_algorithms: NONE,
         key_agreement_algorithms: NONE,
+        encapsulation_algorithms: NONE,
         material: MaterialKind::KeyPair,
     },
     KeySpecProfile {
@@ -4089,6 +4157,7 @@ const KEY_SPEC_PROFILES: &[KeySpecProfile] = &[
         signing_algorithms: RSA_SIGNING_ALGORITHMS,
         mac_algorithms: NONE,
         key_agreement_algorithms: NONE,
+        encapsulation_algorithms: NONE,
         material: MaterialKind::KeyPair,
     },
     // Asymmetric NIST-standard elliptic curve key pairs (signing and verification
@@ -4100,6 +4169,7 @@ const KEY_SPEC_PROFILES: &[KeySpecProfile] = &[
         signing_algorithms: &["ECDSA_SHA_256"],
         mac_algorithms: NONE,
         key_agreement_algorithms: ECDH,
+        encapsulation_algorithms: NONE,
         material: MaterialKind::KeyPair,
     },
     KeySpecProfile {
@@ -4108,6 +4178,7 @@ const KEY_SPEC_PROFILES: &[KeySpecProfile] = &[
         signing_algorithms: &["ECDSA_SHA_384"],
         mac_algorithms: NONE,
         key_agreement_algorithms: ECDH,
+        encapsulation_algorithms: NONE,
         material: MaterialKind::KeyPair,
     },
     KeySpecProfile {
@@ -4116,6 +4187,7 @@ const KEY_SPEC_PROFILES: &[KeySpecProfile] = &[
         signing_algorithms: &["ECDSA_SHA_512"],
         mac_algorithms: NONE,
         key_agreement_algorithms: ECDH,
+        encapsulation_algorithms: NONE,
         material: MaterialKind::KeyPair,
     },
     // "ECC_NIST_EDWARDS25519 (ed25519) - signing and verification only", with both
@@ -4127,6 +4199,7 @@ const KEY_SPEC_PROFILES: &[KeySpecProfile] = &[
         signing_algorithms: &["ED25519_PH_SHA_512", "ED25519_SHA_512"],
         mac_algorithms: NONE,
         key_agreement_algorithms: NONE,
+        encapsulation_algorithms: NONE,
         material: MaterialKind::KeyPair,
     },
     // Other asymmetric elliptic curve key pairs (signing and verification).
@@ -4136,6 +4209,7 @@ const KEY_SPEC_PROFILES: &[KeySpecProfile] = &[
         signing_algorithms: &["ECDSA_SHA_256"],
         mac_algorithms: NONE,
         key_agreement_algorithms: NONE,
+        encapsulation_algorithms: NONE,
         material: MaterialKind::KeyPair,
     },
     // Asymmetric ML-DSA key pairs (signing and verification), which share the one
@@ -4146,6 +4220,7 @@ const KEY_SPEC_PROFILES: &[KeySpecProfile] = &[
         signing_algorithms: &["ML_DSA_SHAKE_256"],
         mac_algorithms: NONE,
         key_agreement_algorithms: NONE,
+        encapsulation_algorithms: NONE,
         material: MaterialKind::KeyPair,
     },
     KeySpecProfile {
@@ -4154,6 +4229,7 @@ const KEY_SPEC_PROFILES: &[KeySpecProfile] = &[
         signing_algorithms: &["ML_DSA_SHAKE_256"],
         mac_algorithms: NONE,
         key_agreement_algorithms: NONE,
+        encapsulation_algorithms: NONE,
         material: MaterialKind::KeyPair,
     },
     KeySpecProfile {
@@ -4162,6 +4238,7 @@ const KEY_SPEC_PROFILES: &[KeySpecProfile] = &[
         signing_algorithms: &["ML_DSA_SHAKE_256"],
         mac_algorithms: NONE,
         key_agreement_algorithms: NONE,
+        encapsulation_algorithms: NONE,
         material: MaterialKind::KeyPair,
     },
     // "SM2 key pairs (encryption and decryption -or- signing and verification -or-
@@ -4172,7 +4249,39 @@ const KEY_SPEC_PROFILES: &[KeySpecProfile] = &[
         signing_algorithms: &["SM2DSA"],
         mac_algorithms: NONE,
         key_agreement_algorithms: ECDH,
+        encapsulation_algorithms: NONE,
         material: MaterialKind::KeyPair,
+    },
+    // Asymmetric ML-KEM key pairs (key encapsulation only), which share the one
+    // key-encapsulation mechanism the model declares
+    // (`smithy_query(shape="KeyEncapsulationAlgorithm")`); the parameter set is the one
+    // the spec's own name gives.
+    KeySpecProfile {
+        key_spec: KEY_SPEC_ML_KEM_512,
+        encryption_algorithms: NONE,
+        signing_algorithms: NONE,
+        mac_algorithms: NONE,
+        key_agreement_algorithms: NONE,
+        encapsulation_algorithms: ML_KEM,
+        material: MaterialKind::MlKemKeyPair,
+    },
+    KeySpecProfile {
+        key_spec: KEY_SPEC_ML_KEM_768,
+        encryption_algorithms: NONE,
+        signing_algorithms: NONE,
+        mac_algorithms: NONE,
+        key_agreement_algorithms: NONE,
+        encapsulation_algorithms: ML_KEM,
+        material: MaterialKind::MlKemKeyPair,
+    },
+    KeySpecProfile {
+        key_spec: KEY_SPEC_ML_KEM_1024,
+        encryption_algorithms: NONE,
+        signing_algorithms: NONE,
+        mac_algorithms: NONE,
+        key_agreement_algorithms: NONE,
+        encapsulation_algorithms: ML_KEM,
+        material: MaterialKind::MlKemKeyPair,
     },
 ];
 
@@ -4215,6 +4324,18 @@ pub const MULTI_REGION_KEY_ID_PREFIX: &str = "mrk-";
 /// `LimitExceededException` — "a length constraint or quota was exceeded" — and
 /// persists nothing.
 pub const MAX_KEYS: usize = 500;
+
+/// The largest page any listing of this service serves: the modelled maximum of
+/// `LimitType`, the shape every `Limit` member of this service targets
+/// (`@range(min: 1, max: 1000)`, `smithy_query(query="operation",operation="ListGrants")`
+/// -> `Limit`).
+///
+/// It is the BOUNDARY validator that enforces it, so a request past it is refused before
+/// any handler runs and in the counted envelope a constraint refusal carries. No handler
+/// states a tighter bound of its own: a page size the API accepts has to be served, and
+/// the per-operation sentences that name a smaller maximum are the documentation's, not
+/// the wire's.
+pub const MAX_PAGE_LIMIT: i32 = 1000;
 
 /// The largest number of tags one key carries: "You can assign up to 50 tags to a
 /// KMS key" is KMS's own per-key tag quota, and it also bounds what one request can

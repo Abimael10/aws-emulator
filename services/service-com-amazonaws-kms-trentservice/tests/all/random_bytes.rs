@@ -38,8 +38,8 @@ use service_com_amazonaws_kms_trentservice::state::{
     CustomKeyStoreBacking, XksProxy,
 };
 
-use super::harness::{call, error_code, error_message, ok, refused, router, router_with_engine,
-                     unb64, REGION};
+use super::harness::{call, error_code, error_message, ok, one_violation, refused, router,
+                     router_with_engine, unb64, REGION};
 
 /// The operation under test.
 const OPERATION: &str = "GenerateRandom";
@@ -144,9 +144,10 @@ struct RefusedLength {
     clause: String,
 }
 
-/// The envelope a refusal states one clause in, as the boundary validator states it.
+/// The envelope a refusal states one clause in, as the boundary validator states it:
+/// the shared one every suite of this crate asserts a constraint refusal through.
 fn envelope(clause: &str) -> String {
-    format!("1 validation error detected: {clause}")
+    one_violation(clause)
 }
 
 /// Every way a request can fail to state a length the member admits: not at all, and

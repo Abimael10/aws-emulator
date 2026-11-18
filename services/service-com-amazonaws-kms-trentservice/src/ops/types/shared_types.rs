@@ -206,6 +206,7 @@ pub struct KeyMetadata {
     pub encryption_algorithms: Option<Vec<String>>,
     pub signing_algorithms: Option<Vec<String>>,
     pub key_agreement_algorithms: Option<Vec<String>>,
+    pub encapsulation_algorithms: Option<Vec<String>>,
     pub multi_region: Option<bool>,
     pub multi_region_configuration: Option<MultiRegionConfiguration>,
     pub pending_deletion_window_in_days: Option<i32>,
@@ -432,12 +433,16 @@ pub const INCLUDE_KEY_MATERIAL_VALUES: &[&str] = &["ALL_KEY_MATERIAL", "ROTATION
 pub const KEY_AGREEMENT_ALGORITHM_SPEC_VALUES: &[&str] = &["ECDH"];
 
 
+/// The values `KeyEncapsulationAlgorithm` accepts on the wire.
+pub const KEY_ENCAPSULATION_ALGORITHM_VALUES: &[&str] = &["ML_KEM"];
+
+
 /// The values `KeyEncryptionMechanism` accepts on the wire.
 pub const KEY_ENCRYPTION_MECHANISM_VALUES: &[&str] = &["RSAES_OAEP_SHA_256"];
 
 
 /// The values `KeyLastUsageTrackingOperation` accepts on the wire.
-pub const KEY_LAST_USAGE_TRACKING_OPERATION_VALUES: &[&str] = &["Decrypt", "DeriveSharedSecret", "Encrypt", "GenerateDataKey", "GenerateDataKeyPair", "GenerateDataKeyPairWithoutPlaintext", "GenerateDataKeyWithoutPlaintext", "GenerateMac", "ReEncrypt", "Sign", "Verify", "VerifyMac"];
+pub const KEY_LAST_USAGE_TRACKING_OPERATION_VALUES: &[&str] = &["Decapsulate", "Decrypt", "DeriveSharedSecret", "Encapsulate", "Encrypt", "GenerateDataKey", "GenerateDataKeyPair", "GenerateDataKeyPairWithoutPlaintext", "GenerateDataKeyWithoutPlaintext", "GenerateMac", "ReEncrypt", "Sign", "Verify", "VerifyMac"];
 
 
 /// The values `KeyManagerType` accepts on the wire.
@@ -449,7 +454,7 @@ pub const KEY_MATERIAL_STATE_VALUES: &[&str] = &["CURRENT", "NON_CURRENT", "PEND
 
 
 /// The values `KeySpec` accepts on the wire.
-pub const KEY_SPEC_VALUES: &[&str] = &["ECC_NIST_EDWARDS25519", "ECC_NIST_P256", "ECC_NIST_P384", "ECC_NIST_P521", "ECC_SECG_P256K1", "HMAC_224", "HMAC_256", "HMAC_384", "HMAC_512", "ML_DSA_44", "ML_DSA_65", "ML_DSA_87", "RSA_2048", "RSA_3072", "RSA_4096", "SM2", "SYMMETRIC_DEFAULT"];
+pub const KEY_SPEC_VALUES: &[&str] = &["ECC_NIST_EDWARDS25519", "ECC_NIST_P256", "ECC_NIST_P384", "ECC_NIST_P521", "ECC_SECG_P256K1", "HMAC_224", "HMAC_256", "HMAC_384", "HMAC_512", "ML_DSA_44", "ML_DSA_65", "ML_DSA_87", "ML_KEM_1024", "ML_KEM_512", "ML_KEM_768", "RSA_2048", "RSA_3072", "RSA_4096", "SM2", "SYMMETRIC_DEFAULT"];
 
 
 /// The values `KeyState` accepts on the wire.
@@ -457,7 +462,7 @@ pub const KEY_STATE_VALUES: &[&str] = &["Creating", "Disabled", "Enabled", "Pend
 
 
 /// The values `KeyUsageType` accepts on the wire.
-pub const KEY_USAGE_TYPE_VALUES: &[&str] = &["ENCRYPT_DECRYPT", "GENERATE_VERIFY_MAC", "KEY_AGREEMENT", "SIGN_VERIFY"];
+pub const KEY_USAGE_TYPE_VALUES: &[&str] = &["ENCAPSULATE_DECAPSULATE", "ENCRYPT_DECRYPT", "GENERATE_VERIFY_MAC", "KEY_AGREEMENT", "SIGN_VERIFY"];
 
 
 /// The values `MacAlgorithmSpec` accepts on the wire.

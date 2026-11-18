@@ -29,5 +29,6 @@ pub struct GetPublicKeyOutput {
     pub encryption_algorithms: Option<Vec<String>>,
     pub signing_algorithms: Option<Vec<String>>,
     pub key_agreement_algorithms: Option<Vec<String>>,
+    pub encapsulation_algorithms: Option<Vec<String>>,
 }
 

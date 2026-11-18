@@ -20,6 +20,7 @@ pub mod create_alias_types;
 pub mod create_custom_key_store_types;
 pub mod create_grant_types;
 pub mod create_key_types;
+pub mod decapsulate_types;
 pub mod decrypt_types;
 pub mod delete_alias_types;
 pub mod delete_custom_key_store_types;
@@ -32,6 +33,7 @@ pub mod disable_key_types;
 pub mod disconnect_custom_key_store_types;
 pub mod enable_key_rotation_types;
 pub mod enable_key_types;
+pub mod encapsulate_types;
 pub mod encrypt_types;
 pub mod generate_data_key_pair_types;
 pub mod generate_data_key_pair_without_plaintext_types;
@@ -83,6 +85,8 @@ pub use create_grant_types::*;
 #[allow(ambiguous_glob_reexports, unused_imports)]
 pub use create_key_types::*;
 #[allow(ambiguous_glob_reexports, unused_imports)]
+pub use decapsulate_types::*;
+#[allow(ambiguous_glob_reexports, unused_imports)]
 pub use decrypt_types::*;
 #[allow(ambiguous_glob_reexports, unused_imports)]
 pub use delete_alias_types::*;
@@ -106,6 +110,8 @@ pub use disconnect_custom_key_store_types::*;
 pub use enable_key_rotation_types::*;
 #[allow(ambiguous_glob_reexports, unused_imports)]
 pub use enable_key_types::*;
+#[allow(ambiguous_glob_reexports, unused_imports)]
+pub use encapsulate_types::*;
 #[allow(ambiguous_glob_reexports, unused_imports)]
 pub use encrypt_types::*;
 #[allow(ambiguous_glob_reexports, unused_imports)]

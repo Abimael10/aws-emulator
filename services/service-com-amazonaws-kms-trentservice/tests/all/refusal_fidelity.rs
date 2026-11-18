@@ -27,8 +27,8 @@
 use serde_json::{json, Value};
 
 use super::harness::{
-    b64, call, create_alias, create_key, describe, error_code, error_message, ok, principal,
-    refused, router, text, unb64, wrap, REGION,
+    b64, call, create_alias, create_key, describe, error_code, error_message, ok, one_violation,
+    principal, refused, router, text, unb64, wrap, REGION,
 };
 
 /// A key policy that allows the account root everything, for the rows that must carry a
@@ -53,12 +53,6 @@ fn policy_allowing_the_account() -> String {
 /// about.
 fn filler(len: usize) -> Vec<u8> {
     vec![b'x'; len]
-}
-
-/// The `ValidationException` envelope the framework renders a single constraint
-/// violation in, with `clause` as that violation.
-fn one_violation(clause: &str) -> String {
-    format!("1 validation error detected: {clause}")
 }
 
 /// A key of `key_spec`/`key_usage`, as (key id, key ARN).

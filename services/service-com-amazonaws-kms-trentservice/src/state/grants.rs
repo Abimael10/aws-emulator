@@ -620,7 +620,7 @@ pub const GRANT_OPERATION_PROFILES: &[GrantOperationProfile] = &[
         families: &[FAMILY_ASYMMETRIC],
         encryption_context: false,
     },
-    // The public half exists only for a key pair, under any of the three usages an
+    // The public half exists only for a key pair, under any of the usages an
     // asymmetric spec can carry.
     GrantOperationProfile {
         operation: "GetPublicKey",
@@ -628,6 +628,7 @@ pub const GRANT_OPERATION_PROFILES: &[GrantOperationProfile] = &[
             KEY_USAGE_ENCRYPT_DECRYPT,
             KEY_USAGE_SIGN_VERIFY,
             KEY_USAGE_KEY_AGREEMENT,
+            KEY_USAGE_ENCAPSULATE_DECAPSULATE,
         ],
         families: &[FAMILY_ASYMMETRIC],
         encryption_context: false,

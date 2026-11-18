@@ -1147,13 +1147,8 @@ async fn list_grants_pages_and_filters() {
             "InvalidGrantIdException",
         ),
         (
-            "a Limit past the documented bound",
-            json!({"Limit": 101}),
-            "ValidationException",
-        ),
-        (
-            "the largest Limit the shared LimitType allows",
-            json!({"Limit": 1000}),
+            "a Limit past the modelled bound of LimitType",
+            json!({"Limit": 1001}),
             "ValidationException",
         ),
         (
@@ -1597,8 +1592,8 @@ async fn list_retirable_grants_selects_by_retiring_principal() {
             "InvalidMarkerException",
         ),
         (
-            "a Limit past the documented bound",
-            json!({"RetiringPrincipal": retirer, "Limit": 101}),
+            "a Limit past the modelled bound of LimitType",
+            json!({"RetiringPrincipal": retirer, "Limit": 1001}),
             "ValidationException",
         ),
     ];

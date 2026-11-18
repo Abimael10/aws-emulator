@@ -774,8 +774,10 @@ async fn the_reader_pages_one_key_s_tags() {
         );
     }
 
-    // Rows: a `Limit` outside the documented 1..=50, which is refused as invalid.
-    for limit in [0i64, 51, 1000] {
+    // Rows: a `Limit` outside the modelled range of `LimitType`, which every `Limit`
+    // member of this service targets (`@range(min: 1, max: 1000)`), and which is the
+    // only bound the wire imposes — see `tests/all/listing_page_limit_bound.rs`.
+    for limit in [0i64, 1001] {
         let case = format!("limit {limit}");
         let (status, code) = failure(
             &router,

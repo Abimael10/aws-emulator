@@ -418,10 +418,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         };
         if !profile.supports(&key_usage) {
+            // How KMS words this refusal: the two values the request gave and nothing
+            // else. Which usages the spec DOES support is not part of the sentence —
+            // a caller learns that from the key spec reference, not from the refusal.
             return Err(crate::scaffolded::Scaffolded::validation(format!(
-                "KeyUsage {key_usage} is not compatible with KeySpec {key_spec}, which \
-                 supports {}.",
-                profile.supported_usages().join(", ")
+                "KeyUsage {key_usage} is not compatible with KeySpec {key_spec}"
             )));
         }
 

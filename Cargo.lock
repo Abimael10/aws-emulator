@@ -16012,6 +16012,7 @@ dependencies = [
 name = "service-com-amazonaws-kms-trentservice"
 version = "0.1.0"
 dependencies = [
+ "automod",
  "aws-emulator-build-support",
  "aws-emulator-emulator-telemetry",
  "aws-emulator-engine",
@@ -16036,6 +16037,7 @@ dependencies = [
  "service-common",
  "sha2 0.10.9",
  "sm2",
+ "spki 0.8.1",
  "tokio",
  "tracing",
  "uuid",

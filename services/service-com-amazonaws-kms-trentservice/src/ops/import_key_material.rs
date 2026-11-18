@@ -596,6 +596,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 }
                 crate::state::imported_key_pair(&key_spec, &opened)
             }
+            // A key-encapsulation key's material is the mechanism's own key object, and
+            // nothing reachable from here reads one out of imported bytes, so the import
+            // is answered as not implemented rather than refusing correct material as
+            // incorrect.
+            crate::state::MaterialKind::MlKemKeyPair => {
+                return Err(crate::scaffolded::Scaffolded::not_implemented(&format!(
+                    "ImportKeyMaterial for a {key_spec} KMS key"
+                )));
+            }
         };
         let Some(material) = material else {
             return Err(incorrect_key_material(&key_arn));

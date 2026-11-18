@@ -48,6 +48,11 @@ ed25519-dalek = { version = "2", default-features = false, features = [
 # KeyMaterialId (64 lowercase hex characters) and the opaque ListKeys marker.
 sha2 = { workspace = true }
 hex = { workspace = true }
+# The X.509 `SubjectPublicKeyInfo` an ML-KEM encapsulation key is downloaded as: the
+# algorithm identifier and the DER writer come from the maintained SPKI crate this
+# workspace already encodes public keys with (it is in the lock file through `sm2`'s
+# PKCS#8 support) rather than from a structure laid out here.
+spki = { version = "0.8", features = ["alloc"] }
 # Version-4 UUIDs: the form a KMS key id takes.
 uuid = { version = "1", features = ["v4"] }
 # `iam_authorization`: the shared evaluation of IAM policy documents against
@@ -68,6 +73,9 @@ service-com-amazonaws-cloudhsmv2-baldrapiservice = { workspace = true }
 emulator-core-build-support = { workspace = true }
 
 [dev-dependencies]
+# `tests/all/main.rs`: one `mod` per suite file under `tests/all/`, so a new suite is a
+# new file and nothing declares it. DEV-ONLY.
+automod = { workspace = true }
 # The authorization suite makes the principals it calls as through IAM's and STS's own
 # operations, so the documents it asserts on are the ones those services wrote.
 service-com-amazonaws-iam-awsidentitymanagementv20100508 = { workspace = true }
