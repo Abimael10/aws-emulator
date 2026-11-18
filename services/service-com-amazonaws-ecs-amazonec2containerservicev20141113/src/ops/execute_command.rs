@@ -3,13 +3,24 @@
 //! @op ExecuteCommand
 //! Runs a command remotely on a container within a task.
 //!
-//! What this operation can answer here is decided by what a task of this emulator IS: a
-//! record of a placement, with no container process behind it and so no managed
-//! execute-command agent to open a session on. The refusals below are therefore the whole
-//! of its behaviour, and each is computed from the stored cluster, task and containers:
-//! the cluster the request names, the task in it, the container of that task, and finally
-//! the agent that is not running. A `session` is an SSM Session Manager stream, so
-//! answering one would mean handing the caller a `streamUrl` nothing serves.
+//! What this operation can answer here is decided by what a session IS: the stream of an
+//! interactive session, opened on the `ExecuteCommandAgent` managed agent inside the
+//! container and CARRIED over the Systems Manager data channel the `Session$streamUrl`
+//! names. Amazon ECS puts that agent in the container only for a task whose launch turned
+//! the feature on, and this store holds exactly that — the flag the launch recorded and the
+//! agent the clock brought up with the container ([`crate::state::execute_command_agent`]) —
+//! so the ANSWER is computed from the stored cluster, task, container and agent:
+//!
+//! * a request asking for a session of any other kind than interactive is refused on the
+//!   member's own rule, before the store is read at all;
+//! * a cluster, task or container that resolves to nothing is reported on that resource;
+//! * a container with NO running execute-command agent — a task launched without the flag,
+//!   or one whose agent is not running — earns the one `InvalidParameterException` sentence
+//!   Amazon ECS states both of those conditions in;
+//! * a container that IS running one is a target the data channel does not reach: this
+//!   emulator serves no WebSocket upgrade, so nothing carries a session's stream, and the
+//!   call earns the modelled `TargetNotConnectedException` rather than a `session` whose
+//!   `streamUrl` nothing answers.
 //!
 //! ## Shape of an operation
 //!
@@ -202,6 +213,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let region = crate::state::request_region(ctx);
         let now = ::std::time::SystemTime::now();
 
+        // `interactive`: "Amazon ECS only supports initiating interactive sessions, so you
+        // must specify true for this value" — a request that asks for any other kind of
+        // session asks for one Amazon ECS does not open, which is a property of the REQUEST
+        // and so is read before the store is consulted at all.
+        if !input.interactive {
+            return Err(ExecuteCommandErrorModeled::InvalidParameterException(
+                InvalidParameterException {
+                    message: Some(
+                        crate::state::EXECUTE_COMMAND_INTERACTIVE_ONLY_MESSAGE.to_string(),
+                    ),
+                },
+            )
+            .into());
+        }
+
         let mut guard = state.lock();
         guard.advance_clock(now);
 
@@ -238,14 +264,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // "A container name only needs to be specified for tasks containing multiple
         // containers": a request that names none runs on the task's only container, and
         // one that names a container has to name a container the task really holds.
-        let names_a_container = match input.container.as_deref() {
+        let container = match input.container.as_deref() {
             Some(requested) => task
                 .containers
                 .iter()
-                .any(|container| container.name.as_deref() == Some(requested)),
-            None => !task.containers.is_empty(),
+                .find(|container| container.name.as_deref() == Some(requested)),
+            None => task.containers.first(),
         };
-        if !names_a_container {
+        let Some(container) = container else {
             return Err(ExecuteCommandErrorModeled::InvalidParameterException(
                 InvalidParameterException {
                     message: Some(
@@ -254,22 +280,42 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 },
             )
             .into());
+        };
+        let container_arn = container.container_arn.clone();
+
+        // A session is opened on the `ExecuteCommandAgent` managed agent running inside the
+        // container ("when the execute command feature is turned on, the managed agent name
+        // is ExecuteCommandAgent"), which Amazon ECS puts there only for a task whose launch
+        // turned the feature on — so a session needs BOTH the flag the launch recorded and
+        // that agent reported running
+        // ([`crate::state::execute_command_agent_is_running`]). Amazon ECS states the two
+        // conditions that leave a task without such an agent in ONE sentence — "execute
+        // command was not enabled when the task was run OR the execute command agent isn't
+        // running" — so either of them earns that one `InvalidParameterException`, and a
+        // caller is told what to change without being told which it was.
+        if !guard.execute_command_agent_is_running(&task_arn, &container_arn) {
+            return Err(ExecuteCommandErrorModeled::InvalidParameterException(
+                InvalidParameterException {
+                    message: Some(
+                        crate::state::EXECUTE_COMMAND_NOT_AVAILABLE_MESSAGE.to_string(),
+                    ),
+                },
+            )
+            .into());
         }
 
-        // The LAST precondition of a session is the one this emulator can never meet: the
-        // session is opened on the `ExecuteCommandAgent` managed agent running inside the
-        // container ("when the execute command feature is turned on, the managed agent name
-        // is ExecuteCommandAgent"), and a task here is a record of a placement with no
-        // container process behind it, so no such agent is running for any task. Amazon ECS
-        // states that in ONE sentence that also covers the task that was never run with
-        // `enableExecuteCommand` — "execute command was not enabled when the task was run OR
-        // the execute command agent isn't running" — so both conditions earn the same
-        // `InvalidParameterException`, whichever of them holds, and a caller is told what to
-        // change without being told which it was.
-        Err(ExecuteCommandErrorModeled::InvalidParameterException(
-            InvalidParameterException {
+        // The agent IS running, and what remains is the channel a session's stream is
+        // carried over: `Session$streamUrl` is "a URL to the managed agent on the container
+        // that the SSM Session Manager client uses to send commands and receive output", a
+        // WebSocket data channel — and this emulator answers no WebSocket upgrade at all, so
+        // nothing of it can carry that stream. A target the channel does not reach is a
+        // target no session can be opened to, which is what
+        // `TargetNotConnectedException` covers; answering a `session` instead would hand the
+        // caller an address nothing serves and a token for a stream nothing carries.
+        Err(ExecuteCommandErrorModeled::TargetNotConnectedException(
+            TargetNotConnectedException {
                 message: Some(
-                    crate::state::EXECUTE_COMMAND_NOT_AVAILABLE_MESSAGE.to_string(),
+                    crate::state::EXECUTE_COMMAND_TARGET_NOT_CONNECTED_MESSAGE.to_string(),
                 ),
             },
         )

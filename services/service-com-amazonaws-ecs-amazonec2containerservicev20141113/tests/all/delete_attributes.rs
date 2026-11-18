@@ -26,7 +26,8 @@
 //!   resource or the full Amazon Resource Name (ARN)."
 //! * `Attribute$targetType`: "This parameter is required if you use the short form ID for
 //!   a resource instead of the full ARN."
-//! * `TargetNotFoundException`: "The specified target wasn't found."
+//! * `TargetNotFoundException`: the refusal an entry naming a resource the cluster does
+//!   not carry earns, whose message names the container instance the entry referred to.
 //! * `ContainerInstance$version`: "Every time a container instance experiences a change
 //!   ... the version counter is incremented."
 //! * `DeregisterContainerInstance`: "Deregistering a container instance removes the
@@ -74,10 +75,18 @@ const CLUSTER: &str = "demo";
 /// The EC2 instance the fixture registers its container instance for.
 const INSTANCE_ID: &str = "i-0aaa0000000000001";
 
-/// The sentence a `TargetNotFoundException` carries, whichever resource the entry named:
-/// the condition is a property of the request, so the text is the same for every entry
-/// that meets it.
-const TARGET_NOT_FOUND: &str = "The specified target wasn't found.";
+/// The sentence a `TargetNotFoundException` carries for an entry whose target this cluster
+/// holds NO record of: the fixed text and the container instance the entry referred to,
+/// which is the one variable part.
+fn target_not_found(reference: &str) -> String {
+    format!("Container instance {} not found.", short_id(reference))
+}
+
+/// The same for an entry whose target the cluster DID hold and has since deregistered: a
+/// target that is out of service is reported as that rather than as absent.
+fn target_inactive(reference: &str) -> String {
+    format!("Container instance {} is inactive.", short_id(reference))
+}
 
 /// One row of the deletion table: the case name, the entries it sends (built from the
 /// target's full ARN and its short form id) and the names of the attributes the call must
@@ -86,7 +95,11 @@ type DeletionRow = (&'static str, fn(&str, &str) -> Value, &'static [&'static st
 
 /// One row of the refusal table: the case name, the ONE `attributes` entry it sends, and
 /// the error code and sentence it must be refused with.
-type RefusalRow = (&'static str, Value, &'static str, &'static str);
+type RefusalRow = (&'static str, Value, &'static str, String);
+
+/// One row of the unreachable-target table: the case name, the reference an entry names the
+/// target by, and the sentence that condition earns for that reference.
+type UnreachableTargetRow<'a> = (&'static str, &'a str, fn(&str) -> String);
 
 /// The attributes a fresh fixture stores against its container instance. The rows differ
 /// along what the rule generalises over: a plain name, a dotted name, a name carrying a
@@ -515,19 +528,19 @@ async fn an_unusable_request_is_refused_and_deletes_nothing() {
                 "targetType": "container-instance",
             }),
             "TargetNotFoundException",
-            TARGET_NOT_FOUND,
+            target_not_found(&"0".repeat(32)),
         ),
         (
             "a container-instance ARN of another cluster",
             json!({ "name": "stack", "targetId": other_arn }),
             "TargetNotFoundException",
-            TARGET_NOT_FOUND,
+            target_not_found(&other_arn),
         ),
         (
             "a container-instance ARN this cluster no longer holds",
             json!({ "name": "stack", "targetId": deregistered }),
             "TargetNotFoundException",
-            TARGET_NOT_FOUND,
+            target_inactive(&deregistered),
         ),
         (
             "a container-instance ARN nothing minted",
@@ -539,25 +552,28 @@ async fn an_unusable_request_is_refused_and_deletes_nothing() {
                 ),
             }),
             "TargetNotFoundException",
-            TARGET_NOT_FOUND,
+            target_not_found(&"f".repeat(32)),
         ),
         (
             "an entry that names no target",
             json!({ "name": "stack" }),
             "InvalidParameterException",
-            "attributes.targetId is required to name the resource the attribute is on",
+            "attributes.targetId is required to name the resource the attribute is on"
+                .to_string(),
         ),
         (
             "an entry whose targetId is blank",
             json!({ "name": "stack", "targetId": "   ", "targetType": "container-instance" }),
             "InvalidParameterException",
-            "attributes.targetId is required to name the resource the attribute is on",
+            "attributes.targetId is required to name the resource the attribute is on"
+                .to_string(),
         ),
         (
             "a short form id with no targetType",
             json!({ "name": "stack", "targetId": short_id(&arn) }),
             "InvalidParameterException",
-            "attributes.targetType is required when targetId is the short form id of a resource",
+            "attributes.targetType is required when targetId is the short form id of a resource"
+                .to_string(),
         ),
     ];
     for (row, entry, expected_code, expected_message) in unusable {
@@ -570,7 +586,7 @@ async fn an_unusable_request_is_refused_and_deletes_nothing() {
         .await;
         assert_eq!(
             (code.as_str(), message.as_str()),
-            (expected_code, expected_message),
+            (expected_code, expected_message.as_str()),
             "case {row:?}: expected the documented refusal for this entry"
         );
     }
@@ -608,6 +624,77 @@ async fn an_unusable_request_is_refused_and_deletes_nothing() {
 /// How many CUSTOM attributes one resource may carry: "You can apply up to 10 custom
 /// attributes for each resource" (`AttributeLimitExceededException`).
 const CEILING: usize = 10;
+/// The refusal an `attributes` entry naming a resource the request cannot reach earns:
+/// `TargetNotFoundException`, whose message NAMES the container instance the entry referred
+/// to and states WHY — the cluster holds no record of that target, or holds one it has
+/// deregistered.
+///
+/// The rows span what the rule generalises over: both operations that take an `attributes`
+/// entry, both forms `Attribute$targetId` documents (the full ARN, and the short form id
+/// with a `targetType` beside it), and both conditions. The id in the sentence is the
+/// resource's own, whichever form the entry named it in.
+#[tokio::test]
+async fn an_unreachable_attribute_target_is_named_in_the_refusal() {
+    let case = "unreachable targets";
+    let router = service();
+    create_cluster(&router, CLUSTER, case).await;
+    // A target this cluster HELD and has since deregistered: "Deregistering a container
+    // instance removes the instance from a cluster."
+    let deregistered =
+        register_with_attributes(&router, CLUSTER, "i-0eee0000000000005", &json!([]), case).await;
+    ok(
+        &router,
+        "DeregisterContainerInstance",
+        json!({ "cluster": CLUSTER, "containerInstance": deregistered }),
+        case,
+    )
+    .await;
+    // And one nothing ever registered, inside the caller's own cluster.
+    let never = format!(
+        "arn:aws:ecs:{SIGNED_REGION}:{ACCOUNT}:container-instance/{CLUSTER}/{}",
+        "a".repeat(32)
+    );
+
+    let conditions: [UnreachableTargetRow<'_>; 2] = [
+        ("a target nothing registered", &never, target_not_found),
+        (
+            "a target this cluster deregistered",
+            &deregistered,
+            target_inactive,
+        ),
+    ];
+    for (condition, reference, expected) in conditions {
+        for form in ["the full ARN", "the short form id"] {
+            let mut entry = json!({ "name": "stack", "targetId": reference });
+            if form == "the short form id" {
+                entry = json!({
+                    "name": "stack",
+                    "targetId": short_id(reference),
+                    "targetType": "container-instance",
+                });
+            }
+            for operation in ["PutAttributes", "DeleteAttributes"] {
+                let row = format!("{operation} against {condition} by {form}");
+                let mut sent = entry.clone();
+                if operation == "PutAttributes" {
+                    sent["value"] = json!("production");
+                }
+                let (code, message) = refusal(
+                    &router,
+                    operation,
+                    json!({ "cluster": CLUSTER, "attributes": [sent] }),
+                    &row,
+                )
+                .await;
+                assert_eq!(
+                    (code.as_str(), message.as_str()),
+                    ("TargetNotFoundException", expected(reference).as_str()),
+                    "case {row:?}: expected the refusal to name this target and its state"
+                );
+            }
+        }
+    }
+}
 
 /// The sentence `AttributeLimitExceededException` carries, whichever resource the write
 /// addressed: fixed text, with no part read off the request or the store.
@@ -1127,13 +1214,13 @@ async fn an_unusable_attribute_write_is_refused_and_applies_nothing() {
             "a container-instance ARN of another cluster".to_string(),
             json!([{ "name": "stack", "value": "production", "targetId": other_arn }]),
             "TargetNotFoundException",
-            TARGET_NOT_FOUND.to_string(),
+            target_not_found(&other_arn),
         ),
         (
             "a container-instance ARN this cluster no longer holds".to_string(),
             json!([{ "name": "stack", "value": "production", "targetId": deregistered }]),
             "TargetNotFoundException",
-            TARGET_NOT_FOUND.to_string(),
+            target_inactive(&deregistered),
         ),
         (
             "a container-instance ARN nothing minted".to_string(),
@@ -1146,7 +1233,7 @@ async fn an_unusable_attribute_write_is_refused_and_applies_nothing() {
                 ),
             }]),
             "TargetNotFoundException",
-            TARGET_NOT_FOUND.to_string(),
+            target_not_found(&"f".repeat(32)),
         ),
         (
             "a short form id nothing minted".to_string(),
@@ -1157,7 +1244,7 @@ async fn an_unusable_attribute_write_is_refused_and_applies_nothing() {
                 "targetType": "container-instance",
             }]),
             "TargetNotFoundException",
-            TARGET_NOT_FOUND.to_string(),
+            target_not_found(&"0".repeat(32)),
         ),
         (
             "a name with no character at all".to_string(),
@@ -1208,7 +1295,7 @@ async fn an_unusable_attribute_write_is_refused_and_applies_nothing() {
                 { "name": "tier", "value": "gpu", "targetId": other_arn },
             ]),
             "TargetNotFoundException",
-            TARGET_NOT_FOUND.to_string(),
+            target_not_found(&other_arn),
         ),
     ];
 

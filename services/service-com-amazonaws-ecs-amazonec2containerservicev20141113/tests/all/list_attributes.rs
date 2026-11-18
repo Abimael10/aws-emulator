@@ -475,3 +475,59 @@ async fn an_unusable_request_is_refused() {
         );
     }
 }
+
+/// `ListAttributes$targetType` is required and targets `TargetType`, whose one modelled
+/// value is `container-instance`: a request naming any other kind of target is refused with
+/// `InvalidParameterException` and a sentence that ECHOES the value it was given, so a
+/// caller reads back the value it has to change.
+///
+/// The rows span what the rule generalises over: another AWS resource kind, the modelled
+/// value spelled in another case, the modelled value spelled with another separator, a
+/// value carrying nothing at all, and a long value — none of which is the modelled value,
+/// and each of which is named in the refusal exactly as it was sent. The modelled value
+/// itself is the positive control: it is served rather than refused.
+#[tokio::test]
+async fn list_attributes_echoes_a_target_type_outside_the_modelled_set() {
+    let case = "target type";
+    let router = service();
+    create_cluster(&router, "demo", case).await;
+
+    for requested in [
+        "task-definition",
+        "task",
+        "CONTAINER-INSTANCE",
+        "container_instance",
+        "",
+        &"c".repeat(256),
+    ] {
+        let row = format!("targetType={requested:?}");
+        let body = refused(
+            &router,
+            "ListAttributes",
+            json!({ "cluster": "demo", "targetType": requested }),
+            "InvalidParameterException",
+            &row,
+        )
+        .await;
+        assert_eq!(
+            body["message"].as_str(),
+            Some(format!("Unexpected targetType '{requested}'.").as_str()),
+            "case {row:?}: expected the sentence to name the target type that was sent, \
+             got {body}"
+        );
+    }
+
+    // The modelled value is served: the refusal above is about the VALUE and nothing else
+    // about the request.
+    let (listed, token) = list_attributes(
+        &router,
+        json!({ "cluster": "demo", "targetType": "container-instance" }),
+        case,
+    )
+    .await;
+    assert_eq!(
+        (listed.as_slice(), token.as_deref()),
+        (&[][..], None),
+        "case {case:?}: expected the modelled target type to be served, got {listed:?}"
+    );
+}

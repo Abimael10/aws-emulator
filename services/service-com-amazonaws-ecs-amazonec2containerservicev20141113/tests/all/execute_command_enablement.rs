@@ -6,13 +6,19 @@
 //! # The rule under test
 //!
 //! > A session is opened on the `ExecuteCommandAgent` managed agent running inside the
-//! > container, so a task with no such agent gets no session: Amazon ECS refuses the call
-//! > with `InvalidParameterException` and ONE fixed sentence that states both conditions
-//! > that leave a task without one — the task was not run with `enableExecuteCommand`, or
-//! > its agent is not running — without saying which of them held. A task of this emulator
-//! > is a record of a placement with no container process behind it, so no task has a
-//! > running agent and every task whose cluster, task and container the request resolves
-//! > earns that one refusal, whatever `enableExecuteCommand` the placement recorded.
+//! > container, and Amazon ECS puts that agent there only because the LAUNCH turned the
+//! > feature on ("whether to use the execute command functionality for the containers in
+//! > this task"). So the outcome of a call turns on the task's own state: a task launched
+//! > WITHOUT `enableExecuteCommand` carries no such agent and earns the ONE fixed
+//! > `InvalidParameterException` sentence that states both conditions leaving a task without
+//! > one, without saying which of them held; a task launched WITH it reports that agent
+//! > running once its containers are running, and the call gets past that condition to the
+//! > channel a session's stream is carried over — which this emulator serves no WebSocket
+//! > upgrade for, so the target is one no session can be connected to and the call earns the
+//! > modelled `TargetNotConnectedException`. A session of any other KIND is not one Amazon
+//! > ECS opens at all: `interactive` "only supports initiating interactive sessions, so you
+//! > must specify true for this value", which is a property of the request and is refused
+//! > whatever task it names.
 //!
 //! # What the rows span
 //!
@@ -20,12 +26,14 @@
 //! task-definition family, both advanced to `RUNNING`. The table then varies what the
 //! `ExecuteCommand` request carries — the task by id and by full ARN, no container named
 //! and each of the revision's two containers named, and both values of `interactive` — so
-//! the refusal is asserted to be a property of the session's missing agent and of nothing
-//! else about the request or the task.
+//! the outcome is asserted to turn on the flag the launch recorded and on the kind of
+//! session asked for, and on nothing else about the request. The agent each task does or
+//! does not carry is read back through `DescribeTasks`, so the flag is observable in the
+//! stored task as well as in the refusal.
 
 use std::time::{Duration, Instant};
 
-use serde_json::json;
+use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::ecs_wire::{cluster_with_capacity, list, ok, refusal, service, string, ACCOUNT};
@@ -42,6 +50,11 @@ const FAMILY: &str = "execflagfamily";
 const FIRST_CONTAINER: &str = "app";
 const SECOND_CONTAINER: &str = "sidecar";
 
+/// The managed agent the execute command feature runs inside a container
+/// (`ManagedAgent$name`: "When the execute command feature is turned on, the managed agent
+/// name is `ExecuteCommandAgent`"), which is the agent a session is opened on.
+const EXECUTE_COMMAND_AGENT: &str = "ExecuteCommandAgent";
+
 /// `InvalidParameterException$message` for a task no session can be opened on: fixed text,
 /// with no part taken from the request, stating both conditions that leave a task without
 /// a running execute-command agent.
@@ -50,11 +63,36 @@ const NOT_AVAILABLE: &str =
      run or the execute command agent isn't running. Wait and try again or run a new task \
      with execute command enabled and try again.";
 
+/// `TargetNotConnectedException$message` for a task whose agent IS running but whose session
+/// stream nothing carries: fixed text, with no part taken from the request.
+const NOT_CONNECTED: &str = "The execute command failed due to an internal error. Wait and try again.";
+
+/// `InvalidParameterException$message` for a request asking for a session of a kind Amazon
+/// ECS does not open, worded as `ExecuteCommandRequest$interactive` states its own rule:
+/// "Amazon ECS only supports initiating interactive sessions, so you must specify true for
+/// this value."
+const INTERACTIVE_ONLY: &str =
+    "Amazon ECS only supports initiating interactive sessions, so you must specify true for \
+     this value.";
+
 /// How often the fixture re-reads a task it is waiting on, and how long it keeps trying:
 /// the start is clock-owed, so the condition is polled for rather than slept on, with
 /// generous room for a loaded machine.
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
 const POLL_BUDGET: Duration = Duration::from_secs(60);
+
+/// A container definition of [`FAMILY`]: the harness's minimal definition plus a program
+/// that runs for longer than the rows below take.
+///
+/// A STANDALONE task's work is finished once its essential containers have exited, and
+/// Amazon ECS stops the task when it is — so a container whose program is still being
+/// performed is what keeps the two tasks of this suite RUNNING while every row is sent
+/// against them, rather than any assumption about how fast the host runs.
+fn long_running_container(name: &str) -> Value {
+    let mut definition = container(name, "public.ecr.aws/nginx/nginx:latest");
+    definition["command"] = json!(["sleep", "600"]);
+    definition
+}
 
 /// A router holding one cluster with capacity and one revision of [`FAMILY`] declaring a
 /// task role — an exec-enabled launch needs one ("specify a valid task role in your task
@@ -69,8 +107,8 @@ async fn fixture() -> MultiServiceRouter {
             "family": FAMILY,
             "taskRoleArn": format!("arn:aws:iam::{ACCOUNT}:role/execFlagTaskRole"),
             "containerDefinitions": [
-                container(FIRST_CONTAINER, "public.ecr.aws/nginx/nginx:latest"),
-                container(SECOND_CONTAINER, "public.ecr.aws/nginx/nginx:latest"),
+                long_running_container(FIRST_CONTAINER),
+                long_running_container(SECOND_CONTAINER),
             ],
         }),
         "fixture",
@@ -79,8 +117,42 @@ async fn fixture() -> MultiServiceRouter {
     router
 }
 
-/// Run ONE task of [`FAMILY`] with `enable_execute_command`, wait until it is `RUNNING`,
-/// and answer its ARN.
+/// Read ONE task back through `DescribeTasks` — the stored record, not the answer of the
+/// call that placed it.
+async fn describe_task(router: &MultiServiceRouter, task_arn: &str, case: &str) -> Value {
+    let body = ok(
+        router,
+        "DescribeTasks",
+        json!({ "cluster": CLUSTER, "tasks": [task_arn] }),
+        case,
+    )
+    .await;
+    list(&body, "tasks", case)
+        .into_iter()
+        .next()
+        .unwrap_or_else(|| panic!("case {case:?}: expected the task back, got {body}"))
+}
+
+/// The `lastStatus` the execute-command agent of `container_name` reports in a described
+/// task, and `None` when that container carries no such agent.
+fn agent_status(task: &Value, container_name: &str, case: &str) -> Option<String> {
+    let container = list(task, "containers", case)
+        .into_iter()
+        .find(|container| container["name"].as_str() == Some(container_name))
+        .unwrap_or_else(|| panic!("case {case:?}: expected a container {container_name}"));
+    list(&container, "managedAgents", case)
+        .into_iter()
+        .find(|agent| agent["name"].as_str() == Some(EXECUTE_COMMAND_AGENT))
+        .map(|agent| {
+            agent["lastStatus"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string()
+        })
+}
+
+/// Run ONE task of [`FAMILY`] with `enable_execute_command`, wait until it is `RUNNING` with
+/// its agents settled, and answer its ARN.
 async fn running_task(router: &MultiServiceRouter, enabled: bool, case: &str) -> String {
     let body = ok(
         router,
@@ -101,30 +173,31 @@ async fn running_task(router: &MultiServiceRouter, enabled: bool, case: &str) ->
     // The start is owed by the clock, so the test waits for the CONDITION.
     let deadline = Instant::now() + POLL_BUDGET;
     loop {
-        let read = ok(
-            router,
-            "DescribeTasks",
-            json!({ "cluster": CLUSTER, "tasks": [arn.clone()] }),
-            case,
-        )
-        .await;
-        let described = list(&read, "tasks", case);
-        let task = described
-            .first()
-            .unwrap_or_else(|| panic!("case {case:?}: expected the task back, got {read}"));
+        let task = describe_task(router, &arn, case).await;
         // The flag the placement recorded is the task's own, which is what the gate reads.
         assert_eq!(
             task["enableExecuteCommand"].as_bool().unwrap_or(false),
             enabled,
             "case {case:?}: expected the stored task to report enableExecuteCommand \
-             {enabled}, got {read}"
+             {enabled}, got {task}"
         );
-        if task["lastStatus"].as_str() == Some("RUNNING") {
+        // The agent Amazon ECS runs inside each container of an exec-enabled task is up
+        // once that container is, so the fixture waits for the agent as well as for the
+        // task — and a task launched without the flag carries no agent at all, ever.
+        let agents_ready = [FIRST_CONTAINER, SECOND_CONTAINER].iter().all(|name| {
+            let reported = agent_status(&task, name, case);
+            match enabled {
+                true => reported.as_deref() == Some("RUNNING"),
+                false => reported.is_none(),
+            }
+        });
+        if task["lastStatus"].as_str() == Some("RUNNING") && agents_ready {
             return arn;
         }
         assert!(
             Instant::now() < deadline,
-            "case {case:?}: expected the task to reach RUNNING, got {read}"
+            "case {case:?}: expected the task to reach RUNNING with its agents settled, got \
+             {task}"
         );
         tokio::time::sleep(POLL_INTERVAL).await;
     }
@@ -138,7 +211,7 @@ fn task_id(arn: &str) -> &str {
 }
 
 #[tokio::test]
-async fn execute_command_is_refused_for_a_task_with_no_running_agent() {
+async fn execute_command_turns_on_the_flag_the_launch_recorded() {
     let router = fixture().await;
     let disabled = running_task(&router, false, "a task run without execute command").await;
     let enabled = running_task(&router, true, "a task run with execute command").await;
@@ -176,8 +249,6 @@ async fn execute_command_is_refused_for_a_task_with_no_running_agent() {
     ];
 
     for (row, by_arn, requested, interactive) in rows {
-        // The refusal a task earns is the same for both tasks, so it is stated once.
-        let expected = ("InvalidParameterException", NOT_AVAILABLE);
         for (flag, task_arn) in [(false, &disabled), (true, &enabled)] {
             let case = format!("{row}, enableExecuteCommand {flag}");
             let reference = if by_arn {
@@ -194,6 +265,16 @@ async fn execute_command_is_refused_for_a_task_with_no_running_agent() {
             if let Some(name) = requested {
                 request["container"] = json!(name);
             }
+
+            // What each row earns: the kind of session asked for is judged first and is a
+            // property of the REQUEST, so it is refused whichever task the request names;
+            // after it, the task's own agent decides which of the two modelled conditions
+            // the call meets.
+            let expected = match (interactive, flag) {
+                (false, _) => ("InvalidParameterException", INTERACTIVE_ONLY),
+                (true, false) => ("InvalidParameterException", NOT_AVAILABLE),
+                (true, true) => ("TargetNotConnectedException", NOT_CONNECTED),
+            };
             let (code, message) = refusal(&router, "ExecuteCommand", request, &case).await;
             assert_eq!(
                 (code.as_str(), message.as_str()),
@@ -202,26 +283,6 @@ async fn execute_command_is_refused_for_a_task_with_no_running_agent() {
             );
         }
     }
-
-    // The two refusals are the SAME, which is the whole of the rule: the flag the placement
-    // recorded is not what a caller's refusal turns on, because no task here has a running
-    // agent either way.
-    let common = json!({
-        "cluster": CLUSTER,
-        "command": "/bin/sh",
-        "interactive": true,
-    });
-    let mut without = common.clone();
-    without["task"] = json!(disabled);
-    let mut with = common;
-    with["task"] = json!(enabled);
-    let refused_without = refusal(&router, "ExecuteCommand", without, "the flag off").await;
-    let refused_with = refusal(&router, "ExecuteCommand", with, "the flag on").await;
-    assert_eq!(
-        refused_without, refused_with,
-        "expected the same refusal whatever the flag, got {refused_without:?} and \
-         {refused_with:?}"
-    );
 }
 
 #[tokio::test]
@@ -231,8 +292,8 @@ async fn the_session_is_attempted_after_the_cluster_task_and_container() {
 
     // The resources the request names are resolved BEFORE the session is attempted, so a
     // request that is wrong about one of them is reported on that resource rather than on
-    // the agent that is not running. The rows walk the three resources in the order they
-    // are resolved.
+    // the channel the session would be carried over. The rows walk the three resources in
+    // the order they are resolved.
     let rows: [(&str, serde_json::Value, &str, &str); 3] = [
         (
             "a cluster the account does not hold",
@@ -266,4 +327,58 @@ async fn the_session_is_attempted_after_the_cluster_task_and_container() {
              {said:?}"
         );
     }
+}
+
+#[tokio::test]
+async fn a_stopped_task_has_no_agent_to_open_a_session_on() {
+    let router = fixture().await;
+    let enabled = running_task(&router, true, "a task run with execute command").await;
+
+    // The agent runs INSIDE the container, so it ends with the container: a task that has
+    // been stopped carries no running agent and earns the same refusal a task launched
+    // without the flag does — not the connectivity one its running agent earned above. The
+    // stop is clock-owed, so the condition is polled for.
+    ok(
+        &router,
+        "StopTask",
+        json!({ "cluster": CLUSTER, "task": enabled.clone(), "reason": "done" }),
+        "the stop",
+    )
+    .await;
+    let deadline = Instant::now() + POLL_BUDGET;
+    loop {
+        let task = describe_task(&router, &enabled, "the stopped task").await;
+        if task["lastStatus"].as_str() == Some("STOPPED") {
+            assert_eq!(
+                agent_status(&task, FIRST_CONTAINER, "the stopped task").as_deref(),
+                Some("STOPPED"),
+                "expected the agent of a stopped container to be stopped too, got {task}"
+            );
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "expected the stopped task to reach STOPPED, got {task}"
+        );
+        tokio::time::sleep(POLL_INTERVAL).await;
+    }
+
+    let (code, message) = refusal(
+        &router,
+        "ExecuteCommand",
+        json!({
+            "cluster": CLUSTER,
+            "task": enabled,
+            "command": "/bin/sh",
+            "interactive": true,
+        }),
+        "a stopped task",
+    )
+    .await;
+    assert_eq!(
+        (code.as_str(), message.as_str()),
+        ("InvalidParameterException", NOT_AVAILABLE),
+        "expected the agent-not-running refusal for a stopped task, got {code:?} with \
+         {message:?}"
+    );
 }

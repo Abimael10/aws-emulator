@@ -34,6 +34,8 @@
 //! * **A scheduling strategy outside its set on a LISTING**, whose sentence opens on the
 //!   member as a sentence does and lists the two strategies in the order the member
 //!   publishes them.
+//! * **A target type outside its set on an attribute LISTING**, whose sentence ECHOES the
+//!   value the request carried instead of listing the kinds the member takes.
 //! * **A status filter whose entries are outside the set**, reported against the LIST — the
 //!   whole list as the value, the list under the name the API prints for it, and the
 //!   element's own requirement nested inside the list's ([`crate::state::list_member_constraint_message`]).
@@ -115,6 +117,9 @@ const SERVICES_MEMBER: &str = "services";
 /// as the response that carries it spells it.
 const TASKS_EMPTY_MESSAGE: &str = "Tasks cannot be empty.";
 
+/// The member an attribute LISTING names the kind of resource it reports the attributes of.
+const TARGET_TYPE_MEMBER: &str = "targetType";
+
 /// The sentence this service refuses `req` with before any handler runs, or `None` when the
 /// request earns no refusal of its own here — which leaves it to the framework's walk and to
 /// the operation exactly as before.
@@ -191,6 +196,11 @@ pub fn operation_worded_refusal(
                 .map(|_| SERVICES_EMPTY_MESSAGE.to_string()),
             }
         }
+        "ListAttributes" => {
+            let input =
+                read_input::<ListAttributesInput>(protocol, LIST_ATTRIBUTES_INPUT_SCHEMA, req)?;
+            target_type_refusal(&input.target_type)
+        }
         "DescribeTasks" => {
             let input = read_input::<DescribeTasksInput>(protocol, DESCRIBE_TASKS_INPUT_SCHEMA, req)?;
             input
@@ -237,6 +247,21 @@ fn deployment_strategy_refusal(configuration: Option<&DeploymentConfiguration>) 
     let requested = configuration?.strategy.as_deref()?;
     (!DEPLOYMENT_STRATEGY_VALUES.contains(&requested))
         .then(|| INVALID_DEPLOYMENT_STRATEGY_MESSAGE.to_string())
+}
+
+/// The sentence an attribute LISTING's `targetType` outside its set earns: Amazon ECS states
+/// this one by ECHOING the value it was given rather than by listing the kinds it takes —
+/// `ListAttributes$targetType` is "The type of the target to list attributes with", and the
+/// value is the one thing in the request the caller has to change.
+///
+/// The set a value is checked against is the member's modelled one
+/// ([`TARGET_TYPE_VALUES`]), so no request's outcome changes here — only the words the
+/// refusal carries. The sentence belongs to this operation: a `targetType` beside an
+/// ATTRIBUTE being written (`Attribute$targetType`) is a member of another shape on another
+/// operation, which publishes no such sentence, so it keeps the refusal it had.
+fn target_type_refusal(requested: &str) -> Option<String> {
+    (!TARGET_TYPE_VALUES.contains(&requested))
+        .then(|| format!("Unexpected {TARGET_TYPE_MEMBER} '{requested}'."))
 }
 
 /// The sentence a LISTING's `schedulingStrategy` outside its set earns, naming the member

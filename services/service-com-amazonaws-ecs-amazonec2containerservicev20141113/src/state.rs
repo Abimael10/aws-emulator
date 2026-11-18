@@ -381,6 +381,16 @@ pub use container_secrets::*;
 mod container_health;
 pub use container_health::*;
 
+/// The EXECUTE-COMMAND agent of a task: the managed agent a launch that turned the feature
+/// on runs inside each container, and the one fact `ExecuteCommand` is decided by.
+mod execute_command_agent;
+pub use execute_command_agent::*;
+
+/// The SESSION an `ExecuteCommand` asks for: what one is, and the sentences a call that
+/// cannot be given one carries.
+mod exec_sessions;
+pub use exec_sessions::*;
+
 /// What the SERVICE SCHEDULER makes of those readings: the task it stops and replaces
 /// because an essential container failed its check, and the rollout that is still waiting
 /// for one to pass.
@@ -838,18 +848,6 @@ pub const EXECUTE_COMMAND_TASK_NOT_FOUND_MESSAGE: &str =
 /// container of the task, worded as the task sentence above is.
 pub const EXECUTE_COMMAND_CONTAINER_NOT_FOUND_MESSAGE: &str =
     "The specified container was not found. Specify a valid container name and try again.";
-
-/// `InvalidParameterException$message` for an `ExecuteCommand` a session cannot be opened
-/// for because no execute-command agent of the task is there to open it on.
-///
-/// ONE fixed sentence states BOTH conditions that leave a task without such an agent —
-/// the task was not run with `enableExecuteCommand`, or its agent is not running — so a
-/// caller is told what to change without being told which of the two held, and the
-/// sentence carries nothing of the request.
-pub const EXECUTE_COMMAND_NOT_AVAILABLE_MESSAGE: &str =
-    "The execute command failed because execute command was not enabled when the task was \
-     run or the execute command agent isn't running. Wait and try again or run a new task \
-     with execute command enabled and try again.";
 
 /// `Cluster$attachmentsStatus` while the cluster's capacity-provider association is
 /// being applied — the member's doc: "UPDATE_IN_PROGRESS: The available capacity
@@ -1787,11 +1785,38 @@ pub fn is_custom_attribute_name(name: &str) -> bool {
 /// of the ceiling above.
 pub const MAX_ATTRIBUTES_PER_TARGET: usize = 200;
 
-/// `TargetNotFoundException$message`: the shape's own doc sentence, which names no
-/// target (`smithy_query` query="shape" shape="TargetNotFoundException"). No recording
-/// fixes this one; what the rule fixes is that the sentence is the SAME for every
-/// request whose attribute names a resource the cluster does not hold.
-pub const TARGET_NOT_FOUND_MESSAGE: &str = "The specified target wasn't found.";
+/// `TargetNotFoundException$message` for an attribute whose `targetId` names NO resource
+/// of the cluster the request addressed: Amazon ECS names the resource kind the target was
+/// to be attached to (`Attribute$targetType` models the one kind, `container-instance`) and
+/// the target the request referred to, so a caller writing a batch can tell WHICH entry was
+/// rejected.
+///
+/// The reference is reduced to the resource's own id ([`container_instance_id_from_reference`]),
+/// which is what identifies the target whichever of the two forms the entry gave it in
+/// (`Attribute$targetId`: "You can specify the short form ID for a resource or the full
+/// Amazon Resource Name (ARN)").
+pub fn attribute_target_not_found_message(reference: &str) -> String {
+    format!(
+        "Container instance {} not found.",
+        container_instance_id_from_reference(reference)
+    )
+}
+
+/// `TargetNotFoundException$message` for an attribute whose `targetId` names a resource the
+/// cluster DOES hold a record of but no longer carries — a container instance that was
+/// deregistered ("Deregistering a container instance removes the instance from a cluster",
+/// which leaves it [`CONTAINER_INSTANCE_INACTIVE`]).
+///
+/// A target that is there but out of service is a different thing from one that never
+/// existed, so it is reported as the state it is IN rather than as absent: the two sentences
+/// differ in that one clause and name the target the same way
+/// ([`attribute_target_not_found_message`]).
+pub fn attribute_target_inactive_message(reference: &str) -> String {
+    format!(
+        "Container instance {} is inactive.",
+        container_instance_id_from_reference(reference)
+    )
+}
 
 /// `InvalidParameterException$message` for an `Attribute` of an attribute WRITE that
 /// names no target at all. `DeleteAttributes$attributes`: "For custom attributes,
@@ -1858,9 +1883,11 @@ pub enum AttributeTargetRefusal {
     /// The entry is unusable as written — it names no target, or names one by short form id
     /// with no `targetType` beside it. `InvalidParameterException`, with this sentence.
     InvalidParameter(String),
-    /// The entry names a resource the cluster does not hold: `TargetNotFoundException`,
-    /// whose sentence is [`TARGET_NOT_FOUND_MESSAGE`].
-    TargetNotFound,
+    /// The entry names a resource this request cannot write an attribute onto:
+    /// `TargetNotFoundException`, carrying the sentence for WHY — the target is not there at
+    /// all ([`attribute_target_not_found_message`]) or is there and out of service
+    /// ([`attribute_target_inactive_message`]).
+    TargetNotFound(String),
 }
 
 /// The stored container instance each entry of `attributes` names, by ARN and in the order
@@ -1905,8 +1932,16 @@ pub fn resolve_attribute_targets(
         }
         let instance = store
             .resolve_container_instance(region, cluster_name, target_id)
-            .filter(|instance| instance.is_registered())
-            .ok_or(AttributeTargetRefusal::TargetNotFound)?;
+            .ok_or_else(|| {
+                AttributeTargetRefusal::TargetNotFound(attribute_target_not_found_message(
+                    target_id,
+                ))
+            })?;
+        if !instance.is_registered() {
+            return Err(AttributeTargetRefusal::TargetNotFound(
+                attribute_target_inactive_message(target_id),
+            ));
+        }
         resolved.push(instance.arn.clone());
     }
     Ok(resolved)

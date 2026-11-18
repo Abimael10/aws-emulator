@@ -212,6 +212,13 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
         // the task pass above, so a task that has just reached `RUNNING` has its independent
         // containers started by the same pass.
         self.start_due_containers(now);
+        // The execute-command agent of every container of an exec-enabled task, brought up
+        // to where its container has got to: Amazon ECS put that agent in the container
+        // because the launch asked for the feature, so it came up with the container whether
+        // or not anybody called to look ([`super::execute_command_agent`]). Run after the
+        // container pass above, so a container this pass started carries a running agent by
+        // the end of it.
+        self.start_execute_command_agents(now);
         // The scheduler's confirmation that a task set has reached a steady state, owed at
         // the instant the write that touched it put on the record: once it is due the task
         // set is stable whether or not anybody called to look.

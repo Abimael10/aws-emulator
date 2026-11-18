@@ -102,9 +102,9 @@ fn attribute_target_refusal(
         crate::state::AttributeTargetRefusal::InvalidParameter(message) => {
             invalid_parameter(message)
         }
-        crate::state::AttributeTargetRefusal::TargetNotFound => {
+        crate::state::AttributeTargetRefusal::TargetNotFound(message) => {
             DeleteAttributesErrorModeled::TargetNotFoundException(TargetNotFoundException {
-                message: Some(crate::state::TARGET_NOT_FOUND_MESSAGE.to_string()),
+                message: Some(message),
             })
             .into()
         }
