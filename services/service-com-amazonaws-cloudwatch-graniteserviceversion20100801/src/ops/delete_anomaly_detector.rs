@@ -193,14 +193,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     found.push(crate::state::METRIC_MATH_FORM);
                 }
                 if found.len() > 1 {
-                    return Err(invalid_combination(format!(
-                        "Either {}, {}, {} or {} can be set, found {}.",
-                        crate::state::DETECTOR_ID_FORM,
-                        crate::state::FLAT_METRIC_FORM,
-                        crate::state::SINGLE_METRIC_FORM,
-                        crate::state::METRIC_MATH_FORM,
-                        crate::state::in_one_order(&found).join(", ")
-                    )));
+                    return Err(invalid_combination(
+                        crate::state::one_detector_identification_message(&found),
+                    ));
                 }
                 named.to_string()
             }

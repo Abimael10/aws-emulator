@@ -51,35 +51,66 @@ pub fn role_template_arn_not_found(template_arn: &str) -> String {
     format!("Role Template {template_arn} cannot be found.")
 }
 
-/// How IAM refuses a value supplied for a role template's ARN whose FORM is not one
-/// ([`role_template_arn_refusal`]).
+/// How IAM refuses a value supplied for a role template's ARN whose FORM is not one, once the
+/// value HAS been read as an ARN living under the publisher ([`role_template_arn_refusal`]).
 ///
 /// MEASURED wording, entirely fixed: it quotes neither the member nor the value it refused,
 /// and states the form the ARN has to take instead — the braced tokens are the message's own
-/// placeholder text rather than fields of the value, so every value whose form is wrong is
-/// told the same rule.
+/// placeholder text rather than fields of the value, so every value whose form is wrong this
+/// way is told the same rule.
 pub const ROLE_TEMPLATE_ARN_NOT_VALID: &str =
     "The specified role template ARN is not valid. Expected format is: \
      arn:{partition}:iam::aws:role-template/{servicePrincipal}/{templateName}:{majorVersion} \
      (majorVersion must be a positive integer with no leading zeros).";
 
-/// Why `value` is not a role template's ARN — the one sentence that reading is stated with —
-/// or `None` when it IS one.
+/// How IAM refuses an ARN whose account field is not the publisher every role template lives
+/// under ([`role_template_arn_refusal`]).
+///
+/// MEASURED wording, entirely fixed — the example ARN is the sentence's own text: an account's
+/// own number is not quoted back, because what is wrong is the field carrying one at all. A
+/// role template is published content rather than a resource an account owns, so its ARN is
+/// written with the publisher in the account field ([`AWS_MANAGED_POLICY_ACCOUNT`]), the same
+/// spelling an AWS-published managed policy's ARN uses.
+pub const ROLE_TEMPLATE_ARN_NOT_PUBLISHED_BY_AWS: &str =
+    "The specified role template ARN is not valid. The ARN must use 'aws' as the account \
+     field (e.g., arn:aws:iam::aws:role-template/...).";
+
+/// Why `value` is not a role template's ARN — the sentence measured for the CLASS of defect it
+/// carries — or `None` when it IS one.
 ///
 /// `arnType` bounds only the length (20..2048), so the FORM of a caller-supplied `TemplateArn`
 /// is read here, in ONE place, before any template is resolved: a member documented as "the
 /// Amazon Resource Name (ARN) of the role template" has to carry that ARN, and a value that
 /// does not is one IAM cannot accept rather than a template that happens to be missing.
 ///
-/// The form is the WHOLE ARN a publishing service mints, as
-/// [`ROLE_TEMPLATE_ARN_NOT_VALID`] states it and [`PublishedRoleTemplate::arn`] builds it:
-/// IAM's own namespace, no Region, the publisher as the account field
-/// ([`AWS_MANAGED_POLICY_ACCOUNT`]), and a resource field of the role-template type carrying
-/// the publishing service's principal, the template's name and its major version. A value
-/// missing any of that names no role template under any publisher, so it answers the one
-/// sentence rather than a reading of its own. The six fields come from the crate's ONE
-/// caller-supplied-ARN parse (`service_common::arn`).
+/// Three classes, each told what is wrong with the value it carries rather than one sentence
+/// for all of them, so a caller can tell them apart:
+///
+/// 1. a value nothing can be read as an ARN from is refused as IAM refuses any such value,
+///    with the crate's ONE unparseable-ARN sentence ([`ARN_UNPARSEABLE`]);
+/// 2. an ARN that names a role template of IAM's under an account rather than the publisher
+///    is in the wrong namespace rather than the wrong shape
+///    ([`ROLE_TEMPLATE_ARN_NOT_PUBLISHED_BY_AWS`]);
+/// 3. anything else about the form — another service's namespace, a Region, another resource
+///    type, or an identity that is not `<service principal>/<template name>:<major version>`
+///    — answers the sentence stating the whole form ([`ROLE_TEMPLATE_ARN_NOT_VALID`]), as
+///    [`PublishedRoleTemplate::arn`] builds it.
+///
+/// The six fields come from the crate's ONE caller-supplied-ARN parse (`service_common::arn`).
 pub fn role_template_arn_refusal(value: &str) -> Option<&'static str> {
+    let Some(arn) = ::service_common::arn::parse(value) else {
+        return Some(ARN_UNPARSEABLE);
+    };
+    // A value that DOES name a role template of IAM's, but under an account rather than the
+    // publisher, is in the wrong namespace rather than of the wrong shape — a caller that
+    // built the ARN from its own account id is told which field is the problem. A value that
+    // names something else entirely is of the wrong shape, however its account field reads.
+    if arn.vendor == IAM_ARN_VENDOR
+        && arn.resource_type() == ROLE_TEMPLATE_ARN_RESOURCE
+        && arn.account != AWS_MANAGED_POLICY_ACCOUNT
+    {
+        return Some(ROLE_TEMPLATE_ARN_NOT_PUBLISHED_BY_AWS);
+    }
     (!is_role_template_arn(value)).then_some(ROLE_TEMPLATE_ARN_NOT_VALID)
 }
 

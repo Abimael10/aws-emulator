@@ -584,7 +584,7 @@ async fn the_refusal_names_the_forms_the_request_was_found_carrying() {
         (
             "the flat members beside the structure",
             json!({"SingleMetricAnomalyDetector": single, "Namespace": NAMESPACE}),
-            format!("{prefix}SingleMetricAnomalyDetector, single metric attributes."),
+            format!("{prefix}single metric attributes, SingleMetricAnomalyDetector."),
         ),
         (
             "the flat members beside the metric-math structure",
@@ -604,8 +604,8 @@ async fn the_refusal_names_the_forms_the_request_was_found_carrying() {
                 "Stat": "Average",
             }),
             format!(
-                "{prefix}MetricMathAnomalyDetector, SingleMetricAnomalyDetector, \
-                 single metric attributes."
+                "{prefix}MetricMathAnomalyDetector, single metric attributes, \
+                 SingleMetricAnomalyDetector."
             ),
         ),
     ];
@@ -615,11 +615,20 @@ async fn the_refusal_names_the_forms_the_request_was_found_carrying() {
         // One rule, so the same sentence answers both writers.
         for operation in ["PutAnomalyDetector", "DeleteAnomalyDetector"] {
             let (status, body) = call(&router, operation, &request).await;
+            let message = fault_message(&body);
             assert_eq!(
-                (status, fault_message(&body).as_str()),
+                (status, message.as_str()),
                 (400, expected.as_str()),
                 "case {case:?} on {operation}: expected HTTP 400 {expected:?}, got {status} \
                  with {body}"
+            );
+            // The INVARIANT the rows above are instances of: whatever was found, it is listed
+            // in the ONE order the service lists these forms in, never in the order the request
+            // named them or a handler tested them.
+            assert!(
+                lists_forms_in_one_fixed_order(&message),
+                "case {case:?} on {operation}: expected the forms found to be listed in the \
+                 order {THE_ORDER_FORMS_ARE_LISTED_IN:?}, got {message:?}"
             );
         }
     }
@@ -641,6 +650,111 @@ async fn the_refusal_names_the_forms_the_request_was_found_carrying() {
             (status, fault_message(&body).as_str()),
             (404, "Anomaly detector not found"),
             "{named}: expected HTTP 404 'Anomaly detector not found', got {status} with {body}"
+        );
+    }
+}
+
+/// The ONE order a refusal lists the forms a request was found carrying in, written out here
+/// rather than read from the implementation or from the sentence under test.
+///
+/// SOURCE: the two refusals AWS's wording is measured for — the deprecated flat attributes
+/// beside the single-metric structure read "found single metric attributes,
+/// SingleMetricAnomalyDetector.", and both structures together read "found
+/// MetricMathAnomalyDetector, SingleMetricAnomalyDetector." — so the structure the deprecated
+/// attributes are superseded by is listed last, with the identifier only the delete accepts
+/// first.
+const THE_ORDER_FORMS_ARE_LISTED_IN: [&str; 4] = [
+    "AnomalyDetectorId",
+    "MetricMathAnomalyDetector",
+    "single metric attributes",
+    "SingleMetricAnomalyDetector",
+];
+
+/// Whether `message` lists the forms the request was FOUND carrying in that order: every form
+/// it names is one of them, and no form comes before one the order puts ahead of it.
+fn lists_forms_in_one_fixed_order(message: &str) -> bool {
+    const BETWEEN: &str = " can be set, found ";
+    let Some((_, found)) = message.split_once(BETWEEN) else {
+        return false;
+    };
+    let mut previous: Option<usize> = None;
+    for form in found.trim_end_matches('.').split(", ") {
+        let Some(at) = THE_ORDER_FORMS_ARE_LISTED_IN
+            .iter()
+            .position(|listed| *listed == form)
+        else {
+            return false;
+        };
+        if previous.is_some_and(|before| at <= before) {
+            return false;
+        }
+        previous = Some(at);
+    }
+    true
+}
+
+#[tokio::test]
+async fn a_delete_naming_a_detector_by_identifier_and_by_metric_lists_both() {
+    // The delete accepts a FOURTH identification — "If you specify this parameter, you do not
+    // need to specify a metric to identify the detector."
+    // (`DeleteAnomalyDetectorInput$AnomalyDetectorId`) — so its refusal enumerates four forms,
+    // and the rows differ along which of the other three the identifier was mixed with, up to
+    // all of them at once. Each sentence lists what was found in the one order the service
+    // lists these forms in.
+    let single = json!({
+        "Namespace": NAMESPACE,
+        "MetricName": "Latency",
+        "Stat": "Average",
+    });
+    let math = metric_math("Latency", "m1 * 2");
+    let prefix = "Either AnomalyDetectorId, single metric attributes, \
+                  SingleMetricAnomalyDetector or MetricMathAnomalyDetector can be set, found \
+                  AnomalyDetectorId, ";
+    let cases: Vec<(&str, Value, String)> = vec![
+        (
+            "the identifier beside a flat Stat",
+            json!({"AnomalyDetectorId": "abc123", "Stat": "Average"}),
+            format!("{prefix}single metric attributes."),
+        ),
+        (
+            "the identifier beside the single-metric structure",
+            json!({"AnomalyDetectorId": "abc123", "SingleMetricAnomalyDetector": single}),
+            format!("{prefix}SingleMetricAnomalyDetector."),
+        ),
+        (
+            "the identifier beside the metric-math structure",
+            json!({"AnomalyDetectorId": "abc123", "MetricMathAnomalyDetector": math}),
+            format!("{prefix}MetricMathAnomalyDetector."),
+        ),
+        (
+            "the identifier beside all three",
+            json!({
+                "AnomalyDetectorId": "abc123",
+                "Namespace": NAMESPACE,
+                "SingleMetricAnomalyDetector": single,
+                "MetricMathAnomalyDetector": math,
+            }),
+            format!(
+                "{prefix}MetricMathAnomalyDetector, single metric attributes, \
+                 SingleMetricAnomalyDetector."
+            ),
+        ),
+    ];
+
+    for (case, request, expected) in cases {
+        let router = build_router();
+        let (status, body) = call(&router, "DeleteAnomalyDetector", &request).await;
+        let message = fault_message(&body);
+        assert_eq!(
+            (status, error_code(&body).as_str(), message.as_str()),
+            (400, "InvalidParameterCombinationException", expected.as_str()),
+            "case {case:?}: expected HTTP 400 InvalidParameterCombinationException \
+             {expected:?}, got {status} with {body}"
+        );
+        assert!(
+            lists_forms_in_one_fixed_order(&message),
+            "case {case:?}: expected the forms found to be listed in the order \
+             {THE_ORDER_FORMS_ARE_LISTED_IN:?}, got {message:?}"
         );
     }
 }

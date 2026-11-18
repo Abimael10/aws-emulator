@@ -32,7 +32,9 @@
 //!   measured for that absence;
 //! * a `TemplateArn` whose FORM is not that of a role template's ARN is a value IAM cannot
 //!   accept rather than a template that happens to be missing (HTTP 400, awsQuery code
-//!   `ValidationError`);
+//!   `ValidationError`), worded with the sentence measured for the CLASS of defect it carries
+//!   — nothing readable as an ARN, an ARN naming a role template under an account rather than
+//!   the `aws` publisher, or any other departure from the form;
 //! * IAM decides the call against the caller's identity-based policies before it resolves
 //!   the template;
 //! * the read is a READ: it leaves the account's templates exactly as it found them.
@@ -104,14 +106,26 @@ const POWER_USER_TEMPLATE_ARN: &str =
 /// The single minor version each catalog entry carries, which is also its default.
 const PUBLISHED_MINOR_VERSION: i32 = 0;
 
-/// The one sentence IAM refuses a value whose form is not a role template's ARN with,
-/// written out here rather than read from the implementation's constant: what this suite
-/// pins is the SENTENCE, so a reworded constant has to fail here rather than agree with
-/// itself.
+/// The three sentences IAM refuses a value whose form is not a role template's ARN with, one
+/// per CLASS of defect, written out here rather than read from the implementation's constants:
+/// what this suite pins is the SENTENCES, so a reworded constant has to fail here rather than
+/// agree with itself.
 const TEMPLATE_ARN_NOT_VALID: &str =
     "The specified role template ARN is not valid. Expected format is: \
      arn:{partition}:iam::aws:role-template/{servicePrincipal}/{templateName}:{majorVersion} \
      (majorVersion must be a positive integer with no leading zeros).";
+
+/// What a value nothing can be read as an ARN from is refused with: IAM's own
+/// unparseable-ARN sentence, whose empty value slot renders between the template's two
+/// spaces.
+const ARN_NOT_PARSEABLE: &str = "Invalid ARN:  Could not be parsed!";
+
+/// What an ARN naming a role template under an account rather than the `aws` publisher is
+/// refused with — fixed text, the example ARN included, quoting neither the account nor the
+/// value.
+const TEMPLATE_ARN_NOT_PUBLISHED_BY_AWS: &str =
+    "The specified role template ARN is not valid. The ARN must use 'aws' as the account \
+     field (e.g., arn:aws:iam::aws:role-template/...).";
 
 /// AWS's sentence for an ARN that resolves no role template at all: the
 /// `<Entity> … cannot be found.` form, with the template named by the ARN the request
@@ -750,17 +764,23 @@ async fn a_minor_version_a_resolved_template_does_not_carry_is_refused_as_missin
 /// RULE: a value supplied for a member documented as the ARN of a role template is read for
 /// its FORM before anything is resolved, and a value whose form is not that ARN is one IAM
 /// cannot accept rather than a template that happens to be missing: HTTP 400 with the
-/// awsQuery code `ValidationError` — the code IAM answers a value it cannot accept with —
-/// and the one sentence stating the form such an ARN takes.
+/// awsQuery code `ValidationError` — the code IAM answers a value it cannot accept with — and
+/// the sentence measured for the CLASS of defect the value carries, so a caller can tell the
+/// classes apart: a value nothing can be read as an ARN from answers IAM's unparseable-ARN
+/// sentence, an ARN naming a role template of IAM's under an account rather than the `aws`
+/// publisher answers the namespace sentence, and anything else answers the sentence stating
+/// the whole form.
 ///
-/// Rows span every way the form can be wrong: a value nothing can be read as an ARN from, an
-/// ARN of another service, an ARN of another resource type in IAM's own namespace (at the
-/// published MINIMUM length of `arnType`, 20), an ARN whose account field is not the
-/// publisher `aws` (an account number, no account at all, and another publisher's name), one
-/// that names a Region, and a role-template ARN whose identity is not
-/// `<service principal>/<template name>:<major version>` — a single segment, no major
+/// Rows span every way the form can be wrong, each paired with the sentence its class earns:
+/// a value nothing can be read as an ARN from (no ARN at all, colons alone, too few fields),
+/// an ARN of another service, an ARN of another resource type in IAM's own namespace (at the
+/// published MINIMUM length of `arnType`, 20), a role-template ARN whose account field is not
+/// the publisher `aws` (an account number, another account's number, no account at all, and
+/// another publisher's name), one that names a Region, and a role-template ARN whose identity
+/// is not `<service principal>/<template name>:<major version>` — a single segment, no major
 /// version, an empty part, and a major version that is not a positive integer without
-/// leading zeros.
+/// leading zeros — with one row carrying two defects at once, which pins which class is
+/// reported when a value is both in an account's namespace and of the wrong shape.
 #[tokio::test]
 async fn a_template_arn_whose_form_is_not_a_role_templates_is_refused_as_a_bad_value() {
     let shortest = "arn:aws:iam:::rt/aaa".to_string();
@@ -771,93 +791,138 @@ async fn a_template_arn_whose_form_is_not_a_role_templates_is_refused_as_a_bad_v
     );
 
     let rows = [
-        ("a value that is no ARN at all", "not-an-arn-but-long-enough".to_string()),
-        ("a value of colons alone", "::::::::::::::::::::".to_string()),
+        (
+            "a value that is no ARN at all",
+            "not-an-arn-but-long-enough".to_string(),
+            ARN_NOT_PARSEABLE,
+        ),
+        (
+            "a value of colons alone",
+            "::::::::::::::::::::".to_string(),
+            ARN_NOT_PARSEABLE,
+        ),
+        (
+            "a value carrying fewer fields than an ARN has",
+            "arn:aws:iam:us-east-1".to_string(),
+            ARN_NOT_PARSEABLE,
+        ),
         (
             "a well-formed ARN of another service",
             "arn:aws:s3:::role-template/ReadFixture".to_string(),
+            TEMPLATE_ARN_NOT_VALID,
         ),
         (
             "a well-formed ARN of another identity service",
             format!("arn:aws:sts::aws:role-template/{RECORDED_PUBLISHER}/ReadFixture:1"),
+            TEMPLATE_ARN_NOT_VALID,
         ),
         (
             "an ARN of another resource type in IAM's own namespace",
             "arn:aws:iam::aws:policy/ReadOnlyAccess".to_string(),
+            TEMPLATE_ARN_NOT_VALID,
         ),
         (
             "an ARN naming an IAM role rather than a role template",
             format!("arn:aws:iam::{}:role/ReadFixture", account_id()),
+            TEMPLATE_ARN_NOT_VALID,
         ),
-        ("another resource type at the published minimum length", shortest),
+        (
+            "another resource type at the published minimum length",
+            shortest,
+            TEMPLATE_ARN_NOT_VALID,
+        ),
         (
             "a role-template ARN carrying this account's number",
             format!(
                 "arn:aws:iam::{}:role-template/{RECORDED_PUBLISHER}/ReadFixture:1",
                 account_id()
             ),
+            TEMPLATE_ARN_NOT_PUBLISHED_BY_AWS,
         ),
         (
             "a role-template ARN carrying another account's number",
             format!("arn:aws:iam::000000000000:role-template/{RECORDED_PUBLISHER}/ReadFixture:1"),
+            TEMPLATE_ARN_NOT_PUBLISHED_BY_AWS,
+        ),
+        // Both wrong at once: the namespace is read first, so a value that is in an account's
+        // namespace AND of the wrong shape is told about the field that put it in the wrong
+        // namespace rather than about the shape.
+        (
+            "a role-template ARN of this account that also names no major version",
+            format!(
+                "arn:aws:iam:us-east-1:{}:role-template/{RECORDED_PUBLISHER}/ReadFixture",
+                account_id()
+            ),
+            TEMPLATE_ARN_NOT_PUBLISHED_BY_AWS,
         ),
         (
             "a role-template ARN naming no account at all",
             format!("arn:aws:iam:::role-template/{RECORDED_PUBLISHER}/ReadFixture:1"),
+            TEMPLATE_ARN_NOT_PUBLISHED_BY_AWS,
         ),
         (
             "a role-template ARN whose account field names another publisher",
             format!("arn:aws:iam::amazonaws:role-template/{RECORDED_PUBLISHER}/ReadFixture:1"),
+            TEMPLATE_ARN_NOT_PUBLISHED_BY_AWS,
         ),
         (
             "a role-template ARN naming a Region",
-            format!(
-                "arn:aws:iam:us-east-1:aws:role-template/{RECORDED_PUBLISHER}/ReadFixture:1"
-            ),
+            format!("arn:aws:iam:us-east-1:aws:role-template/{RECORDED_PUBLISHER}/ReadFixture:1"),
+            TEMPLATE_ARN_NOT_VALID,
         ),
         (
             "a role-template ARN of a single trailing segment",
             "arn:aws:iam::aws:role-template/nonexistent-role-template".to_string(),
+            TEMPLATE_ARN_NOT_VALID,
         ),
         (
             "a role-template ARN naming no major version",
             format!("arn:aws:iam::aws:role-template/{RECORDED_PUBLISHER}/ReadFixture"),
+            TEMPLATE_ARN_NOT_VALID,
         ),
         (
             "a role-template ARN naming no template",
             format!("arn:aws:iam::aws:role-template/{RECORDED_PUBLISHER}/:1"),
+            TEMPLATE_ARN_NOT_VALID,
         ),
         (
             "a role-template ARN naming no publishing service",
             "arn:aws:iam::aws:role-template//ReadFixture:1".to_string(),
+            TEMPLATE_ARN_NOT_VALID,
         ),
         (
             "a role-template ARN carrying a further segment",
             format!("arn:aws:iam::aws:role-template/{RECORDED_PUBLISHER}/team/ReadFixture:1"),
+            TEMPLATE_ARN_NOT_VALID,
         ),
         (
             "a major version of zero",
             format!("arn:aws:iam::aws:role-template/{RECORDED_PUBLISHER}/ReadFixture:0"),
+            TEMPLATE_ARN_NOT_VALID,
         ),
         (
             "a major version with a leading zero",
             format!("arn:aws:iam::aws:role-template/{RECORDED_PUBLISHER}/ReadFixture:01"),
+            TEMPLATE_ARN_NOT_VALID,
         ),
         (
             "a negative major version",
             format!("arn:aws:iam::aws:role-template/{RECORDED_PUBLISHER}/ReadFixture:-1"),
+            TEMPLATE_ARN_NOT_VALID,
         ),
         (
             "a major version that is no number",
             format!("arn:aws:iam::aws:role-template/{RECORDED_PUBLISHER}/ReadFixture:v1"),
+            TEMPLATE_ARN_NOT_VALID,
         ),
         (
             "an empty major version",
             format!("arn:aws:iam::aws:role-template/{RECORDED_PUBLISHER}/ReadFixture:"),
+            TEMPLATE_ARN_NOT_VALID,
         ),
     ];
 
-    for (case, template_arn) in rows {
+    for (case, template_arn, expected) in rows {
         let (router, engine) = router_with_engine();
         seed_recorded(&engine);
 
@@ -874,8 +939,8 @@ async fn a_template_arn_whose_form_is_not_a_role_templates_is_refused_as_a_bad_v
         );
         assert_eq!(
             element(&body, "Message"),
-            TEMPLATE_ARN_NOT_VALID,
-            "case {case:?}: expected the refusal to read {TEMPLATE_ARN_NOT_VALID:?}, got {:?}",
+            expected,
+            "case {case:?}: expected the refusal to read {expected:?}, got {:?}",
             element(&body, "Message")
         );
     }

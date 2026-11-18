@@ -1791,6 +1791,20 @@ pub fn one_detector_form_message(found: &[&str]) -> String {
     )
 }
 
+/// CloudWatch's wording for a request that names the model to DELETE more than one way: the
+/// four identifications one of which may be set — the identifier that names a model on its own
+/// among them — and then the ones the request was found carrying.
+///
+/// Worded here beside the three-form sentence, so the two sentences the service words for one
+/// clash cannot list the forms two ways ([`THE_ORDER_FORMS_ARE_LISTED_IN`]).
+pub fn one_detector_identification_message(found: &[&str]) -> String {
+    format!(
+        "Either {DETECTOR_ID_FORM}, {FLAT_METRIC_FORM}, {SINGLE_METRIC_FORM} or \
+         {METRIC_MATH_FORM} can be set, found {}.",
+        in_one_order(found).join(", ")
+    )
+}
+
 /// `forms` in the one order such a sentence lists them in, whichever order the request named
 /// them in and whichever operation refused it ([`THE_ORDER_FORMS_ARE_LISTED_IN`]).
 ///
@@ -1808,15 +1822,25 @@ pub fn in_one_order<'a>(forms: &[&'a str]) -> Vec<&'a str> {
     ordered
 }
 
-/// The order a refusal lists the forms a request was found carrying in: the identifier that
-/// names a model on its own, then the two structures — the metric-math one before the
-/// single-metric one, which is the order the recorded refusal of a request carrying both lists
-/// them in — and the deprecated flat spelling of the single-metric structure last.
+/// The order a refusal lists the forms a request was found carrying in: a property of the
+/// SERVICE rather than of the request, so a clash of the same forms reads the same sentence
+/// whichever operation refused it, whichever order the members arrived in and whichever order a
+/// handler tested them in.
+///
+/// MEASURED, from the two refusals this service's wording is known for: a request carrying the
+/// deprecated flat attributes beside the single-metric structure is told it was found carrying
+/// "single metric attributes, SingleMetricAnomalyDetector", and one carrying both structures
+/// "MetricMathAnomalyDetector, SingleMetricAnomalyDetector" — so the structure the deprecated
+/// attributes are superseded by (`@deprecated` "Use SingleMetricAnomalyDetector." on
+/// `Namespace`, `MetricName`, `Dimensions` and `Stat`) is listed LAST, after both of the other
+/// two. Their order relative to each other is the one this service has always worded, which
+/// neither refusal contradicts. The identifier that names a model on its own comes first, where
+/// the one operation accepting it lists it first.
 const THE_ORDER_FORMS_ARE_LISTED_IN: [&str; 4] = [
     DETECTOR_ID_FORM,
     METRIC_MATH_FORM,
-    SINGLE_METRIC_FORM,
     FLAT_METRIC_FORM,
+    SINGLE_METRIC_FORM,
 ];
 
 /// Why the detector `form` names cannot be identified, or `None` when it can.

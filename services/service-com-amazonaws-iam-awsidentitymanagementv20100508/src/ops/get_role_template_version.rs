@@ -28,9 +28,11 @@
 //!   operation's refusal of such a value, and the code IAM answers a value it cannot accept
 //!   with throughout this API (`CreateDelegationRequest` answers its own two ARN members with
 //!   it), rather than the modelled `InvalidInputException`'s `<Code>InvalidInput</Code>`,
-//!   which no reading of this member produces — worded with the one sentence that states the
-//!   form such an ARN takes, through the ONE reading of a caller-supplied role-template ARN
-//!   this crate holds ([`crate::state::role_template_arn_refusal`]).
+//!   which no reading of this member produces — worded with the sentence measured for the
+//!   CLASS of defect the value carries (nothing readable as an ARN at all, an ARN in an
+//!   account's own namespace rather than the publisher's, or any other departure from the
+//!   form), through the ONE reading of a caller-supplied role-template ARN this crate holds
+//!   ([`crate::state::role_template_arn_refusal`]).
 //! * an ARN this service resolves no template under reference "a resource entity that does
 //!   not exist": `404` `<Code>NoSuchEntity</Code>` naming the template that cannot be found
 //!   ([`crate::state::role_template_arn_not_found`]), while an ARN that DOES resolve a
@@ -199,7 +201,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // before the store is touched at all, through the ONE reading of a caller-supplied
         // role-template ARN this crate holds: a value whose form is not that ARN is one IAM
         // cannot accept rather than a template that happens to be missing, and what it is
-        // answered with is the one sentence stating the form such an ARN takes.
+        // answered with is the sentence measured for the class of defect it carries.
         if let Some(refusal) = crate::state::role_template_arn_refusal(&input.template_arn) {
             return Err(crate::scaffolded::Scaffolded::validation_error(refusal));
         }
