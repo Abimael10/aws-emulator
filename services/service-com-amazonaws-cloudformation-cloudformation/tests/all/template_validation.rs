@@ -506,7 +506,7 @@ async fn a_deployment_the_template_fails_rolls_the_stack_back() {
             stack_name: "rule-failed",
             template: r#"{"Parameters":{"Env":{"Type":"String","Default":"prod"},"Size":{"Type":"String","Default":"small"}},"Rules":{"ProdRequiresLarge":{"RuleCondition":{"Fn::Equals":[{"Ref":"Env"},"prod"]},"Assertions":[{"Assert":{"Fn::Equals":[{"Ref":"Size"},"large"]},"AssertDescription":"prod stacks must use the large size"}]}},"Resources":{"Topic":{"Type":"AWS::SNS::Topic"}}}"#,
             reason: "Parameter validation failed: assertion error: prod stacks must use the \
-                     large size",
+                     large size.",
         },
         RolledBack {
             case: "a Fn::ForEach loop in a section the transform does not define it for",

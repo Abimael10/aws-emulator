@@ -41,9 +41,10 @@ const VERSION_PARAMETER: &str = "/cfn-ssm-types/version";
 /// reports.
 const ASSERT_DESCRIPTION: &str = "a newer bootstrap version is required";
 
-/// How CloudFormation words a `Rules` assertion that does not hold.
+/// How CloudFormation words a `Rules` assertion that does not hold: the fixed text, the
+/// description as the template wrote it, and the sentence's own period.
 fn assertion_failure(description: &str) -> String {
-    format!("Parameter validation failed: assertion error: {description}")
+    format!("Parameter validation failed: assertion error: {description}.")
 }
 
 /// Write one Parameter Store parameter, as a client does before it deploys a template that

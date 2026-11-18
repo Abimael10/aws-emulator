@@ -1115,22 +1115,26 @@ pub fn validate_template_for_validation(
 ///
 /// `CreateStackInput$OnFailure` documents `ROLLBACK` as the default behaviour of a failed
 /// create, so the rollback is something the REQUEST asked for — which is what the service
-/// says when it reports one. The clause goes AFTER the failure's own sentence, and that
-/// sentence is reproduced exactly as it reads: one already carrying the separator the clause
-/// goes in — the resource-failure summary ([`resource_failure_summary`], which ends with its
-/// separating space) — is concatenated with, and one that ends its own text gets that
-/// separator. Nothing of the sentence itself is re-punctuated: a reason built around text the
-/// SUBMITTER wrote (a `Rules` assertion's own `AssertDescription`) carries that text
-/// character for character, so a client matching on what it declared still matches, and the
-/// sentence's final period and CloudFormation's own both survive.
+/// says when it reports one. The clause is a SENTENCE OF ITS OWN, written after the failure's:
+/// the failure's text is reproduced character for character and nothing in it is
+/// re-punctuated, and the only thing this adds is the one separator between the two
+/// sentences. A failure that already ends its sentence — every sentence this service composes
+/// does, whether or not it also carries the separating space the resource-failure summary
+/// leaves ([`resource_failure_summary`]) — is followed by the clause after a single space; a
+/// failure that stops mid-sentence is ended before it. So a period that came from a SUBMITTED
+/// template (a `Rules` assertion's own `AssertDescription`, which
+/// [`template_validation::rules_failure`] reproduces inside its own sentence) stands exactly
+/// where the template put it, beside this service's, and a client matching on the text it
+/// declared still matches.
 ///
 /// Worded once, and public so a suite asserting a rolled-back stack's reason reads the same
 /// wording rather than spelling a second copy of it.
 pub fn rollback_requested(reason: &str) -> String {
-    if reason.ends_with(". ") {
-        return format!("{reason}Rollback requested by user.");
+    let sentence = reason.trim_end();
+    if sentence.ends_with('.') {
+        return format!("{sentence} Rollback requested by user.");
     }
-    format!("{}. Rollback requested by user.", reason.trim_end())
+    format!("{sentence}. Rollback requested by user.")
 }
 
 /// The message CloudFormation answers when a mutating stack operation presents a

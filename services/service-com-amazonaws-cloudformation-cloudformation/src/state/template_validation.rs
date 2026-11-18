@@ -1321,6 +1321,12 @@ fn holds_for_each(node: &Value, depth: usize) -> bool {
 /// operation that reads a failure here fails and rolls back, with the rule's own
 /// `AssertDescription` as the reason the caller is told.
 ///
+/// The sentence is the fixed text, the `AssertDescription` character for character, and this
+/// service's own sentence end: the description is the SUBMITTER's text and is reproduced as it
+/// was written, so one that ends in its own punctuation keeps it and the period terminating
+/// CloudFormation's sentence lands after it. That is what leaves room for the rollback clause
+/// to follow without re-punctuating anything ([`super::rollback_requested`]).
+///
 /// An assertion this service cannot evaluate from the parameters alone holds: a rule is a
 /// guard on the values, and nothing here fails a deployment over an expression it did not
 /// understand.
@@ -1349,7 +1355,7 @@ pub fn rules_failure(body: &str, parameters: &BTreeMap<String, String>) -> Optio
                     .and_then(Value::as_str)
                     .unwrap_or_default();
                 return Some(format!(
-                    "Parameter validation failed: assertion error: {description}"
+                    "Parameter validation failed: assertion error: {description}."
                 ));
             }
         }

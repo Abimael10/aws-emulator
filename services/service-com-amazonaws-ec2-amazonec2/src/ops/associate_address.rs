@@ -174,8 +174,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         use crate::state::{
             internal_error, invalid_address_not_found, invalid_network_interface_id_malformed,
             invalid_network_interface_id_not_found, is_ipv4_address,
-            network_interface_id_is_well_formed, require_known_address, require_known_instance,
-            require_service_state, resource_already_associated, ElasticIpAssociationSpec,
+            network_interface_id_is_well_formed, require_instance_record_worded,
+            require_known_address, require_service_state, resource_already_associated,
+            ElasticIpAssociationSpec,
         };
 
         // Nothing here depends on the request's metadata: an Elastic IP address and the
@@ -244,15 +245,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 ))
             }
             (Some(instance_id), None) => {
-                require_known_instance(&store, instance_id)?;
+                // An id this operation cannot read is refused in the sentence THIS operation
+                // words an unreadable id with — the request boundary's own
+                // `Invalid id: "<value>"`, which is already what its `AllocationId` half
+                // answers ([`require_known_address`]) — so one call does not word the two ids
+                // it takes two different ways. The RULE behind the refusal is unchanged
+                // ([`require_instance_record_worded`]): an id outside the form EC2 issues is
+                // malformed before any lookup, and a readable id this account holds no
+                // instance for is the not-found half.
+                //
                 // An instance on its way out, or gone, has no interface left to carry an
                 // address. Every other state can: AWS associates an address with a stopped
                 // instance as readily as with a running one.
-                let instance = store.instances.get(instance_id).ok_or_else(|| {
-                    internal_error(format!(
-                        "the instance '{instance_id}' could not be read back"
-                    ))
-                })?;
+                let instance = require_instance_record_worded(
+                    &store,
+                    instance_id,
+                    crate::scaffolded::Scaffolded::invalid_instance_id_malformed,
+                )?;
                 if instance.state.is_terminating() {
                     return Err(Scaffolded::incorrect_instance_state(
                         instance_id,
