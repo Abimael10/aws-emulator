@@ -186,7 +186,10 @@ const SERVICE_ROWS: [ServiceRow; 5] = [
         service_name: "com.amazonaws.us-west-2.appstream.streaming",
         private_dns_name: Some("streaming.appstream.us-west-2.amazonaws.com"),
         base_dns_name: "streaming.appstream.us-west-2.vpce.localhost",
-        policy_supported: true,
+        // The streaming data plane carries sessions rather than API calls, so it supports no
+        // endpoint policy even though it publishes a private DNS name of its own — the two
+        // facts of a service's offering are independent.
+        policy_supported: false,
     },
     ServiceRow {
         case: "the AWS IoT Core data plane, which offers neither",

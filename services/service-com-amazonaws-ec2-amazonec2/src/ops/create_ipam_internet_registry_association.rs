@@ -193,6 +193,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )));
         }
 
+        // "The Regional Internet Registry (RIR) to associate with the IPAM"
+        // (`CreateIpamInternetRegistryAssociationRequest$Rir`): a member of the modelled `Rir`
+        // enum, which the boundary has already held the request to — read into the one
+        // canonical spelling of a registry this service reports, so the association carries the
+        // registry's own identifier whatever case the request spelled the member in.
+        let rir = state::canonical_rir(input.rir.as_str());
+
         // "The organization handle at the internet registry (for example, a RIPE NCC
         // organization ID or ARIN Org ID)"
         // (`CreateIpamInternetRegistryAssociationRequest$OrganizationHandle`) is REQUIRED, and
@@ -278,7 +285,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             if !same_request(
                 &record.view,
                 ipam_id,
-                input.rir.as_str(),
+                &rir,
                 input.organization_handle.as_str(),
                 input.description.as_deref(),
                 &tags,
@@ -316,8 +323,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // What the request decided: "the Regional Internet Registry to associate with"
             // (the modelled `Rir` enum, so a spelling outside its catalog was refused before
             // this handler ran), "the organization handle at the internet registry" and the
-            // association's description.
-            rir: Some(input.rir.clone()),
+            // association's description. The registry is stored under its own canonical
+            // identifier ([`crate::state::canonical_rir`]), which is what every reader of the
+            // association then reports.
+            rir: Some(rir.clone()),
             organization_handle: Some(input.organization_handle.clone()),
             description: input.description.clone(),
             tags: Some(tags),

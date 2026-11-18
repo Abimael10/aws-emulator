@@ -306,6 +306,15 @@ pub const ANALYSIS_STATUS_RUNNING: &str = "running";
 /// [`ANALYSIS_UNSUPPORTED_STATUS_MESSAGE`] and the module docs.
 pub const ANALYSIS_STATUS_FAILED: &str = "failed";
 
+/// An analysis that produced its result: the `AnalysisStatus` enum's `succeeded` member
+/// (`smithy_query(query="shape",shape="AnalysisStatus")`).
+///
+/// The terminal status a PATH analysis this emulator traced reaches: the verdict is read off
+/// the stored security groups, network ACLs and routes
+/// ([`ComAmazonawsEc2Amazonec2State::trace_stored_network_insights_path`]), so the analysis has
+/// a result to report rather than a reason it has none.
+pub const ANALYSIS_STATUS_SUCCEEDED: &str = "succeeded";
+
 /// "The status message" (`NetworkInsightsAccessScopeAnalysis$StatusMessage`) of an analysis
 /// this emulator could not run.
 ///
@@ -916,19 +925,12 @@ pub fn network_insights_endpoint_arn(value: &str, region: &str) -> Option<String
     ))
 }
 
-/// The resource type and the resource an ARN's resource part names: `<type>/<id>` or
-/// `<type>:<id>` under the six colon-separated fields of
-/// `arn:<partition>:<service>:<region>:<account>:<resource>` (AWS General Reference, "Amazon
-/// Resource Names"). `None` for a value that is no ARN at all, which therefore names its
-/// resource as a bare id instead.
+/// The resource type and the resource an ARN's resource part names, read through the crate's
+/// one ARN reader ([`arn_resource`]) — so the end this screens and the end the trace of that
+/// path resolves later cannot disagree about which resource a value names. `None` for a value
+/// that is no ARN at all, which therefore names its resource as a bare id instead.
 fn endpoint_arn_resource(value: &str) -> Option<(&str, &str)> {
-    if !value.starts_with("arn:") {
-        return None;
-    }
-    let resource = value.splitn(6, ':').nth(5)?;
-    resource
-        .split_once('/')
-        .or_else(|| resource.split_once(':'))
+    arn_resource(value)
 }
 
 /// "The status message, if the status is `failed`"
@@ -1270,9 +1272,11 @@ impl ComAmazonawsEc2Amazonec2State {
     /// The one way a path analysis is stored, so the id it carries, the ARN it reports, the
     /// status it starts in, the move the clock owes it, the token that names it and the
     /// bytes it charges cannot be built two ways. An analysis is answered in the
-    /// non-terminal `running` status, so the clock owes it its terminal
-    /// [`ANALYSIS_STATUS_FAILED`] one [`TRANSITION_DELAY`] later (the module docs say why
-    /// that is the terminal status this emulator can honestly reach).
+    /// non-terminal `running` status, so the clock owes it its terminal status one
+    /// [`TRANSITION_DELAY`] later: [`ANALYSIS_STATUS_SUCCEEDED`] for a path this emulator
+    /// traces — the verdict is read off the stored network when the end falls due
+    /// ([`Self::trace_stored_network_insights_path`]) — and [`ANALYSIS_STATUS_FAILED`] for one
+    /// it does not, which ends carrying the reason it has no result.
     ///
     /// What comes back is the stored view itself, so a start answers exactly what a later
     /// `DescribeNetworkInsightsAnalyses` will report.
@@ -1285,6 +1289,7 @@ impl ComAmazonawsEc2Amazonec2State {
         }
         let analysis_id = self.next_id(NETWORK_INSIGHTS_ANALYSIS_ID_PREFIX);
         self.add_stored_bytes(network_insights_analysis_payload_bytes(&spec));
+        let path_id = spec.network_insights_path_id;
         let view = NetworkInsightsAnalysis {
             network_insights_analysis_id: Some(analysis_id.clone()),
             network_insights_analysis_arn: Some(::engine::emulator_arn(
@@ -1292,7 +1297,7 @@ impl ComAmazonawsEc2Amazonec2State {
                 &spec.region,
                 &format!("{RESOURCE_TYPE_NETWORK_INSIGHTS_ANALYSIS}/{analysis_id}"),
             )),
-            network_insights_path_id: Some(spec.network_insights_path_id),
+            network_insights_path_id: Some(path_id.clone()),
             // A list the request named nothing in is reported as absent rather than as an
             // empty set: there is no account and no ARN to report.
             additional_accounts: (!spec.additional_accounts.is_empty())
@@ -1308,8 +1313,8 @@ impl ComAmazonawsEc2Amazonec2State {
             warning_message: None,
             // Whether the destination is reachable, the components of the path, the
             // explanations, the hints and the accounts they would suggest are all results of
-            // a trace: none of them is claimed by this call, and the clock-owed end leaves
-            // them absent too, because nothing traced the path.
+            // the trace, which is read when the analysis ENDS: an analysis still running has
+            // no result yet, so each is absent here.
             network_path_found: None,
             forward_path_components: None,
             return_path_components: None,
@@ -1319,11 +1324,22 @@ impl ComAmazonawsEc2Amazonec2State {
             tags: Some(spec.tags),
         };
         let stored = view.clone();
+        // Which terminal status this analysis is owed: whether its PATH is one this emulator
+        // traces at all. The verdict itself is read when the end falls due, off the network as
+        // it stands then.
+        let owed = if self
+            .trace_stored_network_insights_path(path_id.as_str())
+            .is_some()
+        {
+            ANALYSIS_STATUS_SUCCEEDED
+        } else {
+            ANALYSIS_STATUS_FAILED
+        };
         self.network_insights_analyses.insert(
             analysis_id.clone(),
             NetworkInsightsAnalysisRecord {
                 view,
-                pending: Some(AnalysisTransition::starting_now(ANALYSIS_STATUS_FAILED)),
+                pending: Some(AnalysisTransition::starting_now(owed)),
             },
         );
         self.network_insights_analysis_client_tokens

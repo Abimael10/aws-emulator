@@ -19,10 +19,10 @@
 
 use std::sync::Arc;
 
-use ec2::ops::types::{ALLOCATION_STATE_VALUES, HostInstance};
+use ec2::ops::types::ALLOCATION_STATE_VALUES;
 use ec2::state::{
-    DEDICATED_HOST_TAGGABLE_RESOURCE, HOST_STATE_AVAILABLE, HOST_STATE_RELEASED,
-    HOST_STATE_RELEASED_PERMANENT_FAILURE, INCORRECT_STATE, INVALID_HOST_ID_MALFORMED,
+    DEDICATED_HOST_TAGGABLE_RESOURCE, HOST_OCCUPIED, HOST_STATE_AVAILABLE, HOST_STATE_RELEASED,
+    HOST_STATE_RELEASED_PERMANENT_FAILURE, INVALID_HOST_ID_MALFORMED,
     availability_zones_in_region,
 };
 use service_com_amazonaws_ec2_amazonec2 as ec2;
@@ -528,33 +528,44 @@ async fn each_named_id_is_judged_on_its_own() {
 /// still running instances is reported in `Unsuccessful` and stays as it was, however many
 /// instances it runs.
 ///
-/// No operation of this service launches onto a Dedicated Host yet, so the instances are put
-/// on the stored host directly, through the same engine the service reads.
+/// The instances are LAUNCHED onto the host over the same wire (`Placement.HostId`), so what
+/// the release reads is the dependency a caller actually created rather than a hand-written
+/// record.
 #[tokio::test]
 async fn a_host_still_running_instances_is_not_released() {
     // Rows: one instance on the host and two, against a host with no instance at all.
     for running in [1usize, 2] {
         let case = format!("{running} instance(s)");
-        let (router, engine, allocated) = seeded().await;
+        let (router, _engine, allocated) = seeded().await;
         let occupied = allocated[2].clone();
         let free = allocated[3].clone();
-        {
-            let state = engine.state::<ec2::state::ComAmazonawsEc2Amazonec2State>();
-            let mut store = state.lock();
-            let host = store
-                .dedicated_hosts
-                .get_mut(&occupied)
-                .unwrap_or_else(|| panic!("case {case:?}: host {occupied:?} must be stored"));
-            host.instances = Some(
-                (0..running)
-                    .map(|index| HostInstance {
-                        instance_id: Some(format!("i-000000000000000{index}a")),
-                        instance_type: Some("c5.xlarge".to_string()),
-                        owner_id: Some(engine::emulator_account_id().to_string()),
-                    })
-                    .collect(),
-            );
-        }
+        // The third allocation of `allocations` is a `c5.xlarge` host in the second zone, so
+        // the launch names that type and that zone.
+        let (status, launched) = super::ec2_query::call(
+            &router,
+            REGION,
+            "RunInstances",
+            &[
+                param("ImageId", "ami-0123456789abcdef0"),
+                param("InstanceType", "c5.xlarge"),
+                param("MinCount", running.to_string()),
+                param("MaxCount", running.to_string()),
+                param("Placement.HostId", &occupied),
+                param("Placement.AvailabilityZone", zone_name(1)),
+                param("Placement.Tenancy", "host"),
+            ],
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: the launch onto {occupied} must succeed, got {status} with body \
+             {launched}"
+        );
+        assert_eq!(
+            elements(&launched, "instanceId").len(),
+            running,
+            "case {case:?}: expected {running} instance(s) on the host, got {launched}"
+        );
 
         let (status, body) = release(&router, &[occupied.clone(), free.clone()]).await;
         assert_eq!(
@@ -571,7 +582,7 @@ async fn a_host_still_running_instances_is_not_released() {
                 .iter()
                 .map(|(resource, code, _)| (resource.clone(), code.clone()))
                 .collect::<Vec<_>>(),
-            vec![(occupied.clone(), INCORRECT_STATE.to_string())],
+            vec![(occupied.clone(), HOST_OCCUPIED.to_string())],
             "case {case:?}: expected the occupied host reported unsuccessful, got {body}"
         );
         let (state, release_time) = described(&router, &occupied)

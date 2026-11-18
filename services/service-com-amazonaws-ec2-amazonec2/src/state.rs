@@ -2834,6 +2834,18 @@ mod fleet_placements;
 /// like any helper of this module.
 mod fleet_deletion;
 mod network_insights;
+/// Reading an Amazon Resource Name — the one reader of an ARN's fields and of the resource its
+/// resource field names, in a file of its own rather than as more lines here. Everything it
+/// declares is re-exported below, so a handler reaches it as `crate::state::arn_resource` like
+/// any primitive of this module.
+mod amazon_resource_names;
+pub use amazon_resource_names::*;
+/// Tracing a Reachability Analyzer PATH — the verdict `NetworkPathFound` read off the stored
+/// security groups, network ACLs and routes — in a file of its own rather than as more lines
+/// here. Everything it declares is re-exported below, so a handler reaches it as
+/// `crate::state::<item>` like any primitive of this module.
+mod reachability_trace;
+pub use reachability_trace::*;
 mod nat_gateways_and_vpn_connections;
 /// The CloudWatch series a NAT gateway publishes about the traffic it carries — the namespace
 /// and dimension it is published under, the catalog of its metrics, and the clock the windows
@@ -2868,6 +2880,12 @@ mod vpc_block_public_access_options;
 mod image_usage_report_store;
 mod capacity_billing_and_recycle_bins;
 mod ipam;
+/// How a Regional Internet Registry is NAMED where this service reports one — the one
+/// canonical spelling of a registry, in a file of its own rather than as more lines here.
+/// Everything it declares is re-exported below, so a handler reaches it as
+/// `crate::state::canonical_rir` like any primitive of this module.
+mod regional_internet_registries;
+pub use regional_internet_registries::*;
 mod ipam_deletion;
 mod ipam_policy_enablement;
 mod ipam_prefix_list_resolver_deletion;
@@ -2880,6 +2898,12 @@ mod ipam_pool_cidrs;
 mod ipam_pool_allocations;
 mod vpc_endpoints_and_transit_gateway_attachments;
 mod prefix_lists_and_dedicated_hosts;
+/// Which instances are ON a Dedicated Host — the recompute of `Host$Instances` from the
+/// instance store, in a file of its own rather than as more lines here. Everything it declares
+/// is re-exported below, so a handler reaches it as `crate::state::<item>` like any primitive
+/// of this module.
+mod dedicated_host_instances;
+pub use dedicated_host_instances::*;
 /// The Dedicated Host RESERVATION store: the states a reservation takes, its id form, the
 /// stored record `PurchaseHostReservation` writes and `DescribeHostReservations` reports, and
 /// the store's own ceiling — in a file of its own rather than as more lines here. Everything

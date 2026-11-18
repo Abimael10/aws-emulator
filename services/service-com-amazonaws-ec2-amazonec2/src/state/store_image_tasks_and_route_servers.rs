@@ -1251,6 +1251,48 @@ pub fn route_server_peer_incorrect_state<E>(peer_id: &str) -> Scaffolded<E> {
     route_server_surface_incorrect_state(ROUTE_SERVER_PEER_REFUSAL_NAME, peer_id)
 }
 
+/// Refuse the deletion of a route server endpoint a PEER still holds: HTTP 400
+/// [`INCORRECT_STATE`], naming the peer that holds it.
+///
+/// A peer is "a BGP peer configured to exchange routes with a route server endpoint"
+/// (`CreateRouteServerPeer`), so it is reached THROUGH the endpoint and cannot outlive it: the
+/// peers come down first, and the refusal names the one still there so a caller knows what to
+/// delete. One wording, in the one place, so the operation and the suite that asserts it cannot
+/// drift apart.
+pub fn route_server_endpoint_has_peer<E>(peer_id: &str) -> Scaffolded<E> {
+    incorrect_state(format!(
+        "{ROUTE_SERVER_ENDPOINT_REFUSAL_NAME} has non-deleted {ROUTE_SERVER_PEER_REFUSAL_NAME}: \
+         {peer_id}."
+    ))
+}
+
+impl ComAmazonawsEc2Amazonec2State {
+    /// A route server peer of the endpoint `route_server_endpoint_id` that still holds it, if
+    /// the endpoint has one.
+    ///
+    /// A peer the lifecycle has finished with holds nothing — the same reading
+    /// [`Self::begin_route_server_deletion`] takes of which peers a route server still has — so
+    /// a `deleting` or `deleted` peer is not one. The ONE place that question is answered, so
+    /// the delete that is refused for it and anything else that has to know whether an endpoint
+    /// is still in use cannot disagree.
+    pub fn route_server_peer_holding_endpoint(
+        &self,
+        route_server_endpoint_id: &str,
+    ) -> Option<String> {
+        self.route_server_peers
+            .iter()
+            .find(|(_, peer)| {
+                peer.route_server_endpoint_id.as_deref() == Some(route_server_endpoint_id)
+                    && !matches!(
+                        peer.state.as_deref(),
+                        Some(ROUTE_SERVER_PEER_STATE_DELETING)
+                            | Some(ROUTE_SERVER_PEER_STATE_DELETED)
+                    )
+            })
+            .map(|(peer_id, _)| peer_id.clone())
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Route server associations
 // ---------------------------------------------------------------------------

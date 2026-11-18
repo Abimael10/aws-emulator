@@ -190,6 +190,13 @@ pub struct InstanceDetail {
     /// caller-chosen string of the record; the launch has already resolved it against the
     /// placement group store, so a name no group of the account has is never stored.
     pub placement_group_name: Option<String>,
+    /// The DEDICATED HOST the launch placed the instance on (`Placement$HostId`), or `None`
+    /// for an instance on no host of the account. Already resolved against the host store by
+    /// the launch, so an instance never reports a host no describe can report; held on the
+    /// detail because the host an instance runs on is a fact of where it was launched, and it
+    /// is what makes the host's own `Instances` report that instance
+    /// ([`ComAmazonawsEc2Amazonec2State::resync_dedicated_host_instances`]).
+    pub host_id: Option<String>,
     /// `PrivateDnsNameOptionsResponse$HostnameType`, or `None` to follow the subnet's.
     pub private_dns_hostname_type: Option<&'static str>,
     /// `PrivateDnsNameOptionsResponse$EnableResourceNameDnsARecord`, or `None` to follow
@@ -220,6 +227,7 @@ impl Default for InstanceDetail {
             bandwidth_weighting: BANDWIDTH_WEIGHTING_DEFAULT,
             tenancy: TENANCY_DEFAULT,
             placement_group_name: None,
+            host_id: None,
             private_dns_hostname_type: None,
             private_dns_a_record: None,
             private_dns_aaaa_record: None,
@@ -349,6 +357,7 @@ impl InstanceDetail {
             tenancy: requested_word("Tenancy", spec.tenancy, TENANCY_VALUES)?
                 .unwrap_or(TENANCY_DEFAULT),
             placement_group_name: spec.placement_group_name.map(str::to_string),
+            host_id: spec.host_id.map(str::to_string),
             private_dns_hostname_type: requested_word(
                 "HostnameType",
                 spec.private_dns_name_options
@@ -469,6 +478,9 @@ pub struct InstanceDetailSpec<'request> {
     /// `Placement$GroupName` — the placement group the launch named, already resolved
     /// against the placement group store by the handler that serves the launch.
     pub placement_group_name: Option<&'request str>,
+    /// `Placement$HostId` — the Dedicated Host the launch named, already resolved against the
+    /// Dedicated Host store by the handler that serves the launch.
+    pub host_id: Option<&'request str>,
     /// The account's own IMDS defaults, which stand in for every metadata option the
     /// request left out.
     pub account_metadata_defaults: AccountInstanceMetadataDefaults,
@@ -583,6 +595,26 @@ impl ComAmazonawsEc2Amazonec2State {
             .and_then(|placement| placement.group_name.as_deref())
             .filter(|group_name| !group_name.is_empty())
             .filter(|group_name| self.placement_group_id_for_name(group_name).is_some());
+        // The Dedicated Host the version places the instance on, read on the same terms as the
+        // placement group above: a host the account holds none of is NOT carried, the instance
+        // would otherwise report a host no describe can report.
+        //
+        // Read LENIENTLY, as the placement group beside it is, because this projection also
+        // serves a reader of a stored template VERSION rather than only the launch that names
+        // one: a consumer of the template (an Auto Scaling group's capacity change) brings no
+        // request this could be refused against. The launch a CALLER sends is held to the
+        // stricter rule, where an unresolvable `Placement.HostId` refuses the request with
+        // `InvalidHostID.NotFound` (`crate::ops::run_instances`).
+        let host_id = data
+            .placement
+            .as_ref()
+            .and_then(|placement| placement.host_id.as_deref())
+            .filter(|host_id| !host_id.is_empty())
+            .filter(|host_id| {
+                self.dedicated_hosts
+                    .get(*host_id)
+                    .is_some_and(|host| !crate::state::host_is_released(host))
+            });
         InstanceDetail::launched::<()>(InstanceDetailSpec {
             metadata_options: metadata_options.as_ref(),
             enclave_options: enclave_options.as_ref(),
@@ -602,6 +634,7 @@ impl ComAmazonawsEc2Amazonec2State {
                 .as_ref()
                 .and_then(|placement| placement.tenancy.as_deref()),
             placement_group_name,
+            host_id,
             account_metadata_defaults: self.instance_metadata_defaults(),
             image_imds_support: image_imds_support.as_deref(),
         })
@@ -808,10 +841,13 @@ impl ComAmazonawsEc2Amazonec2State {
             group_name: Some(detail.placement_group_name.clone().unwrap_or_default()),
             group_id: placement_group,
             tenancy: Some(detail.tenancy.to_string()),
-            // A Dedicated Host, a partition and a host resource group are all things a
-            // launch asks for; this one asked for none.
+            // The Dedicated Host the launch placed this instance on, where it placed it on
+            // one — resolved against the host store by the launch, so this reports a host the
+            // account holds. A partition and a host resource group are things a launch asks
+            // for; this one asked for neither, and affinity is a setting `ModifyInstancePlacement`
+            // writes rather than one a launch onto a named host carries.
             affinity: None,
-            host_id: None,
+            host_id: detail.host_id.clone(),
             host_resource_group_arn: None,
             partition_number: None,
             spread_domain: None,

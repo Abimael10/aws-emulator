@@ -298,6 +298,10 @@ struct CreateCase {
     case: &'static str,
     /// The Regional Internet Registry the association is with, a member of `Rir`.
     rir: &'static str,
+    /// The registry as the association REPORTS it: the registry's own canonical identifier,
+    /// written out literally here so the canonical form itself is pinned rather than computed
+    /// by the code under test.
+    reported_rir: &'static str,
     /// The organization handle at that registry, as each registry spells one.
     organization_handle: &'static str,
     /// The description, when the request carries one.
@@ -313,6 +317,7 @@ fn create_cases() -> Vec<CreateCase> {
         CreateCase {
             case: "arin, no optional member at all",
             rir: "arin",
+            reported_rir: "ARIN",
             organization_handle: "EXAMPLE-ORG",
             description: None,
             tags: Vec::new(),
@@ -320,6 +325,7 @@ fn create_cases() -> Vec<CreateCase> {
         CreateCase {
             case: "ripe with a description and one tag",
             rir: "ripe",
+            reported_rir: "RIPE",
             organization_handle: "ORG-EX1-RIPE",
             description: Some("delegated rpki for the edge prefixes"),
             tags: vec![("Name", "edge")],
@@ -327,6 +333,7 @@ fn create_cases() -> Vec<CreateCase> {
         CreateCase {
             case: "apnic with three tags",
             rir: "apnic",
+            reported_rir: "APNIC",
             organization_handle: "A12345678",
             description: Some("apac"),
             tags: vec![("Name", "apac"), ("Team", "network"), ("Env", "prod")],
@@ -334,6 +341,7 @@ fn create_cases() -> Vec<CreateCase> {
         CreateCase {
             case: "lacnic with a description and no tags",
             rir: "lacnic",
+            reported_rir: "LACNIC",
             organization_handle: "LACNIC-EX",
             description: Some("latam"),
             tags: Vec::new(),
@@ -341,6 +349,7 @@ fn create_cases() -> Vec<CreateCase> {
         CreateCase {
             case: "nicbr with one tag and no description",
             rir: "nicbr",
+            reported_rir: "NICBR",
             organization_handle: "NICBR-EX",
             description: None,
             tags: vec![("Name", "brazil")],
@@ -449,10 +458,11 @@ async fn create_stores_the_association_the_request_describes() {
              the create was signed for, got {association:?}"
         );
 
-        // What the request decided, carried through.
+        // What the request decided, carried through — the registry under the canonical
+        // identifier this service reports a registry by.
         assert_eq!(
             association.rir.as_deref(),
-            Some(row.rir),
+            Some(row.reported_rir),
             "case {case:?}: the association is with the registry asked for, \
              got {association:?}"
         );
@@ -498,7 +508,7 @@ async fn create_stores_the_association_the_request_describes() {
             case,
             &router,
             signing_region,
-            &filters(&[("rir", &[row.rir])]),
+            &filters(&[("rir", &[row.reported_rir])]),
         )
         .await;
         assert_eq!(

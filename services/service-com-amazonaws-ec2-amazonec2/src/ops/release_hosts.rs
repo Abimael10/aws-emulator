@@ -136,7 +136,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         use crate::scaffolded::Scaffolded;
         use crate::state::{
-            HOST_STATE_RELEASED, INCORRECT_STATE, INVALID_HOST_ID_MALFORMED, MAX_RESOURCE_IDS,
+            HOST_OCCUPIED, HOST_STATE_RELEASED, INVALID_HOST_ID_MALFORMED, MAX_RESOURCE_IDS,
             host_is_released, require_service_state, system_time_to_date_time,
             unresolvable_host_ids_message,
         };
@@ -161,6 +161,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let state = require_service_state(&*self.engine)?;
         let mut store = state.lock();
+        // The clock first: an instance the clock has already terminated has left the host it
+        // was launched on, so the move is applied before the hosts' dependencies are read —
+        // it was owed at this instant whether or not anybody called.
+        store.materialize_due_transitions();
 
         // "On-Demand billing is stopped and the host goes into released state": the move is
         // due at the instant this call is served — the clock owes nothing later — so every
@@ -202,22 +206,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     unresolvable_host_ids_message([host_id.as_str()]),
                 )),
                 // "You must stop or terminate all instances on a host before it can be
-                // released": a host still running instances is in a state that does not
-                // admit the release, so it is reported instead of released under them.
-                Some(host)
-                    if host
-                        .instances
-                        .as_ref()
-                        .is_some_and(|instances| !instances.is_empty()) =>
-                {
-                    Some((
-                        INCORRECT_STATE,
-                        format!(
-                            "The Dedicated Host '{host_id}' still has instances running on it; \
-                             stop or terminate them before releasing it"
-                        ),
-                    ))
-                }
+                // released": a host still running instances is OCCUPIED by them, which is the
+                // cause this operation reports per item under its own code
+                // ([`crate::state::HOST_OCCUPIED`]) rather than releasing the host under them.
+                // Asked of the INSTANCE store
+                // ([`crate::state::ComAmazonawsEc2Amazonec2State::dedicated_host_is_occupied`]),
+                // which is where that fact lives: the host's own `Instances` is the derived
+                // REPORT of it. The sentence is this service's own — the recorded item carried
+                // the code above, not a message — and it states the documented remedy with the
+                // host from the request.
+                Some(_) if store.dedicated_host_is_occupied(host_id) => Some((
+                    HOST_OCCUPIED,
+                    format!(
+                        "The Dedicated Host '{host_id}' still has instances running on it; \
+                         stop or terminate them before releasing it"
+                    ),
+                )),
                 Some(_) => None,
             };
             match refusal {

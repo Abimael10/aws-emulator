@@ -475,6 +475,12 @@ impl ComAmazonawsEc2Amazonec2State {
         for address in released {
             self.release_private_ip(&address);
         }
+        // Which instances are ON a Dedicated Host follows from the states just applied: an
+        // instance that has reached `terminated` — or `stopped` — has left the host it was
+        // launched on, so the hosts' own `Instances` is recomputed here rather than left
+        // naming an instance that is no longer running. A recompute of a derived member, owed
+        // at the same instant the moves above were.
+        self.resync_dedicated_host_instances();
         // The guest boots the clock already owes: an instance that has just finished starting
         // has brought its operating system up, and one whose queued reboot fell due has
         // brought it up again. Applied after the state moves above, so an instance that
@@ -1321,25 +1327,58 @@ impl ComAmazonawsEc2Amazonec2State {
         }
         // The end of a path analysis `StartNetworkInsightsAnalysis` answered as `running`,
         // on the same contract as the access scope analysis above: at its due instant the
-        // analysis reaches the terminal `AnalysisStatus` the start recorded for it, whether
-        // or not anybody called again.
-        for record in self.network_insights_analyses.values_mut() {
-            let Some(pending) = record
-                .pending
-                .as_ref()
-                .filter(|pending| now >= pending.due_at)
-                .cloned()
-            else {
+        // analysis reaches its terminal `AnalysisStatus`, whether or not anybody called
+        // again. The analyses due are collected first because reading the VERDICT of one
+        // borrows the networks it traces.
+        let due_analyses: Vec<(String, &'static str, String)> = self
+            .network_insights_analyses
+            .iter()
+            .filter_map(|(analysis_id, record)| {
+                let pending = record.pending.as_ref().filter(|pending| now >= pending.due_at)?;
+                Some((
+                    analysis_id.clone(),
+                    pending.to,
+                    record
+                        .view
+                        .network_insights_path_id
+                        .clone()
+                        .unwrap_or_default(),
+                ))
+            })
+            .collect();
+        for (analysis_id, owed, path_id) in due_analyses {
+            // The verdict is read off the network as it stands at the due instant — the
+            // security groups, network ACLs and routes the path runs through — so an analysis
+            // reports what the stored network does to its packet.
+            let traced = (owed == ANALYSIS_STATUS_SUCCEEDED)
+                .then(|| self.trace_stored_network_insights_path(&path_id))
+                .flatten();
+            let Some(record) = self.network_insights_analyses.get_mut(&analysis_id) else {
                 continue;
             };
-            record.view.status = Some(pending.to.to_string());
-            record.view.status_message =
-                Some(PATH_ANALYSIS_UNSUPPORTED_STATUS_MESSAGE.to_string());
-            // "Indicates whether the destination is reachable from the source"
-            // (`NetworkInsightsAnalysis$NetworkPathFound`): nothing traced this path, so
-            // whether it is reachable was never determined, and a boolean either way would
-            // be a result no engine produced. It stays absent, as do the path components,
-            // the explanations and the hints that only a trace could fill in.
+            match traced {
+                Some(trace) => {
+                    record.view.status = Some(ANALYSIS_STATUS_SUCCEEDED.to_string());
+                    // "The status message, if the status is `failed`"
+                    // (`NetworkInsightsAnalysis$StatusMessage`): this analysis produced a
+                    // result, so there is no failure to report.
+                    record.view.status_message = None;
+                    // "Indicates whether the destination is reachable from the source"
+                    // (`$NetworkPathFound`), with the components the trace walked and the
+                    // explanation of a packet that stopped at one of them.
+                    record.view.network_path_found = Some(trace.network_path_found);
+                    record.view.forward_path_components = Some(trace.forward_path_components);
+                    record.view.explanations = Some(trace.explanations);
+                }
+                None => {
+                    // A path this emulator does not trace: the analysis ends carrying the
+                    // reason it has no result rather than a verdict nothing computed, and the
+                    // path components, the explanations and the hints stay absent with it.
+                    record.view.status = Some(ANALYSIS_STATUS_FAILED.to_string());
+                    record.view.status_message =
+                        Some(PATH_ANALYSIS_UNSUPPORTED_STATUS_MESSAGE.to_string());
+                }
+            }
             record.pending = None;
         }
         // Each IPAM whose `create-complete` has fallen due, with the scopes, resource

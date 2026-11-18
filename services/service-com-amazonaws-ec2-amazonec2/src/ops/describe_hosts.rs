@@ -251,7 +251,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let state = require_service_state(&*self.engine)?;
-        let store = state.lock();
+        let mut store = state.lock();
+        // The clock first, the way every other read of this crate starts: the instances a host
+        // reports are the ones RUNNING on it, so an instance the clock has already terminated
+        // has left the host it was launched on — a move owed at this instant whether or not
+        // anybody called, which is what recomputes the hosts' `Instances`
+        // ([`crate::state::ComAmazonawsEc2Amazonec2State::resync_dedicated_host_instances`]).
+        store.materialize_due_transitions();
 
         // "Describes the specified Dedicated Hosts": an id that names no host of the
         // account is an error, not an absent row — and to EC2 an id it never issued is not

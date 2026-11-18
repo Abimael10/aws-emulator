@@ -336,11 +336,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // (`Route$Origin`).
             origin: state::ROUTE_ORIGIN_CREATE_ROUTE,
         };
-        // One destination has one target, so a second route for a destination the table
-        // already routes is refused rather than replacing the first — that is
-        // `ReplaceRoute`.
-        if store.route_table_holds_destination(&input.route_table_id, spec.destination()) {
-            return Err(state::route_already_exists(spec.destination()));
+        // One destination has one target, so a destination the table already routes is
+        // answered by comparing the TARGET as well: re-asserting the route that is already
+        // there asks for nothing, while the same destination toward a DIFFERENT target would
+        // re-point it, which is refused rather than performed — that is `ReplaceRoute`.
+        let already_routed = store
+            .route_for_destination(&input.route_table_id, spec.destination())
+            .map(|route| state::route_points_at(route, &spec.target));
+        match already_routed {
+            // "Ensure that the operation is idempotent" is what a converging caller re-asserts
+            // its routes for: the route the request asks for is the one the table holds, so the
+            // call changes nothing and answers the success a create answers.
+            Some(true) => {
+                // A dry run of a request that WOULD have succeeded answers `DryRunOperation`,
+                // on exactly the terms the fresh create below answers it.
+                if input.dry_run.unwrap_or(false) {
+                    return Err(state::dry_run_operation());
+                }
+                return Ok(CreateRouteOutput {
+                    r#return: Some(true),
+                });
+            }
+            Some(false) => return Err(state::route_already_exists(spec.destination())),
+            None => {}
         }
         if store.route_count(&input.route_table_id) >= state::MAX_ROUTES_PER_ROUTE_TABLE {
             return Err(state::route_limit_exceeded());
@@ -488,6 +506,17 @@ pub(crate) fn resolve_target<E>(
                 // carried it, like the route's other targets.
                 return Err(state::transit_gateway_route_target_not_found(value));
             }
+            // A transit gateway carries a VPC's traffic only through an ATTACHMENT to that
+            // VPC, so a gateway with none in the route table's own VPC is as unreachable from
+            // this table as a gateway attached to another network: the route would forward
+            // nothing, which is the refusal EC2 answers naming both sides.
+            if !store.transit_gateway_is_attached_to_vpc(value, vpc_id) {
+                // A transit gateway is reached from a VPC through its ATTACHMENT to that VPC,
+                // so a route table of a VPC the gateway has no attachment in resolves no
+                // transit gateway at all: the member answers its own not-found, the same way
+                // it answers an id the account holds no gateway for.
+                return Err(state::transit_gateway_route_target_not_found(value));
+            }
             Ok(RouteTarget::TransitGateway(value.to_string()))
         }
         "localGatewayId" => {
@@ -554,6 +583,11 @@ fn belongs_to_another_network<E>(
 
 /// A GATEWAY target, as the refusal above names it: the gateway noun and the id the request
 /// carried.
+///
+/// Every target that is a GATEWAY of a network is named this way, whichever kind of gateway it
+/// is — an internet gateway, a virtual private gateway, an egress-only one, and a transit
+/// gateway the route table's VPC has no attachment to — so one rule about a target that sits in
+/// another network reads one way whatever the caller pointed the route at.
 fn network_gateway_noun(gateway_id: &str) -> String {
     format!("network gateway {gateway_id}")
 }

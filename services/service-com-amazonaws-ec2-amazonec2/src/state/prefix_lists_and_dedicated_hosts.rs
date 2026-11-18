@@ -1191,6 +1191,16 @@ pub const INVALID_HOST_ID_NOT_FOUND: &str = "InvalidHostID.NotFound";
 /// at all, so there is nothing to look up.
 pub const INVALID_HOST_ID_MALFORMED: &str = "InvalidHostID.Malformed";
 
+/// `Client.InvalidHost.Occupied`: the code a `ReleaseHosts` item carries for a host that still
+/// has instances on it.
+///
+/// "You must stop or terminate all instances on a host before it can be released"
+/// (`ReleaseHosts`), and a host that still runs them is reported in `Unsuccessful` under this
+/// code — the recorded code for that one cause, which is NOT the general
+/// [`INCORRECT_STATE`] the rest of this service answers a state that does not admit a request
+/// with.
+pub const HOST_OCCUPIED: &str = "Client.InvalidHost.Occupied";
+
 /// `InvalidHostReservationOfferingId.Malformed` (HTTP 400): the request named something that
 /// is not a Dedicated Host reservation OFFERING id at all, so there is nothing to look up —
 /// the `Invalid<Kind>.Malformed` half of the pair, refused before the published catalog is
@@ -2103,7 +2113,8 @@ pub fn default_vpc_endpoint_policy(endpoint_type: &str) -> &'static str {
 }
 
 /// Whether `document` grants FULL ACCESS to the service — every action, by every principal, on
-/// every resource — whatever whitespace, key order or statement form it is written in.
+/// every resource, and nothing else stated — whatever whitespace, key order or statement form
+/// it is written in.
 ///
 /// "we attach a default policy that allows full access to the service"
 /// (`CreateVpcEndpointRequest$PolicyDocument`) is a question about what a document GRANTS, so it
@@ -2111,6 +2122,13 @@ pub fn default_vpc_endpoint_policy(endpoint_type: &str) -> &'static str {
 /// a caller that writes the full-access policy out itself has written the full-access policy.
 /// A statement's `Action`, `Principal` and `Resource` may each be the string `*` or a list whose
 /// only entry is, which are the same grant.
+///
+/// A statement that states anything BESIDE that grant grants less than full access, however
+/// wide its three members are — a `Condition` lets the grant through only for the requests it
+/// matches, a `Not…` member grants everything EXCEPT what it names, and a member this reader
+/// does not know is not one it may ignore — so only the keys that MAKE the grant, and the `Sid`
+/// that merely names the statement, are admitted. Either way such a document is a restriction,
+/// which is what a service supporting no endpoint policy would ignore.
 pub fn policy_document_grants_full_access(document: &str) -> bool {
     let Ok(parsed) = ::serde_json::from_str::<::serde_json::Value>(document) else {
         return false;
@@ -2135,10 +2153,21 @@ pub fn policy_document_grants_full_access(document: &str) -> bool {
         }
     };
     statements.iter().all(|statement| {
+        let Some(members) = statement.as_object() else {
+            return false;
+        };
         statement.get("Effect").and_then(::serde_json::Value::as_str) == Some("Allow")
             && grants_everything(statement.get("Action"))
             && grants_everything(statement.get("Principal"))
             && grants_everything(statement.get("Resource"))
+            // Nothing else is stated: the keys that make the grant, and the name a statement
+            // may carry. Anything further narrows it.
+            && members.keys().all(|member| {
+                matches!(
+                    member.as_str(),
+                    "Sid" | "Effect" | "Action" | "Principal" | "Resource"
+                )
+            })
     })
 }
 
@@ -2594,12 +2623,22 @@ pub(super) const OFFERS_POLICY_AND_PRIVATE_DNS: EndpointServiceOffering =
 /// The AWS IoT Core DATA-plane service is one: a recorded `DescribeVpcEndpointServices` reports
 /// it with no private DNS name and no endpoint-policy support, which is why a narrowing policy
 /// cannot be written for it and why an endpoint to it is reached through the endpoint's own DNS
-/// names rather than through the service's public hostname. A label this table does not name
-/// keeps the default, so this is the one place a service's offering differs from it.
-pub(super) const ENDPOINT_SERVICE_OFFERINGS: &[(&str, EndpointServiceOffering)] = &[(
-    "iot.data",
-    EndpointServiceOffering { policy: false, private_dns: false },
-)];
+/// names rather than through the service's public hostname. The Amazon AppStream 2.0 STREAMING
+/// service is another: a recorded `DescribeVpcEndpointServices` reports it with
+/// `VpcEndpointPolicySupported` false — the streaming data plane carries sessions rather than
+/// API calls, so there is no request for a policy to allow or deny — which is why a custom
+/// endpoint policy on an endpoint to it is refused. A label this table does not name keeps the
+/// default, so this is the one place a service's offering differs from it.
+pub(super) const ENDPOINT_SERVICE_OFFERINGS: &[(&str, EndpointServiceOffering)] = &[
+    (
+        "appstream.streaming",
+        EndpointServiceOffering { policy: false, private_dns: true },
+    ),
+    (
+        "iot.data",
+        EndpointServiceOffering { policy: false, private_dns: false },
+    ),
+];
 
 /// What the service under `label` offers ([`ENDPOINT_SERVICE_OFFERINGS`]), or the default every
 /// other published service carries.

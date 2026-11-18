@@ -484,10 +484,30 @@ async fn a_route_to_an_absent_transit_gateway_names_the_member_it_arrived_in() {
     let table = ok(case, &router, "CreateRouteTable", &[param("VpcId", &vpc_id)]).await;
     let route_table_id = member(case, &table, "routeTableId");
 
-    // A gateway the account DOES hold, so the route replaced below has a target to begin with
-    // and the refusals are about the id the request named.
+    // A gateway the account DOES hold, ATTACHED to that VPC, so the route replaced below has a
+    // target to begin with — a transit gateway carries a VPC's traffic only through an
+    // attachment to it — and the refusals are about the id the request named.
     let gateway = ok(case, &router, "CreateTransitGateway", &[]).await;
     let transit_gateway_id = member(case, &gateway, "transitGatewayId");
+    let subnet = ok(
+        case,
+        &router,
+        "CreateSubnet",
+        &[param("VpcId", &vpc_id), param("CidrBlock", "10.60.1.0/24")],
+    )
+    .await;
+    let attachment_subnet_id = member(case, &subnet, "subnetId");
+    ok(
+        case,
+        &router,
+        "CreateTransitGatewayVpcAttachment",
+        &[
+            param("TransitGatewayId", &transit_gateway_id),
+            param("VpcId", &vpc_id),
+            param("SubnetIds.1", &attachment_subnet_id),
+        ],
+    )
+    .await;
     let destination = "192.168.0.0/16";
     ok(
         case,

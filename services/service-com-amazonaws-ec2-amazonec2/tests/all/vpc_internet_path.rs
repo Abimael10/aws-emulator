@@ -619,8 +619,9 @@ async fn create_route_stores_one_route_per_destination_against_an_attached_gatew
             "case {case:?}: expected the route's origin to be CreateRoute, got {read}"
         );
 
-        // One destination has one target, so the same destination again is refused rather
-        // than replacing the route that holds.
+        // One destination has one target, so the same destination toward the SAME target
+        // again asks for the route that is already there: the call is an idempotent no-op
+        // success and the table still holds exactly one route for it.
         let (status, duplicate) = call(
             &router,
             "CreateRoute",
@@ -632,19 +633,25 @@ async fn create_route_stores_one_route_per_destination_against_an_attached_gatew
         )
         .await;
         assert_eq!(
-            status, 400,
-            "case {case:?}: expected the duplicate destination refused, got {status} with \
+            status, 200,
+            "case {case:?}: expected the identical re-submission to succeed, got {status} with \
              body {duplicate}"
         );
         assert_eq!(
-            error_code(&duplicate),
-            "RouteAlreadyExists",
-            "case {case:?}: expected RouteAlreadyExists, got {duplicate}"
+            element(&duplicate, "return").as_deref(),
+            Some("true"),
+            "case {case:?}: expected return=true for the identical re-submission, got \
+             {duplicate}"
         );
-        assert!(
-            error_message(&duplicate).contains(canonical),
-            "case {case:?}: expected the refusal to name {canonical}, got {}",
-            error_message(&duplicate)
+        let read_again = describe_route_table(case, &router, &route_table_id).await;
+        assert_eq!(
+            elements(&read_again, destination_element)
+                .iter()
+                .filter(|destination| *destination == canonical)
+                .count(),
+            1,
+            "case {case:?}: expected exactly one route for {canonical} after the re-submission, \
+             got {read_again}"
         );
     }
 }

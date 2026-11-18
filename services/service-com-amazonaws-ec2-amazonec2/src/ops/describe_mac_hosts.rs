@@ -213,7 +213,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let state = require_service_state(&*self.engine)?;
-        let store = state.lock();
+        let mut store = state.lock();
+        // The clock first, on the same terms as `DescribeHosts`: a Mac host reports the
+        // instances RUNNING on it, so an instance the clock has already terminated has left it.
+        store.materialize_due_transitions();
 
         // "Describes the specified EC2 Mac Dedicated Host" (`DescribeMacHosts`): an id that
         // names no EC2 Mac Dedicated Host of the account is an error, not an absent row —

@@ -178,6 +178,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         }
 
+        // An endpoint is what carries its route server's BGP sessions to the appliances in the
+        // VPC — a peer is "a BGP peer configured to exchange routes with a route server
+        // endpoint" (`CreateRouteServerPeer`) — so every peer of the endpoint DEPENDS on it:
+        // the peers have to be deleted first, and until they are the endpoint cannot be taken
+        // down. The refusal names the peer that still holds it, which is what a caller needs
+        // to make progress.
+        if let Some(peer_id) = store.route_server_peer_holding_endpoint(&input.route_server_endpoint_id)
+        {
+            return Err(state::route_server_endpoint_has_peer(&peer_id));
+        }
+
         // The request is one that would have succeeded, so a dry run stops HERE: "If you
         // have the required permissions, the error response is DryRunOperation" (`DryRun`).
         // Nothing has been written yet, and nothing is.

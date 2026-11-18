@@ -528,7 +528,45 @@ impl RouteSpec {
     }
 }
 
+/// Does the stored route `route` point at `target`?
+///
+/// Read through the one mapping of a target onto the member its kind belongs in
+/// ([`RouteSpec::into_route`]): a stored route carries its target in exactly one member, so two
+/// are the same target when that member holds the same id. What a create asks to tell a route it
+/// is being asked for AGAIN from one that would re-point a destination somewhere else.
+pub fn route_points_at(route: &Route, target: &RouteTarget) -> bool {
+    let (stored, named) = match target {
+        RouteTarget::Gateway(id) => (route.gateway_id.as_deref(), id),
+        RouteTarget::NatGateway(id) => (route.nat_gateway_id.as_deref(), id),
+        RouteTarget::Instance(id) => (route.instance_id.as_deref(), id),
+        RouteTarget::NetworkInterface(id) => (route.network_interface_id.as_deref(), id),
+        RouteTarget::TransitGateway(id) => (route.transit_gateway_id.as_deref(), id),
+        RouteTarget::CarrierGateway(id) => (route.carrier_gateway_id.as_deref(), id),
+        RouteTarget::LocalGateway(id) => (route.local_gateway_id.as_deref(), id),
+        RouteTarget::VpcPeeringConnection(id) => (route.vpc_peering_connection_id.as_deref(), id),
+        RouteTarget::EgressOnlyInternetGateway(id) => {
+            (route.egress_only_internet_gateway_id.as_deref(), id)
+        }
+    };
+    stored == Some(named.as_str())
+}
+
 impl ComAmazonawsEc2Amazonec2State {
+    /// The route the table `route_table_id` holds for `destination`, if it holds one.
+    ///
+    /// The same question [`Self::route_table_holds_destination`] answers, with the route
+    /// itself: a create that finds the destination already routed has to know WHAT it is
+    /// routed to, since re-asserting the same destination toward the same target asks for
+    /// nothing that is not already there ([`route_points_at`]).
+    pub fn route_for_destination(&self, route_table_id: &str, destination: &str) -> Option<&Route> {
+        self.route_tables
+            .get(route_table_id)?
+            .routes
+            .as_deref()?
+            .iter()
+            .find(|route| route_matches_destination(route, destination))
+    }
+
     /// The VPC the internet gateway `internet_gateway_id` is attached to, if it is attached
     /// to one.
     ///
@@ -725,18 +763,13 @@ impl ComAmazonawsEc2Amazonec2State {
 
     /// Whether the route table `route_table_id` already holds a route for `destination`.
     ///
-    /// One destination has one target, so this is what a create asks before storing a
-    /// second route for it — read through [`RouteSpec::destination`] on one side and the
-    /// stored route's own members on the other, so the two readings cannot differ.
+    /// One destination has one target, so this is what a writer asks before storing a second
+    /// route for it — answered by the one matcher that finds such a route
+    /// ([`Self::route_for_destination`]), so the question and the route it names cannot be
+    /// decided two ways.
     pub fn route_table_holds_destination(&self, route_table_id: &str, destination: &str) -> bool {
-        self.route_tables
-            .get(route_table_id)
-            .and_then(|route_table| route_table.routes.as_deref())
-            .is_some_and(|routes| {
-                routes
-                    .iter()
-                    .any(|route| route_matches_destination(route, destination))
-            })
+        self.route_for_destination(route_table_id, destination)
+            .is_some()
     }
 
     /// How many routes the route table `route_table_id` holds, which is what

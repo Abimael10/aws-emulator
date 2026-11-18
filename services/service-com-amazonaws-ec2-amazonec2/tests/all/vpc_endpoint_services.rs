@@ -195,7 +195,10 @@ const CATALOGUE_CASES: [CatalogueCase; 6] = [
         dns_host: "streaming.appstream",
         types: &["Interface"],
         private_dns: true,
-        policy: true,
+        // The streaming data plane carries sessions rather than API calls, so it supports no
+        // endpoint policy while publishing a private DNS name of its own: the two facts of a
+        // service's offering are independent.
+        policy: false,
     },
     CatalogueCase {
         label: "iot.data",

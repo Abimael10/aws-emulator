@@ -854,6 +854,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
             None => None,
         };
+        // "The ID of the Dedicated Host on which the instance resides"
+        // (`Placement$HostId`): a launch that names one puts every instance it mints ON that
+        // host, so the id is resolved against the Dedicated Host store here — a host the
+        // account does not hold, or one it has given back, is refused with EC2's own
+        // `InvalidHostID.NotFound` rather than accepted and dropped, which would leave the
+        // instance reporting a host nothing holds and the host reporting no instance running
+        // on it.
+        let placement_host_id = match input
+            .placement
+            .as_ref()
+            .and_then(|placement| placement.host_id.as_deref())
+            .filter(|host_id| !host_id.is_empty())
+        {
+            Some(host_id) => {
+                if store
+                    .dedicated_hosts
+                    .get(host_id)
+                    .is_none_or(crate::state::host_is_released)
+                {
+                    return Err(crate::state::invalid_host_id_not_found(host_id));
+                }
+                Some(host_id.to_string())
+            }
+            None => None,
+        };
         // The option sets this launch chose for every instance it mints — its metadata
         // options, enclave, stop protection, shutdown behaviour, Capacity Reservation
         // preference, maintenance and network performance options, instance hostname options
@@ -906,6 +931,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .as_ref()
                 .and_then(|placement| placement.tenancy.as_deref()),
             placement_group_name: placement_group_name.as_deref(),
+            host_id: placement_host_id.as_deref(),
             account_metadata_defaults: store.instance_metadata_defaults(),
             image_imds_support: image_imds_support.as_deref(),
         })?;
@@ -1374,6 +1400,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if let Some(token) = input.client_token.clone() {
             store.client_tokens.insert(token, reservation_id.clone());
         }
+
+        // The hosts this launch put instances on now report them: a Dedicated Host's
+        // `Instances` follows from where the account's instances were launched
+        // ([`crate::state::ComAmazonawsEc2Amazonec2State::resync_dedicated_host_instances`]),
+        // so it is recomputed here rather than written beside the instance records — which is
+        // what makes a host carrying an instance refuse to be released under it.
+        store.resync_dedicated_host_instances();
 
         store
             .whole_reservation_view(&reservation_id)

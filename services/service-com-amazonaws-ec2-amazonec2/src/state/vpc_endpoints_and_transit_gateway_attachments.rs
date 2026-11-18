@@ -2932,6 +2932,31 @@ pub const MAX_STORED_RECORDS_PER_STORE: usize = 4096;
 pub const STORED_RECORD_OVERHEAD_BYTES: usize = 512;
 
 impl ComAmazonawsEc2Amazonec2State {
+    /// Whether the transit gateway `transit_gateway_id` has a VPC attachment to `vpc_id` that
+    /// still carries traffic.
+    ///
+    /// "You must create a transit gateway attachment to a VPC before traffic from that VPC can
+    /// reach the transit gateway" (Amazon VPC Transit Gateways guide, "Transit gateway
+    /// attachments to a VPC"): the attachment IS the connection between the two, so this is
+    /// what anything that has to know whether a VPC reaches a gateway asks — a route pointing
+    /// at a gateway no attachment of this VPC reaches would forward nothing.
+    ///
+    /// An attachment the lifecycle has FINISHED with carries no traffic any more
+    /// ([`transit_gateway_attachment_is_finished`]), so it is not one, on exactly the terms
+    /// [`Self::transit_gateway_attachments_of`] reads an attachment the gateway still holds.
+    pub fn transit_gateway_is_attached_to_vpc(
+        &self,
+        transit_gateway_id: &str,
+        vpc_id: &str,
+    ) -> bool {
+        self.transit_gateway_attachments.values().any(|record| {
+            record.view.transit_gateway_id() == Some(transit_gateway_id)
+                && record.view.resource_type() == TRANSIT_GATEWAY_ATTACHMENT_RESOURCE_TYPE_VPC
+                && record.view.resource_id() == Some(vpc_id)
+                && !transit_gateway_attachment_is_finished(record.view.state())
+        })
+    }
+
     /// Whether another transit gateway attachment fits inside the store's ceiling
     /// ([`MAX_STORED_RECORDS_PER_STORE`]).
     ///
