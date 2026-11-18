@@ -18,7 +18,12 @@
 //! shape of the LIST — its length, its paging and its filters — which is where a summary
 //! past the first one, and a page past the first one, is reached at all.
 //!
-//! The last two cases state the rule as the KEY SET of a summary: a summary is the
+//! The last cases take the rule round the LOOP a client closes: a summary read out of a
+//! list goes back into an update, which must accept the values the list reported and
+//! answer the same ones — so a member a client carries round that loop is not dropped on
+//! the way back.
+//!
+//! The key-set cases state the rule as the KEY SET of a summary: a summary is the
 //! projection of the stored channel onto the members its shape declares plus the projected
 //! failover-slate ARN, so it reports each of those members exactly as the single read of
 //! the same channel does — the `failoverSlateConfigurationArn` key included — and reports
@@ -386,6 +391,195 @@ async fn a_summary_follows_its_channel_through_an_update() {
             "case {case:?}: the update must answer the channel it named, got {updated}"
         );
         assert_the_summary_projects_the_channel(&ivs, case, &arn).await;
+    }
+}
+
+/// The summary members `UpdateChannel` declares an input member for
+/// (`smithy_query(query="operation",operation="UpdateChannel")`), `arn` aside: this is
+/// what a client that reads a summary and sends it back into an update can carry over.
+const ROUND_TRIPPED_MEMBERS: &[&str] = &[
+    "name",
+    "latencyMode",
+    "authorized",
+    "recordingConfigurationArn",
+    "insecureIngest",
+    "type",
+    "preset",
+    "playbackRestrictionPolicyArn",
+    "adConfigurationArn",
+];
+
+/// The summary members `UpdateChannel` declares NO input member for: the tag map, which
+/// the tagging operations own, and the projected failover-slate ARN, which no operation of
+/// this model revision can configure. A client sending a whole summary back carries them
+/// along, so they are the members an update must tolerate rather than refuse.
+const NON_INPUT_SUMMARY_MEMBERS: &[&str] = &["tags", FAILOVER_SLATE];
+
+/// An `UpdateChannel` request that sends one summary's own values back, so the update
+/// asks for exactly the channel the summary reported.
+///
+/// `preset` is a `TranscodePreset`, whose declared values are
+/// `HIGHER_BANDWIDTH_DELIVERY` and `CONSTRAINED_BANDWIDTH_DELIVERY`
+/// (`smithy_query(query="shape",shape="TranscodePreset")`); the empty string a `BASIC` or
+/// `STANDARD` channel reports for it is not one of them, so it is not a value an update
+/// can carry back and is left out.
+fn update_sending_back(summary: &Value) -> Value {
+    let mut request = json!({ "arn": text(summary, "arn") });
+    for member in ROUND_TRIPPED_MEMBERS {
+        let Some(value) = summary.get(*member) else {
+            continue;
+        };
+        if *member == "preset" && value.as_str() == Some(UNCONFIGURED) {
+            continue;
+        }
+        request[*member] = value.clone();
+    }
+    request
+}
+
+/// The summary `ListChannels` projects for `arn`.
+async fn summary_of(ivs: &Ivs, case: &str, arn: &str) -> Value {
+    let listed = ivs.ok("ListChannels", json!({})).await;
+    listed["channels"]
+        .as_array()
+        .and_then(|channels| {
+            channels
+                .iter()
+                .find(|summary| text(summary, "arn") == arn)
+                .cloned()
+        })
+        .unwrap_or_else(|| {
+            panic!("case {case:?}: the list must project the channel {arn}, got {listed}")
+        })
+}
+
+/// A summary survives the ROUND TRIP a client puts it through: reading a channel out of a
+/// list and sending those same values back into an update is a no-op, and the channel the
+/// update answers reports every member of the summary it was built from — the projected
+/// failover-slate ARN included — so nothing a summary reported is dropped on the way back.
+///
+/// This is the axis the suites above do not reach: they pin what a list REPORTS, while a
+/// client that round-trips a summary also depends on the reported value being one the API
+/// accepts back and on the update not clearing what it did not mention.
+#[tokio::test]
+async fn a_listed_summary_round_trips_back_through_an_update() {
+    let ivs = Ivs::new();
+    let recording = recording_configuration(&ivs, "recording").await;
+    let ad = ad_configuration(&ivs, "ads").await;
+
+    // Rows differ along the shape of the channel the summary describes: which
+    // configuration ARNs it carries, its type (and so the preset the type decides), its
+    // flags, whether it is named, whether it carries tags, and whether it carries the
+    // `Channel`-only multitrack members no summary declares.
+    let cases: Vec<(&str, Value)> = vec![
+        ("a channel created from an empty request", json!({})),
+        (
+            "a BASIC channel with tags",
+            json!({ "name": "tagged", "type": "BASIC", "tags": { "team": "video" } }),
+        ),
+        (
+            "a channel with every configurable ARN attached",
+            json!({ "name": "configured", "recordingConfigurationArn": recording.clone(),
+                    "playbackRestrictionPolicyArn": POLICY_ARN,
+                    "adConfigurationArn": ad.clone() }),
+        ),
+        (
+            "an authorized ADVANCED_HD channel ingesting insecurely",
+            json!({ "name": "advanced", "type": "ADVANCED_HD", "authorized": true,
+                    "insecureIngest": true }),
+        ),
+        (
+            "an ADVANCED_SD channel carrying the multitrack members no summary declares",
+            json!({ "name": "multitrack", "type": "ADVANCED_SD",
+                    "containerFormat": "FRAGMENTED_MP4",
+                    "multitrackInputConfiguration": { "enabled": true, "policy": "REQUIRE",
+                                                      "maximumResolution": "HD" } }),
+        ),
+        (
+            "a STANDARD channel with the low latency mode",
+            json!({ "name": "low", "type": "STANDARD", "latencyMode": "LOW" }),
+        ),
+    ];
+
+    for (case, request) in cases {
+        let arn = ivs.create_arn(request).await;
+        let summary = summary_of(&ivs, case, &arn).await;
+
+        let updated = ivs
+            .ok("UpdateChannel", update_sending_back(&summary))
+            .await["channel"]
+            .clone();
+        for member in SUMMARY_MEMBERS {
+            let sent = summary.get(*member).cloned();
+            let answered = updated.get(*member).cloned();
+            assert_eq!(
+                answered, sent,
+                "case {case:?}: an update sending the summary back must answer {member} as \
+                 the summary reported it ({sent:?}), got {answered:?} in {updated}"
+            );
+        }
+
+        let again = summary_of(&ivs, case, &arn).await;
+        assert_eq!(
+            again, summary,
+            "case {case:?}: sending a summary back must leave the channel as it was, got \
+             {again} after {summary}"
+        );
+    }
+}
+
+/// The same round trip made the way a dynamic client makes it: the WHOLE summary object
+/// goes back as the update's request body, the members `UpdateChannel` declares no input
+/// member for included — the tag map and the projected failover-slate ARN — and the update
+/// is accepted and still reports the projected member.
+///
+/// Only the ADVANCED types are driven here, because they are the ones whose summary
+/// reports a `preset` the enum admits (see [`update_sending_back`]), so the whole object
+/// is a valid request as it stands.
+#[tokio::test]
+async fn a_whole_summary_sent_back_verbatim_is_accepted() {
+    let ivs = Ivs::new();
+    let recording = recording_configuration(&ivs, "recording").await;
+
+    // Rows differ along the ADVANCED type, which decides the preset, and along whether
+    // the channel carries configuration ARNs and tags that travel back with it.
+    let cases: Vec<(&str, Value)> = vec![
+        (
+            "an ADVANCED_HD channel with tags",
+            json!({ "name": "hd", "type": "ADVANCED_HD", "tags": { "team": "video" } }),
+        ),
+        (
+            "an ADVANCED_SD channel with a recording configuration",
+            json!({ "name": "sd", "type": "ADVANCED_SD",
+                    "recordingConfigurationArn": recording.clone() }),
+        ),
+    ];
+
+    for (case, request) in cases {
+        let arn = ivs.create_arn(request).await;
+        let summary = summary_of(&ivs, case, &arn).await;
+        for member in NON_INPUT_SUMMARY_MEMBERS {
+            assert!(
+                summary.get(*member).is_some(),
+                "case {case:?}: the summary must report {member}, got {summary}"
+            );
+        }
+
+        let updated = ivs.ok("UpdateChannel", summary.clone()).await["channel"].clone();
+        let failover = updated.get(FAILOVER_SLATE).cloned().unwrap_or(Value::Null);
+        assert_eq!(
+            failover,
+            Value::String(UNCONFIGURED.to_string()),
+            "case {case:?}: the updated channel must report {FAILOVER_SLATE} as the \
+             unconfigured {UNCONFIGURED:?}, got {failover:?} in {updated}"
+        );
+
+        let again = summary_of(&ivs, case, &arn).await;
+        assert_eq!(
+            again, summary,
+            "case {case:?}: sending a summary back verbatim must leave the channel as it \
+             was, got {again} after {summary}"
+        );
     }
 }
 
