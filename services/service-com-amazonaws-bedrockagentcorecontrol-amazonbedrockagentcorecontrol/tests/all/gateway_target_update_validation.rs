@@ -7,12 +7,13 @@
 //! [`MultiServiceRouter::dispatch`], so the wire protocol (`restJson1`), the boundary
 //! constraint validation and the handler are all exercised, against the one shared engine.
 //!
-//! The rule under test: the resources the URI PATH addresses are resolved FIRST, so a path
-//! naming a gateway or a target that is not there is the modelled
-//! `ResourceNotFoundException` (404) whatever the body carries; only the members the MODEL
-//! constrains are refused ahead of that lookup (the boundary enforces them), and a body this
-//! operation cannot render into its modelled response is the modelled `ValidationException`
-//! (HTTP 400) once the resources it names are known to be there.
+//! The rule under test: the GATEWAY the path label names is resolved first, so a
+//! `gatewayIdentifier` naming no gateway is the modelled `ResourceNotFoundException` (404)
+//! whatever the body carries; a refusal this operation decides from the request body alone —
+//! a member its own response requires that the body leaves undefined — is then reported
+//! BEFORE the child the path names under that gateway is resolved, as the modelled
+//! `ValidationException` (HTTP 400); and the child's own 404 is reached only by a body this
+//! operation could otherwise render into its response.
 //!
 //! The two body members this service's gateway-target writes judge, read off the model
 //! (`smithy_query(query="operation",operation="UpdateGatewayTarget")` /
@@ -20,9 +21,12 @@
 //! `UpdateGatewayTarget`'s request and `@required` with exactly one entry on its response,
 //! and the update REPLACES the target's whole configuration — so a body that defines none
 //! leaves the response nothing to report; `name` is optional on `CreateGatewayTarget`'s
-//! request and `@required` on every response that reports a target. Neither is `@required` on
-//! the request, so neither refusal can precede the path's own lookup. A body that DOES define
+//! request and `@required` on every response that reports a target. A body that DOES define
 //! the member is served, and nothing a refused request carried is written.
+//!
+//! `CreateGatewayTarget` addresses no child of its own — the target it would mint does not
+//! exist yet — so the only resource it resolves is the gateway the path label names, which is
+//! resolved ahead of its own judgement of `name`.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -219,9 +223,10 @@ async fn update_target(
 }
 
 /// A body that defines no credential provider configurations is refused 400 once the gateway
-/// and the target the path names are resolved — for a target that is there, and for a gateway
-/// the clock still owes a transition — and nothing it asked for is written. A path naming a
-/// resource that is NOT there answers the modelled 404 instead, whatever the body left out.
+/// the path label names is resolved — for a target that is there, for a target that is not,
+/// and for a gateway the clock still owes a transition — and nothing it asked for is written.
+/// A `gatewayIdentifier` naming no gateway answers the modelled 404 instead, whatever the body
+/// left out, and a `targetId` naming no target answers it for a body that defines the member.
 #[tokio::test]
 async fn an_update_that_defines_no_credential_providers_is_refused() {
     let router = router();
@@ -308,9 +313,10 @@ async fn an_update_that_defines_no_credential_providers_is_refused() {
         );
     }
 
-    // The path is resolved FIRST, so a path naming a resource that is not there answers the
-    // modelled 404 — for a body that carries the member and for one that leaves it out
-    // alike, since neither is a member the model requires of the request.
+    // The gateway the path label names is resolved first, so a `gatewayIdentifier` naming no
+    // gateway answers the modelled 404 whatever the body carries; the target under it is
+    // resolved only for a body this operation could render into its response, so an absent
+    // `targetId` answers the 404 for the body that DEFINES the member.
     let configured = json!({
         "targetConfiguration": openapi_configuration("{\"openapi\":\"3.1.0\"}"),
         "credentialProviderConfigurations": [
@@ -325,7 +331,7 @@ async fn an_update_that_defines_no_credential_providers_is_refused() {
     let target_absent = "Failed to retrieve target because it doesn't exist. Retry the request \
                          with a different resource identifier.";
     // (case, gatewayIdentifier, targetId, the body the row sends, the sentence it earns)
-    let absent_rows: [(&str, String, String, &Value, &str); 6] = [
+    let absent_rows: [(&str, String, String, &Value, &str); 5] = [
         (
             "a targetId naming no target of a gateway that is there",
             gateway_id.clone(),
@@ -348,13 +354,6 @@ async fn an_update_that_defines_no_credential_providers_is_refused() {
             gateway_absent,
         ),
         (
-            "a targetId naming no target, and a body that defines no credential providers",
-            gateway_id.clone(),
-            ABSENT_TARGET_ID.to_string(),
-            &bodyless,
-            target_absent,
-        ),
-        (
             "a gatewayIdentifier naming no gateway, and a body that defines none either",
             ABSENT_GATEWAY_ID.to_string(),
             target_id.clone(),
@@ -369,6 +368,34 @@ async fn an_update_that_defines_no_credential_providers_is_refused() {
             gateway_absent,
         ),
     ];
+
+    // The same two paths whose gateway IS there, with the body that defines no credential
+    // providers: the member's own refusal is what they earn, because it is decided before the
+    // target is looked for.
+    for (case, target) in [
+        (
+            "a targetId naming no target, and a body that defines no credential providers",
+            ABSENT_TARGET_ID.to_string(),
+        ),
+        (
+            "a target that is there, and a body that defines no credential providers",
+            target_id.clone(),
+        ),
+    ] {
+        let (status, refused) = update_target(&router, &gateway_id, &target, &bodyless).await;
+        assert_eq!(
+            (status, error_code(&refused).as_str()),
+            (400, "ValidationException"),
+            "case {case:?}: expected HTTP 400 ValidationException, got {status} {} ({refused})",
+            error_code(&refused)
+        );
+        assert_eq!(
+            text(&refused, "message"),
+            NOT_DEFINED,
+            "case {case:?}: expected the fixed sentence {NOT_DEFINED:?}, got {}",
+            text(&refused, "message")
+        );
+    }
 
     for (case, gateway, target, body, message) in absent_rows {
         let (status, refused) = update_target(&router, &gateway, &target, body).await;
@@ -499,11 +526,12 @@ async fn an_update_that_defines_the_credential_providers_is_served() {
     }
 }
 
-/// The same precedence on the other gateway-target write: `CreateGatewayTarget` resolves the
-/// gateway the path addresses before it judges the body member it needs for its modelled
-/// response (`name`, optional on the request and `@required` on every response that reports a
-/// target), so a `gatewayIdentifier` naming no gateway is the modelled 404 even for a body
-/// that omits it, while a body that omits it on a gateway that IS there is the modelled 400.
+/// The other half of the precedence, on the other gateway-target write: `CreateGatewayTarget`
+/// resolves the gateway the path label addresses before it judges the body member it needs for
+/// its modelled response (`name`, optional on the request and `@required` on every response
+/// that reports a target), so a `gatewayIdentifier` naming no gateway is the modelled 404 even
+/// for a body that omits it, while a body that omits it on a gateway that IS there is the
+/// modelled 400.
 #[tokio::test]
 async fn a_create_resolves_the_gateway_before_it_judges_the_name() {
     let router = router();

@@ -215,14 +215,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
         let now = ::std::time::SystemTime::now();
 
-        // The resources the PATH addresses are resolved BEFORE this operation's
-        // own judgement of the body: a `gatewayIdentifier` or a `targetId` naming
-        // nothing is the modelled 404 whatever else the request carries, because
-        // the only body members refused ahead of a lookup are the ones the MODEL
-        // constrains (`gatewayIdentifier`, `targetId` and `targetConfiguration`
-        // are `@required`, each enforced at the boundary), and
-        // `credentialProviderConfigurations` is not one of them
-        // (`smithy_query operation=UpdateGatewayTarget`).
+        // The GATEWAY the path label names is resolved before the body is judged,
+        // the way every operation addressed by a `{gatewayIdentifier}` resolves
+        // it; the CHILD the path names under it is resolved only once the body
+        // this operation can decide on its own has passed. So the refusal a
+        // caller hears first is the one that is decidable without reaching for
+        // the child: a body that defines no `credentialProviderConfigurations`
+        // is the modelled 400 even when the `targetId` beside it names no
+        // target, and a `targetId` naming nothing is the modelled 404 only for a
+        // body this operation could otherwise render into its response.
         //
         // Everything that can be decided from stored state alone is decided
         // here, and the store guard is DROPPED before the cross-service call
@@ -239,6 +240,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     crate::state::resource_not_found(crate::state::RESOURCE_GATEWAY),
                 )
             })?;
+
+            // `credentialProviderConfigurations` is optional on the request and
+            // `@required` with exactly one entry on this operation's own response,
+            // and the update REPLACES the target's whole configuration, so a body
+            // that defines none leaves nothing to report and is refused rather
+            // than defaulted. The refusal needs nothing but the request, so it is
+            // reported ahead of resolving the target the request would
+            // reconfigure, and ahead of the gateway's own status.
+            let Some(configured) = input
+                .credential_provider_configurations
+                .clone()
+                .filter(|configured| !configured.is_empty())
+            else {
+                return Err(UpdateGatewayTargetErrorModeled::ValidationException(
+                    crate::state::member_not_defined(
+                        crate::state::CREDENTIAL_PROVIDER_CONFIGURATIONS_PROSE,
+                    ),
+                )
+                .into());
+            };
+
             // A target id naming no target OF THIS GATEWAY is the modelled 404:
             // an update reconfigures a stored target, it does not mint one. A
             // target whose deletion `DeleteGatewayTarget` has already accepted is
@@ -254,25 +276,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )
                 .into());
             }
-
-            // `credentialProviderConfigurations` is optional on the request and
-            // `@required` with exactly one entry on this operation's own response,
-            // and the update REPLACES the target's whole configuration, so a body
-            // that defines none leaves nothing to report and is refused rather
-            // than defaulted — once the target it would reconfigure is known to
-            // be there.
-            let Some(configured) = input
-                .credential_provider_configurations
-                .clone()
-                .filter(|configured| !configured.is_empty())
-            else {
-                return Err(UpdateGatewayTargetErrorModeled::ValidationException(
-                    crate::state::member_not_defined(
-                        crate::state::CREDENTIAL_PROVIDER_CONFIGURATIONS_PROSE,
-                    ),
-                )
-                .into());
-            };
 
             // A target is served BY the gateway, so the gateway has to be ready
             // to serve it: while the gateway is still in the transient status the
