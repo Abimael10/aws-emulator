@@ -44,6 +44,12 @@
 //! asserts both halves — what the caller was answered, and which deployments the api holds
 //! afterwards, read where a client reads them — so a refusal that still deployed, and a grant
 //! that answered without deploying, both fail here.
+//!
+//! The function-principal rows close on the half a role granted BOTH verbs cannot show: a
+//! document granting ONE verb of the plane, asked about both calls, so a grant of the read verb
+//! is seen to serve the listing and refuse the deployment and a grant of the write verb to do
+//! the reverse — the two halves the `apigateway__cloudformation__lambda` scenario's own checks
+//! are made of.
 
 use std::time::{Duration, Instant};
 
@@ -890,9 +896,9 @@ async fn wait_for_active(router: &MultiServiceRouter, function: &str) {
     panic!("setup: {function} never reported {ACTIVE}, last {last}");
 }
 
-/// Invoke the probe function with `event` and answer what the handler reported.
-async fn invoke(router: &MultiServiceRouter, case: &str, event: &Value) -> Value {
-    let answered = dispatch(
+/// One invocation of the probe function with `event`, as it came back.
+async fn invoke_once(router: &MultiServiceRouter, event: &Value) -> Answered {
+    dispatch(
         router,
         "lambda",
         ACCOUNT_KEY_ID,
@@ -901,7 +907,28 @@ async fn invoke(router: &MultiServiceRouter, case: &str, event: &Value) -> Value
         "application/json",
         event.to_string().into_bytes(),
     )
-    .await;
+    .await
+}
+
+/// The status Lambda answers an invocation that found no run capacity with: "Lambda returns
+/// `TooManyRequestsException` if running the function would cause you to exceed a concurrency
+/// limit" (`smithy_query(query="operation", operation="Invoke")`).
+const THROTTLED: u16 = 429;
+
+/// Invoke the probe function with `event` and answer what the handler reported.
+///
+/// A host running many functions at once has only so many run slots, and an invocation that
+/// finds none is answered the service's own capacity refusal ([`THROTTLED`]) — which is not the
+/// decision under test, so this looks again until one is not throttled, as a client retries a
+/// throttled invocation. The wait is on that CONDITION, bounded by [`DEADLINE`], so a loaded
+/// host delays this rather than deciding it; every other answer is asserted at once.
+async fn invoke(router: &MultiServiceRouter, case: &str, event: &Value) -> Value {
+    let giving_up_at = Instant::now() + DEADLINE;
+    let mut answered = invoke_once(router, event).await;
+    while answered.status == THROTTLED && Instant::now() < giving_up_at {
+        tokio::time::sleep(LOOK_AGAIN).await;
+        answered = invoke_once(router, event).await;
+    }
     assert_eq!(
         answered.status, 200,
         "case {case:?}: expected HTTP 200 from Invoke({FUNCTION}), got {} {}",
@@ -917,6 +944,18 @@ async fn invoke(router: &MultiServiceRouter, case: &str, event: &Value) -> Value
         answered.text
     );
     answered.json()
+}
+
+/// The api ids a served `get_rest_apis` reported, as the handler passes them back.
+fn listed_ids(reported: &Value) -> Vec<String> {
+    reported["ids"]
+        .as_array()
+        .map(|ids| {
+            ids.iter()
+                .filter_map(|id| id.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// RULE, for the principal a RUNNING function's own calls speak for: the same decision, taken
@@ -1057,16 +1096,115 @@ async fn a_functions_control_plane_calls_are_decided_by_its_execution_roles_docu
         json!(true),
         "case {case:?}: expected the granted listing to be served, got {listed}"
     );
-    let ids: Vec<String> = listed["ids"]
-        .as_array()
-        .map(|ids| {
-            ids.iter()
-                .filter_map(|id| id.as_str().map(str::to_string))
-                .collect()
-        })
-        .unwrap_or_default();
+    let ids = listed_ids(&listed);
     assert!(
         ids.contains(&api),
         "case {case:?}: expected the listing to report the api {api:?}, got {ids:?}"
     );
+
+    // The beats above put BOTH verbs on the role at once. The action is named after the
+    // request's own HTTP METHOD, so a document granting ONE of them must serve exactly the
+    // calls that use it and refuse the others — the half of the rule a role granted both
+    // cannot show. Same role, same function, the inline document REPLACED between beats, so
+    // the document in force is all that differs between them.
+    //
+    // One row per one-verb document: the verb it grants, the call that verb serves, and the
+    // call of the other verb it therefore refuses with that call's own action and resource.
+    struct OneVerb<'row> {
+        granted: &'static str,
+        /// The event whose call uses the granted verb, and whether that call is the WRITE —
+        /// which is what makes a served answer a deployment the api then holds.
+        served: &'row Value,
+        served_is_the_write: bool,
+        /// The event whose call uses the other verb, with the action and the resource its
+        /// refusal must name.
+        refused: &'row Value,
+        refused_verb: &'static str,
+        refused_resource: String,
+    }
+    let one_verb_rows = [
+        OneVerb {
+            granted: "GET",
+            served: &read_event,
+            served_is_the_write: false,
+            refused: &write_event,
+            refused_verb: "POST",
+            refused_resource: apigateway_arn(&deployments_path),
+        },
+        OneVerb {
+            granted: "POST",
+            served: &write_event,
+            served_is_the_write: true,
+            refused: &read_event,
+            refused_verb: "GET",
+            refused_resource: apigateway_arn(COLLECTION_PATH),
+        },
+    ];
+
+    // Every deployment the served writes have made, in the order they were made: what the api
+    // must hold after each row.
+    let mut made = vec![deployment];
+    for row in &one_verb_rows {
+        let granted_action = action_for(row.granted);
+        let case = format!("a function granted only {granted_action}");
+        put_role_policy(&router, EXECUTION_ROLE, &allow(&granted_action, "*")).await;
+
+        // The call that uses the granted verb is served.
+        let served = invoke(&router, &case, row.served).await;
+        assert_eq!(
+            served["ok"],
+            json!(true),
+            "case {case:?}: expected the call using the granted verb to be served, got {served}"
+        );
+        if row.served_is_the_write {
+            made.push(as_str(&format!("case {case:?}"), &served, "deployment_id"));
+        } else {
+            let listed = listed_ids(&served);
+            assert!(
+                listed.contains(&api),
+                "case {case:?}: expected the served listing to report the api {api:?}, got \
+                 {listed:?}"
+            );
+        }
+
+        // The call that uses the WITHHELD verb is refused for the action its own verb names, on
+        // the ARN of the path it addressed.
+        let withheld_action = action_for(row.refused_verb);
+        let reported = invoke(&router, &case, row.refused).await;
+        assert_eq!(
+            (
+                reported["ok"].clone(),
+                reported["error_code"].clone(),
+                reported["status"].clone(),
+            ),
+            (
+                json!(false),
+                json!(ACCESS_DENIED),
+                json!(ACCESS_DENIED_STATUS),
+            ),
+            "case {case:?}: expected the {withheld_action} call to be refused \
+             {ACCESS_DENIED_STATUS} {ACCESS_DENIED}, got {reported}"
+        );
+        assert_eq!(
+            reported["message"],
+            json!(not_authorized(
+                &principal,
+                &withheld_action,
+                &row.refused_resource,
+                &no_grant(&withheld_action)
+            )),
+            "case {case:?}: expected IAM's sentence naming {withheld_action} on {}, got \
+             {reported}",
+            row.refused_resource
+        );
+
+        // And the api holds exactly the deployments the served writes made: nothing a refused
+        // one asked for.
+        let held = deployment_ids(&router, &case, &api).await;
+        assert_eq!(
+            held, made,
+            "case {case:?}: expected the api to hold exactly the deployments the served writes \
+             made, got {held:?}"
+        );
+    }
 }
