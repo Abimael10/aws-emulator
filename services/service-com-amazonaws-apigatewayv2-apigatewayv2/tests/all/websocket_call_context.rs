@@ -5,13 +5,21 @@
 //! `@connections` management API the function an `AWS_PROXY` route fronts reaches through the
 //! SDK its runtime supplies.
 //!
-//! The rule both tables below are slices of: **one call of a WebSocket connection carries ONE
+//! The rule every table below is a slice of: **one call of a WebSocket connection carries ONE
 //! context — what the gateway reports about that call — and every reader of a call reads the
 //! same one: a mapping template resolves `$context.<member>` for each member the call reports
 //! (and `$stageVariables.<name>` for the serving stage's own variables), and a function the
 //! route fronts is handed that context as its event's `requestContext` and can call the
 //! `@connections` API named in it, so a payload it posts to a connection id is delivered to
 //! THAT connection.**
+//!
+//! The last table drives that rule over a SET of connections a deployed stage carries at the
+//! same time, all of them served by the CATCH-ALL route: **every client the announced endpoint
+//! accepts is minted its own connection id, so concurrent sockets of one stage never share
+//! one, and a payload the serving route's function posts to an id is delivered to that
+//! connection's socket whether or not it is the connection whose frame triggered the call** —
+//! which is what makes a server-side broadcast to connections that sent nothing observable at
+//! all.
 //!
 //! Nothing here is a value this emulator fills in for the test: each assertion is on a value
 //! the gateway computed for the call (the route that served it, the stage, the api, the
@@ -752,4 +760,265 @@ async fn a_routes_function_posts_to_the_connections_it_names() {
             .is_some_and(|instant| !instant.trim().is_empty() && instant != "None"),
         "case {case:?}: GetConnection must report when the connection was made, got {reported}"
     );
+}
+
+/// The CATCH-ALL route key of a WebSocket api: the route that serves every message whose
+/// selected value names no other route of the api, and so the only route the table below
+/// creates.
+const CATCH_ALL_ROUTE_KEY: &str = "$default";
+
+/// How many clients the table below opens on one deployed stage at the same time: three, so
+/// "the sender", "another connection" and "every connection but the sender" are three
+/// different sets and a payload delivered to the wrong socket cannot pass for a delivery to
+/// the right one.
+const CONCURRENT_SOCKETS: usize = 3;
+
+/// The `DeploymentStatus` a released deployment carries, of the values `DeploymentStatus`
+/// declares (`PENDING | FAILED | DEPLOYED`): the state a client waits for before it dials the
+/// stage.
+const DEPLOYED: &str = "DEPLOYED";
+
+/// A payload as an assertion names it: short text in full, and long text by its first
+/// characters and its byte count, so a failure stays readable whatever the row posted.
+fn named(payload: &str) -> String {
+    let shown: String = payload.chars().take(48).collect();
+    if shown.len() == payload.len() {
+        format!("{shown:?}")
+    } else {
+        format!("{shown:?}… ({} bytes in all)", payload.len())
+    }
+}
+
+/// The id the connection `what` carries was minted, learned from the function the CATCH-ALL
+/// route fronts.
+///
+/// The reply names the route that served the call, so a message whose `action` matches no
+/// route key of the api is answered by `$default` — and the id it carries is the one the
+/// gateway reported to the function for THIS connection.
+async fn connection_of(case: &str, what: &str, socket: &mut ClientSocket) -> String {
+    let frame = exchanged(case, socket, r#"{"action":"whoami"}"#).await;
+    let reply: Value = serde_json::from_str(&frame).unwrap_or_else(|error| {
+        panic!(
+            "case {case:?}: {what}'s reply must be the function's JSON body, got {frame:?} \
+             ({error})"
+        )
+    });
+    assert_eq!(
+        reply.get("routeKey").and_then(Value::as_str),
+        Some(CATCH_ALL_ROUTE_KEY),
+        "case {case:?}: {what}'s message must be served by the catch-all route, got {frame:?}"
+    );
+    reply
+        .get("connectionId")
+        .and_then(Value::as_str)
+        .filter(|id| !id.trim().is_empty())
+        .unwrap_or_else(|| {
+            panic!("case {case:?}: {what}'s reply must carry a connectionId, got {frame:?}")
+        })
+        .to_string()
+}
+
+/// Several clients of ONE deployed stage, each minted its own connection id, and a payload the
+/// serving route's function posts to an id delivered to that connection's socket — the
+/// sender's own and, which is what a broadcast is made of, the sockets that sent nothing.
+#[tokio::test]
+async fn every_socket_of_a_deployed_stage_is_posted_to_by_the_id_it_was_minted() {
+    /// One broadcast: which socket sends it, which connections the frame names, and the bytes
+    /// the function posts to each of them.
+    struct Row {
+        what: &'static str,
+        sender: usize,
+        targets: Vec<usize>,
+        message: String,
+    }
+
+    let case = "a broadcast over the catch-all route of a deployed stage";
+    let (emulator, engine) = emulator();
+    let function =
+        given_function(&emulator, &engine, case, "socket-broadcast", &pushing_handler()).await;
+    let api = given_api(&emulator, case, "socket-broadcast-api").await;
+    // ONE route, the catch-all, made two-way by its route response: every message of every
+    // connection is served by it, whatever that message's `action` names.
+    given_lambda_route(
+        &emulator,
+        case,
+        &api.api_id,
+        CATCH_ALL_ROUTE_KEY,
+        &function,
+        true,
+    )
+    .await;
+    given_stage(&emulator, case, &api.api_id).await;
+
+    // The stage is dialled only once the api reports the deployment released to it as the
+    // status a client waits for.
+    let (status, deployments) = control(
+        &emulator,
+        "GET",
+        &format!("/v2/apis/{}/deployments", api.api_id),
+        None,
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: GetDeployments must answer 200, got {status} {deployments}"
+    );
+    let released = deployments["items"].as_array().cloned().unwrap_or_default();
+    assert!(
+        !released.is_empty(),
+        "case {case:?}: the stage must carry the deployment that was released to it, got \
+         {deployments}"
+    );
+    for deployment in &released {
+        assert_eq!(
+            deployment.get("deploymentStatus").and_then(Value::as_str),
+            Some(DEPLOYED),
+            "case {case:?}: the deployment the stage serves must be {DEPLOYED}, got {deployment}"
+        );
+    }
+
+    // Every client dials the address the api announced, independently of the others.
+    let mut sockets: Vec<ClientSocket> = Vec::with_capacity(CONCURRENT_SOCKETS);
+    for at in 0..CONCURRENT_SOCKETS {
+        sockets.push(
+            handshake_at(case, &api.authority, &format!("/{STAGE}"))
+                .await
+                .unwrap_or_else(|status| {
+                    panic!("case {case:?}: socket {at}'s handshake must be completed, got {status}")
+                }),
+        );
+    }
+
+    // Each socket carries a connection of its OWN: the id it learns is the one the gateway
+    // minted for it, so no two concurrent sockets of this stage share one.
+    let mut ids: Vec<String> = Vec::with_capacity(CONCURRENT_SOCKETS);
+    for (at, socket) in sockets.iter_mut().enumerate() {
+        let what = format!("socket {at}");
+        ids.push(connection_of(case, &what, socket).await);
+    }
+    for (left, id) in ids.iter().enumerate() {
+        for (right, other) in ids.iter().enumerate().skip(left + 1) {
+            assert_ne!(
+                id, other,
+                "case {case:?}: sockets {left} and {right} must each be minted their own \
+                 ConnectionId, got {id:?} twice"
+            );
+        }
+        // And the id names a connection the management API HOLDS, so what a broadcast
+        // addresses is a record of this stage rather than a value the reply made up.
+        let (status, reported) = connections_call(&emulator, "GET", id).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: GetConnection on socket {left}'s id {id:?} must answer 200, got \
+             {status} {reported}"
+        );
+    }
+
+    // The rows span what the fan-out generalises over: WHICH connections one call names
+    // relative to the connection it serves (the sender alone, one that sent nothing, every
+    // connection but the sender, all of them), WHICH socket sends the call, HOW MANY
+    // connections it names (one, two, three), and the FORM of the payload (ASCII, characters
+    // of several bytes, text carrying the delimiters of the envelope it travelled in, and a
+    // payload of many bytes). Every row carries its own payload and each socket is read in row
+    // order, so a payload delivered to a connection the call did not name is read as the wrong
+    // payload by the next row that reads that socket — and the last row names every socket, so
+    // none is left unread.
+    let rows = vec![
+        Row {
+            what: "the connection that sent the frame",
+            sender: 0,
+            targets: vec![0],
+            message: "to the sender alone".to_string(),
+        },
+        Row {
+            what: "one connection that sent nothing",
+            sender: 0,
+            targets: vec![1],
+            message: "to a connection that sent nothing".to_string(),
+        },
+        Row {
+            what: "every connection but the sender",
+            sender: 2,
+            targets: vec![0, 1],
+            message: "héllo ✓ to the others".to_string(),
+        },
+        Row {
+            what: "every connection of the stage, from another sender",
+            sender: 1,
+            targets: vec![0, 1, 2],
+            message: "{\"quoted\":\"value\"}\nand a second line".to_string(),
+        },
+        Row {
+            what: "a payload of many bytes, to every connection",
+            sender: 0,
+            targets: vec![0, 1, 2],
+            message: "payload-".repeat(2 * 1024),
+        },
+    ];
+
+    for row in &rows {
+        let what = row.what;
+        let targets: Vec<&str> = row.targets.iter().map(|at| ids[*at].as_str()).collect();
+        let frame = json!({
+            "action": "broadcast",
+            "targets": targets,
+            "message": row.message,
+        })
+        .to_string();
+        send(case, &mut sockets[row.sender], &frame).await;
+        for at in &row.targets {
+            let delivered = next_frame(case, &mut sockets[*at]).await.unwrap_or_else(|| {
+                panic!(
+                    "case {case:?}: {what} must be delivered to socket {at}, which the call named"
+                )
+            });
+            assert!(
+                delivered == row.message,
+                "case {case:?}: {what} must deliver exactly {} to socket {at}, got {}",
+                named(&row.message),
+                named(&delivered)
+            );
+        }
+    }
+
+    // The closing handshake, over a stage carrying several live connections: each client's
+    // close frame is answered with a close frame of the server's own, one socket at a time.
+    for (at, socket) in sockets.iter_mut().enumerate() {
+        socket
+            .send(Message::Close(Some(CloseFrame {
+                code: CloseCode::Normal,
+                reason: String::new().into(),
+            })))
+            .await
+            .unwrap_or_else(|error| {
+                panic!("case {case:?}: socket {at}'s close must be sent, got {error}")
+            });
+        match tokio::time::timeout(FRAME_DEADLINE, socket.next()).await {
+            Ok(Some(Ok(Message::Close(_echo)))) => {}
+            other => panic!(
+                "case {case:?}: socket {at}'s close must be answered with a close frame, got \
+                 {other:?}"
+            ),
+        }
+    }
+
+    // And the registry ends with those connections: every id this stage minted names none.
+    // The close is a call of the connection, so the record goes once that call is served
+    // rather than the instant the frame arrived — the case looks again until it has.
+    for (at, id) in ids.iter().enumerate() {
+        let deadline = std::time::Instant::now() + FRAME_DEADLINE;
+        let mut last = (0u16, Value::Null);
+        while std::time::Instant::now() < deadline {
+            last = connections_call(&emulator, "GET", id).await;
+            if last.0 == GONE {
+                break;
+            }
+            tokio::time::sleep(LOOK_INTERVAL).await;
+        }
+        assert_eq!(
+            last.0, GONE,
+            "case {case:?}: socket {at}'s closed connection {id:?} must answer {GONE}, got {} {}",
+            last.0, last.1
+        );
+    }
 }
