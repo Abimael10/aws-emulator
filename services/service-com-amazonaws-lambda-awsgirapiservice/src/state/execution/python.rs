@@ -1307,13 +1307,11 @@ fn clamp_guest_sleep(vm: &VirtualMachine, session: &Arc<Session>) -> PyResult<()
 }
 
 /// Wait for `seconds`, but never past what the run has left: a blocking wait the guest
-/// asked for cannot outlast the run's deadline.
+/// asked for cannot outlast the span its function's `Timeout` allows it.
 ///
-/// The wait is spent through the run's OWN clock ([`Clock::wait`]), which is where a span of
-/// a run's time passes: against this host's own clock — what every invocation this emulator
-/// serves is bounded against — the thread really waits, and against a clock the host drives
-/// the span is spent on that clock, so the wait costs the run the span it asked for rather
-/// than a span of this host's time.
+/// The wait is spent through the run's own bounds ([`Bounds::wait`]), which is what charges
+/// the span the guest asked for against that `Timeout` and decides how much of THIS HOST's
+/// time really passes over it ([`super::GUEST_WAIT_HOST_SPAN`]).
 ///
 /// A value that is not a finite number of seconds is no wait at all, so nothing is waited
 /// for: the guest decides how long to ask for, never how the host reads it.
@@ -1321,8 +1319,7 @@ fn bounded_sleep(bounds: &Arc<Bounds>, seconds: f64) {
     if !seconds.is_finite() || seconds <= 0.0 {
         return;
     }
-    let asked = Duration::from_secs_f64(seconds.min(MAX_GUEST_SLEEP_SECONDS));
-    bounds.clock.wait(asked.min(bounds.remaining()));
+    bounds.wait(Duration::from_secs_f64(seconds.min(MAX_GUEST_SLEEP_SECONDS)));
 }
 
 /// The longest a guest may ask to wait for in one call, before the run's own remaining
@@ -2178,6 +2175,13 @@ pub struct Bounds {
     /// Whether the INVOKE phase has begun ([`Self::start`]), which is when the handler's
     /// own deadline starts running.
     spending: AtomicBool,
+    /// How much of the span the handler's own WAITS asked for this host did not really wait
+    /// out ([`Self::wait`]), in nanoseconds. A wait is charged to the function's `Timeout` in
+    /// full, and this is the part of it no host time passed over.
+    waived_waiting: AtomicU64,
+    /// How much of [`super::GUEST_WAIT_HOST_SPAN`] the waits of this run have really spent,
+    /// in nanoseconds.
+    host_waiting: AtomicU64,
 }
 
 impl Bounds {
@@ -2194,7 +2198,8 @@ impl Bounds {
     fn new(budget: &Budget, clock: Clock) -> Self {
         Self {
             deadline: Mutex::new(
-                clock.now() + super::INIT_PHASE_LIMIT.saturating_add(budget.wall_clock),
+                clock.now()
+                    + super::INIT_PHASE_LIMIT.saturating_add(clock.host_span(budget.wall_clock)),
             ),
             wall_clock: budget.wall_clock,
             clock,
@@ -2208,6 +2213,8 @@ impl Bounds {
             stopped: Mutex::new(None),
             breached: AtomicBool::new(false),
             spending: AtomicBool::new(false),
+            waived_waiting: AtomicU64::new(0),
+            host_waiting: AtomicU64::new(0),
         }
     }
 
@@ -2244,7 +2251,7 @@ impl Bounds {
             return self.deadline_epoch_ms.load(Ordering::Relaxed);
         }
         *self.deadline.lock().unwrap_or_else(PoisonError::into_inner) =
-            self.clock.now() + self.wall_clock;
+            self.clock.now() + self.host_span();
         // What the handler is TOLD it has left is a host wall-clock instant rather than a
         // bound: the bound is the deadline above, which this run's own clock is read for.
         let epoch_ms = super::epoch_millis(SystemTime::now() + self.wall_clock);
@@ -2291,7 +2298,7 @@ impl Bounds {
             self.breach(Stop::HostCeiling);
             return;
         }
-        if self.clock.now() >= self.deadline() {
+        if self.clock.now() >= self.deadline() || self.past_the_configured_timeout() {
             self.breach(Stop::Deadline);
             return;
         }
@@ -2303,6 +2310,57 @@ impl Bounds {
     /// When the run must be over.
     fn deadline(&self) -> Instant {
         *self.deadline.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// The span of THIS HOST's own time the run may be held for: the span its function's
+    /// `Timeout` allows it, held to the most of this host one run may take
+    /// ([`Clock::host_span`]).
+    fn host_span(&self) -> Duration {
+        self.clock.host_span(self.wall_clock)
+    }
+
+    /// How much of the span its `Timeout` allows the handler this run has spent: the host time
+    /// its work has taken, plus the waits it asked for that this host did not wait out
+    /// ([`Self::wait`]).
+    fn spent_against_the_timeout(&self) -> Duration {
+        self.host_span()
+            .saturating_sub(self.remaining())
+            .saturating_add(Duration::from_nanos(
+                self.waived_waiting.load(Ordering::Relaxed),
+            ))
+    }
+
+    /// Whether the handler has had the whole span its function's `Timeout` allows it, which is
+    /// what a run reported to have run past its timeout ran past.
+    fn past_the_configured_timeout(&self) -> bool {
+        self.spent_against_the_timeout() >= self.wall_clock
+    }
+
+    /// Spend a WAIT the handler asked for.
+    ///
+    /// The span asked for is charged against what the function's `Timeout` allows the handler
+    /// in FULL, so a handler that waits past its own `Timeout` runs out of it exactly as it
+    /// does on AWS — the wait is cut at what is left of that span, and the next bound check
+    /// stops the run on its deadline. How much of THIS HOST's own time passes over it is this
+    /// emulator's to choose ([`super::GUEST_WAIT_HOST_SPAN`]): the wait really passes up to
+    /// that span, so a client can observe the run in flight, and the rest of it is time the
+    /// run has spent without the host waiting it out.
+    ///
+    /// The caller states what the guest asked for; no guest code decides how much of it the
+    /// host spends.
+    fn wait(&self, asked: Duration) {
+        let allowed = self
+            .wall_clock
+            .saturating_sub(self.spent_against_the_timeout());
+        let held = asked.min(allowed);
+        let host_left = super::GUEST_WAIT_HOST_SPAN
+            .saturating_sub(Duration::from_nanos(self.host_waiting.load(Ordering::Relaxed)));
+        let really = held.min(self.remaining()).min(host_left);
+        self.host_waiting
+            .fetch_add(nanoseconds(really), Ordering::Relaxed);
+        self.waived_waiting
+            .fetch_add(nanoseconds(held.saturating_sub(really)), Ordering::Relaxed);
+        self.clock.wait(really);
     }
 
     /// Spend one traced event: `None` to carry on, `Some(stop)` for the bound that is now
@@ -2319,7 +2377,7 @@ impl Bounds {
         if self.clock.past_host_ceiling() {
             return Some(self.breach(Stop::HostCeiling));
         }
-        if self.clock.now() >= self.deadline() {
+        if self.clock.now() >= self.deadline() || self.past_the_configured_timeout() {
             return Some(self.breach(Stop::Deadline));
         }
         // The run's OWN memory is sampled at EVERY traced event, so there is no sampling
@@ -2395,6 +2453,13 @@ impl Bounds {
     fn remaining(&self) -> Duration {
         self.deadline().saturating_duration_since(self.clock.now())
     }
+}
+
+/// A span in nanoseconds, for the counters the run's waits are accounted in: a span no
+/// `u64` of nanoseconds can hold is counted as the longest one that fits, which is longer
+/// than any run.
+fn nanoseconds(span: Duration) -> u64 {
+    u64::try_from(span.as_nanos()).unwrap_or(u64::MAX)
 }
 
 /// How many bytes this PROCESS holds resident, as the host reports it.

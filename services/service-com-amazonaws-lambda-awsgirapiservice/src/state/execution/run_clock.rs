@@ -229,6 +229,23 @@ impl Clock {
         self.host_ceiling
             .is_some_and(|ceiling| self.built_at.elapsed() >= ceiling)
     }
+
+    /// The span of THIS HOST's own time a run whose own span is `run_span` may be held for.
+    ///
+    /// On this host's own clock a run's span IS host time, so it is held to the most of this
+    /// host one run may take ([`super::HOST_WAIT_CEILING`]) — a run configured for a longer
+    /// span is judged against that span and still stopped here. A clock the host DRIVES spends
+    /// none of this host's time, and the caller that hands a run such a clock states what it
+    /// may take of this host on the clock itself ([`Self::within`]), so there the run's own
+    /// span stands.
+    #[must_use]
+    pub fn host_span(&self, run_span: Duration) -> Duration {
+        if self.base.is_none() {
+            run_span.min(super::HOST_WAIT_CEILING)
+        } else {
+            run_span
+        }
+    }
 }
 
 impl Default for Clock {

@@ -1199,7 +1199,8 @@ impl Bounds {
     fn new(budget: &Budget, clock: Clock) -> Self {
         Self {
             deadline: Mutex::new(
-                clock.now() + super::INIT_PHASE_LIMIT.saturating_add(budget.wall_clock),
+                clock.now()
+                    + super::INIT_PHASE_LIMIT.saturating_add(clock.host_span(budget.wall_clock)),
             ),
             wall_clock: budget.wall_clock,
             clock,
@@ -1251,7 +1252,7 @@ impl Bounds {
             return self.deadline_epoch_ms.load(Ordering::Relaxed);
         }
         *self.deadline.lock().unwrap_or_else(PoisonError::into_inner) =
-            self.clock.now() + self.wall_clock;
+            self.clock.now() + self.host_span();
         // What the handler is TOLD it has left is a host wall-clock instant rather than a
         // bound: the bound is the deadline above, which this run's own clock is read for.
         let epoch_ms = super::epoch_millis(SystemTime::now() + self.wall_clock);
@@ -1262,6 +1263,13 @@ impl Bounds {
     /// When the run must be over.
     fn deadline(&self) -> Instant {
         *self.deadline.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// The span of THIS HOST's own time the run may be held for: the span its function's
+    /// `Timeout` allows it, held to the most of this host one run may take
+    /// ([`Clock::host_span`]).
+    fn host_span(&self) -> Duration {
+        self.clock.host_span(self.wall_clock)
     }
 
     /// Answer the engine's question of whether this run should stop: `None` to carry on,

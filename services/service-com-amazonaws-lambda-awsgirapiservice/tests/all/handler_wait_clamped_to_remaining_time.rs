@@ -11,11 +11,12 @@
 //! by the run's own `Timeout` rather than by the span the guest named, and a value that is not
 //! a finite, positive number of seconds is no wait at all.
 //!
-//! So what a wait costs is decided by the run's remaining time and not by how long the handler
-//! asked for: the rows differ along what the rule generalises over — the span asked for (none,
-//! a fraction of the run's span, a negative span, a span that is not a number, an infinite
-//! span, a span well past the run's own, and spans at and beyond the longest one call may ask
-//! for) and the `Timeout` the run is given.
+//! So what a wait costs is decided by the span the RUN is allowed and not by how long the
+//! handler asked for: the rows differ along what the rule generalises over — the span asked for
+//! (none, a fraction of the run's span, a negative span, a span that is not a number, an
+//! infinite span, a span well past the run's own, and spans at and beyond the longest one call
+//! may ask for) and the `Timeout` the run is given, on both sides of the span this emulator
+//! really spends on a handler's wait.
 //!
 //! What the TIMEOUT DOCUMENT itself looks like — the class, the signal and the message, for
 //! each runtime — belongs to `invoke_function_error_document`; what is read here is which SPAN
@@ -205,23 +206,34 @@ enum Expected {
     TimedOut,
 }
 
-/// One row: what it is about, the span the handler asks to wait for, and what the run must
-/// come to.
+/// One row: what it is about, the span the handler asks to wait for, the `Timeout` the run it
+/// is asked inside is given, and what that run must come to.
 struct Row {
     case: &'static str,
     asked: &'static str,
+    timeout: i64,
     expected: Expected,
 }
 
-/// The `Timeout` the rows that ANSWER are given: far above the span any of them asks to wait
-/// for, so a row that answers does so because its wait fitted and not because this host
-/// happened to be quick.
+/// The `Timeout` the rows that ANSWER a wait of their own are given: far above the span any of
+/// them asks to wait for, so a row that answers does so because its wait fitted and not because
+/// this host happened to be quick.
 const GENEROUS_TIMEOUT: i64 = 10;
 
 /// The `Timeout` the rows that TIME OUT are given: the smallest the model allows
 /// (`@range(min: 1)`), which is the span those rows are about, so no row shares one budget
 /// with a row expecting the other outcome.
 const TIGHT_TIMEOUT: i64 = 1;
+
+/// A `Timeout` well above the span this emulator really spends on a handler's wait, for the
+/// row whose handler asks to wait for MINUTES: "the amount of time that Lambda allows a
+/// function to run before stopping it" is the span the wait is spent out of, so a wait of
+/// minutes inside it is one the handler goes on past.
+const MINUTES_TIMEOUT: i64 = 120;
+
+/// A `Timeout` above that same span, for the row whose wait is past it: what such a run is
+/// reported to have run past is this span, and not the one the host really waited out.
+const ABOVE_THE_HOST_SPAN_TIMEOUT: i64 = 45;
 
 /// The whole rule, driven END TO END: every row is a real `CreateFunction` followed by a real
 /// `Invoke` over the router.
@@ -239,61 +251,83 @@ async fn a_wait_a_handler_asks_for_is_spent_out_of_what_the_run_has_left() {
         Row {
             case: "no wait asked for at all",
             asked: "0",
+            timeout: GENEROUS_TIMEOUT,
             expected: Expected::Answered,
         },
         Row {
             case: "a fraction of the span the run has",
             asked: "0.25",
+            timeout: GENEROUS_TIMEOUT,
             expected: Expected::Answered,
         },
         Row {
             case: "a negative span, which is no wait",
             asked: "-1",
+            timeout: GENEROUS_TIMEOUT,
             expected: Expected::Answered,
         },
         Row {
             case: "a span that is not a number, which is no wait",
             asked: "nan",
+            timeout: GENEROUS_TIMEOUT,
             expected: Expected::Answered,
         },
         Row {
             case: "an infinite span, which is no wait either",
             asked: "inf",
+            timeout: GENEROUS_TIMEOUT,
+            expected: Expected::Answered,
+        },
+        Row {
+            case: "a wait of minutes, inside a Timeout that allows it",
+            asked: "90",
+            timeout: MINUTES_TIMEOUT,
             expected: Expected::Answered,
         },
         Row {
             case: "a span well past the one the run has",
             asked: "30",
+            timeout: TIGHT_TIMEOUT,
+            expected: Expected::TimedOut,
+        },
+        Row {
+            case: "a span past a Timeout of its own above the span a wait really takes",
+            asked: "300",
+            timeout: ABOVE_THE_HOST_SPAN_TIMEOUT,
             expected: Expected::TimedOut,
         },
         Row {
             case: "the longest span one call may ask for",
             asked: "3600",
+            timeout: TIGHT_TIMEOUT,
             expected: Expected::TimedOut,
         },
         Row {
             case: "a span past even that",
             asked: "100000",
+            timeout: TIGHT_TIMEOUT,
             expected: Expected::TimedOut,
         },
     ];
     let engine = Arc::new(engine::InMemoryEngine::new());
     let router = router_on(&engine);
-    let answering = "probe-wait-answers";
-    let timing_out = "probe-wait-times-out";
-    given_function(&router, &engine, answering, GENEROUS_TIMEOUT).await;
-    given_function(&router, &engine, timing_out, TIGHT_TIMEOUT).await;
+    // One function per `Timeout` a row names, so a row's wait is spent out of the span its own
+    // row is about.
+    let mut given: Vec<i64> = Vec::new();
+    for row in rows {
+        if given.contains(&row.timeout) {
+            continue;
+        }
+        given.push(row.timeout);
+        given_function(&router, &engine, &probe_name(row.timeout), row.timeout).await;
+    }
     // How many rows of each outcome a run really answered: a row this process's own host
     // bounds ended says nothing about the rule, and the rule is only observed once BOTH sides
     // of it have been — a wait that fitted and a wait that did not.
     let mut answered_rows = 0_usize;
     let mut timed_out_rows = 0_usize;
     for row in rows {
-        let (name, timeout) = match row.expected {
-            Expected::Answered => (answering, GENEROUS_TIMEOUT),
-            Expected::TimedOut => (timing_out, TIGHT_TIMEOUT),
-        };
-        let answered = invoke(&router, name, row.asked).await;
+        let answered = invoke(&router, &probe_name(row.timeout), row.asked).await;
         if is_host_bound(answered.status, &answered.text()) {
             continue;
         }
@@ -311,7 +345,7 @@ async fn a_wait_a_handler_asks_for_is_spent_out_of_what_the_run_has_left() {
         );
         match row.expected {
             Expected::Answered => assert_answered(row, &answered),
-            Expected::TimedOut => assert_timed_out(row, timeout, &answered),
+            Expected::TimedOut => assert_timed_out(row, row.timeout, &answered),
         }
     }
     assert!(
@@ -320,6 +354,11 @@ async fn a_wait_a_handler_asks_for_is_spent_out_of_what_the_run_has_left() {
          fitted and {timed_out_rows} row(s) whose wait was past the run's span were answered by \
          one, the rest having been ended by this process's own host bounds"
     );
+}
+
+/// The name of the function a row whose `Timeout` is `timeout` is invoked on.
+fn probe_name(timeout: i64) -> String {
+    format!("probe-wait-{timeout}")
 }
 
 /// The rule read off a row whose wait fitted: the handler went on past its wait and its own

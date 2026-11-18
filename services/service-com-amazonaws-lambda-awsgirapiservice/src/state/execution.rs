@@ -319,16 +319,35 @@ pub fn run_memory_claim_mb(memory_size: i32) -> u32 {
     megabytes.clamp(1, MAX_CONCURRENT_RUN_MEMORY_MB)
 }
 
-/// The longest a CALLER waits for the RUN of a handler, whatever the function's own timeout
-/// says.
+/// The longest a CALLER waits for the RUN of a handler, and the most of THIS HOST's own time
+/// one run may be held for, whatever the function's own timeout says.
 ///
 /// This is the HOST's ceiling, not the function's: a `Timeout` of up to 900 seconds would
-/// otherwise hold a request open for a quarter of an hour. The run's own deadline is the
-/// function's clamped `Timeout` ([`run_budget`]); this is only how long the answer is
-/// waited for, from the moment this invocation holds the memory to run in — beside the
-/// initialization of the execution environment the handler is called in, which is waited for
-/// on its own span ([`INIT_PHASE_LIMIT`]) because the function's `Timeout` does not bound it.
+/// otherwise hold a request open for a quarter of an hour. The span the run is JUDGED against
+/// is the function's own clamped `Timeout` ([`run_budget`]) — which is what a run that outlasts
+/// it is reported to have run past — while this is the host time it may really take, so a
+/// handler configured for a longer span is still stopped here. The waits that span allows a
+/// handler are not host time it has to spend ([`GUEST_WAIT_HOST_SPAN`]).
+///
+/// The wait a caller makes runs from the moment this invocation holds the memory to run in —
+/// beside the initialization of the execution environment the handler is called in, which is
+/// waited for on its own span ([`INIT_PHASE_LIMIT`]) because the function's `Timeout` does not
+/// bound it.
 pub const HOST_WAIT_CEILING: Duration = Duration::from_secs(30);
+
+/// How much of THIS HOST's own time the WAITS one run's handler asks for really spend.
+///
+/// A wait the handler asks for is part of what the function's `Timeout` allows it, so the span
+/// it asked for is spent against that `Timeout` in full — a handler that waits past its
+/// `Timeout` runs out of it exactly as it does on AWS. How much of this HOST's time that wait
+/// takes is this emulator's to choose, like every other span it serves faster than AWS serves
+/// it: a handler that waits a quarter of an hour inside a `Timeout` that allows it answers
+/// here, rather than being stopped by a ceiling its configuration never asked for.
+///
+/// It is deliberately not nothing: a client can observe the effects of a run WHILE IT IS IN
+/// FLIGHT — a resource whose creation is held open while the handler behind it runs — so a
+/// wait really passes up to here before the rest of its span is spent against the run alone.
+pub const GUEST_WAIT_HOST_SPAN: Duration = Duration::from_secs(5);
 
 /// How long the EXECUTION ENVIRONMENT one invocation runs in may take to be initialized,
 /// which the function's own `Timeout` does not bound.
@@ -1532,8 +1551,14 @@ pub(crate) fn epoch_millis(at: SystemTime) -> i64 {
 }
 
 /// What one run may spend: the function's own `Timeout`, clamped to the range the model
-/// allows for it and to this module's ceiling, and the memory its own `MemorySize` asks for
-/// ([`run_heap_bytes`]), plus the bounds that are this emulator's.
+/// allows for it, and the memory its own `MemorySize` asks for ([`run_heap_bytes`]), plus the
+/// bounds that are this emulator's.
+///
+/// The span is the CONFIGURED one, not this host's: "the amount of time that Lambda allows a
+/// function to run before stopping it" is what the run is judged against and what a run that
+/// ran past it is reported to have run past. How much of this host's own time the run may
+/// really take is bounded beside it ([`HOST_WAIT_CEILING`]), and the waits the handler asks
+/// for inside its span are not host time it has to spend ([`GUEST_WAIT_HOST_SPAN`]).
 ///
 /// The memory bound is the SAME quantity the run's share of the process envelope is charged
 /// in ([`run_memory_claim_mb`]), so what a run may allocate and what it holds of the
@@ -1542,7 +1567,7 @@ pub(crate) fn epoch_millis(at: SystemTime) -> i64 {
 #[must_use]
 pub fn run_budget(timeout_seconds: i32, memory_size: i32) -> Budget {
     let clamped = i64::from(timeout_seconds).clamp(MIN_TIMEOUT_SECONDS, MAX_TIMEOUT_SECONDS);
-    let wall_clock = Duration::from_secs(u64::try_from(clamped).unwrap_or(1)).min(HOST_WAIT_CEILING);
+    let wall_clock = Duration::from_secs(u64::try_from(clamped).unwrap_or(1));
     Budget {
         wall_clock,
         steps: MAX_RUN_STEPS,
@@ -2252,7 +2277,10 @@ mod tests {
     }
 
     /// A stored `Timeout` is clamped into the range the model allows before it bounds a
-    /// run, and never past this module's own ceiling — one row per bound and one past each.
+    /// run — one row per bound of that range and one past each. The span a run is judged
+    /// against is the CONFIGURED one, however much of this host's time it may really take
+    /// ([`HOST_WAIT_CEILING`]), so a `Timeout` past that ceiling still bounds the run at
+    /// what its function asked for.
     #[test]
     fn a_stored_timeout_is_clamped_before_it_bounds_a_run() {
         let cases: &[(i32, u64)] = &[
@@ -2261,8 +2289,9 @@ mod tests {
             (1, 1),
             (3, 3),
             (29, 29),
-            (900, HOST_WAIT_CEILING.as_secs()),
-            (100_000, HOST_WAIT_CEILING.as_secs()),
+            (HOST_WAIT_CEILING.as_secs() as i32 + 1, HOST_WAIT_CEILING.as_secs() + 1),
+            (900, 900),
+            (100_000, 900),
         ];
         for (configured, expected) in cases {
             let actual = run_budget(*configured, MIN_MEMORY_SIZE_MB as i32)
