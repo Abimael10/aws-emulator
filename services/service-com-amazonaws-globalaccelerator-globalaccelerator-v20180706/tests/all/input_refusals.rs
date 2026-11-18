@@ -108,7 +108,7 @@ fn arn_of(accelerator: &Value) -> String {
 }
 
 /// What the boundary is expected to do with one request.
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 enum Expect<'a> {
     /// The request violates a modelled constraint, so it is refused with HTTP 400
     /// `InvalidArgumentException` over a clause naming `path` and stating
@@ -119,9 +119,77 @@ enum Expect<'a> {
         /// A fragment of the requirement the clause states.
         requirement: &'a str,
     },
+    /// The request breaks a requirement this service states in a sentence of its OWN
+    /// rather than through a clause, so the whole message is that sentence — still under
+    /// HTTP 400 `InvalidArgumentException`.
+    Stated(&'a str),
     /// The request satisfies every modelled constraint, so the boundary passes it to
     /// the handler: whatever the handler answers, it is not a constraint refusal.
     Accepted,
+    /// The request is served: it reaches the handler and the handler answers it.
+    Served,
+}
+
+/// Call one operation and assert that this service answers it the way `expected` says.
+async fn assert_expected(
+    router: &MultiServiceRouter,
+    case: &str,
+    operation: &str,
+    body: Value,
+    expected: Expect<'_>,
+) {
+    let (status, parsed) = call(router, operation, body).await;
+    let code = error_code(&parsed);
+    let message = error_message(&parsed);
+    match expected {
+        Expect::Refused { path, requirement } => {
+            assert_eq!(
+                (status, code.as_str()),
+                (400, "InvalidArgumentException"),
+                "case {case}: expected the modelled 400 InvalidArgumentException, \
+                 got {status} {parsed}"
+            );
+            assert!(
+                message.contains(&format!("at '{path}'")),
+                "case {case}: expected the clause to name the member {path:?}, \
+                 got {message:?}"
+            );
+            assert!(
+                message.contains(requirement),
+                "case {case}: expected the clause to state {requirement:?}, \
+                 got {message:?}"
+            );
+            assert!(
+                message.starts_with("1 validation error detected: "),
+                "case {case}: expected the constraint-report envelope, got {message:?}"
+            );
+        }
+        Expect::Stated(sentence) => {
+            assert_eq!(
+                (status, code.as_str()),
+                (400, "InvalidArgumentException"),
+                "case {case}: expected the modelled 400 InvalidArgumentException, \
+                 got {status} {parsed}"
+            );
+            assert_eq!(
+                message, sentence,
+                "case {case}: expected {sentence:?}, got {message:?}"
+            );
+        }
+        Expect::Accepted => {
+            assert!(
+                code != "InvalidArgumentException" && code != "ValidationException",
+                "case {case}: a value inside every modelled bound must reach the \
+                 handler, got {status} {parsed}"
+            );
+        }
+        Expect::Served => {
+            assert_eq!(
+                status, 200,
+                "case {case}: expected the request to be served, got {status} {parsed}"
+            );
+        }
+    }
 }
 
 /// RULE: a request refused for violating a modelled input constraint is answered with
@@ -236,7 +304,9 @@ async fn a_modelled_constraint_refusal_is_the_modelled_invalid_argument_error() 
             update_group(json!({ "TrafficDialPercentage": 100.0 })),
             Expect::Accepted,
         ),
-        // @range{10,30} on HealthCheckIntervalSeconds.
+        // @range{10,30} on HealthCheckIntervalSeconds. The service states a value outside
+        // the set of intervals it supports in its own sentence rather than through a
+        // clause — see `an_unsupported_health_check_interval_states_the_supported_set`.
         (
             "interval-at-the-bounds",
             "CreateEndpointGroup",
@@ -247,19 +317,15 @@ async fn a_modelled_constraint_refusal_is_the_modelled_invalid_argument_error() 
             "interval-below-the-lower-bound",
             "CreateEndpointGroup",
             group(json!({ "HealthCheckIntervalSeconds": 9 })),
-            Expect::Refused {
-                path: "healthCheckIntervalSeconds",
-                requirement: "Member must have value greater than or equal to 10",
-            },
+            Expect::Stated("Invalid HealthCheck Interval Seconds: 9 expected values are: 10 or 30"),
         ),
         (
             "interval-past-the-upper-bound",
             "CreateEndpointGroup",
             group(json!({ "HealthCheckIntervalSeconds": 31 })),
-            Expect::Refused {
-                path: "healthCheckIntervalSeconds",
-                requirement: "Member must have value less than or equal to 30",
-            },
+            Expect::Stated(
+                "Invalid HealthCheck Interval Seconds: 31 expected values are: 10 or 30",
+            ),
         ),
         // @range{1,10} on ThresholdCount.
         (
@@ -395,40 +461,7 @@ async fn a_modelled_constraint_refusal_is_the_modelled_invalid_argument_error() 
     ];
 
     for (case, operation, body, expectation) in cases {
-        let (status, parsed) = call(&router, operation, body).await;
-        let code = error_code(&parsed);
-        let message = error_message(&parsed);
-        match expectation {
-            Expect::Refused { path, requirement } => {
-                assert_eq!(
-                    (status, code.as_str()),
-                    (400, "InvalidArgumentException"),
-                    "case {case}: expected the modelled 400 InvalidArgumentException, \
-                     got {status} {parsed}"
-                );
-                assert!(
-                    message.contains(&format!("at '{path}'")),
-                    "case {case}: expected the clause to name the member {path:?}, \
-                     got {message:?}"
-                );
-                assert!(
-                    message.contains(requirement),
-                    "case {case}: expected the clause to state {requirement:?}, \
-                     got {message:?}"
-                );
-                assert!(
-                    message.starts_with("1 validation error detected: "),
-                    "case {case}: expected the constraint-report envelope, got {message:?}"
-                );
-            }
-            Expect::Accepted => {
-                assert!(
-                    code != "InvalidArgumentException" && code != "ValidationException",
-                    "case {case}: a value inside every modelled bound must reach the \
-                     handler, got {status} {parsed}"
-                );
-            }
-        }
+        assert_expected(&router, case, operation, body, expectation).await;
     }
 }
 
@@ -637,4 +670,430 @@ async fn a_not_found_refusal_names_the_arn_the_request_carried() {
             "case {case}: expected {expected:?}, got {message:?}"
         );
     }
+}
+
+/// RULE: a name outside the length limit this service accepts for an accelerator's name
+/// is refused HTTP 400 `InvalidArgumentException` stating that limit in the service's own
+/// fixed sentence — the same sentence at either bound, for every length past it, and on
+/// every leg that names an accelerator — while a name inside the limit reaches the
+/// handler. A name past the `@length` maximum the MODEL declares for the member
+/// (`GenericString` @length{0,255}) is a different refusal: the boundary's own constraint
+/// report, naming the member and the bound.
+#[tokio::test]
+async fn an_accelerator_name_outside_the_length_limit_states_that_limit() {
+    let router = emulator();
+    // The sentence is a constant of the service: the two bounds of its name-length limit
+    // and nothing taken from the request.
+    let length = Expect::Stated("Accelerator Name should be between 1 - 64 characters in size.");
+
+    // (case, the name, what the service answers)
+    let names: Vec<(&str, String, Expect)> = vec![
+        ("empty", String::new(), length),
+        ("one-character", "n".to_string(), Expect::Served),
+        ("inside-the-limit", "n".repeat(32), Expect::Served),
+        ("at-the-upper-bound", "n".repeat(64), Expect::Served),
+        ("one-past-the-upper-bound", "n".repeat(65), length),
+        ("far-past-the-upper-bound", "n".repeat(200), length),
+        ("at-the-modelled-length-maximum", "n".repeat(255), length),
+        // Past the member's own modelled `@length`, so the boundary refuses it before any
+        // handler runs, with the clause that names the member and the bound.
+        (
+            "past-the-modelled-length-maximum",
+            "n".repeat(256),
+            Expect::Refused {
+                path: "name",
+                requirement: "Member must have length less than or equal to 255",
+            },
+        ),
+    ];
+
+    // Every implemented leg that names an accelerator: the two kinds' creates and the
+    // standard accelerator's update. The limit is a property of the NAME, so it is stated
+    // the same way on all of them.
+    let standard = arn_of(
+        &ok(
+            &router,
+            "CreateAccelerator",
+            json!({ "Name": "length-rule", "IdempotencyToken": "length-rule-token" }),
+        )
+        .await["Accelerator"],
+    );
+    let legs: [&str; 3] = [
+        "CreateAccelerator",
+        "CreateCustomRoutingAccelerator",
+        "UpdateAccelerator",
+    ];
+
+    for (index, (case, name, expected)) in names.iter().enumerate() {
+        for leg in legs {
+            let body = if leg == "UpdateAccelerator" {
+                json!({ "AcceleratorArn": standard, "Name": name })
+            } else {
+                json!({ "Name": name, "IdempotencyToken": format!("{leg}-{index}") })
+            };
+            assert_expected(&router, &format!("{leg} {case}"), leg, body, *expected).await;
+        }
+    }
+}
+
+/// RULE: a value outside the value set of an input member this service states its own
+/// requirement sentence for — the listener protocol — is refused HTTP 400
+/// `InvalidArgumentException` carrying that sentence: the member as the API spells it over
+/// the protocols the model's enum admits, with nothing of the request echoed, on every
+/// operation whose input carries that member. Every OTHER enumerated member of this
+/// service keeps the constraint report, and a value the enum does admit is served.
+///
+/// The value sets are the model's own, from `smithy_query(query="shape",
+/// shape="Protocol,ClientAffinity,HealthCheckProtocol")`: `Protocol` [TCP, UDP],
+/// `ClientAffinity` [NONE, SOURCE_IP], `HealthCheckProtocol` [TCP, HTTP, HTTPS].
+#[tokio::test]
+async fn a_protocol_outside_the_value_set_states_the_protocols_the_service_admits() {
+    let router = emulator();
+    let accelerator_arn = arn_of(
+        &ok(
+            &router,
+            "CreateAccelerator",
+            json!({ "Name": "protocol-rule", "IdempotencyToken": "protocol-rule-token" }),
+        )
+        .await["Accelerator"],
+    );
+    let listener_arn = ok(
+        &router,
+        "CreateListener",
+        json!({
+            "AcceleratorArn": accelerator_arn,
+            "PortRanges": [{ "FromPort": 80, "ToPort": 80 }],
+            "Protocol": "TCP",
+            "IdempotencyToken": "protocol-rule-listener",
+        }),
+    )
+    .await["Listener"]["ListenerArn"]
+        .as_str()
+        .expect("the created listener's ARN")
+        .to_string();
+    // The sentence the service states this member's requirement with: fixed text over the
+    // member and the two values its enum admits.
+    let protocol = Expect::Stated("Protocol must be either TCP or UDP");
+
+    let create = |protocol_value: Value, port: i32, token: &str| -> Value {
+        let mut body = json!({
+            "AcceleratorArn": accelerator_arn,
+            "PortRanges": [{ "FromPort": port, "ToPort": port }],
+            "IdempotencyToken": token,
+        });
+        if !protocol_value.is_null() {
+            body["Protocol"] = protocol_value;
+        }
+        body
+    };
+
+    // (case, operation, body, what the service answers)
+    let cases: Vec<(&str, &str, Value, Expect)> = vec![
+        (
+            "create-another-protocol",
+            "CreateListener",
+            create(json!("UDPX"), 80, "protocol-udpx"),
+            protocol,
+        ),
+        (
+            "create-a-value-differing-in-case",
+            "CreateListener",
+            create(json!("tcp"), 80, "protocol-lowercase"),
+            protocol,
+        ),
+        (
+            "create-an-empty-protocol",
+            "CreateListener",
+            create(json!(""), 80, "protocol-empty"),
+            protocol,
+        ),
+        // The same member on the update leg of the same rule.
+        (
+            "update-another-protocol",
+            "UpdateListener",
+            json!({ "ListenerArn": listener_arn, "Protocol": "SCTP" }),
+            protocol,
+        ),
+        // Both values the enum admits are served, on both legs.
+        (
+            "create-tcp",
+            "CreateListener",
+            create(json!("TCP"), 81, "protocol-tcp"),
+            Expect::Served,
+        ),
+        (
+            "create-udp",
+            "CreateListener",
+            create(json!("UDP"), 82, "protocol-udp"),
+            Expect::Served,
+        ),
+        (
+            "update-udp",
+            "UpdateListener",
+            json!({ "ListenerArn": listener_arn, "Protocol": "UDP" }),
+            Expect::Served,
+        ),
+        // An absent REQUIRED protocol is not a value outside the set: the boundary states
+        // the member it needs, through the constraint report.
+        (
+            "create-without-a-protocol",
+            "CreateListener",
+            create(Value::Null, 83, "protocol-absent"),
+            Expect::Refused {
+                path: "protocol",
+                requirement: "Member must not be null",
+            },
+        ),
+        // Every OTHER enumerated member keeps the constraint report naming it.
+        (
+            "another-enumerated-member-of-the-same-request",
+            "CreateListener",
+            json!({
+                "AcceleratorArn": accelerator_arn,
+                "PortRanges": [{ "FromPort": 84, "ToPort": 84 }],
+                "Protocol": "TCP",
+                "ClientAffinity": "SESSION",
+                "IdempotencyToken": "affinity-outside",
+            }),
+            Expect::Refused {
+                path: "clientAffinity",
+                requirement: "enum value set",
+            },
+        ),
+        (
+            "an-enumerated-member-of-another-resource",
+            "CreateEndpointGroup",
+            json!({
+                "ListenerArn": listener_arn,
+                "EndpointGroupRegion": "us-west-2",
+                "HealthCheckProtocol": "SMTP",
+                "IdempotencyToken": "health-protocol-outside",
+            }),
+            Expect::Refused {
+                path: "healthCheckProtocol",
+                requirement: "enum value set",
+            },
+        ),
+    ];
+
+    for (case, operation, body, expected) in cases {
+        assert_expected(&router, case, operation, body, expected).await;
+    }
+}
+
+/// RULE: an `IpAddressType` outside the value set its enum admits is refused HTTP 400
+/// `InvalidArgumentException` with the sentence this service states that class with — the
+/// value the REQUEST carried, named in the service's own spelling of the member, and
+/// nothing else of the request — on every leg that takes the member; a value the enum
+/// admits reaches the handler.
+///
+/// The value set is the model's own, from `smithy_query(query="shape",
+/// shape="IpAddressType")`: [IPV4, DUAL_STACK].
+#[tokio::test]
+async fn an_ip_address_type_outside_the_value_set_names_the_value_the_request_carried() {
+    let router = emulator();
+    let standard = arn_of(
+        &ok(
+            &router,
+            "CreateAccelerator",
+            json!({ "Name": "address-type-rule", "IdempotencyToken": "address-type-token" }),
+        )
+        .await["Accelerator"],
+    );
+
+    // (case, the submitted value) — a type of neither family, one differing only in case,
+    // one that drops the separator, and the empty string.
+    let outside: [(&str, &str); 4] = [
+        ("another-family", "IPV5"),
+        ("differing-in-case", "ipv4"),
+        ("without-the-separator", "DUALSTACK"),
+        ("empty", ""),
+    ];
+
+    for (index, (case, value)) in outside.iter().enumerate() {
+        let sentence = format!("IP Address type {value} is invalid");
+        // Every implemented leg that takes the member: the two kinds' creates and the
+        // standard accelerator's update.
+        let legs: [(&str, Value); 3] = [
+            (
+                "CreateAccelerator",
+                json!({
+                    "Name": format!("address-type-{index}"),
+                    "IpAddressType": value,
+                    "IdempotencyToken": format!("address-type-create-{index}"),
+                }),
+            ),
+            (
+                "CreateCustomRoutingAccelerator",
+                json!({
+                    "Name": format!("address-type-cra-{index}"),
+                    "IpAddressType": value,
+                    "IdempotencyToken": format!("address-type-cra-{index}"),
+                }),
+            ),
+            (
+                "UpdateAccelerator",
+                json!({ "AcceleratorArn": standard, "IpAddressType": value }),
+            ),
+        ];
+        for (leg, body) in legs {
+            assert_expected(
+                &router,
+                &format!("{leg} {case}"),
+                leg,
+                body,
+                Expect::Stated(&sentence),
+            )
+            .await;
+        }
+    }
+
+    // Both values the enum admits reach the handler, on each leg that supports them. A
+    // custom routing accelerator supports IPV4 only, so DUAL_STACK is a different class
+    // there — unsupported for that kind, not outside the set — and belongs to the test of
+    // that rule in `custom_routing_accelerators.rs`.
+    let admitted: [(&str, &str, &str); 3] = [
+        ("create-ipv4", "CreateAccelerator", "IPV4"),
+        ("create-dual-stack", "CreateAccelerator", "DUAL_STACK"),
+        (
+            "create-custom-routing-ipv4",
+            "CreateCustomRoutingAccelerator",
+            "IPV4",
+        ),
+    ];
+    for (index, (case, operation, value)) in admitted.iter().enumerate() {
+        assert_expected(
+            &router,
+            case,
+            operation,
+            json!({
+                "Name": format!("admitted-{index}"),
+                "IpAddressType": value,
+                "IdempotencyToken": format!("admitted-{index}"),
+            }),
+            Expect::Served,
+        )
+        .await;
+    }
+}
+
+/// RULE: a `HealthCheckIntervalSeconds` outside the set of intervals this service
+/// health-checks at is refused HTTP 400 `InvalidArgumentException` with the one sentence
+/// the service states that class with — naming the value the request carried and the set it
+/// is not in — whether the value is inside the member's modelled `@range` or outside it, and
+/// on every operation that configures an endpoint group's health check; a value in the set
+/// is served.
+///
+/// The supported set is the member's own doc, from `smithy_query(query="doc",
+/// shape="HealthCheckIntervalSeconds")`: "The time—10 seconds or 30 seconds—between each
+/// health check for an endpoint", inside the `@range` 10..30 the shape declares. Both
+/// published bounds, both values just outside them, and an in-range unsupported value are
+/// rows.
+#[tokio::test]
+async fn an_unsupported_health_check_interval_states_the_supported_set() {
+    let router = emulator();
+    let accelerator_arn = arn_of(
+        &ok(
+            &router,
+            "CreateAccelerator",
+            json!({ "Name": "interval-rule", "IdempotencyToken": "interval-rule-token" }),
+        )
+        .await["Accelerator"],
+    );
+    let listener_arn = ok(
+        &router,
+        "CreateListener",
+        json!({
+            "AcceleratorArn": accelerator_arn,
+            "PortRanges": [{ "FromPort": 80, "ToPort": 80 }],
+            "Protocol": "TCP",
+            "IdempotencyToken": "interval-rule-listener",
+        }),
+    )
+    .await["Listener"]["ListenerArn"]
+        .as_str()
+        .expect("the created listener's ARN")
+        .to_string();
+    let group_arn = ok(
+        &router,
+        "CreateEndpointGroup",
+        json!({
+            "ListenerArn": listener_arn,
+            "EndpointGroupRegion": "us-west-2",
+            "HealthCheckIntervalSeconds": 30,
+            "IdempotencyToken": "interval-rule-group",
+        }),
+    )
+    .await["EndpointGroup"]["EndpointGroupArn"]
+        .as_str()
+        .expect("the created endpoint group's ARN")
+        .to_string();
+
+    // (case, the interval, whether the set admits it)
+    let intervals: [(&str, i32, bool); 7] = [
+        ("at-the-lower-supported-value", 10, true),
+        ("at-the-upper-supported-value", 30, true),
+        ("one-below-the-range", 9, false),
+        ("far-below-the-range", 1, false),
+        ("inside-the-range-but-unsupported", 20, false),
+        ("one-past-the-range", 31, false),
+        ("far-past-the-range", 300, false),
+    ];
+
+    for (case, seconds, supported) in intervals {
+        let sentence =
+            format!("Invalid HealthCheck Interval Seconds: {seconds} expected values are: 10 or 30");
+        // The update leg: the group exists, so a supported value is served and an
+        // unsupported one is refused with the sentence.
+        let expected = if supported {
+            Expect::Served
+        } else {
+            Expect::Stated(&sentence)
+        };
+        assert_expected(
+            &router,
+            &format!("update {case}"),
+            "UpdateEndpointGroup",
+            json!({ "EndpointGroupArn": group_arn, "HealthCheckIntervalSeconds": seconds }),
+            expected,
+        )
+        .await;
+
+        // The create leg of the same rule. A supported value only has to reach the
+        // handler: this listener already covers the Region, so the create itself is a
+        // conflict rather than a constraint refusal.
+        let expected = if supported {
+            Expect::Accepted
+        } else {
+            Expect::Stated(&sentence)
+        };
+        assert_expected(
+            &router,
+            &format!("create {case}"),
+            "CreateEndpointGroup",
+            json!({
+                "ListenerArn": listener_arn,
+                "EndpointGroupRegion": "us-west-2",
+                "HealthCheckIntervalSeconds": seconds,
+                "IdempotencyToken": format!("interval-{case}"),
+            }),
+            expected,
+        )
+        .await;
+    }
+
+    // The refused updates changed nothing: the group still health-checks at the interval
+    // the last supported value set.
+    let reread = ok(
+        &router,
+        "DescribeEndpointGroup",
+        json!({ "EndpointGroupArn": group_arn }),
+    )
+    .await["EndpointGroup"]["HealthCheckIntervalSeconds"]
+        .clone();
+    assert_eq!(
+        reread,
+        json!(30),
+        "expected the last supported interval to be the stored one, got {reread}"
+    );
 }

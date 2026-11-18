@@ -210,17 +210,20 @@ async fn a_boundary_refusal_reports_its_text_in_the_modelled_message_member() {
             },
         ),
         (
+            // `ThresholdCount` rather than `HealthCheckIntervalSeconds`: the interval is a
+            // member this service states its own sentence for (see
+            // `src/service/constraint_report.rs`), so it reports no clause.
             "an integer member past its range maximum",
             "CreateEndpointGroup",
             json!({
                 "ListenerArn": listener_arn,
                 "EndpointGroupRegion": "us-west-2",
-                "IdempotencyToken": "past-the-interval",
-                "HealthCheckIntervalSeconds": 31,
+                "IdempotencyToken": "past-the-threshold",
+                "ThresholdCount": 11,
             }),
             Expect::Report {
-                path: "healthCheckIntervalSeconds",
-                requirement: "Member must have value less than or equal to 30",
+                path: "thresholdCount",
+                requirement: "Member must have value less than or equal to 10",
             },
         ),
         (

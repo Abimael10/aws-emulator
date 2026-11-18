@@ -89,6 +89,12 @@ pub const DEFAULT_ENDPOINT_WEIGHT: i32 = 128;
 /// maximum of 64 characters" (`CreateAccelerator$Name` doc).
 pub const ACCELERATOR_NAME_MAX_LEN: usize = 64;
 
+/// The shortest accelerator name the service accepts: a name is what identifies the
+/// accelerator to its owner, so an accelerator named by no character at all names
+/// nothing. The lower bound of the length limit this service states a name outside with
+/// ([`accelerator_name_length_message`]).
+pub const ACCELERATOR_NAME_MIN_LEN: usize = 1;
+
 /// Accelerators per Amazon Web Services account: the service's documented default
 /// quota ("Accelerators per account: 20", AWS Global Accelerator service quotas).
 /// A create past it is refused with the modelled `LimitExceededException` — which is
@@ -867,12 +873,31 @@ enum NamePunctuation {
     HyphensOnly,
 }
 
+/// The sentence this service states a name outside the accelerator name-length limit
+/// with.
+///
+/// Recorded wire behaviour on `CreateAccelerator`: a name the limit does not admit is
+/// refused with ONE fixed sentence that names the two bounds of that limit
+/// ([`ACCELERATOR_NAME_MIN_LEN`] and [`ACCELERATOR_NAME_MAX_LEN`]) and takes nothing from
+/// the request — neither the name submitted nor its length. It is the wording for the
+/// CLASS (a name of an accelerator is outside the length the service accepts), so it is
+/// stated for either bound and for every leg that names an accelerator, rather than for
+/// the one bound a recording happened to break.
+pub fn accelerator_name_length_message() -> String {
+    format!(
+        "Accelerator Name should be between {ACCELERATOR_NAME_MIN_LEN} - \
+         {ACCELERATOR_NAME_MAX_LEN} characters in size."
+    )
+}
+
 /// Refuse a name the real service refuses.
 ///
-/// One rule for both accelerator kinds: at most [`ACCELERATOR_NAME_MAX_LEN`]
-/// characters, only alphanumerics and the punctuation `punctuation` admits, and never
-/// that punctuation at either end. Returns the message to put on an
-/// `InvalidArgumentException`, which states the rule the name broke.
+/// One rule for both accelerator kinds: between [`ACCELERATOR_NAME_MIN_LEN`] and
+/// [`ACCELERATOR_NAME_MAX_LEN`] characters, only alphanumerics and the punctuation
+/// `punctuation` admits, and never that punctuation at either end. Returns the message to
+/// put on an `InvalidArgumentException`: the length limit is stated with the service's own
+/// fixed sentence ([`accelerator_name_length_message`]), and the character rule with the
+/// rule the name broke.
 fn validate_name(name: &str, punctuation: NamePunctuation) -> Result<(), String> {
     let (allowed, edge_names) = match punctuation {
         NamePunctuation::PeriodsAndHyphens => (
@@ -891,8 +916,8 @@ fn validate_name(name: &str, punctuation: NamePunctuation) -> Result<(), String>
         NamePunctuation::PeriodsAndHyphens => c == '-' || c == '.',
         NamePunctuation::HyphensOnly => c == '-',
     };
-    if name.chars().count() > ACCELERATOR_NAME_MAX_LEN {
-        return bad("is too long");
+    if !(ACCELERATOR_NAME_MIN_LEN..=ACCELERATOR_NAME_MAX_LEN).contains(&name.chars().count()) {
+        return Err(accelerator_name_length_message());
     }
     if !name
         .chars()
@@ -982,17 +1007,27 @@ pub fn validate_health_check_interval(seconds: i32) -> Result<(), String> {
     if SUPPORTED_HEALTH_CHECK_INTERVALS.contains(&seconds) {
         return Ok(());
     }
+    Err(unsupported_health_check_interval_message(
+        &seconds.to_string(),
+    ))
+}
+
+/// The sentence this service states an unsupported `HealthCheckIntervalSeconds` with.
+///
+/// Recorded wire behaviour on `UpdateEndpointGroup`: the fixed text
+/// `Invalid HealthCheck Interval Seconds: ` + ` expected values are: ` over the rejected
+/// value as the request carried it and the set of intervals the service supports
+/// ([`SUPPORTED_HEALTH_CHECK_INTERVALS`], joined the way the sentence names alternatives).
+/// It is the wording for the CLASS — the value is not one of the intervals this service
+/// health-checks at — so it is stated for every value outside that set, whether or not the
+/// value is also outside the enclosing `@range` the member declares.
+pub fn unsupported_health_check_interval_message(submitted: &str) -> String {
     let supported = SUPPORTED_HEALTH_CHECK_INTERVALS
         .iter()
         .map(i32::to_string)
         .collect::<Vec<_>>()
         .join(" or ");
-    // The wording the service states this class with — recorded wire behaviour on
-    // `UpdateEndpointGroup` — whose variable parts are the rejected value from the
-    // request and the set of supported intervals.
-    Err(format!(
-        "Invalid HealthCheck Interval Seconds: {seconds} expected values are: {supported}"
-    ))
+    format!("Invalid HealthCheck Interval Seconds: {submitted} expected values are: {supported}")
 }
 
 /// The health-check path an endpoint group ends up with.

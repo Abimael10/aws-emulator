@@ -383,6 +383,16 @@ async fn a_name_outside_the_documented_character_set_is_refused() {
             "case {case}: expected the name {name:?} to be refused, got {status} {body}"
         );
         let message = error_message(&body);
+        // A name outside the LENGTH limit is stated with the service's own fixed sentence
+        // about that limit, which names neither the character set nor the name submitted;
+        // the character rule is what the rest of the rows break.
+        if name.chars().count() > 64 {
+            assert_eq!(
+                message, "Accelerator Name should be between 1 - 64 characters in size.",
+                "case {case}: expected the service's own length sentence, got {message:?}"
+            );
+            continue;
+        }
         assert!(
             message.starts_with("Name ")
                 && message.contains("alphanumeric characters or hyphens (-)")

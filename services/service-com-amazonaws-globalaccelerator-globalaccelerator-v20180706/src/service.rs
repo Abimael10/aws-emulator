@@ -183,10 +183,11 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // The ONE class it states in its own words is a tag (see [`INVALID_PARAMETER`]),
         // which this service validates itself and reports without naming a member.
         //
-        // The clauses of the report itself are stated through
-        // [`constraint_report::report`]: the envelope, the requirement and the bound are
-        // the framework's, while the member path this service reports and the rendering
-        // of the rejected value are this service's own — see that module for the rule.
+        // The words of the refusal itself are stated through
+        // [`constraint_report::message`]: the envelope, the requirement and the bound are
+        // the framework's, while the member path this service reports, the rendering of
+        // the rejected value, and the members whose value set this service states in a
+        // sentence of its own are this service's — see that module for the rule.
         match refusal {
             Refusal::Invalid(violations) if only_tag_parameters(violations) => Some(Refused {
                 code: INVALID_ARGUMENT_EXCEPTION.to_string(),
@@ -194,7 +195,7 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
             }),
             Refusal::Invalid(violations) => Some(Refused {
                 code: INVALID_ARGUMENT_EXCEPTION.to_string(),
-                message: constraint_report::report(violations)?,
+                message: constraint_report::message(violations)?,
             }),
             _ => None,
         }
