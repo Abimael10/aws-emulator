@@ -540,6 +540,185 @@ async fn a_settled_delete_moves_its_arn_into_the_client_fault_class() {
     }
 }
 
+/// What the input shape the ARN arrived in stands as when two operations' wordings are
+/// compared: it is the one part of a refusal that is each operation's OWN
+/// ([`request_shape`]), so a comparison of the rest is what says the two reached one
+/// verdict and worded it one way.
+const REQUEST_SHAPE_PLACEHOLDER: &str = "<the request that carried the ARN>";
+
+/// RULE: the judgement of an `arn` is ONE judgement, so the three operations addressed
+/// by an `AmazonResourceName` reach the same verdict on the same ARN and report it with
+/// the same status, the same modelled code and the same wording — the only difference
+/// being the one the rule itself keeps, that a resolved-to-nothing ARN is the empty tag
+/// set for the READ and the client fault for the two WRITES. The rows span the verdicts
+/// that judgement reaches and differ in which field puts the ARN out of the request's
+/// scope, in that field's value, in the Region segment the ARN carries, in the id prefix
+/// and in whether the ARN resolves at all.
+#[tokio::test]
+async fn one_arn_judgement_answers_every_arn_addressed_operation() {
+    let emulator = Emulator::new();
+    let places = placements(&emulator).await;
+    let live_tags: BTreeMap<String, String> = [("env".to_string(), "test".to_string())]
+        .into_iter()
+        .collect();
+    let live = create_with_tags(&emulator, &places[0], 1_300, &live_tags).await;
+    let live_arn = text(&live, "arn");
+    let live_id = text(&live, "id");
+
+    // `None` is the row the judgement RESOLVES, so the table carries the positive
+    // verdict beside the two negative ones.
+    let rows: Vec<(&str, String, Option<Fault>)> = vec![
+        (
+            "an ARN of another account",
+            live_arn.replace(ACCOUNT_ID, "210987654321"),
+            Some(Fault::OutOfScope),
+        ),
+        (
+            "an ARN of another partition",
+            live_arn.replace(&format!("arn:{PARTITION}:"), "arn:aws-iso-b:"),
+            Some(Fault::OutOfScope),
+        ),
+        (
+            "an ARN of another account spelled with another Region",
+            live_arn
+                .replace(ACCOUNT_ID, "999999999999")
+                .replace(REGION, "ap-northeast-1"),
+            Some(Fault::OutOfScope),
+        ),
+        (
+            "an in-scope ARN whose id was never allocated",
+            connection_arn(PARTITION, REGION, ACCOUNT_ID, "mcc-9z8y7x6w"),
+            Some(Fault::NoSuchConnection),
+        ),
+        (
+            "an in-scope ARN of the other id prefix, never allocated, in another Region",
+            connection_arn(PARTITION, "sa-east-1", ACCOUNT_ID, "lmcc-00ff00ff"),
+            Some(Fault::NoSuchConnection),
+        ),
+        ("the live resource's own ARN", live_arn.clone(), None),
+    ];
+    for (name, arn, _) in &rows {
+        assert!(
+            arn.len() >= ARN_LENGTH.0 && arn.len() <= ARN_LENGTH.1,
+            "case {name:?}: expected an ARN inside the modelled {ARN_LENGTH:?} length, got {} characters",
+            arn.len()
+        );
+    }
+
+    for (name, arn, fault) in &rows {
+        // What each operation answered: the status, the wire code and the wording, so
+        // two operations can be compared on every part of the answer at once. The one
+        // part of a wording that is the operation's OWN is the input shape the ARN
+        // arrived in, which says WHICH request carried it, so it stands in the
+        // comparison as the placeholder below.
+        let mut answers: BTreeMap<&str, (u16, String, String)> = BTreeMap::new();
+        for (operation, body) in arn_operations() {
+            let (status, answer) = emulator.ic(operation, body(arn)).await;
+            match fault {
+                Some(fault) => {
+                    assert_answers_fault(name, operation, *fault, arn, status, &answer);
+                }
+                None => assert_eq!(
+                    status, 200,
+                    "case {name:?} on {operation}: expected an ARN that resolves to be served, got {status} with {answer:?}"
+                ),
+            }
+            answers.insert(
+                operation,
+                (
+                    status,
+                    code(&answer),
+                    message(&answer).replace(&request_shape(operation), REQUEST_SHAPE_PLACEHOLDER),
+                ),
+            );
+        }
+
+        let writers: Vec<&(u16, String, String)> = answers
+            .iter()
+            .filter(|(operation, _)| **operation != TAG_READER)
+            .map(|(_, answered)| answered)
+            .collect();
+        assert_eq!(
+            writers.len(),
+            2,
+            "case {name:?}: expected the two tag writers among {:?}",
+            answers.keys()
+        );
+        assert_eq!(
+            writers[0], writers[1],
+            "case {name:?}: expected both tag writers to report one verdict identically, got {:?} against {:?}",
+            writers[0], writers[1]
+        );
+
+        let read = &answers[TAG_READER];
+        if *fault == Some(Fault::NoSuchConnection) {
+            // The one difference the rule keeps between the read and the writes.
+            assert_eq!(
+                read.0, 200,
+                "case {name:?}: expected the read to serve an ARN resolving to no resource, got {read:?}"
+            );
+            assert_ne!(
+                read, writers[0],
+                "case {name:?}: expected the read and the writes to answer this class differently, got {read:?}"
+            );
+        } else {
+            assert_eq!(
+                read, writers[0],
+                "case {name:?}: expected the read to report the ARN's verdict exactly as the writes do, got {read:?} against {:?}",
+                writers[0]
+            );
+        }
+    }
+
+    // The resolved verdict, driven through an operation of each kind in turn: the write
+    // that adds a key, the read that reports it and the write that removes it all resolve
+    // the SAME resource from the same ARN, so a round trip through the three leaves the
+    // tag set the writes asked for. The baseline is read by the IDENTIFIER-addressed
+    // reader, so what the round trip is measured against is not one of the operations
+    // under test.
+    let (status, fetched) = emulator.get_connection(&live_id).await;
+    assert_eq!(
+        status, 200,
+        "case \"round trip\": expected the resource to be readable by its identifier, got {status} with {fetched:?}"
+    );
+    let baseline = tags_of(&fetched["connection"]);
+    emulator
+        .ic_ok(
+            "TagResource",
+            json!({ "arn": &live_arn, "tags": { "owner": "shared" } }),
+        )
+        .await;
+    let listed = emulator.ic_ok(TAG_READER, list_tags_body(&live_arn)).await;
+    let mut expected = baseline.clone();
+    expected.insert("owner".to_string(), "shared".to_string());
+    assert_eq!(
+        tags_of(&listed),
+        expected,
+        "case \"round trip\": expected the read to report what the write stored, got {:?}",
+        listed["tags"]
+    );
+    emulator
+        .ic_ok(
+            "UntagResource",
+            json!({ "arn": &live_arn, "tagKeys": ["owner"] }),
+        )
+        .await;
+    let listed = emulator.ic_ok(TAG_READER, list_tags_body(&live_arn)).await;
+    assert_eq!(
+        tags_of(&listed),
+        baseline,
+        "case \"round trip\": expected the removal to leave the tag set the round trip started from, got {:?}",
+        listed["tags"]
+    );
+    let settled = emulator.get_connection(&live_id).await.1;
+    assert_eq!(
+        tags_of(&settled["connection"]),
+        baseline,
+        "case \"round trip\": expected the identifier-addressed read to agree, got {:?}",
+        settled["connection"]["tags"]
+    );
+}
+
 /// RULE: an `arn` that is not an Interconnect connection ARN at all is a fault in
 /// the request too — invalid input (HTTP 400), whether the modelled
 /// `@pattern`/`@length` catches it at the boundary or the handler does, and never a

@@ -102,6 +102,28 @@ impl From<TagResourceErrorModeled> for TagResourceError {
 /// ([`crate::state::arn_scope_violation`]).
 const REQUEST_SHAPE: &str = "TagResourceRequest";
 
+/// Which variant of this operation's error channel each ARN-addressed refusal travels
+/// in. WHICH refusal each verdict about an `arn` calls for, and how it is worded, is
+/// `crate::state::judge_connection_arn`'s and `crate::state::connection_for_arn_mut`'s
+/// to say.
+impl crate::state::ArnRefusal for TagResourceError {
+    fn invalid_arn(message: String) -> Self {
+        TagResourceErrorModeled::InterconnectValidationException(InterconnectValidationException {
+            message,
+        })
+        .into()
+    }
+}
+
+impl crate::state::ArnResourceRefusal for TagResourceError {
+    fn arn_resource_absent(message: String) -> Self {
+        TagResourceErrorModeled::InterconnectClientException(InterconnectClientException {
+            message,
+        })
+        .into()
+    }
+}
+
 /// The `TagResource` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -166,36 +188,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
-        // "Currently this supports Connection resources" (the tagging operations'
-        // own documentation), which is also what `AmazonResourceName`'s pattern
-        // allows: the ARN carries the `ConnectionId` of the connection whose tags
-        // these are. An ARN the boundary validator let through that still does not
-        // parse as one is refused as invalid INPUT, never with a 501.
-        let Some(parsed) = crate::state::parse_connection_arn(&input.arn) else {
-            return Err(TagResourceErrorModeled::InterconnectValidationException(
-                InterconnectValidationException {
-                    message: crate::state::not_a_connection_arn_message(&input.arn),
-                },
-            )
-            .into());
-        };
-
-        // The scope an ARN addresses is its account and its partition, so one
-        // carrying either of another scope names a resource the caller is not talking
-        // to at all — a fault in the REQUEST, refused as invalid input naming the
-        // field that differs, the value the ARN carried for it, the caller's own and
-        // this request's input shape, and a DIFFERENT code from an ARN of this scope
-        // that merely resolves to nothing (below), which is what lets a caller tell
-        // "wrong account" from "no such resource". The Region segment is not judged
-        // here: the member's pattern leaves it unconstrained, so it is resolved rather
-        // than scope-checked.
+        // The `arn` is judged by the one rule every ARN-addressed operation here
+        // applies (`crate::state::judge_connection_arn`): "currently this supports
+        // Connection resources" (the tagging operations' own documentation), which is
+        // also what `AmazonResourceName`'s pattern allows, so an ARN the boundary
+        // validator let through that still is not an Interconnect connection ARN is
+        // refused as invalid INPUT, never with a 501; and the scope an ARN addresses is
+        // its account and its partition, so one carrying either of another scope names a
+        // resource the caller is not talking to at all — a fault in the REQUEST, naming
+        // the field that differs, the value the ARN carried for it, the caller's own and
+        // this request's input shape, and a DIFFERENT code from an ARN of this scope that
+        // merely resolves to nothing (below), which is what lets a caller tell "wrong
+        // account" from "no such resource". The Region segment is judged by neither: the
+        // member's pattern leaves it unconstrained, so it is resolved rather than
+        // scope-checked.
+        crate::state::judge_connection_arn::<TagResourceError>(&input.arn, REQUEST_SHAPE)?;
         let region = crate::state::request_region(ctx);
-        if let Some(message) = crate::state::arn_scope_violation(&parsed, REQUEST_SHAPE) {
-            return Err(TagResourceErrorModeled::InterconnectValidationException(
-                InterconnectValidationException { message },
-            )
-            .into());
-        }
 
         // What the request itself carries is judged before any resource is looked up:
         // a tag key or value outside the modelled lengths, a key inside the namespace
@@ -218,20 +226,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // whose delete has completed is seen as `deleted` here.
         guard.materialise_due_transitions(::std::time::Instant::now());
 
-        // The same resolution every ARN-ADDRESSED operation here uses: the connection
-        // the ARN's id names among those the Region the request addressed holds, and a
-        // connection in the terminal deleted state no longer has a tag set. An ARN
-        // that resolves to no connection this account holds is this service's own
-        // CLIENT fault, the modelled 400, not a 404 — worded with the fixed sentence
-        // every ARN-addressed refusal of a missing resource carries.
-        let Some(stored) = guard.connection_in_for_arn_mut(&region, &input.arn) else {
-            return Err(TagResourceErrorModeled::InterconnectClientException(
-                InterconnectClientException {
-                    message: crate::state::arn_resource_absent_message(),
-                },
-            )
-            .into());
-        };
+        // The same resolution every ARN-ADDRESSED operation here uses, through the one
+        // channel that classifies its absent case
+        // (`crate::state::connection_for_arn_mut`): the connection the ARN's id names
+        // among those the Region the request addressed holds, and a connection in the
+        // terminal deleted state no longer has a tag set. An ARN that resolves to no
+        // connection this account holds is this service's own CLIENT fault, the modelled
+        // 400, not a 404 — worded with the fixed sentence every ARN-addressed refusal of
+        // a missing resource carries.
+        let stored = crate::state::connection_for_arn_mut::<TagResourceError>(
+            &mut guard,
+            &region,
+            &input.arn,
+        )?;
 
         // What the resource would be LEFT holding is judged once it is resolved: the
         // merged tag set is the one that has to stay within what a resource holds, so

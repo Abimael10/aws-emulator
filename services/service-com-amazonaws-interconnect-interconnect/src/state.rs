@@ -1391,6 +1391,82 @@ pub fn arn_scope_violation(parsed: &ConnectionArn<'_>, request_shape: &str) -> O
     ))
 }
 
+/// The refusals the ARN-ADDRESSED resolution can call for, in the error channel of the
+/// operation that asked for it.
+///
+/// Every operation of this service carries its own modelled error enum, so the rules
+/// deciding WHICH refusal a verdict about an `AmazonResourceName` calls for and what it
+/// says live once — in [`judge_connection_arn`] for the ARN itself — and an operation
+/// addressed by an ARN supplies only this: which variant of its own channel each refusal
+/// travels in. A handler therefore cannot classify or word one of these refusals
+/// differently from its neighbour.
+pub trait ArnRefusal: Sized {
+    /// The `arn` the request carried addresses no resource this service could act on:
+    /// it is not the ARN of an Interconnect connection at all
+    /// ([`not_a_connection_arn_message`]), or it addresses a scope the request is not
+    /// for ([`arn_scope_violation`]). Either way the REQUEST is at fault and nothing is
+    /// resolved for it: the modelled `InterconnectValidationException` (HTTP 400).
+    fn invalid_arn(message: String) -> Self;
+}
+
+/// The further refusal an operation that ACTS ON the resource its `arn` names needs, and
+/// a reporting one does not: see [`connection_for_arn_mut`].
+pub trait ArnResourceRefusal: ArnRefusal {
+    /// The `arn` addresses the scope the request is for and resolves to no resource of
+    /// it, which is this service's own client fault rather than a malformed request: the
+    /// modelled `InterconnectClientException` (HTTP 400), worded by
+    /// [`arn_resource_absent_message`].
+    fn arn_resource_absent(message: String) -> Self;
+}
+
+/// Judge the `arn` an ARN-ADDRESSED operation was called with, answering `Ok(())` when
+/// it addresses a resource of this service in the scope the request is for.
+///
+/// The ONE judgement every operation whose `arn` member IS the resource it acts on
+/// applies, so which ARNs a caller may address does not depend on which of them it
+/// called. Two things are judged, in this order:
+///
+/// * the ARN's TEXT ([`parse_connection_arn`]): an `arn` the boundary validator let
+///   through that still is not an Interconnect connection ARN names no resource of this
+///   service at all, so it is a fault in the request and the scope it would address is
+///   not asked about;
+/// * then the SCOPE it addresses ([`arn_scope_violation`]), worded from the ARN field
+///   that differs and `request_shape` — the name of the input shape the ARN arrived in,
+///   which is what says WHICH request carried it.
+///
+/// The ARN's Region segment is judged by neither: the member's pattern leaves it
+/// unconstrained, so it is resolved rather than scope-checked
+/// ([`ComAmazonawsInterconnectInterconnectState::connection_in_for_arn`]).
+pub fn judge_connection_arn<E: ArnRefusal>(arn: &str, request_shape: &str) -> Result<(), E> {
+    let Some(parsed) = parse_connection_arn(arn) else {
+        return Err(E::invalid_arn(not_a_connection_arn_message(arn)));
+    };
+    match arn_scope_violation(&parsed, request_shape) {
+        Some(message) => Err(E::invalid_arn(message)),
+        None => Ok(()),
+    }
+}
+
+/// The stored connection an in-scope `arn` addresses in `region`, for the operations
+/// that WRITE what they resolve.
+///
+/// The resolution is the one every ARN-addressed operation here uses
+/// ([`ComAmazonawsInterconnectInterconnectState::connection_in_for_arn_mut`]), and its
+/// absent case is this service's own client fault — so both writers of a tag set report
+/// a missing resource with one code and one sentence. A REPORTING operation resolves the
+/// same resource and refuses nothing for it: a read asks what is on the resource rather
+/// than whether it is there, so an ARN of this scope that resolves to nothing is answered
+/// with the empty tag set instead.
+pub fn connection_for_arn_mut<'store, E: ArnResourceRefusal>(
+    store: &'store mut ComAmazonawsInterconnectInterconnectState,
+    region: &str,
+    arn: &str,
+) -> Result<&'store mut StoredConnection, E> {
+    store
+        .connection_in_for_arn_mut(region, arn)
+        .ok_or_else(|| E::arn_resource_absent(arn_resource_absent_message()))
+}
+
 /// The shortest and longest a tag KEY may be: `TagKey` is modelled
 /// `@length(min: 1, max: 128)`, so an empty key and one past 128 are both outside
 /// what a `TagMap` can carry.

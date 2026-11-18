@@ -106,6 +106,18 @@ impl From<ListTagsForResourceErrorModeled> for ListTagsForResourceError {
 /// ([`crate::state::arn_scope_violation`]).
 const REQUEST_SHAPE: &str = "ListTagsForResourceRequest";
 
+/// Which variant of this operation's error channel the ARN-addressed refusal travels in.
+/// WHICH refusal the judgement of an `arn` calls for, and how it is worded, is
+/// `crate::state::judge_connection_arn`'s to say.
+impl crate::state::ArnRefusal for ListTagsForResourceError {
+    fn invalid_arn(message: String) -> Self {
+        ListTagsForResourceErrorModeled::InterconnectValidationException(
+            InterconnectValidationException { message },
+        )
+        .into()
+    }
+}
+
 /// The `ListTagsForResource` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -169,38 +181,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
-        // "Currently this supports Connection resources", which is also what
-        // `AmazonResourceName`'s pattern allows: the ARN carries the `ConnectionId`
-        // of the connection whose tags these are. An ARN the boundary validator let
-        // through that still does not parse as one is refused as invalid INPUT,
-        // never with a 501.
-        let Some(parsed) = crate::state::parse_connection_arn(&input.arn) else {
-            return Err(
-                ListTagsForResourceErrorModeled::InterconnectValidationException(
-                    InterconnectValidationException {
-                        message: crate::state::not_a_connection_arn_message(&input.arn),
-                    },
-                )
-                .into(),
-            );
-        };
-
-        // The scope an ARN addresses is its account and its partition, so one
+        // The `arn` is judged by the one rule every ARN-addressed operation here
+        // applies (`crate::state::judge_connection_arn`): "currently this supports
+        // Connection resources", which is also what `AmazonResourceName`'s pattern
+        // allows, so an ARN the boundary validator let through that still is not an
+        // Interconnect connection ARN is refused as invalid INPUT, never with a 501;
+        // and the scope an ARN addresses is its account and its partition, so one
         // carrying either of another scope names a resource the caller is not talking
-        // to at all — a fault in the REQUEST, refused as invalid input naming the
-        // field that differs, the value the ARN carried for it, the caller's own and
-        // this request's input shape. The Region segment is not judged here: the
-        // member's pattern leaves it unconstrained, so it is resolved rather than
-        // scope-checked.
+        // to at all — a fault in the REQUEST, naming the field that differs, the value
+        // the ARN carried for it, the caller's own and this request's input shape. The
+        // Region segment is judged by neither: the member's pattern leaves it
+        // unconstrained, so it is resolved rather than scope-checked.
+        crate::state::judge_connection_arn::<ListTagsForResourceError>(&input.arn, REQUEST_SHAPE)?;
         let region = crate::state::request_region(ctx);
-        if let Some(message) = crate::state::arn_scope_violation(&parsed, REQUEST_SHAPE) {
-            return Err(
-                ListTagsForResourceErrorModeled::InterconnectValidationException(
-                    InterconnectValidationException { message },
-                )
-                .into(),
-            );
-        }
 
         // Reporting only: the one write here settles transitions the clock had
         // already made due (`deleting` -> `deleted`, `updating` -> the state the
