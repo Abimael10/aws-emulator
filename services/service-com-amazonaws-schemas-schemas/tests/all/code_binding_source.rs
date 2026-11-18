@@ -2,13 +2,16 @@
 
 //! End-to-end HTTP tests for `GetCodeBindingSource`.
 //!
-//! RULE under test: the source of a code binding is the package of source files the
-//! service generated for that binding — one declaration per named schema the binding's
-//! schema version declares, in the language the binding was generated for, laid out as
-//! a package of that language and served as one ZIP archive — computed from the STORED
-//! document of that version, so it is the same archive however often it is read; and a
-//! binding whose generation has produced nothing yet (one no put started, or one still
-//! in progress) has no source, which is the service's `NotFoundException` (HTTP 404).
+//! RULE under test: the source of a code binding is the PACKAGE of source files the
+//! service generated for that binding — a declaration per type the binding's schema
+//! version declares, in the language the binding was generated for, laid out as a
+//! package of that language, together with what that language needs to BUILD those
+//! declarations and to read and write the documents they describe (its build descriptor
+//! and its (de)serialization support) — served as one ZIP archive and computed from the
+//! STORED document of that version, so it is the same archive however often it is read;
+//! and a binding whose generation has produced nothing yet (one no put started, or one
+//! still in progress) has no source, which is the service's `NotFoundException`
+//! (HTTP 404).
 //!
 //! The mapping the generated declarations are asserted against is this emulator's, and
 //! it is stated once — in the generator, `src/ops/get_code_binding_source.rs` — and
@@ -225,6 +228,64 @@ async fn source(emulator: &Emulator, uri: &str, case: &str) -> Answer {
     answer
 }
 
+/// The package a schema's generated files live in, below the language's source root:
+/// the one root every binding shares and the schema name's own alphanumeric runs,
+/// lower-cased (`src/ops/get_code_binding_source.rs`, `package_segments`).
+pub(crate) fn package_path(schema: &str) -> String {
+    let mut segments = vec!["schema".to_string()];
+    segments.extend(
+        schema
+            .split(|character: char| !character.is_alphanumeric())
+            .filter(|part| !part.is_empty())
+            .map(str::to_lowercase),
+    );
+    segments.join("/")
+}
+
+/// Every entry a generated package carries BESIDE its declarations, for `language` and
+/// the schema `schema`: the descriptor(s) the language's own build reads, at the archive
+/// root where that build looks for them, and the support source the declared types are
+/// read and written through. The generator states this set once
+/// (`src/ops/get_code_binding_source.rs`, `build_files` / `support_files`); it is
+/// restated here so a case can tell a declaration from the package around it.
+pub(crate) fn package_entries(language: &str, schema: &str) -> Vec<String> {
+    let package = package_path(schema);
+    match language {
+        "Java8" => vec![
+            "pom.xml".to_string(),
+            format!("src/main/java/{package}/Marshaller.java"),
+        ],
+        "TypeScript3" => vec![
+            "package.json".to_string(),
+            "tsconfig.json".to_string(),
+            format!("src/{package}/index.ts"),
+            format!("src/{package}/Marshaller.ts"),
+        ],
+        "Python36" => {
+            let mut entries = vec!["setup.py".to_string(), "requirements.txt".to_string()];
+            let segments: Vec<&str> = package.split('/').collect();
+            // Every level of the package is a Python package of its own.
+            for level in 1..=segments.len() {
+                entries.push(format!("src/{}/__init__.py", segments[..level].join("/")));
+            }
+            entries.push(format!("src/{package}/marshaller.py"));
+            entries
+        }
+        "Go1" => vec!["go.mod".to_string(), format!("{package}/marshaller.go")],
+        other => panic!("no package layout known for language {other:?}"),
+    }
+}
+
+/// The entries of `paths` that are DECLARATIONS: everything the package itself is not.
+pub(crate) fn declaration_paths(language: &str, schema: &str, paths: &[String]) -> Vec<String> {
+    let package = package_entries(language, schema);
+    paths
+        .iter()
+        .filter(|path| !package.contains(path))
+        .cloned()
+        .collect()
+}
+
 /// One (schema, language) row of the main table: the files the archive must hold, and
 /// the declarations those files must carry.
 struct SourceCase {
@@ -250,8 +311,10 @@ fn source_cases() -> Vec<SourceCase> {
             schema: "order.placed",
             language: "Java8",
             files: &[
+                "pom.xml",
                 "src/main/java/schema/order/placed/AWSEvent.java",
                 "src/main/java/schema/order/placed/Order.java",
+                "src/main/java/schema/order/placed/Marshaller.java",
             ],
             declarations: &[
                 "package schema.order.placed;",
@@ -278,8 +341,12 @@ fn source_cases() -> Vec<SourceCase> {
             schema: "order.placed",
             language: "TypeScript3",
             files: &[
+                "package.json",
+                "tsconfig.json",
                 "src/schema/order/placed/AWSEvent.ts",
                 "src/schema/order/placed/Order.ts",
+                "src/schema/order/placed/index.ts",
+                "src/schema/order/placed/Marshaller.ts",
             ],
             declarations: &[
                 "import { Order } from \"./Order\";",
@@ -304,8 +371,14 @@ fn source_cases() -> Vec<SourceCase> {
             schema: "order.placed",
             language: "Python36",
             files: &[
+                "setup.py",
+                "requirements.txt",
                 "src/schema/order/placed/awsevent.py",
                 "src/schema/order/placed/order.py",
+                "src/schema/__init__.py",
+                "src/schema/order/__init__.py",
+                "src/schema/order/placed/__init__.py",
+                "src/schema/order/placed/marshaller.py",
             ],
             declarations: &[
                 "from datetime import datetime",
@@ -332,8 +405,10 @@ fn source_cases() -> Vec<SourceCase> {
             schema: "order.placed",
             language: "Go1",
             files: &[
+                "go.mod",
                 "schema/order/placed/awsevent.go",
                 "schema/order/placed/order.go",
+                "schema/order/placed/marshaller.go",
             ],
             declarations: &[
                 "package placed",
@@ -359,8 +434,10 @@ fn source_cases() -> Vec<SourceCase> {
             schema: "shipment-events",
             language: "Java8",
             files: &[
+                "pom.xml",
                 "src/main/java/schema/shipment/events/ShipmentEvents.java",
                 "src/main/java/schema/shipment/events/ShippingAddress.java",
+                "src/main/java/schema/shipment/events/Marshaller.java",
             ],
             declarations: &[
                 "package schema.shipment.events;",
@@ -377,8 +454,12 @@ fn source_cases() -> Vec<SourceCase> {
             schema: "shipment-events",
             language: "TypeScript3",
             files: &[
+                "package.json",
+                "tsconfig.json",
                 "src/schema/shipment/events/ShipmentEvents.ts",
                 "src/schema/shipment/events/ShippingAddress.ts",
+                "src/schema/shipment/events/index.ts",
+                "src/schema/shipment/events/Marshaller.ts",
             ],
             declarations: &[
                 "import { ShippingAddress } from \"./ShippingAddress\";",
@@ -395,8 +476,14 @@ fn source_cases() -> Vec<SourceCase> {
             schema: "shipment-events",
             language: "Python36",
             files: &[
+                "setup.py",
+                "requirements.txt",
                 "src/schema/shipment/events/shipment_events.py",
                 "src/schema/shipment/events/shipping_address.py",
+                "src/schema/__init__.py",
+                "src/schema/shipment/__init__.py",
+                "src/schema/shipment/events/__init__.py",
+                "src/schema/shipment/events/marshaller.py",
             ],
             declarations: &[
                 "from .shipping_address import ShippingAddress",
@@ -413,8 +500,10 @@ fn source_cases() -> Vec<SourceCase> {
             schema: "shipment-events",
             language: "Go1",
             files: &[
+                "go.mod",
                 "schema/shipment/events/shipment_events.go",
                 "schema/shipment/events/shipping_address.go",
+                "schema/shipment/events/marshaller.go",
             ],
             declarations: &[
                 "package events",
@@ -431,7 +520,9 @@ fn source_cases() -> Vec<SourceCase> {
 
 /// RULE: the archive holds one source file per named schema the document declares, in
 /// the package layout of the language asked for, and each file declares that schema's
-/// own members with the type the mapping gives them.
+/// own members with the type the mapping gives them — beside the files that package
+/// is built and (de)serialized through, which [`the_package_builds_and_reads_every_declared_type`]
+/// is about.
 #[tokio::test]
 async fn the_source_is_the_package_generated_from_the_stored_document() {
     let emulator = emulator_with_schemas().await;
@@ -462,6 +553,247 @@ async fn the_source_is_the_package_generated_from_the_stored_document() {
             assert!(
                 text.contains(declaration),
                 "case {label:?}: the generated source must declare {declaration:?}, got {text}"
+            );
+        }
+    }
+}
+
+/// One language's package around its declarations: the descriptor its own build reads,
+/// the entry its (de)serialization lives in, and how that entry names the reader of one
+/// declared type. `{artifact}`, `{package}` and `{type}` stand for the package's
+/// artifact name, the schema's package path and a declared type.
+struct PackageCase {
+    language: &'static str,
+    descriptor: &'static str,
+    names_artifact: &'static str,
+    marshaller: &'static str,
+    reads_type: &'static str,
+}
+
+/// One row per language the service generates for: what a package of that language is
+/// built and (de)serialized by (`src/ops/get_code_binding_source.rs`, `build_files` /
+/// `support_files`).
+fn package_cases() -> Vec<PackageCase> {
+    vec![
+        PackageCase {
+            language: "Java8",
+            descriptor: "pom.xml",
+            names_artifact: "<artifactId>{artifact}</artifactId>",
+            marshaller: "src/main/java/{package}/Marshaller.java",
+            reads_type: "public static {type} unmarshal{type}(final String document)",
+        },
+        PackageCase {
+            language: "TypeScript3",
+            descriptor: "package.json",
+            names_artifact: "\"name\": \"{artifact}\"",
+            marshaller: "src/{package}/Marshaller.ts",
+            reads_type: "export function unmarshal{type}(document: string): {type}",
+        },
+        PackageCase {
+            language: "Python36",
+            descriptor: "setup.py",
+            names_artifact: "name=\"{artifact}\"",
+            marshaller: "src/{package}/marshaller.py",
+            reads_type: "    {type}: {",
+        },
+        PackageCase {
+            language: "Go1",
+            descriptor: "go.mod",
+            names_artifact: "module {artifact}",
+            marshaller: "{package}/marshaller.go",
+            reads_type: "func Unmarshal{type}(document []byte) ({type}, error)",
+        },
+    ]
+}
+
+/// The artifact name a schema's generated package is published as: the schema name's
+/// own alphanumeric runs, lower-cased and hyphen-joined
+/// (`src/ops/get_code_binding_source.rs`, `artifact_name`).
+fn artifact_name(schema: &str) -> String {
+    schema
+        .split(|character: char| !character.is_alphanumeric())
+        .filter(|part| !part.is_empty())
+        .map(str::to_lowercase)
+        .collect::<Vec<String>>()
+        .join("-")
+}
+
+/// RULE: a code binding's source is a PACKAGE, not a bag of declarations — so beside a
+/// declaration per implied type the archive carries what that language needs to build
+/// the declarations and to read and write the documents they describe, generated from
+/// the same document: the build descriptor at the archive root, naming the schema's own
+/// artifact, and the (de)serialization support, which knows every declared type.
+///
+/// The rows differ along the language, the document's own language (OpenAPI 3 against
+/// draft-04), the shape of the schema name and the number and names of the types the
+/// document declares.
+#[tokio::test]
+async fn the_package_builds_and_reads_every_declared_type() {
+    let emulator = emulator_with_schemas().await;
+
+    // The two documents of the main table, with the types each declares.
+    for (schema, declared) in [
+        ("order.placed", ["AWSEvent", "Order"]),
+        ("shipment-events", ["ShipmentEvents", "ShippingAddress"]),
+    ] {
+        for case in package_cases() {
+            let label = format!("{schema}/{}", case.language);
+            let artifact = artifact_name(schema);
+            let package = package_path(schema);
+            generated(
+                &emulator,
+                &binding_uri(REGISTRY, schema, case.language, None),
+                &label,
+            )
+            .await;
+            let answer = source(
+                &emulator,
+                &source_uri(REGISTRY, schema, case.language, None),
+                &label,
+            )
+            .await;
+            let entries = archive_entries(&label, &answer);
+            let paths: Vec<String> = entries.iter().map(|(path, _)| path.clone()).collect();
+
+            // Every file of the package is there, beside the declarations.
+            for entry in package_entries(case.language, schema) {
+                assert!(
+                    paths.contains(&entry),
+                    "case {label:?}: the package must carry {entry:?}, got {paths:?}"
+                );
+            }
+            let declarations = declaration_paths(case.language, schema, &paths);
+            assert_eq!(
+                declarations.len(),
+                declared.len(),
+                "case {label:?}: one declaration per declared type {declared:?}, got \
+                 {declarations:?}"
+            );
+            assert!(
+                paths.len() > declarations.len(),
+                "case {label:?}: a package is more than its declarations, got {paths:?}"
+            );
+
+            let text_of = |wanted: &str| -> String {
+                entries
+                    .iter()
+                    .find(|(path, _)| path == wanted)
+                    .map(|(_, text)| text.clone())
+                    .unwrap_or_else(|| {
+                        panic!("case {label:?}: {wanted:?} must be an entry, got {paths:?}")
+                    })
+            };
+
+            // The build descriptor sits at the archive root, which is where that
+            // language's build looks for it, and names the schema's own artifact.
+            assert!(
+                !case.descriptor.contains('/'),
+                "case {label:?}: the build descriptor must sit at the archive root, got {:?}",
+                case.descriptor
+            );
+            let descriptor = text_of(case.descriptor);
+            let names_artifact = case.names_artifact.replace("{artifact}", &artifact);
+            assert!(
+                descriptor.contains(&names_artifact),
+                "case {label:?}: the build descriptor must name the artifact \
+                 {names_artifact:?}, got {descriptor}"
+            );
+
+            // The (de)serialization support knows every type the package declares.
+            let marshaller = text_of(&case.marshaller.replace("{package}", &package));
+            for type_name in declared {
+                let reads = case.reads_type.replace("{type}", type_name);
+                assert!(
+                    marshaller.contains(&reads),
+                    "case {label:?}: the package's (de)serialization must read \
+                     {type_name:?} ({reads:?}), got {marshaller}"
+                );
+            }
+        }
+    }
+}
+
+/// RULE: what the package's (de)serialization says about a member is read from the
+/// document — the name the member carries ON THE WIRE, which is not the name the
+/// language declares it under, and whether the document declares it as an instant, as
+/// another declared type or as a list of values.
+///
+/// The rows are the languages whose JSON reader needs to be told: one per kind of
+/// per-member knowledge the document is the only source of.
+#[tokio::test]
+async fn the_marshalling_carries_what_the_document_says_about_each_member() {
+    let emulator = emulator_with_schemas().await;
+
+    for (schema, language, marshaller, fragments) in [
+        (
+            "order.placed",
+            "Python36",
+            "src/schema/order/placed/marshaller.py",
+            &[
+                // A member whose wire name is no identifier of the language.
+                "\"detail_type\": (\"detail-type\", None, False),",
+                // A member holding another declared type.
+                "\"detail\": (\"detail\", Order, False),",
+                // A member holding a list.
+                "\"tags\": (\"tags\", None, True),",
+                // A member the document declares as an instant.
+                "\"placed_at\": (\"placedAt\", datetime, False),",
+            ][..],
+        ),
+        (
+            "order.placed",
+            "TypeScript3",
+            "src/schema/order/placed/Marshaller.ts",
+            &["const instants: ReadonlyArray<string> = [\"time\", \"placedAt\"];"][..],
+        ),
+        (
+            "shipment-events",
+            "Python36",
+            "src/schema/shipment/events/marshaller.py",
+            &[
+                "\"shipping_address\": (\"shippingAddress\", ShippingAddress, False),",
+                "\"delivered_at\": (\"deliveredAt\", datetime, False),",
+            ][..],
+        ),
+        (
+            "shipment-events",
+            "Java8",
+            "src/main/java/schema/shipment/events/ShipmentEvents.java",
+            &[
+                // Java reads a member by the name the document gives it.
+                "@JsonProperty(\"shippingAddress\")",
+                "@JsonProperty(\"deliveredAt\")",
+            ][..],
+        ),
+    ] {
+        let label = format!("{schema}/{language}");
+        generated(
+            &emulator,
+            &binding_uri(REGISTRY, schema, language, None),
+            &label,
+        )
+        .await;
+        let answer = source(
+            &emulator,
+            &source_uri(REGISTRY, schema, language, None),
+            &label,
+        )
+        .await;
+        let entries = archive_entries(&label, &answer);
+        let text = entries
+            .iter()
+            .find(|(path, _)| path == marshaller)
+            .map(|(_, text)| text.clone())
+            .unwrap_or_else(|| {
+                panic!(
+                    "case {label:?}: {marshaller:?} must be an entry, got {:?}",
+                    entries.iter().map(|(path, _)| path).collect::<Vec<_>>()
+                )
+            });
+        for fragment in fragments {
+            assert!(
+                text.contains(fragment),
+                "case {label:?}: {marshaller} must carry {fragment:?}, got {text}"
             );
         }
     }
@@ -792,7 +1124,11 @@ async fn the_source_follows_the_version_the_binding_was_generated_from() {
         .collect();
     assert_eq!(
         paths,
-        vec!["src/main/java/schema/order/placed/Shipment.java".to_string()],
+        vec![
+            "pom.xml".to_string(),
+            "src/main/java/schema/order/placed/Shipment.java".to_string(),
+            "src/main/java/schema/order/placed/Marshaller.java".to_string(),
+        ],
         "case {case:?}: the second version's own schema must be what is generated, got {paths:?}"
     );
 }
@@ -842,13 +1178,20 @@ async fn a_service_owned_schema_generates_its_own_package() {
     )
     .await;
     let entries = archive_entries(case, &answer);
+    let paths: Vec<String> = entries.iter().map(|(path, _)| path.clone()).collect();
+    let declarations = declaration_paths("Python36", schema, &paths);
     assert_eq!(
-        entries.len(),
+        declarations.len(),
         declared.len(),
-        "case {case:?}: one file per declared schema of the published document, got {:?} for \
-         {declared:?}",
-        entries.iter().map(|(path, _)| path).collect::<Vec<_>>()
+        "case {case:?}: one declaration per declared schema of the published document, got \
+         {declarations:?} for {declared:?}"
     );
+    for entry in package_entries("Python36", schema) {
+        assert!(
+            paths.contains(&entry),
+            "case {case:?}: the package must carry {entry:?}, got {paths:?}"
+        );
+    }
     for name in &declared {
         assert!(
             entries

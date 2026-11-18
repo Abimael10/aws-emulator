@@ -9,7 +9,10 @@
 //! declaration is read wherever it sits: directly under a member, under the `items` of a
 //! list, and nested inside another inline declaration, however deep. An object that
 //! declares no member of its own is free-form rather than a type, so it still gets no
-//! file.
+//! file. Beside the declarations the archive carries the package those declarations are
+//! built and (de)serialized as, which the sibling suite
+//! [`crate::code_binding_source`] is about; a case here counts the DECLARATIONS, which
+//! is every entry that package is not.
 //!
 //! The naming of a type the document leaves unnamed is this emulator's, stated once in
 //! the generator (`src/ops/get_code_binding_source.rs`) and pinned here: the member's
@@ -29,6 +32,7 @@ use std::time::{Duration, Instant};
 use serde_json::json;
 use service_com_amazonaws_schemas_schemas::state::CODE_BINDING_LANGUAGES;
 
+use crate::code_binding_source::{declaration_paths, package_entries, package_path};
 use crate::registry_schema_lifecycle::{create_registry, schema_uri, Answer, Emulator};
 
 /// The registry every case below creates its schemas in.
@@ -198,19 +202,9 @@ fn file_is_named_after_the_type(language: &str) -> bool {
     matches!(language, "Java8" | "TypeScript3")
 }
 
-/// The package a schema's generated files live in, below the language's source root:
-/// the one root every binding shares and the schema name's own alphanumeric runs,
-/// lower-cased (`src/ops/get_code_binding_source.rs`, `package_segments`).
-fn package_path(schema: &str) -> String {
-    let mut segments = vec!["schema".to_string()];
-    segments.extend(
-        schema
-            .split(|character: char| !character.is_alphanumeric())
-            .filter(|part| !part.is_empty())
-            .map(str::to_lowercase),
-    );
-    segments.join("/")
-}
+// Where a schema's generated files live is the layout the sibling suite states
+// ([`crate::code_binding_source::package_path`]), read through from there rather than
+// restated here.
 
 /// An emulator with the registry and every schema of [`document_cases`] created.
 async fn emulator_with_schemas() -> Emulator {
@@ -302,7 +296,16 @@ async fn the_archive_declares_every_type_the_document_implies() {
             let label = format!("{}/{language}", document.case);
             let answer = generated_source(&emulator, document.schema, language, &label).await;
             let entries = archive_entries(&label, &answer);
-            let paths: Vec<&str> = entries.iter().map(|(path, _)| path.as_str()).collect();
+            let paths: Vec<String> = entries.iter().map(|(path, _)| path.clone()).collect();
+            // The package around the declarations is the sibling suite's rule; what a
+            // case here counts is the declarations.
+            for entry in package_entries(language, document.schema) {
+                assert!(
+                    paths.contains(&entry),
+                    "case {label:?}: the package must carry {entry:?}, got {paths:?}"
+                );
+            }
+            let paths = declaration_paths(language, document.schema, &paths);
 
             assert_eq!(
                 paths.len(),
@@ -397,7 +400,8 @@ async fn an_object_with_no_members_gets_no_file() {
         let label = format!("free-form/{language}");
         let answer = generated_source(&emulator, "inline.freeform", language, &label).await;
         let entries = archive_entries(&label, &answer);
-        let paths: Vec<&str> = entries.iter().map(|(path, _)| path.as_str()).collect();
+        let paths: Vec<String> = entries.iter().map(|(path, _)| path.clone()).collect();
+        let paths = declaration_paths(language, "inline.freeform", &paths);
         assert_eq!(
             paths.len(),
             2,

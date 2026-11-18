@@ -60,3 +60,58 @@ Cause 2 — service=schemas, operation TagResource, fixture schemas-registry-tag
 2. Cause 1: replay fixture schemas-code-binding-lifecycle up to step task#6 — CreateRegistry, CreateSchema, PutCodeBinding for the language the fixture asks for, poll DescribeCodeBinding until CREATE_COMPLETE, then GET /v1/registries/name/<registry>/schemas/name/<schema>/language/<language>/source. Observed: 200 with a ZIP body of 400 bytes; AWS's recorded body for the same step is 3060 bytes. Unzip both and compare the entry list: the emulator's archive holds only the plain model declaration files.
 3. Cause 2: replay fixture schemas-registry-tagging step task#3 — POST /tags/<registry ARN> with a tags map, over HTTP/1.1. Inspect the raw response headers: status 204, empty body, and NO content-length header; AWS sends 'content-length: 0'.
 4. After the fix, re-replay BOTH schemas-code-binding-lifecycle#task#6 and schemas-registry-tagging#task#3 — they are served by two different paths (the code-binding archive generator and the empty-response framing on the HTTP writer) and neither closes the other.
+
+## Resolution
+
+Cause 1 (the truncated archive) — FIXED. A code binding is what a client BUILDS its
+handler against, so what `GetCodeBindingSource` serves is the whole generated PACKAGE of
+the language asked for, not only its declarations. Beside a declaration per type the
+stored document implies (which the earlier change already covered),
+`services/service-com-amazonaws-schemas-schemas/src/ops/get_code_binding_source.rs` now
+generates, from the same types and members:
+
+- the descriptor the language's own build reads, at the archive root where that build
+  looks for it — a Maven `pom.xml`, an npm `package.json` plus `tsconfig.json`, a
+  `setup.py` plus `requirements.txt`, a `go.mod` — naming the schema's own artifact;
+- the support source the declared types are read and written through: a marshaller per
+  package carrying a reader per declared type, the member table the document implies
+  (each attribute's name ON THE WIRE, whether the document declares it as an instant, as
+  another declared type or as a list), the package's export module where the language has
+  one (`index.ts`, `__init__.py` at every level of the package), and the per-member
+  serialization the declarations themselves need (Java's `@JsonProperty`, beside Go's
+  existing struct tags).
+
+A document that implies no type still generates no package at all. The archive for the
+two-type document the suite generates from went from a few hundred bytes to about 2.5 KB
+and still scales only with the stored document, which
+`crate::state::MAX_STORED_CONTENT_BYTES` bounds. `tests/all/code_binding_source.rs`
+asserts the rule over a table (both documents × every language: the package's files are
+present, there is still exactly one declaration per declared type, the descriptor names
+the artifact, and the marshalling reads every declared type) and over a second table for
+the per-member knowledge only the document has;
+`tests/all/code_binding_implied_types.rs` now counts the DECLARATIONS among the archive's
+entries.
+
+CAVEAT: the replay key for this cause compares the archive's BYTE LENGTH against the
+recording's. AWS publishes the bindings, not the generator that writes them, and the
+model describes nothing about the archive's contents, so the exact length of a
+proprietary generator's output is not reproducible by any rule — only by fitting that one
+recorded number, which is not a fix. What the key pins beyond that number — that the
+archive was a small fraction of the published one because it was missing the generated
+files a binding ships — is what the change above addresses.
+
+Cause 2 (`content-length: 0` on the empty 204) — BLOCKED below this crate, and unchanged
+by this fix. The half a service owns is already served: `Service::override_protocol` in
+`src/service.rs` hands every modelled response of this service through a protocol that
+frames an answer it serializes with an empty body as `content-length: 0`, which covers
+every operation of this model whose output is `Unit`, `TagResource` included
+(`tests/all/resource_tag_application.rs`, `tests/all/empty_response_framing.rs`,
+`tests/all/empty_result_statuses.rs`). What removes the header before the socket is the
+HTTP/1.1 writer the vendored transport serves on — `vendor/server/src/lib.rs`, the hyper
+connection builder (and `set_framing_content_length` at the same seam, which likewise
+adds no length at a no-content status) — which strips `content-length` from a `204`
+because RFC 9110 §15.3.5 gives that status no body. That tree is read-only here, so the
+wire-level half of this cause is a platform limitation rather than something a service
+crate can state its way out of; the same gap for this service's sibling 204 operations is
+the still-open 20261029T203553Z-schemas-empty-body-204-responses-omit-the-content-length.md.
+

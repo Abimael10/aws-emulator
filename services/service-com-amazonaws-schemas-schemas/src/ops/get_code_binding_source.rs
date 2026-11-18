@@ -239,28 +239,44 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Generated from the STORED document of the version the binding is attached to,
         // never from the request: the archive is what the generation this binding
         // records produced.
+        //
+        // A document whose package would pass the ceilings the generator answers within
+        // ([`MAX_GENERATED_TYPES`], [`MAX_GENERATED_SOURCE_BYTES`]) generates no package:
+        // a package missing part of itself is not source a client can build, so that is
+        // this service's own failure rather than a successful answer.
+        let archive = code_binding_archive(
+            target,
+            &schema.name,
+            &version.r#type,
+            &version.content,
+        )
+        .ok_or_else(|| {
+            GetCodeBindingSourceError::from(
+                GetCodeBindingSourceErrorModeled::InternalServerErrorException(
+                    crate::state::internal_error(),
+                ),
+            )
+        })?;
         Ok(GetCodeBindingSourceOutput {
-            body: Some(code_binding_archive(
-                target,
-                &schema.name,
-                &version.r#type,
-                &version.content,
-            )),
+            body: Some(archive),
         })
     }
 }
 
 // ---------------------------------------------------------------------------
-// The code generator: a schema document in, source files out.
+// The code generator: a schema document in, a source PACKAGE out.
 //
-// What a code binding IS, is the code a client builds its handler against — one
-// declaration per type the document IMPLIES, in the language asked for. So the archive
-// is COMPUTED from the stored document: the types it implies decide which files exist
-// (the named schemas it declares, and the nested structures its members declare inline,
-// which it never names), each type's own members decide what each file declares, and the
-// JSON Schema type of a member decides the type the declaration gives it. A document
-// that implies no structure therefore generates no source file, and a document that
-// implies twenty generates twenty.
+// What a code binding IS, is the code a client builds its handler against. So the
+// archive is a package of the language asked for, and it is COMPUTED from the stored
+// document: the types the document IMPLIES decide which declarations exist (the named
+// schemas it declares, and the nested structures its members declare inline, which it
+// never names), each type's own members decide what each declaration declares, and the
+// JSON Schema type of a member decides the type the declaration gives it. Beside the
+// declarations the package carries what that language needs to BUILD them and to read
+// and write the documents they declare — its build descriptor and its (de)serialization
+// support, generated from the same types and members (see `package_files`). A document
+// that implies no structure therefore generates no package at all, and a document that
+// implies twenty generates twenty declarations and the package that builds them.
 //
 // The mapping below is this emulator's, stated once here: AWS publishes the bindings,
 // not the generator that writes them, so what is pinned is the mapping itself — JSON
@@ -335,6 +351,20 @@ impl Target {
         match self {
             Self::Java8 | Self::TypeScript3 => type_identifier(declared),
             Self::Python36 | Self::Go1 => snake_case(declared),
+        }
+    }
+
+    /// What one member of a declaration is KNOWN BY in this language: the field or
+    /// attribute name the declaration gives it, which is the member name in that
+    /// language's own case — and the document's own name where the language declares a
+    /// member under the name it carries on the wire.
+    fn member_identity(self, member: &str) -> String {
+        match self {
+            // Java's field and Go's exported field are the same name in two cases, and
+            // Python's attribute is that name in snake case.
+            Self::Java8 | Self::Go1 => upper_camel(member),
+            Self::Python36 => snake_case(member),
+            Self::TypeScript3 => member.to_string(),
         }
     }
 }
@@ -415,27 +445,32 @@ enum Declared {
     Unknown,
 }
 
-/// The archive `GetCodeBindingSource` answers: the source files generated from
-/// `document` for `target`, in the order the document implies them.
+/// The archive `GetCodeBindingSource` answers: the whole package generated from
+/// `document` for `target` — see [`package_files`] for what a package holds — zipped in
+/// the order the generation emits it.
 ///
-/// Infallible. A document that implies no structure generates no source file, and so
-/// does one this service could not have stored (every stored document is a JSON
-/// object): the archive is then an empty one, rather than a failure of a binding whose
-/// generation the service reported complete.
+/// A document that implies no structure generates no source file, and so does one this
+/// service could not have stored (every stored document is a JSON object): the archive
+/// is then an empty one, rather than a failure of a binding whose generation the service
+/// reported complete. `None` is the other case: a document whose package would pass the
+/// ceilings below, or one file of it the archive could not take, which is a failure of
+/// the generation rather than a package served with part of itself missing.
 ///
-/// Its size is the stored document's: one declaration per type the document implies and
-/// a few lines per member of it. What a caller can grow is therefore the document, which
+/// Its size is the stored document's: one declaration per type the document implies, a
+/// few lines per member of it, and the package's own files, which carry an entry per
+/// type and per member too. What a caller can grow is therefore the document, which
 /// `crate::state::MAX_STORED_CONTENT_BYTES` and the model's own cap on `Content` bound
 /// before it is stored, and the nesting of one member's type, which
-/// [`MAX_DECLARATION_DEPTH`] bounds here.
+/// [`MAX_DECLARATION_DEPTH`] bounds here. The generated answer carries its own ceilings
+/// beside those: [`MAX_GENERATED_TYPES`] and [`MAX_GENERATED_SOURCE_BYTES`].
 fn code_binding_archive(
     target: Target,
     schema_name: &str,
     schema_type: &str,
     document: &str,
-) -> Vec<u8> {
+) -> Option<Vec<u8>> {
     let package = package_segments(schema_name);
-    let structures = declared_structures(document, schema_type, schema_name);
+    let structures = declared_structures(document, schema_type, schema_name)?;
     let mut archive = ::zip::ZipWriter::new(::std::io::Cursor::new(Vec::new()));
     // One archive for one (version, language) pair, so its bytes are the generation's
     // own: the entry timestamp is fixed rather than taken from the clock, which is what
@@ -443,22 +478,24 @@ fn code_binding_archive(
     let options = ::zip::write::SimpleFileOptions::default()
         .last_modified_time(::zip::DateTime::default());
     let mut written: BTreeSet<String> = BTreeSet::new();
-    for structure in &structures {
-        let file = render(target, &package, structure);
+    for file in package_files(target, schema_name, &package, &structures)? {
+        // One entry per path. `package_files` generates one file per rendered identity,
+        // so this holds for the files it answers; it is stated here as well because an
+        // archive with two entries of one path is not an archive a client can unpack.
         if !written.insert(file.path.clone()) {
-            // Two declarations of one name are one file; a JSON object holds one member
-            // per name, so this is only reachable for a document that repeats a key.
             continue;
         }
         if archive.start_file(&file.path, options).is_err() {
-            continue;
+            // An entry the archive cannot take would be a package missing part of
+            // itself, which is the one thing this generation does not answer.
+            return None;
         }
-        let _ = archive.write_all(file.text.as_bytes());
+        archive.write_all(file.text.as_bytes()).ok()?;
     }
     archive
         .finish()
         .map(::std::io::Cursor::into_inner)
-        .unwrap_or_default()
+        .ok()
 }
 
 /// The types a document IMPLIES, each as the structure a source file is generated for,
@@ -480,9 +517,18 @@ fn code_binding_archive(
 /// alias for the value it describes, so it gets no source file and a member that
 /// references it takes the type it describes. An object that declares no member of its
 /// own is free-form for the same reason, and stays [`Declared::Unknown`].
-fn declared_structures(document: &str, schema_type: &str, schema_name: &str) -> Vec<Structure> {
+///
+/// `None` where the document implies more types than [`MAX_GENERATED_TYPES`] or more
+/// members than [`MAX_GENERATED_MEMBERS`]: the counts are taken AS the walk reads, and
+/// the walk stops at the first one that passes its ceiling, so what a document can make
+/// this generation hold is bounded here rather than by the document's own size.
+fn declared_structures(
+    document: &str,
+    schema_type: &str,
+    schema_name: &str,
+) -> Option<Vec<Structure>> {
     let Some(parsed) = JsonNode::parse(document) else {
-        return Vec::new();
+        return Some(Vec::new());
     };
 
     let mut declared: Vec<(String, &JsonNode)> = Vec::new();
@@ -491,6 +537,9 @@ fn declared_structures(document: &str, schema_type: &str, schema_name: &str) -> 
             .member("components")
             .and_then(|components| components.member("schemas"))
         {
+            if schemas.len() > MAX_GENERATED_TYPES {
+                return None;
+            }
             for (name, schema) in schemas {
                 declared.push((name.clone(), schema));
             }
@@ -500,6 +549,9 @@ fn declared_structures(document: &str, schema_type: &str, schema_name: &str) -> 
         // schema's own name is the only name it has.
         declared.push((type_identifier(schema_name), &parsed));
         if let Some(JsonNode::Object(definitions)) = parsed.member(DRAFT4_DEFINITIONS) {
+            if definitions.len() > MAX_GENERATED_TYPES {
+                return None;
+            }
             for (name, schema) in definitions {
                 declared.push((name.clone(), schema));
             }
@@ -539,9 +591,13 @@ fn declared_structures(document: &str, schema_type: &str, schema_name: &str) -> 
         .collect();
     // A type hoisted out of an alias's own declaration is a structure too.
     queue.append(&mut hoisted.pending);
+    if queue.len() > MAX_GENERATED_TYPES {
+        return None;
+    }
 
     let mut read: Vec<Structure> = Vec::new();
     let mut seen: BTreeSet<String> = BTreeSet::new();
+    let mut members_read: usize = 0;
     let mut index = 0;
     while index < queue.len() {
         let (name, schema) = queue[index].clone();
@@ -553,6 +609,16 @@ fn declared_structures(document: &str, schema_type: &str, schema_name: &str) -> 
         // name, so this is only reachable for a document that repeats a key.
         if !seen.insert(name.clone()) {
             continue;
+        }
+        // Counted before this structure's members are read, so a document that implies
+        // more than the generation holds stops the walk here instead of being read in
+        // full and refused afterwards.
+        if read.len() >= MAX_GENERATED_TYPES {
+            return None;
+        }
+        members_read = members_read.saturating_add(properties.len());
+        if members_read > MAX_GENERATED_MEMBERS {
+            return None;
         }
         let required = required_members(schema);
         let members: Vec<Member> = properties
@@ -566,23 +632,31 @@ fn declared_structures(document: &str, schema_type: &str, schema_name: &str) -> 
         structure_names.insert(name.clone());
         read.push(Structure { name, members });
         queue.append(&mut hoisted.pending);
+        // Every queued declaration is a candidate type, so the queue is held to the same
+        // ceiling as the types read: one structure's members can queue no more than the
+        // members just counted.
+        if queue.len() > MAX_GENERATED_TYPES {
+            return None;
+        }
     }
 
     // Only now is the whole set of structures known, so a reference is resolved against
     // it last: a member may name a structure declared after it, named or hoisted.
-    read.into_iter()
-        .map(|structure| Structure {
-            name: structure.name,
-            members: structure
-                .members
-                .into_iter()
-                .map(|member| Member {
-                    declared: resolve(member.declared, &structure_names, &aliases, 0),
-                    ..member
-                })
-                .collect(),
-        })
-        .collect()
+    Some(
+        read.into_iter()
+            .map(|structure| Structure {
+                name: structure.name,
+                members: structure
+                    .members
+                    .into_iter()
+                    .map(|member| Member {
+                        declared: resolve(member.declared, &structure_names, &aliases, 0),
+                        ..member
+                    })
+                    .collect(),
+            })
+            .collect(),
+    )
 }
 
 /// The types a document implies without naming them: while a structure's members are
@@ -815,13 +889,7 @@ struct SourceFile {
 
 /// The source file one structure renders to for `target`.
 fn render(target: Target, package: &[String], structure: &Structure) -> SourceFile {
-    let path = format!(
-        "{}{}/{}.{}",
-        target.source_root(),
-        package.join("/"),
-        target.file_stem(&structure.name),
-        target.extension()
-    );
+    let path = source_path(target, package, &target.file_stem(&structure.name));
     let text = match target {
         Target::Java8 => java_source(package, structure),
         Target::TypeScript3 => typescript_source(structure),
@@ -836,13 +904,16 @@ fn render(target: Target, package: &[String], structure: &Structure) -> SourceFi
 /// at the top of the file.
 fn referenced(structure: &Structure) -> Vec<&str> {
     let mut named: Vec<&str> = Vec::new();
+    // The names already taken are kept in a set as well as in order, so one structure's
+    // members cost one pass over them rather than one per name already named.
+    let mut taken: BTreeSet<&str> = BTreeSet::new();
     for member in &structure.members {
         let mut declared = &member.declared;
         while let Declared::List(item) = declared {
             declared = item;
         }
         if let Declared::Named(name) = declared {
-            if name != &structure.name && !named.contains(&name.as_str()) {
+            if name != &structure.name && taken.insert(name.as_str()) {
                 named.push(name.as_str());
             }
         }
@@ -870,12 +941,24 @@ fn java_type(declared: &Declared) -> String {
 
 /// One Java class per structure, in the schema's package: a private field per member
 /// and the accessor pair a Java client reads it through.
+///
+/// A field carries the member name the document declares, which is the name on the
+/// wire and is not the field's own name — so each one states it, and a document the
+/// binding did not declare a member for is read rather than refused.
 fn java_source(package: &[String], structure: &Structure) -> String {
     let class = type_identifier(&structure.name);
-    let mut text = format!("package {};\n\npublic class {class} {{\n", package.join("."));
+    let mut text = format!(
+        "package {};\n\n\
+         import com.fasterxml.jackson.annotation.JsonIgnoreProperties;\n\
+         import com.fasterxml.jackson.annotation.JsonProperty;\n\n\
+         @JsonIgnoreProperties(ignoreUnknown = true)\n\
+         public class {class} {{\n",
+        package.join(".")
+    );
     for member in &structure.members {
         text.push_str(&format!(
-            "    private {} {};\n",
+            "    @JsonProperty({})\n    private {} {};\n",
+            literal(&member.name),
             java_type(&member.declared),
             lower_camel(&member.name)
         ));
@@ -939,8 +1022,8 @@ fn typescript_source(structure: &Structure) -> String {
 }
 
 /// A TypeScript property name as it is written in an interface: as the document declares
-/// it where that is an identifier, quoted where it is not (a name with a `-` in it, as
-/// an event's `detail-type`).
+/// it where that is an identifier, as a string literal where it is not (a name with a `-`
+/// in it, as an event's `detail-type`).
 fn quoted_if_needed(name: &str) -> String {
     let identifier = !name.is_empty()
         && !name.starts_with(|character: char| character.is_ascii_digit())
@@ -950,8 +1033,36 @@ fn quoted_if_needed(name: &str) -> String {
     if identifier {
         name.to_string()
     } else {
-        format!("\"{name}\"")
+        literal(name)
     }
+}
+
+/// `text` as a double-quoted string LITERAL, quotes included: a member name is whatever
+/// the stored document's own JSON holds, so a name carrying the literal's delimiter, a
+/// backslash or a character no literal may hold as itself would otherwise end the
+/// literal and leave the rest of the name standing as source.
+///
+/// Written with JSON's own escapes, by the JSON writer this crate already depends on —
+/// which is the escaping every language generated here reads (`\"`, `\\`, and `\uXXXX`
+/// for a control character). The two code points a JSON string may carry as themselves
+/// while a JavaScript source literal may not are escaped as well.
+fn literal(text: &str) -> String {
+    let written =
+        ::serde_json::to_string(text).unwrap_or_else(|_| format!("\"{}\"", text.escape_debug()));
+    written
+        .replace('\u{2028}', "\\u2028")
+        .replace('\u{2029}', "\\u2029")
+}
+
+/// [`literal`] without its quotes: what a literal another syntax delimits — a Go struct
+/// tag's own string — carries between them.
+fn escaped(text: &str) -> String {
+    let written = literal(text);
+    written
+        .strip_prefix('"')
+        .and_then(|rest| rest.strip_suffix('"'))
+        .map(str::to_string)
+        .unwrap_or(written)
 }
 
 /// The Python type a declaration maps to, without the optionality its member carries.
@@ -1043,6 +1154,22 @@ fn go_type(declared: &Declared) -> String {
     }
 }
 
+/// The struct tag one member carries: the member name the document declares, which is
+/// the name on the wire, and `omitempty` for a member the document does not require.
+///
+/// Written as Go's raw-string tag, which is what a struct tag is written as — and as an
+/// interpreted string where the name holds a character a raw string cannot carry (a
+/// backtick ends the literal, and a raw literal has no escapes).
+fn go_tag(member: &Member) -> String {
+    let name = &member.name;
+    let omitted = if member.required { "" } else { ",omitempty" };
+    if name.contains(['`', '"', '\\', '\n', '\r']) {
+        format!("\"json:\\\"{}{omitted}\\\"\"", escaped(name))
+    } else {
+        format!("`json:\"{name}{omitted}\"`")
+    }
+}
+
 /// One struct per structure, in the package the schema's files share: an exported field
 /// per member, tagged with the member name the document declares, which is the name on
 /// the wire.
@@ -1051,15 +1178,10 @@ fn go_source(package: &[String], structure: &Structure) -> String {
         .members
         .iter()
         .map(|member| {
-            let tag = if member.required {
-                format!("`json:\"{}\"`", member.name)
-            } else {
-                format!("`json:\"{},omitempty\"`", member.name)
-            };
             (
                 upper_camel(&member.name),
                 go_type(&member.declared),
-                tag,
+                go_tag(member),
             )
         })
         .collect();
@@ -1081,6 +1203,709 @@ fn go_source(package: &[String], structure: &Structure) -> String {
         text.push_str(&format!("\t{field} {declared} {tag}\n"));
     }
     text.push_str("}\n");
+    text
+}
+
+// ---------------------------------------------------------------------------
+// The package the declarations are shipped in. A code binding is what a client BUILDS
+// its handler against, so what the archive holds is a package of that language and not
+// a bag of declarations: the descriptor the language's own build reads, and the support
+// source the declared types are read and written through. Both are generated from the
+// same structures the declarations are, so the document decides them as well — a
+// package carries an entry per type and per member of it, and the marshalling knows
+// which member the document declared as an instant and which as another declared type.
+// ---------------------------------------------------------------------------
+
+/// Where a file named `stem` sits in the archive: in the schema's own package, below
+/// the source root this language lays its sources out under.
+fn source_path(target: Target, package: &[String], stem: &str) -> String {
+    format!(
+        "{}{}/{stem}.{}",
+        target.source_root(),
+        package.join("/"),
+        target.extension()
+    )
+}
+
+/// The version a generated package is published at. One package is generated per
+/// (schema version, language) pair and is the whole of that generation, so there is
+/// nothing here for a package version to count.
+const PACKAGE_VERSION: &str = "1.0.0";
+
+/// The type the package's own (de)serialization is declared as, named the same in every
+/// language so a client that reads one binding recognises the next.
+const MARSHALLER: &str = "Marshaller";
+
+/// The module a package exports its declarations through, where the language has one.
+const PACKAGE_INDEX: &str = "index";
+
+/// The file that makes a directory a Python package.
+const PYTHON_PACKAGE_MARKER: &str = "__init__";
+
+/// The JSON library the generated Java package (de)serializes through, and the release
+/// its descriptor asks for.
+const JACKSON_VERSION: &str = "2.13.5";
+
+/// The TypeScript release the generated package's descriptor builds with: the language
+/// version the binding is generated for.
+const TYPESCRIPT_VERSION: &str = "^3.9.10";
+
+/// The library the generated Python package reads an instant with, and the release its
+/// descriptor asks for.
+const PYTHON_DATE_LIBRARY: &str = "python-dateutil>=2.8";
+
+/// The Go release the generated module declares: the oldest one whose module support
+/// every file of the generated package needs.
+const GO_LANGUAGE_VERSION: &str = "1.16";
+
+/// How many types one generated package declares at most. A package is LARGER than the
+/// document it is generated from — a declaration, a member-table entry and a reader per
+/// type — so the stored document's own bound
+/// (`crate::state::MAX_STORED_CONTENT_BYTES`, 64 MiB) is not by itself a bound on the
+/// answer: this caps the work and the size the generation can reach, at the point they
+/// grow.
+const MAX_GENERATED_TYPES: usize = 10_000;
+
+/// How many bytes of generated source one package carries at most, for the same reason
+/// as [`MAX_GENERATED_TYPES`]: a small request cannot answer with an unbounded archive.
+const MAX_GENERATED_SOURCE_BYTES: usize = 16 * 1024 * 1024;
+
+/// How many members, counted over every type one document implies, a generation reads.
+/// Beside [`MAX_GENERATED_TYPES`] this is what bounds the biggest FILE a package holds:
+/// a declaration is a few lines per member, so a ceiling on the members is a ceiling on
+/// the text, and [`generated_cost`] turns the two into the bytes they can reach.
+const MAX_GENERATED_MEMBERS: usize = 50_000;
+
+/// What one declared type costs the generated package, before anything is rendered: the
+/// fixed text of a declaration, of its imports and of the entries the support source
+/// carries for it.
+const COST_PER_TYPE: usize = 4_096;
+
+/// What one member of a declaration costs: the fixed text of the field, the accessors
+/// the languages that have them write, the language's own name for the type it holds,
+/// and the member's entry in the member table.
+const COST_PER_MEMBER: usize = 1_024;
+
+/// How many times over a name may be written into the generated package — a member is
+/// named by its field, its accessors, its wire name and its table entry — so a name's
+/// own bytes are counted this many times. An upper bound on what the renderers below
+/// write, which is what makes [`generated_cost`] a bound on the bytes rather than an
+/// observation about them.
+const COST_PER_NAME_BYTE: usize = 16;
+
+/// The bytes the package generated from `structures` can reach, counted from the types
+/// and members themselves rather than from the text — so the budget is known BEFORE a
+/// file is built, and no single file is built past it.
+///
+/// Every term is an upper bound on what the renderers write, so the answer is never less
+/// than the generated source; it is deliberately generous rather than exact.
+fn generated_cost(structures: &[Structure]) -> usize {
+    structures.iter().fold(0usize, |cost, structure| {
+        let members = structure.members.iter().fold(0usize, |members, member| {
+            let named = member
+                .name
+                .len()
+                .saturating_add(declared_names(&member.declared));
+            members
+                .saturating_add(COST_PER_MEMBER)
+                .saturating_add(COST_PER_NAME_BYTE.saturating_mul(named))
+        });
+        cost.saturating_add(COST_PER_TYPE)
+            .saturating_add(COST_PER_NAME_BYTE.saturating_mul(structure.name.len()))
+            .saturating_add(members)
+    })
+}
+
+/// The NAME bytes one member's declared type carries: the type it names where it names
+/// one, and nothing where the language's own name for it is fixed text (counted in
+/// [`COST_PER_MEMBER`]). Bounded by [`MAX_DECLARATION_DEPTH`], which is what bounds a
+/// list of a list of a list.
+fn declared_names(declared: &Declared) -> usize {
+    match declared {
+        Declared::List(item) => declared_names(item),
+        Declared::Named(name) => name.len(),
+        _ => 0,
+    }
+}
+
+/// The whole package generated for `target`, in the order the archive holds it: the
+/// descriptor(s) the language's own build reads, a declaration per type the document
+/// implies, and the support source that reads and writes the documents those
+/// declarations describe.
+///
+/// A document that implies no type declares nothing, so there is nothing to build and
+/// nothing to (de)serialize: the package is then empty, which is what makes the archive
+/// of such a document an empty archive.
+///
+/// One declaration per RENDERED identity: where two names the document declares are one
+/// type's in the language asked for — one file name, or one declared type name, since
+/// each language builds both from the name's own segments — they are one declaration,
+/// and the support source is generated from exactly the set the declarations are, so a
+/// generated package never imports a type whose declaration the archive does not hold.
+///
+/// `None` where the package would pass [`MAX_GENERATED_TYPES`] or
+/// [`MAX_GENERATED_SOURCE_BYTES`]: the types are counted and the bytes the package can
+/// reach are counted from the types and members themselves ([`generated_cost`]) BEFORE
+/// any file is built, so neither the work this answer costs nor the bytes it holds is
+/// left to the document alone — and the per-file count below is what holds the answer to
+/// the budget as it is assembled. A document that reaches a ceiling
+/// (`crate::state::MAX_STORED_CONTENT_BYTES` admits one four times the byte budget)
+/// generates no package at all rather than one missing part of itself, which is what the
+/// caller is told.
+fn package_files(
+    target: Target,
+    schema_name: &str,
+    package: &[String],
+    structures: &[Structure],
+) -> Option<Vec<SourceFile>> {
+    if structures.is_empty() {
+        return Some(Vec::new());
+    }
+    let mut stems: BTreeSet<String> = BTreeSet::new();
+    let mut named: BTreeSet<String> = BTreeSet::new();
+    let declared: Vec<Structure> = structures
+        .iter()
+        .filter(|structure| {
+            let stem = stems.insert(target.file_stem(&structure.name));
+            let declared = named.insert(type_identifier(&structure.name));
+            stem && declared
+        })
+        .map(|structure| Structure {
+            name: structure.name.clone(),
+            members: distinct_members(target, &structure.members),
+        })
+        .collect();
+    if declared.len() > MAX_GENERATED_TYPES {
+        return None;
+    }
+    // What the package will cost, from the types and members themselves: counted here,
+    // so the budget is enforced before a file is BUILT rather than after one is built
+    // and measured. No single file can pass the budget, because the text of a file is
+    // bounded by the cost of what it declares.
+    if generated_cost(&declared) > MAX_GENERATED_SOURCE_BYTES {
+        return None;
+    }
+    let mut files: Vec<SourceFile> = Vec::new();
+    let mut carried: usize = 0;
+    for file in build_files(target, schema_name, package)
+        .into_iter()
+        // Rendered one declaration at a time, so the budget below is checked before the
+        // next one is generated rather than after all of them are.
+        .chain(
+            declared
+                .iter()
+                .map(|structure| render(target, package, structure)),
+        )
+        // Generated once the declarations are done, and only while the budget is still
+        // open: the support source is one file per language, carrying an entry per type,
+        // and it is counted against the budget like any other.
+        .chain(::std::iter::once_with(|| support_files(target, package, &declared)).flatten())
+    {
+        carried = carried.saturating_add(file.text.len());
+        if carried > MAX_GENERATED_SOURCE_BYTES {
+            return None;
+        }
+        files.push(file);
+    }
+    Some(files)
+}
+
+/// `members` with one member per member identity of `target`: where two names the
+/// document declares are one member's in the language asked for — one field, one
+/// attribute, one key of the member table — the first of them is what the declaration
+/// and its (de)serialization carry, rather than two of one name.
+///
+/// The same rule as the one [`package_files`] applies to the declared types, for the
+/// same reason: a declaration naming one member twice is not source a client can build,
+/// and a member table keyed twice by one name holds only the last of them.
+fn distinct_members(target: Target, members: &[Member]) -> Vec<Member> {
+    let mut taken: BTreeSet<String> = BTreeSet::new();
+    members
+        .iter()
+        .filter(|member| taken.insert(target.member_identity(&member.name)))
+        .cloned()
+        .collect()
+}
+
+/// The artifact a generated package is published as: the schema's own name in the
+/// lower-case, hyphen-joined form every language below names a package by.
+fn artifact_name(package: &[String]) -> String {
+    let named: Vec<&str> = package.iter().skip(1).map(String::as_str).collect();
+    if named.is_empty() {
+        PACKAGE_ROOT.to_string()
+    } else {
+        named.join("-")
+    }
+}
+
+/// What the language's own build reads: what the package is called, what it is compiled
+/// as, and the one library its support source needs. At the archive root, which is
+/// where each of these builds looks for it.
+fn build_files(target: Target, schema_name: &str, package: &[String]) -> Vec<SourceFile> {
+    let artifact = artifact_name(package);
+    match target {
+        Target::Java8 => vec![SourceFile {
+            path: "pom.xml".to_string(),
+            text: maven_pom(&package.join("."), &artifact),
+        }],
+        Target::TypeScript3 => vec![
+            SourceFile {
+                path: "package.json".to_string(),
+                text: npm_package(&artifact, package, schema_name),
+            },
+            SourceFile {
+                path: "tsconfig.json".to_string(),
+                text: typescript_config(),
+            },
+        ],
+        Target::Python36 => vec![
+            SourceFile {
+                path: "setup.py".to_string(),
+                text: python_setup(&artifact, schema_name),
+            },
+            SourceFile {
+                path: "requirements.txt".to_string(),
+                text: format!("{PYTHON_DATE_LIBRARY}\n"),
+            },
+        ],
+        Target::Go1 => vec![SourceFile {
+            path: "go.mod".to_string(),
+            text: format!("module {artifact}\n\ngo {GO_LANGUAGE_VERSION}\n"),
+        }],
+    }
+}
+
+/// The package's own source beside the declarations: the (de)serialization every
+/// generated type is read and written through, and whatever else the language needs for
+/// the declarations to be importable as one package.
+fn support_files(target: Target, package: &[String], structures: &[Structure]) -> Vec<SourceFile> {
+    match target {
+        Target::Java8 => vec![SourceFile {
+            path: source_path(target, package, MARSHALLER),
+            text: java_marshaller(package, structures),
+        }],
+        Target::TypeScript3 => vec![
+            SourceFile {
+                path: source_path(target, package, PACKAGE_INDEX),
+                text: typescript_index(structures),
+            },
+            SourceFile {
+                path: source_path(target, package, MARSHALLER),
+                text: typescript_marshaller(structures),
+            },
+        ],
+        Target::Python36 => {
+            // Every level of the package is a Python package of its own, and a Python
+            // package is a directory carrying this file; the leaf one is the package a
+            // client imports, so it re-exports what the generation produced.
+            let mut files: Vec<SourceFile> = (1..package.len())
+                .map(|level| SourceFile {
+                    path: source_path(target, &package[..level], PYTHON_PACKAGE_MARKER),
+                    text: String::new(),
+                })
+                .collect();
+            files.push(SourceFile {
+                path: source_path(target, package, PYTHON_PACKAGE_MARKER),
+                text: python_exports(structures),
+            });
+            files.push(SourceFile {
+                path: source_path(target, package, &target.file_stem(MARSHALLER)),
+                text: python_marshaller(structures),
+            });
+            files
+        }
+        Target::Go1 => vec![SourceFile {
+            path: source_path(target, package, &target.file_stem(MARSHALLER)),
+            text: go_marshaller(package, structures),
+        }],
+    }
+}
+
+/// What a member holds, as the generated support source names it: the declaration of
+/// one value of the member, and whether the member holds a list of them.
+fn held_item(declared: &Declared) -> (&Declared, bool) {
+    match declared {
+        Declared::List(item) => (item.as_ref(), true),
+        other => (other, false),
+    }
+}
+
+/// The member names the document declares as instants, in the order the structures
+/// declare them: the members a language whose JSON reader has no date type has to be
+/// told about.
+///
+/// The names already answered are kept in a set as well as in order, so one document's
+/// members cost one pass over them rather than one per name already taken.
+fn instant_members(structures: &[Structure]) -> Vec<&str> {
+    let mut named: Vec<&str> = Vec::new();
+    let mut taken: BTreeSet<&str> = BTreeSet::new();
+    for structure in structures {
+        for member in &structure.members {
+            let (item, _) = held_item(&member.declared);
+            if *item == Declared::Timestamp && taken.insert(member.name.as_str()) {
+                named.push(member.name.as_str());
+            }
+        }
+    }
+    named
+}
+
+/// The Maven project the generated Java package is built by.
+fn maven_pom(group: &str, artifact: &str) -> String {
+    format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+  <modelVersion>4.0.0</modelVersion>
+
+  <groupId>{group}</groupId>
+  <artifactId>{artifact}</artifactId>
+  <version>{PACKAGE_VERSION}</version>
+  <packaging>jar</packaging>
+
+  <properties>
+    <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+    <maven.compiler.source>1.8</maven.compiler.source>
+    <maven.compiler.target>1.8</maven.compiler.target>
+    <jackson.version>{JACKSON_VERSION}</jackson.version>
+  </properties>
+
+  <dependencies>
+    <dependency>
+      <groupId>com.fasterxml.jackson.core</groupId>
+      <artifactId>jackson-databind</artifactId>
+      <version>${{jackson.version}}</version>
+    </dependency>
+    <dependency>
+      <groupId>com.fasterxml.jackson.datatype</groupId>
+      <artifactId>jackson-datatype-jsr310</artifactId>
+      <version>${{jackson.version}}</version>
+    </dependency>
+  </dependencies>
+</project>
+"#
+    )
+}
+
+/// The one type every generated Java type is read and written through: the configured
+/// mapper, and the reader of each declared type.
+fn java_marshaller(package: &[String], structures: &[Structure]) -> String {
+    let package_name = package.join(".");
+    let mut text = format!(
+        r#"package {package_name};
+
+import java.io.IOException;
+
+import com.fasterxml.jackson.databind.DeserializationFeature;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.SerializationFeature;
+import com.fasterxml.jackson.datatype.jsr310.JavaTimeModule;
+
+/** Reads and writes the JSON documents this package's types declare. */
+public final class {MARSHALLER} {{
+
+    private static final ObjectMapper MAPPER = new ObjectMapper()
+            .registerModule(new JavaTimeModule())
+            .disable(SerializationFeature.WRITE_DATES_AS_TIMESTAMPS)
+            .disable(DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES);
+
+    private {MARSHALLER}() {{
+    }}
+
+    public static String marshal(final Object value) throws IOException {{
+        return MAPPER.writeValueAsString(value);
+    }}
+"#
+    );
+    for structure in structures {
+        let class = type_identifier(&structure.name);
+        text.push_str(&format!(
+            r#"
+    public static {class} unmarshal{class}(final String document) throws IOException {{
+        return MAPPER.readValue(document, {class}.class);
+    }}
+"#
+        ));
+    }
+    text.push_str("}\n");
+    text
+}
+
+/// The npm package the generated TypeScript sources are built and imported as.
+///
+/// What it points a consumer at is what the BUILD emits — the compiled module and its
+/// declarations under the output directory `tsconfig.json` names — rather than the
+/// sources the compiler reads.
+fn npm_package(artifact: &str, package: &[String], schema_name: &str) -> String {
+    let entry = format!(
+        "{TYPESCRIPT_OUTPUT_ROOT}/{}/{PACKAGE_INDEX}",
+        package.join("/")
+    );
+    let descriptor = ::serde_json::json!({
+        "name": artifact,
+        "version": PACKAGE_VERSION,
+        "description": format!("Code binding generated for the schema {schema_name}."),
+        "main": format!("{entry}.js"),
+        "types": format!("{entry}.d.ts"),
+        "private": true,
+        "scripts": {"build": "tsc --project tsconfig.json"},
+        "devDependencies": {"typescript": TYPESCRIPT_VERSION},
+    });
+    format!(
+        "{}\n",
+        ::serde_json::to_string_pretty(&descriptor).unwrap_or_default()
+    )
+}
+
+/// Where the generated TypeScript package's build puts what it emits.
+const TYPESCRIPT_OUTPUT_ROOT: &str = "dist";
+
+/// How the generated TypeScript sources are compiled.
+fn typescript_config() -> String {
+    let target = Target::TypeScript3;
+    let config = ::serde_json::json!({
+        "compilerOptions": {
+            "target": "es2017",
+            "module": "commonjs",
+            "declaration": true,
+            "strict": true,
+            "rootDir": target.source_root().trim_end_matches('/'),
+            "outDir": TYPESCRIPT_OUTPUT_ROOT,
+        },
+        "include": [format!("{}**/*.{}", target.source_root(), target.extension())],
+    });
+    format!(
+        "{}\n",
+        ::serde_json::to_string_pretty(&config).unwrap_or_default()
+    )
+}
+
+/// What a client importing the generated TypeScript package gets: every declaration of
+/// it, and the (de)serialization for them.
+fn typescript_index(structures: &[Structure]) -> String {
+    let mut text = String::new();
+    for structure in structures {
+        text.push_str(&format!(
+            "export * from \"./{}\";\n",
+            Target::TypeScript3.file_stem(&structure.name)
+        ));
+    }
+    text.push_str(&format!("export * from \"./{MARSHALLER}\";\n"));
+    text
+}
+
+/// The generated TypeScript package's (de)serialization: a reader per declared type,
+/// and the instants the document declares, which JSON itself carries as text.
+fn typescript_marshaller(structures: &[Structure]) -> String {
+    let mut text = String::new();
+    for structure in structures {
+        text.push_str(&format!(
+            "import {{ {} }} from \"./{}\";\n",
+            type_identifier(&structure.name),
+            Target::TypeScript3.file_stem(&structure.name)
+        ));
+    }
+    let instants: Vec<String> = instant_members(structures)
+        .into_iter()
+        .map(literal)
+        .collect();
+    text.push_str(&format!(
+        r#"
+/** The members this schema declares as instants, which JSON carries as text. */
+const instants: ReadonlyArray<string> = [{}];
+
+function revive(key: string, value: unknown): unknown {{
+  return typeof value === "string" && instants.indexOf(key) >= 0 ? new Date(value) : value;
+}}
+
+/** Writes a value as the JSON document its declared type describes. */
+export function marshal(value: unknown): string {{
+  return JSON.stringify(value);
+}}
+"#,
+        instants.join(", ")
+    ));
+    for structure in structures {
+        let declared = type_identifier(&structure.name);
+        text.push_str(&format!(
+            r#"
+/** Reads a JSON document as the {declared} this package declares. */
+export function unmarshal{declared}(document: string): {declared} {{
+  return JSON.parse(document, revive) as {declared};
+}}
+"#
+        ));
+    }
+    text
+}
+
+/// The distribution the generated Python package is installed as.
+fn python_setup(artifact: &str, schema_name: &str) -> String {
+    let source_root = Target::Python36.source_root().trim_end_matches('/');
+    // The schema's own name goes into a literal of the generated file, so it is escaped
+    // for that literal here rather than relying on what a name is admitted from.
+    let described = escaped(schema_name);
+    format!(
+        r#"from setuptools import find_packages, setup
+
+setup(
+    name="{artifact}",
+    version="{PACKAGE_VERSION}",
+    description="Code binding generated for the schema {described}.",
+    package_dir={{"": "{source_root}"}},
+    packages=find_packages("{source_root}"),
+    install_requires=["{PYTHON_DATE_LIBRARY}"],
+    python_requires=">=3.6",
+)
+"#
+    )
+}
+
+/// What `import`ing the generated Python package gets: every declaration of it, and the
+/// (de)serialization for them.
+fn python_exports(structures: &[Structure]) -> String {
+    let mut text = String::new();
+    for structure in structures {
+        text.push_str(&format!(
+            "from .{} import {}\n",
+            Target::Python36.file_stem(&structure.name),
+            type_identifier(&structure.name)
+        ));
+    }
+    text.push_str(&format!(
+        "from .{} import marshal, unmarshal\n",
+        Target::Python36.file_stem(MARSHALLER)
+    ));
+    text
+}
+
+/// The Python type a declared value is READ as, for the member table the generated
+/// marshaller walks: the declared type where the package declares one, the date type
+/// for an instant, and nothing where JSON carries the value as it is.
+fn python_holds(declared: &Declared) -> String {
+    match declared {
+        Declared::Timestamp => "datetime".to_string(),
+        Declared::Named(name) => type_identifier(name),
+        _ => "None".to_string(),
+    }
+}
+
+/// The generated Python package's (de)serialization: the member table the document
+/// implies — per declared type, each attribute's name on the wire, what one value of it
+/// is read as and whether it holds a list of them — and the walk over it.
+fn python_marshaller(structures: &[Structure]) -> String {
+    let mut text = String::from(
+        "import json\nfrom datetime import datetime\n\
+         from typing import Any, Dict, Tuple, Type\n\n\
+         from dateutil.parser import isoparse\n\n",
+    );
+    for structure in structures {
+        text.push_str(&format!(
+            "from .{} import {}\n",
+            Target::Python36.file_stem(&structure.name),
+            type_identifier(&structure.name)
+        ));
+    }
+    text.push_str(
+        "\n# Per declared type, each attribute's name on the wire, the type one value of it is\n\
+         # read as (None where JSON carries it as it is) and whether the member holds a list\n\
+         # of them. Generated from the document this binding was generated from.\n\
+         MEMBERS: Dict[type, Dict[str, Tuple[str, Any, bool]]] = {\n",
+    );
+    for structure in structures {
+        text.push_str(&format!("    {}: {{\n", type_identifier(&structure.name)));
+        for member in &structure.members {
+            let (item, repeated) = held_item(&member.declared);
+            text.push_str(&format!(
+                "        {}: ({}, {}, {}),\n",
+                literal(&snake_case(&member.name)),
+                literal(&member.name),
+                python_holds(item),
+                if repeated { "True" } else { "False" }
+            ));
+        }
+        text.push_str("    },\n");
+    }
+    text.push_str("}\n");
+    text.push_str(PYTHON_MARSHALLER_WALK);
+    text
+}
+
+/// The walk over the member table [`python_marshaller`] writes: the same code for every
+/// document, because the document is in the table rather than in the walk.
+const PYTHON_MARSHALLER_WALK: &str = r#"
+
+def marshal(value: Any) -> str:
+    """Write a declared value as the JSON document its type describes."""
+    return json.dumps(_written(value))
+
+
+def unmarshal(document: str, declared: Type[Any]) -> Any:
+    """Read a JSON document as the declared type it describes."""
+    return _read(json.loads(document), declared)
+
+
+def _written(value: Any) -> Any:
+    members = MEMBERS.get(type(value))
+    if members is None:
+        return value.isoformat() if isinstance(value, datetime) else value
+    document: Dict[str, Any] = {}
+    for attribute, (wire, _holds, repeated) in members.items():
+        held = getattr(value, attribute, None)
+        if held is None:
+            continue
+        document[wire] = [_written(item) for item in held] if repeated else _written(held)
+    return document
+
+
+def _read(document: Any, declared: Type[Any]) -> Any:
+    members = MEMBERS.get(declared)
+    if members is None or not isinstance(document, dict):
+        return document
+    value = declared()
+    for attribute, (wire, holds, repeated) in members.items():
+        held = document.get(wire)
+        if held is None:
+            continue
+        setattr(
+            value,
+            attribute,
+            [_value(item, holds) for item in held] if repeated else _value(held, holds),
+        )
+    return value
+
+
+def _value(held: Any, holds: Any) -> Any:
+    if holds is None:
+        return held
+    if holds is datetime:
+        return isoparse(held)
+    return _read(held, holds)
+"#;
+
+/// The generated Go package's (de)serialization: a reader per declared type, over the
+/// member names the declarations' own tags carry.
+fn go_marshaller(package: &[String], structures: &[Structure]) -> String {
+    let package_name = package
+        .last()
+        .cloned()
+        .unwrap_or_else(|| PACKAGE_ROOT.to_string());
+    let mut text = format!(
+        "package {package_name}\n\nimport \"encoding/json\"\n\n\
+         // Marshal writes a declared value as the JSON document its type describes.\n\
+         func Marshal(value interface{{}}) ([]byte, error) {{\n\
+         \treturn json.Marshal(value)\n}}\n"
+    );
+    for structure in structures {
+        let declared = type_identifier(&structure.name);
+        text.push_str(&format!(
+            "\n// Unmarshal{declared} reads a JSON document as the {declared} this package \
+             declares.\nfunc Unmarshal{declared}(document []byte) ({declared}, error) {{\n\
+             \tvar value {declared}\n\terr := json.Unmarshal(document, &value)\n\
+             \treturn value, err\n}}\n"
+        ));
+    }
     text
 }
 
@@ -1197,7 +2022,8 @@ mod tests {
     /// type it stands for.
     #[test]
     fn the_structures_are_the_documents_named_schemas() {
-        let structures = declared_structures(OPENAPI, "OpenApi3", "order.placed");
+        let structures = declared_structures(OPENAPI, "OpenApi3", "order.placed")
+            .expect("the document is inside the generation's ceilings");
         let names: Vec<&str> = structures
             .iter()
             .map(|structure| structure.name.as_str())
@@ -1236,7 +2062,8 @@ mod tests {
     fn a_draft4_document_is_its_own_root_structure() {
         let draft4 = r##"{"type":"object","properties":{"cause":{"$ref":"#/definitions/Cause"}},
             "definitions":{"Cause":{"type":"object","properties":{"id":{"type":"string"}}}}}"##;
-        let structures = declared_structures(draft4, "JSONSchemaDraft4", "order.placed_v1");
+        let structures = declared_structures(draft4, "JSONSchemaDraft4", "order.placed_v1")
+            .expect("the document is inside the generation's ceilings");
         let names: Vec<&str> = structures
             .iter()
             .map(|structure| structure.name.as_str())
@@ -1261,7 +2088,8 @@ mod tests {
             ("no components", r#"{"openapi":"3.0.0"}"#, "OpenApi3"),
             ("not a document", "not json at all", "OpenApi3"),
         ] {
-            let structures = declared_structures(document, schema_type, "demo");
+            let structures = declared_structures(document, schema_type, "demo")
+                .expect("the document is inside the generation's ceilings");
             assert!(
                 structures.is_empty(),
                 "case {case:?}: expected no structure, got {structures:?}"
@@ -1317,7 +2145,8 @@ mod tests {
                 vec!["AWSEvent"],
             ),
         ] {
-            let structures = declared_structures(document, "OpenApi3", "demo");
+            let structures = declared_structures(document, "OpenApi3", "demo")
+                .expect("the document is inside the generation's ceilings");
             let names: Vec<&str> = structures
                 .iter()
                 .map(|structure| structure.name.as_str())
@@ -1337,7 +2166,8 @@ mod tests {
             "detail":{"type":"object","properties":{"id":{"type":"string"}}},
             "resources":{"type":"array","items":{"type":"object","properties":{
                 "ARN":{"type":"string"}}}}}}}}}"##;
-        let structures = declared_structures(document, "OpenApi3", "demo");
+        let structures = declared_structures(document, "OpenApi3", "demo")
+            .expect("the document is inside the generation's ceilings");
         let declared: Vec<(&str, Declared)> = structures[0]
             .members
             .iter()
@@ -1409,11 +2239,19 @@ mod tests {
         }
     }
 
-    /// Every language renders the same structures, each in its own layout and types.
+    /// Every language renders the same structures, each in its own layout and types, and
+    /// each as a package: the declarations under the schema's own package, and the files
+    /// that language builds and (de)serializes them with.
     #[test]
     fn every_language_renders_the_documents_structures() {
         for target in Target::ALL.iter().copied() {
-            let archive = code_binding_archive(target, "aws.s3@ObjectCreated", "OpenApi3", OPENAPI);
+            let archive = code_binding_archive(target, "aws.s3@ObjectCreated", "OpenApi3", OPENAPI)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "case {:?}: the document's package must be generated",
+                        target.as_wire()
+                    )
+                });
             let mut read = ::zip::ZipArchive::new(::std::io::Cursor::new(archive))
                 .unwrap_or_else(|error| {
                     panic!("case {:?}: the body must be a zip archive: {error}", target.as_wire())
@@ -1425,22 +2263,37 @@ mod tests {
                         .to_string()
                 })
                 .collect();
+            let package = format!("{}schema/aws/s3/objectcreated/", target.source_root());
+            let declarations: Vec<&String> = names
+                .iter()
+                .filter(|name| {
+                    name.starts_with(&package)
+                        && name.ends_with(&format!(".{}", target.extension()))
+                        && !name.ends_with(&format!(
+                            "{}.{}",
+                            target.file_stem(MARSHALLER),
+                            target.extension()
+                        ))
+                        && !name.ends_with(&format!("{PACKAGE_INDEX}.{}", target.extension()))
+                        && !name.ends_with(&format!(
+                            "{PYTHON_PACKAGE_MARKER}.{}",
+                            target.extension()
+                        ))
+                })
+                .collect();
             assert_eq!(
-                names.len(),
+                declarations.len(),
                 2,
-                "case {:?}: one file per structure, got {names:?}",
+                "case {:?}: one declaration per structure, got {names:?}",
                 target.as_wire()
             );
-            for name in &names {
-                assert!(
-                    name.starts_with(&format!(
-                        "{}schema/aws/s3/objectcreated/",
-                        target.source_root()
-                    )) && name.ends_with(&format!(".{}", target.extension())),
-                    "case {:?}: wrong layout for {name:?}",
-                    target.as_wire()
-                );
-            }
+            // The package the declarations are built and read as is there too, so the
+            // archive is more than the declarations.
+            assert!(
+                names.len() > declarations.len(),
+                "case {:?}: the package's own files must be in the archive, got {names:?}",
+                target.as_wire()
+            );
             let mut texts = String::new();
             for index in 0..read.len() {
                 let mut file = read.by_index(index).expect("an entry that was just listed");
@@ -1454,6 +2307,310 @@ mod tests {
                 "case {:?}: the referenced structure must be named, got {texts}",
                 target.as_wire()
             );
+        }
+    }
+
+    /// A document that implies no type generates no package: there is nothing to build
+    /// and nothing to (de)serialize, so the archive is empty.
+    #[test]
+    fn a_document_with_no_type_generates_no_package() {
+        for target in Target::ALL.iter().copied() {
+            let files = package_files(target, "demo", &package_segments("demo"), &[])
+                .unwrap_or_else(|| {
+                    panic!(
+                        "case {:?}: a document with no type is generated for, not refused",
+                        target.as_wire()
+                    )
+                });
+            assert!(
+                files.is_empty(),
+                "case {:?}: expected no package, got {:?}",
+                target.as_wire(),
+                files.iter().map(|file| &file.path).collect::<Vec<_>>()
+            );
+        }
+    }
+
+    /// Two names the language's own naming makes ONE type's are one declaration, and the
+    /// package's support source names exactly the declarations the archive holds — so a
+    /// generated package never imports a type whose file is not there.
+    #[test]
+    fn two_names_that_render_as_one_type_are_one_declaration() {
+        // One pair per collapse each language's naming makes: the separators
+        // `type_identifier` drops, and the case `snake_case` folds.
+        for (case, names) in [
+            ("separators dropped", ["order-placed", "order_placed"]),
+            ("case folded", ["OrderPlaced", "orderplaced"]),
+        ] {
+            let structures: Vec<Structure> = names
+                .iter()
+                .map(|name| Structure {
+                    name: (*name).to_string(),
+                    members: Vec::new(),
+                })
+                .collect();
+            let package = package_segments("demo");
+            for target in Target::ALL.iter().copied() {
+                let files = package_files(target, "demo", &package, &structures)
+                    .unwrap_or_else(|| panic!("case {case:?}: the package must be generated"));
+                let declarations: Vec<&String> = files
+                    .iter()
+                    .map(|file| &file.path)
+                    .filter(|path| {
+                        path.ends_with(&format!(
+                            "{}.{}",
+                            target.file_stem(names[0]),
+                            target.extension()
+                        ))
+                    })
+                    .collect();
+                assert_eq!(
+                    declarations.len(),
+                    1,
+                    "case {case:?}/{}: two names of one type are one declaration, got {:?}",
+                    target.as_wire(),
+                    files.iter().map(|file| &file.path).collect::<Vec<_>>()
+                );
+                // And what the support source names is that one declaration, once.
+                let support: String = files
+                    .iter()
+                    .filter(|file| {
+                        file.path.ends_with(&format!(
+                            "{}.{}",
+                            target.file_stem(MARSHALLER),
+                            target.extension()
+                        ))
+                    })
+                    .map(|file| file.text.as_str())
+                    .collect();
+                let declared = type_identifier(names[0]);
+                assert!(
+                    !support.is_empty(),
+                    "case {case:?}/{}: the package must carry its (de)serialization",
+                    target.as_wire()
+                );
+                assert!(
+                    support.contains(&declared),
+                    "case {case:?}/{}: the support source must name the one declaration \
+                     {declared:?}, got {support}",
+                    target.as_wire()
+                );
+            }
+        }
+    }
+
+    /// Two names the language's own naming makes ONE member's are one member of the
+    /// declaration — and of the (de)serialization that reads it — rather than two of one
+    /// name, which is no source a client can build.
+    #[test]
+    fn two_names_that_render_as_one_member_are_one_member() {
+        // One pair per collapse a member name goes through: a separator against the
+        // camel-case hump it stands for, and two separators that are one.
+        for (case, names) in [
+            ("a separator against a hump", ["detail-type", "detailType"]),
+            ("two separators", ["detail.type", "detail_type"]),
+        ] {
+            let members: Vec<Member> = names
+                .iter()
+                .map(|name| Member {
+                    name: (*name).to_string(),
+                    declared: Declared::Text,
+                    required: false,
+                })
+                .collect();
+            for target in Target::ALL.iter().copied() {
+                let distinct = distinct_members(target, &members);
+                // TypeScript declares a member under the name it carries on the wire, so
+                // two wire names stay two members there; every other language declares
+                // it under a name built from the member's own segments.
+                let expected = if target == Target::TypeScript3 { 2 } else { 1 };
+                assert_eq!(
+                    distinct.len(),
+                    expected,
+                    "case {case:?}/{}: expected {expected} member(s), got {:?}",
+                    target.as_wire(),
+                    distinct.iter().map(|member| &member.name).collect::<Vec<_>>()
+                );
+            }
+        }
+    }
+
+    /// A member name is whatever the stored document's JSON holds, so a name carrying
+    /// the delimiter of the literal it is written into is ESCAPED rather than ending it:
+    /// in every language, the generated source still holds one literal per member name
+    /// and nothing of the name stands as source.
+    #[test]
+    fn a_member_name_is_escaped_into_the_literal_it_is_written_in() {
+        // A name carrying each delimiter the languages below write a name inside: the
+        // double quote every one of them quotes with, the backslash their escapes start
+        // with, and the backtick Go's raw struct tag ends at.
+        let hostile = "say\"hi`\\";
+        let structure = Structure {
+            name: "Envelope".to_string(),
+            members: vec![Member {
+                name: hostile.to_string(),
+                declared: Declared::Text,
+                required: true,
+            }],
+        };
+        let package = package_segments("demo");
+        for target in Target::ALL.iter().copied() {
+            let files = package_files(
+                target,
+                "demo",
+                &package,
+                ::std::slice::from_ref(&structure),
+            )
+            .unwrap_or_else(|| {
+                panic!(
+                    "case {:?}: the package must be generated",
+                    target.as_wire()
+                )
+            });
+            let text: String = files
+                .iter()
+                .map(|file| file.text.as_str())
+                .collect::<Vec<&str>>()
+                .join("\n");
+            assert!(
+                !text.contains(hostile),
+                "case {:?}: a member name must not stand in the generated source as it \
+                 is written, got {text}",
+                target.as_wire()
+            );
+            assert!(
+                text.contains("say\\\"hi"),
+                "case {:?}: the member name must be escaped into the literal that holds \
+                 it, got {text}",
+                target.as_wire()
+            );
+        }
+    }
+
+    /// The walk over a document stops AT the generation's own ceilings rather than
+    /// reading a document in full and refusing it afterwards: a document implying more
+    /// types than a package declares, or more members than a generation reads, implies
+    /// no types at all.
+    #[test]
+    fn a_document_past_the_generations_ceilings_implies_nothing() {
+        /// A document declaring `count` named schemas of one member each.
+        fn types(count: usize) -> String {
+            let mut document = String::from("{\"components\":{\"schemas\":{");
+            for ordinal in 0..count {
+                if ordinal > 0 {
+                    document.push(',');
+                }
+                document.push_str(&format!(
+                    "\"Type{ordinal}\":{{\"type\":\"object\",\"properties\":\
+                     {{\"id\":{{\"type\":\"string\"}}}}}}"
+                ));
+            }
+            document.push_str("}}}");
+            document
+        }
+
+        /// A document declaring one named schema of `count` members.
+        fn members(count: usize) -> String {
+            let mut document = String::from(
+                "{\"components\":{\"schemas\":{\"Envelope\":{\"type\":\"object\",\
+                 \"properties\":{",
+            );
+            for ordinal in 0..count {
+                if ordinal > 0 {
+                    document.push(',');
+                }
+                document.push_str(&format!("\"member{ordinal}\":{{\"type\":\"string\"}}"));
+            }
+            document.push_str("}}}}}");
+            document
+        }
+
+        // One row per ceiling, at it and one past it.
+        for (case, document, implied) in [
+            ("types at the ceiling", types(MAX_GENERATED_TYPES), true),
+            ("types past the ceiling", types(MAX_GENERATED_TYPES + 1), false),
+            ("members at the ceiling", members(MAX_GENERATED_MEMBERS), true),
+            (
+                "members past the ceiling",
+                members(MAX_GENERATED_MEMBERS + 1),
+                false,
+            ),
+        ] {
+            let structures = declared_structures(&document, "OpenApi3", "demo");
+            assert_eq!(
+                structures.is_some(),
+                implied,
+                "case {case:?}: the walk must imply types = {implied}, got {:?} type(s)",
+                structures.as_ref().map(Vec::len)
+            );
+        }
+    }
+
+    /// The generation is bounded where it GROWS: a package whose cost passes the byte
+    /// budget, or that declares more types than a package holds, generates NOTHING — the
+    /// caller is told the generation failed rather than handed a package missing part of
+    /// itself — while one inside both ceilings is generated whole, with every declaration
+    /// in it and its source inside the budget.
+    #[test]
+    fn the_generated_package_is_bounded() {
+        let structure = |ordinal: usize| Structure {
+            name: format!("Type{ordinal}"),
+            members: vec![Member {
+                name: "id".to_string(),
+                declared: Declared::Text,
+                required: true,
+            }],
+        };
+        let package = package_segments("demo");
+        // Rows: a package well inside both ceilings, one whose cost passes the byte
+        // budget, and one past the ceiling on the types a package declares at all.
+        for (case, count, generated) in [
+            (
+                "inside the ceilings",
+                MAX_GENERATED_SOURCE_BYTES / (8 * COST_PER_TYPE),
+                true,
+            ),
+            (
+                "past the byte budget",
+                MAX_GENERATED_SOURCE_BYTES / COST_PER_TYPE,
+                false,
+            ),
+            ("past the type ceiling", MAX_GENERATED_TYPES + 1, false),
+        ] {
+            let structures: Vec<Structure> = (0..count).map(structure).collect();
+            for target in Target::ALL.iter().copied() {
+                let files = package_files(target, "demo", &package, &structures);
+                assert_eq!(
+                    files.is_some(),
+                    generated,
+                    "case {case:?}/{}: a package of {count} types generated must be \
+                     {generated}, got {:?} file(s)",
+                    target.as_wire(),
+                    files.as_ref().map(Vec::len)
+                );
+                let Some(files) = files else {
+                    continue;
+                };
+                let carried: usize = files.iter().map(|file| file.text.len()).sum();
+                assert!(
+                    carried <= MAX_GENERATED_SOURCE_BYTES,
+                    "case {case:?}/{}: the package must stay inside its byte budget, got \
+                     {carried}",
+                    target.as_wire()
+                );
+                let declaration = source_path(
+                    target,
+                    &package,
+                    &target.file_stem(&format!("Type{}", count - 1)),
+                );
+                assert!(
+                    files.iter().any(|file| file.path == declaration),
+                    "case {case:?}/{}: a package generated at all declares every type it \
+                     was given, so {declaration:?} must be in it, got {} file(s)",
+                    target.as_wire(),
+                    files.len()
+                );
+            }
         }
     }
 }
