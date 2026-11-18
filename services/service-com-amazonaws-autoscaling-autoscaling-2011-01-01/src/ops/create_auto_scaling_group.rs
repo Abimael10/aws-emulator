@@ -422,17 +422,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 ));
             }
         }
-        if let Some(policy) = input
-            .termination_policies
-            .iter()
-            .flatten()
-            .find(|policy| !crate::state::is_valid_termination_policy(policy))
-        {
-            return Err(crate::scaffolded::Scaffolded::validation_error(format!(
-                "The TerminationPolicies value {policy} is not valid: it must be one of {:?} or a \
-                 Lambda function ARN",
-                crate::state::TERMINATION_POLICIES
-            )));
+        if let Some(refusal) = crate::state::termination_policies_refusal(
+            input
+                .termination_policies
+                .iter()
+                .flatten()
+                .map(String::as_str),
+        ) {
+            return Err(crate::scaffolded::Scaffolded::validation_error(refusal));
         }
         if let Some(capacity_type) = input.desired_capacity_type.as_deref() {
             if !crate::state::DESIRED_CAPACITY_TYPES.contains(&capacity_type) {

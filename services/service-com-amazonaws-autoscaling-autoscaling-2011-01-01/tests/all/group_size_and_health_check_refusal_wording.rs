@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! The sentences Amazon EC2 Auto Scaling refuses a group's SIZES and its HEALTH CHECK
-//! TYPE with.
+//! The sentences Amazon EC2 Auto Scaling refuses a group's SIZES, its HEALTH CHECK TYPE and
+//! its TERMINATION POLICIES with.
 //!
 //! RULE: an error code is not the whole answer — a client (a CDK or CloudFormation
 //! wrapper, a retry policy) tells one `ValidationError` from another by the sentence that
@@ -19,6 +19,13 @@
 //!   free string the service validates itself, so the refusal is the one machine-readable
 //!   statement of the set it accepts: the fixed sentence `Valid health check types are:
 //!   [EC2, ELB, EBS, VPC_LATTICE].`, carrying nothing from the request;
+//! * `TerminationPolicies` is likewise a list of free strings whose values the
+//!   documentation gives only in prose
+//!   (`smithy_query(query="doc",shape="UpdateAutoScalingGroupType",member="TerminationPolicies")`),
+//!   so its refusal states the set the same way: the rejected value(s) of the request
+//!   bracketed, then the fixed sentence ` is not a valid termination policy. Valid
+//!   termination policies are: [` … `].` naming the policy TYPES the service publishes, in
+//!   the order its catalog reports them;
 //! * a capacity change asks for a capacity the group's OWN bounds admit, so one outside them
 //!   is refused `New SetDesiredCapacity value <n> is above max value <MaxSize> for the
 //!   AutoScalingGroup.` (or `below min value <MinSize>`) — the requested capacity and the
@@ -28,11 +35,14 @@
 //! misses and by how much, whether the bounds come from the create's own members or from
 //! the group the update is applied to, which health check type is named — one word
 //! outside the set, a word of the set in the wrong case, a comma-separated list with one
-//! unknown entry — beside the comma-separated forms the service accepts, and, for the
-//! capacity change, the bound crossed, the distance from it, the bounds being equal and the
-//! group's own name, which no refusal carries.
+//! unknown entry — beside the comma-separated forms the service accepts; which termination
+//! policies a list names: one unknown word, a known policy in the wrong case, an unknown
+//! entry after a known one, two unknown entries at once, beside a policy of the documented
+//! set and the Lambda function ARN that documentation ends with; and, for the capacity
+//! change, the bound crossed, the distance from it, the bounds being equal and the group's
+//! own name, which no refusal carries.
 
-use crate::support::{borrowed, p, query, tag_value, xml_unescape};
+use crate::support::{borrowed, p, query, tag_value, tag_values, xml_unescape, REGION};
 
 /// A launch source every row carries, so no row is refused for naming none. The bounds and
 /// the health check type are read before any launch source is resolved, so the template
@@ -698,6 +708,234 @@ async fn an_unsupported_health_check_type_is_refused_with_the_fixed_sentence() {
                 EXPECTED_HEALTH_CHECK_SENTENCE.to_string()
             ),
             "case {case:?}: expected the fixed health check sentence on the update, got {body}"
+        );
+    }
+}
+
+/// The fixed text of the termination-policy refusal, with the rejected value(s) bracketed
+/// ahead of it. Spelled out here rather than imported, as every sentence in this suite is:
+/// the valid-value list names the policy TYPES the service publishes — the Lambda-ARN form
+/// named by its type `Lambda` — in the order that catalog reports them.
+fn expected_termination_policy_sentence(rejected: &[String]) -> String {
+    format!(
+        "[{}] is not a valid termination policy. Valid termination policies are: \
+         [AllocationStrategy, ClosestToNextInstanceHour, Default, Lambda, NewestInstance, \
+         OldestInstance, OldestLaunchConfiguration, OldestLaunchTemplate].",
+        rejected.join(", ")
+    )
+}
+
+/// The custom-policy form the member's documentation ends with:
+/// "arn:aws:lambda:region:account-id:function:my-function:my-alias", written for the Region
+/// and the account this emulator answers for rather than for any one recorded function.
+fn lambda_policy() -> String {
+    format!(
+        "arn:aws:lambda:{REGION}:{}:function:scale-in-chooser:live",
+        engine::emulator_account_id()
+    )
+}
+
+/// One row of the termination-policy table: the policies the request lists, in order, and
+/// the entries of that list the service rejects — empty when the whole list is accepted.
+struct TerminationPolicyRow {
+    case: &'static str,
+    policies: Vec<String>,
+    rejected: Vec<String>,
+}
+
+impl TerminationPolicyRow {
+    /// A row whose whole list the service accepts.
+    fn accepted(case: &'static str, policies: &[&str]) -> Self {
+        Self {
+            case,
+            policies: policies.iter().map(|policy| (*policy).to_string()).collect(),
+            rejected: Vec::new(),
+        }
+    }
+
+    /// A row the service refuses, naming the entries it rejects in request order.
+    fn refused(case: &'static str, policies: &[&str], rejected: &[&str]) -> Self {
+        Self {
+            case,
+            policies: policies.iter().map(|policy| (*policy).to_string()).collect(),
+            rejected: rejected.iter().map(|value| (*value).to_string()).collect(),
+        }
+    }
+}
+
+/// The `TerminationPolicies.member.N` parameters a request names `policies` under.
+fn termination_policy_params(policies: &[String]) -> Vec<(String, String)> {
+    policies
+        .iter()
+        .enumerate()
+        .map(|(index, policy)| {
+            p(
+                &format!("TerminationPolicies.member.{}", index + 1),
+                policy.clone(),
+            )
+        })
+        .collect()
+}
+
+/// The termination policies a described group reports, in the order it holds them.
+fn described_policies(described: &str) -> Vec<String> {
+    tag_values(&tag_value(described, "TerminationPolicies"), "member")
+}
+
+#[tokio::test]
+async fn an_unknown_termination_policy_is_refused_with_the_bracketed_sentence() {
+    let rows = [
+        TerminationPolicyRow::accepted(
+            "a policy of the documented set the issue never cited",
+            &["AllocationStrategy"],
+        ),
+        TerminationPolicyRow::accepted(
+            "two documented policies, applied in the order they are listed",
+            &["OldestLaunchTemplate", "Default"],
+        ),
+        TerminationPolicyRow::refused(
+            "a word outside the documented set",
+            &["NotARealPolicy"],
+            &["NotARealPolicy"],
+        ),
+        TerminationPolicyRow::refused(
+            "a documented policy in the wrong case",
+            &["oldestinstance"],
+            &["oldestinstance"],
+        ),
+        TerminationPolicyRow::refused(
+            "an unknown entry after a known one",
+            &["OldestInstance", "NotARealPolicy"],
+            &["NotARealPolicy"],
+        ),
+        TerminationPolicyRow::refused(
+            "two unknown entries at once, named in request order",
+            &["NeverHeardOfIt", "OldestInstance", "NotARealPolicy"],
+            &["NeverHeardOfIt", "NotARealPolicy"],
+        ),
+    ];
+    // The Lambda function ARN the documentation ends with, which is accepted in place of the
+    // `Lambda` type the sentence lists.
+    let lambda = lambda_policy();
+    let rows = rows.into_iter().chain(std::iter::once(
+        TerminationPolicyRow::accepted("the Lambda function ARN form", &[lambda.as_str()]),
+    ));
+
+    for (index, row) in rows.enumerate() {
+        let engine = crate::support::new_engine();
+        let router = crate::support::router_with(engine);
+        let case = row.case;
+        let name = format!("termination-policy-{index}");
+        let mut params = vec![
+            p("AutoScalingGroupName", name.clone()),
+            p(LAUNCH_SOURCE.0, LAUNCH_SOURCE.1),
+            p(ZONE.0, ZONE.1),
+            p("MinSize", "0"),
+            p("MaxSize", "1"),
+        ];
+        params.extend(termination_policy_params(&row.policies));
+        let (status, body) = query(&router, "CreateAutoScalingGroup", &borrowed(&params)).await;
+
+        if row.rejected.is_empty() {
+            assert_eq!(
+                status, 200,
+                "case {case:?}: expected the create to be accepted, got {status}: {body}"
+            );
+            let (status, described) = query(
+                &router,
+                "DescribeAutoScalingGroups",
+                &[("AutoScalingGroupNames.member.1", name.as_str())],
+            )
+            .await;
+            assert_eq!(
+                status, 200,
+                "case {case:?}: DescribeAutoScalingGroups expected 200, got {status}: {described}"
+            );
+            assert_eq!(
+                described_policies(&described),
+                row.policies,
+                "case {case:?}: expected the accepted policies to be read back in order, got \
+                 {described}"
+            );
+            continue;
+        }
+
+        assert_eq!(
+            status, 400,
+            "case {case:?}: expected the create to be refused, got {status}: {body}"
+        );
+        assert_eq!(
+            refusal(&body),
+            (
+                "ValidationError".to_string(),
+                expected_termination_policy_sentence(&row.rejected)
+            ),
+            "case {case:?}: expected the bracketed termination-policy sentence, got {body}"
+        );
+        let (status, described) = query(
+            &router,
+            "DescribeAutoScalingGroups",
+            &[("AutoScalingGroupNames.member.1", name.as_str())],
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: DescribeAutoScalingGroups expected 200, got {status}: {described}"
+        );
+        assert!(
+            !described.contains(name.as_str()),
+            "case {case:?}: a refused create leaves no group behind, got {described}"
+        );
+
+        // The same sentence on the update path, where the refused request must leave the
+        // policies the group already holds exactly as they were.
+        let base = format!("{name}-base");
+        let (status, body) = query(
+            &router,
+            "CreateAutoScalingGroup",
+            &borrowed(&[
+                p("AutoScalingGroupName", base.clone()),
+                p(LAUNCH_SOURCE.0, LAUNCH_SOURCE.1),
+                p(ZONE.0, ZONE.1),
+                p("MinSize", "0"),
+                p("MaxSize", "1"),
+                p("TerminationPolicies.member.1", "OldestInstance"),
+            ]),
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: the base group must be created, got {status}: {body}"
+        );
+        let mut update = vec![p("AutoScalingGroupName", base.clone())];
+        update.extend(termination_policy_params(&row.policies));
+        let (status, body) = query(&router, "UpdateAutoScalingGroup", &borrowed(&update)).await;
+        assert_eq!(
+            status, 400,
+            "case {case:?}: expected the update to be refused, got {status}: {body}"
+        );
+        assert_eq!(
+            refusal(&body),
+            (
+                "ValidationError".to_string(),
+                expected_termination_policy_sentence(&row.rejected)
+            ),
+            "case {case:?}: expected the same sentence on the update path, got {body}"
+        );
+        let (status, described) = query(
+            &router,
+            "DescribeAutoScalingGroups",
+            &[("AutoScalingGroupNames.member.1", base.as_str())],
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: DescribeAutoScalingGroups expected 200, got {status}: {described}"
+        );
+        assert_eq!(
+            described_policies(&described),
+            vec!["OldestInstance".to_string()],
+            "case {case:?}: a refused update leaves the group's policies alone, got {described}"
         );
     }
 }

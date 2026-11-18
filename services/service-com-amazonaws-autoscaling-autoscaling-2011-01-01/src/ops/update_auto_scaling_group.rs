@@ -451,17 +451,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 ));
             }
         }
-        if let Some(policy) = input
-            .termination_policies
-            .iter()
-            .flatten()
-            .find(|policy| !crate::state::is_valid_termination_policy(policy))
-        {
-            return Err(crate::scaffolded::Scaffolded::validation_error(format!(
-                "The TerminationPolicies value {policy} is not valid: it must be one of {:?} or a \
-                 Lambda function ARN",
-                crate::state::TERMINATION_POLICIES
-            )));
+        if let Some(refusal) = crate::state::termination_policies_refusal(
+            input
+                .termination_policies
+                .iter()
+                .flatten()
+                .map(String::as_str),
+        ) {
+            return Err(crate::scaffolded::Scaffolded::validation_error(refusal));
         }
         if let Some(capacity_type) = input.desired_capacity_type.as_deref() {
             if !crate::state::DESIRED_CAPACITY_TYPES.contains(&capacity_type) {
@@ -621,10 +618,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // DesiredCapacity, and the new MinSize is larger than the current size of
         // the group, this sets the group's DesiredCapacity to the new MinSize
         // value", and the mirror of that for MaxSize.
-        let desired_capacity = input
-            .desired_capacity
-            .unwrap_or(current_capacity)
-            .clamp(min_size, max_size);
+        let desired_capacity = crate::state::capacity_within_bounds(
+            input.desired_capacity.unwrap_or(current_capacity),
+            min_size,
+            max_size,
+        );
         let launches_needed = group.launches_needed(desired_capacity);
         // The zones the group places instances in after this update: the ones the request
         // named, else those its new subnets resolve to, else the ones it already has. A

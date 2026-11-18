@@ -1837,9 +1837,11 @@ impl AutoScalingState {
                         // change waited, and a group never holds a capacity
                         // outside its own bounds, so the deferred value is
                         // brought inside the ones in force when it is applied.
-                        desired_capacity: pending
-                            .desired_capacity
-                            .clamp(group.min_size, group.max_size),
+                        desired_capacity: capacity_within_bounds(
+                            pending.desired_capacity,
+                            group.min_size,
+                            group.max_size,
+                        ),
                         cause: pending.cause.clone(),
                         due: pending.due,
                         cooldown_override: pending.cooldown_override,
@@ -2131,9 +2133,7 @@ impl AutoScalingState {
         // with it, which is what the decrement below takes off.
         let units = group.capacity_units_of(&taken);
         let new_desired_capacity = if should_decrement {
-            desired_capacity
-                .saturating_sub(units)
-                .clamp(min_size, max_size)
+            capacity_within_bounds(desired_capacity.saturating_sub(units), min_size, max_size)
         } else {
             desired_capacity
         };
@@ -2930,6 +2930,61 @@ pub const TERMINATION_POLICY_LAMBDA_PREFIX: &str = "arn:aws:lambda:";
 /// Whether `policy` is one of [`TERMINATION_POLICIES`] or a Lambda function ARN.
 pub fn is_valid_termination_policy(policy: &str) -> bool {
     TERMINATION_POLICIES.contains(&policy) || policy.starts_with(TERMINATION_POLICY_LAMBDA_PREFIX)
+}
+
+/// `capacity` brought inside the bounds `min_size`..`max_size` a group holds — a group
+/// never holds a capacity outside its own bounds, and this is the ONE place that is
+/// applied.
+///
+/// The ceiling is taken as the HIGHER of the pair rather than assumed to be `max_size`,
+/// so no caller has to establish the order of the two first: `Ord::clamp` panics when its
+/// low bound is above its high one, and the pair is stored state read long after the
+/// request that wrote it. Which pairs a group may be WRITTEN with is a rule of the
+/// operations that write one, stated where the group is stored, and never a precondition
+/// a later read has to re-derive.
+pub fn capacity_within_bounds(capacity: i32, min_size: i32, max_size: i32) -> i32 {
+    capacity.clamp(min_size, min_size.max(max_size))
+}
+
+/// The message the service refuses a `TerminationPolicies` naming policies it does not
+/// accept with, shared by every operation that sets a group's policies.
+///
+/// The member is a free string the service validates itself — the documentation lists the
+/// values in prose and the list's own target states no enum
+/// (`smithy_query(query="doc",shape="UpdateAutoScalingGroupType",member="TerminationPolicies")`)
+/// — so the refusal is the one machine-readable statement of the set it accepts: the
+/// rejected value(s) of the request, bracketed, then the FIXED sentence naming the policy
+/// TYPES ([`TERMINATION_POLICY_TYPES`]) in the order that catalog reports them, which is
+/// where the custom form is named by its type rather than by any one function's ARN.
+///
+/// Not public: [`termination_policies_refusal`] is the ONE entry point to this refusal, so
+/// no handler can assemble the sentence a second, differing way.
+fn invalid_termination_policy_message(rejected: &[&str]) -> String {
+    format!(
+        "[{}] is not a valid termination policy. Valid termination policies are: [{}].",
+        rejected.join(", "),
+        TERMINATION_POLICY_TYPES.join(", ")
+    )
+}
+
+/// The refusal a request that would set `requested` as a group's termination policies earns
+/// ([`invalid_termination_policy_message`]), or `None` when every entry names a policy this
+/// service accepts ([`is_valid_termination_policy`]).
+///
+/// The request is refused as a WHOLE — the group keeps the policies it had — so every
+/// rejected entry is named, in request order, rather than only the first one found. That
+/// reading of the bracketed part is a generalisation of a refusal carrying ONE rejected
+/// value, which is the only shape the sentence is attested in: a request whose list carries
+/// several unaccepted values is one this service has nothing closer to go on for.
+pub fn termination_policies_refusal<'a, I>(requested: I) -> Option<String>
+where
+    I: IntoIterator<Item = &'a str>,
+{
+    let rejected: Vec<&str> = requested
+        .into_iter()
+        .filter(|policy| !is_valid_termination_policy(policy))
+        .collect();
+    (!rejected.is_empty()).then(|| invalid_termination_policy_message(&rejected))
 }
 
 // ---------------------------------------------------------------------------
