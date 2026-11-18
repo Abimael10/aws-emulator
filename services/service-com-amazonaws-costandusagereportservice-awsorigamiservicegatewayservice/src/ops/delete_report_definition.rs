@@ -137,10 +137,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     /// Deleting a report the account does not hold is not refused: the operation models
     /// no not-found error, so a repeated delete of the same name is a no-op that succeeds.
     ///
-    /// The response is the empty object on both legs. `ResponseMessage` is an OPTIONAL
-    /// output member and the service serializes none, so nothing distinguishes the body of
-    /// the delete that removed a report from the body of the one that found nothing to
-    /// remove, and no part of the request is echoed back in it.
+    /// The removal IS the outcome, and the response body is the empty JSON object on both
+    /// legs.
+    ///
+    /// `ResponseMessage` is the output's only member, it is optional, and the model
+    /// documents it as "Whether the deletion was successful or not." — the member's
+    /// documented semantics, but not text the service puts on the wire: the RECORDED
+    /// responses of this operation, the call that removed a report and the repeat that
+    /// found nothing to remove alike, carry no member at all (`{}` on both legs; the model
+    /// fixes no value for the member and declares no catalog for `DeleteResponseMessage`).
+    /// So the service populates none and a caller learns the outcome from the 200 status
+    /// and from a later read of the report (`DescribeReportDefinitions`,
+    /// `ListTagsForResource`), not from text in the body. Nothing from the request is
+    /// echoed back either: a body naming the report would leak the caller's name into a
+    /// response that carries no values, and a body that differed between the two legs would
+    /// advertise a branch no client can take against the service.
     async fn handle(
         &self,
         input: Self::Input,
@@ -157,6 +168,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         let mut store = state.lock();
 
+        // A report's tags live ON its stored entry (`crate::state::StoredReport::tags`),
+        // so removing the entry is what deletes them with it: there is no second
+        // collection a tag could survive in and be reported by a later
+        // `ListTagsForResource`, or be inherited by a report recreated under this name.
         if let Some(at) = store.position(&input.report_name) {
             store.reports.remove(at);
         }

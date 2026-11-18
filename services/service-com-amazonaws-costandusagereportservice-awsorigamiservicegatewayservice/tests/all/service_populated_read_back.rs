@@ -16,7 +16,10 @@
 //! 2. **An optional output member the service does not populate is not serialized.**
 //!    `DeleteReportDefinition` answers HTTP 200 with the empty object on both of its legs
 //!    — the one that removed a report and the one that found nothing to remove — so no
-//!    per-call diagnostic, and nothing from the request, appears in the body.
+//!    per-call diagnostic, and nothing from the request, appears in the body. The outcome
+//!    of the call is the removal itself, which later reads report; the body carries no
+//!    member whatever the name deleted and whatever the account held when the call
+//!    arrived.
 //! 3. **A definition the service could not deliver is refused, not stored.** A report's
 //!    Parquet preference is its `Format`, its `Compression` and the artifacts it
 //!    subscribes to taken together, and a definition that states it inconsistently is
@@ -38,7 +41,7 @@ use cur::state::ReportDelivery;
 // `stored_report_at` is the one seeded-report builder the suites of this target share; it
 // is the stored record a test pins the read-back projection against.
 use super::report_definition_lifecycle::{
-    at_epoch_seconds, expected_read_back, is_report_timestamp, minimal_definition,
+    at_epoch_seconds, error_code, expected_read_back, is_report_timestamp, minimal_definition,
     never_delivered, primary_billing_view_arn, read_back_of, stored_report_at as stored_at,
     Cur,
 };
@@ -451,51 +454,156 @@ async fn a_definition_whose_parquet_preference_is_not_usable_is_refused() {
 
 #[tokio::test]
 async fn delete_answers_the_empty_object_on_both_legs() {
-    // Rows differ in what the account holds when the delete arrives and in the name's
-    // spelling: a report that exists, the same name once it is gone, a name never
-    // created, and a name using the punctuation the `ReportName` pattern allows. The body
-    // is the same empty object every time.
-    let table: Vec<(&str, &str, bool)> = vec![
-        ("a report the account holds", "held-report", true),
-        ("a name whose report was already deleted", "held-report", false),
-        ("a name never created", "never-created", false),
+    // Rows differ along everything the rule generalises over: the name's spelling and
+    // length — a one-character name, the 256-character length bound and every character
+    // class the modelled `ReportName` pattern `^[0-9A-Za-z!\-_.*\'()]+$` admits
+    // (`smithy_query(shape="ReportName")`, length 0..256) — what the account holds when
+    // the delete arrives (nothing, other reports, the five-report cap), whether the
+    // deleted report carries tags, and how many times the same name is deleted. The body
+    // is an object with NO members every time, so neither leg carries a per-call outcome
+    // and neither echoes the request.
+    let at_length_bound = "r".repeat(256);
+    // case, name, the account holds it, tags on it, other reports held, delete calls
+    let table: Vec<(&str, &str, bool, bool, usize, usize)> = vec![
+        ("a report the account holds", "held-report", true, false, 0, 1),
+        (
+            "the same name deleted twice over",
+            "twice-deleted-report",
+            true,
+            false,
+            0,
+            2,
+        ),
+        (
+            "a name never created, on an empty account",
+            "never-created",
+            false,
+            false,
+            0,
+            1,
+        ),
+        (
+            "a name never created while the account holds other reports",
+            "never-created",
+            false,
+            false,
+            3,
+            1,
+        ),
+        (
+            "a name never created, deleted again",
+            "never-created",
+            false,
+            false,
+            0,
+            3,
+        ),
         (
             "a punctuated name the account holds",
             "r3port!-_.*'()",
             true,
+            false,
+            0,
+            1,
+        ),
+        ("a one-character name", "r", true, false, 0, 1),
+        (
+            "a name at the 256-character length bound",
+            at_length_bound.as_str(),
+            true,
+            false,
+            0,
+            1,
+        ),
+        ("a digits-only name", "1234567890", true, false, 0, 1),
+        ("a report carrying tags", "tagged-report", true, true, 0, 1),
+        (
+            "a report deleted while the account is at its five-report cap",
+            "capped-report",
+            true,
+            false,
+            4,
+            1,
         ),
     ];
 
-    let cur = Cur::new();
-    for (case, report_name, create_first) in table {
-        if create_first {
-            let (status, body) = cur.put(&minimal_definition(report_name), None).await;
+    for (case, report_name, held, tagged, others, deletes) in table {
+        // One account per row: what the store holds when the delete arrives is part of
+        // what the rule is asserted over.
+        let cur = Cur::new();
+        let other_names: Vec<String> = (0..others)
+            .map(|index| format!("other-report-{index}"))
+            .collect();
+        for other in &other_names {
+            let (status, body) = cur.put(&minimal_definition(other), None).await;
+            assert_eq!(status, 200, "case {case:?}: setup got {body:?}");
+        }
+        if held {
+            let tags = json!([{ "Key": "team", "Value": "fin" }]);
+            let (status, body) = cur
+                .put(&minimal_definition(report_name), tagged.then_some(&tags))
+                .await;
             assert_eq!(status, 200, "case {case:?}: setup got {body:?}");
         }
 
-        let (status, body) = cur
-            .call(
-                "DeleteReportDefinition",
-                &json!({ "ReportName": report_name }),
-            )
-            .await;
-        assert_eq!(status, 200, "case {case:?}: expected HTTP 200, got {body:?}");
-        assert_eq!(
-            body,
-            json!({}),
-            "case {case:?}: expected an empty body carrying no ResponseMessage, got {body:?}"
-        );
+        // Every call answers the same body, whether it removed the report or found
+        // nothing to remove.
+        let mut bodies: Vec<Value> = Vec::new();
+        for call in 1..=deletes {
+            let (status, body) = cur
+                .call(
+                    "DeleteReportDefinition",
+                    &json!({ "ReportName": report_name }),
+                )
+                .await;
+            assert_eq!(
+                status, 200,
+                "case {case:?}: delete {call} expected HTTP 200, got {status} {body:?}"
+            );
+            assert_eq!(
+                body.as_object().map(serde_json::Map::len),
+                Some(0),
+                "case {case:?}: delete {call} expected a body with no members, got {body:?}"
+            );
+            assert_eq!(
+                body,
+                json!({}),
+                "case {case:?}: delete {call} expected an empty body carrying no \
+                 ResponseMessage, got {body:?}"
+            );
+            assert!(
+                !body.to_string().contains(report_name),
+                "case {case:?}: delete {call} must not echo the report name, got {body:?}"
+            );
+            bodies.push(body);
+        }
         assert!(
-            !body.to_string().contains(report_name),
-            "case {case:?}: the body must not echo the report name, got {body:?}"
+            bodies.windows(2).all(|pair| pair[0] == pair[1]),
+            "case {case:?}: every leg of the delete must answer the same body, got {bodies:?}"
         );
 
+        // The removal is what the call reports: the name is gone from every later read,
+        // its tags with it, and nothing else the account held was touched.
         let listed = cur.describe_all().await;
         assert!(
             !listed
                 .iter()
                 .any(|definition| definition["ReportName"] == json!(report_name)),
             "case {case:?}: the deleted report must be gone, got {listed:?}"
+        );
+        let survivors: Vec<&str> = listed
+            .iter()
+            .map(|definition| definition["ReportName"].as_str().unwrap_or("<no name>"))
+            .collect();
+        assert_eq!(
+            survivors, other_names,
+            "case {case:?}: expected the reports the delete did not name, got {survivors:?}"
+        );
+        let (status, body) = cur.tags_of(report_name).await;
+        assert_eq!(
+            (status, error_code(&body)),
+            (400, "ResourceNotFoundException"),
+            "case {case:?}: a report that is gone holds no tags, got {status} {body:?}"
         );
     }
 }
