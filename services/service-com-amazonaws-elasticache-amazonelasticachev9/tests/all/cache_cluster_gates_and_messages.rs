@@ -37,9 +37,9 @@ use crate::cache_cluster_lifecycle::{create_available_cluster, create_cluster, d
 use crate::harness::{params, Emulator};
 
 /// The identifier rule this service states when a value cannot name a cache
-/// cluster, naming the parameter ElastiCache names
+/// cluster, naming the resource identifier ElastiCache names
 /// (`state::identifier_refusal`).
-const IDENTIFIER_RULE: &str = "The parameter CacheClusterIdentifier is not a valid identifier. \
+const IDENTIFIER_RULE: &str = "Cache Cluster ID specified is not a valid identifier. \
                                Identifiers must begin with a letter; must contain only ASCII \
                                letters, digits, and hyphens; and must not end with a hyphen or \
                                contain two consecutive hyphens.";

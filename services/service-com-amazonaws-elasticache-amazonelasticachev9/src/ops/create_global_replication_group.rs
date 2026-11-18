@@ -258,7 +258,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // role for every account it serves, so no request is answered with it.)
         if let Some(message) = crate::state::identifier_refusal(
             "Global Replication Group ID Suffix",
-            "GlobalReplicationGroupIdSuffix",
             &input.global_replication_group_id_suffix,
             crate::state::REPLICATION_GROUP_ID_MAX_LEN - crate::state::GLOBAL_ID_PREFIX_LEN - 1,
         ) {

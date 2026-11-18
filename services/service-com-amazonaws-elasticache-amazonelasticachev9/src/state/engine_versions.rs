@@ -230,6 +230,53 @@ pub fn version_not_offered_message(engine: &str, engine_version: &str) -> String
     format!("Cannot find version {engine_version} for {engine}")
 }
 
+/// The FIRST engine version of each engine that supports ElastiCache's encryption
+/// features, as `(engine, version)`.
+///
+/// Source: the oldest engine version AWS states those features are available from —
+/// Memcached supports in-transit encryption from 1.6.12 onwards, and Redis OSS from 3.2.6
+/// onwards (AWS lists 3.2.6 and 4.0.10 or later, and 4.0.10 is the oldest Redis OSS version
+/// [`CACHE_ENGINE_VERSIONS`] publishes, so no published Redis version is below this entry).
+/// An engine ABSENT from this table supports encryption in every version ElastiCache
+/// publishes for it, which is the case for Valkey (published from 7.2 up).
+///
+/// A version below its engine's entry can run a cache, but not an encrypted one: that
+/// engine build has no encryption to turn on, so asking for it is a combination the
+/// service cannot serve ([`encryption_unsupported_message`]).
+const ENCRYPTION_MINIMUM_VERSIONS: [(&str, &str); 2] =
+    [("memcached", "1.6.12"), ("redis", "3.2.6")];
+
+/// How ElastiCache words a request that asks for an encryption feature on an engine
+/// version that has none: `Encryption features are not supported for engine version
+/// <engine-version>. Please use engine version <minimum>`.
+///
+/// The variable parts are the version the request named and the first version of that
+/// engine which supports encryption; the rest is fixed text, and it carries no trailing
+/// stop.
+pub fn encryption_unsupported_message(engine_version: &str, minimum: &str) -> String {
+    format!(
+        "Encryption features are not supported for engine version {engine_version}. Please use \
+         engine version {minimum}"
+    )
+}
+
+/// Why `engine_version` of `engine` cannot carry an encryption feature, or `None` when it
+/// can.
+///
+/// The ONE statement of that rule, so a cache cluster create and a replication group
+/// create refuse the same pair the same way. A version at or above its engine's first
+/// encryption-capable release ([`ENCRYPTION_MINIMUM_VERSIONS`]) can carry it, and so can
+/// every version of an engine the table names no minimum for.
+pub fn encryption_support_refusal(engine: &str, engine_version: &str) -> Option<String> {
+    let (_, minimum) = ENCRYPTION_MINIMUM_VERSIONS
+        .iter()
+        .find(|(named, _)| *named == engine)?;
+    // Compared as version NUMBERS rather than as strings, so 1.6.6 counts as older than
+    // 1.6.12 ([`version_sort_key`]).
+    (version_sort_key(engine_version) < version_sort_key(minimum))
+        .then(|| encryption_unsupported_message(engine_version, minimum))
+}
+
 /// One published cache engine version, as this emulator holds it.
 #[derive(Debug, Clone)]
 pub struct CacheEngineVersionRecord {

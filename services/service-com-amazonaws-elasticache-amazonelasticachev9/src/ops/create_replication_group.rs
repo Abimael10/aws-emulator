@@ -702,9 +702,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let automatic_failover = match input.automatic_failover_enabled {
             Some(true) if !cluster_enabled && !every_shard_has_replica => {
                 return Err(invalid_combination(
-                    "AutomaticFailoverEnabled requires at least one replica in every node group \
-                     (shard) to promote."
-                        .to_string(),
+                    crate::state::AUTOMATIC_FAILOVER_NEEDS_TWO_CLUSTERS_MESSAGE.to_string(),
                 ))
             }
             Some(false) if cluster_enabled => {
@@ -998,6 +996,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 return Err(invalid_combination(
                     crate::state::version_not_offered_message(&engine, named),
                 ));
+            }
+        }
+        // The encryption features belong to the ENGINE BUILD, so a version below
+        // the first release of its engine that supports them cannot carry
+        // encryption at all — the same rule `CreateCacheCluster` applies, stated
+        // once (`crate::state::encryption_support_refusal`). Both encryption
+        // members ask for a feature of that build, so either one turned on
+        // reaches it.
+        if transit_encryption_enabled || input.at_rest_encryption_enabled == Some(true) {
+            if let Some(message) =
+                crate::state::encryption_support_refusal(&engine, &engine_version)
+            {
+                return Err(invalid_combination(message));
             }
         }
         let cache_node_type = input.cache_node_type.or_else(|| {
@@ -1368,6 +1379,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // are addresses a client can reach and a replica answers what the primary
         // wrote (`crate::state::serve_replication_group`).
         crate::state::serve_replication_group(&*self.engine, &state, &replication_group_id).await;
+        // Every member cluster's node holds a requester-managed network interface
+        // in a subnet of the group's cache subnet group — the same presence a
+        // standalone cluster's node has, placed by the same pass
+        // (`crate::state::ec2_cache_node_interfaces`).
+        crate::state::ec2_cache_node_interfaces::settle_cache_node_interfaces(&*self.engine);
         // Read back once the sockets are open, so this answer publishes the
         // addresses the group really answers on rather than the ones its record
         // carried before its members were served.

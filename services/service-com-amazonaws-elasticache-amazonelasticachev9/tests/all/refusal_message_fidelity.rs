@@ -35,8 +35,8 @@ use crate::harness::{params, poll_until, Emulator, Reply, REGION};
 use crate::modify_cache_parameter_group::modify;
 
 /// The sentence ElastiCache refuses a value that is not one of its identifiers with,
-/// for the member a cache parameter group delete names.
-const IDENTIFIER_RULE: &str = "The parameter CacheParameterGroupName is not a valid \
+/// for the resource a cache parameter group delete names.
+const IDENTIFIER_RULE: &str = "Cache Parameter Group Name specified is not a valid \
                                identifier. Identifiers must begin with a letter; must \
                                contain only ASCII letters, digits, and hyphens; and must \
                                not end with a hyphen or contain two consecutive hyphens.";

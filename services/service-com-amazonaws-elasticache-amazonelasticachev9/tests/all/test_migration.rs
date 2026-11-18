@@ -368,13 +368,10 @@ async fn an_identifier_no_group_could_carry_is_refused_before_the_lookup() {
             refused.status,
             refused.body
         );
-        let expected = state::identifier_refusal(
-            "Cluster ID",
-            "ReplicationGroupIdentifier",
-            id,
-            state::CLUSTER_ID_MAX_LEN,
-        )
-        .unwrap_or_else(|| panic!("case {case:?}: the row must be outside the identifier rule"));
+        let expected = state::identifier_refusal("Cluster ID", id, state::CLUSTER_ID_MAX_LEN)
+            .unwrap_or_else(|| {
+                panic!("case {case:?}: the row must be outside the identifier rule")
+            });
         assert_eq!(
             refused.error_message(),
             expected,

@@ -214,7 +214,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // against an id that can never be accepted.
             if let Some(message) = crate::state::identifier_refusal(
                 "Replication Group ID",
-                "ReplicationGroupIdentifier",
                 id,
                 crate::state::LOOKUP_IDENTIFIER_MAX_LEN,
             ) {

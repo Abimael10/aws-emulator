@@ -161,7 +161,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         // A pure read: a subnet group has no lifecycle the clock drives, so this
-        // handler writes nothing at all.
+        // handler writes nothing at all — neither here nor in the inventory of
+        // the service that owns subnets, which it only asks.
         let _ = ctx;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(crate::scaffolded::Scaffolded::validation(
@@ -187,53 +188,84 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             None => None,
         };
 
-        let store = state.lock();
+        // Which groups the answer carries is decided under this service's own
+        // lock, which is then DROPPED: what each one reports about its subnets
+        // comes from the service that owns subnets, and no two store locks are
+        // ever held at once (see `crate::state::ec2_live_subnets`).
+        let (page, marker) = {
+            let store = state.lock();
 
-        // With `CacheSubnetGroupName` the answer is that one group, or the
-        // modelled not-found; pagination does not apply to a single-resource
-        // lookup.
-        if let Some(name) = input.cache_subnet_group_name.as_deref() {
-            // The name has ONE identity, whatever case the request spelled it in
-            // (`crate::state::stored_subnet_group_name`), and that identity is
-            // both what the group is looked up under and what the refusal names.
-            let key = crate::state::stored_subnet_group_name(name);
-            let Some(group) = store.cache_subnet_groups.get(&key) else {
-                return Err(
-                    DescribeCacheSubnetGroupsErrorModeled::CacheSubnetGroupNotFoundFault(
-                        CacheSubnetGroupNotFoundFault {
-                            message: Some(
-                                crate::state::describe_subnet_group_not_found_message(&key),
-                            ),
-                        },
-                    )
-                    .into(),
-                );
-            };
-            return Ok(DescribeCacheSubnetGroupsOutput {
-                marker: None,
-                cache_subnet_groups: Some(vec![group.to_modeled()]),
-            });
-        }
-
-        let mut page: Vec<CacheSubnetGroup> = Vec::new();
-        let mut marker = None;
-        for (key, group) in store
-            .cache_subnet_groups
-            .iter()
-            .filter(|(key, _)| resume_from.as_ref().is_none_or(|from| *key >= from))
-        {
-            if page.len() == page_size {
-                // More records exist than `MaxRecords`, so the response carries
-                // the marker the next call resumes from.
-                marker = Some(crate::state::encode_marker(key));
-                break;
+            // With `CacheSubnetGroupName` the answer is that one group, or the
+            // modelled not-found; pagination does not apply to a single-resource
+            // lookup.
+            if let Some(name) = input.cache_subnet_group_name.as_deref() {
+                // The name has ONE identity, whatever case the request spelled
+                // it in (`crate::state::stored_subnet_group_name`), and that
+                // identity is both what the group is looked up under and what
+                // the refusal names.
+                let key = crate::state::stored_subnet_group_name(name);
+                let Some(group) = store.cache_subnet_groups.get(&key) else {
+                    return Err(
+                        DescribeCacheSubnetGroupsErrorModeled::CacheSubnetGroupNotFoundFault(
+                            CacheSubnetGroupNotFoundFault {
+                                message: Some(
+                                    crate::state::describe_subnet_group_not_found_message(&key),
+                                ),
+                            },
+                        )
+                        .into(),
+                    );
+                };
+                (vec![group.clone()], None)
+            } else {
+                let mut page: Vec<crate::state::CacheSubnetGroupRecord> = Vec::new();
+                let mut marker = None;
+                for (key, group) in store
+                    .cache_subnet_groups
+                    .iter()
+                    .filter(|(key, _)| resume_from.as_ref().is_none_or(|from| *key >= from))
+                {
+                    if page.len() == page_size {
+                        // More records exist than `MaxRecords`, so the response
+                        // carries the marker the next call resumes from.
+                        marker = Some(crate::state::encode_marker(key));
+                        break;
+                    }
+                    page.push(group.clone());
+                }
+                (page, marker)
             }
-            page.push(group.to_modeled());
-        }
+        };
+
+        // A group's `Subnets` and `SupportedNetworkTypes` are DERIVED from the
+        // subnets it holds, and a subnet is Amazon EC2's resource: so every
+        // identifier the groups store is resolved against what that service
+        // holds NOW, and one it no longer holds — a subnet deleted since the
+        // group was created — is no longer a member of the group. Every
+        // identifier of the whole page is resolved in ONE hop, so a page of
+        // groups is reported against one reading of that inventory rather than
+        // against a different one per group. An emulator stood up without the
+        // owner of subnets has no inventory to resolve against, and each group
+        // then reports what it stored.
+        let named: Vec<String> = page
+            .iter()
+            .flat_map(|group| group.subnets.iter())
+            .map(|subnet| subnet.subnet_identifier.clone())
+            .collect();
+        let held = crate::state::ec2_live_subnets::held_subnets(&*self.engine, &named);
+        let cache_subnet_groups = page
+            .into_iter()
+            .map(|group| match held.as_ref() {
+                Some(held) => group.reported_over(
+                    &crate::state::ec2_live_subnets::group_subnets_of(&group, held),
+                ),
+                None => group.to_modeled(),
+            })
+            .collect();
 
         Ok(DescribeCacheSubnetGroupsOutput {
             marker,
-            cache_subnet_groups: Some(page),
+            cache_subnet_groups: Some(cache_subnet_groups),
         })
     }
 }

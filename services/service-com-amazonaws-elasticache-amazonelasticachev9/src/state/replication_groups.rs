@@ -225,6 +225,17 @@ pub const INVALID_AUTH_TOKEN_MESSAGE: &str = "Invalid AuthToken provided.";
 pub const AUTH_TOKEN_NEEDS_TRANSIT_ENCRYPTION_MESSAGE: &str =
     "The AUTH token is only supported when encryption-in-transit is enabled";
 
+/// The sentence a request that asks for automatic failover on a replication
+/// group holding ONE cache cluster is refused with.
+///
+/// "If AutomaticFailoverEnabled is true, the value of [NumCacheClusters] must be
+/// at least 2" — failover promotes another cache cluster of the group, so a
+/// group of one has nothing to promote. ElastiCache states that as the COUNT of
+/// cache clusters such a group needs, in wholly fixed text.
+pub const AUTOMATIC_FAILOVER_NEEDS_TWO_CLUSTERS_MESSAGE: &str =
+    "When using automatic failover, there must be at least 2 cache clusters in the replication \
+     group.";
+
 /// The inclusive slot range a `Slots` string names, or the reason it names none.
 ///
 /// "A string that specifies the keyspace for a particular node group. Keyspaces

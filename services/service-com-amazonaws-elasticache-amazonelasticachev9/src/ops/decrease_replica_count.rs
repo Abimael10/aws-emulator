@@ -390,6 +390,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 crate::state::STORE_UNAVAILABLE,
             ));
         };
+        // The store's guard is given back before the account's VPC inventory is
+        // touched: a replica this call removed gives its node's interface, and the
+        // address it held, back to the subnet it sat in
+        // (`crate::state::ec2_cache_node_interfaces`).
+        drop(store);
+        crate::state::ec2_cache_node_interfaces::settle_cache_node_interfaces(&*self.engine);
         Ok(DecreaseReplicaCountOutput {
             replication_group: Some(answer),
         })

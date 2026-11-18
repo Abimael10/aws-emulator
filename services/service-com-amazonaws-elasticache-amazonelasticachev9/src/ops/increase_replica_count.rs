@@ -370,6 +370,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // its own socket, over the group's one keyspace, and its address published
         // as its node endpoint (`crate::state::serve_replication_group`).
         crate::state::serve_replication_group(&*self.engine, &state, &key).await;
+        // A member this call minted holds its own interface in the account's VPC,
+        // placed by the same pass that placed the create's
+        // (`crate::state::ec2_cache_node_interfaces`).
+        crate::state::ec2_cache_node_interfaces::settle_cache_node_interfaces(&*self.engine);
         let answer = state
             .lock()
             .modeled_replication_group(&key)

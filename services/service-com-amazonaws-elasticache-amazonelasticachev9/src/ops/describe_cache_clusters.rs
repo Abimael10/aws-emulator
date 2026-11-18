@@ -232,7 +232,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // carry is a bad parameter value rather than a missing cluster.
             if let Some(message) = crate::state::identifier_refusal(
                 "Cache Cluster ID",
-                "CacheClusterIdentifier",
                 id,
                 crate::state::LOOKUP_IDENTIFIER_MAX_LEN,
             ) {

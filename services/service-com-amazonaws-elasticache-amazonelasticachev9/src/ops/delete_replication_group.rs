@@ -476,6 +476,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             crate::state::serve_cache_cluster_holding(&*self.engine, &state, &member, keyspace)
                 .await;
         }
+        // The interfaces the members' nodes held in the account's VPC are given
+        // back with them, and the retained primary keeps its own: the pass
+        // reconciles that inventory with the cache nodes this store holds now
+        // (`crate::state::ec2_cache_node_interfaces`).
+        crate::state::ec2_cache_node_interfaces::settle_cache_node_interfaces(&*self.engine);
 
         Ok(DeleteReplicationGroupOutput {
             replication_group: Some(answer),

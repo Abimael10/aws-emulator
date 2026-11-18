@@ -927,6 +927,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         for event in immediate_events {
             store.queue_cluster_notification(&cache_cluster_id, event);
         }
+        // The store's guard is given back before the account's VPC inventory is
+        // touched: a node this modify ADDED is owed an interface in its subnet
+        // and one it removed gives its own back, and a change to the cluster's
+        // security groups changes which groups govern the interfaces its nodes
+        // keep (`crate::state::ec2_cache_node_interfaces`).
+        drop(store);
+        crate::state::ec2_cache_node_interfaces::settle_cache_node_interfaces(&*self.engine);
         Ok(ModifyCacheClusterOutput {
             cache_cluster: Some(cache_cluster),
         })

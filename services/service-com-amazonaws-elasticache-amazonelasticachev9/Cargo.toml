@@ -54,6 +54,14 @@ aws-sdk-sns = { version = "1", default-features = false, features = ["rt-tokio",
 # `arn::region_label`: the ONE reading of a caller-supplied Region as a Region
 # LABEL, which is what the endpoint the EC2 call above is made at is built from.
 service-common = { path = "../common" }
+# The EC2 service's OWN state accessor, for the two facts about this service's
+# resources that live in Amazon VPC's inventory rather than here: the subnets a
+# cache subnet group's membership re-derives from (`src/state/ec2_live_subnets.rs`),
+# and the requester-managed network interface each cache node holds in its subnet
+# (`src/state/ec2_cache_node_interfaces.rs`) — an interface another service created
+# and manages is that store's own record, so it is written where
+# `ec2:DescribeNetworkInterfaces` answers from rather than into a second copy here.
+service-com-amazonaws-ec2-amazonec2 = { workspace = true }
 # The RESP wire format (RESP2/RESP3) a cache's own clients speak, decoded and
 # encoded by the protocol's own implementation rather than by a reading of it
 # written here: `src/state/cache_data_plane/resp_frame.rs` frames every command a
@@ -67,11 +75,6 @@ emulator-core-build-support = { workspace = true }
 # The encryption suite mounts KMS beside ElastiCache on one engine, because
 # resolving the key a resource names is a call into it.
 service-com-amazonaws-kms-trentservice = { workspace = true }
-# The EC2 service, mounted beside this one in the test harness: that a cache
-# subnet group can be created in the subnets the account HAS can only be driven
-# end to end with the owner of subnets on the same engine. DEV-ONLY: this crate
-# depends on no other service's crate outside its tests.
-service-com-amazonaws-ec2-amazonec2 = { workspace = true }
 # Amazon S3, mounted beside this one in the test harness: the object an export of a
 # serverless cache snapshot writes is read back through that service's OWN operations,
 # so what the export reports is what the owner of objects really holds.

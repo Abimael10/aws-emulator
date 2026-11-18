@@ -46,8 +46,9 @@ use crate::resource_tags::{add_tags, list_tags, remove_tags};
 const ACCOUNT: &str = engine::EMULATOR_ACCOUNT_ID;
 
 /// The sentence ElastiCache refuses a `CacheParameterGroupName` that is not one
-/// of its identifiers with: wholly fixed text naming the member and the grammar.
-const IDENTIFIER_RULE: &str = "The parameter CacheParameterGroupName is not a valid identifier. \
+/// of its identifiers with: wholly fixed text naming the resource identifier and
+/// the grammar.
+const IDENTIFIER_RULE: &str = "Cache Parameter Group Name specified is not a valid identifier. \
                                Identifiers must begin with a letter; must contain only ASCII \
                                letters, digits, and hyphens; and must not end with a hyphen or \
                                contain two consecutive hyphens.";

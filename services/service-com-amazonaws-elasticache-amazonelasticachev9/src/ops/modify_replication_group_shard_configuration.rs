@@ -468,6 +468,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // address published as its node endpoint
         // (`crate::state::serve_replication_group`).
         crate::state::serve_replication_group(&*self.engine, &state, &group_id).await;
+        // A member a new shard brought with it holds its own network interface in the
+        // account's VPC, and a member a shard that went took with it gives its own back:
+        // the pass reconciles that inventory with the cache nodes this store holds now
+        // (`crate::state::ec2_cache_node_interfaces`).
+        crate::state::ec2_cache_node_interfaces::settle_cache_node_interfaces(&*self.engine);
         let replication_group = state
             .lock()
             .modeled_replication_group(&group_id)

@@ -66,7 +66,6 @@ pub fn replication_group_id_refusal(replication_group_id: &str) -> Option<String
 pub fn replication_group_id_prose_refusal(replication_group_id: &str) -> Option<String> {
     crate::state::identifier_refusal(
         "Replication Group ID",
-        "ReplicationGroupIdentifier",
         replication_group_id,
         crate::state::REPLICATION_GROUP_ID_MAX_LEN,
     )

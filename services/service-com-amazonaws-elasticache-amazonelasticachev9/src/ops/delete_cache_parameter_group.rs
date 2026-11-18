@@ -176,11 +176,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // names no group it could ever hold, so it is reported as the bad
         // parameter it is rather than as a group that does not exist. Worded by
         // the one helper every identifier refusal of this service goes through
-        // (`crate::state::identifier_refusal`), which names this member and the
-        // constraint it broke.
+        // (`crate::state::identifier_refusal`), which names this resource and
+        // the constraint it broke.
         if let Some(message) = crate::state::identifier_refusal(
             "Cache Parameter Group Name",
-            "CacheParameterGroupName",
             &name,
             crate::state::PARAMETER_GROUP_NAME_MAX_LEN,
         ) {

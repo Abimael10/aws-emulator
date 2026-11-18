@@ -202,6 +202,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         }
 
+        // A name this account already holds a group under is the FIRST thing
+        // this create judges about the request: the name is the group's
+        // identity, so a request that could only ever create a SECOND group
+        // under one identity is refused before anything else about it is
+        // resolved — a client retrying on a taken name learns the name is
+        // taken, whatever else the request names. The authoritative check is
+        // the one below, under the lock the insert takes.
+        if state.lock().cache_subnet_groups.contains_key(&name) {
+            return Err(already_exists(&name));
+        }
+
         // A subnet group has to name subnets: the modelled `SubnetIds` carries
         // no length constraint, so an empty list reaches the handler.
         if input.subnet_ids.is_empty() {
@@ -321,29 +332,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
             .into());
         }
-        let subnets: Vec<crate::state::SubnetRecord> = resolved
-            .into_iter()
-            .map(|subnet| crate::state::SubnetRecord {
-                // The network types the subnet supports follow from the blocks
-                // EC2 reported for it; see `crate::state::network_types`.
-                supported_network_types: subnet.supported_network_types(),
-                subnet_identifier: subnet.subnet_id,
-                availability_zone: subnet.availability_zone,
-            })
-            .collect();
+        let subnets: Vec<crate::state::SubnetRecord> =
+            crate::state::ec2_live_subnets::group_subnets(resolved);
 
         let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
 
         if store.cache_subnet_groups.contains_key(&name) {
-            return Err(
-                CreateCacheSubnetGroupErrorModeled::CacheSubnetGroupAlreadyExistsFault(
-                    CacheSubnetGroupAlreadyExistsFault {
-                        message: Some(format!("Cache subnet group {name} already exists.")),
-                    },
-                )
-                .into(),
-            );
+            return Err(already_exists(&name));
         }
         // The store is bounded; see `crate::state::SUBNET_GROUP_QUOTA`.
         if store.cache_subnet_groups.len() >= crate::state::SUBNET_GROUP_QUOTA {
@@ -389,4 +385,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .map(crate::state::CacheSubnetGroupRecord::to_modeled),
         })
     }
+}
+
+/// The modelled `CacheSubnetGroupAlreadyExistsFault` for the stored identity
+/// `name`, worded the one way ElastiCache words a taken group name: `Cache
+/// subnet group <name> already exists.`
+///
+/// Stated once, because this create judges the name both before it resolves
+/// anything else about the request and again under the lock the insert takes —
+/// the two cannot answer a taken name differently.
+fn already_exists(name: &str) -> CreateCacheSubnetGroupError {
+    CreateCacheSubnetGroupErrorModeled::CacheSubnetGroupAlreadyExistsFault(
+        CacheSubnetGroupAlreadyExistsFault {
+            message: Some(format!("Cache subnet group {name} already exists.")),
+        },
+    )
+    .into()
 }

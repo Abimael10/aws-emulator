@@ -27,7 +27,7 @@
 use service_com_amazonaws_elasticache_amazonelasticachev9::service::identifier_length_rules;
 use service_com_amazonaws_elasticache_amazonelasticachev9::state;
 
-use crate::harness::{params, Emulator, PAST_TRANSITION};
+use crate::harness::{params, poll_until, Emulator, REGION};
 
 /// What an identifier AT an operation's bound is answered with: the bound did not refuse
 /// it, so the answer is about the RESOURCE the identifier names.
@@ -351,7 +351,7 @@ async fn the_datastore_create_resolves_its_primary_before_it_judges_the_suffix()
     );
     // The other half of the identifier rule: the FORM every identifier of this service
     // shares, stated once by the service for whichever member broke it.
-    let malformed = "The parameter GlobalReplicationGroupIdSuffix is not a valid identifier. \
+    let malformed = "Global Replication Group ID Suffix specified is not a valid identifier. \
                      Identifiers must begin with a letter; must contain only ASCII letters, \
                      digits, and hyphens; and must not end with a hyphen or contain two \
                      consecutive hyphens."
@@ -460,8 +460,19 @@ async fn the_datastore_create_resolves_its_primary_before_it_judges_the_suffix()
     }
 
     // And once the primary has settled, the well-formed suffix is accepted and the
-    // datastore it names is readable: the reordering refuses nothing it used to serve.
-    std::thread::sleep(PAST_TRANSITION);
+    // datastore it names is readable: the reordering refuses nothing it used to serve. The
+    // suite waits for that CONDITION — the primary reporting `available` — rather than for a
+    // fixed time, so what it asserts does not depend on how fast or how loaded the host is.
+    poll_until(
+        &emulator,
+        REGION,
+        "a create over a settled primary",
+        &format!("the replication group {held} settling at available"),
+        "DescribeReplicationGroups",
+        &params(&[("ReplicationGroupId", held)]),
+        |reply| reply.text("Status") == Some(state::STATUS_AVAILABLE),
+    )
+    .await;
     let created = emulator
         .call(
             "CreateGlobalReplicationGroup",

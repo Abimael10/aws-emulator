@@ -311,10 +311,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // name rule is enforced here rather than at the boundary — worded by the
         // one helper every identifier refusal of this service goes through
         // (`crate::state::identifier_refusal`), so a create and a lookup state
-        // the same rule and name the same parameter.
+        // the same rule and name the resource the same way.
         if let Some(message) = crate::state::identifier_refusal(
             "Cache Cluster ID",
-            "CacheClusterIdentifier",
             &cache_cluster_id,
             crate::state::CLUSTER_ID_MAX_LEN,
         ) {
@@ -789,6 +788,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 );
             }
         }
+        // In-transit encryption is a feature of the ENGINE BUILD: a version
+        // below the first release of its engine that supports the encryption
+        // features cannot serve an encrypted cache at all, so asking for one on
+        // it is a combination this service cannot serve and nothing is created
+        // (`crate::state::encryption_support_refusal`).
+        if input.transit_encryption_enabled == Some(true) {
+            if let Some(message) =
+                crate::state::encryption_support_refusal(&engine, &engine_version)
+            {
+                return Err(
+                    CreateCacheClusterErrorModeled::InvalidParameterCombinationException(
+                        InvalidParameterCombinationException {
+                            message: Some(message),
+                        },
+                    )
+                    .into(),
+                );
+            }
+        }
         // "Default: ... the default parameter group for the specified engine":
         // the derived default is resolved through the SAME stored map as a named
         // group, so the group a cluster reports is always one this account
@@ -949,6 +967,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // endpoint — a cluster still `creating` has no provisioned node to report
         // one for — so the address is published before any reader can see one.
         crate::state::serve_cache_cluster(&*self.engine, &state, &cache_cluster_id).await;
+        // The cluster's presence in the account's VPC: a node of a cluster placed
+        // in a cache subnet group holds a requester-managed network interface in
+        // one of that group's subnets, which is an Amazon VPC record, so it is
+        // created where `ec2:DescribeNetworkInterfaces` answers from
+        // (`crate::state::ec2_cache_node_interfaces`).
+        crate::state::ec2_cache_node_interfaces::settle_cache_node_interfaces(&*self.engine);
         // Read back once the socket is open, so this answer publishes the address
         // the cluster really answers on rather than the one its record carried
         // before it was served.

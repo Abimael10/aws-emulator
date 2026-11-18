@@ -187,7 +187,9 @@ use crate::ops::types::{
     UserGroupPendingChanges, UserGroupsUpdateStatus,
 };
 
+pub mod ec2_cache_node_interfaces;
 pub mod ec2_client;
+pub mod ec2_live_subnets;
 pub mod ec2_security_groups;
 pub mod ec2_subnets;
 mod event_notifications;
@@ -1258,15 +1260,12 @@ pub const LOOKUP_IDENTIFIER_MAX_LEN: usize = CLUSTER_ID_MAX_LEN;
 /// that no resource could ever carry is reported as the bad parameter it is
 /// rather than as a resource that does not exist.
 ///
-/// `prose` is how the service names the member in the length refusal
-/// ("Replication Group ID"), `parameter` how it names it in the identifier-rule
-/// refusal ("ReplicationGroupIdentifier"); both texts are the service's own.
-pub fn identifier_refusal(
-    prose: &str,
-    parameter: &str,
-    value: &str,
-    max_len: usize,
-) -> Option<String> {
+/// `prose` is how the service names the member in BOTH sentences ("Replication
+/// Group ID"): ElastiCache states the identifier rule over the resource
+/// identifier the request SPECIFIED — `<prose> specified is not a valid
+/// identifier. …` — rather than over the shape's member name, so one wording
+/// serves every member this rule judges.
+pub fn identifier_refusal(prose: &str, value: &str, max_len: usize) -> Option<String> {
     if value.len() > max_len {
         return Some(format!("{prose} cannot be longer than {max_len} characters."));
     }
@@ -1274,9 +1273,9 @@ pub fn identifier_refusal(
         return None;
     }
     Some(format!(
-        "The parameter {parameter} is not a valid identifier. Identifiers must begin with a \
-         letter; must contain only ASCII letters, digits, and hyphens; and must not end with a \
-         hyphen or contain two consecutive hyphens."
+        "{prose} specified is not a valid identifier. Identifiers must begin with a letter; must \
+         contain only ASCII letters, digits, and hyphens; and must not end with a hyphen or \
+         contain two consecutive hyphens."
     ))
 }
 
@@ -2011,14 +2010,28 @@ pub struct CacheSubnetGroupRecord {
 }
 
 impl CacheSubnetGroupRecord {
-    /// This record as the modelled `CacheSubnetGroup`.
+    /// This record as the modelled `CacheSubnetGroup`, over the subnets it
+    /// stores.
     pub fn to_modeled(&self) -> CacheSubnetGroup {
+        self.reported_over(&self.subnets)
+    }
+
+    /// This record as the modelled `CacheSubnetGroup`, over `subnets` — the
+    /// group's membership as the service that OWNS subnets holds it now (see
+    /// [`ec2_live_subnets`]).
+    ///
+    /// `Subnets` and `SupportedNetworkTypes` are DERIVED from the subnets the
+    /// group holds, so a reader hands in the ones that are still there and
+    /// everything reported about the placement follows from them; the group's
+    /// own name, description, ARN and `VpcId` are its stored identity and do not
+    /// re-derive.
+    pub fn reported_over(&self, subnets: &[SubnetRecord]) -> CacheSubnetGroup {
         CacheSubnetGroup {
             cache_subnet_group_name: Some(self.name.clone()),
             cache_subnet_group_description: Some(self.description.clone()),
             vpc_id: Some(self.vpc_id.clone()),
             subnets: Some(
-                self.subnets
+                subnets
                     .iter()
                     .map(|subnet| Subnet {
                         subnet_identifier: Some(subnet.subnet_identifier.clone()),
@@ -2034,8 +2047,12 @@ impl CacheSubnetGroupRecord {
             ),
             arn: Some(self.arn.clone()),
             // What the GROUP supports is what all of its subnets support; see
-            // [`group_network_types`].
-            supported_network_types: reported_network_types(group_network_types(&self.subnets)),
+            // [`group_network_types`]. Reported as the LIST it is whether or not
+            // it is empty: the member is derived from the group's membership, so
+            // a group left holding no subnet publishes the empty list rather
+            // than withholding the member a client reads to decide ipv6 or
+            // dual-stack eligibility.
+            supported_network_types: Some(group_network_types(subnets)),
         }
     }
 }

@@ -327,17 +327,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // The subnets REPLACE the ones the group held: the member names the
             // subnets the group is to have, not ones to add to the set. Their zones
             // and their VPC come from the records EC2 answered with, never from
-            // anything built here.
-            group.subnets = resolved
-                .into_iter()
-                .map(|subnet| crate::state::SubnetRecord {
-                    // As on the create: the network types a subnet supports come
-                    // from the blocks EC2 reported for it.
-                    supported_network_types: subnet.supported_network_types(),
-                    subnet_identifier: subnet.subnet_id,
-                    availability_zone: subnet.availability_zone,
-                })
-                .collect();
+            // anything built here — read as a group's member subnets by the one
+            // reading of that (`crate::state::ec2_live_subnets::group_subnets`).
+            group.subnets = crate::state::ec2_live_subnets::group_subnets(resolved);
             group.vpc_id = placement.vpc_id;
         }
         // Modifying a cache subnet group is one of the events this service records,

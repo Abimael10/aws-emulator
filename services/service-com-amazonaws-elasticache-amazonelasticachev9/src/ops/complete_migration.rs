@@ -216,7 +216,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // goes through, worded as `StartMigration` words the same member.
                 if let Some(message) = crate::state::identifier_refusal(
                     "Cluster ID",
-                    "ReplicationGroupIdentifier",
                     replication_group_id,
                     crate::state::CLUSTER_ID_MAX_LEN,
                 ) {

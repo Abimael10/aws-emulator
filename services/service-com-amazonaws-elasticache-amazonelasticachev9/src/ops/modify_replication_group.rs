@@ -735,9 +735,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         match input.automatic_failover_enabled {
             Some(true) if !group.cluster_enabled && !every_shard_has_replica => {
                 return Err(invalid_combination(
-                    "AutomaticFailoverEnabled requires at least one replica in every node group \
-                     (shard) to promote."
-                        .to_string(),
+                    crate::state::AUTOMATIC_FAILOVER_NEEDS_TWO_CLUSTERS_MESSAGE.to_string(),
                 ))
             }
             Some(false) if group.cluster_enabled => {
@@ -1291,6 +1289,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 crate::state::STORE_UNAVAILABLE,
             ));
         };
+        // The store's guard is given back before the account's VPC inventory is
+        // touched: a change to the group's security groups is a change to which
+        // groups govern the network interfaces its members' nodes hold, the same
+        // way `ModifyCacheCluster`'s is
+        // (`crate::state::ec2_cache_node_interfaces`).
+        drop(store);
+        crate::state::ec2_cache_node_interfaces::settle_cache_node_interfaces(&*self.engine);
         Ok(ModifyReplicationGroupOutput {
             replication_group: Some(replication_group),
         })

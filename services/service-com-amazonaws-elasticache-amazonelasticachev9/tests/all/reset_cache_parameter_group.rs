@@ -632,9 +632,9 @@ async fn a_group_the_account_cannot_reset_is_refused() {
     // is refused as the malformed parameter it is — including every family's
     // own default group, whose name carries a '.' the grammar does not admit,
     // and a `default.` name of a family the service does not publish. The rule
-    // the service states is wholly fixed text, naming the member and the
-    // grammar and no request value.
-    let identifier_rule = "The parameter CacheParameterGroupName is not a valid identifier. \
+    // the service states is wholly fixed text, naming the resource identifier
+    // and the grammar and no request value.
+    let identifier_rule = "Cache Parameter Group Name specified is not a valid identifier. \
                            Identifiers must begin with a letter; must contain only ASCII \
                            letters, digits, and hyphens; and must not end with a hyphen or \
                            contain two consecutive hyphens.";

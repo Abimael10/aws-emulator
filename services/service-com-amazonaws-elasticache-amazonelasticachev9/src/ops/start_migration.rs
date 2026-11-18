@@ -212,7 +212,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // every identifier refusal of this service goes through.
                 if let Some(message) = crate::state::identifier_refusal(
                     "Cluster ID",
-                    "ReplicationGroupIdentifier",
                     replication_group_id,
                     crate::state::CLUSTER_ID_MAX_LEN,
                 ) {

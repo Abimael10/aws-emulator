@@ -258,6 +258,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 None => {}
             }
         }
+        // The store's guard is given back before the account's VPC inventory is
+        // touched: the interfaces the nodes of a member cluster that went with the
+        // datastore held are given back there, with the addresses they held, by the
+        // pass that reconciles that inventory with the cache nodes this store holds
+        // now (`crate::state::ec2_cache_node_interfaces`).
+        drop(store);
+        crate::state::ec2_cache_node_interfaces::settle_cache_node_interfaces(&*self.engine);
 
         Ok(DeleteGlobalReplicationGroupOutput {
             global_replication_group: deleted,
