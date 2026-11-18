@@ -894,6 +894,16 @@ pub struct CachedAuthorizerResult {
     /// The `context` map the authorizer published, each entry of which the integration
     /// reads as `$context.authorizer.{key}`.
     pub context: BTreeMap<String, String>,
+    /// The `usageIdentifierKey` the authorizer returned, or `None` for a result that
+    /// carries none.
+    ///
+    /// This is the API KEY the call is metered by where the api reads its key from the
+    /// authorizer rather than from the request: `RestApi$apiKeySource` is "the source of the
+    /// API key for metering requests according to a usage plan", with `AUTHORIZER` reading
+    /// it "from the `UsageIdentifierKey` from a custom authorizer". It is held with the rest
+    /// of the authorizer's return value, so a call answered from a HELD result is metered by
+    /// the same key the invocation that filled it returned.
+    pub usage_identifier_key: Option<String>,
     /// When this result was stored, which is what a later flush of the stage's authorizer
     /// cache is compared against ([`StageEntry::cached_authorizer_result`]).
     pub cached_at: ::std::time::Instant,

@@ -25,6 +25,17 @@
 //!
 //! Every case drives the real wire path through the multi-service router on the api's own
 //! invoke host, with the control plane driven through the same emulator ([`Gateway`]).
+//!
+//! WHERE the presented key is read from is the api's own `RestApi$apiKeySource` — "the source
+//! of the API key for metering requests according to a usage plan. Valid values are: `HEADER`
+//! to read the API key from the `X-API-Key` header of a request. `AUTHORIZER` to read the API
+//! key from the `UsageIdentifierKey` from a custom authorizer" — and the second test below
+//! pins that half of the rule this harness can drive on its own: an api reading its key from
+//! an authorizer consults the header NOT AT ALL, so a method behind no authorizer presents no
+//! key however the header is filled, and those same requests invert the moment
+//! `UpdateRestApi` replaces the source. What an authorizer's RETURNED `usageIdentifierKey`
+//! admits needs that authorizer's function to run, so it is pinned in the assembled-router
+//! suite `apigateway_authorizer_sourced_api_key_metering`.
 
 use bytes::Bytes;
 use serde_json::{json, Value};
@@ -463,5 +474,170 @@ async fn a_key_required_method_admits_only_a_key_the_records_associate_with_that
             "case {:?} (GET {}): expected {:?}, got {:?}",
             case.name, case.path, case.expected, answered.body
         );
+    }
+}
+
+/// `CreateRestApi` for `name` with `apiKeySource` set to `source`, answering the api id and
+/// its root resource id.
+async fn sourced_api(gateway: &Gateway, name: &str, source: &str) -> (String, String) {
+    let answer = gateway
+        .call(
+            "POST",
+            "/restapis",
+            Some(json!({ "name": name, "apiKeySource": source })),
+        )
+        .await;
+    assert_eq!(
+        answer.status, 201,
+        "case CreateRestApi({name:?}, {source:?}): expected 201, got {} with {:?}",
+        answer.status, answer.body
+    );
+    let case = format!("CreateRestApi({name:?})");
+    (
+        string_member(&answer.body, "id", &case),
+        string_member(&answer.body, "rootResourceId", &case),
+    )
+}
+
+/// `GetRestApi` must report `wanted` as the api's `apiKeySource`: the records decide where a
+/// key is read from, so each phase below reads the source back before driving its rows.
+async fn assert_source(gateway: &Gateway, api: &str, wanted: &str) {
+    let answer = gateway
+        .call("GET", &format!("/restapis/{api}"), None)
+        .await;
+    assert_eq!(
+        answer.status, 200,
+        "case GetRestApi({api}): expected 200, got {} with {:?}",
+        answer.status, answer.body
+    );
+    assert_eq!(
+        answer.body.get("apiKeySource").and_then(Value::as_str),
+        Some(wanted),
+        "case GetRestApi({api}): expected apiKeySource {wanted:?}, got {:?}",
+        answer.body
+    );
+}
+
+/// `UpdateRestApi` replacing `/apiKeySource` with `source`, as a client scripts the change.
+async fn replace_source(gateway: &Gateway, api: &str, source: &str) {
+    let answer = gateway
+        .call(
+            "PATCH",
+            &format!("/restapis/{api}"),
+            Some(json!({
+                "patchOperations": [
+                    { "op": "replace", "path": "/apiKeySource", "value": source },
+                ],
+            })),
+        )
+        .await;
+    assert_eq!(
+        answer.status, 200,
+        "case UpdateRestApi({api} -> {source}): expected 200, got {} with {:?}",
+        answer.status, answer.body
+    );
+}
+
+/// RULE: `apiKeySource` names WHERE a key-required method reads the key it admits and meters
+/// by, so an api whose source is `AUTHORIZER` does not consult the `X-API-Key` header at all —
+/// a method behind no authorizer presents no key whatever that header carries — and an api
+/// whose source is `HEADER` admits exactly the header values the records associate with the
+/// invoked stage.
+#[tokio::test]
+async fn the_api_key_source_decides_whether_the_request_header_is_read_at_all() {
+    let gateway = Gateway::new();
+
+    // ONE api, driven under each source: the only thing that changes between the two phases is
+    // the source the records carry, so an inverted verdict can be nothing else.
+    let (api, root) = sourced_api(&gateway, "api-key-source", "AUTHORIZER").await;
+    keyed_mock(&gateway, &api, &root, "mocked", r#"{"served":true}"#).await;
+    deploy(&gateway, &api, "prod").await;
+
+    let metered = key_value(1);
+    let unassociated = key_value(2);
+    let metered_id = api_key(&gateway, "metered", &metered, true, json!([])).await;
+    meter(
+        &gateway,
+        "metered",
+        json!([{ "apiId": api, "stage": "prod" }]),
+        &metered_id,
+    )
+    .await;
+    api_key(&gateway, "unassociated", &unassociated, true, json!([])).await;
+
+    /// One row: what the request carries in `x-api-key`, and whether the HEADER-sourced api
+    /// admits it — under the authorizer-sourced api NONE of them is admitted, because that
+    /// source reads no header.
+    struct Sourced<'s> {
+        name: &'s str,
+        presented: Option<&'s str>,
+        header_admits: bool,
+    }
+
+    let rows: &[Sourced] = &[
+        Sourced {
+            name: "a key a usage plan meters for this api stage",
+            presented: Some(&metered),
+            header_admits: true,
+        },
+        Sourced {
+            name: "an enabled key with no association at all",
+            presented: Some(&unassociated),
+            header_admits: false,
+        },
+        Sourced {
+            name: "a value no stored key carries",
+            presented: Some("not-a-stored-key-value-at-all-0000000000"),
+            header_admits: false,
+        },
+        Sourced {
+            name: "an empty key header",
+            presented: Some(""),
+            header_admits: false,
+        },
+        Sourced {
+            name: "no key header at all",
+            presented: None,
+            header_admits: false,
+        },
+    ];
+
+    // Each phase: the source the records carry, and whether a row's own `header_admits` is
+    // what decides it — under `AUTHORIZER` nothing the header carries decides anything.
+    let phases: &[(&str, bool)] = &[("AUTHORIZER", false), ("HEADER", true)];
+    for (source, header_decides) in phases {
+        replace_source(&gateway, &api, source).await;
+        assert_source(&gateway, &api, source).await;
+        // Redeployed as a client does after changing the api, so each phase is driven against a
+        // stage published under the source it is about.
+        deploy(&gateway, &api, "prod").await;
+        for row in rows {
+            let headers: Vec<(&str, &str)> = row
+                .presented
+                .map(|value| vec![("x-api-key", value)])
+                .unwrap_or_default();
+            let answered = invoke(&gateway, &api, "/prod/mocked", &headers).await;
+            let admitted = *header_decides && row.header_admits;
+            let (status, expected) = if admitted {
+                (200, r#"{"served":true}"#)
+            } else {
+                (403, "Forbidden")
+            };
+            assert_eq!(
+                answered.status, status,
+                "case {source}/{:?}: expected {status}, got {} with {:?}",
+                row.name, answered.status, answered.body
+            );
+            let observed = if admitted {
+                answered.body.clone()
+            } else {
+                answered.message()
+            };
+            assert_eq!(
+                observed, expected,
+                "case {source}/{:?}: expected {expected:?}, got {:?}",
+                row.name, answered.body
+            );
+        }
     }
 }

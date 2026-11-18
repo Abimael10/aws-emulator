@@ -84,6 +84,15 @@ const POLICY_DOCUMENT_MEMBER: &str = "policyDocument";
 /// The member it carries the key-value pairs published to the integration in.
 const CONTEXT_MEMBER: &str = "context";
 
+/// The member it carries the API KEY the call is metered by in, which an api reading its
+/// key from its authorizer takes instead of the request header: `RestApi$apiKeySource`'s
+/// `AUTHORIZER` reads "the API key from the `UsageIdentifierKey` from a custom authorizer".
+///
+/// An output carrying none presents the records no key at all, which is not an output that
+/// fails to be one: the member decides nothing for an api whose key source is the header,
+/// and the authorizers of such an api return it not at all.
+const USAGE_IDENTIFIER_KEY_MEMBER: &str = "usageIdentifierKey";
+
 /// The `$context` member path the authorizer's own values are published under:
 /// `$context.authorizer.{key}`, which is how a mapping template reads one.
 pub(super) const AUTHORIZER_MEMBER: &str = "authorizer";
@@ -465,6 +474,13 @@ fn authorizer_output(returned: &[u8], ttl: Duration) -> Result<CachedAuthorizerR
         principal_id,
         policy_document: policy.to_string(),
         context: context_of(document.get(CONTEXT_MEMBER)),
+        // The key an api metering by its authorizer admits the call with, as the authorizer
+        // spelled it: a value that is not text is no API key value, and an absent member is
+        // an authorizer that identified no usage at all.
+        usage_identifier_key: document
+            .get(USAGE_IDENTIFIER_KEY_MEMBER)
+            .and_then(Value::as_str)
+            .map(str::to_string),
         cached_at: obtained,
         expires_at: obtained + ttl,
     })
@@ -508,6 +524,7 @@ mod tests {
             principal_id: "sim-user".to_string(),
             policy_document: policy.to_string(),
             context: BTreeMap::new(),
+            usage_identifier_key: None,
             cached_at: now,
             expires_at: now + Duration::from_secs(300),
         }

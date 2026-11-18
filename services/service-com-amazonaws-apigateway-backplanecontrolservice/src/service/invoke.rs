@@ -405,6 +405,15 @@ const API_KEY_HEADER: &str = "x-api-key";
 /// The `apiKeySource` that reads the key from the request header; see [`API_KEY_HEADER`].
 const API_KEY_SOURCE_HEADER: &str = "HEADER";
 
+/// The other `apiKeySource` an api may carry, from the modelled value set
+/// (`smithy_query(query="shape", shape="ApiKeySourceType")`: `HEADER`, `AUTHORIZER`, which
+/// [`crate::ops::types::API_KEY_SOURCE_TYPE_VALUES`] carries): "`AUTHORIZER` to read the API
+/// key from the `UsageIdentifierKey` from a custom authorizer".
+///
+/// So for such an api the key that satisfies `apiKeyRequired` and meters the call is the one
+/// the method's authorizer RETURNED, and the request header is not consulted at all.
+const API_KEY_SOURCE_AUTHORIZER: &str = "AUTHORIZER";
+
 /// The request header a client asks for the stage's CACHED entry to be reloaded with.
 ///
 /// API Gateway's documented ask is one directive of it: "A client of your API can
@@ -1888,8 +1897,12 @@ async fn serving<Eng: Send + Sync + 'static>(
             // STAGE's own access-log record is rendered from those same values, so what the
             // authorization published is handed back to the funnel that delivers it
             // ([`stage_logs`]) rather than being left to the integration alone.
-            recorded.authorized = published.clone();
-            call.inputs.context.extend(published);
+            recorded.authorized = published.context.clone();
+            call.inputs.context.extend(published.context);
+            // The API key the authorizer identified this caller's usage by, kept for the
+            // admission below: it is the key an api reading its key from its authorizer is
+            // metered by, and nothing else reads it.
+            let authorizer_key = published.usage_identifier_key;
 
             // The api's own RESOURCE POLICY, which "applies to this RestApi regardless of the
             // caller and Method configuration" (`RestApi$policy`): a document the developer
@@ -1950,8 +1963,16 @@ async fn serving<Eng: Send + Sync + 'static>(
             }
             // A key-required method is admitted by the key the records associate with this
             // stage, and the association is also what says which usage plans METER the call.
+            // WHICH key the request presented is the api's own `apiKeySource`: the header, or
+            // what the method's authorizer returned.
             let admission = if snapshot.api_key_required {
-                match api_key_admission(&store, api, &stage.stage_name, req) {
+                match api_key_admission(
+                    &store,
+                    api,
+                    &stage.stage_name,
+                    req,
+                    authorizer_key.as_deref(),
+                ) {
                     Some(admission) => Some(admission),
                     None => {
                         break 'planned Planned::answered(refusal_response(
@@ -2819,11 +2840,11 @@ fn authorization_refusal<Eng: Send + Sync + 'static>(
     custom: CustomAuthorization<'_>,
 ) -> Authorized {
     if authorization_type == AUTHORIZATION_NONE {
-        return Authorized::Published(BTreeMap::new());
+        return Authorized::Published(Publication::default());
     }
     if authorization_type == AUTHORIZATION_AWS_IAM {
         return if carries_sigv4_credential(req) {
-            Authorized::Published(BTreeMap::new())
+            Authorized::Published(Publication::default())
         } else {
             Authorized::Refused(MISSING_AUTHENTICATION_TOKEN)
         };
@@ -2889,11 +2910,15 @@ fn authorization_refusal<Eng: Send + Sync + 'static>(
             // The claims of an accepted token, each under the `$context` member path a
             // mapping template reads one by.
             cognito_user_pools::Decision::Authorized(authorized) => Authorized::Published(
-                authorized
-                    .claims
-                    .into_iter()
-                    .map(|(claim, value)| (format!("{AUTHORIZER_CLAIMS_MEMBER}.{claim}"), value))
-                    .collect(),
+                Publication::of_context(
+                    authorized
+                        .claims
+                        .into_iter()
+                        .map(|(claim, value)| {
+                            (format!("{AUTHORIZER_CLAIMS_MEMBER}.{claim}"), value)
+                        })
+                        .collect(),
+                ),
             ),
             cognito_user_pools::Decision::Refused(refusal, reason) => {
                 tracing::warn!(
@@ -2964,7 +2989,13 @@ fn authorization_refusal<Eng: Send + Sync + 'static>(
         },
     };
     match custom_authorizer::decided(&held, custom.method_arn) {
-        custom_authorizer::Judged::Published(published) => Authorized::Published(published),
+        // The key the authorizer identified this caller's usage by travels with what it
+        // published: whether it decides anything is the API's own `apiKeySource`, read where
+        // a key-required method is admitted ([`api_key_admission`]).
+        custom_authorizer::Judged::Published(published) => Authorized::Published(Publication {
+            context: published,
+            usage_identifier_key: held.usage_identifier_key.clone(),
+        }),
         custom_authorizer::Judged::Refused(sentence) => {
             tracing::warn!(
                 authorizer = %authorizer.name,
@@ -3031,15 +3062,42 @@ enum CustomDecision {
 /// What the authorization step made of a request.
 #[derive(Debug)]
 enum Authorized {
-    /// The request is authorized, and these are the `$context` members the method's
-    /// authorization published for the integration — empty for a type that publishes none.
-    Published(BTreeMap<String, String>),
+    /// The request is authorized, and this is what its authorization published for the rest
+    /// of the pipeline — empty for a type that publishes nothing.
+    Published(Publication),
     /// The request is refused, through this gateway response.
     Refused(GatewayRefusal),
     /// The request is authorized by a `CUSTOM` authorizer whose result nothing holds, so its
     /// function has to be asked: this is what asking it needs. Boxed because it is far
     /// larger than the other two variants.
     Pending(Box<custom_authorizer::Pending>),
+}
+
+/// What a method's authorization published about an authorized call.
+///
+/// Two separate things come out of it: the `$context` members the integration and the
+/// stage's own access log read, and — for an api metering by its authorizer — the API key
+/// the authorizer identified this caller's usage by.
+#[derive(Debug, Default)]
+struct Publication {
+    /// The `$context` members the method's authorization published, each under the member
+    /// path a mapping template reads it by.
+    context: BTreeMap<String, String>,
+    /// The `usageIdentifierKey` a `CUSTOM` authorizer's result carries, or `None` for every
+    /// other authorization and for an authorizer that returned none. It is the key an api
+    /// whose `apiKeySource` is [`API_KEY_SOURCE_AUTHORIZER`] is metered by.
+    usage_identifier_key: Option<String>,
+}
+
+impl Publication {
+    /// A publication carrying `context` and no key, which is what every authorization
+    /// that is not a `CUSTOM` authorizer's publishes.
+    fn of_context(context: BTreeMap<String, String>) -> Self {
+        Self {
+            context,
+            usage_identifier_key: None,
+        }
+    }
 }
 
 /// The ARN of one `Authorizer` of `api`:
@@ -3087,9 +3145,12 @@ struct Metered {
 /// The admission the API key a request presents earns at `stage`, or `None` when the
 /// records associate no such key with it.
 ///
-/// The key travels in [`API_KEY_HEADER`] when the API's `apiKeySource` is `HEADER`; the
-/// other documented source reads it from a custom authorizer's returned context, which is
-/// a decision this emulator cannot obtain, so no key is presented for it.
+/// WHERE the key is read from is the api's own `apiKeySource`, "the source of the API key
+/// for metering requests according to a usage plan": `HEADER` reads it from
+/// [`API_KEY_HEADER`], and `AUTHORIZER` reads it from the `usageIdentifierKey` the method's
+/// custom authorizer returned (`authorizer_key`, what that authorization published). So an
+/// api metering by its authorizer never consults the request header, and an api metering by
+/// the header never consults the authorizer: the OTHER source's value admits nothing.
 ///
 /// A key admits the call when it is ENABLED and this api's `stage` is among the stages the
 /// records associate it with — see [`plans_metering`] and `ApiKey$stageKeys` for the two
@@ -3100,15 +3161,22 @@ fn api_key_admission(
     api: &RestApiEntry,
     stage: &str,
     req: &RtRequest,
+    authorizer_key: Option<&str>,
 ) -> Option<Metered> {
     let source = api
         .api_key_source
         .as_deref()
         .unwrap_or(crate::state::DEFAULT_API_KEY_SOURCE);
-    if source != API_KEY_SOURCE_HEADER {
-        return None;
-    }
-    let presented = req.headers().get(API_KEY_HEADER).filter(|key| !key.is_empty())?;
+    let presented = match source {
+        API_KEY_SOURCE_AUTHORIZER => authorizer_key.filter(|key| !key.is_empty())?,
+        API_KEY_SOURCE_HEADER => req
+            .headers()
+            .get(API_KEY_HEADER)
+            .filter(|key| !key.is_empty())?,
+        // A value outside the modelled set names no source to read a key from, so the call
+        // presents none.
+        _ => return None,
+    };
     store
         .api_keys
         .values()
