@@ -377,6 +377,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         pool.admin_create_user_config =
             crate::state::effective_admin_create_user_config(input.admin_create_user_config);
         pool.user_pool_add_ons = crate::state::effective_user_pool_add_ons(input.user_pool_add_ons);
+        pool.lambda_config = crate::state::effective_lambda_config(input.lambda_config);
         // The plan this pool is created on. A request that names one configures
         // it, and a request that names none is created on the cheapest plan that
         // includes every feature its configuration asks for.
@@ -384,6 +385,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             input.user_pool_tier,
             Some(&pool.policies),
             pool.user_pool_add_ons.as_ref(),
+            Some(&pool.lambda_config),
         );
         if let Some(mfa_configuration) = input.mfa_configuration {
             pool.mfa_configuration = mfa_configuration;
@@ -394,7 +396,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         pool.username_attributes = input.username_attributes.unwrap_or_default();
         pool.alias_attributes = input.alias_attributes.unwrap_or_default();
         pool.auto_verified_attributes = input.auto_verified_attributes.unwrap_or_default();
-        pool.lambda_config = crate::state::effective_lambda_config(input.lambda_config);
         pool.username_configuration = input.username_configuration;
         pool.device_configuration = input.device_configuration;
         pool.email_configuration =
@@ -479,6 +480,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             &pool.user_pool_tier,
             Some(&pool.policies),
             pool.user_pool_add_ons.as_ref(),
+            Some(&pool.lambda_config),
         ) {
             return Err(feature_unavailable_in_tier(message));
         }

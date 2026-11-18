@@ -122,7 +122,12 @@ const PRE_TOKEN_GENERATION_TRIGGER: &str = "PreTokenGeneration";
 /// version of the request that Amazon Cognito sends to your Lambda function. Higher-numbered
 /// versions add fields that support new features", and the legacy member predates every
 /// higher one (`PreTokenGenerationLambdaVersionType` in this service's model).
-const PRE_TOKEN_GENERATION_V1: &str = "V1_0";
+///
+/// It is also the version that asks for no plan-gated feature, which
+/// [`crate::state::configures_token_customization`] reads, so the version the
+/// trigger treats as the base one and the version the feature plan admits on
+/// every plan are the same value.
+pub const PRE_TOKEN_GENERATION_V1: &str = "V1_0";
 
 /// Amazon Cognito's budget for ONE trigger invocation: the service's documented Lambda
 /// invocation timeout for user pool triggers is five seconds, after which the invocation is

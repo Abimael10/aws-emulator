@@ -5,7 +5,11 @@
 //! operation's input models is written as sent, and a member the request leaves out
 //! goes back to the service default rather than keeping the value the pool held —
 //! "If you don't provide a value for an attribute, Amazon Cognito sets it to its
-//! default value" (this operation's own documentation, below). The pool's
+//! default value" (this operation's own documentation, below). Three members are
+//! not configuration the service holds a default for and so are KEPT by a request
+//! that does not mention them: the pool's name, its tags, and its feature plan,
+//! which is what the pool is billed and gated on and whose change the model gives
+//! a refusal of its own. The pool's
 //! `LastModifiedDate` advances, and a later `DescribeUserPool` renders the STORED
 //! pool. `src/state.rs` owns the pool record and the configuration defaults; this
 //! file owns this request's own refusals.
@@ -316,7 +320,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // not, which `state.rs` owns so a create and an update agree on what
         // "unset" means.
         let policies = crate::state::effective_policies(input.policies);
-        let user_pool_tier = crate::state::effective_user_pool_tier(input.user_pool_tier);
+        let lambda_config = crate::state::effective_lambda_config(input.lambda_config);
         let auto_verified_attributes = input.auto_verified_attributes.unwrap_or_default();
         let mfa_configuration = crate::state::effective_mfa_configuration(input.mfa_configuration);
         let account_recovery_setting =
@@ -360,17 +364,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // mode needs. So the order is: what is wrong with the request, then whether
         // this pool may make the move, then what the moved-to mode rests on.
         //
-        // The pool's stored mode is read in a scope of its own, so no guard is held
+        // The pool's stored mode and feature plan are read in a scope of their
+        // own, so no guard is held
         // across the awaits below; a request that repeats the mode the pool already
         // holds, or turns MFA off, changes nothing about whether the pool can
         // challenge and is served, and a `user_pool_id` this account holds no pool
         // under constrains nothing here — it is answered as the missing pool it is
         // where the pool is looked up.
-        let stored_mfa_configuration = state
+        let stored_pool = state
             .lock()
             .pool(&input.user_pool_id)
-            .map(|pool| pool.mfa_configuration.clone());
-        if stored_mfa_configuration.as_deref() == Some(crate::state::MFA_OFF)
+            .map(|pool| (pool.mfa_configuration.clone(), pool.user_pool_tier.clone()));
+        let stored_mfa_configuration = stored_pool.as_ref().map(|(mode, _)| mode.as_str());
+        // The feature plan this update leaves the pool on, which is what the
+        // plan gate below judges the configuration against: the plan the
+        // request NAMES, or the plan the pool already holds when it names none
+        // ([`crate::state::effective_user_pool_tier_for_update`]).
+        let user_pool_tier = crate::state::effective_user_pool_tier_for_update(
+            input.user_pool_tier,
+            stored_pool.as_ref().map(|(_, plan)| plan.as_str()),
+        );
+        if stored_mfa_configuration == Some(crate::state::MFA_OFF)
             && mfa_configuration != crate::state::MFA_OFF
         {
             return Err(invalid_parameter(
@@ -422,14 +436,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             &user_pool_tier,
             Some(&policies),
             input.user_pool_add_ons.as_ref(),
+            Some(&lambda_config),
         ) {
             return Err(feature_unavailable_in_tier(message));
         }
 
         // `PoolName` is "the updated name of your user pool" and a pool must carry a
         // name — there is no default to fall back to — so an absent `PoolName` leaves
-        // the stored name alone. Every OTHER member below is REPLACED: the request's
-        // value when it carries one, the service default when it does not.
+        // the stored name alone, as an absent `UserPoolTier` and absent `UserPoolTags`
+        // leave the pool's plan and tags alone. Every OTHER member below is REPLACED:
+        // the request's value when it carries one, the service default when it does not.
         if let Some(pool_name) = input.pool_name {
             pool.name = pool_name;
         }
@@ -439,6 +455,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         pool.policies = policies;
         pool.admin_create_user_config =
             crate::state::effective_admin_create_user_config(input.admin_create_user_config);
+        // The plan the gate above judged this configuration against, which is
+        // the plan the request named or the one the pool already held
+        // ([`crate::state::effective_user_pool_tier_for_update`]): a request
+        // that names no plan asks for no plan change.
         pool.user_pool_tier = user_pool_tier;
         pool.mfa_configuration = mfa_configuration;
         pool.deletion_protection =
@@ -453,7 +473,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // service materialises for every pool, which go back to the defaults
         // `state.rs` owns, exactly as a create with no such member stores them.
         pool.auto_verified_attributes = auto_verified_attributes;
-        pool.lambda_config = crate::state::effective_lambda_config(input.lambda_config);
+        pool.lambda_config = lambda_config;
         pool.device_configuration = input.device_configuration;
         pool.email_configuration =
             crate::state::effective_email_configuration(input.email_configuration);

@@ -9,7 +9,9 @@
 //! member the request leaves out goes back to the service default instead of
 //! keeping the value the pool held ("If you don't provide a value for an
 //! attribute, Amazon Cognito sets it to its default value", this operation's
-//! documentation in the service model). The pool's identity (`Id`, `Arn`,
+//! documentation in the service model). The pool's name, its tags and its
+//! feature plan are not configuration with a service default and are kept by a
+//! request that does not mention them. The pool's identity (`Id`, `Arn`,
 //! `CreationDate`) and the members this operation's input does NOT model
 //! (`SchemaAttributes`, `UsernameAttributes`) survive the update, and
 //! `LastModifiedDate` advances.
@@ -238,7 +240,12 @@ fn reset_to_defaults() -> Vec<(&'static str, Value)> {
         ("UserPoolTags", json!({ "env": "created" })),
         ("MfaConfiguration", json!("OFF")),
         ("DeletionProtection", json!("INACTIVE")),
-        ("UserPoolTier", json!("ESSENTIALS")),
+        // A pool's feature plan is what it is billed and gated on, and the model
+        // gives a change of it a refusal of its own
+        // (`smithy_query(query="shape",shape="TierChangeNotAllowedException")`),
+        // so an update that names no plan asks for no plan change and the pool
+        // keeps the plan it was created on.
+        ("UserPoolTier", json!("PLUS")),
         ("Policies.PasswordPolicy.MinimumLength", json!(8)),
         (
             "Policies.PasswordPolicy.TemporaryPasswordValidityDays",
