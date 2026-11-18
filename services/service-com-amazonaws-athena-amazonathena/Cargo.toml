@@ -88,6 +88,12 @@ chrono = { version = "0.4", default-features = false, features = ["std"] }
 sqlparser = { version = "0.59", features = ["visitor"] }
 # Mints the version-4 UUID a `QueryExecutionId` is.
 uuid = { version = "1", features = ["v4"] }
+# The AWS SDK for EventBridge, driven over the in-process callback
+# (`OperationContext::callback`): every state a query execution moves into is published onto
+# the account's default event bus (`state::query_events`), which is how a client reacts to a
+# query settling without polling Athena. Only the generated client is needed — the emulator
+# supplies the transport, so the SDK's own HTTPS stack and runtime are left out.
+aws-sdk-eventbridge = { version = "1", default-features = false }
 # Renders the authenticated bytes of a page token, and a binary result value, as hex.
 hex = { workspace = true }
 smithy-macros = { workspace = true }
@@ -119,6 +125,12 @@ service-com-amazonaws-lakeformation-awslakeformation = { workspace = true }
 # The query-lifecycle suite waits out the span a started query's completion is due
 # after, so it needs the timer driver as well as the runtime.
 tokio = { workspace = true, features = ["time"] }
+# A query execution's state changes are published onto the account's default EventBridge bus
+# and routed from there, so the suite that asserts them mounts EventBridge and Amazon SQS
+# beside Athena on ONE engine and reads each event back off the queue a rule delivered it to —
+# the same path a client's own rule takes.
+service-com-amazonaws-eventbridge-awsevents = { workspace = true }
+service-com-amazonaws-sqs-amazonsqs = { workspace = true }
 
 [lints]
 workspace = true

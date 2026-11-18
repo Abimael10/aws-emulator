@@ -5,7 +5,9 @@
 //! from the clock and the outcome the run recorded, and refuses an id this account holds
 //! no execution for. Beside the modelled `QueryExecution` it reports the flattened
 //! `QueryExecutionDetail` view of the same record, which is recorded behaviour rather than
-//! modelled (see `types::recorded_member_wire`).
+//! modelled (see `types::recorded_member_wire`). Every state a query has moved into and
+//! that has not been announced yet is published onto the account's default EventBridge bus
+//! (`crate::state::query_events`); the answer itself is unchanged by that.
 //!
 //! ## Shape of an operation
 //!
@@ -137,7 +139,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        _ctx: &smithy_server_runtime::OperationContext<'_>,
+        ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(GetQueryExecutionErrorModeled::InternalServerException(
@@ -149,29 +151,42 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         // A read: the store is never written below, so what the next caller sees is
         // exactly what it saw before this call. The STATE the execution reports is
-        // derived from the clock and the stored outcome, not moved by this read.
-        let store = state.lock();
-        // ONE instant for both views of the execution below.
-        let now = ::std::time::SystemTime::now();
+        // derived from the clock and the stored outcome, not moved by this read. The guard
+        // is taken and RELEASED inside this block: the publication after it reaches
+        // EventBridge's own handler, so this service's store is not held across it.
+        let output = {
+            let store = state.lock();
+            // ONE instant for both views of the execution below.
+            let now = ::std::time::SystemTime::now();
 
-        let Some(record) = store.query_execution(&input.query_execution_id) else {
-            // Athena models no not-found error for this operation; naming an execution
-            // that does not exist is "something wrong with the input to the request",
-            // which is what `InvalidRequestException` (HTTP 400) reports — under the code
-            // for an id that names no execution, so a poller can stop on a permanent
-            // miss rather than retrying a request it cannot fix.
-            return Err(GetQueryExecutionError::invalid_request(
-                crate::state::ERROR_CODE_QUERY_EXECUTION_NOT_FOUND,
-                crate::state::query_execution_not_found(&input.query_execution_id),
-            ));
+            let Some(record) = store.query_execution(&input.query_execution_id) else {
+                // Athena models no not-found error for this operation; naming an execution
+                // that does not exist is "something wrong with the input to the request",
+                // which is what `InvalidRequestException` (HTTP 400) reports — under the code
+                // for an id that names no execution, so a poller can stop on a permanent
+                // miss rather than retrying a request it cannot fix.
+                return Err(GetQueryExecutionError::invalid_request(
+                    crate::state::ERROR_CODE_QUERY_EXECUTION_NOT_FOUND,
+                    crate::state::query_execution_not_found(&input.query_execution_id),
+                ));
+            };
+
+            let execution = record.to_query_execution(now);
+            GetQueryExecutionOutput {
+                // The same execution in the flattened form this read also reports, projected
+                // from the modelled view built just above, so the two agree member for member.
+                query_execution_detail: Some(record.to_query_execution_detail(&execution, now)),
+                query_execution: Some(execution),
+            }
         };
 
-        let execution = record.to_query_execution(now);
-        Ok(GetQueryExecutionOutput {
-            // The same execution in the flattened form this read also reports, projected
-            // from the modelled view built just above, so the two agree member for member.
-            query_execution_detail: Some(record.to_query_execution_detail(&execution, now)),
-            query_execution: Some(execution),
-        })
+        // Every state this query has moved into and that has not been announced is published
+        // onto the account's default event bus: the transition was owed at that instant
+        // whether or not anybody read the execution, so a client watching the query through
+        // EventBridge observes exactly what this answer reports (see
+        // `crate::state::query_events`).
+        crate::state::announce_query_state_changes(&self.engine, ctx).await;
+
+        Ok(output)
     }
 }

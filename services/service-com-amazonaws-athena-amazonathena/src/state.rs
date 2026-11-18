@@ -38,6 +38,10 @@
 //! still QUEUED, is RUNNING a moment later and is terminal from its completion instant
 //! on, and no read ever has to write to move it.
 //!
+//! A query execution is also ANNOUNCED as it moves: every state it reaches is published
+//! onto the account's default EventBridge bus ([`query_events`]), so a client that keys off
+//! those events observes the query settling without calling Athena again.
+//!
 //! NOTEBOOKS are kept in the [`NotebookRegistry`] of
 //! [`ComAmazonawsAthenaAmazonathenaState::notebooks`]: `ImportNotebook` stores the ipynb
 //! content it was given (or read out of the one object store, for a request that named an
@@ -102,6 +106,10 @@ pub mod query_results;
 
 /// The runtime statistics of one query execution: its timeline, its counters and its stage.
 mod runtime_statistics;
+
+/// The EventBridge events every state a query execution moves into is published as.
+mod query_events;
+pub use query_events::*;
 
 /// The notebooks a Spark enabled workgroup holds, and the ipynb content of each.
 mod notebooks;
@@ -1434,6 +1442,14 @@ pub struct QueryExecutionRecord {
     /// When a `StopQueryExecution` call interrupted it, if one did. Only a query that
     /// had not reached a terminal state can carry this.
     pub cancelled_at: Option<SystemTime>,
+    /// The `QueryExecutionState` last PUBLISHED for this query as an `Athena Query State
+    /// Change` event, and `None` while none has been. Read and written by the event path
+    /// alone ([`query_events`]), which is what keeps every transition published exactly
+    /// once; nothing a read reports is derived from it.
+    pub(crate) published_state: Option<String>,
+    /// How many state-change events have been published for this query, which is the
+    /// `sequenceNumber` the last of them carried ([`query_events`]).
+    pub(crate) published_events: u32,
 }
 
 impl QueryExecutionRecord {
@@ -1654,26 +1670,7 @@ impl QueryExecutionRecord {
                 .map(|(message, reason, _)| reason.unwrap_or(message).to_string()),
             _ => None,
         };
-        let athena_error = failure.map(|(message, _, cause)| crate::ops::types::AthenaError {
-            error_category: Some(match cause {
-                query_engine::FailureCause::Sql => ERROR_CATEGORY_USER,
-                query_engine::FailureCause::Emulator => ERROR_CATEGORY_OTHER,
-                // A failure of one of Athena's own classes carries that class's
-                // category, which is neither the engine's doing nor a bound of this
-                // emulator.
-                query_engine::FailureCause::Athena { category, .. } => category,
-            }),
-            // Athena's error TYPE is a published code per failure class: the one
-            // reported is the one the failure's own class carries, and a failure the
-            // engine reported carries none, so none is invented for it.
-            error_type: match cause {
-                query_engine::FailureCause::Athena { error_type, .. } => error_type,
-                _ => None,
-            },
-            // "The FAILED state is always terminal with no automatic retry."
-            retryable: false,
-            error_message: Some(message.to_string()),
-        });
+        let athena_error = self.athena_error_at(now);
         QueryExecution {
             query_execution_id: Some(self.id.clone()),
             query: Some(self.query_string.clone()),
@@ -1709,6 +1706,37 @@ impl QueryExecutionRecord {
             substatement_type: self.substatement_type.clone(),
             query_results_s3_access_grants_configuration: None,
         }
+    }
+
+    /// The `AthenaError` this query reports at `now`, or `None` for a query that is not in
+    /// state [`QUERY_STATE_FAILED`] — only a failed query carries one.
+    ///
+    /// The ONE place that error is built, so the one a read of the execution reports and the
+    /// one the published state-change event carries ([`query_events`]) are the same error.
+    pub(crate) fn athena_error_at(&self, now: SystemTime) -> Option<crate::ops::types::AthenaError> {
+        let failure = (self.state_at(now) == QUERY_STATE_FAILED)
+            .then(|| self.failure())
+            .flatten();
+        failure.map(|(message, _, cause)| crate::ops::types::AthenaError {
+            error_category: Some(match cause {
+                query_engine::FailureCause::Sql => ERROR_CATEGORY_USER,
+                query_engine::FailureCause::Emulator => ERROR_CATEGORY_OTHER,
+                // A failure of one of Athena's own classes carries that class's
+                // category, which is neither the engine's doing nor a bound of this
+                // emulator.
+                query_engine::FailureCause::Athena { category, .. } => category,
+            }),
+            // Athena's error TYPE is a published code per failure class: the one
+            // reported is the one the failure's own class carries, and a failure the
+            // engine reported carries none, so none is invented for it.
+            error_type: match cause {
+                query_engine::FailureCause::Athena { error_type, .. } => error_type,
+                _ => None,
+            },
+            // "The FAILED state is always terminal with no automatic retry."
+            retryable: false,
+            error_message: Some(message.to_string()),
+        })
     }
 
     /// The record as the flattened `QueryExecutionDetail` a read answers with BESIDE the
@@ -2274,6 +2302,15 @@ pub struct ComAmazonawsAthenaAmazonathenaState {
     /// for different purposes, and neither can be made to stand in for the other. Drawn
     /// from the system's randomness when the store is created and never reported.
     notebook_address_key: PageTokenKey,
+    /// Set while one clock pump is publishing this store's query state changes as they fall
+    /// due; the claim that keeps a second pump from starting beside it (see
+    /// [`query_events`]).
+    query_clock_pump_running: bool,
+    /// Which claim of that pump is the current one, so a pump that stood down cannot release
+    /// a claim a pump started since is holding.
+    query_clock_pump_generation: u64,
+    /// The running pump's task, held so it is cancellable rather than merely forgotten.
+    query_clock_pump: Option<::tokio::task::JoinHandle<()>>,
 }
 
 impl Default for ComAmazonawsAthenaAmazonathenaState {
@@ -2296,6 +2333,9 @@ impl Default for ComAmazonawsAthenaAmazonathenaState {
             named_queries: NamedQueryRegistry::default(),
             page_token_key: PageTokenKey::new(),
             notebook_address_key: PageTokenKey::new(),
+            query_clock_pump_running: false,
+            query_clock_pump_generation: 0,
+            query_clock_pump: None,
         }
     }
 }

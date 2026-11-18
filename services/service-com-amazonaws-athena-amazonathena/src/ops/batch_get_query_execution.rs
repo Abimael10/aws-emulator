@@ -3,7 +3,9 @@
 //! @op BatchGetQueryExecution
 //! IMPLEMENTED: partitions the requested ids by what this account holds — the stored
 //! execution for each id there is one for, and an unprocessed entry for each there is
-//! not.
+//! not. Every state a query has moved into and that has not been announced yet is
+//! published onto the account's default EventBridge bus (`crate::state::query_events`);
+//! the answer itself is unchanged by that.
 //!
 //! ## Shape of an operation
 //!
@@ -137,7 +139,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        _ctx: &smithy_server_runtime::OperationContext<'_>,
+        ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(BatchGetQueryExecutionErrorModeled::InternalServerException(
@@ -147,34 +149,44 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
-        // A read: nothing below writes the store.
-        let store = state.lock();
-        let now = ::std::time::SystemTime::now();
+        // A read: nothing below writes the store. The guard is taken and RELEASED inside
+        // this block, so this service's store is not held across the publication after it.
+        let output = {
+            let store = state.lock();
+            let now = ::std::time::SystemTime::now();
 
-        // The partition is COMPUTED from state, id by id and in the order the request
-        // listed them: an id the registry holds an execution for is reported from that
-        // execution, and one it does not is reported as unprocessed with the reason.
-        let mut executions: Vec<QueryExecution> = Vec::new();
-        let mut unprocessed: Vec<UnprocessedQueryExecutionId> = Vec::new();
-        for id in &input.query_execution_ids {
-            match store.query_execution(id) {
-                Some(record) => executions.push(record.to_query_execution(now)),
-                None => unprocessed.push(UnprocessedQueryExecutionId {
-                    query_execution_id: Some(id.clone()),
-                    // An id this account minted no execution under is its own refusal
-                    // class — a permanent miss a poller must stop on — and not a request
-                    // this service found otherwise wrong.
-                    error_code: Some(
-                        crate::state::ERROR_CODE_QUERY_EXECUTION_NOT_FOUND.to_string(),
-                    ),
-                    error_message: Some(crate::state::query_execution_not_found(id)),
-                }),
+            // The partition is COMPUTED from state, id by id and in the order the request
+            // listed them: an id the registry holds an execution for is reported from that
+            // execution, and one it does not is reported as unprocessed with the reason.
+            let mut executions: Vec<QueryExecution> = Vec::new();
+            let mut unprocessed: Vec<UnprocessedQueryExecutionId> = Vec::new();
+            for id in &input.query_execution_ids {
+                match store.query_execution(id) {
+                    Some(record) => executions.push(record.to_query_execution(now)),
+                    None => unprocessed.push(UnprocessedQueryExecutionId {
+                        query_execution_id: Some(id.clone()),
+                        // An id this account minted no execution under is its own refusal
+                        // class — a permanent miss a poller must stop on — and not a request
+                        // this service found otherwise wrong.
+                        error_code: Some(
+                            crate::state::ERROR_CODE_QUERY_EXECUTION_NOT_FOUND.to_string(),
+                        ),
+                        error_message: Some(crate::state::query_execution_not_found(id)),
+                    }),
+                }
             }
-        }
 
-        Ok(BatchGetQueryExecutionOutput {
-            query_executions: Some(executions),
-            unprocessed_query_execution_ids: Some(unprocessed),
-        })
+            BatchGetQueryExecutionOutput {
+                query_executions: Some(executions),
+                unprocessed_query_execution_ids: Some(unprocessed),
+            }
+        };
+
+        // Every state a query has moved into and that has not been announced is published
+        // onto the account's default event bus: the transition was owed at that instant
+        // whether or not anybody read the executions (see `crate::state::query_events`).
+        crate::state::announce_query_state_changes(&self.engine, ctx).await;
+
+        Ok(output)
     }
 }

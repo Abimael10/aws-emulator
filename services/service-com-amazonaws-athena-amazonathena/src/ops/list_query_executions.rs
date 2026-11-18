@@ -7,6 +7,9 @@
 //! carries the member as an empty list, so the `@length` minimum of 1 the `## Output`
 //! contract below quotes for `QueryExecutionIdList` is a bound on a list that HAS ids rather
 //! than a reason to leave the member out — the same shape `ListWorkGroups` answers with.
+//! Every state a query has moved into and that has not been announced yet is published onto
+//! the account's default EventBridge bus (`crate::state::query_events`); the answer itself is
+//! unchanged by that.
 //!
 //! ## Shape of an operation
 //!
@@ -178,53 +181,63 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
-        // A read: nothing below writes the store.
-        let store = state.lock();
+        // A read: nothing below writes the store. The guard is taken and RELEASED inside
+        // this block, so this service's store is not held across the publication after it.
+        let output = {
+            let store = state.lock();
 
-        // A history belongs to a workgroup, so a workgroup this account does not have
-        // has no history to report rather than an empty one.
-        if !store.holds_work_group(&work_group) {
-            return Err(ListQueryExecutionsError::invalid_request(
-                crate::state::ERROR_CODE_INVALID_INPUT,
-                crate::state::WORK_GROUP_NOT_FOUND,
-            ));
-        }
+            // A history belongs to a workgroup, so a workgroup this account does not have
+            // has no history to report rather than an empty one.
+            if !store.holds_work_group(&work_group) {
+                return Err(ListQueryExecutionsError::invalid_request(
+                    crate::state::ERROR_CODE_INVALID_INPUT,
+                    crate::state::WORK_GROUP_NOT_FOUND,
+                ));
+            }
 
-        let position = match input.next_token.as_deref() {
-            None => 0,
-            Some(token) => {
-                let Some(position) = store.executions_page_position(&work_group, token) else {
-                    return Err(ListQueryExecutionsError::invalid_request(
-                        crate::state::ERROR_CODE_INVALID_INPUT,
-                        crate::state::INVALID_NEXT_TOKEN,
-                    ));
-                };
-                position
+            let position = match input.next_token.as_deref() {
+                None => 0,
+                Some(token) => {
+                    let Some(position) = store.executions_page_position(&work_group, token) else {
+                        return Err(ListQueryExecutionsError::invalid_request(
+                            crate::state::ERROR_CODE_INVALID_INPUT,
+                            crate::state::INVALID_NEXT_TOKEN,
+                        ));
+                    };
+                    position
+                }
+            };
+
+            // Newest first, which is the order Athena reports a query history in.
+            let ids = store.query_execution_ids(&work_group);
+            let end = position.saturating_add(page_size).min(ids.len());
+            let page: Vec<String> = ids
+                .get(position..end)
+                .unwrap_or_default()
+                .iter()
+                .map(|id| (*id).to_string())
+                .collect();
+
+            // A token only where this page reported something and ids remain behind it: a
+            // page of no ids (`MaxResults` of 0 asks for none) hands back no token, so a
+            // caller following tokens always makes progress.
+            let more = !page.is_empty() && end < ids.len();
+            ListQueryExecutionsOutput {
+                // The member a listing reports is always reported: a workgroup whose history
+                // holds no execution has an empty history, which is a list of no ids rather
+                // than an unknown one, so a client reads the member on every answer (see the
+                // note on this file's header line).
+                query_execution_ids: Some(page),
+                next_token: more.then(|| store.executions_page_token(&work_group, end)),
             }
         };
 
-        // Newest first, which is the order Athena reports a query history in.
-        let ids = store.query_execution_ids(&work_group);
-        let end = position.saturating_add(page_size).min(ids.len());
-        let page: Vec<String> = ids
-            .get(position..end)
-            .unwrap_or_default()
-            .iter()
-            .map(|id| (*id).to_string())
-            .collect();
+        // Every state a query has moved into and that has not been announced is published
+        // onto the account's default event bus: the transition was owed at that instant
+        // whether or not anybody listed the history (see `crate::state::query_events`).
+        crate::state::announce_query_state_changes(&self.engine, ctx).await;
 
-        // A token only where this page reported something and ids remain behind it: a
-        // page of no ids (`MaxResults` of 0 asks for none) hands back no token, so a
-        // caller following tokens always makes progress.
-        let more = !page.is_empty() && end < ids.len();
-        Ok(ListQueryExecutionsOutput {
-            // The member a listing reports is always reported: a workgroup whose history
-            // holds no execution has an empty history, which is a list of no ids rather
-            // than an unknown one, so a client reads the member on every answer (see the
-            // note on this file's header line).
-            query_execution_ids: Some(page),
-            next_token: more.then(|| store.executions_page_token(&work_group, end)),
-        })
+        Ok(output)
     }
 }
 

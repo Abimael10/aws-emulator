@@ -3,7 +3,9 @@
 //! @op StopQueryExecution
 //! IMPLEMENTED: interrupts the stored execution the id names — CANCELLED from that
 //! instant on, with its completion time — and refuses an id this account holds no
-//! execution for.
+//! execution for. The state the stop moved the query into is published onto the account's
+//! default EventBridge bus, like every other state a query reaches
+//! (`crate::state::query_events`).
 //!
 //! ## Shape of an operation
 //!
@@ -128,7 +130,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        _ctx: &smithy_server_runtime::OperationContext<'_>,
+        ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(StopQueryExecutionErrorModeled::InternalServerException(
@@ -138,23 +140,32 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
-        let mut store = state.lock();
+        // The guard is taken and RELEASED inside this block: the publication after it
+        // reaches EventBridge's own handler, so this service's store is not held across it.
+        {
+            let mut store = state.lock();
 
-        if store.query_execution(&input.query_execution_id).is_none() {
-            // Athena models no not-found error here either; stopping an execution that
-            // does not exist is "something wrong with the input to the request", under
-            // the code for an id that names no execution.
-            return Err(StopQueryExecutionError::invalid_request(
-                crate::state::ERROR_CODE_QUERY_EXECUTION_NOT_FOUND,
-                crate::state::query_execution_not_found(&input.query_execution_id),
-            ));
+            if store.query_execution(&input.query_execution_id).is_none() {
+                // Athena models no not-found error here either; stopping an execution that
+                // does not exist is "something wrong with the input to the request", under
+                // the code for an id that names no execution.
+                return Err(StopQueryExecutionError::invalid_request(
+                    crate::state::ERROR_CODE_QUERY_EXECUTION_NOT_FOUND,
+                    crate::state::query_execution_not_found(&input.query_execution_id),
+                ));
+            }
+
+            // A stop is IDEMPOTENT, as the operation's own `@idempotent` trait says: the
+            // first call moves a query that was still queued or running to CANCELLED, and a
+            // later call — or one on a query that had already succeeded or failed — leaves
+            // the execution exactly as it is and reports the same empty success.
+            store.cancel_query_execution(&input.query_execution_id, ::std::time::SystemTime::now());
         }
 
-        // A stop is IDEMPOTENT, as the operation's own `@idempotent` trait says: the
-        // first call moves a query that was still queued or running to CANCELLED, and a
-        // later call — or one on a query that had already succeeded or failed — leaves
-        // the execution exactly as it is and reports the same empty success.
-        store.cancel_query_execution(&input.query_execution_id, ::std::time::SystemTime::now());
+        // The state this stop moved the query into is published onto the account's default
+        // event bus, like every other state a query reaches (see
+        // `crate::state::query_events`).
+        crate::state::announce_query_state_changes(&self.engine, ctx).await;
 
         // `StopQueryExecutionOutput` models no members: the cancelled execution is read
         // back through `GetQueryExecution`.

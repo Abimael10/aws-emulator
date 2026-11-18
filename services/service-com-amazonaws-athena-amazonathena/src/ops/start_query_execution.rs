@@ -6,7 +6,10 @@
 //! `EXECUTE <statement_name> USING <arguments>` submission, the query statement the named
 //! workgroup's prepared statement holds, with those arguments bound to its placeholders —
 //! persists the execution and the result set it produced, and answers with the id it minted —
-//! the same id, and no second execution, for a repeated `ClientRequestToken`.
+//! the same id, and no second execution, for a repeated `ClientRequestToken`. The state the
+//! submission put the execution in is published onto the account's default EventBridge bus,
+//! and the states it reaches afterwards are published as they fall due, with no further call
+//! from anybody (`crate::state::query_events`).
 //!
 //! ## Shape of an operation
 //!
@@ -460,6 +463,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 planning_time: read_time,
                 engine_reported_at: None,
                 cancelled_at: None,
+                // Nothing has been published for this query yet: the state it is created in
+                // is the first event its own transitions owe (see
+                // `crate::state::query_events`).
+                published_state: None,
+                published_events: 0,
             };
             store.record_query_execution(record, input.client_request_token);
 
@@ -531,6 +539,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .unwrap_or_default()
         };
         crate::state::query_results::write(&*self.engine, results);
+
+        // Athena ANNOUNCES a query as it moves: the state this submission put the execution
+        // in is published onto the account's default event bus, and the clock pump this
+        // starts publishes the states it reaches afterwards without a further call from
+        // anybody (see `crate::state::query_events`). Made with this service's store
+        // released, because the publication reaches EventBridge's own handler and the targets
+        // of every rule that matches.
+        crate::state::announce_query_state_changes(&self.engine, ctx).await;
 
         Ok(StartQueryExecutionOutput {
             query_execution_id: Some(id),
