@@ -1,9 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op RollbackApplication
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `RollbackApplication`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` for the
+//! applications it could roll back, and asserts nothing about how one is rolled back.
+//! Implement it here — this is the ONLY file to touch for this operation. What IS
+//! implemented is the runtime-capability refusal: an application whose runtime keeps no
+//! previous running version to load is refused with the modelled
+//! `UnsupportedOperationException`, because that refusal is this operation's answer for
+//! those applications rather than a gap in it.
 //!
 //! A 501 from this operation means "nobody has written it yet", never "the emulator is
 //! broken". Replace the `Err(..)` in [`RollbackApplication::handle`] with real behaviour and
@@ -163,18 +167,64 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `RollbackApplication` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(RollbackApplicationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(RollbackApplicationErrorModeled::InvalidRequestException(
+                InvalidRequestException {
+                    message: Some(
+                        "this service is not mounted on a stateful engine, so no \
+                         application can be rolled back"
+                            .to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+
+        let name = input.application_name.clone();
+        let runtime_environment = {
+            let mut store = state.lock();
+            store.settle_named(&name);
+            let Some(application) = store.applications.get(&name) else {
+                return Err(RollbackApplicationErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(crate::state::missing_application_message(&name)),
+                    },
+                )
+                .into());
+            };
+            application.runtime_environment.clone()
+        };
+
+        // A rollback "loads state data from the last successful snapshot" of the previous
+        // running version (this operation's doc), and only a Managed Service for Apache
+        // Flink application keeps such a version and such a snapshot: a Studio notebook runs
+        // its paragraphs interactively and a SQL application runs no Flink job at all
+        // (`crate::state::is_flink_runtime`), so on either the operation does not exist for
+        // the runtime — the modelled `UnsupportedOperationException` (HTTP 400), which tells
+        // a client the capability is absent for this runtime instead of telling it to correct
+        // its request. Judged on the STORED application's runtime, and nothing about the
+        // application is touched, so a refused rollback leaves its version and status as they
+        // were.
+        if !crate::state::is_flink_runtime(&runtime_environment) {
+            return Err(
+                RollbackApplicationErrorModeled::UnsupportedOperationException(
+                    UnsupportedOperationException {
+                        message: Some(
+                            crate::state::rollback_unsupported_for_runtime_message(
+                                &runtime_environment,
+                            ),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // Reverting a Managed Service for Apache Flink application to its previous running
+        // version — the version advance, the snapshot its state is loaded from and the status
+        // it takes while the job restarts — is not written yet, so a call this service COULD
+        // serve still answers 501 rather than a plausible success.
         Err(crate::scaffolded::Scaffolded::not_implemented("RollbackApplication"))
     }
 }

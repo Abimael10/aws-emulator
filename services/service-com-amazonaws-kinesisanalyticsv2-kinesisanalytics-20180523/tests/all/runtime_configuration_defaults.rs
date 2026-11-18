@@ -3,15 +3,18 @@
 //! The defaults an application is described under depend on the KIND of application the
 //! service runs it as.
 //!
-//! The rule under test: `CheckpointingEnabled` and `SnapshotsEnabled` switch features of a
-//! Managed Service for Apache Flink application — the model documents each as describing
-//! "whether checkpointing is enabled for a Managed Service for Apache Flink application"
-//! and "whether snapshots are enabled for a Managed Service for Apache Flink application"
+//! The rule under test: `CheckpointingEnabled`, `SnapshotsEnabled` and `AutoScalingEnabled`
+//! switch features of a Managed Service for Apache Flink application — the model documents
+//! each as describing "whether checkpointing is enabled for a Managed Service for Apache
+//! Flink application", "whether snapshots are enabled for a Managed Service for Apache Flink
+//! application" and "whether the Managed Service for Apache Flink service can increase the
+//! parallelism of the application in response to increased throughput"
 //! (`smithy_query(query="doc",shape="CheckpointConfiguration",member="CheckpointingEnabled")`
-//! / `shape="ApplicationSnapshotConfiguration",member="SnapshotsEnabled"`) — while an
+//! / `shape="ApplicationSnapshotConfiguration",member="SnapshotsEnabled"` /
+//! `shape="ParallelismConfiguration",member="AutoScalingEnabled"`) — while an
 //! application the service runs in `INTERACTIVE` mode is a Studio notebook rather than such
 //! an application (`CreateApplication$ApplicationMode`). So an application whose request
-//! said nothing about either runs them only when it STREAMS, and every operation that
+//! said nothing about any of them runs them only when it STREAMS, and every operation that
 //! returns `ApplicationConfigurationDescription` reports the one stored answer.
 //!
 //! The rows span every `RuntimeEnvironment` the enum admits a create for, both ways the
@@ -58,6 +61,23 @@ fn snapshots_enabled(detail: &Value) -> Option<bool> {
              /ApplicationSnapshotConfigurationDescription/SnapshotsEnabled",
         )
         .and_then(Value::as_bool)
+}
+
+/// The `AutoScalingEnabled` of the described parallelism configuration.
+fn auto_scaling_enabled(detail: &Value) -> Option<bool> {
+    detail
+        .pointer(
+            "/ApplicationConfigurationDescription/FlinkApplicationConfigurationDescription\
+             /ParallelismConfigurationDescription/AutoScalingEnabled",
+        )
+        .and_then(Value::as_bool)
+}
+
+/// One member of the described parallelism configuration, for the values that are the same
+/// for every kind of application.
+fn parallelism_member<'a>(detail: &'a Value, member: &str) -> &'a Value {
+    &detail["ApplicationConfigurationDescription"]["FlinkApplicationConfigurationDescription"]
+        ["ParallelismConfigurationDescription"][member]
 }
 
 /// One member of the described checkpoint configuration, for the values that are the same
@@ -373,4 +393,119 @@ async fn an_update_that_names_one_switch_moves_only_that_one() {
         (Some(true), Some(false)),
         "expected the describe to report what the update stored, got {described}"
     );
+}
+
+/// Whether the service may scale an application out is defaulted the same way: on for a
+/// Managed Service for Apache Flink application, off for a Studio notebook — while the rest
+/// of the `DEFAULT` parallelism table is the same for every kind of application.
+#[tokio::test]
+async fn each_runtime_is_described_with_the_autoscaling_its_kind_of_application_runs() {
+    let router = router();
+    for runtime in RUNTIME_ENVIRONMENT_VALUES
+        .iter()
+        .filter(|runtime| !runtime.starts_with(SQL_FAMILY))
+    {
+        let case = format!("{runtime} with no parallelism configuration");
+        let name = format!("autoscaling-{}", runtime.to_lowercase());
+        let expected = features_run(runtime);
+
+        let created = create_with(&router, &case, &name, runtime, None, None).await;
+        assert_eq!(
+            auto_scaling_enabled(&created),
+            Some(expected),
+            "case {case:?}: expected the create to report AutoScalingEnabled {expected}, \
+             got {created}"
+        );
+        for (member, value) in [
+            ("ConfigurationType", json!("DEFAULT")),
+            ("Parallelism", json!(1)),
+            ("ParallelismPerKPU", json!(1)),
+            ("CurrentParallelism", json!(1)),
+        ] {
+            assert_eq!(
+                parallelism_member(&created, member),
+                &value,
+                "case {case:?}: expected {member} to be {value}, got {created}"
+            );
+        }
+
+        let described = describe(&router, &name).await;
+        assert_eq!(
+            auto_scaling_enabled(&described),
+            Some(expected),
+            "case {case:?}: expected the describe to report the stored value, got {described}"
+        );
+
+        let updated = update_unrelated_configuration(&router, &case, &name, 1).await;
+        assert_eq!(
+            auto_scaling_enabled(&updated),
+            Some(expected),
+            "case {case:?}: expected an unrelated update to carry the switch through \
+             unchanged, got {updated}"
+        );
+    }
+}
+
+/// A request that names `AutoScalingEnabled` in a `CUSTOM` parallelism configuration is
+/// reported as given, on every kind of application: the per-kind value is a DEFAULT, not a
+/// ceiling — and a configuration marked `DEFAULT` reports the service's table whatever it
+/// carried, which is what that `ConfigurationType` means.
+#[tokio::test]
+async fn a_request_that_names_autoscaling_is_reported_as_given() {
+    // (case, runtime, the ParallelismConfiguration the create carries, expected
+    // AutoScalingEnabled)
+    let rows: [(&str, &str, Value, bool); 5] = [
+        (
+            "a notebook that switches autoscaling on",
+            "ZEPPELIN-FLINK-3_0",
+            json!({"ConfigurationType": "CUSTOM", "AutoScalingEnabled": true}),
+            true,
+        ),
+        (
+            "a notebook with a CUSTOM configuration that names only the parallelism",
+            "ZEPPELIN-FLINK-2_0",
+            json!({"ConfigurationType": "CUSTOM", "Parallelism": 2}),
+            false,
+        ),
+        (
+            "a notebook whose DEFAULT configuration asks for autoscaling",
+            "ZEPPELIN-FLINK-1_0",
+            json!({"ConfigurationType": "DEFAULT", "AutoScalingEnabled": true}),
+            false,
+        ),
+        (
+            "a streaming application that switches autoscaling off",
+            "FLINK-1_19",
+            json!({"ConfigurationType": "CUSTOM", "AutoScalingEnabled": false}),
+            false,
+        ),
+        (
+            "a streaming application with a CUSTOM configuration that names only the \
+             parallelism",
+            "FLINK-2_2",
+            json!({"ConfigurationType": "CUSTOM", "ParallelismPerKPU": 2}),
+            true,
+        ),
+    ];
+
+    let router = router();
+    for (index, (case, runtime, parallelism, expected)) in rows.into_iter().enumerate() {
+        let name = format!("autoscaling-named-{index}");
+        let configuration = json!({"FlinkApplicationConfiguration": {
+            "ParallelismConfiguration": parallelism
+        }});
+        let created =
+            create_with(&router, case, &name, runtime, None, Some(configuration)).await;
+        assert_eq!(
+            auto_scaling_enabled(&created),
+            Some(expected),
+            "case {case:?}: expected AutoScalingEnabled to be {expected}, got {created}"
+        );
+        let described = describe(&router, &name).await;
+        assert_eq!(
+            auto_scaling_enabled(&described),
+            Some(expected),
+            "case {case:?}: expected the describe to report the stored value, got {described}"
+        );
+    }
 }

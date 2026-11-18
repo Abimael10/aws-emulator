@@ -185,6 +185,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         };
 
+        // A snapshot is the state of a RUNNING Apache Flink job, so only a Managed Service
+        // for Apache Flink application has one to take: a Studio notebook runs its
+        // paragraphs interactively and a SQL application runs no Flink job at all
+        // (`crate::state::is_flink_runtime`), so on either the operation does not exist for
+        // the runtime rather than being wrong for the application's state — the modelled
+        // `UnsupportedOperationException` (HTTP 400), which tells a client to skip the
+        // capability instead of correcting its request. Judged on the STORED application's
+        // runtime, and before its status, because the runtime decides whether this call could
+        // ever be served for it.
+        if !crate::state::is_flink_runtime(&application.runtime_environment) {
+            return Err(
+                CreateApplicationSnapshotErrorModeled::UnsupportedOperationException(
+                    UnsupportedOperationException {
+                        message: Some(
+                            crate::state::unsupported_for_runtime_environment_message(
+                                &application.runtime_environment,
+                            ),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        }
+
         // A snapshot captures the state a RUNNING application holds; in any other status
         // there is no running state to capture, so the request is not a valid one for the
         // application as it stands — the modelled `InvalidRequestException` (HTTP 400),

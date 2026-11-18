@@ -279,6 +279,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // The inline code the application will run once this update lands has to be code the
+        // runtime it then runs on RUNS — a Studio notebook's is a Zeppelin note
+        // (`crate::state::zeppelin_note_refusal`), the same rule the create is held to — so
+        // the runtime judged is the one the update moves the application to, else the one it
+        // already runs on. Only an update that WRITES code is judged: one that writes none
+        // leaves the application on the code it already carries. Refused before anything is
+        // written, so the stored code and version stay as they were.
+        if let Some(message) = crate::state::zeppelin_note_refusal(
+            input
+                .runtime_environment_update
+                .as_deref()
+                .unwrap_or(&runtime_environment),
+            input
+                .application_configuration_update
+                .as_ref()
+                .and_then(crate::state::updated_text_content),
+        ) {
+            return Err(UpdateApplicationErrorModeled::InvalidArgumentException(
+                InvalidArgumentException {
+                    message: Some(message),
+                },
+            )
+            .into());
+        }
+
         // The Glue Data Catalog database the notebook will read its tables through once
         // this update lands: the one the update asks for, else the one already stored. It
         // is RESOLVED the same way a create resolves it, so an update of a notebook whose

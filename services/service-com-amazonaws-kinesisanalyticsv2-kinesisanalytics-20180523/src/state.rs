@@ -1554,17 +1554,22 @@ const DEFAULT_CHECKPOINT_INTERVAL: i64 = 60_000;
 const DEFAULT_MIN_PAUSE_BETWEEN_CHECKPOINTS: i64 = 5_000;
 
 /// The default values that are NOT the same for every application this service runs,
-/// because the two features they switch — checkpointing and snapshots — are features of a
-/// Managed Service for Apache Flink application: `CheckpointConfiguration$CheckpointingEnabled`
-/// "describes whether checkpointing is enabled for a Managed Service for Apache Flink
-/// application" and `ApplicationSnapshotConfiguration$SnapshotsEnabled` "describes whether
-/// snapshots are enabled for a Managed Service for Apache Flink application"
+/// because the three features they switch — checkpointing, snapshots and the automatic
+/// scaling of the parallelism — are features of a Managed Service for Apache Flink
+/// application: `CheckpointConfiguration$CheckpointingEnabled` "describes whether
+/// checkpointing is enabled for a Managed Service for Apache Flink application",
+/// `ApplicationSnapshotConfiguration$SnapshotsEnabled` "describes whether snapshots are
+/// enabled for a Managed Service for Apache Flink application" and
+/// `ParallelismConfiguration$AutoScalingEnabled` "describes whether the Managed Service for
+/// Apache Flink service can increase the parallelism of the application in response to
+/// increased throughput"
 /// (`smithy_query(query="doc",shape="CheckpointConfiguration",member="CheckpointingEnabled")`
-/// / `shape="ApplicationSnapshotConfiguration",member="SnapshotsEnabled"`). An application
-/// the service runs INTERACTIVELY is a Studio notebook rather than such an application
+/// / `shape="ApplicationSnapshotConfiguration",member="SnapshotsEnabled"` /
+/// `shape="ParallelismConfiguration",member="AutoScalingEnabled"`). An application the
+/// service runs INTERACTIVELY is a Studio notebook rather than such an application
 /// (`CreateApplication$ApplicationMode`: "Use the STREAMING mode to create a Managed Service
 /// for Apache Flink application. To create a Managed Service for Apache Flink Studio
-/// notebook, use the INTERACTIVE mode"), so neither feature runs for it unless its own
+/// notebook, use the INTERACTIVE mode"), so none of them runs for it unless its own
 /// configuration switched it on, and its defaults are the off ones.
 #[derive(Debug, Clone, Copy)]
 struct ApplicationDefaults {
@@ -1573,22 +1578,28 @@ struct ApplicationDefaults {
     checkpointing_enabled: bool,
     /// The `SnapshotsEnabled` of an application created with no snapshot configuration.
     snapshots_enabled: bool,
+    /// The `AutoScalingEnabled` of a parallelism configuration the caller left to the
+    /// service.
+    auto_scaling_enabled: bool,
 }
 
 /// The defaults of a Managed Service for Apache Flink application — one that STREAMS:
-/// checkpointing runs, as the `DEFAULT` checkpoint-configuration table states, and
-/// snapshots are taken for it.
+/// checkpointing runs, as the `DEFAULT` checkpoint-configuration table states, snapshots
+/// are taken for it, and the service is free to scale its parallelism out in response to
+/// load.
 const STREAMING_DEFAULTS: ApplicationDefaults = ApplicationDefaults {
     checkpointing_enabled: true,
     snapshots_enabled: true,
+    auto_scaling_enabled: true,
 };
 
 /// The defaults of an application the service runs INTERACTIVELY (a Studio notebook):
-/// neither of the two Managed Service for Apache Flink features above runs for it on its
+/// none of the three Managed Service for Apache Flink features above runs for it on its
 /// own. See [`ApplicationDefaults`].
 const INTERACTIVE_DEFAULTS: ApplicationDefaults = ApplicationDefaults {
     checkpointing_enabled: false,
     snapshots_enabled: false,
+    auto_scaling_enabled: false,
 };
 
 /// The defaults the service runs an application of this runtime and mode under.
@@ -1615,14 +1626,13 @@ const DEFAULT_METRICS_LEVEL: &str = "APPLICATION";
 const DEFAULT_LOG_LEVEL: &str = "INFO";
 
 /// The parallelism a `DEFAULT` parallelism configuration runs with: the service's own
-/// published defaults for the three members `CUSTOM` is required to set
-/// (`ParallelismConfiguration$ConfigurationType`) — one parallel task, one task per KPU,
-/// and the service free to scale the application out in response to load.
+/// published defaults for the two members `CUSTOM` is required to set that are the same for
+/// every application (`ParallelismConfiguration$ConfigurationType`) — one parallel task and
+/// one task per KPU. Whether the service may scale the application OUT is the one value of
+/// that table the application's KIND decides ([`ApplicationDefaults`]).
 const DEFAULT_PARALLELISM: i32 = 1;
 /// See [`DEFAULT_PARALLELISM`].
 const DEFAULT_PARALLELISM_PER_KPU: i32 = 1;
-/// See [`DEFAULT_PARALLELISM`].
-const DEFAULT_AUTO_SCALING_ENABLED: bool = true;
 
 /// The service does not roll an application back on its own unless its creator asked for
 /// it: the default for `ApplicationSystemRollbackConfiguration$RollbackEnabled`.
@@ -1692,6 +1702,7 @@ fn complete_with_service_defaults(
             flink
                 .parallelism_configuration_description
                 .get_or_insert_with(ParallelismConfigurationDescription::default),
+            defaults,
         );
     }
 
@@ -1785,17 +1796,22 @@ fn complete_monitoring_configuration(description: &mut MonitoringConfigurationDe
         .or_else(|| Some(DEFAULT_LOG_LEVEL.to_string()));
 }
 
-/// See [`complete_with_service_defaults`]. `CurrentParallelism` is the parallelism in
-/// force right now, which is the configured one until autoscaling moves it, and
-/// autoscaling is not modelled.
-fn complete_parallelism_configuration(description: &mut ParallelismConfigurationDescription) {
+/// See [`complete_with_service_defaults`]. Whether the service may scale an application
+/// that left the decision to it is the application's own default ([`ApplicationDefaults`]);
+/// the parallelism itself is the same for every application. `CurrentParallelism` is the
+/// parallelism in force right now, which is the configured one until the service scales the
+/// application, and that scaling is not modelled.
+fn complete_parallelism_configuration(
+    description: &mut ParallelismConfigurationDescription,
+    defaults: ApplicationDefaults,
+) {
     if !is_custom(description.configuration_type.as_ref()) {
         *description = ParallelismConfigurationDescription {
             configuration_type: Some(CONFIGURATION_DEFAULT.to_string()),
             parallelism: Some(DEFAULT_PARALLELISM),
             parallelism_per_kpu: Some(DEFAULT_PARALLELISM_PER_KPU),
             current_parallelism: Some(DEFAULT_PARALLELISM),
-            auto_scaling_enabled: Some(DEFAULT_AUTO_SCALING_ENABLED),
+            auto_scaling_enabled: Some(defaults.auto_scaling_enabled),
         };
         return;
     }
@@ -1806,7 +1822,7 @@ fn complete_parallelism_configuration(description: &mut ParallelismConfiguration
     description.current_parallelism = description.current_parallelism.or(description.parallelism);
     description.auto_scaling_enabled = description
         .auto_scaling_enabled
-        .or(Some(DEFAULT_AUTO_SCALING_ENABLED));
+        .or(Some(defaults.auto_scaling_enabled));
 }
 
 /// The `RuntimeEnvironment` family that names a SQL application, as the enum spells its
@@ -1893,6 +1909,71 @@ pub fn application_mode_refusal(runtime_environment: &str, mode: Option<&str>) -
     let running_in = mode.unwrap_or(APPLICATION_MODE_STREAMING);
     (running_in != applicable)
         .then(|| inapplicable_application_mode_message(mode, runtime_environment))
+}
+
+/// The two members a Zeppelin note is identified by, as the note object spells them: Apache
+/// Zeppelin holds a note as a JSON object carrying the note's `id` and its `name`.
+const ZEPPELIN_NOTE_ID: &str = "id";
+/// See [`ZEPPELIN_NOTE_ID`].
+const ZEPPELIN_NOTE_NAME: &str = "name";
+
+/// How this service words inline Studio code that is not a note.
+///
+/// Entirely fixed text: what the refusal is about is the FORM the value has to take, so it
+/// quotes no value the request carried.
+pub const INVALID_ZEPPELIN_NOTE: &str =
+    "Zeppelin application code provided in TextContent must be a valid Zeppelin note JSON \
+     object containing 'id' and 'name' fields";
+
+/// The refusal the inline application code of an application on `runtime` earns, or `None`
+/// when it is code that runtime runs.
+///
+/// A Studio notebook's code is a NOTE of the Apache Zeppelin the notebook runtime runs
+/// ([`is_notebook_runtime`]), and a note is a JSON object carrying the note's id and its
+/// name — so `CodeContent$TextContent` supplied for such an application has to be one, and
+/// anything else is refused rather than stored as code no notebook could open. Every other
+/// runtime of this service runs inline code as the program text it is, so nothing about its
+/// form is judged here.
+///
+/// One rule for the create that supplies the code and the update that replaces it, decided
+/// on the runtime the application RUNS on once the call lands, so a notebook cannot be given
+/// code of another form by either route. The value is read with `serde_json`, the crate every
+/// reader of a JSON document in this crate already parses one with, rather than by looking
+/// for the member names in the text: it answers an error for anything that is not a JSON
+/// document instead of failing, and the text reaching it is already bounded by `TextContent`'s
+/// modelled length, which the boundary validator holds every request to.
+pub fn zeppelin_note_refusal(runtime: &str, text_content: Option<&str>) -> Option<String> {
+    let text = text_content.filter(|_| is_notebook_runtime(runtime))?;
+    let is_note = ::serde_json::from_str::<::serde_json::Value>(text)
+        .ok()
+        .as_ref()
+        .and_then(::serde_json::Value::as_object)
+        .is_some_and(|note| {
+            [ZEPPELIN_NOTE_ID, ZEPPELIN_NOTE_NAME]
+                .iter()
+                .all(|member| note.get(*member).is_some_and(|value| !value.is_null()))
+        });
+    (!is_note).then(|| INVALID_ZEPPELIN_NOTE.to_string())
+}
+
+/// The inline code a configuration supplied to a create asks the application to run, or
+/// `None` when it supplies none.
+pub fn configured_text_content(cfg: &ApplicationConfiguration) -> Option<&str> {
+    cfg.application_code_configuration
+        .as_ref()
+        .and_then(|code| code.code_content.as_ref())
+        .and_then(|content| content.text_content.as_deref())
+}
+
+/// The inline code an UPDATE writes, or `None` when it writes none — the update-shape
+/// sibling of [`configured_text_content`], so a caller of the note rule reaches the right
+/// member whichever shape it has in hand.
+pub fn updated_text_content(update: &ApplicationConfigurationUpdate) -> Option<&str> {
+    update
+        .application_code_configuration_update
+        .as_ref()
+        .and_then(|code| code.code_content_update.as_ref())
+        .and_then(|content| content.text_content_update.as_deref())
 }
 
 /// The `ApplicationMaintenanceWindowStartTime` an application is created with.
@@ -2142,6 +2223,31 @@ pub fn missing_application_version_message(version_id: i64, application: &str) -
 /// answers every such call whatever runtime the application runs on.
 pub fn unsupported_for_runtime_message(operation: &str, runtime: &str) -> String {
     format!("{operation} is not supported for applications with runtime environment {runtime}.")
+}
+
+/// How this service words a call refused because the SNAPSHOT the operation would take is
+/// not something the application's runtime keeps: the runtime, read off the stored
+/// application.
+///
+/// The sentence names no operation of its own ("This operation"), which is how AWS words
+/// this refusal — a different wording from the version readers'
+/// ([`unsupported_for_runtime_message`]) and from the rollback's
+/// ([`rollback_unsupported_for_runtime_message`]), each of which states its own.
+pub fn unsupported_for_runtime_environment_message(runtime: &str) -> String {
+    format!("This operation is not supported for RuntimeEnvironment {runtime}")
+}
+
+/// How this service words a rollback refused because the application's runtime keeps no
+/// previous running version to load: the runtime, read off the stored application.
+///
+/// AWS words this one in the singular — about THE application the call named — so it is its
+/// own sentence rather than the version readers'
+/// ([`unsupported_for_runtime_message`]).
+pub fn rollback_unsupported_for_runtime_message(runtime: &str) -> String {
+    format!(
+        "RollbackApplication is not supported for application with runtime environment \
+         {runtime}."
+    )
 }
 
 /// Whether `runtime` names the runtime family of a Managed Service for Apache Flink

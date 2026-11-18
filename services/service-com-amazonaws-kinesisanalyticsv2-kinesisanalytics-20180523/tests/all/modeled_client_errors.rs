@@ -23,6 +23,12 @@
 //!   content with `InvalidApplicationConfigurationException`, and leaves it unstarted;
 //! * a `ParallelismPerKPU` past the value the service runs an application at is refused with
 //!   `InvalidArgumentException`, on the create and on the update alike;
+//! * a Studio notebook's inline code is a Zeppelin note, so a create or an update that
+//!   writes anything else as the code of an application running on a notebook runtime is
+//!   refused with `InvalidArgumentException` and writes nothing;
+//! * taking a snapshot and rolling back are features of a Managed Service for Apache Flink
+//!   application's job, so on another runtime family each is refused with
+//!   `UnsupportedOperationException` in its own wording;
 //! * every modelled client error travels with this service's client-error status, whatever
 //!   `@httpError` its shape carries.
 
@@ -802,4 +808,444 @@ async fn every_modelled_client_error_travels_with_the_client_error_status() {
             "case {case:?}: expected a message stating the refusal, got {refused}"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// A Studio notebook's inline code, and the operations its runtime does not keep
+// ---------------------------------------------------------------------------
+
+/// The `RuntimeEnvironment` family a Studio notebook runs on, as the enum spells it
+/// (`smithy_query(query="shape",shape="RuntimeEnvironment")`: `ZEPPELIN-FLINK-<major>_<minor>`),
+/// and every version of it the enum admits — so a rule about the family is driven on each.
+const NOTEBOOK_RUNTIMES: [&str; 3] = [
+    "ZEPPELIN-FLINK-1_0",
+    "ZEPPELIN-FLINK-2_0",
+    "ZEPPELIN-FLINK-3_0",
+];
+
+/// What the service answers inline Studio code that is not a Zeppelin note: fixed text, so
+/// the sentence is asserted whole.
+const NOT_A_NOTE: &str = "Zeppelin application code provided in TextContent must be a valid \
+                          Zeppelin note JSON object containing 'id' and 'name' fields";
+
+/// One inline `TextContent` and whether it is a Zeppelin note.
+///
+/// The rows span the forms a value can take — a note object, a note object carrying the rest
+/// of what Zeppelin stores in one, an object missing either identifying member, an object
+/// whose member is null, a JSON document that is not an object at all, text that is not JSON,
+/// and text that is truncated JSON — because the rule is about the FORM of the value and not
+/// about one recorded paragraph.
+const CODE_ROWS: [(&str, &str, bool); 11] = [
+    ("a note object", r#"{"id": "2A94M5J1Z", "name": "orders"}"#, true),
+    (
+        "a note object carrying its paragraphs",
+        r#"{"id": "2EWM84JXA", "name": "notebooks/orders", "paragraphs": [{"text": "%flink.ssql\nSELECT 1"}], "angularObjects": {}}"#,
+        true,
+    ),
+    (
+        "a note object whose members are in the other order",
+        r#"{"name": "orders", "id": "2A94M5J1Z"}"#,
+        true,
+    ),
+    (
+        "a bare paragraph",
+        "%flink.ssql\nSELECT ticker, count(*) FROM orders GROUP BY ticker",
+        false,
+    ),
+    ("a note object with no id", r#"{"name": "orders"}"#, false),
+    ("a note object with no name", r#"{"id": "2A94M5J1Z"}"#, false),
+    (
+        "a note object whose id is null",
+        r#"{"id": null, "name": "orders"}"#,
+        false,
+    ),
+    (
+        "an array of note objects",
+        r#"[{"id": "2A94M5J1Z", "name": "orders"}]"#,
+        false,
+    ),
+    ("a JSON string", r#""2A94M5J1Z""#, false),
+    ("no code at all", "", false),
+    (
+        "a truncated note object",
+        r#"{"id": "2A94M5J1Z", "name": "#,
+        false,
+    ),
+];
+
+/// An `ApplicationConfiguration` carrying `text` as the application's inline code.
+fn code_configuration(text: &str) -> Value {
+    json!({
+        "ApplicationCodeConfiguration": {
+            "CodeContentType": "PLAINTEXT",
+            "CodeContent": {"TextContent": text},
+        }
+    })
+}
+
+/// The inline code `DescribeApplication` reports for one application.
+fn described_text_content(detail: &Value) -> Option<&str> {
+    detail
+        .pointer(
+            "/ApplicationConfigurationDescription/ApplicationCodeConfigurationDescription\
+             /CodeContentDescription/TextContent",
+        )
+        .and_then(Value::as_str)
+}
+
+/// A Studio notebook's code is a Zeppelin NOTE — the Apache Zeppelin runtime holds one as a
+/// JSON object carrying the note's `id` and `name` — so a create supplying anything else as
+/// `CodeContent$TextContent` for a notebook runtime is refused with the modelled
+/// `InvalidArgumentException` and stores nothing, while the same value is code for a
+/// Managed Service for Apache Flink application, which runs inline code as the program text
+/// it is.
+#[tokio::test]
+async fn a_studio_notebooks_inline_code_has_to_be_a_zeppelin_note() {
+    for (index, (case, text, is_note)) in CODE_ROWS.iter().enumerate() {
+        // One engine per row, so "nothing was stored" is checked against a store only this
+        // row wrote to; the notebook runtime cycles through every version of the family.
+        let router = router();
+        let runtime = NOTEBOOK_RUNTIMES[index % NOTEBOOK_RUNTIMES.len()];
+        let name = format!("note-probe-{index}");
+        let mut body = create_body(&name, runtime);
+        body["ApplicationConfiguration"] = code_configuration(text);
+        let (status, answered) = call(&router, "CreateApplication", &body).await;
+
+        if *is_note {
+            assert_eq!(
+                status, 200,
+                "case {case:?} on {runtime}: expected the note to be accepted, got {status} \
+                 {answered}"
+            );
+            let (status, described) = call(
+                &router,
+                "DescribeApplication",
+                &json!({"ApplicationName": name}),
+            )
+            .await;
+            assert_eq!(
+                status, 200,
+                "case {case:?} on {runtime}: DescribeApplication got {status} {described}"
+            );
+            assert_eq!(
+                described_text_content(&described["ApplicationDetail"]),
+                Some(*text),
+                "case {case:?} on {runtime}: expected the stored note to be read back, got \
+                 {described}"
+            );
+            continue;
+        }
+
+        assert_eq!(
+            (status, error_code(&answered).as_str()),
+            (400, "InvalidArgumentException"),
+            "case {case:?} on {runtime}: expected InvalidArgumentException, got {status} \
+             {answered}"
+        );
+        assert_eq!(
+            error_message(&answered),
+            NOT_A_NOTE,
+            "case {case:?} on {runtime}: expected the note-form refusal, got {answered}"
+        );
+        // A refused create stores nothing, so the name still resolves to no application.
+        let (status, described) = call(
+            &router,
+            "DescribeApplication",
+            &json!({"ApplicationName": name}),
+        )
+        .await;
+        assert_eq!(
+            (status, error_code(&described).as_str()),
+            (400, "ResourceNotFoundException"),
+            "case {case:?} on {runtime}: a refused create stores nothing, got {status} \
+             {described}"
+        );
+        assert_eq!(
+            error_message(&described),
+            format!("Application '{name}' does not exist."),
+            "case {case:?} on {runtime}: expected the miss to name the application, got \
+             {described}"
+        );
+    }
+}
+
+/// The same values are CODE for a Managed Service for Apache Flink application: the note
+/// rule is the notebook runtime's, not a rule about inline code in general.
+#[tokio::test]
+async fn a_flink_applications_inline_code_is_not_held_to_the_note_rule() {
+    let router = router();
+    // Every `FLINK-` version the enum admits a create for, so the control spans the family
+    // rather than one version.
+    let streaming: Vec<&&str> = RUNTIME_ENVIRONMENT_VALUES
+        .iter()
+        .filter(|runtime| runtime.starts_with("FLINK-"))
+        .collect();
+    assert!(
+        !streaming.is_empty(),
+        "expected the enum to carry a streaming runtime family, got \
+         {RUNTIME_ENVIRONMENT_VALUES:?}"
+    );
+    for (index, runtime) in streaming.into_iter().enumerate() {
+        let (case, text, _) = CODE_ROWS[3];
+        let name = format!("code-{index}");
+        let mut body = create_body(&name, runtime);
+        body["ApplicationConfiguration"] = code_configuration(text);
+        let (status, answered) = call(&router, "CreateApplication", &body).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?} on {runtime}: expected inline code to be accepted, got {status} \
+             {answered}"
+        );
+        assert_eq!(
+            described_text_content(&answered["ApplicationDetail"]),
+            Some(text),
+            "case {case:?} on {runtime}: expected the code to be stored as given, got \
+             {answered}"
+        );
+    }
+}
+
+/// An update that WRITES a notebook's code is held to the same rule, judged on the runtime
+/// the application runs on once the update lands — so moving an application onto a notebook
+/// runtime while writing program text is refused too — and a refused update leaves the
+/// stored code and version exactly as they were.
+#[tokio::test]
+async fn an_update_that_writes_inline_code_is_held_to_the_rule_of_the_runtime_it_lands_on() {
+    let note = CODE_ROWS[0].1;
+    let other_note = CODE_ROWS[1].1;
+    let paragraph = CODE_ROWS[3].1;
+
+    // (case, the runtime the application is created on, the update body, whether it is
+    // accepted) — the four combinations of the runtime the update lands on and the form of
+    // the code it writes.
+    let rows: [(&str, &str, Value, bool); 5] = [
+        (
+            "a notebook given another note",
+            "ZEPPELIN-FLINK-3_0",
+            json!({"ApplicationConfigurationUpdate": {
+                "ApplicationCodeConfigurationUpdate": {
+                    "CodeContentUpdate": {"TextContentUpdate": other_note}
+                }
+            }}),
+            true,
+        ),
+        (
+            "a notebook given program text",
+            "ZEPPELIN-FLINK-2_0",
+            json!({"ApplicationConfigurationUpdate": {
+                "ApplicationCodeConfigurationUpdate": {
+                    "CodeContentUpdate": {"TextContentUpdate": paragraph}
+                }
+            }}),
+            false,
+        ),
+        (
+            "a notebook whose update writes no code at all",
+            "ZEPPELIN-FLINK-1_0",
+            json!({"ApplicationConfigurationUpdate": {
+                "EnvironmentPropertyUpdates": {"PropertyGroups": [
+                    {"PropertyGroupId": "producer", "PropertyMap": {"topic": "orders"}}
+                ]}
+            }}),
+            true,
+        ),
+        (
+            "a streaming application given program text",
+            "FLINK-1_20",
+            json!({"ApplicationConfigurationUpdate": {
+                "ApplicationCodeConfigurationUpdate": {
+                    "CodeContentUpdate": {"TextContentUpdate": paragraph}
+                }
+            }}),
+            true,
+        ),
+        (
+            "a streaming application moved onto a notebook runtime with program text",
+            "FLINK-1_20",
+            json!({
+                "RuntimeEnvironmentUpdate": "ZEPPELIN-FLINK-3_0",
+                "ApplicationConfigurationUpdate": {
+                    "ApplicationCodeConfigurationUpdate": {
+                        "CodeContentUpdate": {"TextContentUpdate": paragraph}
+                    }
+                },
+            }),
+            false,
+        ),
+    ];
+
+    for (index, (case, runtime, update, accepted)) in rows.into_iter().enumerate() {
+        let router = router();
+        let name = format!("code-update-{index}");
+        // Every application starts from code its own runtime runs: a note for a notebook,
+        // program text for a streaming application.
+        let stored = if runtime.starts_with("ZEPPELIN-") {
+            note
+        } else {
+            paragraph
+        };
+        let mut body = create_body(&name, runtime);
+        body["ApplicationConfiguration"] = code_configuration(stored);
+        let (status, created) = call(&router, "CreateApplication", &body).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: CreateApplication got {status} {created}"
+        );
+
+        let mut request = update;
+        request["ApplicationName"] = json!(name);
+        request["CurrentApplicationVersionId"] = json!(1);
+        let (status, answered) = call(&router, "UpdateApplication", &request).await;
+        if accepted {
+            assert_eq!(
+                status, 200,
+                "case {case:?}: expected the update to be accepted, got {status} {answered}"
+            );
+            assert_eq!(
+                answered["ApplicationDetail"]["ApplicationVersionId"].as_i64(),
+                Some(2),
+                "case {case:?}: an accepted update mints the next version, got {answered}"
+            );
+            continue;
+        }
+
+        assert_eq!(
+            (status, error_code(&answered).as_str()),
+            (400, "InvalidArgumentException"),
+            "case {case:?}: expected InvalidArgumentException, got {status} {answered}"
+        );
+        assert_eq!(
+            error_message(&answered),
+            NOT_A_NOTE,
+            "case {case:?}: expected the note-form refusal, got {answered}"
+        );
+        let (status, described) = call(
+            &router,
+            "DescribeApplication",
+            &json!({"ApplicationName": name}),
+        )
+        .await;
+        assert_eq!(status, 200, "case {case:?}: DescribeApplication got {described}");
+        let detail = &described["ApplicationDetail"];
+        assert_eq!(
+            (
+                described_text_content(detail),
+                detail["ApplicationVersionId"].as_i64(),
+                detail["RuntimeEnvironment"].as_str(),
+            ),
+            (Some(stored), Some(1), Some(runtime)),
+            "case {case:?}: a refused update changes nothing, got {described}"
+        );
+    }
+}
+
+/// Taking a snapshot and rolling back to the previous running version are features of a
+/// Managed Service for Apache Flink application's job, so on an application whose runtime
+/// runs no such job — a Studio notebook — each is refused with the modelled
+/// `UnsupportedOperationException`, in that operation's own wording, and the application's
+/// version and status do not move.
+#[tokio::test]
+async fn snapshot_and_rollback_are_unsupported_for_a_studio_notebooks_runtime() {
+    for runtime in NOTEBOOK_RUNTIMES {
+        let router = router();
+        let name = format!("studio-{}", runtime.to_lowercase().replace('_', "-"));
+        let (status, created) = call(&router, "CreateApplication", &create_body(&name, runtime))
+            .await;
+        assert_eq!(
+            status, 200,
+            "case {runtime}: CreateApplication got {status} {created}"
+        );
+
+        // (operation, request, the sentence that operation answers for this refusal)
+        let rows: [(&str, Value, String); 2] = [
+            (
+                "CreateApplicationSnapshot",
+                json!({"ApplicationName": name, "SnapshotName": "studio-snapshot"}),
+                format!("This operation is not supported for RuntimeEnvironment {runtime}"),
+            ),
+            (
+                "RollbackApplication",
+                json!({"ApplicationName": name, "CurrentApplicationVersionId": 1}),
+                format!(
+                    "RollbackApplication is not supported for application with runtime \
+                     environment {runtime}."
+                ),
+            ),
+        ];
+
+        for (operation, request, message) in rows {
+            let (status, refused) = call(&router, operation, &request).await;
+            assert_eq!(
+                (status, error_code(&refused).as_str()),
+                (400, "UnsupportedOperationException"),
+                "case {runtime}/{operation}: expected UnsupportedOperationException, got \
+                 {status} {refused}"
+            );
+            assert_eq!(
+                error_message(&refused),
+                message,
+                "case {runtime}/{operation}: expected the refusal to name the runtime, got \
+                 {refused}"
+            );
+        }
+
+        let (status, described) = call(
+            &router,
+            "DescribeApplication",
+            &json!({"ApplicationName": name}),
+        )
+        .await;
+        let detail = &described["ApplicationDetail"];
+        assert_eq!(
+            (
+                status,
+                detail["ApplicationVersionId"].as_i64(),
+                detail["ApplicationStatus"].as_str(),
+            ),
+            (200, Some(1), Some("READY")),
+            "case {runtime}: neither refusal moves the application, got {described}"
+        );
+    }
+}
+
+/// The same two refusals are keyed on the RUNTIME and not on the operation: a Managed
+/// Service for Apache Flink application is never refused on that ground, so what it is
+/// answered is about its state instead.
+#[tokio::test]
+async fn neither_snapshot_nor_rollback_is_runtime_refused_for_a_flink_application() {
+    let router = router();
+    let name = "flink-capability";
+    let (status, created) =
+        call(&router, "CreateApplication", &create_body(name, "FLINK-1_20")).await;
+    assert_eq!(status, 200, "CreateApplication got {status} {created}");
+
+    // A READY application holds no running state to snapshot, which is a refusal about its
+    // STATUS — the class a client corrects its call on, not the one that says the capability
+    // is absent.
+    let (status, refused) = call(
+        &router,
+        "CreateApplicationSnapshot",
+        &json!({"ApplicationName": name, "SnapshotName": "flink-snapshot"}),
+    )
+    .await;
+    assert_eq!(
+        (status, error_code(&refused).as_str()),
+        (400, "InvalidRequestException"),
+        "expected the refusal to be about the status, got {status} {refused}"
+    );
+
+    // Rolling a Flink application back is not written yet, so this call is answered as a
+    // gap in the emulator; what it must NOT be is the runtime refusal, which belongs to the
+    // runtimes that keep no previous running version.
+    let (_, answered) = call(
+        &router,
+        "RollbackApplication",
+        &json!({"ApplicationName": name, "CurrentApplicationVersionId": 1}),
+    )
+    .await;
+    assert_ne!(
+        error_code(&answered),
+        "UnsupportedOperationException",
+        "expected no runtime refusal for a Flink application, got {answered}"
+    );
 }

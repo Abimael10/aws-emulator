@@ -254,7 +254,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        let tags = input.tags.clone().unwrap_or_default();        // "the maximum number of user-defined application tags is 50" — the
+        // The inline code the application will run has to be code the runtime it runs on
+        // RUNS: a Studio notebook's is a Zeppelin note rather than program text
+        // (`crate::state::zeppelin_note_refusal`), so a create supplying anything else for
+        // one is refused instead of storing code no notebook could open. A property of the
+        // request alone, so it is judged here beside the mode.
+        if let Some(message) = crate::state::zeppelin_note_refusal(
+            &input.runtime_environment,
+            input
+                .application_configuration
+                .as_ref()
+                .and_then(crate::state::configured_text_content),
+        ) {
+            return Err(CreateApplicationErrorModeled::InvalidArgumentException(
+                InvalidArgumentException {
+                    message: Some(message),
+                },
+            )
+            .into());
+        }
+
+        let tags = input.tags.clone().unwrap_or_default();
+        // "the maximum number of user-defined application tags is 50" — the
         // `CreateApplication$Tags` doc; the modelled `Tags` bound (1..200) counts system
         // tags too, so the user-tag ceiling is the service's own rule, stated once in
         // `crate::state` because `TagResource` holds every application to the same one.

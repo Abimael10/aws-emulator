@@ -474,6 +474,17 @@ fn default_parallelism() -> Value {
     })
 }
 
+/// The same `DEFAULT` parallelism table for an application the service runs INTERACTIVELY
+/// (a Studio notebook): the parallelism is the service's, and the automatic scaling is off,
+/// because what `AutoScalingEnabled` switches is a feature of a Managed Service for Apache
+/// Flink application
+/// (`smithy_query(query="doc",shape="ParallelismConfiguration",member="AutoScalingEnabled")`).
+fn interactive_default_parallelism() -> Value {
+    let mut parallelism = default_parallelism();
+    parallelism["AutoScalingEnabled"] = json!(false);
+    parallelism
+}
+
 /// Assert every member of `expected` is reported with that value in `actual`.
 fn assert_members(case: &str, member: &str, actual: &Value, expected: &Value) {
     let members = expected
@@ -611,7 +622,7 @@ async fn a_created_application_reports_the_configuration_it_runs_under() {
             configuration: json!({"ApplicationSnapshotConfiguration": {"SnapshotsEnabled": false}}),
             checkpoint: interactive_default_checkpoint(),
             monitoring: default_monitoring(),
-            parallelism: default_parallelism(),
+            parallelism: interactive_default_parallelism(),
             snapshots_enabled: false,
         },
     ];
