@@ -216,7 +216,7 @@ impl<Eng: Send + Sync + 'static> SubscribeToShard<Eng> {
         region: &str,
         now: std::time::SystemTime,
         input: &SubscribeToShardInput,
-    ) -> Result<SubscribeToShardEvent, SubscribeToShardErrorModeled> {
+    ) -> Result<(SubscribeToShardEvent, crate::state::Measured), SubscribeToShardErrorModeled> {
         // "Before you call this operation, call RegisterStreamConsumer to register the
         // consumer with Kinesis Data Streams": the consumer's ARN names the stream it was
         // registered with, so the stream is resolved first and the consumer inside it — a
@@ -227,6 +227,10 @@ impl<Eng: Send + Sync + 'static> SubscribeToShard<Eng> {
             .stream_by_arn(now, region, stream_arn)
             .ok_or_else(|| not_found(crate::state::stream_not_found_message(stream_arn)))?;
         let stream_key = crate::state::RegionalName::new(&stream.region, &stream.name);
+        // Which `AWS/Kinesis` series this delivery is measured into: the stream's name, and
+        // the shard-level metrics its enhanced monitoring names
+        // (`crate::state::stream_metrics`).
+        let series = crate::state::StreamSeries::of(stream);
 
         // A stream whose create, removal or re-tiling is still due serves no shard to read,
         // which is the modelled "the resource must be in the ACTIVE state" refusal. A stream
@@ -340,6 +344,48 @@ impl<Eng: Send + Sync + 'static> SubscribeToShard<Eng> {
                 .filter(|children| !children.is_empty()),
         };
 
+        // What this delivery did, as the `AWS/Kinesis` series report it: the records it
+        // retrieved from the shard (stream-level, and shard-level where the stream's enhanced
+        // monitoring names the metric — a record retrieved from a shard is counted the same
+        // way whichever reader asked for it) and the `SubscribeToShard` families of the
+        // subscription itself. Collected here, under the store guard, and published by the
+        // caller once that guard is released.
+        let delivered_records = crate::state::counted(read.records.len());
+        let delivered_bytes =
+            crate::state::counted(read.records.iter().fold(0usize, |total, record| {
+                total.saturating_add(record.stored_bytes())
+            }));
+        let lag = f64::from(i32::try_from(read.millis_behind_latest).unwrap_or(i32::MAX));
+        let mut measured = crate::state::Measured::new();
+        measured.record_outgoing(
+            &series,
+            &input.shard_id,
+            delivered_records,
+            delivered_bytes,
+            now,
+        );
+        measured.record(
+            &series,
+            crate::state::ITERATOR_AGE,
+            &input.shard_id,
+            lag,
+            now,
+        );
+        for (call_series, value) in [
+            (crate::state::SUBSCRIBE_TO_SHARD_SUCCESS, 1.0),
+            (
+                crate::state::SUBSCRIBE_TO_SHARD_EVENT_RECORDS,
+                delivered_records,
+            ),
+            (
+                crate::state::SUBSCRIBE_TO_SHARD_EVENT_BYTES,
+                delivered_bytes,
+            ),
+            (crate::state::SUBSCRIBE_TO_SHARD_EVENT_LAG, lag),
+        ] {
+            measured.record_for_the_call(&series, call_series, value, now);
+        }
+
         // The subscription is established, so it is recorded on the consumer it was
         // established for: that is what the next call to the same consumer and shard is
         // judged against.
@@ -351,7 +397,7 @@ impl<Eng: Send + Sync + 'static> SubscribeToShard<Eng> {
             consumer.subscribed_at(&input.shard_id, now);
         }
 
-        Ok(event)
+        Ok((event, measured))
     }
 
     /// Read the request into the modelled input shape and check it against the model.
@@ -494,7 +540,13 @@ impl<Eng: Send + Sync + 'static> SubscribeToShard<Eng> {
         };
         let protocol = svc.definition().protocol();
         let event = match established {
-            Ok(event) => event,
+            Ok((event, measured)) => {
+                // The store guard above is released, so what the delivery measured goes into
+                // the CloudWatch store now — off the answer, exactly as the pull reader's
+                // page is published (`crate::ops::get_records`).
+                measured.publish(&*self.engine);
+                event
+            }
             Err(error) => return error_response(protocol, &error),
         };
 

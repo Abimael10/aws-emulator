@@ -386,15 +386,21 @@ fn not_found(identifier: &str) -> ListShardsError {
 /// The modelled refusal for a `NextToken` that names no page, under the error class the
 /// reason it names none belongs to: a token this service never issued for this listing is a
 /// parameter that "can't be used", and only one it issued whose lifetime has elapsed is the
-/// expiry.
-fn next_token_refusal(refusal: crate::state::NextTokenRefusal) -> ListShardsError {
+/// expiry, which names the instant it lapsed and the listing to invoke again.
+fn next_token_refusal(
+    refusal: crate::state::NextTokenRefusal,
+    operation: &str,
+) -> ListShardsError {
     match refusal {
         crate::state::NextTokenRefusal::NotIssued => {
             invalid_argument(crate::state::INVALID_NEXT_TOKEN_MESSAGE.to_string())
         }
-        crate::state::NextTokenRefusal::Expired => {
+        crate::state::NextTokenRefusal::Expired { issued_at_millis } => {
             ListShardsErrorModeled::ExpiredNextTokenException(ExpiredNextTokenException {
-                message: Some(crate::state::next_token_expired_message()),
+                message: Some(crate::state::next_token_expired_message(
+                    operation,
+                    issued_at_millis,
+                )),
             })
             .into()
         }
@@ -484,7 +490,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // apart by whether the token decodes and verifies at all
                 // (`crate::state::NextTokenRefusal`).
                 let resume = crate::state::ShardPageToken::resume(token, now)
-                    .map_err(next_token_refusal)?;
+                    .map_err(|refusal| next_token_refusal(refusal, Self::NAME))?;
                 // A `StreamARN` the request carries beside the token has to name the
                 // stream the token names, or the two name different streams — the refusal
                 // every listing of this service states for that pair.

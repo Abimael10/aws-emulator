@@ -162,7 +162,10 @@ fn passes_stream_filter(
 /// input-validation class for (`ValidationException`) rather than the generic bad-argument
 /// class it answers every OTHER unusable argument with, and only a token it issued whose
 /// lifetime has elapsed is the expiry.
-fn next_token_refusal(refusal: crate::state::NextTokenRefusal) -> ListChannelsError {
+fn next_token_refusal(
+    refusal: crate::state::NextTokenRefusal,
+    operation: &str,
+) -> ListChannelsError {
     match refusal {
         crate::state::NextTokenRefusal::NotIssued => {
             ListChannelsErrorModeled::ValidationException(ValidationException {
@@ -170,9 +173,12 @@ fn next_token_refusal(refusal: crate::state::NextTokenRefusal) -> ListChannelsEr
             })
             .into()
         }
-        crate::state::NextTokenRefusal::Expired => {
+        crate::state::NextTokenRefusal::Expired { issued_at_millis } => {
             ListChannelsErrorModeled::ExpiredNextTokenException(ExpiredNextTokenException {
-                message: Some(crate::state::next_token_expired_message()),
+                message: Some(crate::state::next_token_expired_message(
+                    operation,
+                    issued_at_millis,
+                )),
             })
             .into()
         }
@@ -248,7 +254,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     token,
                     now,
                 )
-                .map_err(next_token_refusal)?;
+                .map_err(|refusal| next_token_refusal(refusal, Self::NAME))?;
                 // The token names the first channel the earlier page did NOT return, so the
                 // page that resumes it starts AT that channel.
                 Some(resume.next_name)

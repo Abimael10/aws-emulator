@@ -401,17 +401,49 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             crate::state::ShardIteratorToken::new(stream, &shard.shard_id, position, now).encode()
         });
 
+        // "The list of the current shard's child shards, returned in the GetRecords
+        // API's response only when the end of the current shard is reached": a shard
+        // is closed by a reshard, and a reader that has drained a closed one reads on
+        // from the shards that reshard produced from it.
+        let child_shards = (!shard.is_open() && read.drained)
+            .then(|| stream.child_shards_of(&shard.shard_id))
+            .filter(|children| !children.is_empty());
+        let millis_behind_latest = read.millis_behind_latest;
+
+        // What this read did, as the `AWS/Kinesis` series report it: the records and the
+        // record data it served out of this shard (stream-level, and shard-level where the
+        // stream's enhanced monitoring names the metric), the lag it left the consumer at, and
+        // the `GetRecords` family of the call itself. Measured here, where the page is
+        // settled, and published with the store guard released, off the answer below.
+        // The records' own SIZE, which is what the retrieval byte series measure: the data
+        // blob added to the partition key size, the one measure of a record this service uses
+        // (`crate::state::DataRecord::stored_bytes`).
+        let read_bytes = crate::state::counted(read.records.iter().fold(0usize, |total, record| {
+            total.saturating_add(record.stored_bytes())
+        }));
+        let read_records = crate::state::counted(read.records.len());
+        let lag = f64::from(i32::try_from(millis_behind_latest).unwrap_or(i32::MAX));
+        let series = crate::state::StreamSeries::of(stream);
+        let shard_id = shard.shard_id.clone();
+        let mut measured = crate::state::Measured::new();
+        measured.record_outgoing(&series, &shard_id, read_records, read_bytes, now);
+        measured.record(&series, crate::state::ITERATOR_AGE, &shard_id, lag, now);
+        for (call_series, value) in [
+            (crate::state::GET_RECORDS_SUCCESS, 1.0),
+            (crate::state::GET_RECORDS_RECORDS, read_records),
+            (crate::state::GET_RECORDS_BYTES, read_bytes),
+            (crate::state::GET_RECORDS_ITERATOR_AGE, lag),
+        ] {
+            measured.record_for_the_call(&series, call_series, value, now);
+        }
+        drop(store);
+        measured.publish(&*self.engine);
+
         Ok(GetRecordsOutput {
             records,
             next_shard_iterator,
-            millis_behind_latest: Some(read.millis_behind_latest),
-            // "The list of the current shard's child shards, returned in the GetRecords
-            // API's response only when the end of the current shard is reached": a shard
-            // is closed by a reshard, and a reader that has drained a closed one reads on
-            // from the shards that reshard produced from it.
-            child_shards: (!shard.is_open() && read.drained)
-                .then(|| stream.child_shards_of(&shard.shard_id))
-                .filter(|children| !children.is_empty()),
+            millis_behind_latest: Some(millis_behind_latest),
+            child_shards,
         })
     }
 }

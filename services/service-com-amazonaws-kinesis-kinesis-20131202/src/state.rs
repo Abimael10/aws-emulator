@@ -29,24 +29,30 @@
 //! what one read of it from there delivers ([`shard_reading`]), the destination streaming
 //! table a channel's create provisions in S3 Tables ([`streaming_table`]), and the delivery
 //! of a channel's source records to its general purpose bucket destination
-//! ([`channel_delivery`]).
+//! ([`channel_delivery`]), the layout an expiry refusal spells the instant it names in
+//! ([`expiry_instant`]), and the `AWS/Kinesis` series a stream's data plane publishes about
+//! itself ([`stream_metrics`]).
 
 pub mod channel_delivery;
 mod channel_key_access;
 mod channels;
+mod expiry_instant;
 mod kms_key;
 mod reserved_tag_keys;
 mod service_execution_role;
 mod shard_reading;
+mod stream_metrics;
 mod streaming_table;
 mod write_quota;
 
 pub use channel_key_access::*;
 pub use channels::*;
+pub use expiry_instant::*;
 pub use kms_key::*;
 pub use reserved_tag_keys::*;
 pub use service_execution_role::*;
 pub use shard_reading::*;
+pub use stream_metrics::*;
 pub use streaming_table::*;
 pub use write_quota::*;
 
@@ -4127,8 +4133,14 @@ pub enum NextTokenRefusal {
     /// Not a token this service issued for this listing: it does not decode, its digest does
     /// not verify it, it is tagged for another listing, or it names another region.
     NotIssued,
-    /// A token this service issued whose lifetime has elapsed ([`PAGE_TOKEN_TTL`]).
-    Expired,
+    /// A token this service issued whose lifetime has elapsed ([`PAGE_TOKEN_TTL`]), carrying
+    /// the instant it was minted at — the instant it lapsed is that one plus the lifetime, and
+    /// the refusal names it ([`next_token_expired_message`]).
+    Expired {
+        /// When the page that handed this token out was served, in milliseconds since the
+        /// epoch.
+        issued_at_millis: u128,
+    },
 }
 
 /// How a listing refuses a `NextToken` that is not one it issued: the sentence Kinesis
@@ -4299,7 +4311,9 @@ impl ShardPageToken {
     pub fn resume(token: &str, now: SystemTime) -> Result<Self, NextTokenRefusal> {
         let decoded = Self::decode(token).ok_or(NextTokenRefusal::NotIssued)?;
         if decoded.is_expired(now) {
-            return Err(NextTokenRefusal::Expired);
+            return Err(NextTokenRefusal::Expired {
+                issued_at_millis: decoded.issued_at_millis,
+            });
         }
         Ok(decoded)
     }
@@ -4392,7 +4406,9 @@ impl ConsumerPageToken {
     pub fn resume(token: &str, now: SystemTime) -> Result<Self, NextTokenRefusal> {
         let decoded = Self::decode(token).ok_or(NextTokenRefusal::NotIssued)?;
         if decoded.is_expired(now) {
-            return Err(NextTokenRefusal::Expired);
+            return Err(NextTokenRefusal::Expired {
+                issued_at_millis: decoded.issued_at_millis,
+            });
         }
         Ok(decoded)
     }
@@ -4519,7 +4535,9 @@ impl RegionalPageToken {
             return Err(NextTokenRefusal::NotIssued);
         }
         if decoded.is_expired(now) {
-            return Err(NextTokenRefusal::Expired);
+            return Err(NextTokenRefusal::Expired {
+                issued_at_millis: decoded.issued_at_millis,
+            });
         }
         Ok(decoded)
     }
@@ -4809,24 +4827,22 @@ pub const NEXT_TOKEN_STREAM_MISMATCH_MESSAGE: &str =
 /// used at, and the lifetime `GetShardIterator` documents ("A shard iterator expires 5
 /// minutes after it is returned to the requester"), all taken from the iterator and the
 /// clock.
+///
+/// Both instants are spelled in the layout this service's expiry refusals name an instant in
+/// ([`expiry_instant_text`]) rather than in the date-time form the wire carries a modelled
+/// `Timestamp` in: the sentence is read by a client, not deserialized into a member.
 pub fn iterator_expired_message(issued_at_millis: u128, now_millis: u128) -> String {
     format!(
         "Iterator expired. The iterator was created at time {} while right now it is {} \
-         which is further in the past than the tolerated delay of {} milliseconds.",
-        instant_text(issued_at_millis),
-        instant_text(now_millis),
+         which is further in the future than the tolerated delay of {} milliseconds.",
+        expiry_instant_text(issued_at_millis),
+        expiry_instant_text(now_millis),
         SHARD_ITERATOR_TTL.as_millis()
     )
 }
 
-/// An instant as a refusal spells one out, in the date-time form the wire carries a
-/// modelled `Timestamp` in.
-fn instant_text(millis: u128) -> String {
-    instant_at(i64::try_from(millis).unwrap_or(i64::MAX))
-}
-
-/// [`instant_text`] for an instant a REQUEST carried, which the wire admits on either side
-/// of the epoch.
+/// An instant a REQUEST carried as a refusal spells one out, in the date-time form the wire
+/// carries a modelled `Timestamp` in, which the wire admits on either side of the epoch.
 fn instant_at(millis: i64) -> String {
     ::aws_smithy_types::DateTime::from_millis(millis)
         .fmt(::aws_smithy_types::date_time::Format::DateTime)
@@ -4845,15 +4861,30 @@ pub fn next_token_conflict_message(member: &str) -> String {
     )
 }
 
-/// How a read refuses a `NextToken` that is past its lifetime: the rule
-/// `ExpiredNextTokenException` publishes ("The pagination token passed to the operation is
-/// expired") together with the lifetime a cursor of this service carries
-/// ([`PAGE_TOKEN_TTL`]). A token this service never issued is NOT this refusal — it is
-/// [`INVALID_NEXT_TOKEN_MESSAGE`].
-pub fn next_token_expired_message() -> String {
+/// How a listing refuses a `NextToken` that is past its lifetime: the sentence Kinesis
+/// answers for `ExpiredNextTokenException` ("The pagination token passed to the operation is
+/// expired"), which names the instant the token LAPSED and the listing to invoke again for a
+/// new one — never the lifetime itself.
+///
+/// Both variable parts are taken from the request and from the token it carried: `operation`
+/// is the listing that was invoked, and the instant is the mint instant sealed inside the
+/// token plus the one lifetime every cursor of this service carries
+/// ([`page_token_expiry_millis`]), spelled in the layout this service's expiry refusals name
+/// an instant in ([`expiry_instant_text`]).
+///
+/// A token this service never issued is NOT this refusal — it is
+/// [`INVALID_NEXT_TOKEN_MESSAGE`], and it names no instant because it names no page.
+pub fn next_token_expired_message(operation: &str, token_issued_at_millis: u128) -> String {
     format!(
-        "the pagination token passed to the operation is expired; a NextToken is usable for \
-         {} seconds after the page that returned it",
-        PAGE_TOKEN_TTL.as_secs()
+        "NextToken expired at time {}. Invoke {operation} again to get a new pagination \
+         token.",
+        expiry_instant_text(page_token_expiry_millis(token_issued_at_millis))
     )
+}
+
+/// The instant a cursor minted at `issued_at_millis` lapses at: its mint instant plus
+/// [`PAGE_TOKEN_TTL`], the one lifetime every cursor of this service is judged by
+/// ([`is_past_token_lifetime`]).
+pub fn page_token_expiry_millis(issued_at_millis: u128) -> u128 {
+    issued_at_millis.saturating_add(PAGE_TOKEN_TTL.as_millis())
 }

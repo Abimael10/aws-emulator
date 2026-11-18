@@ -44,7 +44,16 @@
 //!   opening with `aws:`) is the modelled `InvalidArgumentException` `Some tag keys in the
 //!   request started with 'aws:'. System tags cannot be modified.` — entirely fixed text — on
 //!   every way into a resource's tags, leaving the stored tag set as it was and provisioning
-//!   nothing when the request was a create.
+//!   nothing when the request was a create;
+//! * a `GetRecords` whose `ShardIterator` is past its age is the modelled
+//!   `ExpiredIteratorException` `Iterator expired. The iterator was created at time <created>
+//!   while right now it is <now> which is further in the future than the tolerated delay of
+//!   300000 milliseconds.` — the mint instant from the iterator the request carried and the
+//!   server's own instant, both spelled `EEE MMM dd HH:mm:ss UTC yyyy`;
+//! * a listing whose `NextToken` is past its lifetime is the modelled
+//!   `ExpiredNextTokenException` `NextToken expired at time <expiry>. Invoke <Operation> again
+//!   to get a new pagination token.` — the instant the token lapsed (its mint instant plus the
+//!   cursor lifetime), spelled in that same layout, and the listing that was invoked.
 //!
 //! The recorded cases this was derived from are one row each — one duplicate create, one
 //! `AT_SEQUENCE_NUMBER` read carrying no sequence number, one second removal of an already
@@ -66,10 +75,13 @@
 //! [`crate::channel_lifecycle`]' and the resource-policy calls [`crate::resource_policies`]',
 //! reused rather than copied.
 
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
 use serde_json::{json, Value};
 use service_com_amazonaws_kinesis_kinesis_20131202::state::{
     account_not_enabled_for_commitment_message, channel_arn, shard_id,
-    stream_already_exists_message, CONSUMER_ACTIVE, STREAM_MODE_ON_DEMAND,
+    stream_already_exists_message, ConsumerPageToken, RegionalListing, RegionalPageToken,
+    ShardIteratorToken, ShardPageToken, CONSUMER_ACTIVE, STREAM_MODE_ON_DEMAND,
 };
 
 use crate::channel_lifecycle::{
@@ -1014,4 +1026,290 @@ async fn a_create_carrying_a_reserved_tag_key_provisions_nothing() {
             &json!({ "StreamARN": source, "ConsumerName": consumer }),
         )
         .await;
+}
+
+/// The three-letter weekday names an instant of AWS's two expiry sentences opens with, in the
+/// order a week runs: the `EEE` field of the `EEE MMM dd HH:mm:ss UTC yyyy` layout those
+/// sentences spell an instant in, which is the catalog this suite reads an instant's first
+/// field against.
+const WEEKDAYS: [&str; 7] = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
+
+/// The three-letter month names of that same layout's `MMM` field, in calendar order.
+const MONTHS: [&str; 12] = [
+    "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+];
+
+/// The delay an expired-iterator sentence states, in milliseconds, as AWS writes the figure:
+/// "A shard iterator expires 5 minutes after it is returned to the requester"
+/// (`GetShardIterator`).
+const ITERATOR_TOLERATED_DELAY_MILLIS: u64 = 300_000;
+
+/// Whether `text` is an instant spelled the way AWS's expiry sentences spell one: `EEE MMM dd
+/// HH:mm:ss UTC yyyy`, each field read against the layout rather than against a sample — the
+/// weekday and month from the catalogs above, a two-digit day, a two-digit 24-hour time, the
+/// literal zone and a four-digit year.
+fn reads_as_an_expiry_instant(text: &str) -> bool {
+    let fields: Vec<&str> = text.split(' ').collect();
+    let [weekday, month, day, time, zone, year] = fields.as_slice() else {
+        return false;
+    };
+    let clock: Vec<&str> = time.split(':').collect();
+    WEEKDAYS.contains(weekday)
+        && MONTHS.contains(month)
+        && day.len() == 2
+        && day.chars().all(char::is_numeric)
+        && clock.len() == 3
+        && clock
+            .iter()
+            .all(|part| part.len() == 2 && part.chars().all(char::is_numeric))
+        && *zone == "UTC"
+        && year.len() == 4
+        && year.chars().all(char::is_numeric)
+}
+
+/// One row of the instant catalog: an instant, how AWS's layout spells it, and how that layout
+/// spells the instant a cursor minted at it lapses at — 300 seconds later, the lifetime
+/// `ListStreamConsumersOutput$NextToken` documents ("Tokens expire after 300 seconds").
+///
+/// The rows differ along every field of the layout — the weekday, the month, a single- and a
+/// two-digit day, the time of day, the year — and one of them crosses a month boundary (and a
+/// leap day) once the cursor lifetime is added, so the rendering is the layout's and not one
+/// instant's.
+struct InstantRow {
+    case: &'static str,
+    /// The instant itself, in milliseconds since the epoch.
+    millis: u64,
+    /// That instant, as AWS's layout spells it.
+    spelled: &'static str,
+    /// The instant 300 seconds after it, as AWS's layout spells it.
+    spelled_after_the_cursor_lifetime: &'static str,
+}
+
+/// The catalog both expiry sentences are read over.
+const EXPIRY_INSTANTS: &[InstantRow] = &[
+    InstantRow {
+        case: "the epoch itself",
+        millis: 0,
+        spelled: "Thu Jan 01 00:00:00 UTC 1970",
+        spelled_after_the_cursor_lifetime: "Thu Jan 01 00:05:00 UTC 1970",
+    },
+    InstantRow {
+        case: "a single-digit day early in a year",
+        millis: 1_767_503_167_000,
+        spelled: "Sun Jan 04 05:06:07 UTC 2026",
+        spelled_after_the_cursor_lifetime: "Sun Jan 04 05:11:07 UTC 2026",
+    },
+    InstantRow {
+        case: "the last second of a leap day",
+        millis: 1_709_251_199_000,
+        spelled: "Thu Feb 29 23:59:59 UTC 2024",
+        spelled_after_the_cursor_lifetime: "Fri Mar 01 00:04:59 UTC 2024",
+    },
+    InstantRow {
+        case: "a two-digit day late in a year",
+        millis: 1_794_257_380_000,
+        spelled: "Mon Nov 09 20:49:40 UTC 2026",
+        spelled_after_the_cursor_lifetime: "Mon Nov 09 20:54:40 UTC 2026",
+    },
+];
+
+/// The instant `millis` milliseconds after the epoch names.
+fn at_millis(millis: u64) -> SystemTime {
+    UNIX_EPOCH + Duration::from_millis(millis)
+}
+
+/// A `GetRecords` whose iterator is past its age is refused with AWS's expired-iterator
+/// sentence: its fixed words exactly, the iterator's own mint instant and the server's current
+/// instant, both spelled in AWS's layout.
+#[tokio::test]
+async fn an_expired_iterator_states_both_instants_in_awss_layout() {
+    let emulator = Emulator::new();
+    let stream = "expired-iterator-wording";
+    emulator
+        .ok(
+            "setup",
+            "CreateStream",
+            &json!({ "StreamName": stream, "ShardCount": 1 }),
+        )
+        .await;
+    poll_until_active(&emulator, "setup", stream).await;
+    let shard = shard_id(0);
+    emulator
+        .ok(
+            "setup",
+            "PutRecord",
+            &json!({
+                "StreamName": stream,
+                "PartitionKey": "expiry",
+                "Data": aws_smithy_types::base64::encode("expiry"),
+            }),
+        )
+        .await;
+
+    // Both positions a reader can ask for without naming a sequence number, so the sentence is
+    // shown to be the expiry's and not one position's.
+    let mut issued: Vec<(&str, String)> = Vec::new();
+    for position in ["TRIM_HORIZON", "LATEST"] {
+        let answer = emulator
+            .ok(
+                "setup",
+                "GetShardIterator",
+                &json!({
+                    "StreamName": stream,
+                    "ShardId": shard,
+                    "ShardIteratorType": position,
+                }),
+            )
+            .await;
+        issued.push((
+            position,
+            answer["ShardIterator"]
+                .as_str()
+                .unwrap_or_else(|| panic!("case setup: GetShardIterator reported no iterator"))
+                .to_string(),
+        ));
+    }
+
+    let opening = "Iterator expired. The iterator was created at time ";
+    let between = " while right now it is ";
+    let closing = format!(
+        " which is further in the future than the tolerated delay of \
+         {ITERATOR_TOLERATED_DELAY_MILLIS} milliseconds."
+    );
+
+    for (position, iterator) in &issued {
+        for row in EXPIRY_INSTANTS {
+            let case = format!("{} read from a {position} iterator", row.case);
+            // The iterator this service issued, carrying the mint instant of this row: every
+            // other part of it is the one the service handed out.
+            let mut aged = ShardIteratorToken::decode(iterator)
+                .unwrap_or_else(|| panic!("case {case}: the issued iterator decodes"));
+            aged.issued_at_millis = u128::from(row.millis);
+
+            let (status, response) = emulator
+                .call("GetRecords", &json!({ "ShardIterator": aged.encode() }))
+                .await;
+            assert_eq!(
+                status, 400,
+                "case {case}: expected the modelled client refusal, got {status} with body \
+                 {response}"
+            );
+            assert_eq!(
+                error_code(&response),
+                "ExpiredIteratorException",
+                "case {case}: expected the modelled expiry, got {response}"
+            );
+
+            let message = error_message(&response);
+            let instants = message
+                .strip_prefix(opening)
+                .and_then(|rest| rest.strip_suffix(closing.as_str()))
+                .unwrap_or_else(|| {
+                    panic!(
+                        "case {case}: expected AWS's expired-iterator sentence \
+                         {opening:?}<created>{between:?}<now>{closing:?}, got {message:?}"
+                    )
+                });
+            let (created, right_now) = instants.split_once(between).unwrap_or_else(|| {
+                panic!(
+                    "case {case}: expected the sentence to name both instants around \
+                     {between:?}, got {message:?}"
+                )
+            });
+            assert_eq!(
+                created, row.spelled,
+                "case {case}: expected the iterator's mint instant spelled in AWS's layout, \
+                 got {created:?} in {message:?}"
+            );
+            assert!(
+                reads_as_an_expiry_instant(right_now),
+                "case {case}: expected the server's instant spelled in AWS's layout, got \
+                 {right_now:?} in {message:?}"
+            );
+        }
+    }
+}
+
+/// Every listing of this service refuses a `NextToken` past its lifetime with AWS's
+/// expired-token sentence: the instant that token lapsed, spelled in AWS's layout, and the
+/// listing to invoke again for a new one.
+#[tokio::test]
+async fn an_expired_pagination_token_states_the_lapse_instant_and_the_listing() {
+    let emulator = Emulator::new();
+    // The cursors below never reach a stream: a token past its lifetime names no page, which
+    // is answered before anything is looked up. So this ARN addresses the stream the two
+    // stream-scoped cursors are tagged for without one having to be created.
+    let arn = stream_arn(REGION, "token-wording-stream");
+    let created_at = SystemTime::now();
+
+    for row in EXPIRY_INSTANTS {
+        let minted_at = at_millis(row.millis);
+        // (the listing, the request resuming it at a cursor minted at this row's instant)
+        let listings: Vec<(&str, Value)> = vec![
+            (
+                "ListStreams",
+                json!({
+                    "NextToken": RegionalPageToken::new(
+                        RegionalListing::Streams,
+                        REGION,
+                        "a-stream",
+                        minted_at,
+                    )
+                    .encode(),
+                }),
+            ),
+            (
+                "ListChannels",
+                json!({
+                    "NextToken": RegionalPageToken::new(
+                        RegionalListing::Channels,
+                        REGION,
+                        "a-channel",
+                        minted_at,
+                    )
+                    .encode(),
+                }),
+            ),
+            (
+                "ListShards",
+                json!({
+                    "NextToken": ShardPageToken::new(&arn, created_at, &shard_id(0), minted_at)
+                        .encode(),
+                }),
+            ),
+            (
+                "ListStreamConsumers",
+                json!({
+                    "StreamARN": arn,
+                    "NextToken": ConsumerPageToken::new(
+                        &arn,
+                        created_at,
+                        "a-consumer",
+                        minted_at,
+                    )
+                    .encode(),
+                }),
+            ),
+        ];
+
+        for (operation, body) in listings {
+            let case = format!("{operation} resumed at a cursor minted at {}", row.case);
+            let (code, message) = refusal(&emulator, &case, operation, &body).await;
+            assert_eq!(
+                code, "ExpiredNextTokenException",
+                "case {case}: expected the modelled expiry, got {code} with {message:?}"
+            );
+            assert_eq!(
+                message,
+                format!(
+                    "NextToken expired at time {}. Invoke {operation} again to get a new \
+                     pagination token.",
+                    row.spelled_after_the_cursor_lifetime
+                ),
+                "case {case}: expected AWS's expired-token sentence naming the lapse instant \
+                 {} and this listing, got {message:?}",
+                row.spelled_after_the_cursor_lifetime
+            );
+        }
+    }
 }

@@ -15822,6 +15822,7 @@ dependencies = [
  "md-5 0.10.6",
  "ruzstd",
  "serde_json",
+ "service-com-amazonaws-cloudwatch-graniteserviceversion20100801",
  "service-com-amazonaws-iam-awsidentitymanagementv20100508",
  "service-com-amazonaws-kms-trentservice",
  "service-com-amazonaws-s3tables-s3tablebuckets",

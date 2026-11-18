@@ -38,11 +38,11 @@ use std::time::{Duration, SystemTime};
 
 use serde_json::{json, Value};
 use service_com_amazonaws_kinesis_kinesis_20131202::state::{
-    next_token_conflict_message, next_token_expired_message, stream_not_active_message,
-    stream_not_found_message, ConsumerPageToken, ShardPageToken, CONSUMER_ACTIVATION_DELAY,
-    CONSUMER_ACTIVE, CONSUMER_CREATING, INVALID_NEXT_TOKEN_MESSAGE, MAX_CONSUMERS_CREATING,
-    MAX_LIST_STREAM_CONSUMERS_LIMIT, NEXT_TOKEN_STREAM_MISMATCH_MESSAGE, PAGE_TOKEN_TTL,
-    STREAM_CREATING,
+    epoch_millis, next_token_conflict_message, next_token_expired_message,
+    stream_not_active_message, stream_not_found_message, ConsumerPageToken, ShardPageToken,
+    CONSUMER_ACTIVATION_DELAY, CONSUMER_ACTIVE, CONSUMER_CREATING, INVALID_NEXT_TOKEN_MESSAGE,
+    MAX_CONSUMERS_CREATING, MAX_LIST_STREAM_CONSUMERS_LIMIT, NEXT_TOKEN_STREAM_MISMATCH_MESSAGE,
+    PAGE_TOKEN_TTL, STREAM_CREATING,
 };
 
 use crate::stream_tags::{
@@ -540,21 +540,11 @@ async fn a_next_token_that_names_no_page_is_refused() {
     }
     let created_at = stream_created_at(&emulator, case, REGION, "cursor-stream");
 
-    let expired = ConsumerPageToken::new(
-        &arn,
-        created_at,
-        "cursor-b",
-        SystemTime::now() - PAGE_TOKEN_TTL - Duration::from_secs(1),
-    )
-    .encode();
+    let expired_at = SystemTime::now() - PAGE_TOKEN_TTL - Duration::from_secs(1);
+    let expired = ConsumerPageToken::new(&arn, created_at, "cursor-b", expired_at).encode();
     // A token minted at an instant that has not arrived names no page this service served.
-    let future = ConsumerPageToken::new(
-        &arn,
-        created_at,
-        "cursor-b",
-        SystemTime::now() + Duration::from_secs(3_600),
-    )
-    .encode();
+    let future_at = SystemTime::now() + Duration::from_secs(3_600);
+    let future = ConsumerPageToken::new(&arn, created_at, "cursor-b", future_at).encode();
     // A token naming this ARN but another creation instant names a stream this account and
     // region do not hold: a name a delete released and a later create took again.
     let other_incarnation = ConsumerPageToken::new(
@@ -574,13 +564,19 @@ async fn a_next_token_that_names_no_page_is_refused() {
             case: "a NextToken past its lifetime".to_string(),
             body: json!({ "StreamARN": arn, "NextToken": expired }),
             expected_code: "ExpiredNextTokenException",
-            expected_message: Some(next_token_expired_message()),
+            expected_message: Some(next_token_expired_message(
+                "ListStreamConsumers",
+                epoch_millis(expired_at),
+            )),
         },
         RefusalCase {
             case: "a NextToken minted in the future".to_string(),
             body: json!({ "StreamARN": arn, "NextToken": future }),
             expected_code: "ExpiredNextTokenException",
-            expected_message: Some(next_token_expired_message()),
+            expected_message: Some(next_token_expired_message(
+                "ListStreamConsumers",
+                epoch_millis(future_at),
+            )),
         },
         RefusalCase {
             case: "a NextToken this service never issued".to_string(),

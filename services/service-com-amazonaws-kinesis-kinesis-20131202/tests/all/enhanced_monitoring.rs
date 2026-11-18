@@ -28,13 +28,27 @@
 //! Every case drives the real awsJson1_1 request path (`POST /` with `X-Amz-Target:
 //! Kinesis_20131202.<Operation>` through `MultiServiceRouter::dispatch`), so the statuses,
 //! bodies and modelled errors asserted here are the ones a client sees.
+//!
+//! What that stored set DOES is the second rule of this suite: a stream's data plane publishes
+//! its traffic as `AWS/Kinesis` CloudWatch series — stream-level for every stream with no
+//! opt-in, and additionally dimensioned by `ShardId` for exactly the metrics the stream's
+//! enhanced monitoring names — so the last case mounts CloudWatch beside Kinesis on one engine
+//! and reads those series back where a client reads them.
 
+use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use bytes::Bytes;
 use serde_json::{json, Value};
 use service_com_amazonaws_kinesis_kinesis_20131202::state::{
-    stream_not_found_message, STREAM_CREATING, STREAM_IDENTIFIER_REQUIRED_MESSAGE,
+    shard_id, stream_not_found_message, STREAM_CREATING, STREAM_IDENTIFIER_REQUIRED_MESSAGE,
 };
+use service_com_amazonaws_kinesis_kinesis_20131202::EmulatedService;
+use smithy_server_runtime::MultiServiceRouter;
 
-use crate::stream_tags::{error_code, error_message, past_activation, stream_arn, Emulator, REGION};
+use crate::stream_tags::{
+    error_code, error_message, past_activation, poll_until, stream_arn, Emulator, REGION,
+};
 
 /// Every shard-level metric enhanced monitoring reports, spelled out here rather than read
 /// from the service so a catalog that drifts fails this test instead of agreeing with
@@ -663,6 +677,507 @@ async fn a_metric_change_needs_an_identifier() {
             message.contains(STREAM_IDENTIFIER_REQUIRED_MESSAGE),
             "case {operation}: expected the message to name the identifier rule, got \
              {message:?}"
+        );
+    }
+}
+
+/// A router carrying this service AND CloudWatch over ONE shared engine: the same assembly
+/// `core/router` performs, with the two services a published metric involves — the stream's
+/// data plane writes the series, and CloudWatch's own store is where a client reads them.
+struct Monitored {
+    router: MultiServiceRouter,
+}
+
+impl Monitored {
+    fn new() -> Self {
+        let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
+        let mut router = MultiServiceRouter::new();
+        // The signature itself is not under test here, so requests are unauthenticated.
+        router.set_request_authentication(false);
+        router.register_service(EmulatedService::new(Arc::clone(&engine)));
+        router.register_service(
+            service_com_amazonaws_cloudwatch_graniteserviceversion20100801::EmulatedService::new(
+                engine,
+            ),
+        );
+        Self { router }
+    }
+
+    /// Send one request to the service `signing_name` signs for, named under `target`.
+    async fn call(&self, signing_name: &str, target: &str, body: &Value) -> (u16, Value) {
+        let request = http::Request::builder()
+            .method("POST")
+            .uri("/")
+            .header("content-type", "application/x-amz-json-1.1")
+            .header("x-amz-target", target)
+            .header(
+                "authorization",
+                format!(
+                    "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20260101/{REGION}/{signing_name}/\
+                     aws4_request, SignedHeaders=host;x-amz-target, Signature=deadbeef"
+                ),
+            )
+            .body(Bytes::from(body.to_string()))
+            .expect("build the request");
+        let response = self.router.dispatch(request).await;
+        let status = response.status().as_u16();
+        let parsed: Value = serde_json::from_slice(response.body()).unwrap_or(Value::Null);
+        (status, parsed)
+    }
+
+    /// One Kinesis operation that must succeed, returning its parsed body.
+    async fn kinesis(&self, case: &str, operation: &str, body: &Value) -> Value {
+        let (status, parsed) = self
+            .call("kinesis", &format!("Kinesis_20131202.{operation}"), body)
+            .await;
+        assert_eq!(
+            status, 200,
+            "case {case}: expected {operation} to be served, got {status} with {parsed}"
+        );
+        parsed
+    }
+
+    /// One CloudWatch operation that must succeed, returning its parsed body.
+    async fn cloudwatch(&self, case: &str, operation: &str, body: &Value) -> Value {
+        let (status, parsed) = self
+            .call(
+                "monitoring",
+                &format!("GraniteServiceVersion20100801.{operation}"),
+                body,
+            )
+            .await;
+        assert_eq!(
+            status, 200,
+            "case {case}: expected CloudWatch's {operation} to be served, got {status} with \
+             {parsed}"
+        );
+        parsed
+    }
+}
+
+/// The namespace Amazon Kinesis Data Streams publishes a stream's own metrics under
+/// (<https://docs.aws.amazon.com/streams/latest/dev/monitoring-with-cloudwatch.html>).
+const KINESIS_NAMESPACE: &str = "AWS/Kinesis";
+
+/// The dimension that names the stream a series belongs to.
+const STREAM_NAME_DIMENSION: &str = "StreamName";
+
+/// The dimension a shard-level series carries beside it.
+const SHARD_ID_DIMENSION: &str = "ShardId";
+
+/// What one series holds over a window wide enough for everything a case published.
+#[derive(Debug)]
+struct Reading {
+    /// How many datapoints the window reported.
+    datapoints: usize,
+    /// The sum of their `Sum` statistics: what the calls contributed.
+    sum: f64,
+    /// The sum of their `SampleCount` statistics: how many calls contributed.
+    sample_count: f64,
+    /// The unit each datapoint carries.
+    units: Vec<String>,
+}
+
+/// The largest difference two of these figures may show and still be the same figure: both
+/// sides are sums of whole records and whole bytes, so anything above rounding is a real
+/// divergence.
+const TOLERANCE: f64 = 1e-9;
+
+/// Read one `AWS/Kinesis` series back through CloudWatch, as a client reads it.
+async fn series(monitored: &Monitored, case: &str, metric: &str, dimensions: Value) -> Reading {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("an instant after the epoch")
+        .as_secs_f64();
+    let answered = monitored
+        .cloudwatch(
+            case,
+            "GetMetricStatistics",
+            &json!({
+                "Namespace": KINESIS_NAMESPACE,
+                "MetricName": metric,
+                "Dimensions": dimensions,
+                // A window far wider than any case needs on either side, so nothing here
+                // depends on how fast the host runs.
+                "StartTime": now - 3_600.0,
+                "EndTime": now + 3_600.0,
+                "Period": 60,
+                "Statistics": ["Sum", "SampleCount"],
+            }),
+        )
+        .await;
+    let points: Vec<Value> = answered["Datapoints"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    Reading {
+        datapoints: points.len(),
+        sum: points.iter().filter_map(|point| point["Sum"].as_f64()).sum(),
+        sample_count: points
+            .iter()
+            .filter_map(|point| point["SampleCount"].as_f64())
+            .sum(),
+        units: points
+            .iter()
+            .filter_map(|point| point["Unit"].as_str().map(str::to_string))
+            .collect(),
+    }
+}
+
+/// The dimension set a stream-level series is published under.
+fn stream_level(stream: &str) -> Value {
+    json!([{ "Name": STREAM_NAME_DIMENSION, "Value": stream }])
+}
+
+/// The dimension set a shard-level series is published under.
+fn shard_level(stream: &str, shard: &str) -> Value {
+    json!([
+        { "Name": STREAM_NAME_DIMENSION, "Value": stream },
+        { "Name": SHARD_ID_DIMENSION, "Value": shard },
+    ])
+}
+
+/// The record data every write of the metrics cases carries, so a byte sum is a record count
+/// times one record's size.
+const PAYLOAD: &str = "metrics-payload";
+
+/// The partition key every one of those writes carries, which counts towards the record's size
+/// beside its data: "when the data blob (the payload before base64-encoding) is added to the
+/// partition key size, the total size must not exceed the maximum record size"
+/// (`PutRecordInput$Data`).
+const PARTITION_KEY: &str = "metrics";
+
+/// One `PutRecord` of [`PAYLOAD`] into `stream`.
+async fn put_one(monitored: &Monitored, case: &str, stream: &str) {
+    monitored
+        .kinesis(
+            case,
+            "PutRecord",
+            &json!({
+                "StreamName": stream,
+                "PartitionKey": PARTITION_KEY,
+                "Data": aws_smithy_types::base64::encode(PAYLOAD),
+            }),
+        )
+        .await;
+}
+
+/// Create `stream` with one shard and wait for the ACTIVE its create owes it.
+async fn active_stream(monitored: &Monitored, case: &str, stream: &str) {
+    monitored
+        .kinesis(
+            case,
+            "CreateStream",
+            &json!({ "StreamName": stream, "ShardCount": 1 }),
+        )
+        .await;
+    poll_until(case, &format!("the stream {stream} is active"), || async {
+        let (status, response) = monitored
+            .call(
+                "kinesis",
+                "Kinesis_20131202.DescribeStreamSummary",
+                &json!({ "StreamName": stream }),
+            )
+            .await;
+        status == 200
+            && response["StreamDescriptionSummary"]["StreamStatus"].as_str() == Some("ACTIVE")
+    })
+    .await;
+}
+
+/// RULE: a stream's data plane publishes its traffic as `AWS/Kinesis` series — stream-level
+/// for every stream with no opt-in, and additionally dimensioned by `ShardId` for exactly the
+/// metrics the stream's own enhanced monitoring names. The sums are what the calls did: N
+/// writes of equal-length payloads come to `IncomingRecords` N and `IncomingBytes` N times
+/// that length, a read comes to `OutgoingRecords` for what it served, and a stream nothing
+/// enhanced has no shard-dimensioned series at all.
+///
+/// The cases span what the rule generalises over: both write APIs (`PutRecord` and the
+/// `PutRecords` batch) and the read, a stream with enhanced monitoring and a twin without one,
+/// metrics inside the enabled set and metrics outside it, and the window before the enable
+/// beside the window after it.
+#[tokio::test]
+async fn a_streams_data_plane_publishes_its_aws_kinesis_series() {
+    let monitored = Monitored::new();
+    let armed = "metrics-armed";
+    let bare = "metrics-bare";
+    let shard = shard_id(0);
+    let record_bytes = f64::from(
+        u32::try_from(PAYLOAD.len() + PARTITION_KEY.len())
+            .expect("the records of these cases are a few bytes long"),
+    );
+
+    let case = "before the enable";
+    active_stream(&monitored, case, armed).await;
+    active_stream(&monitored, case, bare).await;
+    for _ in 0..4 {
+        put_one(&monitored, case, armed).await;
+    }
+    for _ in 0..2 {
+        put_one(&monitored, case, bare).await;
+    }
+
+    // Every stream publishes the stream-level series with no opt-in at all...
+    for (stream, records) in [(armed, 4.0), (bare, 2.0)] {
+        let reading = series(
+            &monitored,
+            case,
+            "IncomingRecords",
+            stream_level(stream),
+        )
+        .await;
+        assert!(
+            (reading.sum - records).abs() < TOLERANCE,
+            "case {case}: expected {stream}'s stream-level IncomingRecords to sum to \
+             {records}, got {reading:?}"
+        );
+        assert!(
+            (reading.sample_count - records).abs() < TOLERANCE,
+            "case {case}: expected one observation per write of {stream}, got {reading:?}"
+        );
+        assert!(
+            reading.units.iter().all(|unit| unit == "Count"),
+            "case {case}: expected a record tally in Count, got {reading:?}"
+        );
+        let bytes = series(&monitored, case, "IncomingBytes", stream_level(stream)).await;
+        assert!(
+            (bytes.sum - records * record_bytes).abs() < TOLERANCE,
+            "case {case}: expected {stream}'s stream-level IncomingBytes to sum to the \
+             records' own data, got {bytes:?}"
+        );
+        assert!(
+            bytes.units.iter().all(|unit| unit == "Bytes"),
+            "case {case}: expected a data measurement in Bytes, got {bytes:?}"
+        );
+    }
+
+    // ... and NO shard-dimensioned series until enhanced monitoring names the metric.
+    for stream in [armed, bare] {
+        for metric in ["IncomingRecords", "IncomingBytes", "OutgoingRecords"] {
+            let reading = series(&monitored, case, metric, shard_level(stream, &shard)).await;
+            assert_eq!(
+                reading.datapoints, 0,
+                "case {case}: a stream whose enhanced monitoring names nothing publishes no \
+                 ShardId-dimensioned {metric} for {stream}, got {reading:?}"
+            );
+        }
+    }
+
+    // Arm ONE of the two streams, and write to both again: three single writes and one batch
+    // of two, so both write APIs contribute.
+    let case = "after the enable";
+    monitored
+        .kinesis(
+            case,
+            "EnableEnhancedMonitoring",
+            &json!({
+                "StreamName": armed,
+                "ShardLevelMetrics": ["IncomingRecords", "IncomingBytes", "OutgoingRecords"],
+            }),
+        )
+        .await;
+    for _ in 0..3 {
+        put_one(&monitored, case, armed).await;
+    }
+    monitored
+        .kinesis(
+            case,
+            "PutRecords",
+            &json!({
+                "StreamName": armed,
+                "Records": [
+                    {
+                        "PartitionKey": PARTITION_KEY,
+                        "Data": aws_smithy_types::base64::encode(PAYLOAD),
+                    },
+                    {
+                        "PartitionKey": PARTITION_KEY,
+                        "Data": aws_smithy_types::base64::encode(PAYLOAD),
+                    },
+                ],
+            }),
+        )
+        .await;
+    put_one(&monitored, case, bare).await;
+
+    // The stream-level series keep counting every write, before and after the enable.
+    for (stream, records) in [(armed, 9.0), (bare, 3.0)] {
+        let reading = series(&monitored, case, "IncomingRecords", stream_level(stream)).await;
+        assert!(
+            (reading.sum - records).abs() < TOLERANCE,
+            "case {case}: expected {stream}'s stream-level IncomingRecords to sum to \
+             {records}, got {reading:?}"
+        );
+    }
+
+    // The armed stream's shard-level series carry what was written AFTER the enable, under
+    // the SAME metric names, one observation per call.
+    for (metric, expected) in [
+        ("IncomingRecords", 5.0),
+        ("IncomingBytes", 5.0 * record_bytes),
+    ] {
+        let reading = series(&monitored, case, metric, shard_level(armed, &shard)).await;
+        assert!(
+            (reading.sum - expected).abs() < TOLERANCE,
+            "case {case}: expected the ShardId-dimensioned {metric} of {armed} to sum to \
+             {expected}, got {reading:?}"
+        );
+        assert!(
+            (reading.sample_count - 4.0).abs() < TOLERANCE,
+            "case {case}: expected one observation per call that wrote to the shard (three \
+             PutRecord and one PutRecords), got {reading:?}"
+        );
+    }
+
+    // A metric the enable did NOT name has no shard-dimensioned series, and the twin stream
+    // has none at all.
+    for (stream, metric) in [
+        (armed, "OutgoingBytes"),
+        (armed, "IteratorAgeMilliseconds"),
+        (bare, "IncomingRecords"),
+        (bare, "IncomingBytes"),
+    ] {
+        let reading = series(&monitored, case, metric, shard_level(stream, &shard)).await;
+        assert_eq!(
+            reading.datapoints, 0,
+            "case {case}: expected no ShardId-dimensioned {metric} for {stream}, got \
+             {reading:?}"
+        );
+    }
+
+    // The per-API families of the calls themselves, which carry no shard dimension.
+    for (metric, expected) in [
+        ("PutRecord.Success", 7.0),
+        ("PutRecords.SuccessfulRecords", 2.0),
+        ("PutRecords.TotalRecords", 2.0),
+    ] {
+        let reading = series(&monitored, case, metric, stream_level(armed)).await;
+        assert!(
+            (reading.sum - expected).abs() < TOLERANCE,
+            "case {case}: expected {metric} of {armed} to sum to {expected}, got {reading:?}"
+        );
+    }
+
+    // A series exists where its own kind of traffic happened and nowhere else: the retrieval
+    // counters have had no read yet, and the shard-dimensioned form of a counter the enable
+    // did not name stays absent whatever the stream's calls do.
+    for (metric, dimensions) in [
+        ("OutgoingRecords", stream_level(armed)),
+        ("OutgoingRecords", shard_level(armed, &shard)),
+        ("WriteProvisionedThroughputExceeded", stream_level(armed)),
+        ("WriteProvisionedThroughputExceeded", shard_level(armed, &shard)),
+        ("OutgoingBytes", shard_level(armed, &shard)),
+    ] {
+        let reading = series(&monitored, case, metric, dimensions.clone()).await;
+        assert_eq!(
+            reading.datapoints, 0,
+            "case {case}: expected no {metric} under {dimensions} while nothing of that kind \
+             has happened, got {reading:?}"
+        );
+    }
+
+    // A read of everything the armed stream holds publishes what it served, stream-level and
+    // \u2014 since the enable named it \u2014 per shard.
+    let case = "after the read";
+    let iterator = monitored
+        .kinesis(
+            case,
+            "GetShardIterator",
+            &json!({
+                "StreamName": armed,
+                "ShardId": shard,
+                "ShardIteratorType": "TRIM_HORIZON",
+            }),
+        )
+        .await["ShardIterator"]
+        .as_str()
+        .unwrap_or_else(|| panic!("case {case}: GetShardIterator reported no iterator"))
+        .to_string();
+    let page = monitored
+        .kinesis(case, "GetRecords", &json!({ "ShardIterator": iterator }))
+        .await;
+    let served = page["Records"].as_array().map(Vec::len).unwrap_or_default();
+    assert_eq!(
+        served, 9,
+        "case {case}: expected the read to serve every record written, got {page}"
+    );
+
+    for (metric, dimensions, expected) in [
+        ("OutgoingRecords", stream_level(armed), 9.0),
+        ("OutgoingRecords", shard_level(armed, &shard), 9.0),
+        ("OutgoingBytes", stream_level(armed), 9.0 * record_bytes),
+        ("GetRecords.Records", stream_level(armed), 9.0),
+        ("GetRecords.Bytes", stream_level(armed), 9.0 * record_bytes),
+        ("GetRecords.Success", stream_level(armed), 1.0),
+    ] {
+        let reading = series(&monitored, case, metric, dimensions).await;
+        assert!(
+            (reading.sum - expected).abs() < TOLERANCE,
+            "case {case}: expected {metric} to sum to {expected} after the read, got \
+             {reading:?}"
+        );
+    }
+
+    // The PUSH reader retrieves records from the same shard, so it counts into the same
+    // retrieval series beside its own per-API family: the rule is about records leaving the
+    // shard, not about which reader asked for them.
+    let case = "after the subscription";
+    let consumer = monitored
+        .kinesis(
+            case,
+            "RegisterStreamConsumer",
+            &json!({ "StreamARN": stream_arn(REGION, armed), "ConsumerName": "metrics-reader" }),
+        )
+        .await["Consumer"]["ConsumerARN"]
+        .as_str()
+        .unwrap_or_else(|| panic!("case {case}: a registration answers a ConsumerARN"))
+        .to_string();
+    poll_until(case, "the consumer reports ACTIVE", || async {
+        let (status, response) = monitored
+            .call(
+                "kinesis",
+                "Kinesis_20131202.DescribeStreamConsumer",
+                &json!({ "ConsumerARN": consumer }),
+            )
+            .await;
+        status == 200
+            && response["ConsumerDescription"]["ConsumerStatus"].as_str() == Some("ACTIVE")
+    })
+    .await;
+    let (status, _) = monitored
+        .call(
+            "kinesis",
+            "Kinesis_20131202.SubscribeToShard",
+            &json!({
+                "ConsumerARN": consumer,
+                "ShardId": shard,
+                "StartingPosition": { "Type": "TRIM_HORIZON" },
+            }),
+        )
+        .await;
+    assert_eq!(
+        status, 200,
+        "case {case}: expected the subscription to be established, got {status}"
+    );
+
+    for (metric, dimensions, expected) in [
+        // The nine records left the shard twice: once to the pull reader, once to this
+        // subscription.
+        ("OutgoingRecords", stream_level(armed), 18.0),
+        ("OutgoingRecords", shard_level(armed, &shard), 18.0),
+        ("SubscribeToShardEvent.Records", stream_level(armed), 9.0),
+        (
+            "SubscribeToShardEvent.Bytes",
+            stream_level(armed),
+            9.0 * record_bytes,
+        ),
+        ("SubscribeToShard.Success", stream_level(armed), 1.0),
+    ] {
+        let reading = series(&monitored, case, metric, dimensions).await;
+        assert!(
+            (reading.sum - expected).abs() < TOLERANCE,
+            "case {case}: expected {metric} to sum to {expected} after the subscription, got \
+             {reading:?}"
         );
     }
 }

@@ -33,8 +33,8 @@ use std::time::{Duration, SystemTime};
 
 use serde_json::{json, Value};
 use service_com_amazonaws_kinesis_kinesis_20131202::state::{
-    next_token_expired_message, shard_id, ConsumerPageToken, RegionalListing, RegionalPageToken,
-    ShardPageToken, INVALID_NEXT_TOKEN_MESSAGE, PAGE_TOKEN_TTL,
+    epoch_millis, next_token_expired_message, shard_id, ConsumerPageToken, RegionalListing,
+    RegionalPageToken, ShardPageToken, INVALID_NEXT_TOKEN_MESSAGE, PAGE_TOKEN_TTL,
 };
 
 use crate::stream_tags::{error_code, error_message, past_activation, Emulator, REGION};
@@ -155,6 +155,9 @@ struct Listing {
     live: String,
     /// A cursor this listing issued whose lifetime has elapsed.
     expired: String,
+    /// The instant that cursor was minted at, which is what the expiry refusal names the
+    /// lapse instant from: the mint instant plus the one lifetime every cursor carries.
+    expired_minted_at: SystemTime,
 }
 
 /// A request body for `listing` resuming at `token`.
@@ -176,6 +179,9 @@ fn past_lifetime() -> SystemTime {
 /// each listing over the wire and mint one expired cursor of each.
 async fn listings(emulator: &Emulator) -> Vec<Listing> {
     let case = "setup";
+    // The ONE instant every expired cursor below is minted at, so each refusal's sentence is
+    // checked against the lapse instant of the token the request carried.
+    let minted_at = past_lifetime();
     // Every create is armed first and waited out ONCE, so the setup costs one transition.
     for (name, shards) in [("cursor-alpha", 1), ("cursor-beta", 1), ("cursor-shards", 2)] {
         emulator
@@ -246,9 +252,10 @@ async fn listings(emulator: &Emulator) -> Vec<Listing> {
                 RegionalListing::Streams,
                 REGION,
                 "cursor-beta",
-                past_lifetime(),
+                minted_at,
             )
             .encode(),
+            expired_minted_at: minted_at,
         },
         Listing {
             operation: "ListShards",
@@ -261,13 +268,9 @@ async fn listings(emulator: &Emulator) -> Vec<Listing> {
                 &json!({ "StreamName": "cursor-shards", "MaxResults": 1 }),
             )
             .await,
-            expired: ShardPageToken::new(
-                &shard_stream,
-                shard_created_at,
-                &shard_id(1),
-                past_lifetime(),
-            )
-            .encode(),
+            expired: ShardPageToken::new(&shard_stream, shard_created_at, &shard_id(1), minted_at)
+                .encode(),
+            expired_minted_at: minted_at,
         },
         Listing {
             operation: "ListStreamConsumers",
@@ -284,9 +287,10 @@ async fn listings(emulator: &Emulator) -> Vec<Listing> {
                 &consumer_stream,
                 consumer_created_at,
                 "cursor-consumer-b",
-                past_lifetime(),
+                minted_at,
             )
             .encode(),
+            expired_minted_at: minted_at,
         },
         Listing {
             operation: "ListChannels",
@@ -308,9 +312,10 @@ async fn listings(emulator: &Emulator) -> Vec<Listing> {
                 RegionalListing::Channels,
                 REGION,
                 "cursor-channel",
-                past_lifetime(),
+                minted_at,
             )
             .encode(),
+            expired_minted_at: minted_at,
         },
     ];
 
@@ -423,7 +428,7 @@ async fn a_cursor_this_listing_issued_expires_only_past_its_lifetime() {
         );
         assert_eq!(
             error_message(&response),
-            next_token_expired_message(),
+            next_token_expired_message(listing.operation, epoch_millis(listing.expired_minted_at)),
             "case {case}: expected the published expiry wording, got {response}"
         );
     }

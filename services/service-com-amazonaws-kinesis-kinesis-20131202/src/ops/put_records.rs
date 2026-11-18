@@ -469,14 +469,34 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // that shard's own write quota admits it.
         let encryption_type = stream.encryption_type.clone();
         let stream_name = stream.name.clone();
+        // Which `AWS/Kinesis` series this batch is measured into: the stream's name, and the
+        // shard-level metrics its enhanced monitoring names
+        // (`crate::state::stream_metrics`). Read here, under the store guard, so the batch is
+        // booked against the setting in force when it was served.
+        let series = crate::state::StreamSeries::of(stream);
+        // What the batch stored, per shard it stored into: the records and the record DATA,
+        // which is what the incoming series measure. Per SHARD rather than per entry, because
+        // a series is an observation of one shard's traffic, whichever entry of the batch
+        // contributed it.
+        let mut stored: ::std::collections::BTreeMap<String, (usize, usize)> =
+            ::std::collections::BTreeMap::new();
+        // The entries a shard's write quota turned down, which the throughput series counts
+        // for the shard that refused them.
+        let mut throttled: ::std::collections::BTreeMap<String, usize> =
+            ::std::collections::BTreeMap::new();
         // The instant the shard's write rate is measured against, read once so every entry
         // of one call is metered at the same point of the refill rather than at a point
         // that depends on how long the loop takes.
         let charged_at = ::std::time::Instant::now();
         let mut records: Vec<PutRecordsResultEntry> = Vec::with_capacity(input.records.len());
         let mut failed = 0i32;
+        let mut total_entries = 0usize;
         for (entry, shard_index) in input.records.into_iter().zip(placements) {
             let metered = metered_bytes(&entry);
+            // The record's own SIZE is what the ingest byte series measures, which is the
+            // figure the shard's quota charges as well ([`metered_bytes`]).
+            let record_bytes = metered;
+            total_entries = total_entries.saturating_add(1);
             // "Each shard can support writes up to 1,000 records per second, up to a
             // maximum data write total of 1 MB per second" (`PutRecords`): an entry the
             // shard cannot take is REPORTED rather than refusing the call — "a single record
@@ -487,6 +507,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             if let Some((false, shard_id)) = stream.charge_write_at(shard_index, metered, charged_at)
             {
                 failed = failed.saturating_add(1);
+                *throttled.entry(shard_id.clone()).or_default() += 1;
                 records.push(PutRecordsResultEntry {
                     sequence_number: None,
                     shard_id: None,
@@ -499,13 +520,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 continue;
             }
             match stream.append_at(shard_index, entry.partition_key, entry.data, now) {
-                Some((shard_id, sequence_number)) => records.push(PutRecordsResultEntry {
-                    sequence_number: Some(sequence_number),
-                    shard_id: Some(shard_id),
-                    // Reported only for a record that failed, which this one did not.
-                    error_code: None,
-                    error_message: None,
-                }),
+                Some((shard_id, sequence_number)) => {
+                    let placed = stored.entry(shard_id.clone()).or_default();
+                    placed.0 = placed.0.saturating_add(1);
+                    placed.1 = placed.1.saturating_add(record_bytes);
+                    records.push(PutRecordsResultEntry {
+                        sequence_number: Some(sequence_number),
+                        shard_id: Some(shard_id),
+                        // Reported only for a record that failed, which this one did not.
+                        error_code: None,
+                        error_message: None,
+                    });
+                }
                 // The shard map answered this index a moment ago, under the same `&mut`
                 // borrow, so nothing reaches here — and if it did, "a single record failure
                 // does not stop the processing of subsequent records" (`PutRecords`), so
@@ -523,6 +549,64 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 }
             }
         }
+
+        // What this batch did, as the `AWS/Kinesis` series report it: the records and the
+        // record data each shard took (stream-level, and shard-level where the stream's
+        // enhanced monitoring names the metric), the entries a shard's quota turned down, and
+        // the `PutRecords` family of the call itself. Published with the store guard released,
+        // off the answer below.
+        let mut measured = crate::state::Measured::new();
+        let mut stored_records = 0usize;
+        let mut stored_bytes = 0usize;
+        for (shard_id, (shard_records, shard_bytes)) in &stored {
+            stored_records = stored_records.saturating_add(*shard_records);
+            stored_bytes = stored_bytes.saturating_add(*shard_bytes);
+            measured.record_incoming(
+                &series,
+                shard_id,
+                crate::state::counted(*shard_records),
+                crate::state::counted(*shard_bytes),
+                now,
+            );
+        }
+        let mut throttled_records = 0usize;
+        for (shard_id, shard_throttled) in &throttled {
+            throttled_records = throttled_records.saturating_add(*shard_throttled);
+            measured.record(
+                &series,
+                crate::state::WRITE_THROUGHPUT_EXCEEDED,
+                shard_id,
+                crate::state::counted(*shard_throttled),
+                now,
+            );
+        }
+        for (call_series, value) in [
+            (crate::state::PUT_RECORDS_SUCCESS, 1.0),
+            (
+                crate::state::PUT_RECORDS_BYTES,
+                crate::state::counted(stored_bytes),
+            ),
+            (
+                crate::state::PUT_RECORDS_TOTAL_RECORDS,
+                crate::state::counted(total_entries),
+            ),
+            (
+                crate::state::PUT_RECORDS_SUCCESSFUL_RECORDS,
+                crate::state::counted(stored_records),
+            ),
+            (
+                crate::state::PUT_RECORDS_FAILED_RECORDS,
+                f64::from(failed.max(0)),
+            ),
+            (
+                crate::state::PUT_RECORDS_THROTTLED_RECORDS,
+                crate::state::counted(throttled_records),
+            ),
+        ] {
+            measured.record_for_the_call(&series, call_series, value, now);
+        }
+        drop(store);
+        measured.publish(&*self.engine);
 
         Ok(PutRecordsOutput {
             records,

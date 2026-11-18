@@ -39,7 +39,7 @@ use std::time::{Duration, SystemTime};
 use bytes::Bytes;
 use serde_json::{json, Value};
 use service_com_amazonaws_kinesis_kinesis_20131202::state::{
-    next_token_expired_message, shard_id, stream_creation_time_not_found_message,
+    epoch_millis, next_token_expired_message, shard_id, stream_creation_time_not_found_message,
     stream_identifier_mismatch_message, stream_not_active_message, stream_not_found_message,
     ComAmazonawsKinesisKinesis20131202State, ShardPageToken, ACTIVATION_DELAY,
     DEFAULT_LIST_SHARDS_LIMIT, INVALID_NEXT_TOKEN_MESSAGE, LIST_SHARDS_TOKEN_TTL,
@@ -694,11 +694,12 @@ async fn list_shards_refuses_what_it_cannot_serve() {
     let other = "refusals-other";
     let other_arn = emulator.active_stream("refusals", other, Some(1)).await;
 
+    let expired_at = SystemTime::now() - LIST_SHARDS_TOKEN_TTL - Duration::from_secs(1);
     let expired = ShardPageToken::new(
         &arn,
         emulator.stream_created_at("refusals", stream),
         &shard_id(1),
-        SystemTime::now() - LIST_SHARDS_TOKEN_TTL - Duration::from_secs(1),
+        expired_at,
     )
     .encode();
     let live = ShardPageToken::new(
@@ -709,11 +710,12 @@ async fn list_shards_refuses_what_it_cannot_serve() {
     )
     .encode();
     // A token minted at an instant that has not arrived names no page this service served.
+    let future_at = SystemTime::now() + Duration::from_secs(3_600);
     let future = ShardPageToken::new(
         &arn,
         emulator.stream_created_at("refusals", stream),
         &shard_id(1),
-        SystemTime::now() + Duration::from_secs(3_600),
+        future_at,
     )
     .encode();
     // A token naming this ARN but another creation instant names a stream this account and
@@ -812,13 +814,19 @@ async fn list_shards_refuses_what_it_cannot_serve() {
             label: "a NextToken past its documented lifetime",
             body: json!({ "NextToken": expired }),
             expected_code: "ExpiredNextTokenException",
-            expected_message: Some(next_token_expired_message()),
+            expected_message: Some(next_token_expired_message(
+                "ListShards",
+                epoch_millis(expired_at),
+            )),
         },
         RefusalCase {
             label: "a NextToken minted at an instant that has not arrived",
             body: json!({ "NextToken": future }),
             expected_code: "ExpiredNextTokenException",
-            expected_message: Some(next_token_expired_message()),
+            expected_message: Some(next_token_expired_message(
+                "ListShards",
+                epoch_millis(future_at),
+            )),
         },
         RefusalCase {
             label: "a NextToken naming another incarnation of the same stream name",

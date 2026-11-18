@@ -28,8 +28,8 @@ use std::time::{Duration, SystemTime};
 
 use serde_json::json;
 use service_com_amazonaws_kinesis_kinesis_20131202::state::{
-    next_token_expired_message, RegionalListing, RegionalPageToken, INVALID_NEXT_TOKEN_MESSAGE,
-    PAGE_TOKEN_TTL,
+    epoch_millis, next_token_expired_message, RegionalListing, RegionalPageToken,
+    INVALID_NEXT_TOKEN_MESSAGE, PAGE_TOKEN_TTL,
 };
 
 use crate::channel_lifecycle::{on_demand_stream, role_arn, storage_configuration, stream_configuration};
@@ -240,11 +240,12 @@ async fn a_cursor_the_channel_listing_issued_is_served_or_expired() {
     );
 
     let case = "a cursor past its lifetime";
+    let minted_at = SystemTime::now() - PAGE_TOKEN_TTL - Duration::from_secs(1);
     let expired = RegionalPageToken::new(
         RegionalListing::Channels,
         REGION,
         "cursor-refusal-b",
-        SystemTime::now() - PAGE_TOKEN_TTL - Duration::from_secs(1),
+        minted_at,
     )
     .encode();
     let (status, response) = emulator
@@ -263,7 +264,7 @@ async fn a_cursor_the_channel_listing_issued_is_served_or_expired() {
     let message = error_message(&response);
     assert_eq!(
         message,
-        next_token_expired_message(),
+        next_token_expired_message("ListChannels", epoch_millis(minted_at)),
         "case {case}: expected the published expiry wording, got {message:?}"
     );
 }

@@ -24,8 +24,8 @@ use std::time::{Duration, SystemTime};
 
 use serde_json::{json, Value};
 use service_com_amazonaws_kinesis_kinesis_20131202::state::{
-    next_token_expired_message, shard_id, stream_not_found_message, RegionalListing,
-    RegionalPageToken,
+    epoch_millis, next_token_expired_message, shard_id, stream_not_found_message,
+    RegionalListing, RegionalPageToken,
     DELETION_DELAY, MAX_LIST_STREAMS_LIMIT, PAGE_TOKEN_TTL, SHARD_ITERATOR_TYPE_TRIM_HORIZON,
     STREAM_ACTIVE, STREAM_DELETING,
 };
@@ -336,11 +336,12 @@ async fn a_cursor_no_page_of_this_listing_was_handed_out_for_is_refused() {
         );
     }
 
+    let expired_again_at = SystemTime::now() - PAGE_TOKEN_TTL - Duration::from_secs(1);
     let expired_again = RegionalPageToken::new(
         RegionalListing::Streams,
         REGION,
         "cursor-beta",
-        SystemTime::now() - PAGE_TOKEN_TTL - Duration::from_secs(1),
+        expired_again_at,
     )
     .encode();
     let (_, message) = refused(
@@ -352,7 +353,7 @@ async fn a_cursor_no_page_of_this_listing_was_handed_out_for_is_refused() {
     .await;
     assert_eq!(
         message,
-        next_token_expired_message(),
+        next_token_expired_message("ListStreams", epoch_millis(expired_again_at)),
         "a cursor past its lifetime is refused with the service's one pagination-expiry \
          sentence"
     );

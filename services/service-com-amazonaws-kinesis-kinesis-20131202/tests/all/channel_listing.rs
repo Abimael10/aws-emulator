@@ -34,7 +34,7 @@ use std::time::{Duration, SystemTime};
 
 use serde_json::{json, Value};
 use service_com_amazonaws_kinesis_kinesis_20131202::state::{
-    channel_arn, next_token_expired_message, RegionalListing, RegionalPageToken,
+    channel_arn, epoch_millis, next_token_expired_message, RegionalListing, RegionalPageToken,
     INVALID_NEXT_TOKEN_MESSAGE, MAX_LIST_CHANNELS_LIMIT, PAGE_TOKEN_TTL,
 };
 
@@ -612,6 +612,10 @@ async fn a_listing_refuses_a_cursor_it_never_issued() {
     for name in ["cursor-a", "cursor-b"] {
         s3_channel(&emulator, REGION, name, &source).await;
     }
+    // The two instants a cursor past its lifetime is minted at, held here so the sentence each
+    // refusal names the lapse instant in is built from the SAME instant the token carries.
+    let lapsed = SystemTime::now() - PAGE_TOKEN_TTL - Duration::from_secs(1);
+    let unarrived = SystemTime::now() + Duration::from_secs(3_600);
 
     let rows = vec![
         RefusalRow {
@@ -626,11 +630,11 @@ async fn a_listing_refuses_a_cursor_it_never_issued() {
                 RegionalListing::Channels,
                 REGION,
                 "cursor-b",
-                SystemTime::now() - PAGE_TOKEN_TTL - Duration::from_secs(1),
+                lapsed,
             )
             .encode(),
             expected_code: "ExpiredNextTokenException",
-            expected_message: next_token_expired_message(),
+            expected_message: next_token_expired_message("ListChannels", epoch_millis(lapsed)),
         },
         RefusalRow {
             case: "a NextToken minted at an instant that has not arrived",
@@ -638,11 +642,14 @@ async fn a_listing_refuses_a_cursor_it_never_issued() {
                 RegionalListing::Channels,
                 REGION,
                 "cursor-b",
-                SystemTime::now() + Duration::from_secs(3_600),
+                unarrived,
             )
             .encode(),
             expected_code: "ExpiredNextTokenException",
-            expected_message: next_token_expired_message(),
+            expected_message: next_token_expired_message(
+                "ListChannels",
+                epoch_millis(unarrived),
+            ),
         },
         RefusalRow {
             case: "a NextToken minted for another region",

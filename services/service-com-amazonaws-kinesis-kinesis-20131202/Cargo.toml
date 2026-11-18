@@ -58,6 +58,10 @@ service-common = { path = "../common" }
 # A channel with a streaming table destination creates that table in S3 Tables, which owns
 # every table record: the create writes it through that service's own state.
 service-com-amazonaws-s3tables-s3tablebuckets = { workspace = true }
+# A stream's data plane publishes its own `AWS/Kinesis` series — what producers wrote, what
+# consumers read, how far behind a consumer is — into the CloudWatch store, which is the one
+# place a client reads a metric from (`crate::state::stream_metrics`).
+service-com-amazonaws-cloudwatch-graniteserviceversion20100801 = { workspace = true }
 # Who a request's credential speaks for: the session the token service minted that access key
 # id for, which is what an authorization decision is taken about.
 service-com-amazonaws-sts-awssecuritytokenservicev20110615 = { workspace = true }

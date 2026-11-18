@@ -449,6 +449,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // asks for an ordering every write to one shard of this emulator already has.
         let encryption_type = stream.encryption_type.clone();
         let stream_name = stream.name.clone();
+        // Which `AWS/Kinesis` series this write is measured into: the stream's name, and the
+        // shard-level metrics its enhanced monitoring names
+        // (`crate::state::stream_metrics`). Read here, under the store guard, so the write is
+        // booked against the setting in force when it was served.
+        let series = crate::state::StreamSeries::of(stream);
         // "Each shard can support writes up to 1,000 records per second, up to a maximum
         // data write total of 1 MB per second" (`PutRecord`): the shard the record was
         // placed in is metered, and a record it cannot take is not stored — the modelled
@@ -459,9 +464,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .as_deref()
                 .map(str::len)
                 .unwrap_or_default();
+        // The record's own SIZE, which is what the ingest byte series measures: "when the data
+        // blob (the payload before base64-encoding) is added to the partition key size, the
+        // total size must not exceed the maximum record size" (`PutRecordInput$Data`) — the
+        // same figure the shard's write quota above charges, so a dashboard reading these
+        // bytes against the shard's own limit is reading the same measure
+        // (`crate::state::DataRecord::stored_bytes`).
+        let record_bytes = crate::state::counted(metered);
         if let Some((false, shard_id)) =
             stream.charge_write_at(shard_index, metered, ::std::time::Instant::now())
         {
+            // A record the shard's quota turned down is what the throughput series counts,
+            // and the call it failed is what the per-API success series reports as a zero.
+            let mut measured = crate::state::Measured::new();
+            measured.record(
+                &series,
+                crate::state::WRITE_THROUGHPUT_EXCEEDED,
+                &shard_id,
+                1.0,
+                now,
+            );
+            measured.record_for_the_call(&series, crate::state::PUT_RECORD_SUCCESS, 0.0, now);
+            drop(store);
+            measured.publish(&*self.engine);
             return Err(throughput_exceeded(&stream_name, &shard_id));
         }
         // The shard map answered this index a moment ago, under the same `&mut` borrow, so
@@ -480,6 +505,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
+
+        // One record of `record_bytes` bytes landed in this shard: the stream-level incoming
+        // series, the shard-level one where the stream's enhanced monitoring names the metric,
+        // and the `PutRecord` family of the call itself. Published with the store guard
+        // released, off the answer below, so a metric store this engine does not hold changes
+        // nothing about what this write answers.
+        let mut measured = crate::state::Measured::new();
+        measured.record_incoming(&series, &shard_id, 1.0, record_bytes, now);
+        measured.record_for_the_call(&series, crate::state::PUT_RECORD_SUCCESS, 1.0, now);
+        measured.record_for_the_call(&series, crate::state::PUT_RECORD_BYTES, record_bytes, now);
+        drop(store);
+        measured.publish(&*self.engine);
 
         Ok(PutRecordOutput {
             shard_id,
