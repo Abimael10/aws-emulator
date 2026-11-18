@@ -95,24 +95,16 @@ async fn get_base_path_mappings_pages_through_creation_order_on_position_and_lim
     let domain_name = "collection.example.com";
     created_domain(&gateway, domain_name, json!({})).await;
 
-    // A domain name that carries no mapping reports its page member as the EMPTY list
-    // rather than a refusal or no member at all, on this collection as on every other one
-    // of this service.
+    // A domain name that carries no mapping is answered with the SUCCESS ENVELOPE ALONE:
+    // no collection member, and no cursor beside it either. What an empty 200 looks like is
+    // a fact of the OPERATION — this collection's recorded empty answer is the bare object,
+    // where the other listings of this service report the empty list — so it is pinned here,
+    // on the listing that owns it.
     let empty = page_of(&gateway, domain_name, "", "the empty collection").await;
     assert_eq!(
-        empty.get("item"),
-        Some(&json!([])),
-        "case the empty collection: expected the empty page member, got {empty:?}"
-    );
-    assert_eq!(
-        listed_base_paths(&empty, "the empty collection"),
-        Vec::<String>::new(),
-        "case the empty collection: expected no items, got {empty:?}"
-    );
-    assert!(
-        empty["position"].is_null(),
-        "case the empty collection: a single page omits position, got {:?}",
-        empty["position"]
+        empty,
+        json!({}),
+        "case the empty collection: expected the bare success envelope, got {empty:?}"
     );
 
     // The creates differ along what the rule generalises over: the SPELLING of the base
@@ -511,5 +503,83 @@ async fn the_listing_reports_the_stored_mappings_as_later_calls_leave_them() {
             "case {case}: expected the listed record to match its own read, got {listed:?} and {:?}",
             read.body
         );
+    }
+}
+
+/// RULE: an EMPTY page of this collection is answered with the envelope this listing
+/// records — the bare success object, carrying neither the `item` member nor a `position` —
+/// however the page came to hold nothing, while a page that HOLDS a mapping reports it under
+/// `item` as always.
+///
+/// The rows differ along what the rule generalises over — how the page came to be empty (a
+/// domain name that never held a mapping, one emptied of its only mapping, one emptied of
+/// several) crossed with the page size the request asked for (none, the smallest, the
+/// published maximum) — so no row is the specification. The last block is the contrast: the
+/// member is omitted because the page holds nothing, not because this listing never writes
+/// it.
+#[tokio::test]
+async fn an_empty_page_of_this_collection_is_answered_with_the_bare_success_envelope() {
+    /// The page sizes a request may ask of the collection: none at all, the smallest, and
+    /// the published maximum ("The maximum number of returned results per page. The default
+    /// value is 25 and the maximum value is 500",
+    /// `smithy_query(query="doc", shape="GetBasePathMappingsRequest", member="limit")`).
+    const PAGE_SIZES: [&str; 4] = ["", "limit=1", "limit=25", "limit=500"];
+
+    // How many mappings the domain name held before they were deleted again: none at all,
+    // one, and several — the ways a page of this collection comes to hold nothing.
+    for emptied_from in [0_usize, 1, 3] {
+        let gateway = Gateway::new();
+        let (api, stage) = deployed_api(&gateway, "empty-envelope-api", "prod").await;
+        let domain_name = format!("empty-envelope-{emptied_from}.example.com");
+        created_domain(&gateway, &domain_name, json!({})).await;
+
+        let case = format!("a domain name emptied of {emptied_from} mapping(s)");
+        for index in 0..emptied_from {
+            let base_path = format!("v{index}");
+            created_mapping(
+                &gateway,
+                &domain_name,
+                json!({ "basePath": base_path, "restApiId": api, "stage": stage }),
+                &case,
+            )
+            .await;
+        }
+        for index in 0..emptied_from {
+            crate::emptied_collection_page_member::deleted(
+                &gateway,
+                &format!("/domainnames/{domain_name}/basepathmappings/v{index}"),
+                &case,
+            )
+            .await;
+        }
+
+        for query in PAGE_SIZES {
+            let case = format!("{case} read with {query:?}");
+            let body = page_of(&gateway, &domain_name, query, &case).await;
+            assert_eq!(
+                body,
+                json!({}),
+                "case {case}: expected the bare success envelope, got {body:?}"
+            );
+        }
+
+        // The contrast: one mapping created again, and the page carries it — so what the
+        // empty answer omits is a page of nothing, not this listing's member.
+        created_mapping(
+            &gateway,
+            &domain_name,
+            json!({ "basePath": "held", "restApiId": api, "stage": stage }),
+            &case,
+        )
+        .await;
+        for query in PAGE_SIZES {
+            let case = format!("{case} holding one mapping, read with {query:?}");
+            let body = page_of(&gateway, &domain_name, query, &case).await;
+            assert_eq!(
+                listed_base_paths(&body, &case),
+                vec!["held".to_string()],
+                "case {case}: expected the stored mapping on the page, got {body:?}"
+            );
+        }
     }
 }

@@ -9,7 +9,8 @@
 //! `Attribute` names, and nothing else. The refusals keep the same order as every other
 //! FPGA-image operation of this crate: a malformed id (`InvalidFpgaImageID.Malformed`), then
 //! `DryRun` (`DryRunOperation`), then an id the account holds no AFI for
-//! (`InvalidFpgaImageID.NotFound`).
+//! (`InvalidFpgaImageID.NotFound`, worded with the sentence THIS operation is recorded
+//! answering — `crate::state::describe_fpga_image_attribute_id_not_found`).
 //!
 //! ## Shape of an operation
 //!
@@ -137,8 +138,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         use crate::state::{
-            dry_run_operation, fpga_image_id_is_well_formed, internal_error,
-            invalid_fpga_image_id_malformed, invalid_fpga_image_id_not_found,
+            describe_fpga_image_attribute_id_not_found, dry_run_operation,
+            fpga_image_id_is_well_formed, internal_error, invalid_fpga_image_id_malformed,
             require_service_state, unknown_attribute_parameter_value,
         };
 
@@ -173,7 +174,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the same attribute and a read cannot change what a later caller sees.
         let store = state.lock();
         let Some(record) = store.fpga_images.get(&input.fpga_image_id) else {
-            return Err(invalid_fpga_image_id_not_found(&input.fpga_image_id));
+            // An id inside the issued form that names no AFI of this account: worded with
+            // the sentence THIS operation is recorded answering
+            // ([`crate::state::describe_fpga_image_attribute_id_not_found`]), which is EC2's
+            // common missing-id sentence naming the `fpga-image` resource type rather than
+            // the `Image ID '<id>' not found.` the delete and the reset answer.
+            return Err(describe_fpga_image_attribute_id_not_found(
+                &input.fpga_image_id,
+            ));
         };
 
         let reported = reported_attribute(attribute, record).ok_or_else(|| {

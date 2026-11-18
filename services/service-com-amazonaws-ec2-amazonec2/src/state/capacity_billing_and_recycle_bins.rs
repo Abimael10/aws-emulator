@@ -553,17 +553,46 @@ pub fn fpga_image_id_is_well_formed(id: &str) -> bool {
 /// Refuse a request that named an AFI id the account holds no FPGA image for: HTTP 400
 /// `InvalidFpgaImageID.NotFound`.
 ///
-/// The FPGA-image id kind words BOTH its refusals about the "Image ID" the request carried,
-/// not about the `ResourceType` that spells the resource: an id nothing is stored under is
-/// `Image ID '<id>' not found.` the way an unreadable one is
-/// [`invalid_fpga_image_id_malformed`]'s `Image ID '<id>' is invalid.`, each closing with a
-/// full stop. Only the id is variable, and it is the one the REQUEST carried, bounded by
-/// [`echoed_resource_id`] the way every refusal that echoes a caller-chosen id is.
+/// The wording is the one the operations that act on ONE named AFI of their own Region — the
+/// delete and the attribute reset — are recorded answering: `Image ID '<id>' not found.`, the
+/// way an unreadable id is [`invalid_fpga_image_id_malformed`]'s `Image ID '<id>' is
+/// invalid.`, each closing with a full stop. The attribute DESCRIBE is recorded wording the
+/// same cause with EC2's common missing-id sentence instead
+/// ([`describe_fpga_image_attribute_id_not_found`]), so a reader of this refusal keeps the
+/// sentence of the operation that answers it. Only the id is variable, and it is the one the
+/// REQUEST carried, bounded by [`echoed_resource_id`] the way every refusal that echoes a
+/// caller-chosen id is.
 pub fn invalid_fpga_image_id_not_found<E>(fpga_image_id: &str) -> Scaffolded<E> {
     Scaffolded::service_error(
         INVALID_FPGA_IMAGE_ID_NOT_FOUND,
         400,
         format!("Image ID '{}' not found.", echoed_resource_id(fpga_image_id)),
+    )
+}
+
+/// Refuse a `DescribeFpgaImageAttribute` whose AFI id the account holds no FPGA image for:
+/// HTTP 400 `InvalidFpgaImageID.NotFound`.
+///
+/// The attribute DESCRIBE words this cause with EC2's common missing-id sentence
+/// ([`id_not_found_message`] — the fixed `The `, ` '` and `' does not exist` around the
+/// resource type and the id), naming the `fpga-image` resource type
+/// ([`FPGA_IMAGE_TAGGABLE_RESOURCE`], the one spelling of that type in this crate): that is
+/// the sentence its own recorded refusal carries. The operations that CHANGE the AFI an id
+/// names — the delete and the attribute reset — word the same cause their own way
+/// ([`invalid_fpga_image_id_not_found`]'s `Image ID '<id>' not found.`), which is what their
+/// recordings carry, so the sentence belongs to the operation that answers it rather than to
+/// the id kind, and neither reader is worded from the other's recording.
+///
+/// Only the id is variable, and it is the one the REQUEST carried, bounded by
+/// [`echoed_resource_id`] the way every refusal that echoes a caller-chosen id is.
+pub fn describe_fpga_image_attribute_id_not_found<E>(fpga_image_id: &str) -> Scaffolded<E> {
+    Scaffolded::service_error(
+        INVALID_FPGA_IMAGE_ID_NOT_FOUND,
+        400,
+        id_not_found_message(
+            &format!("{FPGA_IMAGE_TAGGABLE_RESOURCE} ID"),
+            &echoed_resource_id(fpga_image_id),
+        ),
     )
 }
 

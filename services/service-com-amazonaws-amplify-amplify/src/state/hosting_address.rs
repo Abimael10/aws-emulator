@@ -10,9 +10,11 @@
 //! told both composes `https://<displayName>.<defaultDomain>/` — the deployed page, the
 //! branch's basic-authorization challenge, or the redirect a rule states.
 //!
-//! The member is the DOMAIN an app's sites are published under: the app's own id under the
-//! Amplify hosting zone ([`announced_default_domain`]), a name derived from the app's record
-//! rather than from the request that created it.
+//! The member is the DOMAIN an app's sites are published under, and a domain a client is
+//! handed is a domain it RESOLVES and then dials, so it has to lead back to this emulator:
+//! the address this emulator answers on ([`announced_default_domain`]), never a name in the
+//! zone AWS publishes its own hosting under, which resolves nowhere near this process or, at
+//! worst, to genuine AWS infrastructure.
 //!
 //! The member is a DOMAIN, so the value is an address and nothing else: no scheme, no path.
 //! What that address cannot carry — which app, and which of its branches — is carried in the
@@ -34,27 +36,57 @@
 //! nothing but this emulator's own endpoint ([`hosted_site_path`], read back by
 //! [`addressed_hosted_site`]).
 
-/// The default domain an app's hosting is ANNOUNCED under: the app's own id under the
-/// Amplify hosting zone, `<appId>.amplifyapp.com`.
+/// The default domain an app's hosting is ANNOUNCED under: the address THIS emulator
+/// answers on — the endpoint the create reached, else the port this process is served on.
 ///
-/// `App$defaultDomain` is a DNS name of the app — a client composes one of its sites'
-/// addresses by prefixing a branch's label to it — so it is derived from the app's own
-/// record and from nothing about the request that created it: the value is the same
-/// whichever endpoint a client was configured with, and every later read of the app reports
-/// it unchanged.
+/// `App$defaultDomain` is a name a client RESOLVES and then dials — it composes one of the
+/// app's site addresses by prefixing a branch's label to it — so the name has to lead back
+/// to this emulator, which is the tree's one reading of the question
+/// (`service_common::data_plane_addressing::reached_emulator_endpoint` /
+/// `served_endpoint_authority`): a client on this machine resolves nothing but the endpoint
+/// it is already talking to, so that is the address to announce.
 ///
-/// The value is the name alone — no scheme and no path — and what such an address cannot
+/// AWS's own hosting zone (`<appId>.amplifyapp.com`) stands only where there is no own
+/// address to announce in its place — a request that addressed one of AWS's own hosts on an
+/// emulator served on no port at all, which is a caller that resolves those hosts and
+/// nothing of this process.
+///
+/// The value is the address alone — no scheme and no path — and what such an address cannot
 /// carry (which app, and which of its branches) is carried in the PATH this plane ALSO
 /// serves a site under ([`hosted_site_path`]), which is how a client that resolves nothing
 /// but this emulator's own endpoint reaches the site.
 ///
-/// Resolved ONCE, by the create, and persisted as the app's `defaultDomain`.
-pub fn announced_default_domain(app_id: &str) -> String {
-    format!("{app_id}.{AMPLIFY_HOSTING_ZONE}")
+/// Resolved ONCE, by the create, and persisted as the app's `defaultDomain`, so every later
+/// read of that app reports the same string whatever it is addressed at.
+pub fn announced_default_domain(
+    parts: &::http::request::Parts,
+    served_base: &str,
+    app_id: &str,
+) -> String {
+    emulator_authority(parts, served_base)
+        .unwrap_or_else(|| format!("{app_id}.{AMPLIFY_HOSTING_ZONE}"))
 }
 
-/// The zone Amplify publishes an app's hosting under, which every app's default domain is
-/// one label of: the suffix of `<appId>.amplifyapp.com`.
+/// The address this emulator answers on for the client that made this request: the
+/// emulator's own endpoint the request reached, else the port this process is served on, and
+/// `None` for a request that addressed one of AWS's own hosts on an emulator served on no
+/// port at all — which has no own address to announce.
+fn emulator_authority(parts: &::http::request::Parts, served_base: &str) -> Option<String> {
+    ::service_common::data_plane_addressing::reached_emulator_endpoint(
+        &parts.uri.to_string(),
+        parts
+            .headers
+            .get(::http::header::HOST)
+            .and_then(|value| value.to_str().ok()),
+    )
+    .or_else(|| {
+        ::service_common::data_plane_addressing::served_endpoint_authority(served_base)
+    })
+}
+
+/// The zone AWS publishes an app's hosting under, which an app announces a name of its own
+/// id in only where this emulator has no address to announce instead: the suffix of
+/// `<appId>.amplifyapp.com`.
 const AMPLIFY_HOSTING_ZONE: &str = "amplifyapp.com";
 
 /// The segment that names THIS plane under the reserved data-plane marker, ahead of the

@@ -19,8 +19,10 @@
 //! 4. AN AFI ID IS RESOLVED MALFORMED BEFORE NOT FOUND, with `DryRun` answered between
 //!    them: something that is not an AFI id at all is `InvalidFpgaImageID.Malformed`, an
 //!    authorized `DryRun` is 412 `DryRunOperation` even for an id the account holds nothing
-//!    for, and a well-formed id naming no AFI is `InvalidFpgaImageID.NotFound` — the same
-//!    refusal, in the same wording, as every other operation that resolves an AFI.
+//!    for, and a well-formed id naming no AFI is `InvalidFpgaImageID.NotFound` — in the
+//!    sentence THIS operation answers it with, which is EC2's common missing-id sentence
+//!    naming the `fpga-image` resource type rather than the one the delete and the reset
+//!    word the same cause with.
 //!
 //! Each table row is a distinct input along what the rule generalises over — which
 //! attribute of the catalog, whether the AFI holds a value for it, which id shape, which
@@ -486,16 +488,18 @@ async fn an_afi_id_and_an_attribute_are_resolved_in_one_order() {
         }
     }
 
-    // The wording of the not-found refusal is the ONE this service answers for an AFI,
-    // whichever operation resolved the id, and it names the id the REQUEST carried.
-    let expected_message = format!("Image ID '{UNKNOWN_FPGA_IMAGE_ID}' not found.");
-    let resolver_rows: [(&str, Params); 3] = [
+    // The wording of the not-found refusal is the ANSWERING OPERATION's own, and it names the
+    // id the REQUEST carried: this describe answers EC2's common missing-id sentence, naming
+    // the `fpga-image` resource type, while the delete and the reset word the same cause
+    // `Image ID '<id>' not found.`.
+    let resolver_rows: [(&str, Params, String); 3] = [
         (
             "DescribeFpgaImageAttribute",
             vec![
                 p("FpgaImageId", UNKNOWN_FPGA_IMAGE_ID),
                 p("Attribute", "loadPermission"),
             ],
+            format!("The fpga-image ID '{UNKNOWN_FPGA_IMAGE_ID}' does not exist"),
         ),
         (
             "ResetFpgaImageAttribute",
@@ -503,13 +507,15 @@ async fn an_afi_id_and_an_attribute_are_resolved_in_one_order() {
                 p("FpgaImageId", UNKNOWN_FPGA_IMAGE_ID),
                 p("Attribute", "loadPermission"),
             ],
+            format!("Image ID '{UNKNOWN_FPGA_IMAGE_ID}' not found."),
         ),
         (
             "DeleteFpgaImage",
             vec![p("FpgaImageId", UNKNOWN_FPGA_IMAGE_ID)],
+            format!("Image ID '{UNKNOWN_FPGA_IMAGE_ID}' not found."),
         ),
     ];
-    for (action, params) in resolver_rows {
+    for (action, params, expected_message) in resolver_rows {
         let (status, body) = op(&router, action, &params).await;
         assert_eq!(
             status, 400,

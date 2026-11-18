@@ -9,8 +9,11 @@
 //! hexadecimal digits, of which not every digit is `0` — and refuses anything else with HTTP
 //! 400 `InvalidFpgaImageID.Malformed` and the FPGA-image kind's own sentence,
 //! `Image ID '<value>' is invalid.`, built from the value the REQUEST sent; an id inside that
-//! form which the account holds no AFI under is the DIFFERENT answer
-//! `InvalidFpgaImageID.NotFound`, so a client can tell a typo from a missing image. The null
+//! form which the account holds no AFI under is answered by the OPERATION's own refusal —
+//! `InvalidFpgaImageID.NotFound` for the operations that resolve one named AFI of their own
+//! Region, so a client can tell a typo from a missing image, and the unreadable answer again
+//! for `CopyFpgaImage`, which judges the id of another Region it was given
+//! (`super::fpga_image_unresolvable_id_refusals` holds that per-operation table). The null
 //! (all-zero) id is outside the form because the mint counts from one, so no AFI can ever
 //! hold it.
 //!
@@ -58,8 +61,8 @@ const SOURCE_REGION: &str = REGION;
 ///
 /// `CopyFpgaImage` is in the list because it takes an AFI id too — it reads the id of its
 /// SOURCE — and it is the one operation here whose subject does not live in the Region the
-/// call is made in, though it reads that id in the same malformed-before-not-found order the
-/// other three keep.
+/// call is made in, which is why an id inside the form that names no AFI is the unreadable
+/// answer there rather than the not-found one.
 fn resolver_params(action: &str, fpga_image_id: &str) -> Params {
     match action {
         "ResetFpgaImageAttribute" | "DescribeFpgaImageAttribute" => vec![
@@ -75,12 +78,28 @@ fn resolver_params(action: &str, fpga_image_id: &str) -> Params {
 }
 
 /// The operations that resolve an AFI id of the Region they are called in: each keeps the
-/// malformed answer apart from the not-found one, as the copy does.
+/// malformed answer apart from the not-found one.
+///
+/// The not-found SENTENCE is the answering operation's own — the delete and the reset word it
+/// `Image ID '<id>' not found.`, the attribute describe with EC2's common missing-id sentence
+/// — so the table carries one expected sentence per operation
+/// ([`regional_not_found_message`]).
 const REGIONAL_RESOLVERS: [&str; 3] = [
     "DeleteFpgaImage",
     "ResetFpgaImageAttribute",
     "DescribeFpgaImageAttribute",
 ];
+
+/// The not-found sentence `action` answers an id inside the issued form that names no AFI
+/// with. Written out here, independently of the service, so the suite pins the sentence and
+/// not the code that composes it.
+fn regional_not_found_message(action: &str, fpga_image_id: &str) -> String {
+    if action == "DescribeFpgaImageAttribute" {
+        format!("The fpga-image ID '{fpga_image_id}' does not exist")
+    } else {
+        format!("Image ID '{fpga_image_id}' not found.")
+    }
+}
 
 /// One `action` call signed for the Region the suite works in.
 async fn op(router: &MultiServiceRouter, action: &str, params: &Params) -> (u16, String) {
@@ -228,9 +247,9 @@ async fn an_afi_id_outside_the_issued_form_is_refused_as_malformed() {
     );
 }
 
-/// RULE: an id INSIDE the issued form that names no stored AFI is the other answer —
-/// `InvalidFpgaImageID.NotFound`, from the copy and from the operations that resolve an AFI
-/// of their own Region alike.
+/// RULE: an id INSIDE the issued form that names no stored AFI is answered by the OPERATION's
+/// own refusal — the not-found code, with that operation's sentence, from the operations that
+/// resolve an AFI of their own Region, and the unreadable answer from the copy.
 #[tokio::test]
 async fn an_afi_id_inside_the_issued_form_is_answered_as_not_found() {
     let (router, _engine) = emulator();
@@ -250,9 +269,9 @@ async fn an_afi_id_inside_the_issued_form_is_answered_as_not_found() {
                 "case {case:?} on {action}: expected the code \
                  {INVALID_FPGA_IMAGE_ID_NOT_FOUND:?}, got {answered_code:?} in {body}"
             );
-            // The missing-resource wording is the one this service answers for an AFI, and it
-            // names the id the REQUEST carried rather than the malformed sentence.
-            let expected_message = format!("Image ID '{fpga_image_id}' not found.");
+            // The missing-resource wording is the answering OPERATION's own, and it names the
+            // id the REQUEST carried rather than the malformed sentence.
+            let expected_message = regional_not_found_message(action, &fpga_image_id);
             let message = error_message(&body);
             assert_eq!(
                 message, expected_message,
@@ -261,8 +280,9 @@ async fn an_afi_id_inside_the_issued_form_is_answered_as_not_found() {
             );
         }
 
-        // `CopyFpgaImage` resolves its source in the same order: a well-formed id naming no
-        // AFI is the not-found answer there too, in the same sentence naming the same id.
+        // `CopyFpgaImage` names its source by an id of ANOTHER Region, so it judges the id it
+        // was given: an id inside the form that names no AFI is the SAME refusal it answers a
+        // value that is no AFI id at all with, in the same sentence naming the same id.
         let params = resolver_params("CopyFpgaImage", &fpga_image_id);
         let (status, body) = op(&router, "CopyFpgaImage", &params).await;
         assert_eq!(
@@ -272,11 +292,11 @@ async fn an_afi_id_inside_the_issued_form_is_answered_as_not_found() {
         );
         let answered_code = error_code(&body);
         assert_eq!(
-            answered_code, INVALID_FPGA_IMAGE_ID_NOT_FOUND,
+            answered_code, INVALID_FPGA_IMAGE_ID_MALFORMED,
             "case {case:?} on CopyFpgaImage: expected the code \
-             {INVALID_FPGA_IMAGE_ID_NOT_FOUND:?}, got {answered_code:?} in {body}"
+             {INVALID_FPGA_IMAGE_ID_MALFORMED:?}, got {answered_code:?} in {body}"
         );
-        let expected_message = format!("Image ID '{fpga_image_id}' not found.");
+        let expected_message = format!("Image ID '{fpga_image_id}' is invalid.");
         let message = error_message(&body);
         assert_eq!(
             message, expected_message,
@@ -327,9 +347,9 @@ async fn a_stored_afi_id_resolves_until_the_delete_removes_it() {
     );
 
     // The id is still inside the form, so what changed is the resource: both readers answer
-    // the missing AFI, not a malformed id.
-    let expected_message = format!("Image ID '{fpga_image_id}' not found.");
+    // the missing AFI, not a malformed id — each in its own sentence.
     for action in ["DeleteFpgaImage", "DescribeFpgaImageAttribute"] {
+        let expected_message = regional_not_found_message(action, &fpga_image_id);
         let params = resolver_params(action, &fpga_image_id);
         let (status, body) = op(&router, action, &params).await;
         assert_eq!(
