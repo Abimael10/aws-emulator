@@ -74,15 +74,15 @@ pub const PRACTICE_CONFIGURATION_MISSING_REASON: &str = "PracticeConfigurationDo
 /// The message ARC answers when a practice run configuration is asked to be deleted while
 /// zonal autoshift is enabled for the resource.
 ///
-/// It is worded the way this service words the mirror-image conflict — the one it answers
-/// when zonal autoshift is asked to be enabled for a resource that has no configuration
-/// ([`super::PRACTICE_CONFIGURATION_REQUIRED_MESSAGE`]): the state the resource is in,
-/// then what therefore cannot be done. Like the other refusals of this service it names no
-/// identifier and has no variable part — the requirement is the same for every resource
-/// and every caller, and the caller already named the resource.
-pub const AUTOSHIFT_ENABLED_MESSAGE: &str =
-    "Zonal autoshift is enabled for the resource. Cannot delete the practice run \
-     configuration.";
+/// Two sentences: the state the resource is in, naming the status as the token the model
+/// enumerates for it (`ZonalAutoshiftStatus`: `ENABLED`), then what therefore cannot be
+/// done, about "the requested resource" — the way this service names the target of a
+/// conflict it refuses ([`PRACTICE_CONFIGURATION_EXISTS_MESSAGE`]). Like the other
+/// refusals of this service it names no identifier and has no variable part: `ENABLED` is
+/// the only status that reaches this refusal, and the requirement is the same for every
+/// resource and every caller, which already named the resource.
+pub const AUTOSHIFT_ENABLED_MESSAGE: &str = "Zonal autoshift is ENABLED. Cannot delete a \
+     practice run configuration for the requested resource.";
 
 /// The `ConflictExceptionReason` ARC names for a conflict whose cause is that zonal
 /// autoshift is enabled for the resource

@@ -22,6 +22,9 @@
 //!   asked for while it is `ENABLED` is refused 409 `ConflictException`
 //!   (`AutoShiftEnabled`) and leaves the configuration held, while the same deletion is
 //!   served once autoshift is disabled;
+//! * that refusal's MESSAGE is the fixed sentence pair of its class, the same words for
+//!   every resource, caller and held configuration, carrying nothing of the request or of
+//!   the store — pinned as a literal below;
 //! * there is no precondition that a configuration exist: the operation is `@idempotent`,
 //!   so a deletion asked of a resource that holds none — including a second deletion of
 //!   one just removed — is SERVED, answers exactly what the first did, and leaves the
@@ -266,6 +269,97 @@ async fn deleting_a_configuration_while_zonal_autoshift_is_enabled_is_refused_40
              {answer}"
         );
         assert_holds_nothing(&router, &case, target).await;
+    }
+}
+
+/// The sentence ARC states when a deletion is asked for while zonal autoshift is `ENABLED`
+/// for the resource, pinned here as a LITERAL rather than through the constant the crate
+/// exports: both sentences are fixed text of the refusal class — the status named as the
+/// token `ZonalAutoshiftStatus` enumerates, then the action it blocks, about "the requested
+/// resource" — so a row that reverts to prose composed from the request or the store fails.
+const AUTOSHIFT_ENABLED_SENTENCE: &str = "Zonal autoshift is ENABLED. Cannot delete a \
+     practice run configuration for the requested resource.";
+
+#[tokio::test]
+async fn the_autoshift_enabled_refusal_states_one_fixed_sentence() {
+    let (router, engine) = emulator();
+    register(&engine, REGISTERED_ARN, "practice-run-eks", REGISTERED_ZONES);
+    let mut targets: Vec<String> = seeded(&engine).into_iter().map(|(arn, _)| arn).collect();
+    targets.push(REGISTERED_ARN.to_string());
+
+    // The rows cross what the rule generalises over: WHICH resource the deletion names and
+    // how it reached ARC (seeded, each deployed in a different number of zones, and one its
+    // owner registered) by WHICH configuration the resource holds (every configuration the
+    // create suite spans, from the one member the model requires to every list at its
+    // largest). The sentence is a property of the refusal class, so every row states it.
+    for target in &targets {
+        for row in ROWS {
+            let case = format!("{target}, holding {}", row.case);
+            let held = hold(&router, row, target).await;
+            let (status, enabled) = set_autoshift(&router, target, "ENABLED").await;
+            assert_eq!(
+                status, 200,
+                "case {case:?}: enabling zonal autoshift answers 200, got {status} {enabled}"
+            );
+
+            let (status, body) = delete(&router, target).await;
+            assert_eq!(status, 409, "case {case:?}: expected 409, got {status} {body}");
+            assert_eq!(
+                error_code(&body),
+                "ConflictException",
+                "case {case:?}: expected ConflictException, got {body}"
+            );
+            assert_eq!(
+                body["reason"].as_str(),
+                Some(AUTOSHIFT_ENABLED_REASON),
+                "case {case:?}: expected reason {AUTOSHIFT_ENABLED_REASON}, got {body}"
+            );
+            let message = body["message"].as_str().unwrap_or_else(|| {
+                panic!("case {case:?}: a refusal states a message, got {body}")
+            });
+            assert_eq!(
+                message, AUTOSHIFT_ENABLED_SENTENCE,
+                "case {case:?}: expected {AUTOSHIFT_ENABLED_SENTENCE:?}, got {message:?}"
+            );
+
+            // The sentence carries nothing of the request or of the store: not the target,
+            // not the resource's name, not an alarm the held configuration names.
+            let (_, view) = get_managed_resource(&router, target).await;
+            let mut withheld: Vec<String> = vec![target.clone()];
+            withheld.extend(view["name"].as_str().map(str::to_string));
+            for member in ["outcomeAlarms", "blockingAlarms"] {
+                withheld.extend(
+                    held.get(member)
+                        .and_then(Value::as_array)
+                        .into_iter()
+                        .flatten()
+                        .filter_map(|alarm| alarm["alarmIdentifier"].as_str())
+                        .map(str::to_string),
+                );
+            }
+            for value in &withheld {
+                assert!(
+                    !message.contains(value.as_str()),
+                    "case {case:?}: the sentence must not carry {value:?}, got {message:?}"
+                );
+            }
+
+            // The refusal is the resource's state and not the operation: once the
+            // authorization resting on the configuration is withdrawn the same deletion is
+            // served, which is also the state the next row starts from.
+            let (status, disabled) = set_autoshift(&router, target, "DISABLED").await;
+            assert_eq!(
+                status, 200,
+                "case {case:?}: disabling zonal autoshift answers 200, got {status} {disabled}"
+            );
+            let (status, answer) = delete(&router, target).await;
+            assert_eq!(
+                status, 200,
+                "case {case:?}: the deletion is served once autoshift is disabled, got \
+                 {status} {answer}"
+            );
+            assert_holds_nothing(&router, &case, target).await;
+        }
     }
 }
 
