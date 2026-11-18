@@ -1587,11 +1587,22 @@ pub const ASSUME_ROLE_PUBLISHED_CONDITION_KEYS: &[&str] = &[
 /// The `aws:RequestTag/` family: every session tag THIS mint sets, which is exactly the
 /// set the request named plus the ones the calling session carries forward. A mint knows
 /// all of them, so the family is published and a clause over a tag key the mint does not
-/// set is decided — as absent — rather than left undecided.
-const REQUEST_TAG_CONDITION_KEY_FAMILY: &str = "aws:RequestTag/";
+/// set is decided — as absent — rather than left undecided. The workspace's one spelling of
+/// it ([`::service_common::attached_session_tags`]).
+const REQUEST_TAG_CONDITION_KEY_FAMILY: &str =
+    ::service_common::attached_session_tags::REQUEST_TAG_CONDITION_KEY_FAMILY;
 
 /// The `aws:PrincipalTag/` family: the session tags the CALLING principal carries.
 const PRINCIPAL_TAG_CONDITION_KEY_FAMILY: &str = "aws:PrincipalTag/";
+
+/// The condition keys the session tags ONE mint attaches publish about that mint, and the
+/// key families such a mint publishes: the workspace's one rendering of them
+/// ([`::service_common::attached_session_tags`], which every service that mints a tagged
+/// session shares), re-exported under this module's own names because its callers reach
+/// every other condition-key rule through here.
+pub use ::service_common::attached_session_tags::{
+    attached_tag_conditions as attached_tag_condition_context, ATTACHED_TAG_PUBLISHED_CONDITION_KEYS,
+};
 
 /// The condition keys an `AssumeRole` mint by `caller` publishes
 /// ([`ASSUME_ROLE_PUBLISHED_CONDITION_KEYS`]), plus the tag key FAMILIES whose values are
@@ -1706,10 +1717,7 @@ pub fn assume_role_condition_context(
     for (key, value) in &caller.tags {
         context.push((format!("aws:PrincipalTag/{key}"), value.clone()));
     }
-    for (key, value) in tags {
-        context.push((format!("aws:RequestTag/{key}"), value.clone()));
-        context.push(("aws:TagKeys".to_string(), key.clone()));
-    }
+    context.extend(attached_tag_condition_context(tags));
     for key in transitive_tag_keys {
         context.push(("sts:TransitiveTagKeys".to_string(), key.clone()));
     }

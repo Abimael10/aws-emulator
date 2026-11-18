@@ -36,19 +36,21 @@ use super::*;
 /// under the tag key `Department`. It is the key a role's trust policy gates a tagged assume
 /// on, and it answers for the tags of THIS request rather than for those the caller already
 /// carries.
-pub const REQUEST_TAG_CONDITION_KEY_FAMILY: &str = "aws:RequestTag/";
+pub const REQUEST_TAG_CONDITION_KEY_FAMILY: &str =
+    ::service_common::attached_session_tags::REQUEST_TAG_CONDITION_KEY_FAMILY;
 
 /// The condition key carrying every tag KEY the assume requests, which is what a trust policy
 /// that bounds WHICH tags may be passed is written over. Multi-valued, so a policy decides it
 /// under one of IAM's set qualifiers.
-pub const TAG_KEYS_CONDITION_KEY: &str = "aws:TagKeys";
+pub const TAG_KEYS_CONDITION_KEY: &str =
+    ::service_common::attached_session_tags::TAG_KEYS_CONDITION_KEY;
 
 /// The condition keys a TAGGED assume publishes beside the web-identity ones
 /// ([`super::WEB_IDENTITY_PUBLISHED_CONDITION_KEYS`], which names these too): declared so a
 /// clause over a tag the vend does NOT request is decided as absent rather than left
 /// undecided.
 pub const SESSION_TAG_PUBLISHED_CONDITION_KEYS: &[&str] =
-    &[REQUEST_TAG_CONDITION_KEY_FAMILY, TAG_KEYS_CONDITION_KEY];
+    ::service_common::attached_session_tags::ATTACHED_TAG_PUBLISHED_CONDITION_KEYS;
 
 /// The condition keys `tags` publish about the assume requesting them: one
 /// `aws:RequestTag/<key>` per tag, and one [`TAG_KEYS_CONDITION_KEY`] value per tag key.
@@ -56,17 +58,13 @@ pub const SESSION_TAG_PUBLISHED_CONDITION_KEYS: &[&str] =
 /// Appended to the keys the exchange itself publishes
 /// ([`super::web_identity_condition_context`]) so ONE context decides the trust policy: the
 /// pool, the identity, the authentication methods, and the tags the assume asks to attach.
+/// The rendering is the workspace's one
+/// ([`::service_common::attached_session_tags::attached_tag_conditions`]), shared with the
+/// STS mints that attach session tags of their own, so a trust policy written over one of
+/// those keys is decided alike whichever mint it gates.
 #[must_use]
 pub fn requested_session_tag_conditions(tags: &[(String, String)]) -> Vec<(String, String)> {
-    let mut context = Vec::with_capacity(tags.len() * 2);
-    for (key, value) in tags {
-        context.push((
-            format!("{REQUEST_TAG_CONDITION_KEY_FAMILY}{key}"),
-            value.clone(),
-        ));
-        context.push((TAG_KEYS_CONDITION_KEY.to_string(), key.clone()));
-    }
-    context
+    ::service_common::attached_session_tags::attached_tag_conditions(tags)
 }
 
 impl ComAmazonawsCognitoidentityAwscognitoidentityserviceState {

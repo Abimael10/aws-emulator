@@ -34,6 +34,26 @@
 //!   for `sts:AssumeRoleWithWebIdentity` with the audience and subject the token carries;
 //!   otherwise `AccessDenied`.
 //!
+//! ## The session tags the exchange attaches
+//!
+//! A web identity can arrive TAGGED: an issuer that tags the identity its token names
+//! carries those pairs in the token itself — the `https://aws.amazon.com/tags` claim's
+//! `principal_tags` for a token an issuer signed, and the `PrincipalTags` the issuance
+//! recorded for a token this emulator minted (`GetOpenIdTokenForDeveloperIdentity`) — and
+//! this operation takes no `Tags` member of its own, so the token is the only place they
+//! come from. They are attached to the session this exchange mints, which is what
+//! `aws:PrincipalTag/<key>` answers for every request the vended credential later signs, so
+//! a policy in force on the assumed role that grants an action only under a tag value
+//! decides on the identity's own attributes.
+//!
+//! Attaching them needs one grant more than the assume: "To pass session tags, the
+//! principal must have the `sts:TagSession` permission" (`AssumeRole$Tags`, this service's
+//! model), so a role whose trust policy admits only the web-identity assume is NOT assumed
+//! with tags and the exchange is refused — the same decision `AssumeRole` takes for the
+//! tags a request passes it. The tags also publish `aws:RequestTag/<key>` and `aws:TagKeys`
+//! to that decision, so a trust policy that bounds WHICH tags may be passed decides this
+//! exchange on the pairs the token carries.
+//!
 //! `ProviderId` names "the fully qualified host component of the domain name of the OAuth
 //! 2.0 identity provider" and is read NOWHERE here: it describes an OAuth 2.0 access
 //! token, which is not a token this emulator issues, so a request naming one is answered
@@ -339,8 +359,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         use crate::state::{
             packed_policy_bytes, packed_policy_size, packed_policy_too_large_message,
             parse_role_arn, policy_document_error, sts_arn, Identity, NewSession, SessionKind,
-            SessionPolicies, ASSUME_ROLE_DEFAULT_DURATION_SECONDS, MAX_MANAGED_SESSION_POLICIES,
-            SESSION_TOKEN_SIZE_LIMIT,
+            SessionPolicies, ASSUME_ROLE_DEFAULT_DURATION_SECONDS,
+            ATTACHED_TAG_PUBLISHED_CONDITION_KEYS, MAX_MANAGED_SESSION_POLICIES,
+            SESSION_TOKEN_SIZE_LIMIT, TAG_SESSION_ACTION,
         };
 
         let now = ::std::time::SystemTime::now();
@@ -390,8 +411,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // The packed-token rule this service applies to every mint: the measured size of
-        // the session policies and session tags (this operation carries no session tags),
-        // refused past the token budget with the size and the limit named.
+        // the session policies and session tags this REQUEST carries — the operation has no
+        // `Tags` member, so the only session tags of this exchange are the ones the token
+        // itself carries, which no request of the caller's packs — refused past the token
+        // budget with the size and the limit named.
         let packed_bytes = packed_policy_bytes(input.policy.as_deref(), &named_policy_arns, &[]);
         let packed_policy = packed_policy_size(input.policy.as_deref(), &named_policy_arns, &[]);
         if packed_bytes > SESSION_TOKEN_SIZE_LIMIT {
@@ -418,13 +441,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // token — its claims, named after the provider (`crate::state::web_identity`).
         let principals = crate::state::web_identity::principals(&web_identity.identity.issuer);
         let context = crate::state::web_identity::condition_context(&web_identity);
+        // The session tags this exchange attaches: the principal tags the PRESENTED TOKEN
+        // carries, which is the only place they can come from here (see the module docs).
+        let session_tags = web_identity.identity.principal_tags.clone();
+        // The decision is taken over the keys the tags publish about this mint beside the
+        // exchange's own, so a trust policy gated on `aws:RequestTag/<key>` admits the
+        // identities whose tag value satisfies it and refuses the others.
+        let mut decision_context = context.clone();
+        decision_context.extend(crate::state::attached_tag_condition_context(&session_tags));
         let published = crate::state::web_identity::published_condition_keys(&web_identity);
-        let published: Vec<&str> = published.iter().map(String::as_str).collect();
+        let mut published: Vec<&str> = published.iter().map(String::as_str).collect();
+        published.extend(ATTACHED_TAG_PUBLISHED_CONDITION_KEYS.iter().copied());
         let admitted = role.as_ref().is_some_and(|role| {
             role.trust_policy_admits(
                 crate::state::ASSUME_ROLE_WITH_WEB_IDENTITY_ACTION,
                 &principals,
-                &context,
+                &decision_context,
                 &published,
             )
         });
@@ -432,9 +464,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // no record of and a role whose trust policy withholds the grant are worded alike.
         let Some(role) = role.filter(|_| admitted) else {
             return Err(crate::scaffolded::Scaffolded::access_denied(
-                WEB_IDENTITY_NOT_AUTHORIZED_MESSAGE,
+                not_authorized_message(crate::state::ASSUME_ROLE_WITH_WEB_IDENTITY_ACTION),
             ));
         };
+
+        // Attaching the token's tags is a SEPARATE grant from the assume: "To pass session
+        // tags, the principal must have the `sts:TagSession` permission"
+        // (`AssumeRole$Tags`), and the mint that SETS tags on the new session is what needs
+        // it — so a role whose trust policy admits only the web-identity assume cannot be
+        // assumed WITH the tags the token carries. Asked only of an exchange that really
+        // attaches one: a token carrying none attaches none and needs no grant to pass one.
+        if !session_tags.is_empty()
+            && !role.trust_policy_admits(
+                TAG_SESSION_ACTION,
+                &principals,
+                &decision_context,
+                &published,
+            )
+        {
+            return Err(crate::scaffolded::Scaffolded::access_denied(
+                not_authorized_message(TAG_SESSION_ACTION),
+            ));
+        }
 
         // The authorization boundary is behind us, so the request's OWN session policy is
         // read now: an inline session policy must be a JSON policy document, and the refusal
@@ -496,6 +547,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // The role's own id, which IDENTIFIES the principal this session speaks for;
                 // see `Session::role_id`.
                 role_id: Some(role.role_id.clone()),
+                // The tags the presented token carries are attached to the session it mints:
+                // they are what `aws:PrincipalTag/<key>` answers for every request this
+                // credential signs.
+                tags: session_tags,
                 // The identity the exchanged token established travels with the session it
                 // mints, so a request the vended credential signs is decided against the
                 // very keys this assume was decided under
@@ -556,12 +611,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     }
 }
 
-/// How AWS words the refusal of a web identity the role's trust policy does not admit —
-/// which is also the answer for a role the account does not hold, because STS does not
-/// disclose whether the resource exists. A web identity presents no Amazon Web Services
-/// principal, so the sentence names the action alone.
-const WEB_IDENTITY_NOT_AUTHORIZED_MESSAGE: &str =
-    "Not authorized to perform sts:AssumeRoleWithWebIdentity";
+/// How AWS words the refusal of a web identity exchange the role's trust policy does not
+/// admit — which is also the answer for a role the account does not hold, because STS does
+/// not disclose whether the resource exists. A web identity presents no Amazon Web Services
+/// principal, so the sentence names the action alone: the assume itself, or the
+/// `sts:TagSession` the tags the token carries need beside it.
+fn not_authorized_message(action: &str) -> String {
+    format!("Not authorized to perform {action}")
+}
 
 /// The modelled failure AWS answers for a token that stands for no web identity, and the
 /// sentence it states it with.

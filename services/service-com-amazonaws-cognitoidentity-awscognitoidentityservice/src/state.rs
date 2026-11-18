@@ -4120,6 +4120,18 @@ pub fn record_issued_web_identity<Eng: Send + Sync + 'static>(
             subject: issued.identity_id.clone(),
             authentication_methods: authentication_methods(&issued.authenticated_by),
             expires_at: issued.expiration,
+            // The `PrincipalTags` the issuing call asked for travel WITH the issuance: they
+            // are tags of the identity the token names, so the service that redeems the
+            // token attaches them to the session it mints
+            // (`SetPrincipalTagAttributeMap`'s own doc: principal tags "enable you to
+            // reference user attributes in your IAM permissions policy"). An issuance that
+            // carried none records none.
+            principal_tags: issued
+                .principal_tags
+                .iter()
+                .flatten()
+                .map(|(tag_key, value)| (tag_key.clone(), value.clone()))
+                .collect(),
         },
         now,
     );

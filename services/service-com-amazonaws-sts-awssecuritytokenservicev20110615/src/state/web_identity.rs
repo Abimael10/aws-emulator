@@ -60,6 +60,18 @@ const EXPIRY_CLAIM: &str = "exp";
 /// `<provider>:amr` value per method.
 const AUTHENTICATION_METHODS_CLAIM: &str = "amr";
 
+/// The claim an identity provider carries the SESSION TAGS of its token in: an OpenID
+/// Connect provider that tags the identity its token names writes them under the
+/// `https://aws.amazon.com/tags` claim, whose `principal_tags` member holds one tag key per
+/// member with the value(s) it carries (AWS IAM User Guide, *Passing session tags using
+/// `AssumeRoleWithWebIdentity`*). A token this emulator ITSELF issued carries them as the
+/// issuance recorded them instead ([`IssuedWebIdentity::principal_tags`]), which is the
+/// evidence it holds in place of a signature.
+const SESSION_TAGS_CLAIM: &str = "https://aws.amazon.com/tags";
+
+/// The member of [`SESSION_TAGS_CLAIM`] holding the tags themselves, keyed by tag key.
+const PRINCIPAL_TAGS_MEMBER: &str = "principal_tags";
+
 /// How AWS words the refusal of a value that is not a readable identity token, including one
 /// that carries no expiry at all: an ID token is a JSON Web Token, and an OAuth 2.0 ACCESS
 /// token presented in its place is the mistake the sentence names.
@@ -151,7 +163,8 @@ impl TokenDefect {
 #[derive(Debug, Clone)]
 pub struct WebIdentity {
     /// The identity the exchange reports: the issuer, the audience, the subject, the
-    /// authentication methods and the token's own expiry.
+    /// authentication methods, the principal tags the token carries and the token's own
+    /// expiry.
     pub identity: IssuedWebIdentity,
     /// The claims the token carried, for a token whose issuer signed it; empty for an
     /// issuance this emulator made itself.
@@ -376,6 +389,7 @@ fn identity_of(token: &jwt::CompactJws, expiry: i64) -> WebIdentity {
                 .get(AUTHENTICATION_METHODS_CLAIM)
                 .map(authentication_methods)
                 .unwrap_or_default(),
+            principal_tags: claimed_principal_tags(&token.claims),
             // An instant past what the clock type can represent is not an expiry any
             // comparison can be made against, so it reads as the epoch rather than
             // overflowing: the token was admitted by the comparison above, which was made on
@@ -386,6 +400,42 @@ fn identity_of(token: &jwt::CompactJws, expiry: i64) -> WebIdentity {
         },
         claims: token.claims.clone(),
     }
+}
+
+/// The PRINCIPAL TAGS a verified token carries: the pairs its [`SESSION_TAGS_CLAIM`] states,
+/// in tag-key order, each with the first value its member carries (a tag is one value, and
+/// the claim writes it as a list of them).
+///
+/// Bounded by what one session may hold ([`super::MAX_SESSION_TAGS`], "You can pass up to 50
+/// session tags", `AssumeRole$Tags`): the tags of the session this token mints are kept in
+/// that session's record, so a claim naming more than a session can hold contributes only
+/// the tags, in key order, that fit.
+///
+/// A token carrying no such claim, or carrying it as anything but the documented structure,
+/// states no tag at all: there is no pair for a session to be tagged with.
+fn claimed_principal_tags(
+    claims: &::serde_json::Map<String, ::serde_json::Value>,
+) -> Vec<(String, String)> {
+    let Some(::serde_json::Value::Object(tags)) = claims.get(SESSION_TAGS_CLAIM) else {
+        return Vec::new();
+    };
+    let Some(::serde_json::Value::Object(principal_tags)) = tags.get(PRINCIPAL_TAGS_MEMBER)
+    else {
+        return Vec::new();
+    };
+    principal_tags
+        .iter()
+        .filter_map(|(tag_key, value)| {
+            Some((tag_key.clone(), scalar_values(value).into_iter().next()?))
+        })
+        // The member order of the claim's own document is the ISSUER's; the tags of a session
+        // are held in tag-key order, so they are ordered by key here — which is also what
+        // makes the ceiling below cut at the same tags for one claim however that document
+        // happened to be written.
+        .collect::<::std::collections::BTreeMap<String, String>>()
+        .into_iter()
+        .take(super::MAX_SESSION_TAGS)
+        .collect()
 }
 
 /// The audience a token claims. RFC 7519 §4.1.3 writes `aud` as a string, or as an array of
@@ -501,4 +551,126 @@ fn numeric_date(value: &::serde_json::Value) -> Option<i64> {
     // A float-to-integer cast saturates at the integer's bounds rather than wrapping, so an
     // instant beyond them reads as the nearest representable one.
     Some(seconds.trunc() as i64)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{claimed_principal_tags, SESSION_TAGS_CLAIM};
+
+    /// The claim set a token carrying `tags` under the session-tags claim has.
+    fn claims(tags: ::serde_json::Value) -> ::serde_json::Map<String, ::serde_json::Value> {
+        let mut claims = ::serde_json::Map::new();
+        claims.insert("sub".to_string(), ::serde_json::json!("user-1"));
+        claims.insert(SESSION_TAGS_CLAIM.to_string(), tags);
+        claims
+    }
+
+    /// One row of the table below: the case, the token's claim set, and the tags it carries.
+    type ClaimRow = (
+        &'static str,
+        ::serde_json::Map<String, ::serde_json::Value>,
+        Vec<(&'static str, &'static str)>,
+    );
+
+    /// RULE: the principal tags a verified token carries are the `principal_tags` member of
+    /// its `https://aws.amazon.com/tags` claim, one value per tag key, in tag-key order; a
+    /// token carrying that claim in any other shape carries no tag at all.
+    ///
+    /// The rows differ along what the rule generalises over: how many tags the claim states,
+    /// how the claim writes a value (the documented list, a bare scalar, a non-scalar), and
+    /// the shapes that state no tag (claim absent, claim not an object, member missing).
+    #[test]
+    fn a_tokens_session_tags_claim_states_its_principal_tags() {
+        // (case, the token's claim set, the tags it carries)
+        let rows: Vec<ClaimRow> = vec![
+            (
+                "one tag, written the documented way",
+                claims(::serde_json::json!({"principal_tags": {"department": ["engineering"]}})),
+                vec![("department", "engineering")],
+            ),
+            (
+                "several tags, reported in tag-key order",
+                claims(::serde_json::json!({
+                    "principal_tags": {"tenant": ["acme"], "department": ["engineering"]},
+                    "transitive_tag_keys": ["tenant"],
+                })),
+                vec![("department", "engineering"), ("tenant", "acme")],
+            ),
+            (
+                "a value written as a bare string",
+                claims(::serde_json::json!({"principal_tags": {"tenant": "acme"}})),
+                vec![("tenant", "acme")],
+            ),
+            (
+                "a value list naming several values: the tag takes the first",
+                claims(::serde_json::json!({"principal_tags": {"tenant": ["acme", "globex"]}})),
+                vec![("tenant", "acme")],
+            ),
+            (
+                "a value that is no scalar at all",
+                claims(::serde_json::json!({"principal_tags": {"tenant": {"name": "acme"}}})),
+                Vec::new(),
+            ),
+            (
+                "the claim carrying no principal tags member",
+                claims(::serde_json::json!({"transitive_tag_keys": ["tenant"]})),
+                Vec::new(),
+            ),
+            (
+                "the member written as something other than a map",
+                claims(::serde_json::json!({"principal_tags": ["tenant"]})),
+                Vec::new(),
+            ),
+            (
+                "the claim written as something other than an object",
+                claims(::serde_json::json!("tenant=acme")),
+                Vec::new(),
+            ),
+            ("no such claim at all", ::serde_json::Map::new(), Vec::new()),
+        ];
+
+        for (case, claims, expected) in rows {
+            let actual = claimed_principal_tags(&claims);
+            let expected: Vec<(String, String)> = expected
+                .iter()
+                .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
+                .collect();
+            assert_eq!(
+                actual, expected,
+                "case {case:?}: expected {expected:?}, got {actual:?}"
+            );
+        }
+    }
+
+    /// RULE: a claim naming more tags than one session may hold contributes only the tags, in
+    /// key order, that fit — the ceiling is the one the model states for a session's tags.
+    #[test]
+    fn a_claim_past_the_session_tag_ceiling_contributes_only_what_fits() {
+        let ceiling = super::super::MAX_SESSION_TAGS;
+        // The rows walk the bound: under it, exactly at it, and one and ten past it.
+        for named in [1, ceiling - 1, ceiling, ceiling + 1, ceiling + 10] {
+            let mut principal_tags = ::serde_json::Map::new();
+            for index in 0..named {
+                // Keyed so the order is the tag-key order the reader reports.
+                principal_tags.insert(format!("tag{index:04}"), ::serde_json::json!(["value"]));
+            }
+            let carried = claimed_principal_tags(&claims(::serde_json::json!({
+                "principal_tags": ::serde_json::Value::Object(principal_tags),
+            })));
+            let expected = named.min(ceiling);
+            assert_eq!(
+                carried.len(),
+                expected,
+                "case {named} tag(s) named: expected {expected} carried, got {}",
+                carried.len()
+            );
+            for (position, (key, value)) in carried.iter().enumerate() {
+                assert_eq!(
+                    (key.as_str(), value.as_str()),
+                    (format!("tag{position:04}").as_str(), "value"),
+                    "case {named} tag(s) named: expected the tags in key order, got {carried:?}"
+                );
+            }
+        }
+    }
 }

@@ -312,6 +312,10 @@ pub mod agentcore_resources;
 /// cannot otherwise see.
 pub mod arc_managed_resources;
 pub mod arn;
+/// The condition keys the session tags one mint ATTACHES publish about that mint — the
+/// `aws:RequestTag/<key>` family and `aws:TagKeys` — for every service that mints a tagged
+/// session.
+pub mod attached_session_tags;
 /// Who judges the `@connections` endpoint a request was addressed through — whether its
 /// invoke path names a stage an api of this emulator has DEPLOYED — installed by the
 /// service that owns apis and stages and called by the service that serves `@connections`,

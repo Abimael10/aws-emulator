@@ -24,6 +24,16 @@
 //! unauthenticated one. The issuance is recorded in `open_id_tokens`, so the service can
 //! later say which identity a token it issued names and until when.
 //!
+//! The issuance also records the PRINCIPAL TAGS the minted token carries: this call takes no
+//! `PrincipalTags` member of its own, so they are the ones the pool MAPS for the providers
+//! the presented logins were made under, read out of those tokens' claims
+//! ([`crate::state::session_tags`] — the very reading `GetCredentialsForIdentity` makes for
+//! the same logins). They travel with the issuance because the token is what carries them to
+//! the exchange the classic flow makes next: `sts:AssumeRoleWithWebIdentity` attaches the
+//! tags the presented token carries to the session it mints, which is what
+//! `aws:PrincipalTag/<key>` then answers for the credential's own requests. A pool that maps
+//! none mints a token carrying none.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -422,15 +432,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> GetOpenIdToken<En
         // What the clock has already expired is forgotten here, and the store is kept
         // inside this emulator's own ceiling on outstanding tokens; then this issuance is
         // recorded, which is what lets the service say later which identity the token it
-        // handed out names. This call carries no `PrincipalTags` member, so the record
-        // names none rather than an empty map.
+        // handed out names. This call carries no `PrincipalTags` member of its own, so the
+        // tags the issuance records are the ones the POOL maps for the providers the
+        // presented logins were made under, read out of those tokens' own claims — the same
+        // reading the enhanced flow's vend makes for the same logins
+        // (`crate::state::session_tags`), so one exchange and one token of one login carry
+        // one set of principal tags. A pool that maps none records none rather than an empty
+        // map.
+        let mapped_tags = store.requested_session_tags(&identity_pool_id, &logins);
         let issued = crate::state::IssuedOpenIdToken {
             identity_id: input.identity_id.clone(),
             identity_pool_id,
             issued_at: now,
             expiration,
             authenticated_by: providers.clone(),
-            principal_tags: None,
+            principal_tags: (!mapped_tags.is_empty()).then(|| mapped_tags.into_iter().collect()),
         };
         store.record_open_id_token(token.clone(), issued.clone(), now);
         // The same issuance, in the registry the service that REDEEMS this token reads

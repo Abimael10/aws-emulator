@@ -39,7 +39,7 @@ pub const MAX_ISSUED_TOKENS: usize = 10_000;
 /// What one issued web identity token stands for: the three claims a redeemer reports back
 /// (`AssumeRoleWithWebIdentityResponse$Provider`, `$Audience`,
 /// `$SubjectFromWebIdentityToken`), the authentication methods the issuance was made under,
-/// and the instant the issuance stops being valid.
+/// the principal tags it carries, and the instant the issuance stops being valid.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IssuedWebIdentity {
     /// The `iss` the token carries: the issuing authority, as the redeemer reports it.
@@ -56,6 +56,15 @@ pub struct IssuedWebIdentity {
     pub authentication_methods: Vec<String>,
     /// When the issuance stops being valid, which is the token's own `exp`.
     pub expires_at: SystemTime,
+    /// The PRINCIPAL TAGS this token carries, as the issuance recorded them, in tag-key
+    /// order.
+    ///
+    /// An issuer that tags the identity its token names carries those pairs IN the token, so
+    /// the redeemer attaches them to the session it mints as that session's tags — which is
+    /// what `aws:PrincipalTag/<key>` answers for every request the vended credential signs.
+    /// Empty for an issuance that recorded none, which is a token whose redemption attaches
+    /// no tag at all.
+    pub principal_tags: Vec<(String, String)>,
 }
 
 /// Every token this emulator issued and has not pruned, keyed by the token itself.
@@ -168,6 +177,7 @@ mod tests {
             subject: subject.to_string(),
             authentication_methods: vec!["authenticated".to_string()],
             expires_at,
+            principal_tags: Vec::new(),
         }
     }
 
