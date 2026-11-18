@@ -519,6 +519,11 @@ pub struct InstanceRecord {
     /// that program, inside the bounded tree it runs in
     /// ([`crate::state::guest_console::boot_console`]).
     pub guest_files: BTreeMap<String, String>,
+    /// The SERVICES this instance's guest runs: what its own program installed, what it
+    /// enabled to come up on every boot, and what is listening on which port right now. What
+    /// another service reaches a workload of this instance through
+    /// ([`crate::state::guest_services`]), written only by the programs that guest runs.
+    pub guest_runtime: crate::state::guest_services::GuestRuntime,
     /// When the guest is owed its next BOOT, or `None` when it is owed none: the instant a
     /// launch, a start or a queued reboot made the operating system due to come up. Spent by
     /// [`ComAmazonawsEc2Amazonec2State::boot_due_instance_guests`], exactly as

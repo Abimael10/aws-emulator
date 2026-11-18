@@ -87,12 +87,18 @@
 //! balancer already in it is answered as a target that cannot be connected to, and the walk
 //! is capped by [`MAX_PASSED_ON_HOPS`] either way.
 //!
-//! A `forward` to any other target group names targets this emulator has no server behind: a
-//! registered target is an instance id or an address, and nothing in this emulator listens
-//! on it. Neither a body nor a status is invented for a backend that never ran, so such a
-//! forward is answered the way a load balancer answers those two conditions —
+//! A `forward` to an `instance` or an `ip` target group IS performed too: such a
+//! registration names a resource of this emulator's own account — an instance id, or an
+//! address an interface of one holds — and what answers the request is the server that
+//! instance's guest RUNS on the port the registration receives traffic on, out of the
+//! instance's own storage ([`super::instance_target`]). The client is answered with the
+//! TARGET's own status line and bytes.
+//!
+//! Neither a body nor a status is invented for a backend that never ran, so a forward with no
+//! server behind it is answered the way a load balancer answers those two conditions —
 //! [`NO_HEALTHY_TARGET_STATUS`] when the group has no target to send the request to, and
-//! [`TARGET_UNREACHABLE_STATUS`] when it has one and the connection to it cannot be made.
+//! [`TARGET_UNREACHABLE_STATUS`] when it has one and the connection to it cannot be made
+//! (a target this emulator holds no instance for, or one running nothing on that port).
 //!
 //! An `authenticate-oidc` or `authenticate-cognito` action IS performed, ahead of the
 //! action it guards: no request reaching this emulator carries a session an Application
@@ -199,10 +205,9 @@ const PROVISIONING_STATUS: u16 = 503;
 pub const NO_HEALTHY_TARGET_STATUS: u16 = 503;
 
 /// The status a `forward` whose target cannot be CONNECTED to earns: a load balancer that
-/// cannot establish a connection to the target it chose answers HTTP 502. Every target
-/// this emulator holds is a registration — an instance id or an address — with no server
-/// of this emulator's behind it, so this is what a forward to a healthy target answers
-/// rather than a body invented for a backend that never ran.
+/// cannot establish a connection to the target it chose answers HTTP 502. A registration this
+/// emulator holds no running server behind on the port it receives traffic on is in exactly
+/// that position ([`super::instance_target`]), and no body is invented for it.
 pub const TARGET_UNREACHABLE_STATUS: u16 = 502;
 
 /// The status an action this emulator cannot perform earns, rather than serving what is
@@ -1054,6 +1059,23 @@ pub async fn serve<Eng: Send + Sync + 'static>(
                 );
                 break super::lambda_target::served(ctx, &forwarded, &request, body).await;
             }
+            // The listener forwarded the request to a target of this account, so what answers
+            // it is the server that target RUNS ([`super::instance_target`]). The store's
+            // guard is released above, so the hand-off is made with no lock of this service's
+            // held, exactly as a `lambda` target's invocation is.
+            Performed::ToTarget(forwarded) => {
+                // What this load balancer's own attribute collection has it do to the
+                // request's `X-Forwarded-For` before the target receives it
+                // ([`super::forwarded_for`]). Applied HERE, where the request leaves the load
+                // balancer for a target, so the rules its listener evaluated were matched
+                // against the request as the client sent it.
+                super::forwarded_for::processed(
+                    &mut request.headers,
+                    xff_processing,
+                    &connecting_address,
+                );
+                break super::instance_target::served(engine, &forwarded, &request);
+            }
             // The listener handed the connection to a load balancer of its own, which is
             // what answers it: the same request is served against that load balancer's
             // listeners, on the port its registration receives traffic on.
@@ -1568,6 +1590,11 @@ enum Performed {
     /// Application Load Balancer registered with it and answered by that load balancer's own
     /// listener ([`PassedOn`]).
     PassedOn(Box<PassedOn>),
+    /// The action forwards to a target group whose registration names a resource of this
+    /// account — an `instance` or an `ip` target — so the client is answered by the server
+    /// that resource RUNS on the port the registration receives traffic on
+    /// ([`super::instance_target`]).
+    ToTarget(Box<super::instance_target::Forwarded>),
 }
 
 /// The load balancer a request was passed on to, and the port the registration says it
@@ -1837,9 +1864,10 @@ fn default_port(protocol: &str) -> Option<&'static str> {
 /// ([`super::target_group_selection`]), and the registration that group holds decides what
 /// happens next: a `lambda` target group's function is INVOKED ([`super::lambda_target`]), an
 /// `alb` target group's load balancer is the one the request is PASSED ON to, and a target of
-/// any other group is a registration this emulator has no server behind, so the answer is the
-/// status a load balancer gives for the condition that holds — no target to choose, or a
-/// target chosen whose connection cannot be made.
+/// any other group names a resource of this account, whose own server answers the request
+/// ([`super::instance_target`]) — or, for a registration nothing of this emulator stands
+/// behind, the status a load balancer gives for the condition that holds: no target to
+/// choose, or a target chosen whose connection cannot be made.
 fn forward(
     store: &ElbState,
     listener: &ListenerRecord,
@@ -1931,11 +1959,28 @@ fn forward(
         );
         return Performed::Answered(Served::status(TARGET_UNREACHABLE_STATUS));
     }
-    tracing::warn!(
-        "the target group's healthy target is a registration with no server of this \
-         emulator's behind it, so the connection to it cannot be made"
-    );
-    Performed::Answered(Served::status(TARGET_UNREACHABLE_STATUS))
+    // "instance - Targets are specified by instance ID" and "ip - Targets are specified by IP
+    // address" (`TargetGroup$TargetType`): the registration names a resource of this account,
+    // and what answers the request is the server that resource RUNS on the port the
+    // registration receives traffic on ([`super::instance_target`]). The hand-off is made
+    // where the store's guard has been released, for the same reason a `lambda` target's
+    // invocation is.
+    Performed::ToTarget(Box::new(super::instance_target::Forwarded {
+        target_group_arn: group.arn.clone(),
+        target_type: group.target_type.clone(),
+        target_id: target.id.clone(),
+        // "the port on which the target is listening" (`TargetDescription$Port`), which is
+        // the target group's own port for a registration that names none.
+        port: target.port.or(group.port),
+        // The pin that answer hands back, for a client that does not hold it already: it
+        // accompanies the response the TARGET produced, as a `lambda` target's does.
+        set_cookie: (distribution.sticky && pinned.is_none()).then(|| {
+            super::target_group_selection::set_cookie(
+                &group.arn,
+                distribution.sticky_duration_seconds,
+            )
+        }),
+    }))
 }
 
 /// Whether the load balancer may send this registration a request: its reported health says

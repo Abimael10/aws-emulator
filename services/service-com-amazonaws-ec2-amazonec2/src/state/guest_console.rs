@@ -246,14 +246,19 @@ pub struct GuestBoot {
     /// The files on the machine's own storage once that boot's program had run — what the
     /// next boot of this guest reads.
     pub files: BTreeMap<String, String>,
+    /// The services the machine runs once that boot had started them: the units the init
+    /// system brought up because they are enabled, and whatever the boot's own program
+    /// installed and started ([`super::guest_services`]).
+    pub runtime: super::guest_services::GuestRuntime,
 }
 
 /// What boot number `number` of `machine`'s guest writes to the console, and the files it
 /// leaves behind.
 ///
 /// `files` are the ones the machine's storage already held (what earlier boots wrote),
-/// `program` is what the instance's user data gives the guest to run, and `boot_id` and
-/// `booted_at` are this boot's own identity and instant.
+/// `program` is what the instance's user data gives the guest to run, `runtime` is the state
+/// its init system was in before the machine restarted, and `boot_id` and `booted_at` are
+/// this boot's own identity and instant.
 pub fn boot_console(
     machine: &GuestMachine,
     number: u32,
@@ -261,6 +266,7 @@ pub fn boot_console(
     booted_at: SystemTime,
     program: &GuestProgram,
     files: &BTreeMap<String, String>,
+    runtime: &super::guest_services::GuestRuntime,
 ) -> GuestBoot {
     let mut clock = PrintkClock::default();
     let mut lines: Vec<String> = Vec::new();
@@ -272,7 +278,13 @@ pub fn boot_console(
     }
     // The init stage is where the commands of EVERY boot are run, as cloud-init runs its
     // `bootcmd` module; the final stage is where a first-boot command runs.
-    let (performed, files) = run_guest_program(machine, boot_id, booted_at, number, program, files);
+    // The init system starts the units the machine has ENABLED before it runs the instance's
+    // own program, which is what makes a server a previous boot enabled serve again
+    // ([`super::guest_services`]).
+    let services = super::guest_services::GuestServices::starting_from(&runtime.restarted());
+    let (performed, files) = run_guest_program(
+        machine, boot_id, booted_at, number, program, files, &services,
+    );
     lines.extend(performed.into_iter().map(|written| match written {
         GuestOutput::Console(line) => line,
         GuestOutput::InitStage(line) => clock.stamped(&cloud_init_line(machine, number, &line)),
@@ -293,7 +305,11 @@ pub fn boot_console(
     if lines.len() > MAX_BOOT_CONSOLE_LINES {
         lines.drain(..lines.len() - MAX_BOOT_CONSOLE_LINES);
     }
-    GuestBoot { lines, files }
+    GuestBoot {
+        lines,
+        files,
+        runtime: services.taken(),
+    }
 }
 
 /// A line the guest's own program wrote while the boot was coming up.
@@ -568,8 +584,24 @@ fn run_guest_program(
     number: u32,
     program: &GuestProgram,
     files: &BTreeMap<String, String>,
+    services: &super::guest_services::GuestServices,
 ) -> (Vec<GuestOutput>, BTreeMap<String, String>) {
-    let volume = guest_volume(machine, boot_id, files);
+    // The files the document's own `write_files` module names are part of the storage the
+    // FIRST boot of this instance starts with — that module writes them once per instance —
+    // with the directories above them made as the module makes them
+    // ([`super::guest_user_data`]).
+    let mut held = files.clone();
+    if number <= 1 {
+        for file in &program.written_files {
+            let kept = held.entry(file.path.clone()).or_default();
+            if file.append {
+                kept.push_str(&file.content);
+            } else {
+                *kept = file.content.clone();
+            }
+        }
+    }
+    let volume = guest_volume(machine, boot_id, &held);
     let mut session = ShellSession::in_volume(
         guest_environment(machine, number),
         SessionConfig {
@@ -588,8 +620,9 @@ fn run_guest_program(
         volume,
     )
     // The programs this machine has installed in it, which a boot script reads the
-    // instance's own facts with ([`super::guest_metadata`]).
-    .with_environment_programs(super::guest_metadata::guest_programs(machine));
+    // instance's own facts with ([`super::guest_metadata`]) and installs and starts its
+    // services with ([`super::guest_services`]).
+    .with_environment_programs(super::guest_services::installed_programs(machine, services));
     // The instant the boot happened is the console's, not the program's: a guest's own clock
     // is not something a boot script reads here.
     let _ = booted_at;
@@ -673,6 +706,7 @@ mod tests {
     use std::collections::BTreeMap;
     use std::time::{Duration, SystemTime};
 
+    use super::super::guest_services::GuestRuntime;
     use super::super::guest_user_data::GuestProgram;
     use super::{boot_console, kernel_release_in, GuestMachine, CLOUD_INIT_PREFIX};
 
@@ -710,6 +744,7 @@ mod tests {
             booted,
             &GuestProgram::default(),
             &BTreeMap::new(),
+            &GuestRuntime::default(),
         );
         let stamped = boot
             .lines
@@ -768,6 +803,7 @@ mod tests {
                     .to_string(),
             ],
             first_boot: vec!["echo FIRST-BOOT-ONLY > /dev/console".to_string()],
+            ..GuestProgram::default()
         };
         let booted = SystemTime::UNIX_EPOCH + Duration::from_secs(1_800_000_060);
         let first = boot_console(
@@ -777,6 +813,7 @@ mod tests {
             booted,
             &program,
             &BTreeMap::new(),
+            &GuestRuntime::default(),
         );
         assert!(
             first.lines.iter().any(|line| line
@@ -798,6 +835,7 @@ mod tests {
             booted + Duration::from_secs(30),
             &program,
             &first.files,
+            &first.runtime,
         );
         assert!(
             second.lines.iter().any(|line| line

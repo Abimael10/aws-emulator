@@ -214,6 +214,10 @@ struct Redirections {
     error: Option<(String, bool)>,
     /// The path standard input is read from.
     input: Option<String>,
+    /// The TEXT standard input carries, for a command whose input is written inside the
+    /// command itself: a here-document (`<<WORD`, `<<-WORD`) or a here-string (`<<<WORD`).
+    /// It is the input itself rather than a path, so nothing of the tree is read for it.
+    input_text: Option<String>,
     /// Set by `2>&1`: standard error goes wherever standard OUTPUT goes for this command,
     /// which is how a program asks for its diagnostics on the one stream its caller reads.
     error_to_out: bool,
@@ -322,6 +326,18 @@ pub trait ProgramFiles {
         let _ = path;
         Vec::new()
     }
+
+    /// Make `path` a directory of that tree, with every directory above it, answering
+    /// whether the tree now has it — what a program that INSTALLS something has to do for
+    /// the directories what it installs ships, so the commands around it can write files
+    /// under them.
+    ///
+    /// The default is `false`, which is "this tree has no directory to make": an environment
+    /// whose programs make one is one whose session implements this.
+    fn make_directories(&mut self, path: &str) -> bool {
+        let _ = path;
+        false
+    }
 }
 
 /// The commands a session whose tree is a MACHINE's — or its own WORKING tree
@@ -329,7 +345,8 @@ pub trait ProgramFiles {
 /// their names.
 ///
 /// Each one's whole effect is inside the session and the tree it works over: `printf` writes
-/// one line of output, `mkdir`, `touch` and `rm` change the tree, `ls` names what the tree
+/// one line of output, `mkdir`, `touch` and `rm` change the tree, `tee` writes what it reads
+/// into the files it names and passes it on, `ls` names what the tree
 /// holds, `test` (and its `[`
 /// spelling) answers a question about it, `sh` performs a program in this same session —
 /// `sh -c PROGRAM` the text it was given and `sh FILE` the script the TREE holds at that
@@ -342,15 +359,27 @@ pub trait ProgramFiles {
 /// environment with storage of its own has, and such a session's tree is only the files its
 /// redirections left.
 pub const VOLUME_COMMANDS: &[&str] = &[
-    "printf", "mkdir", "touch", "rm", LIST_COMMAND, "test", "[", "sh", "bash", ".", "source",
-    "sleep",
+    "printf", "mkdir", "touch", "rm", TEE_COMMAND, LIST_COMMAND, "test", "[", "sh", "bash", ".",
+    "source", "sleep",
 ];
+
+/// The command of [`VOLUME_COMMANDS`] that writes what it READS into the files it names: a
+/// program's own way of putting a document somewhere, beside a redirection.
+const TEE_COMMAND: &str = "tee";
 
 /// The one command of [`VOLUME_COMMANDS`] that only READS the tree, and so the one an
 /// environment's own program for that name takes precedence over
 /// ([`ShellSession::run_built_in`]): a caller whose storage has its own catalog of names
 /// answers `ls` out of that catalog.
 const LIST_COMMAND: &str = "ls";
+
+/// The commands that only change HOW the command after them is run, and are therefore not
+/// commands of their own: `nohup` — "invoke a utility immune to hangups", whose operands are
+/// "the utility to be invoked" and its arguments — and `setsid`, which runs one in a session
+/// of its own. This session has no signal to block and no session to lead, so the command
+/// such a wrapper names IS the command performed, with the wrapper's remaining words as its
+/// own ([`ShellSession::run_simple_command`]). A wrapper naming no utility runs nothing.
+const COMMAND_WRAPPERS: &[&str] = &["nohup", "setsid"];
 
 /// The commands an assignment written before them persists in the session for: POSIX's
 /// special built-in utilities, for which "variable assignments specified with special
@@ -661,6 +690,10 @@ impl ProgramFiles for SessionFiles<'_> {
 
     fn entries_in(&self, path: &str) -> Vec<String> {
         self.session.tree_entry_names(path)
+    }
+
+    fn make_directories(&mut self, path: &str) -> bool {
+        self.session.tree_make_directories(path)
     }
 }
 
@@ -1212,6 +1245,20 @@ impl ShellSession {
             },
             None => None,
         };
+        // A command invoked through a WRAPPER that only changes how it is run
+        // ([`COMMAND_WRAPPERS`]) is that command: the wrapper's first remaining word is the
+        // command name and the rest are its words. One naming no utility at all runs
+        // nothing, which is the wrapper's own failure.
+        let mut name = name;
+        while name
+            .as_deref()
+            .is_some_and(|name| COMMAND_WRAPPERS.contains(&name))
+        {
+            if words.is_empty() {
+                return self.config.statuses.could_not_run;
+            }
+            name = Some(words.remove(0));
+        }
         let persists = name
             .as_deref()
             .is_none_or(|name| PERSISTING_COMMANDS.contains(&name));
@@ -1274,11 +1321,17 @@ impl ShellSession {
     /// file from the start and `>> path` adds to what it holds ("the file shall be opened for
     /// appending"), and `>|` is `>` with the no-clobber option off. A session given a
     /// MACHINE's tree performs the other descriptors a machine's program redirects too —
-    /// standard error to a file or a device (`2>`, `2>>`) and standard input from one (`<`).
+    /// standard error to a file or a device (`2>`, `2>>`), standard input from one (`<`), and
+    /// the HERE-DOCUMENT and HERE-STRING forms, whose text is written inside the command
+    /// itself: `<<WORD` — with `<<-WORD` stripping the leading tabs off each of its lines —
+    /// and `<<<WORD` are the command's standard input, which is how a machine's program writes
+    /// a document it was given into a file. A document whose delimiter was QUOTED
+    /// (`<<'WORD'`) is taken literally, and an unquoted one is expanded, as the shell
+    /// specifies.
     /// A duplication of one standard stream onto the other (`2>&1`, `1>&2`) is performed by
     /// every session, which is how a program asks for its diagnostics on the one stream its
-    /// caller reads. A read-write open, a here-document, a here-string, a duplication of any
-    /// other descriptor and a descriptor other than 0, 1 and 2 are forms no session performs.
+    /// caller reads. A read-write open, a duplication of any other descriptor and a descriptor
+    /// other than 0, 1 and 2 are forms no session performs.
     fn apply_redirect(
         &mut self,
         redirect: &::brush_parser::ast::IoRedirect,
@@ -1286,6 +1339,15 @@ impl ShellSession {
     ) -> bool {
         use ::brush_parser::ast::IoFileRedirectKind as Kind;
         let machine = self.volume.is_some();
+        if let Some(text) = self.here_document(redirect) {
+            // A here-document reaches the descriptor a `<` does, so it is a form a session
+            // that works over a tree performs.
+            if !machine {
+                return false;
+            }
+            redirections.input_text = Some(text);
+            return true;
+        }
         let ::brush_parser::ast::IoRedirect::File(fd, kind, target) = redirect else {
             return false;
         };
@@ -1333,6 +1395,37 @@ impl ShellSession {
         true
     }
 
+    /// The TEXT one here-document or here-string carries, or `None` for a redirection that is
+    /// neither.
+    ///
+    /// `<<WORD` is the document written under the command, `<<-WORD` is the same with the
+    /// leading tabs stripped off each of its lines, and `<<<WORD` is the one word itself with
+    /// a line ending, which is what the shell gives the command on its standard input.
+    /// Whether the text is EXPANDED is the delimiter's own question: a quoted delimiter takes
+    /// the document literally, and the parser reports which it was.
+    fn here_document(&mut self, redirect: &::brush_parser::ast::IoRedirect) -> Option<String> {
+        match redirect {
+            ::brush_parser::ast::IoRedirect::HereDocument(_fd, document) => {
+                let text = if document.requires_expansion {
+                    self.expand_word(&document.doc.value)?
+                } else {
+                    document.doc.value.clone()
+                };
+                Some(if document.remove_tabs {
+                    text.lines()
+                        .map(|line| format!("{}\n", line.trim_start_matches('\t')))
+                        .collect()
+                } else {
+                    text
+                })
+            }
+            ::brush_parser::ast::IoRedirect::HereString(_fd, word) => {
+                Some(format!("{}\n", self.expand_word(&word.value)?))
+            }
+            _ => None,
+        }
+    }
+
     /// What reading `path` answers in the tree this session reads: a machine's tree where it
     /// was given one, and its own otherwise.
     fn read_path(&self, path: &str) -> Option<String> {
@@ -1351,6 +1444,11 @@ impl ShellSession {
     /// command after it in the same pipeline reads nothing rather than the same bytes twice.
     /// There is no terminal behind this: a command with neither reads nothing at all.
     fn standard_input(&mut self, redirections: &Redirections) -> Option<String> {
+        // The text a here-document or here-string carries IS the input, and it is the
+        // command's own: nothing of the tree is read for it.
+        if let Some(text) = redirections.input_text.clone() {
+            return Some(text);
+        }
         if let Some(path) = redirections.input.clone() {
             return self.read_path(&path);
         }
@@ -1577,6 +1675,9 @@ impl ShellSession {
     /// What the command being performed would read from STANDARD INPUT, WITHOUT consuming it
     /// ([`Self::standard_input`] is the reading that does).
     fn peeked_standard_input(&self, redirections: &Redirections) -> Option<String> {
+        if let Some(text) = redirections.input_text.clone() {
+            return Some(text);
+        }
         match redirections.input.as_deref() {
             Some(path) => self.read_path(path),
             None => self.piped_input.clone(),
@@ -1900,6 +2001,8 @@ impl ShellSession {
     /// directory (`-p` makes the ones above it too), `touch` makes an empty file where the
     /// tree holds none, and `rm` removes a file (`-f` passes over one that is not there).
     /// `ls` writes the names the tree holds at the paths it was given ([`Self::run_list`]).
+    /// `tee` writes what it READS into each file it names and passes it on
+    /// ([`Self::run_tee`]).
     /// `test`, and its `[` spelling, answers a question about the tree or about two values.
     /// `sh -c` performs a program in THIS session, which is how a machine's init system
     /// runs one line of a script, `sh FILE` performs the script the tree holds at that path
@@ -1919,6 +2022,7 @@ impl ShellSession {
             "touch" => self.run_touch(arguments, redirections),
             "rm" => self.run_remove(arguments, redirections),
             "ls" => self.run_list(arguments, redirections),
+            TEE_COMMAND => self.run_tee(arguments, redirections),
             "test" | "[" => self.run_test(name, arguments),
             "sh" | "bash" => self.run_nested_program(arguments, redirections),
             "." | "source" => self.run_dot(arguments, redirections),
@@ -2076,6 +2180,43 @@ impl ShellSession {
                     status = self.config.statuses.failure;
                 }
             }
+        }
+        status
+    }
+
+    /// `tee`: "copy standard input to each OUTPUT FILE and also to standard output".
+    ///
+    /// What it reads is its standard input ([`Self::read_standard_input`]) — a here-document,
+    /// a file an input redirection named, or what the stage before it in a pipeline wrote —
+    /// and it is written into every file operand, from the start or APPENDED for `-a`
+    /// ("append the output to the files"), and then passed on. A write the tree will not take
+    /// is reported in the utility's own wording and the command answers failure, without
+    /// stopping the files after it.
+    fn run_tee(&mut self, arguments: &[String], redirections: &Redirections) -> i32 {
+        let append = arguments
+            .iter()
+            .any(|argument| argument == "-a" || argument == "--append");
+        let paths: Vec<String> = arguments
+            .iter()
+            .filter(|argument| !argument.starts_with('-'))
+            .cloned()
+            .collect();
+        let input = match self.read_standard_input(TEE_COMMAND, redirections) {
+            Ok(input) => input,
+            Err(status) => return status,
+        };
+        let mut status = self.config.statuses.success;
+        for path in paths {
+            if !self.write_path(&path, &input, append) {
+                let _ = self.write_stderr(
+                    &format!("{TEE_COMMAND}: {path}: Cannot write to file\n"),
+                    redirections,
+                );
+                status = self.config.statuses.failure;
+            }
+        }
+        if !self.write_stdout(&input, redirections) {
+            status = self.config.statuses.failure;
         }
         status
     }
@@ -2746,6 +2887,51 @@ mod tests {
             }
         }
         held
+    }
+
+    /// RULE: a command invoked through a wrapper that only changes HOW it is run is that
+    /// command — the wrapper's own words are the command line — and a wrapper naming no
+    /// utility runs nothing.
+    #[test]
+    fn a_wrapper_runs_the_command_it_names() {
+        let statuses = Statuses::default();
+        // (case, the line, the status, the lines it wrote)
+        let rows: &[(&str, &str, i32, &[&str])] = &[
+            ("nohup around a utility", "nohup echo kept", statuses.success, &["kept"]),
+            (
+                "setsid around a utility",
+                "setsid echo kept",
+                statuses.success,
+                &["kept"],
+            ),
+            (
+                "one wrapper around another",
+                "nohup setsid echo kept",
+                statuses.success,
+                &["kept"],
+            ),
+            (
+                "a wrapper around a command this session cannot run",
+                "nohup nothing-of-this-session",
+                statuses.could_not_run,
+                &[],
+            ),
+            ("a wrapper naming no utility", "nohup", statuses.could_not_run, &[]),
+        ];
+        for (case, line, status, written) in rows {
+            let mut held = session();
+            let answered = held.run(line);
+            assert_eq!(
+                answered, *status,
+                "case {case:?}: expected status {status}, got {answered}"
+            );
+            assert_eq!(
+                held.output(),
+                *written,
+                "case {case:?}: expected {written:?}, got {:?}",
+                held.output()
+            );
+        }
     }
 
     /// RULE: only the catalog's utilities are performed; every other command and every form
@@ -3823,6 +4009,97 @@ mod tests {
                 volume.device_lines("/dev/console")
             );
         }
+    }
+
+    /// RULE: `tee` writes what it reads into each file it names and passes it on, from the
+    /// start or appended, and a session given no tree performs none of it.
+    #[test]
+    fn tee_writes_what_it_reads_into_the_files_it_names() {
+        let statuses = Statuses::default();
+        let mut held = in_volume();
+        assert_eq!(
+            held.run("echo first | tee /var/lib/page"),
+            statuses.success,
+            "expected the write to be taken"
+        );
+        assert_eq!(
+            held.run("echo second | tee -a /var/lib/page > /dev/console"),
+            statuses.success,
+            "expected the appending write to be taken"
+        );
+        let volume = held.into_volume().expect("the session ran in a volume");
+        assert_eq!(
+            volume.read("/var/lib/page").as_deref(),
+            Some("first\nsecond\n"),
+            "expected the file to hold both writes, got {:?}",
+            volume.read("/var/lib/page")
+        );
+        // What it read is passed on, which is what the redirection above collected.
+        assert_eq!(
+            volume.device_lines("/dev/console"),
+            ["second"],
+            "expected the input to be passed on, got {:?}",
+            volume.device_lines("/dev/console")
+        );
+    }
+
+    /// RULE: a HERE-DOCUMENT is the command's standard input, written inside the command
+    /// itself — taken literally for a quoted delimiter, expanded for an unquoted one, with
+    /// `<<-` stripping the leading tabs — and a here-string is the one word it names.
+    #[test]
+    fn a_here_document_is_the_commands_standard_input() {
+        let statuses = Statuses::default();
+        // (case, the program, the contents the file then holds)
+        let rows: &[(&str, &str, &str)] = &[
+            (
+                "a quoted delimiter takes the document literally",
+                "cat > /var/lib/page <<'EOF'\nMARKER $HOME\nEOF",
+                "MARKER $HOME\n",
+            ),
+            (
+                "an unquoted delimiter expands the document",
+                "NAME=marker\ncat > /var/lib/page <<EOF\nvalue $NAME\nEOF",
+                "value marker\n",
+            ),
+            (
+                "the tab-stripping form",
+                "cat > /var/lib/page <<-'EOF'\n\tindented\nEOF",
+                "indented\n",
+            ),
+            (
+                "a here-string",
+                "cat > /var/lib/page <<<'one word'",
+                "one word\n",
+            ),
+            (
+                "a document of several lines",
+                "cat > /var/lib/page <<'EOF'\nfirst\nsecond\nEOF",
+                "first\nsecond\n",
+            ),
+        ];
+        for (case, program, expected) in rows {
+            let mut held = in_volume();
+            let status = held.run(program);
+            assert_eq!(
+                status, statuses.success,
+                "case {case:?}: expected the command to run, got {status}"
+            );
+            let volume = held.into_volume().expect("the session ran in a volume");
+            let held = volume.read("/var/lib/page");
+            assert_eq!(
+                held.as_deref(),
+                Some(*expected),
+                "case {case:?}: expected the file to hold {expected:?}, got {held:?}"
+            );
+        }
+
+        // A session given no tree performs none of those forms.
+        let mut own = session();
+        assert_eq!(
+            own.run("cat <<'EOF'\nnothing\nEOF"),
+            statuses.could_not_run,
+            "a session with no tree performs no here-document"
+        );
     }
 
     /// RULE: what a program wrote to the tree is what the caller takes back out, so the next

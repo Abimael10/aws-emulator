@@ -612,6 +612,9 @@ pub fn launch_host_instance<Eng: Send + Sync + 'static>(
         // The guest's own storage starts empty: what is on it is what the instance's
         // user-data program puts there, boot by boot.
         guest_files: ::std::collections::BTreeMap::new(),
+        // And it is running nothing: what a guest runs is what its own program installs and
+        // starts, and no user data reaches an ESX host.
+        guest_runtime: ec2::GuestRuntime::default(),
         boot_due: Some(::std::time::SystemTime::now() + ec2::TRANSITION_DELAY),
         launch_time: ::std::time::SystemTime::now(),
         ami_launch_index: 0,

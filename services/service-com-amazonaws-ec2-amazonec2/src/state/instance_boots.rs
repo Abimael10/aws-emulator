@@ -107,8 +107,13 @@ impl ComAmazonawsEc2Amazonec2State {
             at,
             &program,
             &instance.guest_files,
+            &instance.guest_runtime,
         );
         instance.guest_files = written.files;
+        // What the machine is running once the boot is over: the units it had enabled, which
+        // the init system started again, and whatever this boot's own program started
+        // ([`crate::state::guest_services`]).
+        instance.guest_runtime = written.runtime;
         instance.boots.push(InstanceBoot {
             number,
             boot_id,

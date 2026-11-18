@@ -1304,6 +1304,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // The guest's own storage starts empty: what is on it is what the
                 // instance's user-data program puts there, boot by boot.
                 guest_files: ::std::collections::BTreeMap::new(),
+                // And it is running nothing: what it runs is what that program installs and
+                // starts ([`crate::state::guest_services`]).
+                guest_runtime: crate::state::GuestRuntime::default(),
                 boot_due: Some(launch_time + TRANSITION_DELAY),
                 launch_time,
                 ami_launch_index: i32::try_from(launch_index).unwrap_or(i32::MAX),

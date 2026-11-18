@@ -48,3 +48,24 @@ Replay the behavioral suite and re-run exactly the check in trace_ids (elbv2.e2e
 5. CreateListener Protocol='HTTP' Port=80 with DefaultActions=[{Type:'forward', ForwardConfig:{TargetGroups:[{TargetGroupArn:<tg>, Weight:100}]}}]; CreateRule Priority=10, Conditions=[{Field:'path-pattern', Values:['/*']}], same forward action; confirm DescribeRules returns it.
 6. Poll DescribeTargetHealth until State='healthy' (this passes today).
 7. GET http://<DNSName>/. EXPECT HTTP 200 whose body contains the marker the instance serves. OBSERVED: no successful response for the full 120s window.
+
+## Resolution
+The data path is implemented: a `forward` whose chosen target names a resource of this account —
+an `instance` registration, or an `ip` one whose address an interface of an instance holds — is
+proxied to the server that instance's own guest runs on the port the registration receives traffic
+on, and the client is answered with that server's own status, media type and bytes
+(`elasticloadbalancingv2 src/service/instance_target.rs`, reached from `src/service/data_plane.rs`);
+`502` remains for a registration nothing of this emulator stands behind on that port. Behind it, an
+instance's guest now RUNS the web server its user data installs and starts — a package manager, the
+init system's control program and the servers themselves are programs of the guest, and a server
+answers out of the machine's own storage (`ec2 src/state/guest_services.rs`). Covered end to end by
+`elasticloadbalancingv2 tests/all/alb_instance_target.rs` (including a real connection to the
+published `DNSName`) and `ec2 tests/all/instance_guest_web_server.rs`.
+
+What this does NOT give the recorded check: its instance's user-data program brings its server up in
+a form the in-process guest shell does not perform — a server written as interpreter code holding a
+socket. A guest that runs such a program needs an execution/socket seam inside the guest, which this
+emulator does not have yet (the open `lambda-microvms` guest-runtime issue names the same
+capability); the guest performs the documented package + init-system and interpreter-module forms.
+So `elbv2.e2e-alb-traffic-lifecycle-flow` still times out in its fetch poll, on that gap rather than
+on a refused forward.

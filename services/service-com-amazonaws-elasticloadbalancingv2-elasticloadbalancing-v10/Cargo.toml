@@ -140,6 +140,9 @@ service-com-amazonaws-sts-awssecuritytokenservicev20110615 = { workspace = true 
 emulator-core-build-support = { workspace = true }
 
 [dev-dependencies]
+# Declares one module per `tests/all/<name>.rs`, so the crate's single integration-test
+# target (`tests/all/main.rs`) lists no suite by hand. TEST-ONLY.
+automod = { workspace = true }
 # The HTTPS-listener suite dials the address a load balancer publishes, in this process,
 # exactly as a client handed that name does: `rcgen` mints the real leaf and key a client
 # imports into Certificate Manager, and the Certificate Manager service is mounted beside

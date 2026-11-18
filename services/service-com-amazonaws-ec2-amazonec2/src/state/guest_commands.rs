@@ -93,6 +93,10 @@ impl ComAmazonawsEc2Amazonec2State {
         let (boot_id, number) = (boot.boot_id.clone(), boot.number);
         let files = instance.guest_files.clone();
         let machine = self.guest_machine(instance);
+        // The services the machine is running now, which a command of this run may install,
+        // start or stop ([`super::guest_services`]).
+        let services =
+            super::guest_services::GuestServices::starting_from(&instance.guest_runtime);
         let volume = guest_volume(&machine, &boot_id, &files);
         let mut session = ShellSession::in_volume(
             guest_environment(&machine, number),
@@ -110,9 +114,12 @@ impl ComAmazonawsEc2Amazonec2State {
             volume,
         )
         // The programs this machine has installed in it, which an agent's command reads the
-        // instance's own facts with ([`super::guest_metadata`]) — the same client the boot's
-        // own program has.
-        .with_environment_programs(super::guest_metadata::guest_programs(&machine));
+        // instance's own facts with ([`super::guest_metadata`]) and installs and starts its
+        // services with ([`super::guest_services`]) — the same programs the boot's own
+        // program has.
+        .with_environment_programs(super::guest_services::installed_programs(
+            &machine, &services,
+        ));
         let mut status = 0;
         for command in commands {
             status = session.run(command);
@@ -129,9 +136,10 @@ impl ComAmazonawsEc2Amazonec2State {
             .map(|(path, contents)| (path.to_string(), contents.to_string()))
             .collect();
         // What the program left on the machine's storage is what the machine holds now — the
-        // same write the boot's own program makes.
+        // same write the boot's own program makes, and so is what it left RUNNING.
         if let Some(instance) = self.instances.get_mut(instance_id) {
             instance.guest_files = written;
+            instance.guest_runtime = services.taken();
         }
         Some(GuestRun { output, status })
     }

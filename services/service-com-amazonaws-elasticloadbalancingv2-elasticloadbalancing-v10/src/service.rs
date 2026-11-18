@@ -105,6 +105,10 @@ pub mod access_log_destination;
 
 pub mod lambda_target;
 
+/// A `forward` to an `instance` or an `ip` target group: how a request is served by the
+/// workload the registered target itself runs.
+pub mod instance_target;
+
 pub mod invalid_header_fields;
 
 pub mod request_framing;

@@ -467,6 +467,9 @@ impl ComAmazonawsEc2Amazonec2State {
             // The guest's own storage starts empty: what is on it is what the instance's
             // user-data program puts there, boot by boot.
             guest_files: ::std::collections::BTreeMap::new(),
+            // And it is running nothing: what it runs is what that program installs and
+            // starts ([`super::guest_services`]).
+            guest_runtime: super::guest_services::GuestRuntime::default(),
             boot_due: Some(at + TRANSITION_DELAY),
             // The instance was launched when the placement fell due, not when somebody next
             // asked about it.

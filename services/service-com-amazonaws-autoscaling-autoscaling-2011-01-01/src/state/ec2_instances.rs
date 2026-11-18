@@ -309,6 +309,9 @@ pub fn launch<Eng: Send + Sync + 'static>(
             // The guest's own storage starts empty: what is on it is what the instance's
             // user-data program puts there, boot by boot.
             guest_files: ::std::collections::BTreeMap::new(),
+            // And it is running nothing: what it runs is what that program installs and
+            // starts, which the guest's own boot performs.
+            guest_runtime: ec2::GuestRuntime::default(),
             boot_due: Some(launch_time + ec2::TRANSITION_DELAY),
             launch_time,
             // One instance per reservation, so it is that reservation's first.

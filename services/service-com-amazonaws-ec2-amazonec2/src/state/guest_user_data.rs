@@ -15,7 +15,9 @@
 //!   `yaml-rust2`, the pure-Rust YAML 1.2 implementation the other services that read
 //!   caller-supplied YAML use. Its `bootcmd` runs on EVERY boot and its `runcmd` on the
 //!   first, which is the split cloud-init publishes for those two modules (`bootcmd` is run
-//!   from the init stage of every boot, `runcmd` from the final stage once per instance);
+//!   from the init stage of every boot, `runcmd` from the final stage once per instance), and
+//!   its `write_files` names FILES the machine's storage holds — "write arbitrary files",
+//!   written once per instance, with the directories above them made as needed;
 //! * a text that starts with `#!` — a user-data SCRIPT, which cloud-init runs once per
 //!   instance, so its lines are first-boot commands.
 //!
@@ -87,6 +89,35 @@ pub const CLOUD_CONFIG_BOOTCMD: &str = "bootcmd";
 /// The key of the cloud-config module whose commands run on the FIRST boot only.
 pub const CLOUD_CONFIG_RUNCMD: &str = "runcmd";
 
+/// The key of the cloud-config module that WRITES FILES on the machine's storage, and the
+/// keys of one of its entries: "write arbitrary files" at `path`, holding `content`, which
+/// `encoding` says how to read and `append` says whether to add to what the path holds.
+pub const CLOUD_CONFIG_WRITE_FILES: &str = "write_files";
+const WRITE_FILES_PATH: &str = "path";
+const WRITE_FILES_CONTENT: &str = "content";
+const WRITE_FILES_ENCODING: &str = "encoding";
+const WRITE_FILES_APPEND: &str = "append";
+
+/// The `encoding` values that say the content is base64, as cloud-init names them. Every
+/// other value leaves the content as the text it is, which is that module's own default.
+const BASE64_ENCODINGS: &[&str] = &["b64", "base64"];
+
+/// How many files ONE document may name, and how many bytes one of them may carry: the
+/// bounds on what reading a caller-supplied document can put on a machine, taken before
+/// anything is stored. The machine's storage is bounded again where it is built
+/// ([`super::guest_console::MAX_GUEST_FILES`]).
+pub const MAX_GUEST_WRITTEN_FILES: usize = 16;
+pub const MAX_GUEST_WRITTEN_FILE_BYTES: usize = 32 * 1024;
+
+/// One file a `write_files` module names: where it goes, what it holds, and whether it is
+/// ADDED to what the path already holds.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GuestWrittenFile {
+    pub path: String,
+    pub content: String,
+    pub append: bool,
+}
+
 /// The commands one instance's guest runs at boot, read off its user data.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct GuestProgram {
@@ -95,12 +126,16 @@ pub struct GuestProgram {
     /// The commands it runs on the FIRST boot of the instance only — a cloud-config
     /// `runcmd`, or the lines of a user-data script.
     pub first_boot: Vec<String>,
+    /// The files the document names on the machine's storage — a cloud-config `write_files`,
+    /// which is a MODULE of the document rather than a command: the files are part of the
+    /// storage the first boot of this instance starts with.
+    pub written_files: Vec<GuestWrittenFile>,
 }
 
 impl GuestProgram {
     /// Whether this user data gives the guest nothing to run.
     pub fn is_empty(&self) -> bool {
-        self.every_boot.is_empty() && self.first_boot.is_empty()
+        self.every_boot.is_empty() && self.first_boot.is_empty() && self.written_files.is_empty()
     }
 
     /// The commands boot number `boot` performs, in the order the init system runs them:
@@ -139,6 +174,7 @@ pub fn guest_program(user_data: Option<&str>) -> GuestProgram {
         return GuestProgram {
             every_boot: Vec::new(),
             first_boot: script_commands(trimmed),
+            written_files: Vec::new(),
         };
     }
     GuestProgram::default()
@@ -185,7 +221,66 @@ fn cloud_config_program(text: &str) -> GuestProgram {
     GuestProgram {
         every_boot: module_commands(document, CLOUD_CONFIG_BOOTCMD),
         first_boot: module_commands(document, CLOUD_CONFIG_RUNCMD),
+        written_files: module_files(document),
     }
+}
+
+/// The files the `write_files` module names, each as the path it goes to and the content it
+/// holds — read up to [`MAX_GUEST_WRITTEN_FILES`] entries, skipping an entry that names no
+/// path, one whose content this emulator cannot read (an encoding it does not decode, or
+/// base64 that does not decode to text) and one past [`MAX_GUEST_WRITTEN_FILE_BYTES`].
+fn module_files(document: &::yaml_rust2::Yaml) -> Vec<GuestWrittenFile> {
+    let Some(entries) = document[CLOUD_CONFIG_WRITE_FILES].as_vec() else {
+        return Vec::new();
+    };
+    let mut files: Vec<GuestWrittenFile> = Vec::new();
+    for entry in entries {
+        if files.len() >= MAX_GUEST_WRITTEN_FILES {
+            break;
+        }
+        let Some(path) = entry[WRITE_FILES_PATH].as_str() else {
+            continue;
+        };
+        if path.trim().is_empty() {
+            continue;
+        }
+        // "content: the content to write", left out for an entry that names none, which
+        // cloud-init writes as an empty file.
+        let written = entry[WRITE_FILES_CONTENT].as_str().unwrap_or_default();
+        let encoding = entry[WRITE_FILES_ENCODING].as_str().unwrap_or_default();
+        let content = if BASE64_ENCODINGS.contains(&encoding.trim()) {
+            let Some(decoded) = decoded_base64_text(written) else {
+                continue;
+            };
+            decoded
+        } else if encoding.trim().is_empty() {
+            written.to_string()
+        } else {
+            // An encoding this emulator does not decode (a compressed one) names content it
+            // cannot read, so no file is written rather than one holding the undecoded text.
+            continue;
+        };
+        if content.len() > MAX_GUEST_WRITTEN_FILE_BYTES {
+            continue;
+        }
+        files.push(GuestWrittenFile {
+            path: path.trim().to_string(),
+            content,
+            // "append: whether to append to the file", which is `false` unless the entry
+            // says otherwise.
+            append: entry[WRITE_FILES_APPEND].as_bool().unwrap_or(false),
+        });
+    }
+    files
+}
+
+/// `text` as the base64 an entry's own `encoding` declares it to be — `None` when it is not
+/// base64 at all, or not UTF-8 text once decoded.
+fn decoded_base64_text(text: &str) -> Option<String> {
+    let decoded = ::base64::engine::general_purpose::STANDARD
+        .decode(text.trim())
+        .ok()?;
+    String::from_utf8(decoded).ok()
 }
 
 /// Whether `text` is inside the budget a LOAD of it is given, read off the parser's own
@@ -286,16 +381,80 @@ fn module_commands(document: &::yaml_rust2::Yaml, key: &str) -> Vec<String> {
     commands
 }
 
-/// The command lines of a script: its lines, without the ones a shell performs nothing for —
-/// the blank ones and the comments, the interpreter line included.
+/// The commands of a script: its lines, without the ones a shell performs nothing for — the
+/// blank ones and the comments, the interpreter line included.
+///
+/// A line carrying a HERE-DOCUMENT (`<<WORD`, `<<-WORD`) is one command TOGETHER with the
+/// lines up to its delimiter: the document is part of the command that reads it, which is how
+/// a shell reads one, so those lines are kept verbatim rather than read as commands of their
+/// own.
 fn script_commands(text: &str) -> Vec<String> {
-    text.lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty() && !line.starts_with('#'))
-        .filter(|line| line.len() <= MAX_GUEST_COMMAND_BYTES)
-        .map(str::to_string)
-        .take(MAX_GUEST_COMMANDS)
-        .collect()
+    let mut commands: Vec<String> = Vec::new();
+    let mut lines = text.lines();
+    while let Some(line) = lines.next() {
+        if commands.len() >= MAX_GUEST_COMMANDS {
+            break;
+        }
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        let mut command = trimmed.to_string();
+        if let Some(delimiter) = here_document_delimiter(trimmed) {
+            // The document's own lines, as written: the delimiter line ends it, and a
+            // document that never reaches one runs out with the script.
+            for next in lines.by_ref() {
+                command.push('\n');
+                command.push_str(next);
+                if next.trim() == delimiter || command.len() > MAX_GUEST_COMMAND_BYTES {
+                    break;
+                }
+            }
+        }
+        if command.len() <= MAX_GUEST_COMMAND_BYTES {
+            commands.push(command);
+        }
+    }
+    commands
+}
+
+/// The DELIMITER the here-document `line` opens, or `None` for a line that opens none.
+///
+/// `<<WORD` and `<<-WORD` open one, with the word optionally quoted — the quoting decides
+/// whether the document is expanded, which the shell itself reads ("a here-document whose
+/// delimiter was quoted is taken literally"). `<<<WORD` is a here-STRING: its text is on the
+/// line already, so it opens no document. A `<<` whose word is not a plain one, or which is
+/// followed by text rather than by the operands a redirection may carry, opens none either:
+/// that is a `<<` inside a quoted argument rather than a redirection.
+fn here_document_delimiter(line: &str) -> Option<String> {
+    let (_, rest) = line.split_once("<<")?;
+    if rest.starts_with('<') {
+        return None;
+    }
+    let rest = rest.strip_prefix('-').unwrap_or(rest).trim_start();
+    let (quote, rest) = match rest.chars().next() {
+        Some(quote @ ('\'' | '"')) => (Some(quote), rest.get(1..)?),
+        _ => (None, rest),
+    };
+    let word: String = rest
+        .chars()
+        .take_while(|character| character.is_ascii_alphanumeric() || *character == '_')
+        .collect();
+    if word.is_empty() {
+        return None;
+    }
+    let after = rest.get(word.len()..)?;
+    let after = match quote {
+        Some(quote) => after.strip_prefix(quote)?,
+        None => after,
+    };
+    // What may follow the delimiter is what may follow a redirection: nothing, or another
+    // operand of the same command.
+    let follows = after
+        .chars()
+        .next()
+        .is_none_or(|character| character.is_whitespace() || "|&;<>".contains(character));
+    follows.then_some(word)
 }
 
 /// Whether `node` nests inside `depth` levels — what keeps this walk, and the document it
@@ -398,6 +557,88 @@ mod tests {
         );
     }
 
+    /// RULE: a line carrying a here-document is ONE command with the lines up to its
+    /// delimiter, and a `<<` that opens no document leaves the lines after it as commands of
+    /// their own.
+    #[test]
+    fn a_here_document_is_part_of_the_command_that_reads_it() {
+        // (case, the script, the commands it gives the guest)
+        let rows: &[(&str, &str, &[&str])] = &[
+            (
+                "a quoted delimiter",
+                "#!/bin/sh\ncat > /page <<'EOF'\nMARKER\nEOF\necho after\n",
+                &["cat > /page <<'EOF'\nMARKER\nEOF", "echo after"],
+            ),
+            (
+                "the document before another operand",
+                "#!/bin/sh\ncat <<EOF > /page\nMARKER\nEOF\n",
+                &["cat <<EOF > /page\nMARKER\nEOF"],
+            ),
+            (
+                "the tab-stripping form",
+                "#!/bin/sh\ncat > /page <<-EOF\n\tMARKER\nEOF\n",
+                &["cat > /page <<-EOF\n\tMARKER\nEOF"],
+            ),
+            (
+                "a here-string, which opens no document",
+                "#!/bin/sh\ncat > /page <<<'one word'\necho after\n",
+                &["cat > /page <<<'one word'", "echo after"],
+            ),
+            (
+                "a `<<` inside a quoted argument",
+                "#!/bin/sh\necho \"a << b\"\necho after\n",
+                &["echo \"a << b\"", "echo after"],
+            ),
+        ];
+        for (case, script, expected) in rows {
+            let program = guest_program(Some(&encoded(script)));
+            assert_eq!(
+                program.first_boot, *expected,
+                "case {case:?}: expected {expected:?}, got {:?}",
+                program.first_boot
+            );
+        }
+    }
+
+    /// RULE: a `write_files` module names FILES the machine's storage holds, read as the
+    /// text they carry or as the base64 an entry's own `encoding` declares — and an entry
+    /// this emulator cannot read names no file at all.
+    #[test]
+    fn the_write_files_module_names_the_files_the_storage_holds() {
+        let document = concat!(
+            "#cloud-config\n",
+            "write_files:\n",
+            "  - path: /var/www/html/index.html\n",
+            "    content: |\n",
+            "      <h1>served</h1>\n",
+            "  - path: /etc/motd\n",
+            "    encoding: b64\n",
+            "    content: ZnJvbS1iYXNlNjQ=\n",
+            "  - path: /var/log/added\n",
+            "    content: one more line\n",
+            "    append: true\n",
+            "  - path: /etc/compressed\n",
+            "    encoding: gzip+base64\n",
+            "    content: H4sIAAAAAAAA\n",
+            "  - content: no path at all\n",
+        );
+        let program = guest_program(Some(&encoded(document)));
+        let written: Vec<(&str, &str, bool)> = program
+            .written_files
+            .iter()
+            .map(|file| (file.path.as_str(), file.content.as_str(), file.append))
+            .collect();
+        assert_eq!(
+            written,
+            [
+                ("/var/www/html/index.html", "<h1>served</h1>\n", false),
+                ("/etc/motd", "from-base64", false),
+                ("/var/log/added", "one more line", true),
+            ],
+            "expected the files the module names, got {written:?}"
+        );
+    }
+
     /// RULE: which commands a boot performs is the boot NUMBER's question — the every-boot
     /// commands always, the first-boot ones only on the first.
     #[test]
@@ -405,6 +646,7 @@ mod tests {
         let program = GuestProgram {
             every_boot: vec!["echo every".to_string()],
             first_boot: vec!["echo once".to_string()],
+            ..GuestProgram::default()
         };
         // (the boot, the commands it performs)
         for (boot, expected) in [
