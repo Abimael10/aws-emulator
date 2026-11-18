@@ -1119,6 +1119,22 @@ fn unsupported_member(input: &UpdateTableInput) -> Option<&'static str> {
     None
 }
 
+/// The structure one `GlobalSecondaryIndexUpdates` entry is, as the refusals of an entry
+/// that states no single action name it.
+const INDEX_UPDATE_SHAPE: &str = "GlobalSecondaryIndexUpdate";
+
+/// Its action members, in the order the model declares them
+/// (`smithy_query(query="shape", shape="GlobalSecondaryIndexUpdate")`), which is the order
+/// a refusal naming them follows.
+const INDEX_UPDATE_ACTIONS: [&str; 3] = ["Update", "Create", "Delete"];
+
+/// The same two facts for one `VectorIndexUpdates` entry, which models two actions rather
+/// than three (`smithy_query(query="shape", shape="VectorIndexUpdate")`).
+const VECTOR_INDEX_UPDATE_SHAPE: &str = "VectorIndexUpdate";
+
+/// Its action members, in the order the model declares them.
+const VECTOR_INDEX_UPDATE_ACTIONS: [&str; 2] = ["Create", "Delete"];
+
 /// The index actions one request asks for, each named at most once, with at most one
 /// create and at most one delete: "You can create or delete only one global secondary
 /// index per UpdateTable operation" (`UpdateTable$GlobalSecondaryIndexUpdates`).
@@ -1145,22 +1161,35 @@ fn validated_index_updates(
     }
     let mut named: ::std::collections::HashSet<&str> = ::std::collections::HashSet::new();
     for update in &updates {
-        let actions = usize::from(update.create.is_some())
-            + usize::from(update.update.is_some())
-            + usize::from(update.delete.is_some());
-        if actions != 1 {
-            return Err(crate::state::RequestError::Validation(format!(
-                "Invalid GlobalSecondaryIndexUpdates: each entry must request exactly one of \
-                 Create, Update or Delete, got {actions}"
-            )));
-        }
-        let index_name = match (&update.create, &update.update, &update.delete) {
-            (Some(create), _, _) => create.index_name.as_str(),
-            (_, Some(update), _) => update.index_name.as_str(),
-            (_, _, Some(delete)) => delete.index_name.as_str(),
-            _ => unreachable!("exactly one action is present"),
+        // The index the entry acts on, which exists only when the entry asks for exactly
+        // one of the three actions the model gives it: an entry asking for none describes
+        // no change, and one asking for several no single change.
+        let index_name = match (&update.update, &update.create, &update.delete) {
+            (Some(change), None, None) => change.index_name.as_str(),
+            (None, Some(create), None) => create.index_name.as_str(),
+            (None, None, Some(delete)) => delete.index_name.as_str(),
+            (None, None, None) => {
+                return Err(crate::state::RequestError::Validation(
+                    crate::state::no_index_action_message(
+                        INDEX_UPDATE_SHAPE,
+                        &INDEX_UPDATE_ACTIONS,
+                    ),
+                ))
+            }
+            _ => {
+                return Err(crate::state::RequestError::Validation(
+                    crate::state::one_index_action_message(
+                        INDEX_UPDATE_SHAPE,
+                        &INDEX_UPDATE_ACTIONS,
+                    ),
+                ))
+            }
         };
         if !named.insert(index_name) {
+            // An UPDATE list naming one index twice asks for two changes to one resource,
+            // which is a defect of the list rather than of a declaration: it keeps this
+            // member's own sentence, not the one a request DECLARING two indexes of a name
+            // earns ([`crate::state::duplicate_index_name`]).
             return Err(crate::state::RequestError::Validation(format!(
                 "Invalid GlobalSecondaryIndexUpdates: index {index_name} is named more than once"
             )));
@@ -1255,20 +1284,32 @@ fn validated_vector_index_updates(
     for update in &updates {
         // The name the entry changes, which exists only when the entry asks for exactly
         // one of the two actions; an entry that asks for both, or for neither, names no
-        // single change and is refused with the count it did ask for. Matched rather than
+        // single change and is refused over the two action members it had to pick one of
+        // ([`crate::state::no_index_action_message`]). Matched rather than
         // counted-then-unwrapped, so this stays total for every entry a request can send.
         let index_name = match (&update.create, &update.delete) {
             (Some(create), None) => create.index_name.as_str(),
             (None, Some(delete)) => delete.index_name.as_str(),
-            (create, delete) => {
-                let actions = usize::from(create.is_some()) + usize::from(delete.is_some());
-                return Err(crate::state::RequestError::Validation(format!(
-                    "Invalid VectorIndexUpdates: each entry must request exactly one of Create \
-                     or Delete, got {actions}"
-                )));
+            (None, None) => {
+                return Err(crate::state::RequestError::Validation(
+                    crate::state::no_index_action_message(
+                        VECTOR_INDEX_UPDATE_SHAPE,
+                        &VECTOR_INDEX_UPDATE_ACTIONS,
+                    ),
+                ))
+            }
+            (Some(_), Some(_)) => {
+                return Err(crate::state::RequestError::Validation(
+                    crate::state::one_index_action_message(
+                        VECTOR_INDEX_UPDATE_SHAPE,
+                        &VECTOR_INDEX_UPDATE_ACTIONS,
+                    ),
+                ))
             }
         };
         if !named.insert(index_name) {
+            // One index named twice in one update list, which keeps that member's own
+            // sentence for the reason the secondary-index list above does.
             return Err(crate::state::RequestError::Validation(format!(
                 "Invalid VectorIndexUpdates: index {index_name} is named more than once"
             )));

@@ -46,6 +46,39 @@ const TRANSACT_ITEMS_MEMBER: &str = "TransactItems";
 /// (`smithy_query(query="shape", shape="com.amazonaws.dynamodb#TransactWriteItem")`).
 const TRANSACT_ITEM_ACTIONS: [&str; 4] = ["ConditionCheck", "Put", "Delete", "Update"];
 
+/// The member a table NAME arrives in, as the model spells it on the wire.
+const TABLE_NAME_MEMBER: &str = "TableName";
+
+/// The clauses the `TableName` of a request that NAMES the table it creates earns, read off
+/// `req`'s body.
+///
+/// Empty for an operation that does not hold the member to the table-name form
+/// (`super::TABLE_NAME_FORM_OPERATIONS`), for a request that carries no name, and for a
+/// name that takes the form. The clauses are read HERE, off the body, because they answer
+/// for a refusal the validating WALK may have raised about ANY member: that walk reports
+/// the bound the model declares on a member that admits a table's ARN as well as its name,
+/// which is wider than the form a NAME takes, and the clauses a caller reads are this
+/// form's — so the whole refusal is stated from the name, and the handler's own check words
+/// the identical clauses for the request that reaches it
+/// (`crate::state::table_name_form_clauses`).
+pub fn table_name_form_clauses(operation: &str, req: &RtRequest) -> Vec<String> {
+    if !super::holds_table_name_to_its_form(operation) {
+        return Vec::new();
+    }
+    let Some(body) = req.body().bytes() else {
+        return Vec::new();
+    };
+    let Ok(document) = ::serde_json::from_slice::<Value>(body) else {
+        return Vec::new();
+    };
+    let Some(name) = document.get(TABLE_NAME_MEMBER).and_then(Value::as_str) else {
+        // A member the request does not carry is the absent member this service's own
+        // parameter check states, which is a different refusal.
+        return Vec::new();
+    };
+    crate::state::table_name_form_clauses(crate::state::TABLE_NAME_MEMBER_PATH, name)
+}
+
 /// The clauses this service's own reading of `req` found for the operation it is being
 /// served as, in the order the input declares the members they are about — so they join
 /// the walk's clauses in the one order the refusal states its members in.
@@ -223,11 +256,9 @@ fn broken_bounds(member: &::aws_smithy_schema::Schema, document: &Value) -> Vec<
             ),
             kind,
             // Held to the same ceiling the walk holds its echoed values to, so a caller
-            // cannot amplify a request into an arbitrarily long response.
-            value: Some(
-                ::service_common::validation::quoted_echo_up_to(value, MAX_ECHOED_VALUE)
-                    .into_owned(),
-            ),
+            // cannot amplify a request into an arbitrarily long response
+            // ([`crate::state::MAX_ECHOED_CLAUSE_VALUE`]).
+            value: Some(crate::state::echoed_clause_value(value).into_owned()),
             sensitive: false,
         })
         .collect()
@@ -270,7 +301,4 @@ fn declared_trait<'t, T: 'static>(
     traits.get(id)?.as_any().downcast_ref::<T>()
 }
 
-/// The largest rejected value one clause quotes, which is the ceiling the framework's own
-/// walk elides an echoed value at: a caller controls the length of what it sent, and a
-/// clause interpolates it as it stands.
-const MAX_ECHOED_VALUE: usize = 256;
+

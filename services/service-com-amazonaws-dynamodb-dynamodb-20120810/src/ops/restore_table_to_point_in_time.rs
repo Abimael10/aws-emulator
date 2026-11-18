@@ -894,9 +894,7 @@ fn restored_indexes(
     let mut indexes: Vec<crate::state::GlobalSecondaryIndex> = Vec::new();
     for (name, restated) in selected {
         if indexes.iter().any(|stored| stored.name == name) {
-            return Err(crate::state::RequestError::Validation(format!(
-                "Invalid GlobalSecondaryIndexOverride: duplicate index name {name}"
-            )));
+            return Err(crate::state::duplicate_index_name(&name));
         }
         let Some(existing) = source
             .global_secondary_indexes
@@ -995,9 +993,7 @@ fn restored_local_indexes(
     let mut indexes: Vec<crate::state::LocalSecondaryIndex> = Vec::new();
     for name in selected {
         if indexes.iter().any(|stored| stored.name == name) {
-            return Err(crate::state::RequestError::Validation(format!(
-                "Invalid LocalSecondaryIndexOverride: duplicate index name {name}"
-            )));
+            return Err(crate::state::duplicate_index_name(&name));
         }
         let Some(existing) = source
             .local_secondary_indexes

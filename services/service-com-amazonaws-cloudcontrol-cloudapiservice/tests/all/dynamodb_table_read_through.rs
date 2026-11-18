@@ -775,9 +775,9 @@ async fn a_create_the_owning_service_would_refuse_fails_with_the_handlers_verdic
                 "AttributeDefinitions": [{ "AttributeName": "other", "AttributeType": "S" }],
                 "BillingMode": "PAY_PER_REQUEST",
             }),
-            "One or more parameter values were invalid: Some index key attributes are not \
-             defined in AttributeDefinitions. Keys: [id], AttributeDefinitions: [other]"
-                .to_string(),
+            // The owning service states one fixed sentence for a key element it has no
+            // definition for, whatever else the declaration carries.
+            "Invalid KeySchema: Some index key attribute have no definition".to_string(),
         ),
         (
             "an attribute no key schema uses",

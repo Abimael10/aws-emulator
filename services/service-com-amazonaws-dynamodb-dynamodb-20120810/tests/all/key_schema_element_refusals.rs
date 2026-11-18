@@ -286,9 +286,12 @@ async fn an_index_key_refusal_names_the_element_that_broke_the_rule() {
         (
             "one HASH element past the partition-key bound",
             index_key(MAX_INDEX_PARTITION_KEYS + 1, 0),
+            // The COUNT of that role is what was exceeded, and with several partition keys
+            // allowed no single element is the one at fault, so the refusal states the
+            // count's own fixed sentence and names neither an element nor the index.
             Some(
-                "Invalid KeySchema for index idx: The fifth KeySchemaElement is not a RANGE key \
-                 type"
+                "One or more parameter values were invalid: The KeySchema exceeds the maximum \
+                 allowed number of HASH key attributes"
                     .to_string(),
             ),
         ),
@@ -349,8 +352,9 @@ async fn an_index_key_refusal_names_the_element_that_broke_the_rule() {
         }
     }
 
-    // One past the sort-key bound: the elements are all in the right order, so the
-    // refusal states the bound instead of naming an element.
+    // One past the sort-key bound: the elements are all in the right order, so the refusal
+    // states the COUNT of that role which was exceeded — the same fixed sentence the
+    // partition-key count earns, over the other role.
     let (status, body) = call(
         &router,
         "CreateTable",
@@ -374,10 +378,11 @@ async fn an_index_key_refusal_names_the_element_that_broke_the_rule() {
         "case {case:?}: expected a 400 ValidationException, got {status} with {body}"
     );
     let stated = message(&body);
-    assert!(
-        stated.contains("KeySchema") && stated.contains(&MAX_INDEX_SORT_KEYS.to_string()),
-        "case {case:?}: expected the refusal to name KeySchema and the {MAX_INDEX_SORT_KEYS} \
-         sort-key bound, got {stated:?}"
+    assert_eq!(
+        stated,
+        "One or more parameter values were invalid: The KeySchema exceeds the maximum allowed \
+         number of RANGE key attributes",
+        "case {case:?}: expected the sort-key count's own sentence, got {stated:?}"
     );
 }
 

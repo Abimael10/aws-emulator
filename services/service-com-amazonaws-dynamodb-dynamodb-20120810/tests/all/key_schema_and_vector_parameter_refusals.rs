@@ -11,10 +11,9 @@
 //!    an element: an index key may carry several partition keys, so no single position is
 //!    the one at fault;
 //! 2. a TABLE's own key schema naming an attribute `AttributeDefinitions` does not declare
-//!    is refused with its own fixed sentence, which interpolates nothing, while every
-//!    declared definition is used by some key schema; a request that also declares one no
-//!    key schema uses has the two sets differing both ways round and is told what each of
-//!    them holds, in the wording rule 3 describes;
+//!    is refused with its own fixed sentence, which interpolates nothing — and reads the
+//!    same whatever else the declaration carries, including a definition no key schema
+//!    uses;
 //! 3. an INDEX key schema naming one is refused with the parameter-value sentence that
 //!    carries the index's whole key schema beside the declared attribute names — and
 //!    NEITHER list is in the order the request stated it, so the same names declared in
@@ -230,17 +229,17 @@ async fn a_partition_key_after_a_sort_key_is_refused_with_the_order_rule() {
     }
 }
 
-/// Rule 2: a TABLE key attribute with no definition earns the fixed sentence while every
-/// declared definition is used; a request that also declares one no key schema uses has
-/// the two sets differing both ways round and is told what each of them holds.
+/// Rule 2: a TABLE key attribute with no definition earns the fixed sentence, whatever
+/// else the declaration carries — a definition no key schema uses does not change it.
 #[tokio::test]
-async fn a_table_key_with_no_definition_is_worded_by_how_the_two_sets_differ() {
+async fn a_table_key_with_no_definition_earns_its_own_fixed_sentence() {
     let router = emulator();
 
     // Rows differ along WHICH element has no definition, the number of definitions the
-    // request declares, and what consumes them — every one of them used, so the key with
-    // nothing declared for it is the only fact there is to state.
-    let rows: [(&str, Keys, Names, bool); 4] = [
+    // request declares, what consumes them, and whether the request ALSO declares a
+    // definition no key schema uses: the key with nothing declared for it is the fact
+    // stated either way.
+    let rows: [(&str, Keys, Names, bool); 5] = [
         (
             "the sort key has no definition",
             &[("pk", "HASH"), ("sk", "RANGE")],
@@ -264,6 +263,15 @@ async fn a_table_key_with_no_definition_is_worded_by_how_the_two_sets_differ() {
             &[("one", "HASH"), ("two", "RANGE")],
             &["one", "indexed"],
             true,
+        ),
+        // The sets differing BOTH ways round — a key with no definition beside a definition
+        // no key schema uses — states the same sentence: the key with nothing to key on is
+        // what the primary key cannot be built from.
+        (
+            "an undefined key beside a definition nothing uses",
+            &[("PK", "HASH"), ("SK", "RANGE")],
+            &["PK", "EXTRA"],
+            false,
         ),
     ];
 
@@ -299,28 +307,6 @@ async fn a_table_key_with_no_definition_is_worded_by_how_the_two_sets_differ() {
             "case {case:?}: a refused create stores no table, got {listed}"
         );
     }
-
-    // The sets differing BOTH ways round — a key with no definition beside a definition
-    // no key schema uses — is told what each list holds, in the order a name-keyed table
-    // renders them and not the one the request stated.
-    let (status, body) = call(
-        &router,
-        "CreateTable",
-        json!({
-            "TableName": "both-ways",
-            "BillingMode": "PAY_PER_REQUEST",
-            "KeySchema": [key("PK", "HASH"), key("SK", "RANGE")],
-            "AttributeDefinitions": definitions(&["PK", "EXTRA"]),
-        }),
-    )
-    .await;
-    assert_eq!(
-        refusal("an undefined key beside a definition nothing uses", status, &body),
-        "One or more parameter values were invalid: Some index key attributes are not defined in \
-         AttributeDefinitions. Keys: [SK, PK], AttributeDefinitions: [EXTRA, PK]",
-        "case \"an undefined key beside a definition nothing uses\": expected both lists, got \
-         {body}"
-    );
 
     // The control: every element defined is accepted and read back.
     ok(

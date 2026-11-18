@@ -748,7 +748,8 @@ async fn an_index_name_already_taken_on_the_table_is_refused() {
             (
                 400,
                 "ValidationException".to_string(),
-                "Invalid VectorIndex: duplicate index name idx.taken".to_string()
+                "One or more parameter values were invalid: Duplicate index name: idx.taken"
+                    .to_string()
             ),
             "case {case}: a name already taken is refused, got {status} with {body}"
         );

@@ -457,15 +457,15 @@ async fn a_vector_index_update_that_names_no_single_change_is_refused() {
         (
             "an entry that asks for nothing",
             json!([{}]),
-            "Invalid VectorIndexUpdates: each entry must request exactly one of Create or \
-             Delete, got 0"
+            "One or more parameter values were invalid: One of VectorIndexUpdate.Create, \
+             VectorIndexUpdate.Delete must not be null"
                 .to_string(),
         ),
         (
             "an entry that asks for both actions",
             json!([{"Create": create("idx-new"), "Delete": {"IndexName": "idx-drop"}}]),
-            "Invalid VectorIndexUpdates: each entry must request exactly one of Create or \
-             Delete, got 2"
+            "One or more parameter values were invalid: Only one of VectorIndexUpdate.Create, \
+             VectorIndexUpdate.Delete may be specified"
                 .to_string(),
         ),
         (

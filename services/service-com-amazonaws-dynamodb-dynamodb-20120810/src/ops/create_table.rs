@@ -1016,6 +1016,44 @@ fn validated_key_type_order(
     Ok(())
 }
 
+/// The member path a table's own `KeySchema` is reported under: the lowerCamel path the
+/// request validator builds for a top-level member, which is what the recorded refusals of
+/// that member state.
+const TABLE_KEY_SCHEMA_MEMBER_PATH: &str = "keySchema";
+
+/// A submitted `KeySchema` list as the refusal of that member quotes it.
+///
+/// This is the OBJECT rendering the service's own request validator states a refused
+/// structure value with — `[KeySchemaElement(attributeName=<name>, keyType=<type>), …]` —
+/// rather than the JSON the request arrived as, the same form the refusal of another
+/// structured member of this service quotes its value in
+/// (`crate::state::rendered_batch_write_request_items`). Every value in it comes from the
+/// request; the field names and their order are the renderer's fixed frame, and are the
+/// members in the order the model declares them (`smithy_query(query="shape",
+/// shape="KeySchemaElement")` gives `AttributeName` then `KeyType`).
+///
+/// The list's length is the caller's, so the rendering is held to the ceiling every clause
+/// of this service echoes a value at ([`crate::state::echoed_clause_value`]): elements stop
+/// being rendered once that much text is in hand, and the elision marker names how much the
+/// caller sent.
+fn rendered_key_schema(elements: &[KeySchemaElement]) -> String {
+    let mut rendered = String::from("[");
+    for (at, element) in elements.iter().enumerate() {
+        if at > 0 {
+            rendered.push_str(", ");
+        }
+        if rendered.len() > crate::state::MAX_ECHOED_CLAUSE_VALUE {
+            break;
+        }
+        rendered.push_str(&format!(
+            "KeySchemaElement(attributeName={}, keyType={})",
+            element.attribute_name, element.key_type
+        ));
+    }
+    rendered.push(']');
+    crate::state::echoed_clause_value(&rendered).into_owned()
+}
+
 /// The table's key schema, refused unless it is one `HASH` attribute optionally
 /// followed by one `RANGE` attribute, each defined in `AttributeDefinitions` as a
 /// scalar type — "The attributes in KeySchema must also be defined in the
@@ -1033,17 +1071,19 @@ pub fn validated_key_schema(
     }
     let definitions = declared.attribute_definitions.to_vec();
     if key_schema.len() > crate::state::MAX_TABLE_KEY_ELEMENTS {
-        return Err(crate::state::RequestError::Validation(format!(
-            "Invalid KeySchema: a table's primary key may declare at most {} \
-             KeySchemaElement(s), got {}",
-            crate::state::MAX_TABLE_KEY_ELEMENTS,
-            key_schema.len()
-        )));
+        // The LIST itself is what broke a bound here — a primary key may carry one
+        // partition key and at most one sort key, so a longer list is outside the length
+        // the member admits — which is the class of defect the request validator reports:
+        // the lowerCamel member path, the submitted list echoed, and the length
+        // requirement, inside the envelope that counts the clauses
+        // ([`crate::state::invalid_member`]). The checks below are about what the
+        // ELEMENTS say, and state their own sentences.
+        return Err(crate::state::invalid_member(
+            TABLE_KEY_SCHEMA_MEMBER_PATH,
+            Some(&rendered_key_schema(&key_schema)),
+            &crate::state::max_length_requirement(crate::state::MAX_TABLE_KEY_ELEMENTS),
+        ));
     }
-    // A table's primary key is "one KeySchemaElement (for the partition key)" and, when
-    // composite, "another KeySchemaElement for the sort key": position 1 holds the only
-    // HASH element and position 2, when present, the only RANGE one.
-    validated_key_type_order(None, &key_schema, crate::state::MAX_TABLE_PARTITION_KEYS)?;
     // The key attributes of every requested index, collected ONCE: the loop below asks
     // whether each definition is used, and a per-definition scan of every index's key
     // schema would be the product of two request-chosen counts. Both index kinds declare
@@ -1069,35 +1109,22 @@ pub fn validated_key_schema(
                 .flat_map(vector_index_attributes),
         )
         .collect();
-    // Whether the request's key schemas and its definitions name the same attributes in
-    // ONE direction only — every definition used, so the sets can differ only by a key
-    // with nothing declared for it. That is what decides WHICH sentence an undefined
-    // table key earns below.
-    let every_definition_used = definitions.iter().all(|definition| {
-        let name = definition.attribute_name.as_str();
-        key_schema
-            .iter()
-            .any(|element| element.attribute_name == name)
-            || index_key_attributes.contains(name)
-    });
     for element in &key_schema {
         let name = element.attribute_name.as_str();
         let Some(definition) = definitions
             .iter()
             .find(|definition| definition.attribute_name == name)
         else {
-            // A key with no definition, with every definition used, is the ONE fact there
-            // is to state, and DynamoDB states it with its fixed sentence, which
-            // interpolates nothing. A request that ALSO declares an attribute no key
-            // schema uses has the two sets differing both ways round, and is told what
-            // each of them holds instead ([`undefined_schema_keys`]) — the same wording a
-            // secondary index's key schema earns.
-            return Err(match every_definition_used {
-                true => crate::state::RequestError::Validation(
-                    KEY_WITHOUT_DEFINITION_MESSAGE.to_string(),
-                ),
-                false => undefined_schema_keys(&key_schema, &definitions),
-            });
+            // A key element the request declares no definition for has no attribute to key
+            // on, and DynamoDB states that with its FIXED sentence, which interpolates
+            // nothing — not the element, not the names the request did declare. It reads the
+            // same whatever else the declaration carries: a request that also declares an
+            // attribute no schema uses breaks two rules, and this is the one it is told
+            // about, because a key with nothing declared for it is what the primary key
+            // itself cannot be built from.
+            return Err(crate::state::RequestError::Validation(
+                KEY_WITHOUT_DEFINITION_MESSAGE.to_string(),
+            ));
         };
         if !matches!(definition.attribute_type.as_str(), "S" | "N" | "B") {
             return Err(crate::state::RequestError::Validation(format!(
@@ -1127,6 +1154,17 @@ pub fn validated_key_schema(
         KEY_WITHOUT_DEFINITION_MESSAGE
     };
     check_distinct_key_attributes(&key_schema, duplicated)?;
+    // A table's primary key is "one KeySchemaElement (for the partition key)" and, when
+    // composite, "another KeySchemaElement for the sort key": position 1 holds the only
+    // HASH element and position 2, when present, the only RANGE one.
+    //
+    // AFTER the elements have been paired with their definitions: each element is resolved
+    // to the attribute it keys on before the ROLE that element plays is read, so a schema
+    // naming an attribute the request declares no definition for is refused for the missing
+    // definition whatever its key types say ([`KEY_WITHOUT_DEFINITION_MESSAGE`]) — a key
+    // with nothing declared for it has no attribute to key on at all, which is the earlier
+    // defect of the two.
+    validated_key_type_order(None, &key_schema, crate::state::MAX_TABLE_PARTITION_KEYS)?;
     for definition in &definitions {
         // "Some AttributeDefinitions are not used in any KeySchema": every defined
         // attribute must be consumed by a schema of the table — its own key, the key of
@@ -1186,10 +1224,7 @@ pub(crate) fn validated_indexes(
     let mut indexes: Vec<crate::state::GlobalSecondaryIndex> = Vec::new();
     for index in &requested {
         if indexes.iter().any(|stored| stored.name == index.index_name) {
-            return Err(crate::state::RequestError::Validation(format!(
-                "Invalid GlobalSecondaryIndex: duplicate index name {}",
-                index.index_name
-            )));
+            return Err(crate::state::duplicate_index_name(&index.index_name));
         }
         validated_index_key_schema(
             &index.index_name,
@@ -1265,10 +1300,7 @@ fn validated_local_indexes(
                 .iter()
                 .any(|stored| stored.name == index.index_name)
         {
-            return Err(crate::state::RequestError::Validation(format!(
-                "Invalid LocalSecondaryIndex: duplicate index name {}",
-                index.index_name
-            )));
+            return Err(crate::state::duplicate_index_name(&index.index_name));
         }
         validated_index_key_schema(
             &index.index_name,
@@ -1345,10 +1377,7 @@ pub(crate) fn validated_vector_indexes(
                 .iter()
                 .any(|stored| stored.name == index.index_name);
         if taken {
-            return Err(crate::state::RequestError::Validation(format!(
-                "Invalid VectorIndex: duplicate index name {}",
-                index.index_name
-            )));
+            return Err(crate::state::duplicate_index_name(&index.index_name));
         }
         indexes.push(
             DeclaredVectorIndex {
@@ -1475,13 +1504,34 @@ impl IndexKeyShape {
     };
 }
 
+/// How many elements of `key_schema` claim `key_type`.
+fn count_of_key_type(key_schema: &[KeySchemaElement], key_type: &str) -> usize {
+    key_schema
+        .iter()
+        .filter(|element| element.key_type == key_type)
+        .count()
+}
+
+/// AWS's fixed text for a key schema carrying more keys of one KIND than it admits: the
+/// sentence names the kind whose count was exceeded and nothing else — not the index, not
+/// the maximum, not the count that was sent — because the fact is about that kind's limit,
+/// which is the same limit for every index of every table.
+fn key_schema_exceeds_key_kind_message(key_type: &str) -> String {
+    format!(
+        "{}: The KeySchema exceeds the maximum allowed number of {key_type} key attributes",
+        crate::state::INVALID_PARAMETER_CLAUSE
+    )
+}
+
 /// One index's key schema: at least one `HASH` element, within the key counts its KIND
 /// admits ([`IndexKeyShape`]), with every attribute declared in `AttributeDefinitions` as
 /// a scalar type.
 ///
-/// An index key is validated by position like a table's — the leading positions hold the
-/// partition keys and the sort keys follow — so an element out of place is named by its
-/// ordinal.
+/// An index key is read COUNT first and POSITION second, for the kind of index that admits
+/// several keys of a role: a schema with more partition keys or more sort keys than that
+/// kind admits is refused by the count, and one within both counts is then validated by
+/// position like a table's — the leading positions hold the partition keys and the sort
+/// keys follow — so an element out of place is named by its ordinal.
 pub(crate) fn validated_index_key_schema(
     index_name: &str,
     key_schema: &[KeySchemaElement],
@@ -1494,11 +1544,29 @@ pub(crate) fn validated_index_key_schema(
              attribute"
         )));
     }
+    // HOW MANY elements claim each role, before WHICH position claims which — for the kind
+    // of index that admits SEVERAL keys of a role. Such a schema with more of a role than
+    // its kind admits has broken that role's COUNT rather than put one element out of
+    // place: with several partition keys allowed no single position is the one at fault, so
+    // AWS states the count's own fixed sentence
+    // ([`key_schema_exceeds_key_kind_message`]) instead of naming an element.
+    //
+    // A kind that admits ONE key of each role has no such count to exceed: its second
+    // partition key is an element in the wrong ROLE for its position, which is how the
+    // TABLE's own primary key — one partition key and at most one sort key — is refused
+    // too, by its ordinal ([`validated_key_type_order`]).
+    let range_keys = count_of_key_type(key_schema, "RANGE");
+    if shape.partition_keys > 1 && count_of_key_type(key_schema, "HASH") > shape.partition_keys {
+        return Err(crate::state::RequestError::Validation(
+            key_schema_exceeds_key_kind_message("HASH"),
+        ));
+    }
+    if shape.sort_keys > 1 && range_keys > shape.sort_keys {
+        return Err(crate::state::RequestError::Validation(
+            key_schema_exceeds_key_kind_message("RANGE"),
+        ));
+    }
     validated_key_type_order(Some(index_name), key_schema, shape.partition_keys)?;
-    let range_keys = key_schema
-        .iter()
-        .filter(|element| element.key_type == "RANGE")
-        .count();
     if range_keys > shape.sort_keys {
         return Err(crate::state::RequestError::Validation(format!(
             "Invalid KeySchema for index {index_name}: an index key may declare at most {} RANGE \

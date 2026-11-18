@@ -899,9 +899,10 @@ async fn a_schema_defect_is_worded_over_the_request_and_the_tables_own_schema() 
             "Invalid KeySchema: Some index key attribute have no definition".to_string(),
         ),
         (
-            // The two sets differ BOTH ways round — a key with no definition beside a
-            // definition no key schema uses — so each list is reported, in the order a
-            // name-keyed table renders it rather than the one the request stated.
+            // The sets differ BOTH ways round — a key with no definition beside a
+            // definition no key schema uses — and the sentence is the same one: a key with
+            // nothing declared for it is what the primary key cannot be built from,
+            // whatever else the declaration carries.
             "a table key attribute with no definition beside an unused definition",
             json!({
                 "TableName": "UndefinedTableKeyAndExtra",
@@ -911,9 +912,7 @@ async fn a_schema_defect_is_worded_over_the_request_and_the_tables_own_schema() 
                 "AttributeDefinitions": [{"AttributeName": "EXTRA", "AttributeType": "S"},
                                          {"AttributeName": "PK", "AttributeType": "S"}],
             }),
-            "One or more parameter values were invalid: Some index key attributes are not \
-             defined in AttributeDefinitions. Keys: [SK, PK], AttributeDefinitions: [EXTRA, PK]"
-                .to_string(),
+            "Invalid KeySchema: Some index key attribute have no definition".to_string(),
         ),
         (
             // Neither list is reported in the order the request stated it: both are

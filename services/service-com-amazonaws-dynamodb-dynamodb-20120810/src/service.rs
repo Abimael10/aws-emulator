@@ -428,6 +428,34 @@ fn checks_its_own_members(operation: &str) -> bool {
         .is_ok()
 }
 
+/// The operations whose `TableName` NAMES the table the request is creating, so the value
+/// is held to the table-name form itself and not to the bound the model declares on the
+/// member.
+///
+/// `TableName` targets the shape that also carries a table's ARN — "You can also provide
+/// the Amazon Resource Name (ARN) of the table in this parameter"
+/// (`CreateTable$TableName`), which is why the member admits far longer and far shorter
+/// values than a NAME does. A request CREATING a table states the name the table will be
+/// addressed by from then on, and that name has its own form
+/// ([`crate::state::table_name_form_clauses`]); so a bound the validating walk reports on
+/// that member is RESTATED as every way the submitted name breaks that form, and states
+/// nothing of any other member — the name is the whole selector the created resource will
+/// be addressed by, exactly as the ARN-addressed surface's own selector is
+/// ([`SELF_CHECKED_MEMBER_OPERATIONS`]).
+///
+/// The operations that RESOLVE a table the account already holds are not here: each of
+/// them accepts the ARN spelling of an existing table, so the bound its member declares is
+/// the one a caller is held to, and the walk's clause states it.
+///
+/// Sorted, which [`holds_table_name_to_its_form`] relies on for `binary_search` and
+/// `table_name_form_operations_are_sorted` pins.
+const TABLE_NAME_FORM_OPERATIONS: &[&str] = &["CreateTable"];
+
+/// Whether `operation` holds its `TableName` to the table-name form.
+fn holds_table_name_to_its_form(operation: &str) -> bool {
+    TABLE_NAME_FORM_OPERATIONS.binary_search(&operation).is_ok()
+}
+
 /// The REQUIRED TAG LISTS of that same surface, each as the member path the validating walk
 /// reports it under and the entry its own sentence names
 /// (`crate::state::no_tag_entries_message`).
@@ -642,6 +670,11 @@ tokio::task_local! {
     /// checks ([`SELF_CHECKED_MEMBER_OPERATIONS`]), set and read back the same way.
     static SERVED_MEMBER_CHECK: bool;
 
+    /// The clauses the `TableName` of the request this task is serving earns for breaking
+    /// the table-name form, for an operation that holds it to that form
+    /// ([`TABLE_NAME_FORM_OPERATIONS`]), set and read back the same way.
+    static SERVED_TABLE_NAME_CLAUSES: Vec<String>;
+
     /// The clauses this service's OWN reading of the request found
     /// ([`request_constraints`]), set around the same run and read back by
     /// [`validation_envelope`] so they are counted in the one envelope beside the
@@ -689,6 +722,16 @@ fn served_checks_its_own_members() -> bool {
     SERVED_MEMBER_CHECK
         .try_with(|checked| *checked)
         .unwrap_or(false)
+}
+
+/// The clauses the `TableName` of the request this task is serving earns for breaking the
+/// table-name form. None at all is a refusal raised outside an operation's run, where there
+/// is no request to have read a name off — and the walk's clause is what such a refusal
+/// states.
+fn served_table_name_clauses() -> Vec<String> {
+    SERVED_TABLE_NAME_CLAUSES
+        .try_with(Clone::clone)
+        .unwrap_or_default()
 }
 
 /// The clauses this service's own reading of the request it is serving found. None at all
@@ -816,11 +859,16 @@ impl<Eng: Send + Sync + 'static> ErasedOperation for OperationScopedClauseForm<E
                             states_absent_member_as_clause(operation),
                             SERVED_MEMBER_CHECK.scope(
                                 checks_its_own_members(operation),
-                                SERVED_SERVICE_CHECKED_CLAUSES.scope(
-                                    request_constraints::service_checked_clauses(operation, req),
-                                    SERVED_READABLE_BODY.scope(
-                                        request_constraints::readable_body(operation, req),
-                                        op.run(svc, req, ctx),
+                                SERVED_TABLE_NAME_CLAUSES.scope(
+                                    request_constraints::table_name_form_clauses(operation, req),
+                                    SERVED_SERVICE_CHECKED_CLAUSES.scope(
+                                        request_constraints::service_checked_clauses(
+                                            operation, req,
+                                        ),
+                                        SERVED_READABLE_BODY.scope(
+                                            request_constraints::readable_body(operation, req),
+                                            op.run(svc, req, ctx),
+                                        ),
                                     ),
                                 ),
                             ),
@@ -1063,6 +1111,14 @@ fn validation_envelope(violations: &[Violation]) -> Option<String> {
             return Some(crate::state::no_tag_entries_message(entry));
         }
     }
+    // A `TableName` that NAMES the table the request creates is held to the table-name form
+    // rather than to the bound the ARN-accepting member declares, so a request whose name
+    // breaks that form is refused by every way it breaks it, and states nothing of any
+    // other member — the name is the whole selector the created resource will be addressed
+    // by ([`TABLE_NAME_FORM_OPERATIONS`]).
+    if let Some(refusal) = crate::state::validation_message(served_table_name_clauses()) {
+        return Some(refusal);
+    }
     if let Some(absent) = missing_service_required_member(violations) {
         if !served_states_absent_member_as_clause() {
             return Some(crate::state::missing_parameter_message(&absent));
@@ -1181,6 +1237,12 @@ const STATED_MEMBER_ORDERS: &[&[&str]] = &[
         "returnValues",
         "key",
     ],
+    // The capacity MODE and the key schema of a table declaration, which the model declares
+    // as `KeySchema` then `BillingMode` (`smithy_query(query="operation",
+    // operation="CreateTable")`): the service states the MODE's clause first. Named by the
+    // schema's LIST member, so a clause about one of its elements is ordered by the list it
+    // belongs to whichever position and member inside the element it is about.
+    &["billingMode", "keySchema"],
 ];
 
 /// `violations` in the order their clauses are stated: the order
@@ -1463,9 +1525,10 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
 #[cfg(test)]
 mod tests {
     use super::{
-        checks_its_own_members, clause_form, stated_enum_order, states_absent_member_as_clause,
-        states_service_checked_clause_bare, ClauseForm, BARE_CLAUSE_OPERATIONS,
-        ITEM_REQUEST_FORM_OPERATIONS, PUBLISHED_ENUM_ORDERS, SELF_CHECKED_MEMBER_OPERATIONS,
+        checks_its_own_members, clause_form, holds_table_name_to_its_form, stated_enum_order,
+        states_absent_member_as_clause, states_service_checked_clause_bare, ClauseForm,
+        BARE_CLAUSE_OPERATIONS, ITEM_REQUEST_FORM_OPERATIONS, PUBLISHED_ENUM_ORDERS,
+        SELF_CHECKED_MEMBER_OPERATIONS, TABLE_NAME_FORM_OPERATIONS,
         VALIDATOR_NULL_CLAUSE_OPERATIONS, VALIDATOR_PATH_FORM_OPERATIONS,
     };
 
@@ -1600,6 +1663,32 @@ mod tests {
             assert!(
                 !checks_its_own_members(operation),
                 "case {operation:?}: expected the walk's clause, got the service's sentence"
+            );
+        }
+    }
+
+    #[test]
+    fn table_name_form_operations_are_sorted() {
+        let mut sorted = TABLE_NAME_FORM_OPERATIONS.to_vec();
+        sorted.sort_unstable();
+        assert_eq!(
+            TABLE_NAME_FORM_OPERATIONS,
+            sorted.as_slice(),
+            "case the table-name-form list: expected it sorted for `binary_search`, got \
+             {TABLE_NAME_FORM_OPERATIONS:?}"
+        );
+        for operation in TABLE_NAME_FORM_OPERATIONS {
+            assert!(
+                holds_table_name_to_its_form(operation),
+                "case {operation:?}: expected the table-name form, got the walk's clause"
+            );
+        }
+        // The operations that RESOLVE a table the account already holds, whose member
+        // accepts that table's ARN as well as its name.
+        for operation in ["DescribeTable", "GetItem", "PutItem", "UpdateTable", "DeleteTable"] {
+            assert!(
+                !holds_table_name_to_its_form(operation),
+                "case {operation:?}: expected the walk's clause, got the table-name form"
             );
         }
     }
