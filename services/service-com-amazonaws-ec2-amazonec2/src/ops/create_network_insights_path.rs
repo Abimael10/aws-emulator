@@ -5,7 +5,9 @@
 //! destination, the addresses, the protocol, the destination port and the filters scoping it
 //! at either end — and answers it exactly as it was stored, so
 //! `DescribeNetworkInsightsPaths` reports the same path and `StartNetworkInsightsAnalysis`
-//! resolves it. This is the ONLY file to touch for this operation.
+//! resolves it. The ARN of the resource at each end is resolved from the value that end names
+//! and stored with the path ([`crate::state::network_insights_endpoint_arn`]), so every reader
+//! of the path reports it. This is the ONLY file to touch for this operation.
 //!
 //! Nothing here analyzes the path: a path is the DESCRIPTION of what to analyze, and the
 //! analysis of one is `StartNetworkInsightsAnalysis`'s own operation, so this call mints the
@@ -213,7 +215,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ("Destination", input.destination.as_deref()),
         ] {
             if let Some(named) = named {
-                if endpoint_type(named).is_none() {
+                if state::network_insights_endpoint_type(named).is_none() {
                     return Err(unsupported_endpoint_type(member, named));
                 }
             }
@@ -309,65 +311,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     }
 }
 
-/// The resource types an end of a path may name, each beside the id prefix EC2 issues that
-/// type's ids under, in the order the service's own refusal lists them.
-///
-/// A path is analyzed BETWEEN resources, and only some kinds of resource can be one of its
-/// ends; the service names that catalog in the refusal it answers a value of any other kind
-/// with ([`unsupported_endpoint_type`]), which is where this list comes from. Each entry's
-/// prefix is the one the rest of this crate mints and reads that type's ids under, so the
-/// catalog cannot name a type whose ids the crate spells differently.
-const ENDPOINT_TYPES: [(&str, &str); 9] = [
-    // The instance id prefix `crate::state::instance_id_is_well_formed` reads.
-    ("instance", "i"),
-    (
-        crate::state::RESOURCE_TYPE_NETWORK_INTERFACE,
-        crate::state::NETWORK_INTERFACE_ID_PREFIX,
-    ),
-    // The `ResourceType` member of an internet gateway, whose ids this crate mints under
-    // `crate::state::INTERNET_GATEWAY_ID_PREFIX`.
-    ("internet-gateway", crate::state::INTERNET_GATEWAY_ID_PREFIX),
-    (
-        crate::state::RESOURCE_TYPE_VPN_GATEWAY,
-        crate::state::VPN_GATEWAY_ID_PREFIX,
-    ),
-    (
-        crate::state::RESOURCE_TYPE_VPC_ENDPOINT,
-        crate::state::VPC_ENDPOINT_ID_PREFIX,
-    ),
-    (
-        crate::state::RESOURCE_TYPE_VPC_ENDPOINT_SERVICE,
-        crate::state::VPC_ENDPOINT_SERVICE_ID_PREFIX,
-    ),
-    (
-        crate::state::RESOURCE_TYPE_VPC_PEERING_CONNECTION,
-        crate::state::VPC_PEERING_CONNECTION_ID_PREFIX,
-    ),
-    (
-        crate::state::RESOURCE_TYPE_TRANSIT_GATEWAY,
-        TRANSIT_GATEWAY_ID_PREFIX,
-    ),
-    (
-        crate::state::RESOURCE_TYPE_TRANSIT_GATEWAY_ATTACHMENT,
-        crate::state::TRANSIT_GATEWAY_ATTACHMENT_ID_PREFIX,
-    ),
-];
-
-/// The id prefix of a transit gateway, the one kind in [`ENDPOINT_TYPES`] this crate names no
-/// prefix constant for: the `tgw-` every transit gateway id of this service carries, which
-/// [`crate::state::TRANSIT_GATEWAY_ATTACHMENT_ID_PREFIX`] extends for an attachment.
-const TRANSIT_GATEWAY_ID_PREFIX: &str = "tgw";
-
 /// Refuse an end of the path whose value names no resource a path can be analyzed between:
 /// HTTP 400 `InvalidParameterValue`, worded as the service words it — the value, the member
 /// that carried it, and the catalog of types that member accepts.
 ///
 /// The member's name is taken from the request, since either end can be the one that names an
-/// unsupported kind, and the catalog is [`ENDPOINT_TYPES`] itself, so the sentence cannot list
-/// a type this operation would refuse. The echo of the value is bounded by the one reader every
-/// refusal of this crate quotes a caller-chosen id through.
+/// unsupported kind, and the catalog is
+/// [`crate::state::NETWORK_INSIGHTS_ENDPOINT_TYPES`] itself — the one this crate both screens
+/// an end against and derives that end's ARN from — so the sentence cannot list a type this
+/// operation would refuse. The echo of the value is bounded by the one reader every refusal of
+/// this crate quotes a caller-chosen id through.
 fn unsupported_endpoint_type(member: &str, value: &str) -> CreateNetworkInsightsPathError {
-    let supported: Vec<&str> = ENDPOINT_TYPES
+    let supported: Vec<&str> = crate::state::NETWORK_INSIGHTS_ENDPOINT_TYPES
         .iter()
         .map(|(resource_type, _)| *resource_type)
         .collect();
@@ -377,47 +332,6 @@ fn unsupported_endpoint_type(member: &str, value: &str) -> CreateNetworkInsights
         value = crate::state::echoed_resource_id(value),
         supported = supported.join(", "),
     ))
-}
-
-/// The type of the resource an end of the path names, or `None` when it names no resource of
-/// the [`ENDPOINT_TYPES`] catalog.
-///
-/// "The ID or ARN of the source. If the resource is in another account, you must specify an
-/// ARN" (`Source`, and the same sentence for `Destination`), so a value carrying the `arn:`
-/// scheme is read for the type its resource part names and anything else as a resource id,
-/// whose type is the kind whose prefix it reads under
-/// ([`crate::state::prefixed_id_is_well_formed`], the two forms EC2 has issued ids in). A value
-/// in neither form names nothing at all, whatever resources the account holds, which is why
-/// this is decided before the store is reached.
-fn endpoint_type(value: &str) -> Option<&'static str> {
-    if let Some((resource_type, named)) = arn_resource(value) {
-        if named.is_empty() {
-            return None;
-        }
-        return ENDPOINT_TYPES
-            .iter()
-            .find(|(supported, _)| *supported == resource_type)
-            .map(|(supported, _)| *supported);
-    }
-    ENDPOINT_TYPES
-        .iter()
-        .find(|(_, prefix)| crate::state::prefixed_id_is_well_formed(prefix, value))
-        .map(|(supported, _)| *supported)
-}
-
-/// The resource type and the resource an ARN's resource part names: `<type>/<id>` or
-/// `<type>:<id>` under the six colon-separated fields of
-/// `arn:<partition>:<service>:<region>:<account>:<resource>` (AWS General Reference, "Amazon
-/// Resource Names"). `None` for a value that is no ARN at all, which therefore names its
-/// resource as a bare id instead.
-fn arn_resource(value: &str) -> Option<(&str, &str)> {
-    if !value.starts_with("arn:") {
-        return None;
-    }
-    let resource = value.splitn(6, ':').nth(5)?;
-    resource
-        .split_once('/')
-        .or_else(|| resource.split_once(':'))
 }
 
 /// One requested filter as the modelled [`PathFilter`] the store holds and every reader of a

@@ -826,6 +826,111 @@ pub const RESOURCE_TYPE_NETWORK_INSIGHTS_PATH: &str = "network-insights-path";
 /// member), which is also what the analysis's own ARN names.
 pub const RESOURCE_TYPE_NETWORK_INSIGHTS_ANALYSIS: &str = "network-insights-analysis";
 
+/// The resource types one END of a Reachability Analyzer path may name, each beside the id
+/// prefix EC2 issues that type's ids under, in the order the service's own refusal lists
+/// them.
+///
+/// A path is analyzed BETWEEN resources, and only some kinds of resource can be one of its
+/// ends; the service names that catalog in the refusal it answers a value of any other kind
+/// with, which is where this list comes from. Each entry's type is the `ResourceType` member
+/// an ARN of that resource names, and each prefix is the one the rest of this crate mints and
+/// reads that type's ids under — so the catalog cannot name a type whose ids the crate spells
+/// differently, and it decides BOTH whether an end may name a value
+/// ([`network_insights_endpoint_type`]) and the ARN a stored path reports for that end
+/// ([`network_insights_endpoint_arn`]).
+pub const NETWORK_INSIGHTS_ENDPOINT_TYPES: [(&str, &str); 9] = [
+    (RESOURCE_TYPE_INSTANCE, INSTANCE_ID_PREFIX),
+    (RESOURCE_TYPE_NETWORK_INTERFACE, NETWORK_INTERFACE_ID_PREFIX),
+    (
+        INTERNET_GATEWAY_TAGGABLE_RESOURCE,
+        INTERNET_GATEWAY_ID_PREFIX,
+    ),
+    (RESOURCE_TYPE_VPN_GATEWAY, VPN_GATEWAY_ID_PREFIX),
+    (RESOURCE_TYPE_VPC_ENDPOINT, VPC_ENDPOINT_ID_PREFIX),
+    (
+        RESOURCE_TYPE_VPC_ENDPOINT_SERVICE,
+        VPC_ENDPOINT_SERVICE_ID_PREFIX,
+    ),
+    (
+        RESOURCE_TYPE_VPC_PEERING_CONNECTION,
+        VPC_PEERING_CONNECTION_ID_PREFIX,
+    ),
+    (RESOURCE_TYPE_TRANSIT_GATEWAY, TRANSIT_GATEWAY_ID_PREFIX),
+    (
+        RESOURCE_TYPE_TRANSIT_GATEWAY_ATTACHMENT,
+        TRANSIT_GATEWAY_ATTACHMENT_ID_PREFIX,
+    ),
+];
+
+/// The type of the resource one end of a path names, or `None` when it names no resource of
+/// the [`NETWORK_INSIGHTS_ENDPOINT_TYPES`] catalog.
+///
+/// "The ID or ARN of the source. If the resource is in another account, you must specify an
+/// ARN" (`CreateNetworkInsightsPathRequest$Source`, and the same sentence for `Destination`),
+/// so a value carrying the `arn:` scheme is read for the type its resource part names and
+/// anything else as a resource id, whose type is the kind whose prefix it reads under
+/// ([`prefixed_id_is_well_formed`], the two forms EC2 has issued ids in). A value in neither
+/// form names nothing at all, whatever resources the account holds, which is why this needs
+/// no store.
+pub fn network_insights_endpoint_type(value: &str) -> Option<&'static str> {
+    if let Some((resource_type, named)) = endpoint_arn_resource(value) {
+        if named.is_empty() {
+            return None;
+        }
+        return NETWORK_INSIGHTS_ENDPOINT_TYPES
+            .iter()
+            .find(|(supported, _)| *supported == resource_type)
+            .map(|(supported, _)| *supported);
+    }
+    NETWORK_INSIGHTS_ENDPOINT_TYPES
+        .iter()
+        .find(|(_, prefix)| prefixed_id_is_well_formed(prefix, value))
+        .map(|(supported, _)| *supported)
+}
+
+/// "The Amazon Resource Name (ARN) of the source" / "of the destination"
+/// (`NetworkInsightsPath$SourceArn` / `$DestinationArn`): the ARN of the resource one end of
+/// a path names, or `None` when the value names no resource of the
+/// [`NETWORK_INSIGHTS_ENDPOINT_TYPES`] catalog and there is therefore no resource to name an
+/// ARN of.
+///
+/// An end given as an ARN already IS that ARN — "if the resource is in another account, you
+/// must specify an ARN", so the account and Region it names are the resource's own and
+/// nothing here may overwrite them. An end given as a bare id names a resource of THIS
+/// account in the Region the request was signed for, so its ARN is this emulator's canonical
+/// one for the type the id reads under, in the `<type>/<id>` form EC2 spells a resource ARN
+/// of that type in.
+///
+/// The ONE place a path's endpoint ARNs are derived, reached from
+/// [`ComAmazonawsEc2Amazonec2State::insert_network_insights_path`], so every path the account
+/// holds reports them and no two writers can build them differently.
+pub fn network_insights_endpoint_arn(value: &str, region: &str) -> Option<String> {
+    let resource_type = network_insights_endpoint_type(value)?;
+    if endpoint_arn_resource(value).is_some() {
+        return Some(value.to_string());
+    }
+    Some(::engine::emulator_arn(
+        "ec2",
+        region,
+        &format!("{resource_type}/{value}"),
+    ))
+}
+
+/// The resource type and the resource an ARN's resource part names: `<type>/<id>` or
+/// `<type>:<id>` under the six colon-separated fields of
+/// `arn:<partition>:<service>:<region>:<account>:<resource>` (AWS General Reference, "Amazon
+/// Resource Names"). `None` for a value that is no ARN at all, which therefore names its
+/// resource as a bare id instead.
+fn endpoint_arn_resource(value: &str) -> Option<(&str, &str)> {
+    if !value.starts_with("arn:") {
+        return None;
+    }
+    let resource = value.splitn(6, ':').nth(5)?;
+    resource
+        .split_once('/')
+        .or_else(|| resource.split_once(':'))
+}
+
 /// "The status message, if the status is `failed`"
 /// (`NetworkInsightsAnalysis$StatusMessage`) of an analysis this emulator could not run.
 ///
@@ -945,7 +1050,10 @@ pub struct NetworkInsightsAnalysisSpec {
 /// The ONE definition of that charge, so a writer cannot ask one number and charge another.
 /// A filter is a nested structure this module reads no member of, so it is charged by the
 /// length of its rendered form — never less than the bytes of the strings it holds — the way
-/// [`network_insights_access_scope_payload_bytes`] charges a scope's paths.
+/// [`network_insights_access_scope_payload_bytes`] charges a scope's paths. The ARN each end
+/// of the path reports ([`network_insights_endpoint_arn`]) is NOT a second charge: it is the
+/// value that end was named by, which this formula already counts, plus the Region, account
+/// and type parts [`STORED_RECORD_OVERHEAD_BYTES`] stands for.
 pub fn network_insights_path_payload_bytes(spec: &NetworkInsightsPathSpec) -> usize {
     let text = |value: &Option<String>| value.as_deref().unwrap_or_default().len();
     tag_list_bytes(&spec.tags)
@@ -1035,12 +1143,38 @@ pub fn invalid_network_insights_path_id_value<E>(path_id: &str) -> Scaffolded<E>
 
 /// Refuse an analysis id a request named that the account holds no analysis under: HTTP 400
 /// [`INVALID_NETWORK_INSIGHTS_ANALYSIS_ID_NOT_FOUND`].
+///
+/// The message is the id the REQUEST carried followed by the fixed text " does not exist",
+/// the one template this surface's reads word a value they cannot resolve with — the same one
+/// [`invalid_network_insights_path_id_not_found`] answers for the path and
+/// [`invalid_network_insights_access_scope_analysis_id_not_found`] for the access scope's
+/// analysis — so the reads of this surface cannot word one condition two ways. The id is
+/// bounded by [`echoed_resource_id`] the way every refusal of this crate that echoes a
+/// caller-chosen id is.
 pub fn invalid_network_insights_analysis_id_not_found<E>(analysis_id: &str) -> Scaffolded<E> {
     Scaffolded::service_error(
         INVALID_NETWORK_INSIGHTS_ANALYSIS_ID_NOT_FOUND,
         400,
-        format!("The network insights analysis ID '{analysis_id}' does not exist"),
+        format!("{} does not exist", echoed_resource_id(analysis_id)),
     )
+}
+
+/// Refuse a path-analysis id the operation ACTING on the one analysis it names cannot
+/// resolve: HTTP 400 `InvalidParameterValue`, naming the member that carried it and the value.
+///
+/// Which of the two refusals EC2 answers for an id it cannot resolve is a fact of the
+/// OPERATION rather than of the id — the split
+/// [`invalid_network_insights_access_scope_analysis_id_value`] records for the access scope's
+/// analysis and [`invalid_network_insights_path_id_value`] for this surface's path: the
+/// describe answers this resource's own [`INVALID_NETWORK_INSIGHTS_ANALYSIS_ID_NOT_FOUND`],
+/// while the delete, which acts on the one analysis it is given, states that the
+/// `NetworkInsightsAnalysisId` it was given is not a valid one — one answer for every id it
+/// cannot resolve, whatever its form. This is the ONE place that second wording lives, so the
+/// operation and the suite that asserts it cannot drift apart.
+pub fn invalid_network_insights_analysis_id_value<E>(analysis_id: &str) -> Scaffolded<E> {
+    invalid_parameter_value(format!(
+        "NetworkInsightsAnalysisId ({analysis_id}) is not valid"
+    ))
 }
 
 impl ComAmazonawsEc2Amazonec2State {
@@ -1089,13 +1223,22 @@ impl ComAmazonawsEc2Amazonec2State {
             )),
             // "The time stamp when the path was created" (`CreatedDate`).
             created_date: Some(system_time_to_date_time(SystemTime::now())),
+            // "The Amazon Resource Name (ARN) of the source" / "of the destination": the ARN
+            // of the resource that end NAMES, resolved here from the value itself — an end
+            // given as an ARN is that ARN, and an end given as an id names a resource of this
+            // account in the Region the request was signed for. An end naming no resource a
+            // path can be analyzed between has no ARN to report, so nothing is invented for
+            // it.
+            source_arn: spec
+                .source
+                .as_deref()
+                .and_then(|named| network_insights_endpoint_arn(named, &spec.region)),
+            destination_arn: spec
+                .destination
+                .as_deref()
+                .and_then(|named| network_insights_endpoint_arn(named, &spec.region)),
             source: spec.source,
             destination: spec.destination,
-            // "The Amazon Resource Name (ARN) of the source" / "of the destination": the ARN
-            // of a resource this emulator was not given one for is not invented here — a
-            // writer that resolved one passes it as the `Source`/`Destination` it stores.
-            source_arn: None,
-            destination_arn: None,
             source_ip: spec.source_ip,
             destination_ip: spec.destination_ip,
             protocol: spec.protocol,
@@ -1186,6 +1329,57 @@ impl ComAmazonawsEc2Amazonec2State {
         self.network_insights_analysis_client_tokens
             .insert(spec.client_token, analysis_id);
         Some(stored)
+    }
+
+    /// Take the path analysis `analysis_id` names OUT of the store, with the client token that
+    /// named it, and answer the analysis as it was last reported — or `None` when the account
+    /// holds no analysis of that id, nothing having been removed.
+    ///
+    /// The ONE way a path analysis leaves the store, on the contract of
+    /// [`Self::remove_network_insights_access_scope_analysis`], so a deletion is observable
+    /// through every path that resolves an analysis id: `AnalysisStatus`
+    /// (`smithy_query(query="shape",shape="AnalysisStatus")`) has no member for a deleted
+    /// analysis, so there is no terminal state for one to be reported in and the id simply
+    /// stops resolving — including the clock-owed move the record was still carrying, which
+    /// goes with it.
+    ///
+    /// The token that named this analysis stops naming it, so a later start carrying that
+    /// token begins a new analysis rather than reporting one nothing holds, and the bytes the
+    /// record held go back to the store's budget on exactly the terms the insert took them on
+    /// ([`network_insights_analysis_payload_bytes`]).
+    pub fn remove_network_insights_analysis(
+        &mut self,
+        analysis_id: &str,
+    ) -> Option<NetworkInsightsAnalysis> {
+        let record = self.network_insights_analyses.remove(analysis_id)?;
+        let client_token = self
+            .network_insights_analysis_client_tokens
+            .iter()
+            .find(|(_, named)| named.as_str() == analysis_id)
+            .map(|(token, _)| token.clone());
+        if let Some(token) = client_token.as_deref() {
+            self.network_insights_analysis_client_tokens.remove(token);
+        }
+        // The spec as the insert was given it: a list the request named nothing in is stored
+        // as absent, so an absent list is the empty one it was charged as.
+        self.release_stored_bytes(network_insights_analysis_payload_bytes(
+            &NetworkInsightsAnalysisSpec {
+                network_insights_path_id: record
+                    .view
+                    .network_insights_path_id
+                    .clone()
+                    .unwrap_or_default(),
+                additional_accounts: record.view.additional_accounts.clone().unwrap_or_default(),
+                filter_in_arns: record.view.filter_in_arns.clone().unwrap_or_default(),
+                filter_out_arns: record.view.filter_out_arns.clone().unwrap_or_default(),
+                // Neither the Region nor the path id is charged by the formula: it counts the
+                // caller-chosen members the record retains.
+                region: String::new(),
+                tags: record.view.tags.clone().unwrap_or_default(),
+                client_token: client_token.unwrap_or_default(),
+            },
+        ));
+        Some(record.view)
     }
 }
 

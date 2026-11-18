@@ -913,7 +913,9 @@
 //! account does not hold is refused with [`invalid_network_insights_path_id_not_found`]
 //! rather than analyzed. [`ComAmazonawsEc2Amazonec2State::insert_network_insights_path`] is
 //! its one writer, so every member a path reports is derived there rather than by each
-//! caller, and [`ComAmazonawsEc2Amazonec2State::remove_network_insights_path`] is its one
+//! caller — including the ARN of the resource at each of its two ends, resolved from the
+//! value that end names ([`network_insights_endpoint_arn`]) — and
+//! [`ComAmazonawsEc2Amazonec2State::remove_network_insights_path`] is its one
 //! remover, so the bytes a deleted path held go back to the store's budget with it.
 //!
 //! [`ComAmazonawsEc2Amazonec2State::network_insights_analyses`] holds the analyses started
@@ -933,6 +935,13 @@
 //! [`ComAmazonawsEc2Amazonec2State::network_insights_analysis_client_tokens`] maps one
 //! start's `ClientToken` to the analysis it started, so a replay of the same request answers
 //! that analysis instead of starting a second one.
+//!
+//! `DeleteNetworkInsightsAnalysis` takes an analysis back out through the one removal path
+//! ([`ComAmazonawsEc2Amazonec2State::remove_network_insights_analysis`]), which drops the
+//! client token and the clock-owed move with it and gives the bytes the record held back to
+//! the store's budget: `AnalysisStatus` has no member for a deleted analysis, so a deleted
+//! one has no terminal state to be reported in and its id simply stops resolving for every
+//! reader of this surface.
 //!
 //! ## VPC Block Public Access exclusions
 //!
