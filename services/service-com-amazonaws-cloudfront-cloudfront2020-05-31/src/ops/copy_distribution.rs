@@ -452,85 +452,113 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
         let edge_endpoint =
             crate::state::open_edge_endpoint(&*self.engine, ctx.callback().clone()).await;
-        let mut store = state.lock();
-        store.settle(now);
+        // EVERYTHING THIS REQUEST READS AND WRITES OF THE STORE IS WEIGHED UNDER ONE GUARD,
+        // which is released as the block ends: the grant that follows the standard logging
+        // the copy runs under awaits, and a guard held across an await would make this
+        // future non-`Send` — the shape `crate::ops::update_distribution` keeps for the same
+        // reason.
+        let (created, logging) = {
+            let mut store = state.lock();
+            store.settle(now);
 
-        // The configuration being copied is the PRIMARY's stored one — "the
-        // configuration of the provided primary distribution" — so a primary the store
-        // does not hold is the modelled 404 and nothing is minted for it.
-        let Some(primary) = store
-            .distribution(&input.primary_distribution_id)
-            .map(|stored| (stored.etag.clone(), stored.config.clone()))
-        else {
-            return Err(CopyDistributionErrorModeled::NoSuchDistribution(
-                crate::state::no_such_distribution(),
-            )
-            .into());
-        };
-        let (primary_etag, primary_config) = primary;
+            // The configuration being copied is the PRIMARY's stored one — "the
+            // configuration of the provided primary distribution" — so a primary the store
+            // does not hold is the modelled 404 and nothing is minted for it.
+            let Some(primary) = store
+                .distribution(&input.primary_distribution_id)
+                .map(|stored| (stored.etag.clone(), stored.config.clone()))
+            else {
+                return Err(CopyDistributionErrorModeled::NoSuchDistribution(
+                    crate::state::no_such_distribution(),
+                )
+                .into());
+            };
+            let (primary_etag, primary_config) = primary;
 
-        // `If-Match` is "the version identifier of the primary distribution whose
-        // configuration you are copying", and the model leaves the header OPTIONAL — this
-        // call modifies nothing about the primary, so a request that states no version
-        // states no precondition and copies the configuration as it now stands. A header
-        // that IS present is checked against the stored version, so a copy taken under a
-        // version is taken only from the configuration its caller actually read.
-        if input.if_match.is_some() {
-            match crate::state::check_if_match(&primary_etag, input.if_match.as_deref()) {
-                IfMatch::Current => {}
-                IfMatch::Invalid => {
-                    // The refusal wording is `crate::state`'s: the sentence is a property
-                    // of the header the request carried, so every operation that
-                    // evaluates an `If-Match` answers with the same service text rather
-                    // than wording of its own.
-                    return Err(CopyDistributionErrorModeled::InvalidIfMatchVersion(
-                        crate::state::invalid_if_match_version(),
-                    )
-                    .into());
-                }
-                IfMatch::Stale => {
-                    return Err(CopyDistributionErrorModeled::PreconditionFailed(
-                        crate::state::precondition_failed(),
-                    )
-                    .into());
+            // `If-Match` is "the version identifier of the primary distribution whose
+            // configuration you are copying", and the model leaves the header OPTIONAL —
+            // this call modifies nothing about the primary, so a request that states no
+            // version states no precondition and copies the configuration as it now stands.
+            // A header that IS present is checked against the stored version, so a copy
+            // taken under a version is taken only from the configuration its caller
+            // actually read.
+            if input.if_match.is_some() {
+                match crate::state::check_if_match(&primary_etag, input.if_match.as_deref()) {
+                    IfMatch::Current => {}
+                    IfMatch::Invalid => {
+                        // The refusal wording is `crate::state`'s: the sentence is a
+                        // property of the header the request carried, so every operation
+                        // that evaluates an `If-Match` answers with the same service text
+                        // rather than wording of its own.
+                        return Err(CopyDistributionErrorModeled::InvalidIfMatchVersion(
+                            crate::state::invalid_if_match_version(),
+                        )
+                        .into());
+                    }
+                    IfMatch::Stale => {
+                        return Err(CopyDistributionErrorModeled::PreconditionFailed(
+                            crate::state::precondition_failed(),
+                        )
+                        .into());
+                    }
                 }
             }
-        }
 
-        // What this operation creates is a STAGING distribution, and the request's
-        // `Staging` member says so: its only documented value is `true`, so any other one
-        // is refused rather than silently creating something else.
-        if input.staging == Some(false) {
-            return Err(CopyDistributionErrorModeled::InvalidArgument(InvalidArgument {
-                message: Some(STAGING_MUST_BE_TRUE.to_string()),
-            })
-            .into());
-        }
+            // What this operation creates is a STAGING distribution, and the request's
+            // `Staging` member says so: its only documented value is `true`, so any other
+            // one is refused rather than silently creating something else.
+            if input.staging == Some(false) {
+                return Err(CopyDistributionErrorModeled::InvalidArgument(InvalidArgument {
+                    message: Some(STAGING_MUST_BE_TRUE.to_string()),
+                })
+                .into());
+            }
 
-        // The copy's configuration: the primary's, with exactly the three members this
-        // request speaks about applied to it. Every other member — the origins, the cache
-        // behaviours, the aliases, the certificate, the restrictions — is the primary's,
-        // because the copy is "a copy of an existing distribution" rather than a
-        // configuration the request describes.
-        let mut config = primary_config;
-        // "A value that uniquely identifies a request to create a resource": the copy is a
-        // new resource, so it is created under the reference THIS request names rather
-        // than under the primary's.
-        config.caller_reference = input.caller_reference;
-        // "A Boolean flag to specify the state of the staging distribution when it's
-        // created."
-        config.enabled = input.enabled.unwrap_or(DEFAULT_ENABLED);
-        // "A Boolean that indicates whether this is a staging distribution. When this
-        // value is `true`, this is a staging distribution."
-        config.staging = Some(true);
+            // The copy's configuration: the primary's, with exactly the three members this
+            // request speaks about applied to it. Every other member — the origins, the
+            // cache behaviours, the aliases, the certificate, the restrictions — is the
+            // primary's, because the copy is "a copy of an existing distribution" rather
+            // than a configuration the request describes.
+            let mut config = primary_config;
+            // "A value that uniquely identifies a request to create a resource": the copy is
+            // a new resource, so it is created under the reference THIS request names rather
+            // than under the primary's.
+            config.caller_reference = input.caller_reference;
+            // "A Boolean flag to specify the state of the staging distribution when it's
+            // created."
+            config.enabled = input.enabled.unwrap_or(DEFAULT_ENABLED);
+            // "A Boolean that indicates whether this is a staging distribution. When this
+            // value is `true`, this is a staging distribution."
+            config.staging = Some(true);
 
-        // The shared create path: the copy is a distribution like any other, so it is
-        // created, bounded and indexed by caller reference exactly as `CreateDistribution`
-        // creates one — and, like that operation, this request carries no tag set, so the
-        // copy starts with no tags.
-        let created = store
-            .create_distribution(config, crate::state::TagSet::new(), now, edge_endpoint)
-            .map_err(create_refusal)?;
+            // The copy runs under the primary's standard logging, so it delivers access logs
+            // into the same bucket — a side effect on that bucket, owed once the copy is
+            // stored. The member is read for it BEFORE the configuration is handed to the
+            // store, which takes it whole.
+            let logging = config.logging.clone();
+
+            // The shared create path: the copy is a distribution like any other, so it is
+            // created, bounded and indexed by caller reference exactly as
+            // `CreateDistribution` creates one — and, like that operation, this request
+            // carries no tag set, so the copy starts with no tags.
+            let created = store
+                .create_distribution(config, crate::state::TagSet::new(), now, edge_endpoint)
+                .map_err(create_refusal)?;
+            (created, logging)
+        };
+
+        // The copy is stored, so the side effect of the standard logging it runs under is
+        // owed: the log-delivery account holds `FULL_CONTROL` on the target bucket
+        // (`crate::state::standard_logging`). Nothing is REFUSED here — this request submits
+        // no configuration of its own, it runs the one CloudFront already accepted for the
+        // primary — and the read is BOXED, as it is on the create path, because it reaches
+        // Amazon S3 over the in-process callback.
+        let access_logs = Box::pin(crate::state::resolve_logging_target_for(
+            ctx,
+            logging.as_ref(),
+        ))
+        .await;
+        Box::pin(access_logs.grant_log_delivery(ctx)).await;
 
         Ok(CopyDistributionOutput {
             distribution: Some(created.distribution),

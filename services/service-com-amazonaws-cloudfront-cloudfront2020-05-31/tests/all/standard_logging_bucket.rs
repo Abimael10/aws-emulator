@@ -28,6 +28,10 @@
 //! controls were withdrawn), the FORM of the bucket's endpoint host (the global one and a
 //! regional one), whether the bucket's name carries dots, and whether the configuration
 //! names a prefix and asks for cookies.
+//!
+//! The harness below — CloudFront mounted beside the object store, and the bucket reads every
+//! assertion is made through — is reused by [`crate::standard_logging_grant_paths`], which
+//! takes the same rule to the other calls that store a logging configuration.
 
 use aws_sdk_s3::types::{ObjectOwnership, Permission, Type};
 use smithy_server_runtime::{EmbeddedEmulator, MultiServiceRouter};
@@ -38,12 +42,12 @@ use crate::distribution_lifecycle::{call, Answer, API_VERSION};
 
 /// The Region this suite's buckets are created in, and the Region the global endpoint host
 /// below addresses.
-const REGION: &str = "us-east-1";
+pub(crate) const REGION: &str = "us-east-1";
 
 /// A Region OTHER than [`REGION`], for the row whose log bucket is named by a regional
 /// endpoint host: one object store holds every bucket, so the host's Region is addressing
 /// rather than a second store.
-const OTHER_REGION: &str = "us-west-2";
+pub(crate) const OTHER_REGION: &str = "us-west-2";
 
 // ---------------------------------------------------------------------------
 // The emulator: CloudFront plus the object store its log buckets live in
@@ -52,13 +56,13 @@ const OTHER_REGION: &str = "us-west-2";
 /// CloudFront and Amazon S3 over ONE shared engine, with a callback into the same router, so
 /// this suite creates buckets and reads their ACLs through S3's own API — the very seam the
 /// handler reaches them over.
-struct Emulator {
-    router: MultiServiceRouter,
+pub(crate) struct Emulator {
+    pub(crate) router: MultiServiceRouter,
     callback: EmbeddedEmulator,
 }
 
 impl Emulator {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let engine: std::sync::Arc<engine::InMemoryEngine> =
             std::sync::Arc::new(engine::InMemoryEngine::new());
         let mut router = MultiServiceRouter::new();
@@ -77,12 +81,12 @@ impl Emulator {
 
     /// The Amazon S3 client, built by the one shared constructor over the in-process
     /// callback, so this suite's buckets are the ones the handler reads.
-    fn s3(&self) -> aws_sdk_s3::Client {
+    pub(crate) fn s3(&self) -> aws_sdk_s3::Client {
         service_common::s3_client::s3_client(&self.callback, REGION)
     }
 
     /// Create `bucket` with the Object Ownership setting `ownership` asks for.
-    async fn bucket(&self, bucket: &str, ownership: Ownership) {
+    pub(crate) async fn bucket(&self, bucket: &str, ownership: Ownership) {
         let mut create = self.s3().create_bucket().bucket(bucket);
         if let Some(setting) = ownership.object_ownership() {
             create = create.object_ownership(setting);
@@ -105,7 +109,7 @@ impl Emulator {
 
     /// Every `(canonical user id, permission)` pair the bucket's access control list grants,
     /// as Amazon S3 reports it.
-    async fn acl_grants(&self, bucket: &str) -> Vec<(String, String)> {
+    pub(crate) async fn acl_grants(&self, bucket: &str) -> Vec<(String, String)> {
         let answered = self
             .s3()
             .get_bucket_acl()
@@ -133,7 +137,7 @@ impl Emulator {
     }
 
     /// How many grants of `bucket`'s ACL are the log-delivery account's `FULL_CONTROL`.
-    async fn log_delivery_grants(&self, bucket: &str) -> usize {
+    pub(crate) async fn log_delivery_grants(&self, bucket: &str) -> usize {
         self.acl_grants(bucket)
             .await
             .into_iter()
@@ -157,7 +161,7 @@ impl Emulator {
 /// a bucket whose ownership controls were WITHDRAWN, and a bucket the object store does not
 /// hold.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Ownership {
+pub(crate) enum Ownership {
     BucketOwnerEnforced,
     BucketOwnerPreferred,
     ObjectWriter,
@@ -338,7 +342,7 @@ async fn create_with_tags(router: &MultiServiceRouter, config: &str) -> Answer {
 
 /// The sentence CloudFront refuses a log bucket with ACLs disabled with, as this suite
 /// expects it: the service's fixed text, naming the bucket the request itself specified.
-fn acl_access_not_enabled(specified: &str) -> String {
+pub(crate) fn acl_access_not_enabled(specified: &str) -> String {
     format!(
         "The S3 bucket that you specified for CloudFront logs does not enable ACL access: \
          {specified}"

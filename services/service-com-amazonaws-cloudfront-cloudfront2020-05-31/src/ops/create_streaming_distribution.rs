@@ -174,7 +174,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(crate::state::store_unavailable());
         };
-        let _ = ctx;
         let now = SystemTime::now();
         // The configuration as the service will run it: the members submitted plus every
         // member the service itself supplies. Resolved BEFORE the caller-reference
@@ -184,153 +183,196 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             input.streaming_distribution_config,
         );
 
-        let mut store = state.lock();
-        // Materialise whatever the clock owes the rest of the store before this call reads
-        // it, as every handler here does.
-        store.settle(now);
+        // Standard logging is delivered into the bucket the configuration names, as the
+        // log-delivery account, so whether that bucket can receive a log at all is Amazon
+        // S3's answer about it — read here, with NO lock held, because an await under the
+        // store guard would make this future non-`Send`. The refusal it may earn is
+        // answered in order below, and the grant it leaves is applied once the
+        // configuration is stored (`crate::state::standard_logging`). BOXED, both of them,
+        // for the reason `crate::ops::create_distribution` records: each reaches Amazon S3
+        // over the in-process callback.
+        let access_logs = Box::pin(crate::state::resolve_streaming_access_logs_target(
+            ctx, &config,
+        ))
+        .await;
 
-        // "The value of Quantity and the size of Items don't match." Every CloudFront list
-        // travels in a wrapper that states its own length beside the list itself, and a
-        // request where the two disagree is refused — for each wrapper a streaming
-        // distribution configuration reaches.
-        let aliases = config.aliases.clone().unwrap_or_default();
-        let alias_count = aliases.items.as_ref().map_or(0, Vec::len);
-        let signers = config.trusted_signers.items.as_deref().unwrap_or_default();
-        for (label, quantity, length) in [
-            ("Aliases", aliases.quantity, alias_count),
-            (
-                "TrustedSigners",
-                config.trusted_signers.quantity,
-                signers.len(),
-            ),
-        ] {
-            if usize::try_from(quantity).ok() != Some(length) {
+        // EVERYTHING THIS REQUEST READS AND WRITES OF THE STORE IS WEIGHED UNDER ONE GUARD,
+        // which is released as the block ends: the grant that follows a configuration
+        // enabling standard logging awaits, and a guard held across an await would make this
+        // future non-`Send` — the shape `crate::ops::update_distribution` keeps for the same
+        // reason.
+        let (streaming_distribution, location, etag) = {
+            let mut store = state.lock();
+            // Materialise whatever the clock owes the rest of the store before this call
+            // reads it, as every handler here does.
+            store.settle(now);
+
+            // "The value of Quantity and the size of Items don't match." Every CloudFront
+            // list travels in a wrapper that states its own length beside the list itself,
+            // and a request where the two disagree is refused — for each wrapper a streaming
+            // distribution configuration reaches.
+            let aliases = config.aliases.clone().unwrap_or_default();
+            let alias_count = aliases.items.as_ref().map_or(0, Vec::len);
+            let signers = config.trusted_signers.items.as_deref().unwrap_or_default();
+            for (label, quantity, length) in [
+                ("Aliases", aliases.quantity, alias_count),
+                (
+                    "TrustedSigners",
+                    config.trusted_signers.quantity,
+                    signers.len(),
+                ),
+            ] {
+                if usize::try_from(quantity).ok() != Some(length) {
+                    return Err(
+                        CreateStreamingDistributionErrorModeled::InconsistentQuantities(
+                            InconsistentQuantities {
+                                message: Some(format!(
+                                    "The value of Quantity and the size of Items don't match \
+                                     for {label}."
+                                )),
+                            },
+                        )
+                        .into(),
+                    );
+                }
+            }
+
+            // "Your request contains more trusted signers than are allowed per
+            // distribution."
+            if signers.len() > crate::state::MAX_TRUSTED_SIGNERS {
                 return Err(
-                    CreateStreamingDistributionErrorModeled::InconsistentQuantities(
-                        InconsistentQuantities {
+                    CreateStreamingDistributionErrorModeled::TooManyTrustedSigners(
+                        TooManyTrustedSigners {
                             message: Some(format!(
-                                "The value of Quantity and the size of Items don't match \
-                                 for {label}."
+                                "This streaming distribution states {} trusted signers; at \
+                                 most {} are allowed per distribution",
+                                signers.len(),
+                                crate::state::MAX_TRUSTED_SIGNERS
                             )),
                         },
                     )
                     .into(),
                 );
             }
-        }
 
-        // "Your request contains more trusted signers than are allowed per distribution."
-        if signers.len() > crate::state::MAX_TRUSTED_SIGNERS {
-            return Err(
-                CreateStreamingDistributionErrorModeled::TooManyTrustedSigners(
-                    TooManyTrustedSigners {
-                        message: Some(format!(
-                            "This streaming distribution states {} trusted signers; at most \
-                             {} are allowed per distribution",
-                            signers.len(),
-                            crate::state::MAX_TRUSTED_SIGNERS
-                        )),
-                    },
-                )
-                .into(),
-            );
-        }
-
-        // "Your request contains more CNAMEs than are allowed per distribution."
-        if alias_count > crate::state::MAX_DISTRIBUTION_CNAMES {
-            return Err(
-                CreateStreamingDistributionErrorModeled::TooManyStreamingDistributionCNAMEs(
-                    TooManyStreamingDistributionCNAMEs {
-                        message: Some(format!(
-                            "This streaming distribution states {alias_count} alternate domain \
-                             names; at most {} are allowed per distribution",
-                            crate::state::MAX_DISTRIBUTION_CNAMES
-                        )),
-                    },
-                )
-                .into(),
-            );
-        }
-
-        // A caller reference identifies ONE streaming distribution for its whole life. "If
-        // the value of CallerReference is new (regardless of the content of the
-        // StreamingDistributionConfig object), CloudFront creates a new distribution. If
-        // CallerReference is a value that you already sent in a previous request to create
-        // a distribution, CloudFront returns a DistributionAlreadyExists error" — so a
-        // repeat whose configuration is the one that reference already names is answered
-        // with that distribution, creating nothing, and a repeat that changes the
-        // configuration is refused. The same rule the distribution create path follows.
-        if let Some(existing) = store.streaming_distribution_by_caller_reference(
-            &config.caller_reference,
-        ) {
-            if crate::state::same_streaming_distribution_config(&existing.config, &config) {
-                return Ok(CreateStreamingDistributionOutput {
-                    streaming_distribution: Some(existing.to_streaming_distribution()),
-                    location: Some(crate::state::location_uri(
-                        ctx,
-                        &crate::state::streaming_distribution_path(&existing.id),
-                    )),
-                    e_tag: Some(existing.etag.clone()),
-                });
+            // "Your request contains more CNAMEs than are allowed per distribution."
+            if alias_count > crate::state::MAX_DISTRIBUTION_CNAMES {
+                return Err(
+                    CreateStreamingDistributionErrorModeled::TooManyStreamingDistributionCNAMEs(
+                        TooManyStreamingDistributionCNAMEs {
+                            message: Some(format!(
+                                "This streaming distribution states {alias_count} alternate \
+                                 domain names; at most {} are allowed per distribution",
+                                crate::state::MAX_DISTRIBUTION_CNAMES
+                            )),
+                        },
+                    )
+                    .into(),
+                );
             }
-            let message =
-                crate::state::streaming_distribution_already_exists_message(&existing.id);
-            return Err(
-                CreateStreamingDistributionErrorModeled::StreamingDistributionAlreadyExists(
-                    StreamingDistributionAlreadyExists {
+
+            // A standard access log is delivered into the bucket the configuration names,
+            // as the log-delivery account, so a configuration that enables logging to a
+            // bucket whose ACLs are DISABLED is refused where it is submitted: no such grant
+            // can exist on that bucket, so no log could ever be written there
+            // (`crate::state::standard_logging`). The same rule the distribution create path
+            // applies, worded by the same module.
+            if let Some(message) = access_logs.refusal() {
+                return Err(
+                    CreateStreamingDistributionErrorModeled::InvalidArgument(InvalidArgument {
                         message: Some(message),
-                    },
-                )
-                .into(),
-            );
-        }
+                    })
+                    .into(),
+                );
+            }
 
-        // "Processing your request would cause you to exceed the maximum number of
-        // streaming distributions allowed." A record is what a later read answers from, so
-        // it cannot be evicted: the bound is an entry count refused BEFORE anything is
-        // minted.
-        if store.streaming_distributions.len() >= crate::state::MAX_STREAMING_DISTRIBUTIONS {
-            return Err(
-                CreateStreamingDistributionErrorModeled::TooManyStreamingDistributions(
-                    TooManyStreamingDistributions {
-                        message: Some(format!(
-                            "This emulator holds at most {} streaming distributions; delete \
-                             one before creating another",
-                            crate::state::MAX_STREAMING_DISTRIBUTIONS
+            // A caller reference identifies ONE streaming distribution for its whole life.
+            // "If the value of CallerReference is new (regardless of the content of the
+            // StreamingDistributionConfig object), CloudFront creates a new distribution. If
+            // CallerReference is a value that you already sent in a previous request to
+            // create a distribution, CloudFront returns a DistributionAlreadyExists error" —
+            // so a repeat whose configuration is the one that reference already names is
+            // answered with that distribution, creating nothing, and a repeat that changes
+            // the configuration is refused. The same rule the distribution create path
+            // follows. The answer is the record that reference already names, so the grant
+            // the configuration owes was applied by the create that stored it.
+            if let Some(existing) =
+                store.streaming_distribution_by_caller_reference(&config.caller_reference)
+            {
+                if crate::state::same_streaming_distribution_config(&existing.config, &config) {
+                    return Ok(CreateStreamingDistributionOutput {
+                        streaming_distribution: Some(existing.to_streaming_distribution()),
+                        location: Some(crate::state::location_uri(
+                            ctx,
+                            &crate::state::streaming_distribution_path(&existing.id),
                         )),
-                    },
-                )
-                .into(),
-            );
-        }
+                        e_tag: Some(existing.etag.clone()),
+                    });
+                }
+                let message =
+                    crate::state::streaming_distribution_already_exists_message(&existing.id);
+                return Err(
+                    CreateStreamingDistributionErrorModeled::StreamingDistributionAlreadyExists(
+                        StreamingDistributionAlreadyExists {
+                            message: Some(message),
+                        },
+                    )
+                    .into(),
+                );
+            }
 
-        let id = store.allocate_streaming_distribution_id();
-        let domain_name = store.allocate_domain_name();
-        let etag = store.next_etag();
-        let stored = crate::state::StoredStreamingDistribution {
-            arn: crate::state::streaming_distribution_arn(&id),
-            id: id.clone(),
-            domain_name,
-            // A distribution CloudFront has just accepted is not yet propagated to the
-            // edge locations, so it reports the transient status until the clock owes it
-            // the terminal one.
-            status: crate::state::STATUS_IN_PROGRESS.to_string(),
-            deployed_due: now + crate::state::PROPAGATION_DELAY,
-            last_modified_time: now,
-            etag: etag.clone(),
-            // Stored whole: a later read answers from this record — the configuration the
-            // distribution actually runs under — never from the request that was served.
-            config,
-            // `CreateStreamingDistribution` carries no tag set, so the distribution starts
-            // out carrying none; a later tagging call writes into this very set.
-            tags: crate::state::TagSet::new(),
+            // "Processing your request would cause you to exceed the maximum number of
+            // streaming distributions allowed." A record is what a later read answers from,
+            // so it cannot be evicted: the bound is an entry count refused BEFORE anything
+            // is minted.
+            if store.streaming_distributions.len() >= crate::state::MAX_STREAMING_DISTRIBUTIONS
+            {
+                return Err(
+                    CreateStreamingDistributionErrorModeled::TooManyStreamingDistributions(
+                        TooManyStreamingDistributions {
+                            message: Some(format!(
+                                "This emulator holds at most {} streaming distributions; \
+                                 delete one before creating another",
+                                crate::state::MAX_STREAMING_DISTRIBUTIONS
+                            )),
+                        },
+                    )
+                    .into(),
+                );
+            }
+
+            let id = store.allocate_streaming_distribution_id();
+            let domain_name = store.allocate_domain_name();
+            let etag = store.next_etag();
+            let stored = crate::state::StoredStreamingDistribution {
+                arn: crate::state::streaming_distribution_arn(&id),
+                id: id.clone(),
+                domain_name,
+                // A distribution CloudFront has just accepted is not yet propagated to the
+                // edge locations, so it reports the transient status until the clock owes it
+                // the terminal one.
+                status: crate::state::STATUS_IN_PROGRESS.to_string(),
+                deployed_due: now + crate::state::PROPAGATION_DELAY,
+                last_modified_time: now,
+                etag: etag.clone(),
+                // Stored whole: a later read answers from this record — the configuration
+                // the distribution actually runs under — never from the request that was
+                // served.
+                config,
+                // `CreateStreamingDistribution` carries no tag set, so the distribution
+                // starts out carrying none; a later tagging call writes into this very set.
+                tags: crate::state::TagSet::new(),
+            };
+            let streaming_distribution = stored.to_streaming_distribution();
+            let location =
+                crate::state::location_uri(ctx, &crate::state::streaming_distribution_path(&id));
+            store.streaming_distributions.insert(id, stored);
+            (streaming_distribution, location, etag)
         };
-        let streaming_distribution = stored.to_streaming_distribution();
-        let location = crate::state::location_uri(
-            ctx,
-            &crate::state::streaming_distribution_path(&id),
-        );
-        store.streaming_distributions.insert(id, stored);
+
+        // The configuration is stored, so the side effect of enabling standard logging is
+        // owed: the log-delivery account holds `FULL_CONTROL` on the target bucket.
+        Box::pin(access_logs.grant_log_delivery(ctx)).await;
 
         Ok(CreateStreamingDistributionOutput {
             // "The streaming distribution's information."

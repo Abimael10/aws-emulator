@@ -44,10 +44,23 @@
 //!
 //! The grant is applied only once the configuration has been STORED, so a create or update
 //! that is refused for any other reason leaves the target bucket's ACL exactly as it was.
+//!
+//! ## Which configurations the rule is asked of
+//!
+//! The question is a property of the LOGGING CONFIGURATION a distribution runs under, not of
+//! the call that submitted it, so it is asked wherever one becomes a distribution's stored
+//! configuration: the configuration a request submits whole
+//! ([`resolve_access_logs_target`]), the configuration a streaming distribution runs under,
+//! whose own `Logging` names its bucket the same way
+//! ([`resolve_streaming_access_logs_target`]), and the configuration a copy or a promotion
+//! takes from another distribution's record. The two halves part company on the paths that
+//! do not submit a configuration: a copy and a promotion run a configuration CloudFront has
+//! already accepted, so they apply the grant their stored configuration owes without
+//! refusing anything.
 
 use ::aws_smithy_types::error::metadata::ProvideErrorMetadata;
 
-use crate::ops::types::DistributionConfig;
+use crate::ops::types::{DistributionConfig, LoggingConfig, StreamingDistributionConfig};
 
 /// The canonical user id of the account CloudFront delivers standard access logs as.
 ///
@@ -196,14 +209,61 @@ pub async fn resolve_access_logs_target(
     ctx: &::smithy_server_runtime::OperationContext<'_>,
     config: &DistributionConfig,
 ) -> AccessLogsTarget {
-    let Some(logging) = config.logging.as_ref() else {
-        return AccessLogsTarget::NotEnabled;
-    };
-    if logging.enabled != Some(true) {
+    resolve_logging_target_for(ctx, config.logging.as_ref()).await
+}
+
+/// What the bucket a `LoggingConfig` names establishes about standard logging to it.
+///
+/// The same question as [`resolve_access_logs_target`], asked of a logging configuration
+/// held on its own: a copy and a promotion run the configuration another record already
+/// carries rather than one their request submits, so they reach the rule through the member
+/// instead of through a `DistributionConfig` they never saw.
+pub async fn resolve_logging_target_for(
+    ctx: &::smithy_server_runtime::OperationContext<'_>,
+    logging: Option<&LoggingConfig>,
+) -> AccessLogsTarget {
+    resolve_logging_target(
+        ctx,
+        logging.is_some_and(|logging| logging.enabled == Some(true)),
+        logging.and_then(|logging| logging.bucket.as_deref()),
+    )
+    .await
+}
+
+/// What the bucket a STREAMING distribution configuration's `Logging` names establishes
+/// about standard logging to it.
+///
+/// The same question as [`resolve_access_logs_target`], asked of the other configuration a
+/// distribution can run under: `StreamingLoggingConfig` states the same two things about the
+/// same side effect — whether logging is on, and "the Amazon S3 bucket to store the access
+/// logs in" — so the answer is reached by the one reading of a logging configuration this
+/// module has. Its members are required rather than optional, so a configuration that states
+/// no `Logging` element at all is the one that enables none.
+pub async fn resolve_streaming_access_logs_target(
+    ctx: &::smithy_server_runtime::OperationContext<'_>,
+    config: &StreamingDistributionConfig,
+) -> AccessLogsTarget {
+    let logging = config.logging.as_ref();
+    resolve_logging_target(
+        ctx,
+        logging.is_some_and(|logging| logging.enabled),
+        logging.map(|logging| logging.bucket.as_str()),
+    )
+    .await
+}
+
+/// What the bucket a logging configuration names establishes about standard logging to it,
+/// from the two things any of this service's logging configurations states about it: whether
+/// logging is enabled, and the bucket's endpoint host.
+async fn resolve_logging_target(
+    ctx: &::smithy_server_runtime::OperationContext<'_>,
+    enabled: bool,
+    bucket: Option<&str>,
+) -> AccessLogsTarget {
+    if !enabled {
         return AccessLogsTarget::NotEnabled;
     }
-    let Some(domain_name) = logging.bucket.as_deref().map(str::trim).filter(|bucket| !bucket.is_empty())
-    else {
+    let Some(domain_name) = bucket.map(str::trim).filter(|bucket| !bucket.is_empty()) else {
         return AccessLogsTarget::NotEnabled;
     };
     // "The Amazon S3 bucket to store the access logs in, for example,
