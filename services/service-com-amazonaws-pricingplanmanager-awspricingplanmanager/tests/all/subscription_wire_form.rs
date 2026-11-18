@@ -22,7 +22,9 @@
 //! Both rules are asserted over TABLES whose rows differ along what the rules generalise
 //! over — tier, usage level, resource count, approval mode, whether a change is pending,
 //! and the sequence of mutations a subscription has taken — plus one test pinning the
-//! protocol seam the first rule's rendering comes from.
+//! protocol seam the first rule's rendering comes from, and one carrying both rules onto
+//! the two publishers those tables do not read, so neither form can depend on which
+//! operation published it.
 
 use std::sync::Arc;
 
@@ -710,5 +712,181 @@ fn the_service_takes_the_shared_date_time_protocol() {
                 member.shape_type()
             );
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Both rules, on the remaining operations that publish a subscription
+// ---------------------------------------------------------------------------
+
+/// The instants a published subscription or summary names — `createdAt` then `updatedAt`,
+/// in epoch milliseconds.
+type Instants = (i64, i64);
+
+/// Every `date-time` member the published structure carries, asserted in the form the
+/// first rule requires: the two required ones, plus a pending change's `effectiveDate`
+/// whenever a change is reported.
+fn published_instants(case: &str, published: &Value) -> Instants {
+    let created = date_time_millis(case, "createdAt", &published["createdAt"]);
+    let updated = date_time_millis(case, "updatedAt", &published["updatedAt"]);
+    assert!(
+        updated >= created,
+        "case {case}: updatedAt is never before createdAt, got {updated} ms and {created} ms"
+    );
+    let effective = published
+        .get("scheduledChange")
+        .map(|change| &change["effectiveDate"])
+        .filter(|value| !value.is_null());
+    if let Some(value) = effective {
+        let effective = date_time_millis(case, "scheduledChange.effectiveDate", value);
+        assert!(
+            effective >= updated,
+            "case {case}: a change pending at the end of the billing period takes effect \
+             after the write that scheduled it, got {effective} ms and {updated} ms"
+        );
+    }
+    (created, updated)
+}
+
+/// Both rules on one `Subscription` payload and the `ETag` header it came with: every
+/// `date-time` member is a date-time string, and the tag is `revision` in decimal.
+fn check_published_subscription(case: &str, answer: &Answer, revision: u64) -> Instants {
+    let instants = published_instants(case, &answer.body);
+    let token = answer.require_etag(case);
+    assert_eq!(
+        revision_of(case, &token),
+        revision,
+        "case {case}: the published entity tag is the record's revision, got {token:?}"
+    );
+    instants
+}
+
+/// The same two rules on a `SubscriptionSummary`, where the model puts the tag in the
+/// `eTag` BODY member instead of a response header.
+fn check_published_summary(case: &str, summary: &Value, revision: u64) -> Instants {
+    let instants = published_instants(case, summary);
+    let token = summary["eTag"]
+        .as_str()
+        .unwrap_or_else(|| panic!("case {case}: eTag is a required String member, got {summary:?}"));
+    assert_eq!(
+        revision_of(case, token),
+        revision,
+        "case {case}: the summary's eTag is the record's revision, got {token:?}"
+    );
+    instants
+}
+
+/// The two reporting paths republish what the last write left: in the same form, naming
+/// the same instants, under the same token.
+async fn assert_reporting_paths_agree(
+    router: &MultiServiceRouter,
+    label: &str,
+    arn: &str,
+    revision: u64,
+    written: Instants,
+) {
+    let read = call(router, "GetSubscription", json!({"arn": arn}), None).await;
+    assert_eq!(
+        read.status, 200,
+        "case {label}: GetSubscription must succeed, got {} {:?}",
+        read.status, read.body
+    );
+    let reported = check_published_subscription(&format!("{label}/GetSubscription"), &read, revision);
+    assert_eq!(
+        reported, written,
+        "case {label}: a read republishes the instants the write published, got {reported:?} \
+         vs {written:?}"
+    );
+
+    let summary = summary_for(router, arn).await;
+    let listed = check_published_summary(&format!("{label}/ListSubscriptions"), &summary, revision);
+    assert_eq!(
+        listed, written,
+        "case {label}: the listing republishes the instants the write published, got \
+         {listed:?} vs {written:?}"
+    );
+}
+
+/// The two publishers of a `Subscription` payload that the tables above do not read:
+/// `ApprovePaidSubscription` and `CancelSubscription`.
+///
+/// `date_time_members_travel_as_iso_8601_strings_on_every_read_path` reads the create, the
+/// update and the two reporting paths, and
+/// `the_entity_tag_is_the_decimal_revision_and_advances_once_per_mutation` reads the tag
+/// every mutation hands out. What no row of either asserts is the FORM of the date-time
+/// members on the remaining two publishers, nor `effectiveDate` on a MUTATING response —
+/// cancelling an active subscription is the write that populates it. Both rules are
+/// asserted here on each of those answers and on the two reporting paths after it, because
+/// every publisher renders the same stored record through the one representation/summary
+/// conversion and the one protocol seam: neither form can depend on which operation
+/// published it.
+///
+/// `AssociateResourcesToSubscription`, `DisassociateResourcesFromSubscription` and
+/// `CancelSubscriptionChange` are still 501 stubs, so they publish nothing to assert on
+/// yet.
+#[tokio::test]
+async fn the_approve_and_cancel_publishers_use_the_same_wire_form() {
+    // (plan family, tier, resource count, usage level). Every row is created under MANUAL
+    // approval on a paid tier, which is what holds it for `ApprovePaidSubscription`; the
+    // rows differ along everything else the rules generalise over, within the modelled
+    // 1..10 bound on `resourceArns`.
+    let rows = [
+        ("CloudFront", "PRO", 3, Some("DEFAULT")),
+        ("Route53", "PREMIUM", 10, Some("LEVEL_2")),
+        ("CloudFront", "BUSINESS", 1, None),
+    ];
+
+    let router = router();
+    for (family, tier, resources, usage_level) in rows {
+        let label = format!("{family}/{tier}");
+        let created = create(
+            &router,
+            create_body(family, tier, resources, usage_level, Some("MANUAL")),
+        )
+        .await;
+        let arn = created.string("arn");
+        let mut token = created.require_etag(&label);
+        // A paid tier held for approval has taken the mint and nothing else.
+        let mut revision = FIRST_REVISION;
+        let published =
+            check_published_subscription(&format!("{label}/CreateSubscription"), &created, revision);
+        let minted_at = published.0;
+        assert_reporting_paths_agree(&router, &label, &arn, revision, published).await;
+
+        // Approving puts the subscription into service; cancelling an ACTIVE subscription
+        // schedules the termination, so the record survives that write and the answer
+        // carries the pending change whose `effectiveDate` is the model's third date-time
+        // member.
+        for operation in ["ApprovePaidSubscription", "CancelSubscription"] {
+            let case = format!("{label}/{operation}");
+            let answer = call(&router, operation, json!({"arn": arn.clone()}), Some(&token)).await;
+            assert_eq!(
+                answer.status, 200,
+                "case {case}: the operation must succeed under the current If-Match, got {} {:?}",
+                answer.status, answer.body
+            );
+            revision += 1;
+            token = answer.require_etag(&label);
+            let published = check_published_subscription(&case, &answer, revision);
+            assert_eq!(
+                published.0, minted_at,
+                "case {case}: createdAt keeps naming the instant the record was minted, got {} \
+                 ms instead of {minted_at} ms",
+                published.0
+            );
+            assert_reporting_paths_agree(&router, &label, &arn, revision, published).await;
+        }
+
+        // The `effectiveDate` assertions above are conditional on a change being reported,
+        // so pin that the cancellation did leave one behind.
+        let read = call(&router, "GetSubscription", json!({"arn": arn.clone()}), None).await;
+        assert!(
+            read.body
+                .get("scheduledChange")
+                .is_some_and(|change| !change["effectiveDate"].is_null()),
+            "case {label}: cancelling an active subscription leaves a dated pending change, \
+             which is what carries the third date-time member, got {:?}",
+            read.body
+        );
     }
 }
