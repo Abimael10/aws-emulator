@@ -160,12 +160,24 @@ fn user_auth_events(destination: Value) -> Value {
     entry
 }
 
-/// What a request-validation refusal says: the fixed sentence, the condition and
-/// the event sources that failed it, as recorded for a collection Amazon Cognito
-/// will not accept.
+/// What a request-validation refusal says for the conditions Amazon Cognito
+/// words as a clause about the event sources in the request: the fixed
+/// sentence, the condition and the bracketed sources that failed it.
 fn request_validation_message(clause: &str, event_sources: &[&str]) -> String {
     format!(
         "Request validation Failed. Following event sources in request {clause}: [{}].",
+        event_sources.join(", ")
+    )
+}
+
+/// What a request-validation refusal says for a collection that configures one
+/// event source more than once, which Amazon Cognito words with its own
+/// sentence (its "more then once" spelling included) rather than with the
+/// clause frame the other conditions use.
+fn duplicate_sources_message(event_sources: &[&str]) -> String {
+    format!(
+        "Request validation Failed. Following event sources appear more then once in a \
+         request: [{}].",
         event_sources.join(", ")
     )
 }
@@ -355,13 +367,56 @@ async fn a_refused_set_leaves_the_stored_collection_unchanged() {
             }]),
             request_validation_message("have more than one destination", &["userAuthEvents"]),
         ),
+        // The duplicate-source rows differ along what the rule generalises
+        // over: which source is repeated, whether the two entries differ in
+        // their destination, their level, or in nothing at all. The list is
+        // `LogConfigurationListType` (@length 0..2), so a duplicate is always
+        // exactly two entries.
         (
-            "one event source configured twice",
+            "userNotification configured twice against two log groups",
             json!([
                 user_notification(LOG_GROUP_ARN),
                 user_notification(OTHER_LOG_GROUP_ARN),
             ]),
-            request_validation_message("are configured more than once", &["userNotification"]),
+            duplicate_sources_message(&["userNotification"]),
+        ),
+        (
+            "userNotification configured twice identically",
+            json!([
+                user_notification(LOG_GROUP_ARN),
+                user_notification(LOG_GROUP_ARN),
+            ]),
+            duplicate_sources_message(&["userNotification"]),
+        ),
+        (
+            "userNotification configured twice at different levels",
+            json!([
+                user_notification(LOG_GROUP_ARN),
+                {
+                    "LogLevel": "INFO",
+                    "EventSource": "userNotification",
+                    "CloudWatchLogsConfiguration": { "LogGroupArn": LOG_GROUP_ARN },
+                },
+            ]),
+            duplicate_sources_message(&["userNotification"]),
+        ),
+        (
+            "userAuthEvents configured twice to two destinations",
+            json!([
+                user_auth_events(json!({ "S3Configuration": { "BucketArn": BUCKET_ARN } })),
+                user_auth_events(json!({ "FirehoseConfiguration": { "StreamArn": STREAM_ARN } })),
+            ]),
+            duplicate_sources_message(&["userAuthEvents"]),
+        ),
+        (
+            "userAuthEvents configured twice, the second entry with no destination",
+            json!([
+                user_auth_events(json!({ "S3Configuration": { "BucketArn": BUCKET_ARN } })),
+                { "LogLevel": "INFO", "EventSource": "userAuthEvents" },
+            ]),
+            // A source configured more than once is reported before any entry's
+            // own configuration is judged.
+            duplicate_sources_message(&["userAuthEvents"]),
         ),
     ];
 

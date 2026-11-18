@@ -263,7 +263,7 @@ fn check_request(
         }
         if !failing.is_empty() {
             return Err(invalid_parameter(request_validation_message(
-                condition.clause,
+                condition.sentence,
                 &failing,
             )));
         }
@@ -314,12 +314,16 @@ fn source_rule(event_source: &str) -> Option<&'static DeliverableSource> {
         .find(|rule| rule.event_source == event_source)
 }
 
-/// One condition every entry of a request has to satisfy, and the clause a
+/// One condition every entry of a request has to satisfy, and the sentence a
 /// refusal names it with.
 struct RequestCondition {
-    /// What the refusal says the listed event sources did, as the clause between
-    /// "Following event sources in request" and the list.
-    clause: &'static str,
+    /// The sentence Amazon Cognito words THIS condition's refusal with, after
+    /// the fixed `Request validation Failed. ` prefix, carrying
+    /// [`EVENT_SOURCES`] where the list of failing event sources goes. Each
+    /// condition has its own sentence rather than a clause slotted into one
+    /// shared frame, because the sentences differ in structure and not only in
+    /// the condition they name.
+    sentence: &'static str,
     /// Whether this entry fails the condition, judged against the whole
     /// collection so a condition about two entries (one source configured twice)
     /// is expressible.
@@ -331,7 +335,9 @@ struct RequestCondition {
 /// at all comes before whether one entry's configuration is deliverable.
 const REQUEST_CONDITIONS: &[RequestCondition] = &[
     RequestCondition {
-        clause: "are configured more than once",
+        // Amazon Cognito's own sentence for this condition, misspelling
+        // "than" included.
+        sentence: "Following event sources appear more then once in a request: [{EventSources}].",
         failed_by: |configuration, all| {
             all.iter()
                 .filter(|other| other.event_source == configuration.event_source)
@@ -340,15 +346,17 @@ const REQUEST_CONDITIONS: &[RequestCondition] = &[
         },
     },
     RequestCondition {
-        clause: "have no destination",
+        sentence: "Following event sources in request have no destination: [{EventSources}].",
         failed_by: |configuration, _| named_destinations(configuration).is_empty(),
     },
     RequestCondition {
-        clause: "have more than one destination",
+        sentence: "Following event sources in request have more than one destination: \
+                   [{EventSources}].",
         failed_by: |configuration, _| named_destinations(configuration).len() > 1,
     },
     RequestCondition {
-        clause: "have an unsupported destination",
+        sentence: "Following event sources in request have an unsupported destination: \
+                   [{EventSources}].",
         failed_by: |configuration, _| {
             source_rule(&configuration.event_source).is_some_and(|rule| {
                 named_destinations(configuration)
@@ -361,16 +369,21 @@ const REQUEST_CONDITIONS: &[RequestCondition] = &[
 
 /// What a `SetLogDeliveryConfiguration` request-validation refusal says.
 ///
-/// The fixed sentence and the bracketed list of event sources are what Amazon
-/// Cognito answers for a collection it will not accept — the refusal names the
-/// condition once and then every event source in the request that failed it,
-/// rather than one sentence per entry. `clause` is the condition.
-fn request_validation_message(clause: &str, event_sources: &[&str]) -> String {
+/// Every such refusal opens with the same fixed prefix and then the sentence
+/// Amazon Cognito words the failed condition with, whose only variable part is
+/// the list of the request's event sources that failed it — the refusal names
+/// the condition once and then every failing source, rather than one sentence
+/// per entry.
+fn request_validation_message(sentence: &str, event_sources: &[&str]) -> String {
     format!(
-        "Request validation Failed. Following event sources in request {clause}: [{}].",
-        event_sources.join(", ")
+        "Request validation Failed. {}",
+        sentence.replace(EVENT_SOURCES, &event_sources.join(", "))
     )
 }
+
+/// Where a [`RequestCondition::sentence`] carries the list of failing event
+/// sources.
+const EVENT_SOURCES: &str = "{EventSources}";
 
 /// What one `EventSourceName` may be exported as: the destinations it may be
 /// exported to, and the feature plan that includes it.
