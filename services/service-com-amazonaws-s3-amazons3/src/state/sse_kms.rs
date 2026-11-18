@@ -36,6 +36,17 @@
 //! against when request authentication is on, and from the account this service serves; a read
 //! presenting any other credential is decided as above.
 //!
+//! A refusal S3 answers such a call with is worded in S3's OWN published text
+//! ([`super::ACCESS_DENIED_MESSAGE`]) rather than in the sentence KMS words for it: that
+//! sentence is about the principal the decision was taken against and names it, the key and
+//! the action it was refused, and no IAM identity of a caller's made the call — whoever reads
+//! the answer (a viewer at another service's edge, not the principal) is told that the request
+//! was refused and nothing more. It is the wording this service's own authorization gate
+//! already answers a service principal's call with
+//! ([`crate::service::request_authorization::denial`]), so the two halves of one decision
+//! cannot word S3's refusal of one call differently. Every other caller reads KMS's sentence,
+//! which is about that caller's own identity.
+//!
 //! Both halves are the KMS service's OWN ([`kms_store::authorization`]), made against the
 //! key policy, caller identity policies and grants that KMS's and IAM's handlers wrote, so
 //! this service and KMS cannot disagree about a key and the refusal a caller sees is the
@@ -283,7 +294,7 @@ fn key_use_refusal<Eng: Send + Sync + 'static>(
     let kms = kms_store::service_state(engine)?;
     // The caller is resolved before the KMS store is locked, because resolving it reads
     // the STS and IAM stores.
-    let caller = caller(engine, ctx);
+    let asked = caller(engine, ctx);
     let store = kms.lock();
     let key = match store.resolve(region, key_id) {
         kms_store::KeyRef::Found(key) => key,
@@ -291,7 +302,7 @@ fn key_use_refusal<Eng: Send + Sync + 'static>(
         // permission before any key is looked up, with KMS's own sentence for it, so the
         // object's bytes cannot be opened under it at all.
         kms_store::KeyRef::UnauthorizedAccount => {
-            return Some(kms_store::unauthorized_account_message(operation))
+            return Some(asked.worded(kms_store::unauthorized_account_message(operation)))
         }
         kms_store::KeyRef::NotFound | kms_store::KeyRef::MalformedArn => return None,
     };
@@ -299,7 +310,7 @@ fn key_use_refusal<Eng: Send + Sync + 'static>(
         return None;
     }
     kms_store::authorization::authorize_use(
-        &caller,
+        &asked.caller,
         &store,
         region,
         key,
@@ -308,6 +319,10 @@ fn key_use_refusal<Eng: Send + Sync + 'static>(
         None,
     )
     .err()
+    // Worded as S3 words a refusal of THIS caller, which for a call another service made as
+    // its own service principal is S3's own published text rather than KMS's sentence (the
+    // module header carries the rule).
+    .map(|sentence| asked.worded(sentence))
 }
 
 /// The wire error code S3 answers a WRITE whose SSE-KMS key reference KMS holds no key for,
@@ -548,10 +563,13 @@ fn not_found(region: &str, reference: &str) -> Relay {
 /// credential and the account the record is kept to). Every other read is the principal of the
 /// credential it presents, which is KMS's own resolution
 /// ([`kms_store::authorization::caller`]).
+///
+/// Answered beside WHICH of the two it is ([`AskedAbout`]), because that decides how S3 words
+/// a refusal of the call: one resolution of who is calling serves both.
 fn caller<Eng: Send + Sync + 'static>(
     engine: &Eng,
     ctx: &::smithy_server_runtime::OperationContext<'_>,
-) -> kms_store::authorization::Caller {
+) -> AskedAbout {
     if let Some(call) = crate::service::request_authorization::service_principal_call(engine, ctx) {
         ::tracing::debug!(
             principal = %call.principal,
@@ -559,12 +577,48 @@ fn caller<Eng: Send + Sync + 'static>(
             "this read is one another service is making as its own service principal, so \
              the object's key is asked about that principal"
         );
-        return kms_store::authorization::Caller::service_principal(
-            &call.principal,
-            &call.source_arn,
-        );
+        return AskedAbout {
+            caller: kms_store::authorization::Caller::service_principal(
+                &call.principal,
+                &call.source_arn,
+            ),
+            of_a_service_principal: true,
+        };
     }
-    kms_store::authorization::caller(engine, ctx)
+    AskedAbout {
+        caller: kms_store::authorization::caller(engine, ctx),
+        of_a_service_principal: false,
+    }
+}
+
+/// The principal a key's authorities are asked about ([`caller`]), and whether it is another
+/// SERVICE's own rather than an IAM identity the request's credential speaks for.
+///
+/// The pair travels together because the second half decides how S3 WORDS whatever the first
+/// half is refused (the module header carries the rule): one resolution of who is calling, one
+/// wording of the refusal it reads.
+struct AskedAbout {
+    /// Whose call this is, as the key's authorities decide it.
+    caller: kms_store::authorization::Caller,
+    /// Whether [`Self::caller`] is another service's own service principal.
+    of_a_service_principal: bool,
+}
+
+impl AskedAbout {
+    /// How S3 words a refusal of this call, given `sentence` — the one KMS worded for the
+    /// principal the decision was taken against.
+    ///
+    /// A call another service made as its own service principal reads S3's own published text
+    /// ([`super::ACCESS_DENIED_MESSAGE`]): KMS's sentence is about an identity that made no
+    /// such call and names the key and the action it was refused, neither of which S3 reports
+    /// to whoever reads the answer. Every other caller reads KMS's sentence unchanged, since it
+    /// is about that caller's own identity.
+    fn worded(&self, sentence: String) -> String {
+        if self.of_a_service_principal {
+            return super::ACCESS_DENIED_MESSAGE.to_string();
+        }
+        sentence
+    }
 }
 
 /// The encryption context the data key of `object` is bound to, which is what a key policy
