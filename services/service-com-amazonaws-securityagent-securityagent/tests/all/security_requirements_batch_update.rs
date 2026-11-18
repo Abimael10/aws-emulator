@@ -915,3 +915,202 @@ async fn whole_request_refusals() {
         );
     }
 }
+
+/// RULE: an update writes only the `(packId, name)` records its entries name — a
+/// requirement of the same pack the request does not name keeps every member AND both
+/// stamps, and the pack holds exactly the same set of names afterwards, so an update is
+/// never a write to the pack as a whole.
+///
+/// The rows differ along how many requirements the pack holds and which of them the
+/// request names: the first, the last, a middle subset, every one, and none at all (the
+/// entry list carries no `@length`, so an empty one is a request that names nothing).
+#[tokio::test]
+async fn an_update_leaves_the_records_it_does_not_name_untouched() {
+    // (case, the names the pack holds, the names the update addresses)
+    let rows: Vec<(&str, Vec<&str>, Vec<&str>)> = vec![
+        (
+            "the first of two",
+            vec!["h-one", "h-two"],
+            vec!["h-one"],
+        ),
+        ("the last of two", vec!["i-one", "i-two"], vec!["i-two"]),
+        (
+            "two of five, in the middle",
+            vec!["j-one", "j-two", "j-three", "j-four", "j-five"],
+            vec!["j-two", "j-three"],
+        ),
+        (
+            "every one of three",
+            vec!["k-one", "k-two", "k-three"],
+            vec!["k-one", "k-two", "k-three"],
+        ),
+        ("none of three", vec!["l-one", "l-two", "l-three"], vec![]),
+    ];
+
+    let router = emulator();
+
+    for (case, held, requested) in rows {
+        let pack_id = create_pack(&router, &format!("pack for {case}"), case).await;
+        store(&router, &pack_id, &held, case).await;
+
+        // Every record of the pack as it reads BEFORE the update.
+        let mut before = Vec::new();
+        for name in &held {
+            before.push(read_one(&router, &pack_id, name, case).await);
+        }
+
+        let entries: Vec<Value> = requested
+            .iter()
+            .map(|name| {
+                json!({
+                    "name": name,
+                    "description": format!("the description {name} was updated with")
+                })
+            })
+            .collect();
+        let answer = batch_update(&router, &pack_id, &entries, case).await;
+        assert!(
+            errors(&answer, case).is_empty(),
+            "case {case:?}: an update of names the pack holds reported errors: {answer}"
+        );
+        assert_eq!(
+            updated(&answer, case),
+            requested
+                .iter()
+                .map(|name| (*name).to_string())
+                .collect::<Vec<String>>(),
+            "case {case:?}: wrong updated names in {answer}"
+        );
+
+        for (name, prior) in held.iter().zip(&before) {
+            let after = read_one(&router, &pack_id, name, case).await;
+            if requested.contains(name) {
+                let written = format!("the description {name} was updated with");
+                assert_eq!(
+                    member(&after, "description").as_deref(),
+                    Some(written.as_str()),
+                    "case {case:?}: expected {name:?} to hold {written:?}, got {after}"
+                );
+                assert_eq!(
+                    date_time(&after, "createdAt", case),
+                    date_time(prior, "createdAt", case),
+                    "case {case:?}: an update must not move the createdAt of {name:?}: \
+                     {after}"
+                );
+                assert!(
+                    date_time(&after, "updatedAt", case) > date_time(prior, "updatedAt", case),
+                    "case {case:?}: expected the updatedAt of {name:?} to move to the \
+                     write, got {after}"
+                );
+            } else {
+                assert_eq!(
+                    &after, prior,
+                    "case {case:?}: the update changed {name:?}, a record it does not \
+                     name: expected {prior}, got {after}"
+                );
+            }
+        }
+
+        // Nothing was created and nothing was removed: the pack still holds exactly the
+        // names it held.
+        let summaries = list_all(&router, &pack_id, case).await;
+        let mut listed: Vec<String> = summaries
+            .iter()
+            .filter_map(|summary| member(summary, "name"))
+            .collect();
+        listed.sort();
+        let mut expected: Vec<String> = held.iter().map(|name| (*name).to_string()).collect();
+        expected.sort();
+        assert_eq!(
+            listed, expected,
+            "case {case:?}: the update changed which names the pack holds: {summaries:?}"
+        );
+    }
+}
+
+/// RULE: a stored requirement is what the last write to it left, so sending the SAME
+/// update a second time leaves every member where the first one put it and never moves
+/// `createdAt` or `updatedAt` backwards; reading is not a write, so two reads issued after
+/// a write answer the same record and the same listing.
+///
+/// The rows differ along which writable members the repeated entry carries.
+#[tokio::test]
+async fn re_sending_an_update_converges_and_reading_changes_nothing() {
+    // (case, the members the repeated entry carries besides the immutable name)
+    let rows: Vec<(&str, Value)> = vec![
+        (
+            "description alone",
+            json!({"description": "the one description"}),
+        ),
+        (
+            "domain and evaluation together",
+            json!({"domain": "NetworkSecurity", "evaluation": "the one evaluation"}),
+        ),
+        (
+            "every writable member at once",
+            json!({
+                "description": "the one description",
+                "domain": "ApplicationSecurity",
+                "evaluation": "the one evaluation",
+                "remediation": "the one remediation"
+            }),
+        ),
+    ];
+
+    let router = emulator();
+    let name = "converging-requirement";
+
+    for (case, patch) in rows {
+        let pack_id = create_pack(&router, &format!("pack for {case}"), case).await;
+        batch_create(
+            &router,
+            &pack_id,
+            &[created_entry(name, Some("the created remediation"))],
+            case,
+        )
+        .await;
+
+        let mut entry = patched(&patch, case);
+        entry.insert("name".to_string(), json!(name));
+        let entry = Value::Object(entry);
+
+        batch_update(&router, &pack_id, std::slice::from_ref(&entry), case).await;
+        let first = read_one(&router, &pack_id, name, case).await;
+
+        batch_update(&router, &pack_id, std::slice::from_ref(&entry), case).await;
+        let second = read_one(&router, &pack_id, name, case).await;
+
+        for field in WRITABLE_MEMBERS {
+            assert_eq!(
+                second.get(field),
+                first.get(field),
+                "case {case:?}: re-sending the same update changed {field}: expected \
+                 {first}, got {second}"
+            );
+        }
+        assert_eq!(
+            date_time(&second, "createdAt", case),
+            date_time(&first, "createdAt", case),
+            "case {case:?}: a second update moved createdAt: {second}"
+        );
+        assert!(
+            date_time(&second, "updatedAt", case) >= date_time(&first, "updatedAt", case),
+            "case {case:?}: a second update moved updatedAt backwards: expected at least \
+             the first write's, got {second}"
+        );
+
+        // No write between these reads, so every one of them answers the same record.
+        let again = read_one(&router, &pack_id, name, case).await;
+        assert_eq!(
+            again, second,
+            "case {case:?}: reading the record changed it: expected {second}, got {again}"
+        );
+        let listed_once = list_all(&router, &pack_id, case).await;
+        let listed_twice = list_all(&router, &pack_id, case).await;
+        assert_eq!(
+            listed_twice, listed_once,
+            "case {case:?}: listing the pack changed it: expected {listed_once:?}, got \
+             {listed_twice:?}"
+        );
+    }
+}
