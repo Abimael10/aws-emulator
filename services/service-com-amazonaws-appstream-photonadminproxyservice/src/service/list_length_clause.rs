@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! How this service states the clause refusing a LIST member for its modelled `@length`.
+//! How a LIST of modelled STRUCTURES is quoted in the clause refusing it for its modelled
+//! `@length`.
 //!
 //! A constraint clause names the value that was rejected, the member path it sat at and the
 //! requirement it failed. A `@length` on a list is checked ON THE MEMBER, before the
@@ -17,33 +18,24 @@
 //! element's own content: the list's LENGTH and the shape its elements are is the whole of
 //! it. Which shape that is, per list member, is [`ELEMENT_SHAPES`].
 //!
-//! Two kinds of list are stated here, and they are the two this seam can state:
+//! Two kinds of list are stated here, and they are the two this seam can state from the
+//! violation alone:
 //!
 //! * an EMPTY list (the `@length` minimum of a list a request carried no element in)
 //!   renders as `[]` whatever its elements would have been;
 //! * a list of modelled STRUCTURES renders as one printed element per element the request
 //!   carried, because that rendering is the element's class and identity and not its value.
 //!
-//! A non-empty list of SCALARS renders as the elements' own text, which this layer cannot
-//! know: [`smithy_server_runtime::Service::override_refusal`] is handed the violations
-//! alone and never the request they were found in, and the walk stored a count in place of
-//! the value. Such a clause keeps the framework's summary rather than a value the caller did
-//! not send.
+//! A non-empty list of SCALARS renders as the elements' own text, which no violation
+//! carries: it is read from the REQUEST instead, one layer up
+//! ([`super::refusal_wording`], whose per-operation wrapper collects it through
+//! `service_common::validation::submitted_lists`), and this layer answers `None` for it.
 //!
 //! Everything else about the refusal stays where it already was: the requirement, the member
-//! path and the clause around them are the framework's own
-//! ([`Violation::message`]), the envelope over the clauses is the framework's own
-//! (`service_common::validation_message::envelope_over`), and the status and the wire
-//! envelope come from the framework's refusal channel. A refusal with no list-length clause
-//! in it is left to that channel untouched.
+//! path, the clause around them, the envelope over the clauses and the status come from the
+//! framework and from [`super::refusal_wording`].
 
-use ::smithy_server_runtime::{Refusal, Refused, Violation, ViolationKind};
-
-/// The error code a constraint refusal of this service carries — the code the framework's
-/// own default picks for this class on the JSON protocols, restated here because a chosen
-/// message has to travel with the code it would have travelled with: a client branches on
-/// the code.
-const VALIDATION_EXCEPTION: &str = "ValidationException";
+use ::smithy_server_runtime::{Violation, ViolationKind};
 
 /// The package the layer in front of this service prints a modelled shape's class from.
 ///
@@ -87,48 +79,6 @@ const ELEMENT_SHAPES: &[(&str, &str)] = &[
     ("userStackAssociations", "UserStackAssociation"),
 ];
 
-/// How this service states `refusal`, or `None` to keep the framework's own wording.
-///
-/// `None` covers a refusal that is not a constraint failure at all (an authentication
-/// refusal is not this service's to reword) and every constraint refusal with no
-/// list-length clause this layer can state, so the framework's channel answers those
-/// exactly as before.
-pub(crate) fn refused(refusal: &Refusal) -> Option<Refused> {
-    let Refusal::Invalid(violations) = refusal else {
-        return None;
-    };
-    let mut quoted_a_list = false;
-    // Bounded by the ceiling the framework's own walk collects under, so the clause count —
-    // and with it the length of the message — is a constant rather than something one
-    // request chooses.
-    let mut clauses: Vec<String> = Vec::new();
-    for violation in violations
-        .iter()
-        .take(::service_common::validation::MAX_VIOLATIONS)
-    {
-        match quoted_list(violation) {
-            Some(list) => {
-                quoted_a_list = true;
-                clauses.push(
-                    Violation {
-                        value: Some(list),
-                        ..violation.clone()
-                    }
-                    .message(),
-                );
-            }
-            None => clauses.push(violation.message()),
-        }
-    }
-    if !quoted_a_list {
-        return None;
-    }
-    Some(Refused {
-        code: VALIDATION_EXCEPTION.to_string(),
-        message: ::service_common::validation_message::envelope_over(&clauses)?,
-    })
-}
-
 /// The list `violation` is about, as a clause quotes it, or `None` when `violation` is not a
 /// list-length violation this layer can state the list of.
 ///
@@ -136,7 +86,7 @@ pub(crate) fn refused(refusal: &Refusal) -> Option<Refused> {
 /// broke the bound (`service_common::validation_message::list_item_count` is the shared
 /// reading of it), so a string member whose own value happens to read as one is the accepted
 /// collision that reading already documents.
-fn quoted_list(violation: &Violation) -> Option<String> {
+pub(super) fn quoted_list(violation: &Violation) -> Option<String> {
     if !matches!(
         violation.kind,
         ViolationKind::MinLength(_) | ViolationKind::MaxLength(_)
@@ -301,9 +251,9 @@ mod tests {
         }
     }
 
-    /// RULE: a list-length clause quotes the list the request carried — `[]` for an empty
-    /// one and one printed element per element otherwise — and every other clause keeps the
-    /// framework's own wording.
+    /// RULE: a list-length violation this layer can state quotes the list the request
+    /// carried — `[]` for an empty one and one printed element per element otherwise — and
+    /// every other violation is left for the layer above to state.
     ///
     /// The rows differ along what the rule generalises over: the bound that was broken
     /// (minimum, maximum), the element count, a count past the ceiling one clause quotes up
@@ -363,28 +313,26 @@ mod tests {
             ),
         ];
         for (case, offence, quoted) in rows {
-            let stated = refused(&Refusal::Invalid(vec![offence.clone()]));
+            let stated = quoted_list(&offence);
             let Some(elements) = quoted else {
                 assert!(
                     stated.is_none(),
-                    "case {case:?}: expected the framework's own wording, got {stated:?}"
+                    "case {case:?}: expected no quoted list, got {stated:?}"
                 );
                 continue;
             };
-            let stated = stated
-                .unwrap_or_else(|| panic!("case {case:?}: a list-length clause is stated"));
-            assert_eq!(
-                stated.code, VALIDATION_EXCEPTION,
-                "case {case:?}: expected code {VALIDATION_EXCEPTION:?}, got {:?}",
-                stated.code
-            );
-            let value = quoted_value(&stated.message).unwrap_or_else(|| {
-                panic!("case {case:?}: the clause quotes a value, got {:?}", stated.message)
-            });
-            let printed: Vec<&str> = if elements == 0 {
+            let value = stated
+                .unwrap_or_else(|| panic!("case {case:?}: a list is quoted"));
+            let inner = value
+                .strip_prefix('[')
+                .and_then(|value| value.strip_suffix(']'))
+                .unwrap_or_else(|| {
+                    panic!("case {case:?}: a quoted list is bracketed, got {value:?}")
+                });
+            let printed: Vec<&str> = if inner.is_empty() {
                 Vec::new()
             } else {
-                value.split(", ").collect()
+                inner.split(", ").collect()
             };
             assert_eq!(
                 printed.len(),
@@ -398,38 +346,5 @@ mod tests {
                 );
             }
         }
-    }
-
-    /// The text between the brackets of the value a clause quotes, or `None` when the
-    /// clause quotes no bracketed value.
-    fn quoted_value(message: &str) -> Option<&str> {
-        let (_, rest) = message.split_once("Value '[")?;
-        let (value, _) = rest.split_once("]' at ")?;
-        Some(value)
-    }
-
-    /// Two clauses in one refusal: the list is quoted and the other clause is the
-    /// framework's, inside the framework's own envelope for two.
-    #[test]
-    fn one_quoted_clause_leaves_the_others_as_the_framework_stated_them() {
-        let over = violation("accessEndpoints", ViolationKind::MaxLength(4), Some("5 items"));
-        let absent = violation("name", ViolationKind::MissingRequiredMember, None);
-        let stated = refused(&Refusal::Invalid(vec![over, absent.clone()]))
-            .expect("a list-length clause is stated");
-        assert!(
-            stated.message.starts_with("2 validation errors detected: "),
-            "expected the framework's envelope for two clauses, got {:?}",
-            stated.message
-        );
-        assert!(
-            stated.message.contains(&absent.message()),
-            "expected the framework's own clause for the absent member, got {:?}",
-            stated.message
-        );
-        assert!(
-            !stated.message.contains("5 items"),
-            "expected the list quoted rather than counted, got {:?}",
-            stated.message
-        );
     }
 }

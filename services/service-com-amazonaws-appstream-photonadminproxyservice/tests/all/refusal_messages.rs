@@ -671,3 +671,218 @@ async fn a_list_outside_its_modelled_length_is_refused_quoting_the_list() {
         .await;
 }
 
+/// Every `StackAttribute` value a refusal of this service ADVERTISES, in the order it lists
+/// them: the order the validation layer in front of this service walks its own table of the
+/// values, which is neither the model's declaration order nor sorted.
+///
+/// Three of them — `AGENT_ACCESS_CONFIG_COMPUTER_USE_INTERFACE_ID`, `WEB_AUTHN_REDIRECTION`
+/// and `AGENT_ACCESS_CONFIG_KMS_KEY_ARN` — are attributes the service has that the shipped
+/// model does not declare (`smithy_query(query="shape", shape="StackAttribute")` lists the
+/// other fifteen). Advertising them is all this states: which values the member ADMITS is
+/// the enum the member targets, so a value the shipped model does not declare is still
+/// refused.
+const STACK_ATTRIBUTE_SET: &str = "AGENT_ACCESS_CONFIG_COMPUTER_USE_INTERFACE_ID, THEME_NAME, \
+     AGENT_ACCESS_CONFIG, ACCESS_ENDPOINTS, CONTENT_REDIRECTION, WEB_AUTHN_REDIRECTION, \
+     STORAGE_CONNECTORS, REDIRECT_URL, STORAGE_CONNECTOR_AUTHENTICATION, \
+     STORAGE_CONNECTOR_HOMEFOLDERS, AGENT_ACCESS_CONFIG_KMS_KEY_ARN, FEEDBACK_URL, \
+     USER_SETTINGS, STORAGE_CONNECTOR_GOOGLE_DRIVE, STREAMING_EXPERIENCE_SETTINGS, \
+     STORAGE_CONNECTOR_ONE_DRIVE, IAM_ROLE_ARN, EMBED_HOST_DOMAINS";
+
+/// `EmbedHostDomain`'s expression, as the model writes it
+/// (`smithy_query(query="shape", shape="EmbedHostDomain")`).
+const DOMAIN_PATTERN: &str =
+    r"^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9][a-z0-9-]{0,61}[a-z0-9]$";
+
+/// `TagKey`'s expression, as the model writes it
+/// (`smithy_query(query="shape", shape="TagKey")`).
+const TAG_KEY_PATTERN: &str = r"^(^(?!aws:).[\p{L}\p{Z}\p{N}_.:/=+\-@]*)$";
+
+/// A resource ARN of this emulator's account, well inside the `Arn` member's own expression,
+/// so a refusal of a `TagKeys` row reports that list and nothing else.
+fn resource_arn() -> String {
+    format!("arn:aws:appstream:us-east-1:{ACCOUNT}:stack/stored")
+}
+
+/// The requirement a clause states at a collection member for a constraint its ELEMENTS
+/// broke: the element shape's whole declared set, nested.
+fn element_set(requirements: &[String]) -> String {
+    format!("Member must satisfy constraint: [{}]", requirements.join(", "))
+}
+
+/// The nested set a clause about one of a list's enum elements states.
+fn enum_element_set() -> String {
+    element_set(&[format!(
+        "Member must satisfy enum value set: [{STACK_ATTRIBUTE_SET}]"
+    )])
+}
+
+/// The nested set a clause about one of `EmbedHostDomains`' elements states: the element
+/// shape's `@length` bounds and its expression, whichever of them the value broke.
+fn domain_element_set() -> String {
+    element_set(&[
+        "Member must have length less than or equal to 128".to_string(),
+        "Member must have length greater than or equal to 0".to_string(),
+        format!("Member must satisfy regular expression pattern: {DOMAIN_PATTERN}"),
+    ])
+}
+
+/// The nested set a clause about one of `TagKeys`' elements states.
+fn tag_key_element_set() -> String {
+    element_set(&[
+        "Member must have length less than or equal to 128".to_string(),
+        "Member must have length greater than or equal to 1".to_string(),
+        format!("Member must satisfy regular expression pattern: {TAG_KEY_PATTERN}"),
+    ])
+}
+
+/// One request a list ELEMENT's constraint refuses: the operation it arrives on, the request
+/// itself, the member path the clause blames, the list as the clause quotes it, and the
+/// nested requirement the clause states.
+struct ElementRefusal {
+    case: &'static str,
+    operation: &'static str,
+    request: Value,
+    path: &'static str,
+    quoted: String,
+    element_set: String,
+}
+
+/// Requests spanning the class: which CONSTRAINT the element broke (an enumerated value set,
+/// an expression, a length maximum), which MEMBER and which operation carried the list, WHICH
+/// element of the list broke it (the only one, a later one, several at once) and how many
+/// elements the list carried beside it.
+fn element_refusals() -> Vec<ElementRefusal> {
+    let long_domain = format!("{}.example", "d".repeat(128));
+    vec![
+        ElementRefusal {
+            case: "the only attribute is not a stack attribute",
+            operation: "UpdateStack",
+            request: json!({ "Name": "stored", "AttributesToDelete": ["access_endpoints"] }),
+            path: "attributesToDelete",
+            quoted: "[access_endpoints]".to_string(),
+            element_set: enum_element_set(),
+        },
+        ElementRefusal {
+            case: "the second of two attributes is not a stack attribute",
+            operation: "UpdateStack",
+            request: json!({
+                "Name": "stored",
+                "AttributesToDelete": ["ACCESS_ENDPOINTS", "redirect_url"],
+            }),
+            path: "attributesToDelete",
+            quoted: "[ACCESS_ENDPOINTS, redirect_url]".to_string(),
+            element_set: enum_element_set(),
+        },
+        ElementRefusal {
+            case: "two attributes are not stack attributes",
+            operation: "UpdateStack",
+            request: json!({
+                "Name": "stored",
+                "AttributesToDelete": ["user_settings", "THEME_NAME", "feedback_url"],
+            }),
+            path: "attributesToDelete",
+            quoted: "[user_settings, THEME_NAME, feedback_url]".to_string(),
+            element_set: enum_element_set(),
+        },
+        ElementRefusal {
+            case: "a create whose embed host domain is not a domain",
+            operation: "CreateStack",
+            request: json!({ "Name": "embedding", "EmbedHostDomains": ["test,com"] }),
+            path: "embedHostDomains",
+            quoted: "[test,com]".to_string(),
+            element_set: domain_element_set(),
+        },
+        ElementRefusal {
+            case: "an update whose second embed host domain is not a domain",
+            operation: "UpdateStack",
+            request: json!({
+                "Name": "stored",
+                "EmbedHostDomains": ["embed.example", ".com"],
+            }),
+            path: "embedHostDomains",
+            quoted: "[embed.example, .com]".to_string(),
+            element_set: domain_element_set(),
+        },
+        ElementRefusal {
+            case: "an embed host domain past the element length maximum",
+            operation: "UpdateStack",
+            request: json!({ "Name": "stored", "EmbedHostDomains": [long_domain.clone()] }),
+            path: "embedHostDomains",
+            quoted: format!("[{long_domain}]"),
+            element_set: domain_element_set(),
+        },
+        ElementRefusal {
+            case: "an untag whose tag key is longer than the element maximum",
+            operation: "UntagResource",
+            request: json!({
+                "ResourceArn": resource_arn(),
+                "TagKeys": ["k".repeat(129)],
+            }),
+            path: "tagKeys",
+            quoted: format!("[{}]", "k".repeat(129)),
+            element_set: tag_key_element_set(),
+        },
+        ElementRefusal {
+            case: "an untag whose second tag key is empty",
+            operation: "UntagResource",
+            request: json!({ "ResourceArn": resource_arn(), "TagKeys": ["Environment", ""] }),
+            path: "tagKeys",
+            quoted: "[Environment, ]".to_string(),
+            element_set: tag_key_element_set(),
+        },
+    ]
+}
+
+#[tokio::test]
+async fn a_constraint_a_list_element_breaks_is_refused_at_the_list() {
+    let emulator = Emulator::new();
+    emulator
+        .ok("setup", "CreateStack", json!({ "Name": "stored" }))
+        .await;
+
+    for row in element_refusals() {
+        let message = refusal(
+            &emulator,
+            row.case,
+            row.operation,
+            row.request,
+            400,
+            "ValidationException",
+        )
+        .await;
+
+        // ONE validation error, whatever the number of offending elements: the clause names
+        // the member, the list it held and the whole set each element has to satisfy.
+        let expected = format!(
+            "1 validation error detected: Value '{}' at '{}' failed to satisfy constraint: {}",
+            row.quoted, row.path, row.element_set
+        );
+        assert_eq!(
+            message, expected,
+            "case {:?}: expected message {expected:?}, got {message:?}",
+            row.case
+        );
+    }
+
+    // The controls: the same members inside the element constraints are accepted, so the
+    // clauses above reported the element shape rather than the member — and the stack keeps
+    // the attributes a refused update named.
+    emulator
+        .ok(
+            "every attribute the model declares",
+            "UpdateStack",
+            json!({
+                "Name": "stored",
+                "AttributesToDelete": ["ACCESS_ENDPOINTS", "REDIRECT_URL", "THEME_NAME"],
+            }),
+        )
+        .await;
+    emulator
+        .ok(
+            "a domain inside the element expression",
+            "UpdateStack",
+            json!({ "Name": "stored", "EmbedHostDomains": ["embed.example.com"] }),
+        )
+        .await;
+}
+
