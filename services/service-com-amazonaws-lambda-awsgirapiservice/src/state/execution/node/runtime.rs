@@ -553,6 +553,9 @@ pub(super) const RUNTIME_SOURCE: &str = r##"
             paths: core ? [] : searchPaths(directory)
         };
         cache[id] = module;
+        // The exports object the module SCOPE is given, kept so the names its exports were
+        // assigned under can be stated once its body has run ([`nameModuleExports`]).
+        var scopeExports = module.exports;
         // Inside this module from here on: a require it makes that resolves to nothing names
         // this file as the innermost frame of its require stack, over the chain it was itself
         // reached through.
@@ -587,6 +590,7 @@ pub(super) const RUNTIME_SOURCE: &str = r##"
                     filename,
                     core ? 'node:' + id.slice(CORE_PREFIX.length) : filenameOf(directory)
                 );
+                nameModuleExports(module, scopeExports, core);
             }
             module.loaded = true;
         } catch (error) {
@@ -596,6 +600,81 @@ pub(super) const RUNTIME_SOURCE: &str = r##"
             loading.pop();
         }
         return module.exports;
+    }
+
+    // State the name a function was ASSIGNED under, for a function carrying none of its own.
+    //
+    // A stack frame names the function it is in by the name that function carries, and a
+    // function written without one carries the name the language INFERS for it. The engine a
+    // managed node runtime embeds infers one for a function expression assigned to a PROPERTY
+    // as well, naming it by the assignment path it was written at; the engine embedded here
+    // infers one only where the language states it (a declaration, a variable initialiser, a
+    // member of an object literal), and a function it inferred nothing for reads as an
+    // anonymous one in every frame of it. A function that carries a name already — one the
+    // language stated, or one inferred at the position it was written at — keeps it, because
+    // that is the name the frame carries on a managed runtime too.
+    function nameAssigned(value, assigned) {
+        if (typeof value !== 'function') {
+            return;
+        }
+        try {
+            if (value.name !== '') {
+                return;
+            }
+            Object.defineProperty(value, 'name', {
+                value: assigned,
+                writable: false,
+                enumerable: false,
+                configurable: true
+            });
+        } catch (error) {
+            // A function whose name cannot be read or stated keeps the one it has: naming a
+            // frame is no reason for a module to fail to load.
+        }
+    }
+
+    // The names a CommonJS module's exports were assigned under, stated on the functions
+    // among them once the module's body has run ([`nameAssigned`]): the members of the
+    // exports object the module scope was given are `exports.<member>`, a module whose
+    // exports it REPLACED with a function is `module.exports`, and the members of an object
+    // it replaced them with are `module.exports.<member>`.
+    //
+    // Only a member held as a VALUE is named: reading an accessor would run the module's own
+    // code to decide a name. A module the RUNTIME supplies its own implementation of is left
+    // alone: node compiles its internals as its own and a frame inside one names that
+    // internal module, not an export of the package that imported it.
+    function nameModuleExports(module, scopeExports, core) {
+        if (core) {
+            return;
+        }
+        var exported = module.exports;
+        if (exported === null || exported === undefined) {
+            return;
+        }
+        var replaced = exported !== scopeExports;
+        nameAssigned(exported, 'module.exports');
+        if (typeof exported !== 'object' && typeof exported !== 'function') {
+            return;
+        }
+        var prefix = replaced ? 'module.exports.' : 'exports.';
+        var keys = [];
+        try {
+            keys = Object.keys(exported);
+        } catch (error) {
+            // Exports whose members cannot be enumerated are named by nothing.
+            return;
+        }
+        for (var index = 0; index < keys.length; index += 1) {
+            var held = null;
+            try {
+                held = Object.getOwnPropertyDescriptor(exported, keys[index]);
+            } catch (error) {
+                held = null;
+            }
+            if (held !== null && held !== undefined && 'value' in held) {
+                nameAssigned(held.value, prefix + keys[index]);
+            }
+        }
     }
 
     // The source the host declares an ES module from, for an id this runtime resolved.
@@ -947,6 +1026,106 @@ pub(super) const RUNTIME_SOURCE: &str = r##"
         return message === '' ? name : name + ': ' + message;
     }
 
+    // The property a PROPERTY ACCESS failure named, for the error the engine raises when the
+    // value it was read from or written to is `undefined` or `null`; `null` for every other
+    // error. The wording the runtime reports for the class is [`decorated`]'s; this reads the
+    // engine's own, which is where the property the access named is stated.
+    function accessedProperty(error) {
+        if (!(error instanceof TypeError)) {
+            return null;
+        }
+        var access = propertyAccess(error.message);
+        return access === null ? null : access.property;
+    }
+
+    // The unit, line and column one frame line names, or `null` for a line that names no
+    // position at all (a frame inside the engine's own code, which carries none).
+    function framePosition(line) {
+        var tail = /:(\d+):(\d+)(\)?)$/.exec(line);
+        if (tail === null) {
+            return null;
+        }
+        var head = line.slice(0, line.length - tail[0].length);
+        var open = head.lastIndexOf('(');
+        return {
+            unit: open < 0 ? head.replace(/^\s*at\s*/, '') : head.slice(open + 1),
+            line: Number(tail[1]),
+            column: Number(tail[2]),
+            // The line up to the position it ends with, and the parenthesis that closes it:
+            // what [`withColumn`] states another column between.
+            head: head,
+            closed: tail[3]
+        };
+    }
+
+    // That same frame line, naming `column` instead of the one it carries.
+    function withColumn(position, column) {
+        return position.head + ':' + position.line + ':' + column + position.closed;
+    }
+
+    // Line `at` of the unit a frame names, as the file holding it was written, or `null` for
+    // a unit this function holds no source for — the runtime's own entry module among them.
+    function unitLine(unit, at) {
+        var path = unit.indexOf(FILE_URL_PREFIX) === 0
+            ? unit.slice(FILE_URL_PREFIX.length)
+            : unit;
+        var id = idOfPath(path);
+        var source = id === null ? null : sourceOf(id);
+        if (source === null) {
+            return null;
+        }
+        var lines = source.split('\n');
+        return at >= 1 && at <= lines.length ? lines[at - 1] : null;
+    }
+
+    // The column `property` is written at on `text`, at or after `column`, as the position a
+    // frame names it by — `0` where the line does not state that access, which is every line
+    // naming the property by an expression rather than writing it.
+    function propertyColumn(text, column, property) {
+        var from = column < 1 ? 0 : column - 1;
+        var written = '.' + property;
+        for (;;) {
+            var at = text.indexOf(written, from);
+            if (at < 0) {
+                return 0;
+            }
+            // The written name ends the token it is: a longer name beginning with it is
+            // another property, and the access that failed is not in it.
+            var after = text.charAt(at + written.length);
+            if (after === '' || !/[A-Za-z0-9_$]/.test(after)) {
+                return at + 2;
+            }
+            from = at + 1;
+        }
+    }
+
+    // The frames of a PROPERTY ACCESS failure, its innermost frame naming the position the
+    // property is written at.
+    //
+    // A managed runtime names that frame by the property the access named, which is what
+    // tells a client WHICH access on the line failed; the engine embedded here names the
+    // position the expression the property is read from begins at instead. The property is in
+    // the failure's own message and the module's own source says where on the line it is
+    // written, so the frame the access was made in — the innermost one, the frames under it
+    // being named by their own calls — is named by that position.
+    function atAccessedProperty(frames, property) {
+        var lines = frames.split('\n');
+        var innermost = lines.length === 0 ? null : framePosition(lines[0]);
+        if (innermost === null) {
+            return frames;
+        }
+        var text = unitLine(innermost.unit, innermost.line);
+        if (text === null) {
+            return frames;
+        }
+        var column = propertyColumn(text, innermost.column, property);
+        if (column === 0) {
+            return frames;
+        }
+        lines[0] = withColumn(innermost, column);
+        return lines.join('\n');
+    }
+
     // `stack` as a node runtime reports it: the error's own head line ([`errorHead`]), then one
     // line per frame the engine took.
     //
@@ -978,6 +1157,12 @@ pub(super) const RUNTIME_SOURCE: &str = r##"
                 var frames = typeof taken === 'string' ? taken : '';
                 while (frames !== '' && frames.charAt(frames.length - 1) === '\n') {
                     frames = frames.slice(0, frames.length - 1);
+                }
+                // A property access that failed is named by the property it named
+                // ([`atAccessedProperty`]).
+                var property = frames === '' ? null : accessedProperty(this);
+                if (property !== null) {
+                    frames = atAccessedProperty(frames, property);
                 }
                 var head = errorHead(this);
                 return frames === '' ? head : head + '\n' + frames;
@@ -1326,15 +1511,32 @@ pub(super) const RUNTIME_SOURCE: &str = r##"
         if (keyword !== null) {
             return "Unexpected token '" + keyword[1] + "'";
         }
-        var read = /^cannot read property '(.*)' of (undefined|null)$/.exec(message);
-        if (read !== null) {
-            return 'Cannot read properties of ' + read[2] + " (reading '" + read[1] + "')";
-        }
-        var written = /^cannot set property '(.*)' of (undefined|null)$/.exec(message);
-        if (written !== null) {
-            return 'Cannot set properties of ' + written[2] + " (setting '" + written[1] + "')";
+        var access = propertyAccess(message);
+        if (access !== null) {
+            return access.read
+                ? 'Cannot read properties of ' + access.value
+                    + " (reading '" + access.property + "')"
+                : 'Cannot set properties of ' + access.value
+                    + " (setting '" + access.property + "')";
         }
         return message;
+    }
+
+    // The property ACCESS the engine's own wording states: which direction the access was in,
+    // the property it named, and the value — `undefined` or `null` — it was made on. `null`
+    // for a message that is not that failure's.
+    //
+    // The ONE place this runtime reads that wording. Both what it reports for the class
+    // ([`decorated`]) and the position it names the access at ([`atAccessedProperty`]) are
+    // stated from what this answers, so one reading of the engine's message serves both.
+    function propertyAccess(message) {
+        var access = /^cannot (read|set) property '(.*)' of (undefined|null)$/.exec(
+            typeof message === 'string' ? message : ''
+        );
+        if (access === null) {
+            return null;
+        }
+        return { read: access[1] === 'read', property: access[2], value: access[3] };
     }
 
     // Why the module that is running is being treated as an ES module, when that is the
@@ -1730,7 +1932,19 @@ pub(super) const RUNTIME_SOURCE: &str = r##"
         settle(serialized(state.callbackValue));
     }
 
-    function callHandler(entry, event, context) {
+    // Call the handler the invocation resolved, with the event and the context held for it
+    // ([`invoke`]).
+    //
+    // The call is made from a JOB of the runtime's own, so this is the only frame of the
+    // runtime underneath the deployment package's own frames in a stack taken inside the
+    // handler: a managed runtime AWAITS the handler's answer, and what scheduled the call it
+    // awaits is no longer on the stack by the time the handler runs. The arguments are read
+    // off the invocation rather than passed in for that reason — a function that passed them
+    // on would be a frame of the runtime on that stack too.
+    function callHandler() {
+        var entry = state.invocation.entry;
+        var event = state.invocation.event;
+        var context = state.invocation.context;
         if (entry[STREAMING_MARK] === RESPONSE_STREAMING) {
             var chunks = [];
             return callStreamingHandler(entry, event, context, responseStream(chunks), chunks);
@@ -1799,7 +2013,14 @@ pub(super) const RUNTIME_SOURCE: &str = r##"
             // told the invoke phase begins now and answers the instant that `Timeout` is up
             // at — which is what the context reports as the time remaining.
             input.deadlineEpochMs = hostBeginInvocation();
-            return callHandler(entry, event, makeContext(input));
+            state.invocation = {
+                entry: entry,
+                event: event,
+                context: makeContext(input)
+            };
+            // The handler runs in a job of the runtime's own, which is what the only frame
+            // of the runtime on a stack taken inside it comes from ([`callHandler`]).
+            return Promise.resolve().then(callHandler);
         }, function (error) {
             // How the node runtime classifies a module that would not load: a module it
             // could not find, source that would not compile, and anything else the
@@ -1834,7 +2055,10 @@ pub(super) const RUNTIME_SOURCE: &str = r##"
             logFormat: input.environment.AWS_LAMBDA_LOG_FORMAT,
             esModuleHint: null,
             loggedError: false,
-            rejections: []
+            rejections: [],
+            // What the handler is called with, once the invocation has resolved it
+            // ([`callHandler`]).
+            invocation: null
         };
         nodeMajor = input.nodeMajor;
         installProcess(input);
