@@ -935,6 +935,9 @@ fn restored_indexes(
             ),
             reported_counters: crate::state::MeteredCounters::new(now),
             contributor_insights: crate::state::ContributorInsights::default(),
+            // Restored WITH the table, so it reports no `Backfilling`, exactly as an
+            // index created with a table does ([`crate::state::IndexBackfill`]).
+            backfill: crate::state::IndexBackfill::WithTable,
         });
     }
     Ok(indexes)
@@ -962,6 +965,9 @@ fn restored_vector_indexes(
             transient_status: crate::state::IndexStatus::Creating,
             active_at: now + crate::state::STATUS_TRANSITION,
             reported_counters: crate::state::MeteredCounters::new(now),
+            // Restored WITH the table, whatever the SOURCE index was reporting, so it
+            // reports no `Backfilling` ([`crate::state::IndexBackfill`]).
+            backfill: crate::state::IndexBackfill::WithTable,
             ..index.clone()
         })
         .collect()

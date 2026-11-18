@@ -1003,6 +1003,10 @@ impl Table {
                     contributor_insights: ContributorInsights::default(),
                     transient_status: IndexStatus::Creating,
                     active_at: now + STATUS_TRANSITION,
+                    // The replica's index is created WITH the replica's own table, so it
+                    // reports no `Backfilling` whatever the source index was reporting
+                    // ([`super::IndexBackfill`]).
+                    backfill: super::IndexBackfill::WithTable,
                     // An index the action overrides a setting of carries that setting in
                     // this Region; every other index follows the source table's.
                     provisioned_throughput: overridden_index_throughput(
@@ -1029,6 +1033,9 @@ impl Table {
                     reported_counters: MeteredCounters::new(now),
                     transient_status: IndexStatus::Creating,
                     active_at: now + STATUS_TRANSITION,
+                    // Created WITH the replica's own table, by the same rule its secondary
+                    // indexes follow ([`super::IndexBackfill`]).
+                    backfill: super::IndexBackfill::WithTable,
                     ..index.clone()
                 })
                 .collect(),

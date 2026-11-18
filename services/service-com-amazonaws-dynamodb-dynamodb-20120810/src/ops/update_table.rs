@@ -47,7 +47,11 @@
 //! it describes, held to the same rules as one declared with the table — the capacity mode
 //! the update leaves the table in included
 //! ([`crate::state::check_vector_index_capacity_mode`]) — and it becomes
-//! searchable when it reaches `ACTIVE`. Either way the change is index lifecycle work, so
+//! searchable when it reaches `ACTIVE`. An index ADDED this way has the items the table
+//! already holds to read, so its description reports `Backfilling` for that span
+//! ([`crate::state::IndexBackfill`]) — true while those items are being indexed, false
+//! once they have been, which is also what an index added to an empty table reports from
+//! the start. Either way the change is index lifecycle work, so
 //! the table is left `UPDATING` for the span below like any other — and a call asking for
 //! more than one create or one delete of a vector index exceeds what one `UpdateTable`
 //! carries, which is the control plane's `LimitExceededException`.
@@ -1657,6 +1661,14 @@ fn resolve_indexes(
                 // Contributor insights are off on a new index, as they are on a new
                 // table: only `UpdateContributorInsights` turns them on.
                 contributor_insights: crate::state::ContributorInsights::default(),
+                // An index ADDED to a table has the items that table already holds to
+                // read, which is the backfill its description reports until those items
+                // have been processed ([`crate::state::IndexBackfill`]).
+                backfill: crate::state::IndexBackfill::added(
+                    !table.items.is_empty(),
+                    now,
+                    now + crate::state::STATUS_TRANSITION,
+                ),
             });
         }
         if let Some(delete) = &update.delete {
@@ -1775,7 +1787,9 @@ fn resolve_indexes(
 }
 
 /// The table's vector indexes after the update: every one a `Delete` names is gone, and
-/// every one a `Create` names is added, `CREATING` until the clock settles it `ACTIVE`.
+/// every one a `Create` names is added, `CREATING` until the clock settles it `ACTIVE` and
+/// backfilling the items the table already holds for that span
+/// ([`crate::state::IndexBackfill`]).
 ///
 /// A `Delete` naming a vector index the table does not carry names a resource that is not
 /// there, so it is refused with the index-lifecycle surface's own sentence
@@ -1859,7 +1873,21 @@ fn resolve_vector_indexes(
                 dimensions: create.dimensions,
                 distance_function: &create.distance_function,
             }
-            .validated(definitions, region, &table.name, now)?,
+            .validated(
+                definitions,
+                region,
+                &table.name,
+                // What this index has to read is what the table ALREADY holds: an index
+                // added to a populated table backfills those items, and one added to an
+                // empty table has nothing to read
+                // ([`crate::state::IndexBackfill`]).
+                crate::state::IndexBackfill::added(
+                    !table.items.is_empty(),
+                    now,
+                    now + crate::state::STATUS_TRANSITION,
+                ),
+                now,
+            )?,
         );
     }
     Ok(indexes)

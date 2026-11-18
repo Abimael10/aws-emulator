@@ -777,6 +777,10 @@ fn restored_indexes(
             ),
             reported_counters: crate::state::MeteredCounters::new(now),
             contributor_insights: crate::state::ContributorInsights::default(),
+            // Restored WITH the table, so there is no pre-existing table data to read
+            // and the member is absent, exactly as it is for an index created with a
+            // table ([`crate::state::IndexBackfill`]).
+            backfill: crate::state::IndexBackfill::WithTable,
         });
     }
     Ok(indexes)
@@ -812,6 +816,9 @@ fn restored_vector_indexes(
                 transient_status: crate::state::IndexStatus::Creating,
                 active_at: now + crate::state::STATUS_TRANSITION,
                 reported_counters: crate::state::MeteredCounters::new(now),
+                // Restored WITH the table, like every index a restore brings into being,
+                // so it reports no `Backfilling` ([`crate::state::IndexBackfill`]).
+                backfill: crate::state::IndexBackfill::WithTable,
             }
         })
         .collect()

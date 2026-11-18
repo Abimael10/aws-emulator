@@ -1262,6 +1262,9 @@ pub(crate) fn validated_indexes(
             reported_counters: crate::state::MeteredCounters::new(now),
             // Off on a new index, for the same reason it is off on a new table.
             contributor_insights: crate::state::ContributorInsights::default(),
+            // Defined WITH the table, so there is no table data to read and the member
+            // "does not appear in the DescribeTable output" (the `Backfilling` doc).
+            backfill: crate::state::IndexBackfill::WithTable,
         });
     }
     Ok(indexes)
@@ -1388,7 +1391,7 @@ pub(crate) fn validated_vector_indexes(
                 dimensions: index.dimensions,
                 distance_function: &index.distance_function,
             }
-            .validated(&definitions, region, table, now)?,
+            .validated(&definitions, region, table, crate::state::IndexBackfill::WithTable, now)?,
         );
     }
     Ok(indexes)
@@ -1421,12 +1424,15 @@ impl DeclaredVectorIndex<'_> {
     ///
     /// The stored index starts `CREATING` and becomes `ACTIVE` when the clock makes the
     /// transient span due, and it carries the ARN this service mints for an index of
-    /// `table` in `region`.
+    /// `table` in `region`. What it has to BACKFILL is the caller's to state
+    /// ([`crate::state::IndexBackfill`]): an index declared with the table has no table
+    /// data to read, while one added to a table that already holds items does.
     pub(crate) fn validated(
         &self,
         definitions: &[AttributeDefinition],
         region: &str,
         table: &str,
+        backfill: crate::state::IndexBackfill,
         now: ::std::time::SystemTime,
     ) -> Result<crate::state::VectorIndex, crate::state::RequestError> {
         validated_projection(self.index_name, self.projection)?;
@@ -1455,6 +1461,7 @@ impl DeclaredVectorIndex<'_> {
             transient_status: crate::state::IndexStatus::Creating,
             active_at: now + crate::state::STATUS_TRANSITION,
             reported_counters: crate::state::MeteredCounters::new(now),
+            backfill,
         })
     }
 }

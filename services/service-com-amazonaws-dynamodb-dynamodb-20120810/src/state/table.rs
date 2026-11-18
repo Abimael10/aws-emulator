@@ -1476,11 +1476,14 @@ impl Table {
             key_schema: Some(index.key_schema.clone()),
             projection: Some(index.projection.clone()),
             index_status: Some(index.status(now).as_str().to_string()),
-            // "For indexes that were created during a CreateTable operation, the
+            // "Backfilling is the process of reading items from the table and determining
+            // whether they can be added to the index ... After all items have been
+            // processed, the backfilling operation is complete and Backfilling is false",
+            // and "For indexes that were created during a CreateTable operation, the
             // Backfilling attribute does not appear in the DescribeTable output" (the
-            // `Backfilling` doc), and this emulator projects an index's items from the
-            // table on every read, so no index is ever backfilling.
-            backfilling: None,
+            // `Backfilling` doc) — one rule for every index kind that reports the member
+            // ([`IndexBackfill`]).
+            backfilling: index.backfill.backfilling(now),
             provisioned_throughput: Some(ProvisionedThroughputDescription {
                 read_capacity_units: Some(capacity.read_capacity_units),
                 write_capacity_units: Some(capacity.write_capacity_units),

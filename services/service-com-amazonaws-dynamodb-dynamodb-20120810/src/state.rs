@@ -1202,6 +1202,9 @@ pub struct GlobalSecondaryIndex {
     /// contributor insights operations through `IndexName` beside the table, so each one
     /// carries its own ([`ContributorInsights`]).
     pub contributor_insights: ContributorInsights,
+    /// Whether this index still has the items its table already held to read, which is
+    /// what its description reports as `Backfilling` ([`IndexBackfill`]).
+    pub backfill: IndexBackfill,
 }
 
 impl GlobalSecondaryIndex {
@@ -1256,6 +1259,9 @@ pub struct VectorIndex {
     /// The metered figures this index's `ItemCount` and `IndexSizeBytes` report,
     /// refreshed with the table's on the documented schedule.
     pub reported_counters: MeteredCounters,
+    /// Whether this index still has the items its table already held to read, which is
+    /// what its description reports as `Backfilling` ([`IndexBackfill`]).
+    pub backfill: IndexBackfill,
 }
 
 impl VectorIndex {
@@ -1383,11 +1389,12 @@ impl VectorIndex {
             dimensions: Some(self.dimensions),
             distance_function: Some(self.distance_function.clone()),
             index_status: Some(self.status(now).as_str().to_string()),
-            // "Specifies whether the index is currently backfilling"
-            // (`VectorIndexDescription$Backfilling`): an index defined WITH the table has
-            // no table data to backfill from, and this emulator projects an index's items
-            // from the table on every read, so none ever is.
-            backfilling: None,
+            // "Specifies whether the index is currently backfilling. During backfill,
+            // SearchVectors operations might return incomplete results"
+            // (`VectorIndexDescription$Backfilling`): true while the items the table
+            // already held when this index was added are still being read
+            // ([`IndexBackfill`]), and absent for an index defined with the table.
+            backfilling: self.backfill.backfilling(now),
             item_count: Some(self.reported_counters.item_count),
             index_size_bytes: Some(self.reported_counters.size_bytes),
         }
@@ -4722,3 +4729,9 @@ mod item_writes;
 /// store holds. Re-exported below, so every caller still names them `crate::state::…`.
 mod addressing;
 pub use addressing::*;
+
+/// Whether an index is BACKFILLING the items its table already held, in its own file: one
+/// rule for every index kind whose description carries that member. Re-exported below, so
+/// every caller still names it `crate::state::…`.
+mod index_backfill;
+pub use index_backfill::*;
