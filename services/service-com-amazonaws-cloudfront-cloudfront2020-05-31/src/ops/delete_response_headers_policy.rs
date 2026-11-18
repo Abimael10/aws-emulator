@@ -7,8 +7,11 @@
 //! the listing stops reporting it, and it is gated on the policy belonging to this account
 //! at all (a policy AWS published is `IllegalDelete`), on the policy's own version token
 //! (`If-Match`) and on nothing in the store still attaching it — a cache behaviour's
-//! `ResponseHeadersPolicyId` — which is `ResponseHeadersPolicyInUse`. This is the ONLY file
-//! to touch for this operation.
+//! `ResponseHeadersPolicyId` — which is `ResponseHeadersPolicyInUse`. The header's FORM is a
+//! property of the request alone, so an `If-Match` carrying no version token at all is
+//! `InvalidIfMatchVersion` (400) BEFORE the id is resolved against the store, while a
+//! well-formed token that is not the policy's current version is `PreconditionFailed` (412).
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -77,8 +80,6 @@
 
 #[allow(unused_imports)]
 use super::types::*;
-
-use crate::state::IfMatch;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -201,6 +202,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // "The version of the response headers policy that you are deleting. The version is
+        // the response headers policy's ETag value." The FORM of the header comes first:
+        // `InvalidIfMatchVersion` is "the If-Match version is missing or not valid", which is a
+        // property of the REQUEST alone, so it is decided before the id is resolved against the
+        // store — no policy any id could name makes an absent or malformed header readable, so
+        // this refusal cannot depend on what the store holds
+        // ([`crate::state::if_match_version`]). The only refusal ahead of it is the one above,
+        // which is about what the request ASKED FOR rather than about the store.
+        let Some(submitted_version) = crate::state::if_match_version(input.if_match.as_deref())
+        else {
+            return Err(
+                DeleteResponseHeadersPolicyErrorModeled::InvalidIfMatchVersion(
+                    crate::state::invalid_if_match_version(),
+                )
+                .into(),
+            );
+        };
+
         // "The identifier for the response headers policy that you are deleting": the
         // policy is resolved against the policies this account OWNS, since those are the
         // only ones a mutation addresses, so every refusal below is about the record this id
@@ -219,31 +238,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         };
 
-        // "The version of the response headers policy that you are deleting. The version is
-        // the response headers policy's ETag value." The precondition is checked against the
-        // STORED version, the way HTTP evaluates one: a caller holding a version that is no
-        // longer current is told that before anything about what the policy is attached to.
-        match crate::state::check_if_match(&current_etag, input.if_match.as_deref()) {
-            IfMatch::Current => {}
-            IfMatch::Invalid => {
-                return Err(
-                    DeleteResponseHeadersPolicyErrorModeled::InvalidIfMatchVersion(
-                        crate::state::invalid_if_match_version(),
-                    )
-                    .into(),
-                );
-            }
-            IfMatch::Stale => {
-                return Err(
-                    DeleteResponseHeadersPolicyErrorModeled::PreconditionFailed(
-                        // CloudFront words this refusal per API family: the policy surface
-                        // reports the unmet precondition of the OPERATION rather than of the
-                        // request's header fields.
-                        crate::state::precondition_failed_for_this_operation(),
-                    )
-                    .into(),
-                );
-            }
+        // The precondition itself is evaluated against the STORED version, the way HTTP
+        // evaluates one: a caller holding a well-formed version that is no longer current is
+        // told that before anything about what the policy is attached to.
+        if submitted_version != current_etag {
+            return Err(
+                DeleteResponseHeadersPolicyErrorModeled::PreconditionFailed(
+                    // CloudFront words this refusal per API family: the policy surface
+                    // reports the unmet precondition of the OPERATION rather than of the
+                    // request's header fields.
+                    crate::state::precondition_failed_for_this_operation(),
+                )
+                .into(),
+            );
         }
 
         // "You cannot delete a response headers policy if it's attached to a cache behavior.

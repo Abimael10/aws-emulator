@@ -8,8 +8,11 @@
 //! caller matched on no longer satisfies an `If-Match` and the delete that follows is gated
 //! on the new one. It is refused when the target is a policy AWS published
 //! (`IllegalUpdate`), when the id names no policy of this account
-//! (`NoSuchResponseHeadersPolicy`), on the policy's own version token
-//! (`InvalidIfMatchVersion` / `PreconditionFailed`), on a list wrapper whose `Quantity`
+//! (`NoSuchResponseHeadersPolicy`), on the policy's own version token — an `If-Match` that
+//! carries no version token at all is `InvalidIfMatchVersion` (400) before the id is
+//! resolved against the store, since the header's form is a property of the request alone,
+//! and a well-formed token that is not the policy's current version is `PreconditionFailed`
+//! (412) — on a list wrapper whose `Quantity`
 //! disagrees with its `Items` (`InconsistentQuantities`), on a `Content-Security-Policy`
 //! value past CloudFront's published quota on its length
 //! (`TooLongCSPInResponseHeadersPolicy`) and on a `Name` another policy of
@@ -116,8 +119,6 @@ use super::types::*;
 
 use std::time::SystemTime;
 
-use crate::state::IfMatch;
-
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -216,6 +217,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // The FORM of the `If-Match` header: `InvalidIfMatchVersion` is "the If-Match version
+        // is missing or not valid", a property of the REQUEST alone, so it is decided before
+        // the id is resolved against the store — no policy any id could name makes an absent or
+        // malformed header readable ([`crate::state::if_match_version`]). The same order
+        // `DeleteResponseHeadersPolicy` answers in, so the two mutations of one record cannot
+        // disagree about what a header says.
+        let Some(submitted_version) = crate::state::if_match_version(input.if_match.as_deref())
+        else {
+            return Err(
+                UpdateResponseHeadersPolicyErrorModeled::InvalidIfMatchVersion(
+                    crate::state::invalid_if_match_version(),
+                )
+                .into(),
+            );
+        };
+
         // The policy being updated is looked up among the policies this account OWNS: every
         // refusal below is about the record this id names, and nothing is minted for an id the
         // store does not hold. The identifier's shape is examined the way the readers of this
@@ -232,26 +249,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         };
 
-        // The precondition is checked against the STORED version, so an update only lands on
-        // the configuration its caller actually read.
-        match crate::state::check_if_match(&current_etag, input.if_match.as_deref()) {
-            IfMatch::Current => {}
-            IfMatch::Invalid => {
-                return Err(
-                    UpdateResponseHeadersPolicyErrorModeled::InvalidIfMatchVersion(
-                        crate::state::invalid_if_match_version(),
-                    )
-                    .into(),
-                );
-            }
-            IfMatch::Stale => {
-                return Err(
-                    UpdateResponseHeadersPolicyErrorModeled::PreconditionFailed(
-                        crate::state::precondition_failed_for_this_operation(),
-                    )
-                    .into(),
-                );
-            }
+        // The precondition itself is evaluated against the STORED version, so an update only
+        // lands on the configuration its caller actually read.
+        if submitted_version != current_etag {
+            return Err(
+                UpdateResponseHeadersPolicyErrorModeled::PreconditionFailed(
+                    crate::state::precondition_failed_for_this_operation(),
+                )
+                .into(),
+            );
         }
 
         // "The value of Quantity and the size of Items don't match." — walked over every
