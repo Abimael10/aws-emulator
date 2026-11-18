@@ -11,6 +11,17 @@
 //! from that caller holds no value to aggregate and contributes to no bucket and no metric —
 //! reading a field by aggregating it is reading it.
 //!
+//! Reading a field's per-document values is also what an aggregation CANNOT do on a field the
+//! index holds none for — an analyzed `text` field with `fielddata` left off, whose values are
+//! only the terms of its analysis. Such a field can bucket and measure nothing, so an
+//! aggregation naming one is REFUSED ([`Aggregations::without_doc_values`]) exactly as a sort
+//! key naming one is: an empty `buckets` array means "the selected documents hold no such
+//! value", and answering it for a field that could not be read at all would report nothing
+//! where the engine reports a failure. A MULTI-FIELD of that same field — the `keyword`
+//! sub-field a mapping adds for exactly this purpose — does hold them, and reads the values of
+//! the field above it, which is what makes the usual "full-text search plus exact aggregation
+//! on one field" mapping work.
+//!
 //! The aggregations served are the ones this engine can compute over those values: the
 //! `terms` buckets, and the single-value metrics `value_count`, `min`, `max`, `sum` and `avg`.
 //! A request naming any other type is REFUSED, rather than answered with a section it did not
@@ -25,6 +36,8 @@ use std::collections::BTreeMap;
 
 use ::serde_json::{json, Map, Value};
 use aws_smithy_runtime_api::http::Response as RtResponse;
+
+use crate::state::analysis::IndexAnalysis;
 
 use super::{error, scalar_text, Terms, PARSING_EXCEPTION};
 
@@ -138,6 +151,20 @@ impl Aggregations {
     /// Whether this names no aggregation at all.
     pub(super) fn is_empty(&self) -> bool {
         self.requested.is_empty()
+    }
+
+    /// The first field these aggregations name that the index whose mappings are `analysis`
+    /// holds no PER-DOCUMENT values for, where they name one: the condition an aggregation
+    /// cannot be computed under, since every one of them reads those values.
+    ///
+    /// The same question a sort key is asked ([`super::search::Sorting::without_doc_values`]),
+    /// because it is the same reading: a field's per-document values are what orders a hit and
+    /// what buckets or measures one.
+    pub(super) fn without_doc_values(&self, analysis: &IndexAnalysis) -> Option<&str> {
+        self.requested
+            .iter()
+            .map(|requested| requested.field.as_str())
+            .find(|field| analysis.needs_fielddata(field))
     }
 
     /// Read one SELECTED document into every aggregation.

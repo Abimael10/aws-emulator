@@ -106,7 +106,8 @@
 //! conditional write is taken against — the
 //! newline-delimited stream of them the bulk API takes ([`bulk`]), a count and a search over
 //! a bounded query vocabulary ([`selector`]) whose `match` is evaluated over the terms the
-//! field's own analysis chain produces, the documents such a query selects removed
+//! field's own analysis chain produces, the buckets such a search groups the documents it
+//! selected into ([`aggregations`]), the documents such a query selects removed
 //! ([`delete_by_query`]), the tokens a text produces through that chain
 //! ([`analyze`]), index templates and the component templates they are composed of
 //! ([`component_templates`]), ingest pipelines (declared, simulated and applied to a write
@@ -3572,7 +3573,14 @@ fn search(
         "hits".to_string(),
         json!({
             "total": { "value": total, "relation": "eq" },
-            "max_score": if total == 0 { Value::Null } else { json!(search::MATCH_SCORE) },
+            // The greatest score among the hits the request is ANSWERED with, which a
+            // request that asked for no hit at all — one aggregating over the documents
+            // rather than reading them — has none of.
+            "max_score": if total == 0 || size == 0 {
+                Value::Null
+            } else {
+                json!(search::MATCH_SCORE)
+            },
             "hits": hits,
         }),
     );
@@ -3730,6 +3738,17 @@ fn selected_documents(
         // naming a field it holds none for is refused — per shard, as the engine refuses
         // it, since it is that index's own mappings that decide it.
         if let Some(field) = sorting.without_doc_values(&analysis) {
+            return Err(Box::new(all_shards_failed(
+                &index.index_name,
+                ingest::ILLEGAL_ARGUMENT_EXCEPTION,
+                &fielddata_disabled(field),
+            )));
+        }
+        // Every aggregation is taken on those same per-document values, so one naming a
+        // field the index holds none for is refused the same way rather than answered with
+        // no buckets — an empty bucket list says the selected documents hold no such value,
+        // which is not what a field that could not be read at all means.
+        if let Some(field) = scan.aggregating.without_doc_values(&analysis) {
             return Err(Box::new(all_shards_failed(
                 &index.index_name,
                 ingest::ILLEGAL_ARGUMENT_EXCEPTION,
@@ -3967,9 +3986,9 @@ impl Scan<'_> {
         }
         let selected = select.matches(id, source, terms)
             // The document-level security in force is asked of the document too, and a
-            // document it does not admit is not selected at all: it is counted in no total
-            // and reported on no page, which is what makes it indistinguishable from one
-            // the index does not hold.
+            // document it does not admit is not selected at all: it is counted in no total,
+            // reported on no page and read into no aggregation, which is what makes it
+            // indistinguishable from one the index does not hold.
             && reading
                 .admits
                 .as_ref()

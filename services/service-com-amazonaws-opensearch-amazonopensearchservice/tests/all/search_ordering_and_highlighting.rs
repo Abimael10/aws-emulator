@@ -1,10 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! The ORDER a domain's search answers its hits in, and the FRAGMENTS each hit carries —
-//! driven over the real wire path: a signed request to the endpoint a domain publishes,
-//! through the multi-service router, into the mounted service.
+//! The ORDER a domain's search answers its hits in, the FRAGMENTS each hit carries, and the
+//! BUCKETS it counts the selected documents into — driven over the real wire path: a signed
+//! request to the endpoint a domain publishes, through the multi-service router, into the
+//! mounted service.
 //!
-//! Two rules, each asserted over a table of inputs rather than one call:
+//! Three rules, each asserted over a table of inputs rather than one call:
 //!
 //! > a search applies every section of its body the index's own mappings can serve: the
 //! > `sort` orders the selected documents by the per-document values of the fields its keys
@@ -15,11 +16,15 @@
 //! > a `highlight` answers, on each hit, the field's own value with the terms the query asked
 //! > about wrapped in the highlighter's tags, as that field's analysis chain reports them —
 //! > exactly the matched token on an analyzed field and the whole value on a field held
-//! > whole — and a requested field carrying no asked-for term contributes no key at all.
+//! > whole — and a requested field carrying no asked-for term contributes no key at all;
 //!
 //! > an `aggs` section summarises the documents the query SELECTED, from the per-document
-//! > values of the field each aggregation names — the same values a sort key reads — and a
+//! > values of the field each aggregation names — the same values a sort key reads, so a
+//! > dotted name reaching a multi-field reads the values of the field above it — and a
 //! > summary this cluster does not compute is refused rather than quietly left out.
+//!
+//! What those per-document values are read OFF, and what is answered for a field that holds
+//! none of them, is [`aggregation_doc_values`]'s own rule.
 //!
 //! The harness is [`super::domain_lifecycle`]'s and the data-plane request helper is
 //! [`super::domain_rest_data_plane`]'s; this suite adds no second copy of either.
@@ -28,6 +33,14 @@ use serde_json::{json, Value};
 
 use super::domain_lifecycle::{Answer, Emulator};
 use super::domain_rest_data_plane::rest_prefixed;
+
+/// What an aggregation may be taken ON — the fields the index holds per-document values for,
+/// and the refusal of one it holds none for.
+///
+/// The `#[path]` is what points this child at its own directory: this suite is itself reached
+/// through a `#[path]` from `tests/all.rs`, so a bare `mod` would resolve to a SIBLING suite.
+#[path = "search_ordering_and_highlighting/aggregation_doc_values.rs"]
+mod aggregation_doc_values;
 
 /// The domain whose published endpoint every request below is addressed to.
 const DOMAIN: &str = "search-order";
