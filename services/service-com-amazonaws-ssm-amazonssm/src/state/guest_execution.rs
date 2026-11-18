@@ -212,6 +212,11 @@ fn resolved_line(text: &str, values: &BTreeMap<String, Vec<String>>) -> String {
 /// The boot the guest was already owed is materialised first: an instance that has just
 /// started has its operating system coming up at its own instant, and a script runs in the
 /// guest that boot brought up.
+///
+/// The session is given the resolver clients of the guest besides
+/// ([`super::guest_resolver`]): a script that resolves a name is answered by the DNS of the
+/// VPC the node is in, which is read ONCE here — before the store that owns the guest is
+/// taken — because answering a query reads three stores and running the script holds one.
 pub fn perform_in_guest<Eng: Send + Sync + 'static>(
     engine: &Eng,
     instance_id: &str,
@@ -219,6 +224,10 @@ pub fn perform_in_guest<Eng: Send + Sync + 'static>(
     now: SystemTime,
 ) -> Option<ec2_store::GuestRun> {
     let _ = now;
+    let resolver = ::service_com_amazonaws_route53resolver_route53resolver::state::vpc_dns::view_from_instance(
+        engine, instance_id,
+    )
+    .map(super::guest_resolver::resolver_programs);
     let ec2 = ec2_store::service_state(engine)?;
     let mut store = ec2.lock();
     // The moves that service already owed the instance — its launch reaching `running` and
@@ -226,5 +235,5 @@ pub fn perform_in_guest<Eng: Send + Sync + 'static>(
     // and a script runs in the guest that boot brought up. Materialising them is EC2's own
     // write, through its own one-stop materialiser.
     store.materialize_due_transitions();
-    store.run_in_instance_guest(instance_id, commands)
+    store.run_in_instance_guest_with(instance_id, commands, resolver)
 }

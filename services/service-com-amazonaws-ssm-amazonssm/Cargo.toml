@@ -102,6 +102,11 @@ icalendar = "0.17"
 rrule = "0.14"
 # An entry's `DURATION` is an ISO-8601 duration, read by the maintained ISO-8601 reader.
 iso8601 = "0.6"
+# The DNS a script delivered to a node's guest resolves a name through: which addresses answer
+# one inside the node's VPC, what the security groups on a Resolver endpoint admit, and what
+# the private hosted zones associated with that VPC hold, read through that service's own
+# state accessors rather than from a second copy of them here (`state::guest_resolver`).
+service-com-amazonaws-route53resolver-route53resolver = { workspace = true }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
@@ -110,6 +115,9 @@ emulator-core-build-support = { workspace = true }
 # One module per `tests/all/<name>.rs`, so a new suite is a new file: this crate's tests
 # are the single `all` target rooted at `tests/all/main.rs`.
 automod = { workspace = true }
+# The suite about the DNS a node's guest resolves a name through creates the private hosted
+# zone and its records over Route 53's own front door.
+service-com-amazonaws-route53-awsdnsv20130401 = { workspace = true }
 
 [lints]
 workspace = true

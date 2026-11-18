@@ -53,6 +53,11 @@ mod query_log_destinations;
 mod resolver_rules;
 mod tags;
 mod vpc_configs;
+/// The DNS DATA PLANE a query asked from inside a VPC reaches: which addresses of the VPC
+/// answer one, what the security groups on them admit, and what the private hosted zones
+/// associated with the VPC answer. `pub` because the component that reaches into a VPC client
+/// takes the view and answers its queries out of it.
+pub mod vpc_dns;
 pub use domain_imports::*;
 pub use firewall_associations::*;
 pub use firewall_rules::*;
@@ -61,6 +66,7 @@ pub use query_log_destinations::*;
 pub use resolver_rules::*;
 pub use tags::*;
 pub use vpc_configs::*;
+pub use vpc_dns::*;
 
 /// The region an ARN carries when the request's SigV4 scope names none.
 pub const DEFAULT_REGION: &str = "us-east-1";

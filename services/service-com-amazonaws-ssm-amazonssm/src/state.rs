@@ -390,6 +390,10 @@ pub mod document_references;
 /// which is what an invocation's output and exit code come from.
 pub mod guest_execution;
 
+/// The RESOLVER CLIENTS a script delivered to a node's guest resolves a name with, answered by
+/// the DNS of the VPC that node is in.
+pub mod guest_resolver;
+
 /// Where this service's EC2-facing work lives: the registration half and the delivery half,
 /// and why they are separate.
 pub mod ec2_managed_nodes;

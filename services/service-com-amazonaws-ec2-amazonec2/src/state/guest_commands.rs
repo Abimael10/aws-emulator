@@ -34,7 +34,9 @@
 //! each of those answers `None` — "there was no guest to run this in" — rather than an
 //! outcome nothing produced.
 
-use ::service_common::posix_shell_session::{Bounds, OutputLimits, SessionConfig, ShellSession};
+use ::service_common::posix_shell_session::{
+    layered, Bounds, EnvironmentPrograms, OutputLimits, SessionConfig, ShellSession,
+};
 
 use super::guest_console::{guest_environment, guest_volume};
 use super::{ComAmazonawsEc2Amazonec2State, InstanceStateName};
@@ -83,6 +85,24 @@ impl ComAmazonawsEc2Amazonec2State {
         instance_id: &str,
         commands: &[String],
     ) -> Option<GuestRun> {
+        self.run_in_instance_guest_with(instance_id, commands, None)
+    }
+
+    /// [`Self::run_in_instance_guest`], with `supplied` as the programs the CALLER installs in
+    /// the guest beside the machine's own ([`super::guest_metadata::guest_programs`]).
+    ///
+    /// A guest has programs whose answers come from state this store cannot read — an agent's
+    /// resolver client, which answers out of the account's DNS — and the component that CAN
+    /// read that state is the one that reaches into the guest. So it hands those programs over
+    /// here rather than this store keeping a second notion of what they answer; the machine's
+    /// own programs are asked first, so nothing the caller supplies can shadow one of them
+    /// ([`::service_common::posix_shell_session::layered`]).
+    pub fn run_in_instance_guest_with(
+        &mut self,
+        instance_id: &str,
+        commands: &[String],
+        supplied: Option<Box<dyn EnvironmentPrograms>>,
+    ) -> Option<GuestRun> {
         let instance = self.instances.get(instance_id)?;
         if instance.state != InstanceStateName::Running {
             return None;
@@ -116,10 +136,14 @@ impl ComAmazonawsEc2Amazonec2State {
         // The programs this machine has installed in it, which an agent's command reads the
         // instance's own facts with ([`super::guest_metadata`]) and installs and starts its
         // services with ([`super::guest_services`]) — the same programs the boot's own
-        // program has.
-        .with_environment_programs(super::guest_services::installed_programs(
-            &machine, &services,
-        ));
+        // program has — and, under them, the ones the caller installed.
+        .with_environment_programs({
+            let own = super::guest_services::installed_programs(&machine, &services);
+            match supplied {
+                Some(supplied) => layered(own, supplied),
+                None => own,
+            }
+        });
         let mut status = 0;
         for command in commands {
             status = session.run(command);

@@ -20,6 +20,8 @@ use smithy_server_runtime::MultiServiceRouter;
 
 use service_com_amazonaws_ec2_amazonec2 as ec2;
 use service_com_amazonaws_iam_awsidentitymanagementv20100508 as iam;
+use service_com_amazonaws_route53_awsdnsv20130401 as route53;
+use service_com_amazonaws_route53resolver_route53resolver as route53resolver;
 use service_com_amazonaws_ssm_amazonssm as ssm;
 use service_com_amazonaws_sts_awssecuritytokenservicev20110615 as sts;
 
@@ -35,6 +37,13 @@ const IAM_API_VERSION: &str = "2010-05-08";
 /// The AWS STS API version an `awsQuery` body carries, for the suite that signs a call as a
 /// principal of its own rather than as the account's published credential.
 const STS_API_VERSION: &str = "2011-06-15";
+
+/// The path prefix every Route 53 request carries, which is that service's own API version.
+pub(crate) const ROUTE53_PREFIX: &str = "/2013-04-01";
+
+/// The `X-Amz-Target` prefix Route 53 Resolver's `awsJson1_1` wire carries, from that crate's
+/// `OPERATIONS.md` wire-protocol section.
+const RESOLVER_TARGET_PREFIX: &str = "Route53Resolver";
 
 /// The access key id every call of this harness presents unless a case names another: one
 /// neither STS nor IAM holds a record for, which resolves to the account's own identity.
@@ -93,6 +102,11 @@ impl Emulator {
         // request speaks for is resolved from the access key id it signed with, which is the
         // same place `sts:GetCallerIdentity` answers from.
         router.register_service(sts::EmulatedService::new(Arc::clone(&engine)));
+        // Route 53 and Route 53 Resolver, for the suite about the DNS a node's guest
+        // resolves a name through: the zones and the endpoints it is answered from are those
+        // services' own records, created over their own front doors.
+        router.register_service(route53::EmulatedService::new(Arc::clone(&engine)));
+        router.register_service(route53resolver::EmulatedService::new(Arc::clone(&engine)));
         Self { engine, router }
     }
 
@@ -149,6 +163,62 @@ impl Emulator {
             "case {case:?}: STS {action} must be served, got {status}: {body}"
         );
         body
+    }
+
+    /// One Route 53 call over that service's `restXml` wire, which must answer `expected`.
+    pub(crate) async fn route53(
+        &self,
+        case: &str,
+        method: &str,
+        path: &str,
+        body: &str,
+        expected: u16,
+    ) -> String {
+        let host = "route53.amazonaws.com";
+        let request = http::Request::builder()
+            .method(method)
+            .uri(format!("https://{host}{ROUTE53_PREFIX}{path}"))
+            .header("host", host)
+            .header("content-type", "application/xml")
+            .header("authorization", authorization("route53", REGION))
+            .body(Bytes::from(body.to_owned()))
+            .expect("a well-formed request");
+        let response = self.router.dispatch(request).await;
+        let status = response.status().as_u16();
+        let text = String::from_utf8_lossy(response.body()).to_string();
+        assert_eq!(
+            status, expected,
+            "case {case:?}: Route 53 {method} {path} expected HTTP {expected}, got {status}: \
+             {text}"
+        );
+        text
+    }
+
+    /// One Route 53 Resolver call over that service's `awsJson1_1` wire.
+    pub(crate) async fn resolver(&self, case: &str, operation: &str, body: &Value) -> Value {
+        let host = format!("route53resolver.{REGION}.amazonaws.com");
+        let request = http::Request::builder()
+            .method("POST")
+            .uri("/")
+            .header("host", host)
+            .header("content-type", "application/x-amz-json-1.1")
+            .header(
+                "x-amz-target",
+                format!("{RESOLVER_TARGET_PREFIX}.{operation}"),
+            )
+            .header("authorization", authorization("route53resolver", REGION))
+            .body(Bytes::from(
+                serde_json::to_vec(body).expect("serialize the request body"),
+            ))
+            .expect("a well-formed request");
+        let response = self.router.dispatch(request).await;
+        let status = response.status().as_u16();
+        let text = String::from_utf8_lossy(response.body()).to_string();
+        assert_eq!(
+            status, 200,
+            "case {case:?}: Route 53 Resolver {operation} must be served, got {status}: {text}"
+        );
+        serde_json::from_str(&text).unwrap_or(Value::Null)
     }
 
     /// The text of the first `<tag>` element of an XML answer — the id or ARN a setup call

@@ -295,6 +295,59 @@ pub trait EnvironmentPrograms: ::std::fmt::Debug + Send + Sync {
     }
 }
 
+/// The programs of TWO environments over one session, asked in order.
+///
+/// What an environment provides is not always held in one place: a machine has the programs
+/// its own owner installed in it, and a caller that reaches into that machine may supply the
+/// ones only IT can — a program whose answers come from state the machine's owner cannot read.
+/// This layers the two without either having to know the other's names: a command is asked of
+/// the FIRST catalog, and of the second only where the first provides no program of that name,
+/// so the machine's own program wins a name they both carry.
+#[derive(Debug)]
+pub struct LayeredPrograms {
+    /// Asked first: the environment whose own programs these are.
+    own: Box<dyn EnvironmentPrograms>,
+    /// Asked for a name the first provides nothing for.
+    supplied: Box<dyn EnvironmentPrograms>,
+}
+
+/// The two catalogs as one, `own` taking precedence ([`LayeredPrograms`]).
+#[must_use]
+pub fn layered(
+    own: Box<dyn EnvironmentPrograms>,
+    supplied: Box<dyn EnvironmentPrograms>,
+) -> Box<dyn EnvironmentPrograms> {
+    Box::new(LayeredPrograms { own, supplied })
+}
+
+impl EnvironmentPrograms for LayeredPrograms {
+    fn run(
+        &self,
+        name: &str,
+        arguments: &[String],
+        files: &mut dyn ProgramFiles,
+    ) -> Option<ProgramOutcome> {
+        self.own
+            .run(name, arguments, files)
+            .or_else(|| self.supplied.run(name, arguments, files))
+    }
+
+    fn run_with_input(
+        &self,
+        name: &str,
+        arguments: &[String],
+        standard_input: Option<&str>,
+        files: &mut dyn ProgramFiles,
+    ) -> Option<ProgramOutcome> {
+        self.own
+            .run_with_input(name, arguments, standard_input, files)
+            .or_else(|| {
+                self.supplied
+                    .run_with_input(name, arguments, standard_input, files)
+            })
+    }
+}
+
 /// The FILES of the tree a session works over, as the ENVIRONMENT's own programs reach them.
 ///
 /// It is the same tree the session's redirections write and its `cat` reads — a machine's

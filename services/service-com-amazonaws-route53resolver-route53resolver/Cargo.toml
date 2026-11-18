@@ -49,6 +49,13 @@ service-com-amazonaws-route53profiles-route53profiles = { workspace = true }
 # The ONE reading and minting of an AWS X-Ray trace id, which the refusals of the
 # per-VPC configuration operations close with.
 service-common = { path = "../common" }
+# The account's own Route 53 inventory: the DNS a query asked inside a VPC is answered from
+# is the PRIVATE HOSTED ZONES associated with that VPC, which are records of that service's
+# own store, read through its own accessors (`state::vpc_dns`).
+service-com-amazonaws-route53-awsdnsv20130401 = { workspace = true }
+# A VPC's own resolver answers at the base of the VPC's address range plus two, so that range
+# is read by the maintained network-address crate this workspace already carries.
+ipnet = "2"
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

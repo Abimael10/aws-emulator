@@ -2665,6 +2665,12 @@ pub use guest_metadata::*;
 pub mod guest_services;
 pub use guest_services::*;
 
+/// Whether the security groups on an interface ADMIT one arriving packet — the one decision
+/// every service whose resource is reached through an interface of this account asks of this
+/// crate. A SUBMODULE for the same reason [`image_usage_reports`] is one.
+pub mod security_group_admission;
+pub use security_group_admission::*;
+
 /// Which capacity resources each of Capacity Manager's metrics measures, and the DIMENSION
 /// VALUES each of those resources carries — the one reading every operation that answers
 /// along Capacity Manager's dimensions shares, so the report of the available dimensions and
