@@ -190,10 +190,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let Some(resolver) = state.global_resolvers.get(&input.global_resolver_id) else {
             return Err(GetGlobalResolverErrorModeled::ResourceNotFoundException(
-                crate::state::not_found(
-                    crate::state::GLOBAL_RESOLVER_RESOURCE,
-                    &input.global_resolver_id,
-                ),
+                crate::state::global_resolver_not_found(&input.global_resolver_id),
             )
             .into());
         };

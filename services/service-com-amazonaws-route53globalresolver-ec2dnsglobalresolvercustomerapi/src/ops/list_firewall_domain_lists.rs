@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListFirewallDomainLists
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListFirewallDomainLists`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListFirewallDomainLists::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -159,18 +150,85 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListFirewallDomainLists` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListFirewallDomainListsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListFirewallDomainLists"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListFirewallDomainListsErrorModeled::InternalServerException(
+                crate::state::state_unavailable(),
+            )
+            .into());
+        };
+
+        // `maxResults` is a plain `Integer` with no `@range`, so the page size is
+        // this service's rule to enforce: a page holds at least one item.
+        if let Some(max_results) = input.max_results {
+            if max_results < 1 {
+                return Err(ListFirewallDomainListsErrorModeled::ValidationException(
+                    crate::state::field_validation(
+                        "maxResults",
+                        format!("must be at least 1, got {max_results}"),
+                    ),
+                )
+                .into());
+            }
+        }
+
+        // `nextToken` is one of this service's own firewall domain list ids, for
+        // the same reason as in the service's other paginated lists.
+        if let Some(token) = input.next_token.as_deref() {
+            if !crate::state::is_page_token(crate::state::FIREWALL_DOMAIN_LIST_ID_PREFIX, token) {
+                return Err(ListFirewallDomainListsErrorModeled::ValidationException(
+                    crate::state::field_validation(
+                        "nextToken",
+                        "is not a token this service issued",
+                    ),
+                )
+                .into());
+            }
+        }
+
+        let mut state = state.lock();
+        state.settle(::std::time::SystemTime::now());
+
+        // `globalResolverId` is optional here: present, it scopes the page to that
+        // resolver's lists, and an id the store does not hold is the modelled 404;
+        // absent, every list this store holds is in scope.
+        if let Some(resolver_id) = input.global_resolver_id.as_deref() {
+            if !state.global_resolvers.contains_key(resolver_id) {
+                return Err(
+                    ListFirewallDomainListsErrorModeled::ResourceNotFoundException(
+                        crate::state::global_resolver_not_found(resolver_id),
+                    )
+                    .into(),
+                );
+            }
+        }
+
+        let (page, next_token) = crate::state::page(
+            state.firewall_domain_lists.iter().filter(|(_, list)| {
+                input
+                    .global_resolver_id
+                    .as_deref()
+                    .is_none_or(|resolver_id| list.global_resolver_id == resolver_id)
+            }),
+            input.next_token.as_deref(),
+            input.max_results,
+        );
+
+        Ok(ListFirewallDomainListsOutput {
+            next_token,
+            firewall_domain_lists: page
+                .into_iter()
+                .map(|list| FirewallDomainListsItem {
+                    id: list.id.clone(),
+                    arn: list.arn.clone(),
+                    global_resolver_id: list.global_resolver_id.clone(),
+                    name: list.name.clone(),
+                    description: list.description.clone(),
+                    created_at: ::aws_smithy_types::DateTime::from(list.created_at),
+                    updated_at: ::aws_smithy_types::DateTime::from(list.updated_at),
+                    status: list.status.as_wire().to_string(),
+                })
+                .collect(),
+        })
     }
 }

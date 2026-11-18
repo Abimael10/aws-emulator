@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateFirewallDomainList
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateFirewallDomainList`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateFirewallDomainList::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -185,18 +176,125 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateFirewallDomainList` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateFirewallDomainListErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateFirewallDomainList"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateFirewallDomainListErrorModeled::InternalServerException(
+                crate::state::state_unavailable(),
+            )
+            .into());
+        };
+
+        let region = crate::state::request_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
+        let mut state = state.lock();
+        state.settle(now);
+
+        // A domain list only exists under a resolver, so an unknown parent is a
+        // 404 — and it is answered BEFORE the idempotency record is consulted or
+        // written, so a refused create persists nothing for a later call carrying
+        // the same `clientToken` to be answered from.
+        if !state.global_resolvers.contains_key(&input.global_resolver_id) {
+            return Err(
+                CreateFirewallDomainListErrorModeled::ResourceNotFoundException(
+                    crate::state::global_resolver_not_found(&input.global_resolver_id),
+                )
+                .into(),
+            );
+        }
+
+        // The `@idempotent` replay: the same `clientToken` answers with the domain
+        // list it already minted, and only when this request asks for the same list
+        // under the same parent — a token reused with different parameters is a
+        // conflict.
+        if let Some(token) = input.client_token.as_deref() {
+            let minted = state.firewall_domain_list_idempotency.get(token).cloned();
+            if let Some(list) = minted.and_then(|id| state.firewall_domain_lists.get(&id)) {
+                if list.matches_create(&input) {
+                    return Ok(output(list));
+                }
+                return Err(CreateFirewallDomainListErrorModeled::ConflictException(
+                    crate::state::idempotency_conflict(
+                        crate::state::FIREWALL_DOMAIN_LIST_RESOURCE,
+                        &list.id,
+                    ),
+                )
+                .into());
+            }
+        }
+
+        // Not a replay, so this request would add a list: refuse it when the parent
+        // is already at its ceiling, rather than growing without limit.
+        let lists_held = state
+            .firewall_domain_lists
+            .values()
+            .filter(|list| list.global_resolver_id == input.global_resolver_id)
+            .count();
+        if lists_held >= crate::state::MAX_FIREWALL_DOMAIN_LISTS_PER_RESOLVER {
+            return Err(
+                CreateFirewallDomainListErrorModeled::ServiceQuotaExceededException(
+                    crate::state::quota_exceeded(
+                        crate::state::FIREWALL_DOMAIN_LIST_RESOURCE,
+                        Some(&input.global_resolver_id),
+                        crate::state::MAX_FIREWALL_DOMAIN_LISTS_PER_RESOLVER,
+                    ),
+                )
+                .into(),
+            );
+        }
+
+        let sequence = state.next_sequence();
+        let id = crate::state::firewall_domain_list_id(sequence);
+        let client_token = input
+            .client_token
+            .unwrap_or_else(|| crate::state::minted_client_token(sequence));
+        let list = crate::state::FirewallDomainList {
+            arn: crate::state::resource_arn(
+                &region,
+                crate::state::FIREWALL_DOMAIN_LIST_RESOURCE,
+                &id,
+            ),
+            id: id.clone(),
+            global_resolver_id: input.global_resolver_id.clone(),
+            name: input.name,
+            description: input.description,
+            client_token: client_token.clone(),
+            // A list is being provisioned, not ready: it reports CREATING until the
+            // clock owes it OPERATIONAL.
+            status: crate::state::CrResourceStatus::Creating,
+            created_at: now,
+            updated_at: now,
+            operational_at: now + crate::state::PROVISIONING_DELAY,
+            // A new list holds no domains; `domainCount` follows from the set.
+            domains: ::std::collections::BTreeSet::new(),
+            tags: input.tags.unwrap_or_default().into_iter().collect(),
+        };
+
+        state
+            .firewall_domain_list_idempotency
+            .insert(client_token, id.clone());
+        state.firewall_domain_lists.insert(id.clone(), list);
+        // Read the stored record back, so the response is the state rather than the
+        // value that went into it.
+        let stored = state.firewall_domain_lists.get(&id).ok_or_else(|| {
+            CreateFirewallDomainListErrorModeled::InternalServerException(
+                crate::state::state_unavailable(),
+            )
+        })?;
+        Ok(output(stored))
+    }
+}
+
+/// This operation's output for a stored domain list — every member read off the
+/// record, so a create answers exactly what the following list answers.
+fn output(list: &crate::state::FirewallDomainList) -> CreateFirewallDomainListOutput {
+    CreateFirewallDomainListOutput {
+        id: list.id.clone(),
+        arn: list.arn.clone(),
+        global_resolver_id: list.global_resolver_id.clone(),
+        name: list.name.clone(),
+        description: list.description.clone(),
+        domain_count: list.domain_count(),
+        created_at: ::aws_smithy_types::DateTime::from(list.created_at),
+        updated_at: ::aws_smithy_types::DateTime::from(list.updated_at),
+        status: list.status.as_wire().to_string(),
     }
 }

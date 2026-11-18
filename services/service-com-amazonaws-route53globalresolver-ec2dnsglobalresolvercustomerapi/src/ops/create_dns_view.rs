@@ -248,10 +248,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A view only exists under a resolver, so an unknown parent is a 404.
         if !state.global_resolvers.contains_key(&input.global_resolver_id) {
             return Err(CreateDNSViewErrorModeled::ResourceNotFoundException(
-                crate::state::not_found(
-                    crate::state::GLOBAL_RESOLVER_RESOURCE,
-                    &input.global_resolver_id,
-                ),
+                crate::state::global_resolver_not_found(&input.global_resolver_id),
             )
             .into());
         }

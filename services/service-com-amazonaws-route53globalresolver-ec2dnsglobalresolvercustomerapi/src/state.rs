@@ -2,8 +2,9 @@
 
 //! Engine state for the com-amazonaws-route53globalresolver-ec2dnsglobalresolvercustomerapi service.
 //!
-//! The records here are the ONLY place a Route 53 Global Resolver or a DNS View
-//! exists: every handler in `src/ops/` mints into this store or reads out of it, so
+//! The records here are the ONLY place a Route 53 Global Resolver, a DNS View or
+//! a DNS Firewall domain list exists: every handler in `src/ops/` mints into this
+//! store or reads out of it, so
 //! a create is observable by the next get/list and a delete by the next reader.
 //!
 //! Two things this slice deliberately does NOT emulate, so a reader does not
@@ -13,14 +14,14 @@
 //! likewise). The emulator verifies request signatures in the framework, before any
 //! handler runs.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::net::{Ipv4Addr, Ipv6Addr};
 use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
-    ConflictException, CreateDNSViewInput, CreateGlobalResolverInput, InternalServerException,
-    ResourceNotFoundException, ServiceQuotaExceededException, ValidationException,
-    ValidationExceptionField,
+    ConflictException, CreateDNSViewInput, CreateFirewallDomainListInput, CreateGlobalResolverInput,
+    InternalServerException, ResourceNotFoundException, ServiceQuotaExceededException,
+    ValidationException, ValidationExceptionField,
 };
 
 /// The Region an ARN carries when the request is unsigned, so no SigV4 credential
@@ -39,6 +40,9 @@ pub const GLOBAL_RESOLVER_RESOURCE: &str = "global-resolver";
 /// The ARN resource prefix of a DNS View.
 pub const DNS_VIEW_RESOURCE: &str = "dns-view";
 
+/// The ARN resource prefix of a DNS Firewall domain list.
+pub const FIREWALL_DOMAIN_LIST_RESOURCE: &str = "firewall-domain-list";
+
 /// The leading characters of every Global Resolver id this service mints, and so
 /// of every `ListGlobalResolvers` page token.
 pub const RESOLVER_ID_PREFIX: &str = "gr-";
@@ -46,6 +50,10 @@ pub const RESOLVER_ID_PREFIX: &str = "gr-";
 /// The leading characters of every DNS View id this service mints, and so of
 /// every `ListDNSViews` page token.
 pub const DNS_VIEW_ID_PREFIX: &str = "dnsv-";
+
+/// The leading characters of every firewall domain list id this service mints,
+/// and so of every `ListFirewallDomainLists` page token.
+pub const FIREWALL_DOMAIN_LIST_ID_PREFIX: &str = "fdl-";
 
 /// How long a freshly minted resource stays in its non-terminal `CREATING` status
 /// before the clock owes it the terminal one (`OPERATIONAL`).
@@ -90,6 +98,10 @@ pub const MAX_GLOBAL_RESOLVERS: usize = 100;
 /// The most DNS Views one Global Resolver holds at once, for the same reason and
 /// with the same refusal.
 pub const MAX_DNS_VIEWS_PER_RESOLVER: usize = 100;
+
+/// The most firewall domain lists one Global Resolver holds at once, for the same
+/// reason and with the same refusal.
+pub const MAX_FIREWALL_DOMAIN_LISTS_PER_RESOLVER: usize = 100;
 
 /// The most Regions one `CreateGlobalResolver` request may name, so a single
 /// record cannot be grown without limit either. AWS has well under this many
@@ -351,6 +363,63 @@ impl DnsView {
     }
 }
 
+/// A DNS Firewall domain list under a Global Resolver, as this emulator holds it.
+#[derive(Debug, Clone)]
+pub struct FirewallDomainList {
+    /// `id`.
+    pub id: String,
+    /// `arn`.
+    pub arn: String,
+    /// `globalResolverId` — the parent resolver.
+    pub global_resolver_id: String,
+    /// `name`.
+    pub name: String,
+    /// `description`.
+    pub description: Option<String>,
+    /// `clientToken` — the caller's, or the one this service minted for it.
+    pub client_token: String,
+    /// `status`.
+    pub status: CrResourceStatus,
+    /// `createdAt`.
+    pub created_at: SystemTime,
+    /// `updatedAt`.
+    pub updated_at: SystemTime,
+    /// When the clock owes this list its terminal status.
+    pub operational_at: SystemTime,
+    /// The domain specifications this list holds, deduplicated and ordered;
+    /// `domainCount` is their number. A list is created empty — the operations
+    /// that add domains to one are scaffolds still.
+    pub domains: BTreeSet<String>,
+    /// The tags the create request carried.
+    pub tags: BTreeMap<String, String>,
+}
+
+impl FirewallDomainList {
+    /// The firewall domain list counterpart of [`GlobalResolver::settle`].
+    fn settle(&mut self, now: SystemTime) {
+        if self.status == CrResourceStatus::Creating && now >= self.operational_at {
+            self.status = CrResourceStatus::Operational;
+            self.updated_at = self.operational_at;
+        }
+    }
+
+    /// `domainCount` — the number of domains this list holds, as the wire carries
+    /// it.
+    pub fn domain_count(&self) -> i32 {
+        i32::try_from(self.domains.len()).unwrap_or(i32::MAX)
+    }
+
+    /// The firewall domain list counterpart of [`GlobalResolver::matches_create`],
+    /// including the parent resolver: a token reused under a different resolver is
+    /// a mismatch, not a replay.
+    pub fn matches_create(&self, input: &CreateFirewallDomainListInput) -> bool {
+        self.global_resolver_id == input.global_resolver_id
+            && self.name == input.name
+            && self.description == input.description
+            && self.tags == tags_of(input.tags.as_ref())
+    }
+}
+
 /// A create request's `tags` as a record holds them: ordered, and empty when the
 /// member is absent.
 fn tags_of(tags: Option<&HashMap<String, String>>) -> BTreeMap<String, String> {
@@ -370,6 +439,8 @@ pub struct ComAmazonawsRoute53globalresolverEc2dnsglobalresolvercustomerapiState
     pub global_resolvers: BTreeMap<String, GlobalResolver>,
     /// Every DNS View, keyed by id, for the same reason.
     pub dns_views: BTreeMap<String, DnsView>,
+    /// Every firewall domain list, keyed by id, for the same reason.
+    pub firewall_domain_lists: BTreeMap<String, FirewallDomainList>,
     /// `clientToken` -> resolver id, so an `@idempotent` create replayed with the
     /// same token answers with the resolver it already minted.
     pub resolver_idempotency: HashMap<String, String>,
@@ -378,6 +449,9 @@ pub struct ComAmazonawsRoute53globalresolverEc2dnsglobalresolvercustomerapiState
     /// token reused across both must not make a `CreateDNSView` answer with a
     /// resolver.
     pub dns_view_idempotency: HashMap<String, String>,
+    /// `clientToken` -> firewall domain list id, for the same reason and kept
+    /// separate for the same one.
+    pub firewall_domain_list_idempotency: HashMap<String, String>,
     /// Source of the per-resource sequence number behind every minted id, client
     /// token and anycast address. Monotonic, so no two resources in one store ever
     /// share an id or a client token. The anycast addresses are drawn from a fixed
@@ -394,6 +468,9 @@ impl ComAmazonawsRoute53globalresolverEc2dnsglobalresolvercustomerapiState {
         }
         for view in self.dns_views.values_mut() {
             view.settle(now);
+        }
+        for list in self.firewall_domain_lists.values_mut() {
+            list.settle(now);
         }
     }
 
@@ -415,6 +492,12 @@ pub fn resolver_id(sequence: u64) -> String {
 /// A DNS View id for sequence number `sequence`, under the same constraint.
 pub fn dns_view_id(sequence: u64) -> String {
     format!("{DNS_VIEW_ID_PREFIX}{sequence:012x}")
+}
+
+/// A firewall domain list id for sequence number `sequence`, under the same
+/// constraint.
+pub fn firewall_domain_list_id(sequence: u64) -> String {
+    format!("{FIREWALL_DOMAIN_LIST_ID_PREFIX}{sequence:012x}")
 }
 
 /// Whether `token` is a page cursor this service could have issued for ids
@@ -550,6 +633,20 @@ pub fn not_found(resource_type: &str, id: &str) -> ResourceNotFoundException {
         message: format!("{resource_type} {id} was not found"),
         resource_id: Some(id.to_string()),
         resource_type: resource_type.to_string(),
+    }
+}
+
+/// The modelled 404 for a Global Resolver id that names nothing in the store.
+///
+/// Route 53 Global Resolver words this one itself: its own error code for a
+/// Global Resolver that does not exist, then the id the request named. Every
+/// handler that resolves a `globalResolverId` answers with it, so one error class
+/// has one wording whichever operation reports it.
+pub fn global_resolver_not_found(id: &str) -> ResourceNotFoundException {
+    ResourceNotFoundException {
+        message: format!("[GR-ERR00309] No GlobalResolver found with the ID: {id}"),
+        resource_id: Some(id.to_string()),
+        resource_type: GLOBAL_RESOLVER_RESOURCE.to_string(),
     }
 }
 

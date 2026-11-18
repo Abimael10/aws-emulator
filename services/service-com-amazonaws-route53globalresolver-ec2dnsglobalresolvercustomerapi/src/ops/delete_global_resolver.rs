@@ -198,10 +198,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // 404: the resolver is gone from the store after the first call.
         let Some(mut resolver) = state.global_resolvers.remove(&input.global_resolver_id) else {
             return Err(DeleteGlobalResolverErrorModeled::ResourceNotFoundException(
-                crate::state::not_found(
-                    crate::state::GLOBAL_RESOLVER_RESOURCE,
-                    &input.global_resolver_id,
-                ),
+                crate::state::global_resolver_not_found(&input.global_resolver_id),
             )
             .into());
         };
@@ -210,13 +207,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // later reader sees a view whose parent is gone. The parent's own
         // `dns_view_ids` is the one source of that parentage — every
         // `CreateDNSView` appends to it — so the sweep needs no scan of the view
-        // map. The sentence also names access sources, tokens and firewall rules:
-        // none of those can exist yet, because every operation that creates one is
-        // still a 501, and their cascade belongs here when they are implemented.
+        // map. The firewall domain lists under this resolver go the same way: they
+        // carry their parentage on the record itself, so that sweep is a filter
+        // over them. The sentence also names access sources, tokens and firewall
+        // rules: none of those can exist yet, because every operation that creates
+        // one is still a 501, and their cascade belongs here when they are
+        // implemented.
         let orphaned: ::std::collections::BTreeSet<String> =
             resolver.dns_view_ids.iter().cloned().collect();
         for view_id in &orphaned {
             state.dns_views.remove(view_id);
+        }
+        let orphaned_lists: ::std::collections::BTreeSet<String> = state
+            .firewall_domain_lists
+            .iter()
+            .filter(|(_, list)| list.global_resolver_id == resolver.id)
+            .map(|(id, _)| id.clone())
+            .collect();
+        for list_id in &orphaned_lists {
+            state.firewall_domain_lists.remove(list_id);
         }
         // The idempotency records of the resources that are gone go too, so a
         // replayed create mints a new resource rather than naming a dead one, and
@@ -224,6 +233,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         state
             .dns_view_idempotency
             .retain(|_, view_id| !orphaned.contains(view_id));
+        state
+            .firewall_domain_list_idempotency
+            .retain(|_, list_id| !orphaned_lists.contains(list_id));
         state
             .resolver_idempotency
             .retain(|_, id| id != &resolver.id);

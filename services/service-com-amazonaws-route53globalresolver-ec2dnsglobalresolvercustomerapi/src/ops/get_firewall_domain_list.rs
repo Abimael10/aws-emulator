@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetFirewallDomainList
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetFirewallDomainList`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetFirewallDomainList::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -172,18 +163,45 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetFirewallDomainList` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetFirewallDomainListErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetFirewallDomainList"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(GetFirewallDomainListErrorModeled::InternalServerException(
+                crate::state::state_unavailable(),
+            )
+            .into());
+        };
+
+        let mut state = state.lock();
+        state.settle(::std::time::SystemTime::now());
+
+        let Some(list) = state
+            .firewall_domain_lists
+            .get(&input.firewall_domain_list_id)
+        else {
+            return Err(GetFirewallDomainListErrorModeled::ResourceNotFoundException(
+                crate::state::not_found(
+                    crate::state::FIREWALL_DOMAIN_LIST_RESOURCE,
+                    &input.firewall_domain_list_id,
+                ),
+            )
+            .into());
+        };
+
+        Ok(GetFirewallDomainListOutput {
+            id: list.id.clone(),
+            arn: list.arn.clone(),
+            global_resolver_id: list.global_resolver_id.clone(),
+            client_token: Some(list.client_token.clone()),
+            name: list.name.clone(),
+            description: list.description.clone(),
+            domain_count: list.domain_count(),
+            created_at: ::aws_smithy_types::DateTime::from(list.created_at),
+            updated_at: ::aws_smithy_types::DateTime::from(list.updated_at),
+            status: list.status.as_wire().to_string(),
+            // `statusMessage` carries what the service has to say about a status it
+            // is explaining; this store holds no such note for a list, so the
+            // member is absent rather than invented.
+            status_message: None,
+        })
     }
 }
