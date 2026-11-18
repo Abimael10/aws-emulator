@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetUploadJobPath
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetUploadJobPath`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetUploadJobPath::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the address the file of a stored upload job is written to, and the data key that
+//! write is authorized with, from the job the service holds — so the address names a job
+//! this emulator has, and the key is the one that job was created with.
 //!
 //! ## Shape of an operation
 //!
@@ -157,18 +151,81 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetUploadJobPath` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetUploadJobPathErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetUploadJobPath"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(unavailable)?;
+
+        // A read: the data key is reported as the job stores it (`CreateUploadJob` minted
+        // it with the job, because the uploaded file is encrypted under it), and the
+        // address is derived from that same record. The lock is released before the URL is
+        // signed, so nothing else waits on this store while it is.
+        let (client_token, path) = {
+            let store = state.lock();
+            let domain = store.domains.get(&input.domain_name).ok_or_else(|| {
+                not_found(crate::state::upload_job_domain_not_found(
+                    &input.domain_name,
+                ))
+            })?;
+            let job = domain.upload_jobs.get(&input.job_id).ok_or_else(|| {
+                not_found(crate::state::upload_job_not_found(
+                    &input.job_id,
+                    &input.domain_name,
+                ))
+            })?;
+            (
+                job.client_token.clone(),
+                crate::state::upload_path(&domain.name, &job.job_id),
+            )
+        };
+
+        // "The pre-signed S3 URL for uploading the CSV file associated with the upload
+        // job" (`Url`): a PRESIGNED PUT target — a URL carrying its own authorisation in
+        // the query, which is why it is followed with no `Authorization` header — so it is
+        // signed through the framework's signer, which signs for the base URL THIS
+        // emulator is reached on and for this service's own signing name. That is what
+        // makes the published address one this emulator answers (`crate::service` serves
+        // it); a target on a host only AWS serves would send the caller's file off this
+        // machine.
+        let signed = ctx
+            .url_signer()
+            .sign(
+                ::smithy_server_runtime::SignedUrlRequest::new(
+                    ::smithy_server_runtime::http::Method::PUT,
+                    ctx.identity().signing_name(),
+                    &path,
+                ),
+                crate::state::UPLOAD_TARGET_VALIDITY,
+            )
+            .map_err(|_| unsignable())?;
+
+        Ok(GetUploadJobPathOutput {
+            url: signed.as_str().to_string(),
+            client_token: Some(client_token),
+            // "The expiry timestamp for the pre-signed URL, after which the URL will no
+            // longer be valid": the instant the signature this call minted stops
+            // verifying, taken from the signer rather than computed a second time.
+            valid_until: Some(crate::state::to_date_time(signed.expires_at())),
+        })
     }
+}
+
+/// A domain or upload job the request names is not stored.
+fn not_found(message: String) -> GetUploadJobPathError {
+    GetUploadJobPathErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(message),
+    })
+    .into()
+}
+
+/// The store is unreachable — a server fault, not a bad request.
+fn unavailable() -> GetUploadJobPathError {
+    GetUploadJobPathErrorModeled::InternalServerException(crate::state::store_unavailable()).into()
+}
+
+/// The address could not be signed, so there is no target to report — a server fault: the
+/// path is built from labels the model has already constrained, so nothing a caller sends
+/// reaches this.
+fn unsignable() -> GetUploadJobPathError {
+    GetUploadJobPathErrorModeled::InternalServerException(InternalServerException {
+        message: Some("The upload path for this job could not be signed".to_string()),
+    })
+    .into()
 }

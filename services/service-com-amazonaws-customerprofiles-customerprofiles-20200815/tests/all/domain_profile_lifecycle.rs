@@ -159,6 +159,48 @@ impl Emulator {
         .await
     }
 
+    /// `GetUploadJobPath`: `GET /domains/{DomainName}/upload-jobs/{JobId}/path`.
+    pub(crate) async fn get_upload_job_path(&self, domain: &str, job_id: &str) -> (u16, Value) {
+        self.send(
+            "GET",
+            &format!("/domains/{domain}/upload-jobs/{job_id}/path"),
+            None,
+        )
+        .await
+    }
+
+    /// A request built by hand: the whole `uri` a response handed back, the headers it
+    /// carries and a raw body.
+    ///
+    /// The upload target `GetUploadJobPath` publishes is followed with this: it is
+    /// addressed by the URL that response carried (signature and all), carries no
+    /// `Authorization` header — a presigned URL carries its authorisation in the query —
+    /// and its body is bytes rather than a JSON document.
+    pub(crate) async fn send_raw(
+        &self,
+        method: &str,
+        uri: &str,
+        headers: &[(&str, &str)],
+        body: Vec<u8>,
+    ) -> (u16, Value) {
+        let mut request = http::Request::builder().method(method).uri(uri);
+        for (name, value) in headers {
+            request = request.header(*name, *value);
+        }
+        let request = request
+            .body(bytes::Bytes::from(body))
+            .expect("build request");
+        let response = self.router.dispatch(request).await;
+        let status = response.status().as_u16();
+        let body = response.body();
+        let value = if body.is_empty() {
+            Value::Null
+        } else {
+            serde_json::from_slice(body).unwrap_or(Value::Null)
+        };
+        (status, value)
+    }
+
     /// `SearchProfiles` for one key, with optional query parameters.
     pub(crate) async fn search(&self, domain: &str, body: Value, query: &str) -> (u16, Value) {
         self.post(&format!("/domains/{domain}/profiles/search{query}"), body)

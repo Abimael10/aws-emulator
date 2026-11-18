@@ -31,6 +31,17 @@ pub mod tagged_resources;
 /// profile, written by the operations that take those actions.
 pub mod profile_history;
 
+/// The upload target of an upload job: the address and data key `GetUploadJobPath` reports,
+/// and the file a write to that address leaves on the job.
+pub mod upload_job_file;
+
+pub use upload_job_file::{
+    data_key_md5, parse_upload_path, upload_path, write_is_authorized, UploadTarget,
+    CUSTOMER_ALGORITHM_HEADER, CUSTOMER_KEY_HEADER, CUSTOMER_KEY_MD5_HEADER,
+    MAX_STORED_UPLOAD_FILE_BYTES, MAX_UPLOAD_FILE_BYTES, UPLOAD_ENCRYPTION_ALGORITHM,
+    UPLOAD_TARGET_VALIDITY,
+};
+
 /// The segment definitions a domain holds, and the sentences the operations addressing
 /// one word their refusals with.
 pub mod segment_definitions;
@@ -560,6 +571,15 @@ pub struct StoredUploadJob {
     /// gets the structure — and it is its three counters that stay unset until the job
     /// has processed records.
     pub results_summary: ResultsSummary,
+    /// `ClientToken`, as minted with the job: "the plaintext data key used to encrypt the
+    /// upload file", which `GetUploadJobPath` reports and a write to the job's upload
+    /// target presents ([`upload_job_file`]). Minted once, with the job, because the file
+    /// is encrypted under it.
+    pub client_token: String,
+    /// The file written to the job's upload target, or `None` for a job nothing has been
+    /// uploaded for yet — which is every job until a caller performs the write
+    /// `GetUploadJobPath`'s address and token document.
+    pub uploaded_file: Option<Vec<u8>>,
 }
 
 impl StoredUploadJob {
@@ -586,6 +606,12 @@ impl StoredUploadJob {
             // Nothing has been processed yet, so the summary is present with none of
             // its three counters populated.
             results_summary: ResultsSummary::default(),
+            // The data key the job's upload file is encrypted under, minted here so every
+            // read of the job's upload path reports the same one and a file written under
+            // it stays readable.
+            client_token: upload_job_file::new_data_key(),
+            // Nothing has been uploaded for a job that was just created.
+            uploaded_file: None,
         }
     }
 }
@@ -2310,6 +2336,15 @@ pub fn profile_collection_domain_not_found(domain_name: &str) -> String {
 /// reads the same whichever of them was called.
 pub fn upload_job_domain_not_found(domain_name: &str) -> String {
     format!("Domain with name {domain_name} could not be found")
+}
+
+/// The `ResourceNotFoundException` message for an upload job the domain the request
+/// addressed does not hold: the resource kind, the `JobId` the request's URI label carried
+/// and the domain it was looked for in — the two variable parts of the sentence. Shared by
+/// every operation addressing one upload job, so the same absent id reads the same
+/// whichever of them was called.
+pub fn upload_job_not_found(job_id: &str, domain_name: &str) -> String {
+    format!("The upload job {job_id} does not exist in domain {domain_name}")
 }
 
 /// The `ResourceNotFoundException` message for a profile a domain does not hold, as the

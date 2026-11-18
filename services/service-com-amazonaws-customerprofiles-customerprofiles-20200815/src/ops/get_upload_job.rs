@@ -174,9 +174,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             not_found(crate::state::upload_job_domain_not_found(&input.domain_name))
         })?;
         let job = domain.upload_jobs.get(&input.job_id).ok_or_else(|| {
-            not_found(format!(
-                "The upload job {} does not exist in domain {}",
-                input.job_id, input.domain_name
+            not_found(crate::state::upload_job_not_found(
+                &input.job_id,
+                &input.domain_name,
             ))
         })?;
 

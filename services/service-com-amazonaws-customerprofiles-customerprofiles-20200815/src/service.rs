@@ -42,11 +42,25 @@
 //! table, and the default error renderers — lives in the generated `ServiceDefinition`
 //! and is reached, not edited, through the one `definition` method below. You
 //! do not write it; editing the entry would let this file drift from the model.
+//!
+//! ## The upload-job file plane
+//!
+//! `GetUploadJobPath` reports the address an upload job's file is written to
+//! ([`crate::state::upload_path`]), PRESIGNED against the base URL this emulator is reached
+//! on. The model binds no operation to that path, so a request following the published
+//! address is exactly the case [`Service::override_routing_error`] answers, and that is
+//! where the write is served: one `PUT`, carrying the three headers the operation documents
+//! (the job's `ClientToken` and its digest, under `AES256`), stores the bytes on the job
+//! they were written for. Nothing else about the service is reachable through it, and the
+//! bytes it keeps are bounded per file and across the store
+//! ([`crate::state::MAX_UPLOAD_FILE_BYTES`], [`crate::state::MAX_STORED_UPLOAD_FILE_BYTES`]).
 
 pub mod modelled_refusal;
 pub mod unreadable_values;
 pub mod wire;
 
+use aws_smithy_runtime_api::http::{Request as RtRequest, Response as RtResponse, StatusCode};
+use aws_smithy_types::body::SdkBody;
 use smithy_server_runtime::{
     http, ErasedOperation, OperationRoutingTable, Refusal, Refused, Service,
 };
@@ -71,6 +85,13 @@ pub struct EmulatedService<Eng: Send + Sync + 'static> {
     /// for a refusal that words none ([`wire`]). Built once, here, because
     /// `override_protocol` hands back a borrow of it.
     wire_protocol: wire::MessageReportedRestJson,
+    /// The SAME shared engine the generated entry threads into every operation.
+    ///
+    /// Held here because the upload-job file plane is served from
+    /// [`Service::override_routing_error`], which is not an operation with a `self.engine`
+    /// of its own, and it must write to the one store `CreateUploadJob` and
+    /// `GetUploadJobPath` read.
+    engine: Arc<Eng>,
 }
 
 impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
@@ -80,11 +101,122 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     pub fn new(engine: Arc<Eng>) -> Self {
         let refused_as_modelled = modelled_refusal::table(&engine);
         Self {
-            entry: crate::ServiceDefinition::new(engine),
+            entry: crate::ServiceDefinition::new(Arc::clone(&engine)),
             refused_as_modelled,
             wire_protocol: wire::MessageReportedRestJson::new(),
+            engine,
         }
     }
+
+    /// Serve one request to the upload target of an upload job — the address
+    /// `GetUploadJobPath` published for that job's file.
+    ///
+    /// A `PUT` carrying the three headers that operation documents stores the body as the
+    /// job's file, which is the only thing this plane touches. Everything else is refused:
+    /// another method, a target naming a job this store does not hold, a request that does
+    /// not present the job's own data key, a body this process cannot read, and a write
+    /// larger than this emulator keeps for one file or across the store — each before
+    /// anything is stored, so a 200 from here always means the bytes were kept.
+    fn serve_upload_job_file(
+        &self,
+        req: &RtRequest,
+        target: &crate::state::UploadTarget,
+    ) -> RtResponse {
+        if req.method() != "PUT" {
+            return plane_error(405, "MethodNotAllowed", UPLOAD_METHOD_MESSAGE);
+        }
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return plane_error(500, "InternalServerException", UPLOAD_STORE_MESSAGE);
+        };
+        // The body is what this plane STORES, so a request whose body this process cannot
+        // read is refused rather than stored as an empty file: answering 200 to a write
+        // that kept nothing would tell the caller its file had landed.
+        let Some(body) = req.body().bytes() else {
+            return plane_error(400, "IncompleteBody", UPLOAD_UNREADABLE_MESSAGE);
+        };
+        if body.len() > crate::state::MAX_UPLOAD_FILE_BYTES {
+            return plane_error(413, "EntityTooLarge", UPLOAD_TOO_LARGE_MESSAGE);
+        }
+        let algorithm = req.headers().get(crate::state::CUSTOMER_ALGORITHM_HEADER);
+        let presented_key = req.headers().get(crate::state::CUSTOMER_KEY_HEADER);
+        let presented_key_md5 = req.headers().get(crate::state::CUSTOMER_KEY_MD5_HEADER);
+        let mut store = state.lock();
+        // What the whole store already holds apart from the slot this write replaces, so a
+        // re-written file is not counted twice against the total.
+        let held = store.stored_upload_file_bytes_apart_from(target);
+        let Some(job) = store.upload_job_mut(target) else {
+            return plane_error(404, "NoSuchKey", UPLOAD_NOT_FOUND_MESSAGE);
+        };
+        if !crate::state::write_is_authorized(
+            algorithm,
+            presented_key,
+            presented_key_md5,
+            &job.client_token,
+        ) {
+            return plane_error(403, "AccessDenied", UPLOAD_UNAUTHORIZED_MESSAGE);
+        }
+        if held.saturating_add(body.len()) > crate::state::MAX_STORED_UPLOAD_FILE_BYTES {
+            return plane_error(413, "EntityTooLarge", UPLOAD_STORE_FULL_MESSAGE);
+        }
+        // A target is written by ONE caller and may be re-written until the job is
+        // started, exactly as an object store's key is: the last write is the job's file.
+        job.uploaded_file = Some(body.to_vec());
+
+        let mut resp = RtResponse::new(
+            StatusCode::try_from(200_u16).expect("200 is a valid status"),
+            SdkBody::empty(),
+        );
+        resp.headers_mut().insert("content-length", "0");
+        resp
+    }
+}
+
+/// The body of an upload-plane refusal of a method other than the one write a target takes.
+const UPLOAD_METHOD_MESSAGE: &str = "This upload target is written by a single PUT";
+
+/// The body of an upload-plane answer when this service's store is unreachable.
+const UPLOAD_STORE_MESSAGE: &str = "the Customer Profiles upload-job store is unavailable";
+
+/// The body of an upload-plane refusal of a request whose body this process cannot read,
+/// and so cannot store.
+const UPLOAD_UNREADABLE_MESSAGE: &str = "The upload's body could not be read";
+
+/// The body of an upload-plane refusal of a target naming no stored upload job.
+const UPLOAD_NOT_FOUND_MESSAGE: &str = "The upload target does not exist";
+
+/// The body of an upload-plane refusal of a write that does not present the job's own data
+/// key in the headers `GetUploadJobPath` documents. It names the headers, never the key.
+const UPLOAD_UNAUTHORIZED_MESSAGE: &str = "A write to this upload target must carry the \
+     upload job's client token and its MD5 digest in the server-side-encryption customer-key \
+     headers";
+
+/// The body of an upload-plane refusal of a file larger than this emulator keeps for one
+/// upload job.
+const UPLOAD_TOO_LARGE_MESSAGE: &str = "The upload is larger than this emulator keeps for \
+     one upload job";
+
+/// The body of an upload-plane refusal of a write that would take the whole store past what
+/// this emulator keeps for upload files at once.
+const UPLOAD_STORE_FULL_MESSAGE: &str = "This emulator already holds the maximum it keeps \
+     for upload-job files";
+
+/// One answer of the plane this service serves outside the model: the status, the code in
+/// `x-amzn-errortype`, and a JSON body carrying the reason.
+///
+/// That plane is plain HTTPS rather than a modelled operation, so it answers in this one
+/// small envelope instead of the service's restJson1 one. The message is built from the
+/// constants above, never from the request or from stored state: a caller is told what is
+/// wrong with its write, and nothing about what the store holds.
+fn plane_error(status: u16, code: &str, message: &str) -> RtResponse {
+    let body = ::serde_json::json!({ "message": message, "code": code }).to_string();
+    let mut resp = RtResponse::new(
+        StatusCode::try_from(status).expect("the status is a constant of this module"),
+        SdkBody::from(body),
+    );
+    resp.headers_mut().insert("content-type", "application/json");
+    resp.headers_mut()
+        .insert("x-amzn-errortype", code.to_string());
+    resp
 }
 
 impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
@@ -160,8 +292,12 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // default for this service's envelope (query -> 400 InvalidAction text/xml,
         // awsJson -> 404, rpcv2Cbor -> 404, rest -> 501). Return `Some(resp)` to
         // word that routing failure in your own envelope instead.
-        let _ = req;
-        None
+        //
+        // A request to the upload target `GetUploadJobPath` published is exactly that case
+        // by construction — the model binds no operation to the upload path — so this is
+        // where those writes are served. Anything else keeps the framework's default.
+        let target = crate::state::parse_upload_path(::service_common::request_path(req.uri()))?;
+        Some(self.serve_upload_job_file(req, &target))
     }
 
     fn override_framework_error(

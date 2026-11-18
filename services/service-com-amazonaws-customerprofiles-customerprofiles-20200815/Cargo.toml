@@ -32,6 +32,9 @@ uuid = { version = "1", features = ["v4"] }
 # object ingested twice is one record; `hex` renders that digest.
 sha2 = { workspace = true }
 hex = { workspace = true }
+# The digest an upload target's write presents its data key under
+# (`x-amz-server-side-encryption-customer-key-MD5`), which the service checks it against.
+md-5 = "0.10"
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
