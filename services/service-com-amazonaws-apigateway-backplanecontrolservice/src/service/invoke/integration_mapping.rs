@@ -364,7 +364,7 @@ pub fn perform_integration(
                     ),
                 }
             })?;
-            (mock_status_code(&body), Some(body.into_bytes()))
+            (mock_status_code(&body.text), Some(body.text.into_bytes()))
         }
         // Nothing is mapped, so the integration answers the method request's own payload:
         // that is what "passes the method request body through the integration request

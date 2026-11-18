@@ -27,6 +27,12 @@
 //! the in-process transport ([`onward_endpoint`]). An address nothing in this emulator claims
 //! reaches no backend at all and is answered as the integration this stage cannot perform,
 //! with no status, header or body invented for a backend that never ran.
+//!
+//! Two things the integration states about its request are applied to whichever of the two it
+//! is, because they are stated on the INTEGRATION rather than on its type: the FORM its body
+//! is sent in, which `contentHandling` converts ([`content_handling`]), and the parameters its
+//! request template OVERRODE, which replace what `requestParameters` mapped
+//! ([`overridden`]).
 
 use super::*;
 
@@ -144,6 +150,38 @@ pub(super) fn onward_request(
     // plane passes no request through, whatever its parameters map.
     authority_of(uri)?;
 
+    // The PAYLOAD the integration request carries, which is where the two types part: a
+    // proxy integration passes the caller's own body on as it stands, and the standard one
+    // carries what the integration's `requestTemplates` make of it — the same rendering a
+    // `MOCK` answers with ([`perform_integration`]), applied to the body the backend is
+    // called with.
+    //
+    // Rendered FIRST, before the mappings below, because a request template may state a
+    // parameter of the integration request as well as its body
+    // ([`mapping_template::Overrides`]): the overrides are what the mappings are then
+    // overridden by, and the PATH ones decide the address itself.
+    let (payload, overrides) = match carried {
+        HttpEndpoint::Proxy => (request_payload(req), mapping_template::Overrides::default()),
+        HttpEndpoint::Mapped => match mapped_payload(integration, call) {
+            Ok(rendered) => rendered,
+            Err(unserved) => return Some(PassedThrough::Unserved(unserved)),
+        },
+    };
+    // The FORM the body is sent in, which is the integration's own `contentHandling` over the
+    // form the method request's own media type names ([`content_handling`]): a payload it
+    // cannot convert is an integration this call cannot be performed through.
+    let payload = match content_handling::converted(
+        payload,
+        integration.content_handling.as_deref(),
+        &call.media_type,
+        Some(&call.media_type),
+        &call.proxy.binary_media_types,
+        content_handling::THE_INTEGRATION_REQUEST,
+    ) {
+        Ok(converted) => converted,
+        Err(unserved) => return Some(PassedThrough::Unserved(unserved)),
+    };
+
     // What `requestParameters` maps onto the integration request, read BEFORE anything is
     // built from it: the PATH parameters decide the address itself, so the mappings are
     // resolved first and the request is addressed from them.
@@ -184,6 +222,11 @@ pub(super) fn onward_request(
             ParameterIn::Query => mapped.querystring.push((name.to_string(), value)),
         }
     }
+    // What the request template STATED about these same parameters has the last word over
+    // what the mappings above produced: that is what overriding one means, and it is applied
+    // once per parameter, so a name the template overrode carries the overriding value and
+    // not the mapped one as well.
+    overridden(&mut mapped, &overrides);
 
     // The address the backend is called at: the `uri`, with each `{name}` placeholder
     // replaced by the path parameter the integration maps onto that name, and then the
@@ -223,18 +266,8 @@ pub(super) fn onward_request(
                 .to_string(),
         }));
     };
-    // The PAYLOAD the integration request carries, which is where the two types part: a
-    // proxy integration passes the caller's own body on as it stands, and the standard one
-    // carries what the integration's `requestTemplates` make of it — the same rendering a
-    // `MOCK` answers with ([`perform_integration`]), applied to the body the backend is
-    // called with.
-    let payload = match carried {
-        HttpEndpoint::Proxy => request_payload(req),
-        HttpEndpoint::Mapped => match mapped_payload(integration, call) {
-            Ok(payload) => payload,
-            Err(unserved) => return Some(PassedThrough::Unserved(unserved)),
-        },
-    };
+    // The PAYLOAD the integration request carries was rendered and converted above, before
+    // the mappings it may override; what is left is to send it.
     let declares_media_type = carried == HttpEndpoint::Mapped && !payload.is_empty();
     let mut passed = RtRequest::new(SdkBody::from(payload));
     // The caller's own query string travels only where the request is PASSED THROUGH; a
@@ -384,7 +417,8 @@ pub(super) fn onward_request(
     })
 }
 
-/// The body a STANDARD (non-proxy) integration request carries: what the integration's
+/// The body a STANDARD (non-proxy) integration request carries, and what the template that
+/// rendered it STATED about the integration request's own parameters: what the integration's
 /// `requestTemplates` and `passthroughBehavior` make of the method request's own payload.
 ///
 /// `requestTemplates` is "a map of Velocity templates that are applied on the request payload
@@ -395,13 +429,17 @@ pub(super) fn onward_request(
 /// documents — "rejects the method request with an HTTP 415 Unsupported Media Type response"
 /// — and a template this emulator does not render is an integration this call cannot be
 /// performed through rather than a backend called with a body built by guesswork.
+///
+/// A body no template rendered states nothing: an override is something a TEMPLATE says, so a
+/// request whose body was passed through unmapped carries the parameters its mappings produced
+/// and no others.
 fn mapped_payload(
     integration: &GetIntegrationOutput,
     call: &MethodRequest,
-) -> Result<Vec<u8>, UnservedIntegration> {
+) -> Result<(Vec<u8>, mapping_template::Overrides), UnservedIntegration> {
     match request_mapping(integration, call) {
         RequestMapping::Mapped(template) => rendered_mapping_template(template, &call.inputs)
-            .map(String::into_bytes)
+            .map(|rendering| (rendering.text.into_bytes(), rendering.request))
             .map_err(|reason| UnservedIntegration {
                 refusal: API_CONFIGURATION_ERROR,
                 reason: format!(
@@ -411,7 +449,10 @@ fn mapped_payload(
                     template.len()
                 ),
             }),
-        RequestMapping::PassedThrough => Ok(call.inputs.payload.clone().unwrap_or_default()),
+        RequestMapping::PassedThrough => Ok((
+            call.inputs.payload.clone().unwrap_or_default(),
+            mapping_template::Overrides::default(),
+        )),
         RequestMapping::Unsupported => Err(UnservedIntegration {
             refusal: UNSUPPORTED_MEDIA_TYPE,
             reason: format!(
@@ -420,5 +461,31 @@ fn mapped_payload(
                 call.media_type
             ),
         }),
+    }
+}
+
+/// `mapped` with everything the request template STATED about the integration request's
+/// parameters applied over it.
+///
+/// An override is final: it REPLACES whatever the integration's own `requestParameters` mapped
+/// onto that name — a header the caller's request had mapped onto it carries the overriding
+/// value alone — and a name nothing mapped is carried by the override on its own. The three
+/// locations are the ones an override names, and they are the same three
+/// `Integration$requestParameters` maps onto, so an overridden parameter travels exactly where
+/// a mapped one does: a header name is compared case-insensitively, as a header name is, and a
+/// query-string name as it is written.
+fn overridden(mapped: &mut MappedRequest, overrides: &mapping_template::Overrides) {
+    for (name, value) in &overrides.header {
+        mapped
+            .headers
+            .retain(|(carried, _)| !carried.eq_ignore_ascii_case(name));
+        mapped.headers.push((name.clone(), value.clone()));
+    }
+    for (name, value) in &overrides.querystring {
+        mapped.querystring.retain(|(carried, _)| carried != name);
+        mapped.querystring.push((name.clone(), value.clone()));
+    }
+    for (name, value) in &overrides.path {
+        mapped.path.insert(name.clone(), value.clone());
     }
 }

@@ -29,6 +29,12 @@
 //! member and another for one that does not. A directive's own line renders nothing, and the
 //! text of a branch this call does not take renders nothing and resolves nothing.
 //!
+//! The one `#set` that binds no name of the template's own is an OVERRIDE of the request or
+//! response the template is building (`$context.requestOverride.header.<name>`,
+//! `$context.responseOverride.status`, …): it renders no text, and what it states is carried
+//! out of the rendering ([`Overrides`]) for the caller to apply to the request or response it
+//! holds.
+//!
 //! Everything else stays unrendered, and the caller of this module answers such a template
 //! the way it answers an integration it cannot perform:
 //!
@@ -96,6 +102,65 @@ pub struct Unrendered {
     pub reason: String,
 }
 
+/// What rendering one template produced: the TEXT, and what the template's own override
+/// directives state about the request or the response it is building.
+#[derive(Debug, Default)]
+pub struct Rendering {
+    /// The text the template rendered to, which is the body its caller sends.
+    pub text: String,
+    /// What `$context.requestOverride.…` stated about the INTEGRATION REQUEST.
+    pub request: Overrides,
+    /// What `$context.responseOverride.…` stated about the METHOD RESPONSE.
+    pub response: Overrides,
+}
+
+/// The parameters of one side of the call a template OVERRODE, by the location each travels
+/// in.
+///
+/// A mapping template may state a parameter of the request or the response it is building
+/// rather than only read the call: `$context.requestOverride.header.<name>`,
+/// `.querystring.<name>` and `.path.<name>` name the integration request's parameters, and
+/// `$context.responseOverride.header.<name>` and `.status` the method response's. What is
+/// collected here is WHAT the template stated; applying it is the caller's, because only the
+/// caller holds the request or the response it applies to.
+///
+/// Each name carries the FIRST value stated for it: a template that overrides one parameter
+/// twice keeps the value it stated first, and the later statement is not applied.
+#[derive(Debug, Default, Clone)]
+pub struct Overrides {
+    /// The headers overridden, by name as the template spelled it.
+    pub header: BTreeMap<String, String>,
+    /// The query-string parameters overridden, by name.
+    pub querystring: BTreeMap<String, String>,
+    /// The path parameters overridden, by name.
+    pub path: BTreeMap<String, String>,
+    /// The status the response is to be sent with, as the template stated it.
+    pub status: Option<String>,
+}
+
+impl Overrides {
+    /// State `value` for `target`, unless this side already carries one for it: the FIRST
+    /// statement about a parameter is the one kept.
+    fn state(&mut self, target: &directives::OverrideTarget, value: String) {
+        use directives::OverrideTarget;
+
+        match target {
+            OverrideTarget::Header(name) => {
+                self.header.entry(name.clone()).or_insert(value);
+            }
+            OverrideTarget::QueryString(name) => {
+                self.querystring.entry(name.clone()).or_insert(value);
+            }
+            OverrideTarget::Path(name) => {
+                self.path.entry(name.clone()).or_insert(value);
+            }
+            OverrideTarget::Status => {
+                self.status.get_or_insert(value);
+            }
+        }
+    }
+}
+
 /// Emulator resource guard, NOT an AWS quota: the largest body one template renders to.
 ///
 /// A template is at most [`crate::ops::put_integration::MAX_TEMPLATE_CHARS`] and each
@@ -142,7 +207,7 @@ pub fn rendered_without_directives(
                 .to_string(),
         });
     }
-    rendered(template, inputs)
+    rendered(template, inputs).map(|rendering| rendering.text)
 }
 
 /// `template` rendered against `inputs`, or the first reason this emulator does not render
@@ -153,13 +218,15 @@ pub fn rendered_without_directives(
 /// the payload — which is read as a document once per rendering. So rendering costs a
 /// constant per template character, plus one value per reference, plus the reads
 /// [`MAX_RENDER_WORK`] bounds; the body it produces is bounded by [`MAX_RENDERED_BYTES`].
-pub fn rendered(template: &str, inputs: &TemplateInputs) -> Result<String, Unrendered> {
+pub fn rendered(template: &str, inputs: &TemplateInputs) -> Result<Rendering, Unrendered> {
     let glyphs: Vec<char> = template.chars().collect();
     let mut render = Render {
         inputs,
         document: None,
         bindings: BTreeMap::new(),
         work: MAX_RENDER_WORK,
+        request: Overrides::default(),
+        response: Overrides::default(),
     };
     let mut rendered = String::with_capacity(template.len());
     // The conditional directives this template has opened and not closed yet: what decides
@@ -243,7 +310,11 @@ pub fn rendered(template: &str, inputs: &TemplateInputs) -> Result<String, Unren
             reason: "it opens a #if it does not close".to_string(),
         });
     }
-    Ok(rendered)
+    Ok(Rendering {
+        text: rendered,
+        request: render.request,
+        response: render.response,
+    })
 }
 
 /// How many conditional directives one template may have open at once.
@@ -263,6 +334,11 @@ const MAX_BRANCH_DEPTH: usize = 16;
 /// (`::service_common::velocity_template::MAX_NESTING`); this is the bound of the walk over
 /// it, so neither rests on the other.
 const MAX_EXPRESSION_DEPTH: usize = 16;
+
+/// What an OVERRIDE's value is named as in the reason a rendering that could not write it
+/// reports: the value a parameter is overridden with is an expression rather than a reference
+/// of the template's own text, so there is no spelling of it to quote.
+const OVERRIDE_SOURCE: &str = "the value an override states";
 
 /// One conditional directive of a template that is open: whether the piece being read now is
 /// rendered, whether a branch of it has already been taken, and whether the directive itself
@@ -297,6 +373,10 @@ struct Render<'i> {
     bindings: BTreeMap<String, ::serde_json::Value>,
     /// How many more bytes this rendering may READ.
     work: usize,
+    /// What the override directives seen so far have stated about the INTEGRATION REQUEST.
+    request: Overrides,
+    /// What they have stated about the METHOD RESPONSE.
+    response: Overrides,
 }
 
 impl Render<'_> {
@@ -324,6 +404,23 @@ impl Render<'_> {
                     let bound = self.value_of(value, 0)?;
                     self.spend(weight(&bound))?;
                     self.bindings.insert(name.clone(), bound);
+                }
+            }
+            // An override states a parameter of the request or the response the template is
+            // building, so what is kept is the TEXT the expression comes to — the same text a
+            // reference to that expression would render ([`Render::written`]), since a
+            // parameter carries text and nothing else.
+            Directive::Override(overriding) => {
+                if inside {
+                    let stated = self.value_of(&overriding.value, 0)?;
+                    let text = Self::written(stated, OVERRIDE_SOURCE)?;
+                    self.spend(text.len())?;
+                    let side = if overriding.response {
+                        &mut self.response
+                    } else {
+                        &mut self.request
+                    };
+                    side.state(&overriding.target, text);
                 }
             }
             Directive::If(condition) => {
@@ -813,7 +910,20 @@ impl Render<'_> {
     /// unresolved rather than written as something else — which is why a template that
     /// means to read inside one BINDS it first (`#set`) and renders the members it names.
     fn resolved(&mut self, reference: &Reference) -> Result<String, Unrendered> {
-        match self.evaluated(reference)? {
+        let value = self.evaluated(reference)?;
+        Self::written(value, &reference.source)
+    }
+
+    /// The TEXT a value renders as, or the reason this emulator renders none for it.
+    ///
+    /// A value renders as the text the language writes it as: a string as itself, a number or
+    /// a boolean as it spells, and a value the call does not have as nothing. An OBJECT or an
+    /// ARRAY is a Java object whose own rendering AWS does not state, so it is left unwritten
+    /// rather than written as something else — which is why a template that means to read
+    /// inside one BINDS it first (`#set`) and renders the members it names. `source` is what
+    /// named it, for the reason a caller reports.
+    fn written(value: ::serde_json::Value, source: &str) -> Result<String, Unrendered> {
+        match value {
             ::serde_json::Value::String(text) => Ok(text),
             node @ (::serde_json::Value::Number(_) | ::serde_json::Value::Bool(_)) => {
                 Ok(node.to_string())
@@ -821,8 +931,7 @@ impl Render<'_> {
             ::serde_json::Value::Null => Ok(String::new()),
             ::serde_json::Value::Object(_) | ::serde_json::Value::Array(_) => Err(Unrendered {
                 reason: format!(
-                    "it names {}, which this emulator resolves no value of this call for",
-                    reference.source
+                    "it names {source}, which this emulator resolves no value of this call for"
                 ),
             }),
         }
@@ -1315,6 +1424,13 @@ fn escaped_as_javascript(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The TEXT `template` renders to against `inputs`, which is what the cases below assert
+    /// over; the overrides a rendering also carries have cases of their own
+    /// ([`tests::an_override_states_the_parameter_it_names`]).
+    fn rendered(template: &str, inputs: &TemplateInputs) -> Result<String, Unrendered> {
+        super::rendered(template, inputs).map(|rendering| rendering.text)
+    }
 
     /// The inputs the cases below render against: one of each kind of value a template can
     /// name.
@@ -1995,5 +2111,111 @@ mod tests {
             Some("acme"),
             "case params without a payload: expected acme, got {rendered:?}"
         );
+    }
+
+    /// RULE: an override directive states the parameter it names, with the value its
+    /// expression comes to, renders nothing itself, and keeps the FIRST value stated for a
+    /// parameter it names twice.
+    #[test]
+    fn an_override_states_the_parameter_it_names() {
+        /// (case, the template, the text it renders to, the parameters it stated as
+        /// `side location name=value` lines)
+        type Row<'a> = (&'a str, &'a str, &'a str, &'a [&'a str]);
+        let rows: &[Row<'_>] = &[
+            (
+                "a static header value",
+                "#set($context.requestOverride.header.x-flow = 'on')body",
+                "body",
+                &["request header x-flow=on"],
+            ),
+            (
+                "a value read off the call",
+                "#set($context.requestOverride.querystring.tenant = $input.params('tenant'))",
+                "",
+                &["request querystring tenant=acme"],
+            ),
+            (
+                "a value read off a binding",
+                "#set($r = $input.path('$'))#set($context.requestOverride.path.id = $r.id)",
+                "",
+                &["request path id=a1"],
+            ),
+            (
+                "a number, which a parameter carries as the text it spells",
+                "#set($context.responseOverride.status = 400)",
+                "",
+                &["response status=400"],
+            ),
+            (
+                "the same parameter stated twice, which keeps the first value",
+                "#set($context.requestOverride.header.x-flow = 'first')\
+                 #set($context.requestOverride.header.x-flow = 'second')",
+                "",
+                &["request header x-flow=first"],
+            ),
+            (
+                "the same status stated twice",
+                "#set($context.responseOverride.status = 400)\
+                 #set($context.responseOverride.status = 500)",
+                "",
+                &["response status=400"],
+            ),
+            (
+                "both sides at once, and a header of each",
+                "#set($context.requestOverride.header.a = '1')\
+                 #set($context.responseOverride.header.b = '2')",
+                "",
+                &["request header a=1", "response header b=2"],
+            ),
+            (
+                "an override inside a branch this call does not take, which states nothing",
+                "#if($context.stage == 'other')\
+                 #set($context.responseOverride.status = 500)\
+                 #end",
+                "",
+                &[],
+            ),
+            (
+                "an override inside the branch this call does take",
+                "#if($context.stage == 'test')\
+                 #set($context.responseOverride.status = 404)\
+                 #end",
+                "",
+                &["response status=404"],
+            ),
+        ];
+        let inputs = inputs();
+        for (case, template, text, stated) in rows {
+            let actual = super::rendered(template, &inputs);
+            let Ok(actual) = actual else {
+                panic!("case {case:?}: expected the template to render, got {actual:?}");
+            };
+            assert_eq!(
+                actual.text, *text,
+                "case {case:?}: expected the text {text:?}, got {:?}",
+                actual.text
+            );
+            let mut lines = Vec::new();
+            for (side, overrides) in [("request", &actual.request), ("response", &actual.response)]
+            {
+                for (location, parameters) in [
+                    ("header", &overrides.header),
+                    ("querystring", &overrides.querystring),
+                    ("path", &overrides.path),
+                ] {
+                    for (name, value) in parameters {
+                        lines.push(format!("{side} {location} {name}={value}"));
+                    }
+                }
+                if let Some(status) = &overrides.status {
+                    lines.push(format!("{side} status={status}"));
+                }
+            }
+            assert_eq!(
+                lines,
+                stated.iter().map(|line| (*line).to_string()).collect::<Vec<String>>(),
+                "case {case:?}: expected the overrides {stated:?}, got {lines:?}"
+            );
+        }
     }
 }

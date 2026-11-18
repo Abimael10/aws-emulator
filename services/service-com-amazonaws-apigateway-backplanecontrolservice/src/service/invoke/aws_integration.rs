@@ -841,7 +841,7 @@ fn integration_request_body(
 ) -> Result<Vec<u8>, UnservedIntegration> {
     let body = match request_mapping(integration, call) {
         RequestMapping::Mapped(template) => rendered_mapping_template(template, &call.inputs)
-            .map(String::into_bytes)
+            .map(|rendering| rendering.text.into_bytes())
             .map_err(|reason| {
                 unanswered(&format!(
                     "the {media} request template of {bytes} bytes is not one this emulator \

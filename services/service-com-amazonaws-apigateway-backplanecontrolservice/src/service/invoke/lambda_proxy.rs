@@ -1336,7 +1336,12 @@ fn proxy_response(
 /// api declares a class of payloads binary rather than listing every subtype. Compared
 /// without the parameters a `Content-Type` may carry (`; charset=…`) and case-insensitively,
 /// because a media type's type and subtype are.
-fn declares_binary(media: &str, declared: &[String]) -> bool {
+///
+/// The ONE reading of that member in this plane: the `contentHandling` conversion asks it the
+/// same question about an integration request's and a method response's payload
+/// ([`super::content_handling`]), so which payloads this api calls binary is decided here and
+/// nowhere else.
+pub(super) fn declares_binary(media: &str, declared: &[String]) -> bool {
     let (media_type, media_subtype) = media_type_tokens(media);
     declared.iter().any(|binary| {
         let (declared_type, declared_subtype) = media_type_tokens(binary);

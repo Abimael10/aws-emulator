@@ -36,6 +36,16 @@ use serde_json::{json, Value};
 
 use crate::rest_api_lifecycle::{create_api, create_resource, string_member, Gateway};
 
+/// The TRANSFORMATIONS a STANDARD (non-proxy) `HTTP` integration of this plane performs on
+/// the request it makes and the response it answers — `contentHandling`, the override
+/// directives a mapping template states and the `415` of `passthroughBehavior` — in their own
+/// file beside this one: the other half of what a deployed method's integration does with a
+/// call, and this suite's sibling concern. `tests/all.rs` declares one module per suite FILE,
+/// and this is that file's module; the `#[path]` points it into this suite's own directory, as
+/// that file's own declaration points into `tests/all/`.
+#[path = "execute_api_data_plane/nonproxy_integration_transformations.rs"]
+mod nonproxy_integration_transformations;
+
 /// The region the invoke host is addressed in. Any region is served — the host's region
 /// label is not matched against a list — so one is enough to drive the data plane, and
 /// `src/service/invoke.rs`'s own unit test varies the label.

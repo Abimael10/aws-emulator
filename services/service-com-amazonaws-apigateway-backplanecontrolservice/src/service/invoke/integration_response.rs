@@ -15,6 +15,12 @@
 //! `MOCK`'s own rendered integration request, whose `statusCode` names that response; and
 //! an answer nothing maps — a proxy integration's response, and the response of an endpoint
 //! a request was passed on to — which IS the method response.
+//!
+//! What the integration response that maps an answer may say about the method response is the
+//! status it is keyed by, the headers its `responseParameters` map and the body its
+//! `responseTemplates` render — and, stated by that template as it renders, an OVERRIDE of a
+//! header or of the status ([`overridden_status`]) and the FORM the body is served in, which
+//! its `contentHandling` converts ([`content_handling`]).
 
 use super::*;
 
@@ -128,21 +134,23 @@ fn rendered(
         });
     };
     let mut headers = mapped_response_headers(method, selected, status, &call.inputs, answer);
-    // The media type is the method response's own `Content-Type` mapping where it declares
-    // one; see [`super::taken_content_type`].
-    let mapped_type = taken_content_type(&mut headers);
     let templated = selected
         .response_templates
         .as_ref()
         .is_some_and(|templates| !templates.is_empty());
-    let (content_type, body) = if templated || matches!(untemplated, Untemplated::Nothing) {
+    // The response template's own rendering, and what it STATED about this response: a
+    // response template may name a header and the status as well as the body
+    // ([`mapping_template::Overrides`]). Rendered before the headers are read off the
+    // mappings, so an override of one of them has the last word.
+    let mut stated = mapping_template::Overrides::default();
+    let rendered_body = if templated || matches!(untemplated, Untemplated::Nothing) {
         // The template is rendered against THIS call, with the payload it reads being the
         // one the INTEGRATION answered rather than the one the client sent.
         let inputs = TemplateInputs {
             payload: answer.payload.clone(),
             ..call.inputs.clone()
         };
-        let body =
+        let (body, overrides) =
             response_body(selected, call, &inputs).map_err(|template| UnservedIntegration {
                 refusal: API_CONFIGURATION_ERROR,
                 reason: format!(
@@ -150,30 +158,87 @@ fn rendered(
                     template.content_type, template.bytes, template.reason
                 ),
             })?;
+        stated = overrides;
+        Some(body)
+    } else {
+        None
+    };
+    // An override is final: a header the response template stated REPLACES what the
+    // integration response's own `responseParameters` mapped onto that name, and a name
+    // nothing mapped is carried by the override on its own — which is what overriding a
+    // response parameter means.
+    for (name, value) in &stated.header {
+        headers.insert(name.clone(), vec![value.clone()]);
+    }
+    // The media type is the method response's own `Content-Type` mapping where it declares
+    // one; see [`super::taken_content_type`].
+    let mapped_type = taken_content_type(&mut headers);
+    let (content_type, body) = match rendered_body {
         // A templated response is rendered from the api's own records, so the media type it
         // is served with is the mapping's, and `application/json` when none is declared —
         // never the key of the template the caller's `Accept` chose.
-        (
+        Some(body) => (
             mapped_type.unwrap_or_else(|| JSON_CONTENT_TYPE.to_string()),
             body,
-        )
-    } else {
+        ),
         // No template: the answer's own bytes and content type are the method response's,
         // which is what passing a response through means — unless the method response
         // declares a `Content-Type` mapping of its own, which overrides it.
-        (
+        None => (
             mapped_type
                 .or_else(|| answer.content_type.clone())
                 .unwrap_or_else(|| JSON_CONTENT_TYPE.to_string()),
             answer.payload.clone().unwrap_or_default(),
-        )
+        ),
     };
+    // The FORM the body is served in: the form this request's `Accept` names, which the
+    // integration response's own `contentHandling` overrides ([`content_handling`]). The
+    // payload's own media type is the one it is SERVED under — the template's rendering is
+    // served under the mapped type and not under whatever the backend answered — and which of
+    // those media types is binary the api's `binaryMediaTypes` say.
+    let body = content_handling::converted(
+        body,
+        selected.content_handling.as_deref(),
+        &content_type,
+        call.accepted.as_deref(),
+        &call.proxy.binary_media_types,
+        content_handling::THE_METHOD_RESPONSE,
+    )?;
     Ok(IntegratedResponse {
-        status,
+        status: overridden_status(&stated, status)?,
         content_type,
         body,
         headers,
     })
+}
+
+/// The status the response is sent with: the one the response template STATED where it stated
+/// one, and the integration response's own `statusCode` otherwise.
+///
+/// An override of the status is what lets one integration response answer a call with a status
+/// of its own — a backend's `200` served as a `400`, say — so it has the last word over the
+/// code the selected integration response is keyed by. A value that is no HTTP status is a
+/// configuration error of the template rather than a response sent with a status nothing
+/// names.
+fn overridden_status(
+    stated: &mapping_template::Overrides,
+    status: u16,
+) -> Result<u16, UnservedIntegration> {
+    let Some(overriding) = stated.status.as_deref() else {
+        return Ok(status);
+    };
+    overriding
+        .trim()
+        .parse::<u16>()
+        .ok()
+        .filter(|code| (100..=599).contains(code))
+        .ok_or_else(|| UnservedIntegration {
+            refusal: API_CONFIGURATION_ERROR,
+            reason: format!(
+                "the response template overrides the status with {overriding:?}, which is no \
+                 status a response can be sent with"
+            ),
+        })
 }
 
 /// A PROXY integration's own response as an integration response nothing maps: the function

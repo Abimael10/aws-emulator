@@ -10,7 +10,11 @@
 //!
 //! * `#set` — "the `#set` directive is used to set the value of a reference": a BINDING of a
 //!   name to a value of this call, which is what lets a template name a sub-document of the
-//!   payload (`#set($inputRoot = $input.path('$'))`) and read its members;
+//!   payload (`#set($inputRoot = $input.path('$'))`) and read its members. The one form of it
+//!   that binds no name of the template's own is an OVERRIDE
+//!   (`#set($context.requestOverride.header.name = …)`), the way API Gateway documents a
+//!   template for stating a parameter of the request or response it is building
+//!   ([`Override`]);
 //! * `#if` / `#elseif` / `#else` / `#end` — a CHOICE between two pieces of the template,
 //!   decided by a condition over those same values, which is how a template renders one
 //!   document for a request that carries a member and another for one that does not.
@@ -26,13 +30,16 @@
 //! The directives that are neither a binding nor a choice (`#foreach`, `#macro`, `#parse`, a
 //! comment) stay unperformed, and a template carrying one is refused before rendering.
 
-use ::service_common::velocity_template::{Expr, Parse};
+use ::service_common::velocity_template::{Access, Expr, Parse, Reference};
 
 /// One directive of a template, as this plane performs it.
 #[derive(Debug)]
 pub(super) enum Directive {
     /// `#set($name = expression)`: the name it binds, and the expression bound to it.
     Set { name: String, value: Expr },
+    /// `#set($context.requestOverride.header.name = expression)` and its siblings: a
+    /// statement about the CALL rather than a name of the template's own.
+    Override(Override),
     /// `#if(condition)`
     If(Expr),
     /// `#elseif(condition)`
@@ -41,6 +48,96 @@ pub(super) enum Directive {
     Else,
     /// `#end`
     End,
+}
+
+/// One OVERRIDE a template states: which side of the call it names, which parameter of that
+/// side, and the expression whose value the parameter is overridden with.
+///
+/// `$context.requestOverride` names the parameters of the INTEGRATION request a request
+/// template is building, and `$context.responseOverride` those of the METHOD response a
+/// response template is building — the two sides API Gateway documents the override
+/// variables for.
+#[derive(Debug)]
+pub(super) struct Override {
+    /// Whether it names the METHOD RESPONSE's parameters (`responseOverride`) rather than the
+    /// integration request's (`requestOverride`).
+    pub(super) response: bool,
+    /// Which parameter of that side it names.
+    pub(super) target: OverrideTarget,
+    /// The expression the parameter is overridden with.
+    pub(super) value: Expr,
+}
+
+/// The parameter an override names: one of the three locations a request or response
+/// parameter travels in, or the status a response is sent with.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum OverrideTarget {
+    /// `header.<name>`
+    Header(String),
+    /// `querystring.<name>`
+    QueryString(String),
+    /// `path.<name>`
+    Path(String),
+    /// `status`, which only a response has.
+    Status,
+}
+
+/// The variable the override namespaces hang off: the call's own context.
+const CONTEXT_VARIABLE: &str = "context";
+/// `$context.requestOverride`, the integration request's parameters.
+const REQUEST_OVERRIDE: &str = "requestOverride";
+/// `$context.responseOverride`, the method response's parameters.
+const RESPONSE_OVERRIDE: &str = "responseOverride";
+/// The three locations a parameter of either side travels in, and the status member of a
+/// response, as an override spells them.
+const HEADER_LOCATION: &str = "header";
+/// See [`HEADER_LOCATION`].
+const QUERY_LOCATION: &str = "querystring";
+/// See [`HEADER_LOCATION`].
+const PATH_LOCATION: &str = "path";
+/// See [`HEADER_LOCATION`].
+const STATUS_MEMBER: &str = "status";
+
+/// The override `target` names, or `None` for an assignment that names no override at all —
+/// which the caller answers as the member assignment it is.
+///
+/// Both spellings of a member are read, the bare `.name` and the bracketed `['name']`, since
+/// a header name need not be a bare name.
+fn overridden(target: &Reference) -> Option<(bool, OverrideTarget)> {
+    if target.root != CONTEXT_VARIABLE {
+        return None;
+    }
+    let mut steps = target.accesses.iter();
+    let response = match member(steps.next()?)?.as_str() {
+        REQUEST_OVERRIDE => false,
+        RESPONSE_OVERRIDE => true,
+        _ => return None,
+    };
+    let location = member(steps.next()?)?;
+    if location == STATUS_MEMBER {
+        return steps.next().is_none().then_some((response, OverrideTarget::Status));
+    }
+    let name = member(steps.next()?)?;
+    if steps.next().is_some() || name.is_empty() {
+        return None;
+    }
+    let target = match location.as_str() {
+        HEADER_LOCATION => OverrideTarget::Header(name),
+        QUERY_LOCATION => OverrideTarget::QueryString(name),
+        PATH_LOCATION => OverrideTarget::Path(name),
+        _ => return None,
+    };
+    Some((response, target))
+}
+
+/// The member name one step of a reference names, or `None` for a step that names no member
+/// (a method call, an index that is not a quoted key).
+fn member(access: &Access) -> Option<String> {
+    match access {
+        Access::Prop(name) => Some(name.clone()),
+        Access::Index(Expr::Literal(::serde_json::Value::String(key))) => Some(key.clone()),
+        _ => None,
+    }
 }
 
 /// What the text at `at` (the index of a `#`) is:
@@ -62,7 +159,8 @@ pub(super) fn directive_at(
     match name.as_str() {
         "set" => Some(match parse.assignment() {
             // A `#set` binds a NAME of its own here: assigning to a member of a value is a
-            // write into the call, which this plane performs nothing of.
+            // write into the call, and the ONE write into a call API Gateway documents is an
+            // OVERRIDE of the request or response parameters it is building.
             Ok((target, value)) if target.accesses.is_empty() => Ok((
                 Directive::Set {
                     name: target.root,
@@ -70,11 +168,21 @@ pub(super) fn directive_at(
                 },
                 parse.at,
             )),
-            Ok(_) => Err(
-                "it binds a member of a reference rather than a name of its own, which this \
-                 emulator does not set"
-                    .to_string(),
-            ),
+            Ok((target, value)) => match overridden(&target) {
+                Some((response, overridden)) => Ok((
+                    Directive::Override(Override {
+                        response,
+                        target: overridden,
+                        value,
+                    }),
+                    parse.at,
+                )),
+                None => Err(
+                    "it binds a member of a reference rather than a name of its own or a \
+                     parameter of this call, which this emulator does not set"
+                        .to_string(),
+                ),
+            },
             Err(why) => Err(why),
         }),
         "if" => Some(
@@ -118,6 +226,20 @@ mod tests {
             read.map(|(directive, next)| {
                 let shape = match directive {
                     Directive::Set { name, .. } => format!("set {name}"),
+                    Directive::Override(overriding) => format!(
+                        "override {} {}",
+                        if overriding.response {
+                            "response"
+                        } else {
+                            "request"
+                        },
+                        match overriding.target {
+                            OverrideTarget::Header(name) => format!("header {name}"),
+                            OverrideTarget::QueryString(name) => format!("querystring {name}"),
+                            OverrideTarget::Path(name) => format!("path {name}"),
+                            OverrideTarget::Status => "status".to_string(),
+                        }
+                    ),
                     Directive::If(_) => "if".to_string(),
                     Directive::ElseIf(_) => "elseif".to_string(),
                     Directive::Else => "else".to_string(),
@@ -182,6 +304,50 @@ mod tests {
             ("else", "#else", "else", 5),
             ("end", "#end", "end", 4),
             ("the formal spelling of end", "#{end}", "end", 6),
+            // The override forms API Gateway documents for a mapping template, over each
+            // location a parameter travels in and the status a response is sent with.
+            (
+                "a request header override",
+                "#set($context.requestOverride.header.name = 'x')",
+                "override request header name",
+                48,
+            ),
+            (
+                "a request header override of a dashed name",
+                "#set($context.requestOverride.header.x-trace-id = 'x')",
+                "override request header x-trace-id",
+                54,
+            ),
+            (
+                "a request header override written as a subscript",
+                "#set($context.requestOverride.header['X-Api:Key'] = 'x')",
+                "override request header X-Api:Key",
+                56,
+            ),
+            (
+                "a request query-string override",
+                "#set($context.requestOverride.querystring.q = $input.body)",
+                "override request querystring q",
+                58,
+            ),
+            (
+                "a request path override",
+                "#set($context.requestOverride.path.id = 'a')",
+                "override request path id",
+                44,
+            ),
+            (
+                "a response header override",
+                "#set($context.responseOverride.header.name = 'x')",
+                "override response header name",
+                49,
+            ),
+            (
+                "a response status override",
+                "#set($context.responseOverride.status = 400)",
+                "override response status",
+                44,
+            ),
         ];
         for (case, template, shape, next) in rows {
             let actual = read(template);
@@ -222,6 +388,14 @@ mod tests {
     fn a_directive_that_cannot_be_read_is_reported() {
         let rows: &[(&str, &str)] = &[
             ("a member assignment", "#set($a.b = 1)"),
+            (
+                "an assignment to a context member that is no override",
+                "#set($context.requestId = 'x')",
+            ),
+            (
+                "an override of a location no request parameter travels in",
+                "#set($context.requestOverride.cookie.a = 'x')",
+            ),
             ("no closing parenthesis", "#set($a = 1"),
             ("no value at all", "#set($a)"),
             ("no arguments", "#set"),

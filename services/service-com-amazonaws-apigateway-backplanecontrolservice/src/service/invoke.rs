@@ -3828,7 +3828,10 @@ struct UnrenderableTemplate {
 /// carrying a CONTROL-FLOW directive is reported as the integration it cannot perform rather
 /// than passed through as if it were a literal body. A template with neither half IS the
 /// body, and renders to itself through the same path.
-fn rendered_mapping_template(template: &str, inputs: &TemplateInputs) -> Result<String, String> {
+fn rendered_mapping_template(
+    template: &str,
+    inputs: &TemplateInputs,
+) -> Result<mapping_template::Rendering, String> {
     if carries_unperformed_directive(template) {
         return Err("it carries a Velocity directive, which is a statement this emulator \
                     does not execute"
@@ -3837,13 +3840,14 @@ fn rendered_mapping_template(template: &str, inputs: &TemplateInputs) -> Result<
     mapping_template::rendered(template, inputs).map_err(|unrendered| unrendered.reason)
 }
 
-/// The body the selected integration response renders.
+/// The body the selected integration response renders, and what that rendering STATED about
+/// the method response ([`mapping_template::Overrides`]).
 ///
 /// The template is chosen by the content type the caller asked for (`Accept`), then the
 /// JSON one, then the single template an integration response that declares exactly one
-/// carries. `Ok` with an EMPTY body when no template applies — a `MOCK` with no template
-/// answers no body — and `Err` when the chosen template is not one this emulator renders
-/// ([`rendered_mapping_template`]).
+/// carries. `Ok` with an EMPTY body and nothing stated when no template applies — a `MOCK`
+/// with no template answers no body — and `Err` when the chosen template is not one this
+/// emulator renders ([`rendered_mapping_template`]).
 ///
 /// Which template was chosen decides the BODY and nothing else: the media type the response
 /// is SERVED with is the method response's own `Content-Type` mapping
@@ -3853,13 +3857,14 @@ fn response_body(
     selected: &GetIntegrationResponseOutput,
     call: &MethodRequest,
     inputs: &TemplateInputs,
-) -> Result<Vec<u8>, UnrenderableTemplate> {
+) -> Result<(Vec<u8>, mapping_template::Overrides), UnrenderableTemplate> {
+    let empty = || (Vec::new(), mapping_template::Overrides::default());
     let Some(templates) = selected
         .response_templates
         .as_ref()
         .filter(|templates| !templates.is_empty())
     else {
-        return Ok(Vec::new());
+        return Ok(empty());
     };
     let chosen = call
         .accepted
@@ -3872,10 +3877,10 @@ fn response_body(
             (entries.len() == 1).then(|| entries[0])
         });
     let Some((content_type, template)) = chosen else {
-        return Ok(Vec::new());
+        return Ok(empty());
     };
     match rendered_mapping_template(template, inputs) {
-        Ok(body) => Ok(body.into_bytes()),
+        Ok(rendering) => Ok((rendering.text.into_bytes(), rendering.response)),
         Err(reason) => Err(UnrenderableTemplate {
             content_type: content_type.clone(),
             bytes: template.len(),
@@ -4875,3 +4880,8 @@ mod http_integration;
 use http_integration::*;
 pub use integration_mapping::*;
 use authorizer_cache::authorizer_cache_key;
+
+/// `contentHandling`, the conversion an integration states between the TEXT and the BINARY
+/// form of a payload, in a file of its own: it is the one concern that is about the BYTES of
+/// a payload rather than about which payload is sent or served.
+mod content_handling;
