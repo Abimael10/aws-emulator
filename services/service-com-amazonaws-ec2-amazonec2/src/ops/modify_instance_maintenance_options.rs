@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ModifyInstanceMaintenanceOptions
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ModifyInstanceMaintenanceOptions`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ModifyInstanceMaintenanceOptions::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Modifies the maintenance and recovery behaviour of ONE instance
+//! ([`crate::state::InstanceDetail`], the settings part of that instance's record), where
+//! `DescribeInstances` reports them back as `Instance$MaintenanceOptions`.
+//!
+//! Each member of the request names one behaviour: a value from that member's own catalog
+//! sets it, and a member the request leaves out leaves that behaviour exactly as it stands,
+//! so the answer reports the settings the instance carries once the call is served
+//! ([`crate::state::InstanceDetail::maintenance_options`], the one reading of them).
+//! Neither setting has a transient state of its own — the modelled shape declares none —
+//! so what this call writes is what the next read reports.
 //!
 //! ## Shape of an operation
 //!
@@ -92,6 +94,8 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+use crate::scaffolded::Scaffolded;
+use crate::state;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -160,18 +164,82 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ModifyInstanceMaintenanceOptions` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ModifyInstanceMaintenanceOptionsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ModifyInstanceMaintenanceOptions"))
+        // Which instance's settings change is a fact of the id the request names, and the
+        // settings themselves come off the request: nothing here depends on the request's
+        // headers or URI.
+        let _ = ctx;
+
+        // Each behaviour the request asks for, resolved against the catalog of that
+        // member's own modelled enum — so what reaches the store is a catalog member, never
+        // the request's own text. `None` is "the request left this member out", which asks
+        // for no change and leaves that behaviour as it stands.
+        let auto_recovery = state::requested_word(
+            "AutoRecovery",
+            input.auto_recovery.as_deref(),
+            INSTANCE_AUTO_RECOVERY_STATE_VALUES,
+        )?;
+        let reboot_migration = state::requested_word(
+            "RebootMigration",
+            input.reboot_migration.as_deref(),
+            INSTANCE_REBOOT_MIGRATION_STATE_VALUES,
+        )?;
+
+        let service_state = state::require_service_state(&*self.engine)?;
+        let mut store = service_state.lock();
+        // Which state an instance is in is a fact of where the clock stands, so every move
+        // it already owed is materialised before one is read: the refusal below is answered
+        // from the state the instance is in now, not the one it was left in.
+        store.materialize_due_transitions();
+
+        // Malformed before unknown, the order this service resolves an instance id in —
+        // through the reading of the id form this operation is recorded taking, where a
+        // value EC2 can read as an instance id but has issued no instance for names an
+        // instance that is not there rather than an id that cannot be read.
+        let instance = state::require_readable_instance_record(&store, &input.instance_id)?;
+        // An instance on its way to `terminated`, or already there, has no maintenance or
+        // recovery behaviour left to configure, while `pending` and `stopping` are transient
+        // states on their way to exactly `running` and `stopped`, so this service's own
+        // lifecycle spans never refuse a modify.
+        if instance.state.is_terminating() {
+            return Err(Scaffolded::incorrect_instance_state(
+                &input.instance_id,
+                "modified",
+            ));
+        }
+        // The id is read back off the record the lookup resolved, so the answer reports the
+        // stored instance rather than the request's text.
+        let instance_id = instance.instance_id.clone();
+
+        // DryRun sits after every refusal above and before the one write: "if you have the
+        // required permissions, the error response is DryRunOperation" (`$DryRun`), so a
+        // request that would have been refused is refused with that reason instead, and one
+        // that would have succeeded leaves the instance's settings exactly where they were.
+        if input.dry_run == Some(true) {
+            return Err(Scaffolded::dry_run_operation());
+        }
+
+        let Some(instance) = store.instances.get_mut(&instance_id) else {
+            return Err(Scaffolded::invalid_instance_id_not_found(&instance_id));
+        };
+        let detail = &mut instance.detail;
+        // Exactly the behaviours the request named are written; every other one is left as
+        // it stands.
+        if let Some(value) = auto_recovery {
+            detail.auto_recovery = value;
+        }
+        if let Some(value) = reboot_migration {
+            detail.reboot_migration = value;
+        }
+
+        // "Provides information on the current automatic recovery behavior of your
+        // instance" (`$AutoRecovery`): read back off the record just written through the one
+        // reading `DescribeInstances` reports these settings with, so the two cannot
+        // disagree about one instance.
+        let options = detail.maintenance_options();
+        Ok(ModifyInstanceMaintenanceOptionsOutput {
+            instance_id: Some(instance_id),
+            auto_recovery: options.auto_recovery,
+            reboot_migration: options.reboot_migration,
+        })
     }
 }

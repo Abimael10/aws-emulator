@@ -179,6 +179,10 @@ pub struct InstanceDetail {
     pub capacity_reservation_preference: &'static str,
     /// `InstanceMaintenanceOptions$AutoRecovery`.
     pub auto_recovery: &'static str,
+    /// `InstanceMaintenanceOptions$RebootMigration` — the reboot-migration behaviour the
+    /// instance carries, which a launch cannot name (`InstanceMaintenanceOptionsRequest`
+    /// declares only `AutoRecovery`) and `ModifyInstanceMaintenanceOptions` writes.
+    pub reboot_migration: &'static str,
     /// `InstanceNetworkPerformanceOptions$BandwidthWeighting`.
     pub bandwidth_weighting: &'static str,
     /// `Placement$Tenancy`.
@@ -224,6 +228,7 @@ impl Default for InstanceDetail {
             instance_initiated_shutdown_behavior: DEFAULT_SHUTDOWN_BEHAVIOR,
             capacity_reservation_preference: CAPACITY_RESERVATION_PREFERENCE_OPEN,
             auto_recovery: AUTO_RECOVERY_DEFAULT,
+            reboot_migration: REBOOT_MIGRATION_DEFAULT,
             bandwidth_weighting: BANDWIDTH_WEIGHTING_DEFAULT,
             tenancy: TENANCY_DEFAULT,
             placement_group_name: None,
@@ -347,6 +352,11 @@ impl InstanceDetail {
                 INSTANCE_AUTO_RECOVERY_STATE_VALUES,
             )?
             .unwrap_or(AUTO_RECOVERY_DEFAULT),
+            // A launch names no reboot-migration behaviour — the shape it asks for
+            // maintenance options with carries only `AutoRecovery`
+            // (`InstanceMaintenanceOptionsRequest`) — so an instance starts on the
+            // `default` behaviour and only a modify of its maintenance options changes it.
+            reboot_migration: REBOOT_MIGRATION_DEFAULT,
             bandwidth_weighting: requested_word(
                 "BandwidthWeighting",
                 spec.network_performance_options
@@ -397,6 +407,21 @@ impl InstanceDetail {
             http_endpoint: Some(self.http_endpoint.to_string()),
             http_protocol_ipv6: Some(self.http_protocol_ipv6.to_string()),
             instance_metadata_tags: Some(self.instance_metadata_tags.to_string()),
+        }
+    }
+
+    /// These maintenance options as the modelled response shape reports them.
+    ///
+    /// The ONE reading of the stored maintenance settings, so the instance report and the
+    /// answer a modify of them gives cannot disagree about one instance: both the `Instance`
+    /// view ([`ComAmazonawsEc2Amazonec2State::report_instance_detail`]) and
+    /// `ModifyInstanceMaintenanceOptions` report them from here. Neither member carries a
+    /// transient state of its own — the shape declares none — so a setting a modify writes
+    /// is reported from that instant on.
+    pub fn maintenance_options(&self) -> InstanceMaintenanceOptions {
+        InstanceMaintenanceOptions {
+            auto_recovery: Some(self.auto_recovery.to_string()),
+            reboot_migration: Some(self.reboot_migration.to_string()),
         }
     }
 
@@ -872,14 +897,12 @@ impl ComAmazonawsEc2Amazonec2State {
             // targets none, so it reports the preference alone.
             capacity_reservation_target: None,
         });
-        view.maintenance_options = Some(InstanceMaintenanceOptions {
-            auto_recovery: Some(detail.auto_recovery.to_string()),
-            // "This setting only applies to supported instances that have a scheduled
-            // reboot event" (`InstanceMaintenanceOptions$RebootMigration`), and the setting
-            // itself is a property of the instance either way: an instance nothing has
-            // disabled migration for reports the `default` behaviour.
-            reboot_migration: Some(REBOOT_MIGRATION_DEFAULT.to_string()),
-        });
+        // "This setting only applies to supported instances that have a scheduled reboot
+        // event" (`InstanceMaintenanceOptions$RebootMigration`), and the setting itself is a
+        // property of the instance either way: an instance nothing has disabled migration
+        // for reports the `default` behaviour, and one a modify has disabled it for reports
+        // that — read off the record through the one reading of these options.
+        view.maintenance_options = Some(detail.maintenance_options());
         view.network_performance_options = Some(InstanceNetworkPerformanceOptions {
             bandwidth_weighting: Some(detail.bandwidth_weighting.to_string()),
         });
