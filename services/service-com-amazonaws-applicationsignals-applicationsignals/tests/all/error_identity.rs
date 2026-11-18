@@ -34,7 +34,7 @@ use crate::refusal_wording::assert_work_item_wording;
 // The sentence a create whose name is already stored is refused with, and the assertion that
 // it names the stored record: owned by the suite that holds this service's refusal prose and
 // applied here to this suite's rows too, so the two cannot drift.
-use crate::refusal_prose::assert_names_the_stored_slo;
+use crate::refusal_prose::assert_identifier_taken;
 
 /// The `ResourceType` every SLO failure reports: the resource's type NAME, capitalised.
 const SLO_RESOURCE_TYPE: &str = "Slo";
@@ -218,7 +218,7 @@ async fn a_repeated_create_conflicts_and_identifies_the_stored_slo() {
                 "case {name:?}/{index}: expected a ConflictException, got {error}"
             );
             let message = error["Message"].as_str().unwrap_or_default();
-            assert_names_the_stored_slo(&format!("{name:?}/{index}"), message, &stored_arn);
+            assert_identifier_taken(&format!("{name:?}/{index}"), message);
         }
 
         // The ARN the winning create returned addresses the record the store really holds: a
@@ -277,8 +277,8 @@ async fn create_signed_in(
 }
 
 /// Rule 2, the other half: the sentence does not depend on the refused request at all — a
-/// duplicate create signed in another region reads the identical sentence, naming the STORED
-/// record's ARN rather than the one this request's own credential scope would mint.
+/// duplicate create signed in another region reads the identical fixed sentence, which states
+/// no identifier and so carries nothing of either credential scope.
 ///
 /// The rows differ along the region the duplicate create is signed in, including the region
 /// the stored record itself carries, and along the name's form.
@@ -321,13 +321,17 @@ async fn a_conflict_sentence_does_not_depend_on_the_refused_request() {
                  {error}"
             );
             let message = error["Message"].as_str().unwrap_or_default();
-            assert_names_the_stored_slo(&label, message, &stored_arn);
-            // The ARN is the STORED record's, so a region this request was signed in but the
-            // record does not carry is nowhere in the sentence.
+            assert_identifier_taken(&label, message);
+            // The sentence is fixed text, so neither the stored record's ARN nor a region
+            // this request happened to be signed in is anywhere in it.
+            assert!(
+                !message.contains(&stored_arn),
+                "case {label}: expected a sentence naming no identifier, got {message:?}"
+            );
             if region != REGION {
                 assert!(
                     !message.contains(region),
-                    "case {label}: expected the stored record's ARN, which carries no \
+                    "case {label}: expected this class's fixed sentence, which carries no \
                      {region:?}, got {message:?}"
                 );
             }

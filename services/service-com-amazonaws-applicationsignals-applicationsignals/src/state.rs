@@ -861,16 +861,17 @@ pub fn slo_not_found(region: &str, id: &str) -> ResourceNotFoundException {
 /// The predicate [`slo_arn_sentence`] states about an SLO this service does not hold.
 const SLO_DOES_NOT_EXIST: &str = "does not exist";
 
-/// The predicate [`slo_arn_sentence`] states about an SLO this service ALREADY holds, which
-/// is what refuses a create under a name that is taken.
-const SLO_ALREADY_EXISTS: &str = "already exists";
+/// The ONE sentence this service refuses a create whose identifier is already taken with:
+/// fixed text alone, naming NO identifier — the conflict is about the identifier the request
+/// itself carried, so the refusal states the class of the collision rather than an ARN.
+pub const SLO_IDENTIFIER_TAKEN: &str = "A resource with the same identifier already exists";
 
 /// The ONE sentence this service words a refusal ABOUT ONE PARTICULAR SLO IT CANNOT RESOLVE
 /// with: the resource's capitalised type name ([`SLO_RESOURCE_TYPE`]), the ARN that addresses
 /// it in single quotes, and the predicate saying what is wrong with it, closed by a period.
 ///
-/// The only variable part is the ARN of the SLO the refusal is about, whether that is one
-/// this service cannot resolve or one it already holds ([`slo_already_exists`]).
+/// The only variable part is the ARN of the SLO the refusal is about, which is one this
+/// service cannot resolve.
 fn slo_arn_sentence(arn: &str, predicate: &str) -> String {
     format!("{SLO_RESOURCE_TYPE} with arn '{arn}' {predicate}.")
 }
@@ -985,18 +986,15 @@ pub fn tagged_resource_type(resource_arn: &str) -> &'static str {
 }
 
 /// The modelled `ConflictException` a create is refused with when the SLO name it sent is
-/// already stored: the same sentence every other refusal about one particular SLO is worded
-/// in ([`slo_arn_sentence`]), stating the ARN of the SLO that holds the identifier and the
-/// predicate that it already exists.
+/// already stored: [`SLO_IDENTIFIER_TAKEN`], this error class's own fixed sentence.
 ///
-/// `arn` is the STORED record's own ARN, read off the SLO the store holds under that name, so
-/// the refusal addresses the resource that exists rather than one derived from the refused
-/// request — a duplicate create signed in another Region reads the ARN of the record it
-/// collided with. The sentence therefore does not depend on the refused request at all, which
-/// is also what makes every loser of a concurrent race read one identical message.
-pub fn slo_already_exists(arn: &str) -> ConflictException {
+/// It names NOTHING of the request and nothing of the stored record — a caller that sent an
+/// identifier is told that identifier is taken — so every refused create reads one identical
+/// message, sequential or racing, and a client cannot learn an ARN of another Region's
+/// resource from it.
+pub fn slo_already_exists() -> ConflictException {
     ConflictException {
-        message: slo_arn_sentence(arn, SLO_ALREADY_EXISTS),
+        message: SLO_IDENTIFIER_TAKEN.to_string(),
     }
 }
 

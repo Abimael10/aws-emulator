@@ -1085,14 +1085,11 @@ async fn delete(router: &MultiServiceRouter, params: &[(String, String)]) -> (u1
     call(router, REGION, "DeleteInstanceEventWindow", params).await
 }
 
-/// The code the event-window DESCRIBE answers for an id the account holds no window for:
-/// ONE word, where the rest of this service answers the dotted `Invalid<Resource>Id.NotFound`.
+/// The code EVERY event-window operation answers for an id the account holds no window for —
+/// the describe that resolves a list of them and the operations addressed to one window, the
+/// delete among them: ONE word, where the rest of this service answers the dotted
+/// `Invalid<Resource>Id.NotFound`.
 const WINDOW_NOT_FOUND: &str = "InvalidInstanceEventWindowIDNotFound";
-
-/// The code an operation ADDRESSED TO ONE window — the delete among them — answers for an id
-/// the account holds no window for: the dotted form, which is what those operations' recorded
-/// refusals carry.
-const ADDRESSED_WINDOW_NOT_FOUND: &str = "InvalidInstanceEventWindowId.NotFound";
 
 /// RULE 5: "deletes the specified event window" — the delete reports the `deleting` state of
 /// the window it took away, that window is gone for every later caller (the describe by id
@@ -1163,7 +1160,7 @@ async fn deleting_a_window_takes_exactly_it_out_of_the_store() {
         let (status, body) = delete(&router, &[p("InstanceEventWindowId", doomed.clone())]).await;
         assert_eq!(
             (status, error_code(&body).as_str()),
-            (400, ADDRESSED_WINDOW_NOT_FOUND),
+            (400, WINDOW_NOT_FOUND),
             "case {case:?}: a second delete must be refused, got {status} with body {body}"
         );
         assert_eq!(
@@ -1259,20 +1256,33 @@ async fn a_window_that_carries_targets_is_deleted_only_with_the_force_flag() {
 }
 
 // ---------------------------------------------------------------------------
-// RULE 6: an `InstanceEventWindowId` this service cannot resolve is answered in the form the
-// operation's own answer takes — the dotted not-found code and its singular sentence for an
-// operation ADDRESSED TO ONE window, the family's one-word code and bracketed list for the
-// DESCRIBE, which resolves a list of ids, and the malformed refusal for a value that is no
-// event window id at all, on every one of them
+// RULE 6: an `InstanceEventWindowId` this service cannot resolve is answered by the refusal
+// of the resolution that could not resolve it — the family's own code with its bracketed list
+// for the DESCRIBE over a LIST of ids, that code with the singular of the same sentence for
+// the DELETE over one, and this service's generic dotted not-found with its quoted sentence
+// for the operations that name a window beside what they would change — and the malformed
+// refusal for a value that is no event window id at all, on every one of them
 // ---------------------------------------------------------------------------
 
 /// The code every event-window operation answers a value that is no event window id at all.
 const WINDOW_ID_MALFORMED: &str = "InvalidInstanceEventWindowId.Malformed";
 
-/// The sentence an operation addressed to ONE window words for `id`: fixed text around the id
-/// the request carried, in single quotes and with no trailing period.
+/// The code an operation that names a window as an ordinary single-resource REFERENCE — the
+/// associate, the disassociate, the modify — answers for an id the account holds no window
+/// for: the dotted form every other resource of this service answers, which is what those
+/// operations' recorded refusals carry.
+const ADDRESSED_WINDOW_NOT_FOUND: &str = "InvalidInstanceEventWindowId.NotFound";
+
+/// The sentence those operations word for `id`: this service's quoted `does not exist`
+/// template, with no trailing period.
 fn does_not_exist(id: &str) -> String {
     format!("The instance-event-window ID '{id}' does not exist")
+}
+
+/// The sentence the DELETE words for the one id it could not resolve: the SINGULAR of the
+/// family's own sentence.
+fn one_id_not_found(id: &str) -> String {
+    format!("Invalid Instance Event Window ID {id}.")
 }
 
 /// The sentence the DESCRIBE words for the ids it could not resolve: the bracketed list.
@@ -1300,8 +1310,8 @@ fn malformed_ids() -> Vec<(&'static str, &'static str)> {
     ]
 }
 
-/// One operation addressed to a SINGLE event window: its name and the parameters that address
-/// `window_id` through it.
+/// One operation addressed to a SINGLE event window: its name, the parameters that address
+/// `window_id` through it, and the refusal it words for an id it could not resolve.
 ///
 /// From the model (`smithy_query(query="operation",
 /// operation="AssociateInstanceEventWindow,DisassociateInstanceEventWindow,
@@ -1312,9 +1322,11 @@ fn malformed_ids() -> Vec<(&'static str, &'static str)> {
 struct Addressed {
     operation: &'static str,
     params: fn(&str) -> Params,
+    code: &'static str,
+    sentence: fn(&str) -> String,
 }
 
-/// The four of them.
+/// The four of them, each with the refusal its own recorded answer carries.
 fn addressed_operations() -> Vec<Addressed> {
     vec![
         Addressed {
@@ -1326,6 +1338,8 @@ fn addressed_operations() -> Vec<Addressed> {
                     p("AssociationTarget.InstanceTag.1.Value", "platform"),
                 ]
             },
+            code: ADDRESSED_WINDOW_NOT_FOUND,
+            sentence: does_not_exist,
         },
         Addressed {
             operation: "DisassociateInstanceEventWindow",
@@ -1336,14 +1350,22 @@ fn addressed_operations() -> Vec<Addressed> {
                     p("AssociationTarget.InstanceTag.1.Value", "platform"),
                 ]
             },
+            code: ADDRESSED_WINDOW_NOT_FOUND,
+            sentence: does_not_exist,
         },
         Addressed {
             operation: "ModifyInstanceEventWindow",
             params: |id| vec![p("InstanceEventWindowId", id), p("Name", "renamed")],
+            code: ADDRESSED_WINDOW_NOT_FOUND,
+            sentence: does_not_exist,
         },
+        // The DELETE resolves the window through the family's own id resolution, so it
+        // answers that family's code and the singular of its sentence.
         Addressed {
             operation: "DeleteInstanceEventWindow",
             params: |id| vec![p("InstanceEventWindowId", id)],
+            code: WINDOW_NOT_FOUND,
+            sentence: one_id_not_found,
         },
     ]
 }
@@ -1365,7 +1387,8 @@ async fn seed_one_window(router: &MultiServiceRouter, case: &str) -> String {
 }
 
 /// RULE 6: every operation addressed to ONE window answers an id the account holds no window
-/// for with the dotted not-found code and the sentence naming that id.
+/// for with the not-found refusal its own resolution words — the code and the sentence of that
+/// refusal, naming that id.
 #[tokio::test]
 async fn an_operation_addressed_to_one_window_reports_an_unheld_id_as_not_found() {
     let router = emulator();
@@ -1382,8 +1405,8 @@ async fn an_operation_addressed_to_one_window_reports_an_unheld_id_as_not_found(
                 ),
                 (
                     400,
-                    ADDRESSED_WINDOW_NOT_FOUND,
-                    does_not_exist(id).as_str()
+                    operation.code,
+                    (operation.sentence)(id).as_str()
                 ),
                 "case {case:?} on {}: expected the not-found refusal naming {id}, got {status} \
                  with body {body}",
@@ -1409,14 +1432,10 @@ async fn an_operation_addressed_to_one_window_reports_an_unheld_id_as_not_found(
 }
 
 /// RULE 6, the other half: the describe resolves a LIST, so it reports the ids it could not
-/// resolve as a list, under this family's one-word code — a different answer from the one every
-/// operation addressed to a single window gives, so a client can tell them apart.
+/// resolve as a bracketed list — a sentence no operation addressed to a single window words,
+/// so the two resolutions are told apart.
 #[tokio::test]
 async fn the_describe_reports_the_ids_it_could_not_resolve_as_a_list() {
-    assert_ne!(
-        ADDRESSED_WINDOW_NOT_FOUND, WINDOW_NOT_FOUND,
-        "the addressed and the bulk not-found codes must differ"
-    );
     let router = emulator();
     let held = seed_one_window(&router, "describe-not-found").await;
 

@@ -17,9 +17,9 @@
 //!
 //! The refusals: a request carrying no id is `MissingParameter`; a value that is no event
 //! window id at all is `InvalidInstanceEventWindowId.Malformed` before anything is looked up;
-//! an id the account holds no window for is `InvalidInstanceEventWindowId.NotFound`, the code
-//! every operation addressed to ONE window answers; and a `DryRun` request that would have
-//! succeeded is `DryRunOperation`.
+//! an id the account holds no window for is `InvalidInstanceEventWindowIDNotFound`, the code
+//! this family's own id resolution answers, in the SINGULAR of that resolution's sentence;
+//! and a `DryRun` request that would have succeeded is `DryRunOperation`.
 //!
 //! ## Shape of an operation
 //!
@@ -162,9 +162,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         }
         // A value that is not an event window id at all is refused BEFORE the lookup, the
-        // order every resource of this service keeps.
+        // order every resource of this service keeps, in the one wording every resolution of
+        // this id gives an unreadable one.
         if !state::instance_event_window_id_is_well_formed(&input.instance_event_window_id) {
-            return Err(state::unresolvable_addressed_instance_event_window_id(
+            return Err(state::malformed_instance_event_window_id(
                 &input.instance_event_window_id,
             ));
         }
@@ -184,17 +185,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // anybody called, so those moves are applied before this call reads it.
         store.materialize_due_transitions();
 
-        // An id this account holds no event window for has nothing to delete. The code and
-        // the sentence are the ones the operations ADDRESSED TO ONE window answer —
-        // the dotted `InvalidInstanceEventWindowId.NotFound` and the sentence naming that id
-        // ([`crate::state::invalid_instance_event_window_id`]) — where a describe resolves a
-        // LIST of ids and reports the ones it could not resolve as a list under the
-        // family's one-word code.
+        // An id this account holds no event window for has nothing to delete: the delete
+        // resolves the window through the FAMILY's own id resolution, so it answers that
+        // resolution's code and its sentence in the singular, naming the one id it was given
+        // ([`crate::state::invalid_one_instance_event_window_id_not_found`]) — where a request
+        // that resolves a LIST of ids reports the ones it could not resolve as a bracketed
+        // list, and an operation that names a window beside what it would change answers this
+        // service's generic `does not exist` refusal instead.
         let Some(record) = store
             .instance_event_windows
             .get(&input.instance_event_window_id)
         else {
-            return Err(state::invalid_instance_event_window_id(
+            return Err(state::invalid_one_instance_event_window_id_not_found(
                 &input.instance_event_window_id,
             ));
         };

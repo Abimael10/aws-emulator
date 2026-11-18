@@ -267,7 +267,7 @@ fn refusals() -> Vec<Refusal> {
         Refusal {
             action: "DeleteInstanceEventWindow",
             params: vec![param("InstanceEventWindowId", &event_window)],
-            code: "InvalidInstanceEventWindowId.NotFound".to_string(),
+            code: ec2::state::INVALID_INSTANCE_EVENT_WINDOW_ID_NOT_FOUND.to_string(),
             status: 400,
         },
         Refusal {

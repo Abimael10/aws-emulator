@@ -9,10 +9,9 @@
 //!   must be populated, and nothing of the rest of the request;
 //! * an update that would change a stored SLO's evaluation kind states the DIRECTION it
 //!   attempted, read off the stored record's kind and the kind of the supplied config;
-//! * a create whose name is already stored states the ARN of the STORED record that holds
-//!   that name and the predicate that it already exists — read off the record rather than
-//!   minted from the refused request, so the same sentence reaches every refused create,
-//!   sequential or racing;
+//! * a create whose name is already stored states that an identifier is taken and NOTHING of
+//!   the request or of the record that holds it — one fixed sentence, so the same message
+//!   reaches every refused create, sequential or racing;
 //! * the TAGGING plane, which addresses every kind of resource by `ResourceArn` alone, names
 //!   the resource generically and echoes the ARN the request carried, whichever kind that ARN
 //!   addresses;
@@ -45,13 +44,10 @@ use crate::tag_attachment::tag_resource;
 pub(crate) const MISSING_SLI_CONFIG: &str =
     "Either SliConfig or RequestBasedSliConfig must be populated";
 
-/// The sentence a create whose `Name` is already stored is refused with: this service's one
-/// sentence about a particular SLO — the resource's capitalised type name, the ARN of the
-/// STORED record that holds the name, and the predicate that it already exists, closed by a
-/// period.
-pub(crate) fn identifier_taken(stored_arn: &str) -> String {
-    format!("Slo with arn '{stored_arn}' already exists.")
-}
+/// The sentence a create whose `Name` is already stored is refused with: this error class's
+/// own FIXED sentence, which names no identifier at all — neither the name the request sent
+/// nor an ARN of the record that holds it.
+pub(crate) const IDENTIFIER_TAKEN: &str = "A resource with the same identifier already exists";
 
 /// The sentence the `ConflictException` shape itself is DOCUMENTED with
 /// (`smithy_query(query="shape",shape="ConflictException")`). A shape's documentation is not
@@ -342,17 +338,15 @@ async fn an_update_that_switches_the_evaluation_kind_states_the_direction() {
     }
 }
 
-/// Assert that `message` is the whole sentence of the taken-identifier conflict class: it
-/// states the ARN of the STORED record that holds the name, and it is not the error shape's
-/// documentation.
+/// Assert that `message` is the whole sentence of the taken-identifier conflict class: this
+/// class's fixed sentence, and not the error shape's documentation.
 ///
 /// `pub(crate)` so the sibling suite that asserts the same rule over its own rows checks it
 /// through this one spelling rather than a second copy.
-pub(crate) fn assert_names_the_stored_slo(label: &str, message: &str, stored_arn: &str) {
-    let expected = identifier_taken(stored_arn);
+pub(crate) fn assert_identifier_taken(label: &str, message: &str) {
     assert_eq!(
-        message, expected,
-        "case {label}: expected {expected:?}, got {message:?}"
+        message, IDENTIFIER_TAKEN,
+        "case {label}: expected {IDENTIFIER_TAKEN:?}, got {message:?}"
     );
     assert_ne!(
         message, CONFLICT_SHAPE_DOC,
@@ -362,14 +356,14 @@ pub(crate) fn assert_names_the_stored_slo(label: &str, message: &str, stored_arn
 }
 
 /// A create under a `Name` already stored is refused 409 `ConflictException` with the sentence
-/// of that error class, which states the ARN of the stored record that holds the name.
+/// of that error class, which states that the identifier is taken and nothing else.
 ///
 /// The rows differ along the name's form — the character classes the modelled
 /// `ServiceLevelObjectiveName` pattern `^[0-9A-Za-z][-._0-9A-Za-z ]{0,126}[0-9A-Za-z]$` admits
 /// — including the shortest name it admits and one of its maximum length — and along the rest
 /// of the repeated request, which the wording does not depend on.
 #[tokio::test]
-async fn a_create_whose_identifier_is_taken_states_the_stored_slos_arn() {
+async fn a_create_whose_identifier_is_taken_is_refused_with_that_classs_sentence() {
     let longest = format!("a{}z", "b".repeat(126));
     let names = vec![
         "taken-slo".to_string(),
@@ -426,7 +420,12 @@ async fn a_create_whose_identifier_is_taken_states_the_stored_slos_arn() {
                 "case {label}: expected a ConflictException, got {answer}"
             );
             let message = answer["Message"].as_str().unwrap_or_default();
-            assert_names_the_stored_slo(&label, message, &stored_arn);
+            assert_identifier_taken(&label, message);
+            // The sentence is fixed text: the stored record's ARN is not in it.
+            assert!(
+                !message.contains(&stored_arn),
+                "case {label}: expected a sentence naming no identifier, got {message:?}"
+            );
         }
 
         // Round trip: the refused creates left the record the store holds under that name
@@ -463,8 +462,8 @@ async fn a_create_whose_identifier_is_taken_states_the_stored_slos_arn() {
 }
 
 /// The SAME sentence reaches every loser of a RACE: of N creates arriving together on one
-/// name, exactly one is admitted and each of the other N-1 reads the sentence naming the ARN
-/// of the record that won — the one identifier the conflict is about.
+/// name, exactly one is admitted and each of the other N-1 reads this conflict class's one
+/// fixed sentence.
 ///
 /// The rows differ along how many callers race (two, and a pool large enough that several
 /// losers are refused from different threads) and along the name's form, and each racer sends
@@ -527,7 +526,11 @@ async fn every_loser_of_a_create_race_reads_the_same_sentence() {
                 "case {label}: expected a ConflictException, got {loser}"
             );
             let message = loser["Message"].as_str().unwrap_or_default();
-            assert_names_the_stored_slo(&label, message, &stored_arn);
+            assert_identifier_taken(&label, message);
+            assert!(
+                !message.contains(&stored_arn),
+                "case {label}: expected a sentence naming no identifier, got {message:?}"
+            );
         }
 
         // One winner means one stored record, and it is the one the admitted create answered.
@@ -547,15 +550,15 @@ async fn every_loser_of_a_create_race_reads_the_same_sentence() {
     }
 }
 
-/// The ARN a conflict states ADDRESSES the stored record: reading the SLO by the very ARN the
-/// refusal's sentence named answers the record the create that won stored, so the sentence
-/// identifies a resource a client can resolve rather than reciting a value.
+/// A conflict's sentence states NO identifier: neither the name the refused request sent nor
+/// the ARN of the record that holds it is anywhere in it — while the record itself stays
+/// readable by that ARN, so what the refusal withholds is wording and not state.
 ///
 /// The rows differ along the name's form and along which service level indicator the stored
-/// record carries, which the sentence does not depend on: the ARN is the resource's whatever
+/// record carries, which the sentence does not depend on: it is one fixed sentence whatever
 /// the record holds.
 #[tokio::test]
-async fn the_arn_a_conflict_states_addresses_the_stored_slo() {
+async fn a_conflict_sentence_states_no_identifier() {
     // (the name, the member carrying the indicator, its config)
     let rows: Vec<(&str, &str, Value)> = vec![
         (
@@ -597,29 +600,30 @@ async fn the_arn_a_conflict_states_addresses_the_stored_slo() {
             "case {name:?}: expected HTTP 409 for a taken identifier, got {status} with {refusal}"
         );
         let message = refusal["Message"].as_str().unwrap_or_default();
-        assert_names_the_stored_slo(name, message, &stored_arn);
+        assert_identifier_taken(name, message);
+        assert!(
+            !message.contains(&stored_arn) && !message.contains(*name),
+            "case {name:?}: expected a sentence naming neither the name nor the ARN, got \
+             {message:?}"
+        );
 
-        // The ARN the sentence stated, taken out of the sentence itself: a read by it answers
-        // the stored record, so the refusal handed the caller a usable identifier.
-        let stated = message
-            .split('\'')
-            .nth(1)
-            .unwrap_or_else(|| panic!("case {name:?}: the sentence quotes an ARN: {message:?}"));
+        // The record the conflict was about is still the stored one, read back by its own
+        // ARN: the refusal wrote nothing and withheld only the identifier from its prose.
         let (status, fetched) = call(
             &router,
             "GET",
-            &format!("/slo/{}", arn_uri_segment(&stated.replace(' ', "%20"))),
+            &format!("/slo/{}", arn_uri_segment(&stored_arn.replace(' ', "%20"))),
             None,
         )
         .await;
         assert_eq!(
             status, 200,
-            "case {name:?}: expected the stated ARN {stated:?} to resolve, got {status} with \
-             {fetched}"
+            "case {name:?}: expected the stored ARN {stored_arn:?} to resolve, got {status} \
+             with {fetched}"
         );
         assert_eq!(
             fetched["Slo"], created["Slo"],
-            "case {name:?}: expected the stated ARN to address the stored record, got {:?}",
+            "case {name:?}: expected the stored ARN to address the stored record, got {:?}",
             fetched["Slo"]
         );
     }

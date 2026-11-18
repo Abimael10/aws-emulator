@@ -41,5 +41,10 @@ chrono = { version = "0.4.31", default-features = false, features = ["std"] }
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
 
+[dev-dependencies]
+# Declares one module per `tests/all/<name>.rs` from `tests/all/main.rs`, so this crate's one
+# integration-test target picks each suite up from its own file.
+automod = { workspace = true }
+
 [lints]
 workspace = true
