@@ -395,6 +395,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 Some(parent.to_string())
             }
             (None, parent) => {
+                // A name the repository holds only in its TAG namespace
+                // (`refs/tags/<name>`, which a git push writes) is a tag name rather
+                // than a branch name, which the model has its own error for — and a
+                // repository holding a tag is not an empty one, so there is no
+                // branch to create for it either.
+                if repository.git_tags.contains_key(&input.branch_name) {
+                    return Err(PutFileErrorModeled::BranchNameIsTagNameException(
+                        BranchNameIsTagNameException {
+                            message: Some(
+                                crate::state::BRANCH_NAME_IS_TAG_NAME_MESSAGE.to_string(),
+                            ),
+                        },
+                    )
+                    .into());
+                }
                 // The branch does not exist. CodeCommit creates it only for an empty
                 // repository; otherwise the branch has to exist already.
                 if !repository.branches.is_empty() {

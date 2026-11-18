@@ -493,6 +493,19 @@ fn resolve_parent(
             Ok(Some(parent.to_string()))
         }
         (None, parent) => {
+            // A name the repository holds only in its TAG namespace
+            // (`refs/tags/<name>`, which a git push writes) is a tag name rather
+            // than a branch name, which the model has its own error for — and a
+            // repository holding a tag is not an empty one, so there is no branch
+            // to create for it either.
+            if repository.git_tags.contains_key(branch_name) {
+                return Err(CreateCommitErrorModeled::BranchNameIsTagNameException(
+                    BranchNameIsTagNameException {
+                        message: Some(crate::state::BRANCH_NAME_IS_TAG_NAME_MESSAGE.to_string()),
+                    },
+                )
+                .into());
+            }
             if !repository.branches.is_empty() {
                 return Err(CreateCommitErrorModeled::BranchDoesNotExistException(
                     BranchDoesNotExistException {

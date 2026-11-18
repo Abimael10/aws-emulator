@@ -323,10 +323,10 @@ impl Repository {
     /// The commit a `commitSpecifier` names. `CommitName` documents the forms as
     /// "the branch, tag, HEAD, or other fully qualified reference used to identify
     /// a commit", so a branch name, the fully qualified reference of a branch
-    /// (`refs/heads/<branch>`), `HEAD` (the repository's default branch) and the id
-    /// of a commit this repository holds all resolve here. `None` when the
-    /// specifier names none of them. This repository holds no tags, so a tag
-    /// reference resolves to nothing until tags are stored.
+    /// (`refs/heads/<branch>`), `HEAD` (the repository's default branch), a TAG —
+    /// by its own name or its fully qualified reference (`refs/tags/<tag>`) — and
+    /// the id of a commit this repository holds all resolve here. `None` when the
+    /// specifier names none of them.
     pub fn resolve_commit(&self, specifier: &str) -> Option<&Commit> {
         // A branch of that literal name comes first, so the reference forms below
         // only resolve what the bare name could not — a repository that really
@@ -336,12 +336,42 @@ impl Repository {
         }
         let referenced = match specifier {
             "HEAD" => self.default_branch.as_deref(),
-            other => other.strip_prefix("refs/heads/"),
+            other => other.strip_prefix(HEADS_PREFIX),
         };
         if let Some(branch) = referenced.and_then(|name| self.branches.get(name)) {
             return self.commits.get(&branch.commit_id);
         }
+        // A tag names a commit too, and an ANNOTATED tag names it through the tag
+        // object a push stored, so the reference is peeled to the commit it finally
+        // points at ([`Repository::peel`]) — the same commit a fetch advertises
+        // that reference as peeling to.
+        if let Some(object) = self
+            .resolve_tag(specifier)
+            .and_then(|tag| self.git_tags.get(tag))
+        {
+            let commit_id = self.peel(object).unwrap_or_else(|| object.clone());
+            if let Some(commit) = self.commits.get(&commit_id) {
+                return Some(commit);
+            }
+        }
         self.commits.get(specifier)
+    }
+
+    /// The TAG a reference specifier names: a tag of that literal name, or its
+    /// fully qualified reference (`refs/tags/<tag>`), which is the form a
+    /// `git push origin <tag>` writes and a client reads back. `None` where this
+    /// repository holds no such tag.
+    ///
+    /// A repository's tag namespace is the one a push writes
+    /// ([`Repository::git_tags`]); no operation of this service creates a tag. The
+    /// BRANCH namespace is resolved first wherever both are asked
+    /// ([`Repository::resolve_branch`], [`Repository::resolve_commit`]), so a name
+    /// held in both is the branch's.
+    pub fn resolve_tag(&self, specifier: &str) -> Option<&str> {
+        let name = specifier.strip_prefix(TAGS_PREFIX).unwrap_or(specifier);
+        self.git_tags
+            .get_key_value(name)
+            .map(|(held, _)| held.as_str())
     }
 
     /// The BRANCH a reference specifier names, in the same order

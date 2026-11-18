@@ -812,6 +812,18 @@ pub fn repository_name_exists_message(repository_name: &str) -> String {
 /// operation raises the code with no message rather than with this constant.
 pub const BRANCH_DOES_NOT_EXIST_MESSAGE: &str = "The specified branch does not exist";
 
+/// `BranchNameIsTagNameException`'s message: what a request naming a reference the
+/// repository holds only as a TAG, where a BRANCH name belongs, is refused with.
+///
+/// The template has no slot — the sentence names neither the reference, nor the
+/// repository, nor which member carried it — so every operation that needs a branch
+/// name refuses a tag name with the one constant, whichever member named it
+/// (`targetBranch`, the destination specifier a merge takes its target from, or a
+/// `branchName` a write commits on).
+pub const BRANCH_NAME_IS_TAG_NAME_MESSAGE: &str =
+    "The specified branch name is not valid. Branch names cannot be tag names. Provide a valid \
+     branch name, and then try again.";
+
 /// The commit specifier an operation reads when the request names none.
 ///
 /// `CommitName` documents the default on every member that takes one — GetFile's

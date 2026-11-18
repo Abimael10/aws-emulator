@@ -317,10 +317,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             None if repository.git_tags.contains_key(&input.branch_name) => {
                 return Err(DeleteFileErrorModeled::BranchNameIsTagNameException(
                     BranchNameIsTagNameException {
-                        message: Some(format!(
-                            "the name {} is a tag name in the repository {}, not a branch name",
-                            input.branch_name, input.repository_name
-                        )),
+                        message: Some(crate::state::BRANCH_NAME_IS_TAG_NAME_MESSAGE.to_string()),
                     },
                 )
                 .into());

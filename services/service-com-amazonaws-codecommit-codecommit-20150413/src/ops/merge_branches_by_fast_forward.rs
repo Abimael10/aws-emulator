@@ -288,19 +288,38 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the request names no valid target at all.
         let target = match requested_target {
             Some(target) => target.to_string(),
-            None => repository
-                .resolve_branch(destination_specifier)
-                .ok_or_else(|| {
-                    MergeBranchesByFastForwardErrorModeled::InvalidTargetBranchException(
-                        InvalidTargetBranchException {
-                            message: Some(format!(
+            None => match repository.resolve_branch(destination_specifier) {
+                Some(branch) => branch.to_string(),
+                // A destination specifier the repository holds only in its TAG
+                // namespace is what the merge would be applied to, so it is a tag
+                // name used as a branch name — the model's own error, rather than
+                // "no target at all".
+                None if repository.resolve_tag(destination_specifier).is_some() => {
+                    return Err(
+                        MergeBranchesByFastForwardErrorModeled::BranchNameIsTagNameException(
+                            BranchNameIsTagNameException {
+                                message: Some(
+                                    crate::state::BRANCH_NAME_IS_TAG_NAME_MESSAGE.to_string(),
+                                ),
+                            },
+                        )
+                        .into(),
+                    );
+                }
+                None => {
+                    return Err(
+                        MergeBranchesByFastForwardErrorModeled::InvalidTargetBranchException(
+                            InvalidTargetBranchException {
+                                message: Some(format!(
                                 "{destination_specifier} names no branch of the repository {}, so the merge has no target branch to be applied to",
                                 input.repository_name
                             )),
-                        },
-                    )
-                })?
-                .to_string(),
+                            },
+                        )
+                        .into(),
+                    );
+                }
+            },
         };
         // A name the repository holds only in its TAG namespace (`refs/tags/<name>`,
         // which a git push writes) is a tag name rather than a branch name, which
@@ -313,10 +332,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 return Err(
                     MergeBranchesByFastForwardErrorModeled::BranchNameIsTagNameException(
                         BranchNameIsTagNameException {
-                            message: Some(format!(
-                                "the name {target} is a tag name in the repository {}, not a branch name",
-                                input.repository_name
-                            )),
+                            message: Some(
+                                crate::state::BRANCH_NAME_IS_TAG_NAME_MESSAGE.to_string(),
+                            ),
                         },
                     )
                     .into(),

@@ -15,6 +15,12 @@
 //!    whichever face wrote them — a push or `PutFile`.
 //! 4. A push whose declared old value is not where the ref now stands is refused
 //!    by the server and leaves the ref unmoved.
+//! 5. A reference a push wrote into the TAG namespace is a tag for both faces: the
+//!    control plane resolves it as a commit SPECIFIER — `CommitName` is "the
+//!    branch, tag, HEAD, or other fully qualified reference used to identify a
+//!    commit" — and refuses it as a BRANCH name wherever an operation needs the
+//!    branch it changes. A push is the only way a tag exists, so this is the one
+//!    face that can create the state those refusals are about.
 //!
 //! Every case here builds its git objects, packfiles and pkt-lines in this file,
 //! with the names computed from the bytes, so the emulator is checked against
@@ -33,8 +39,9 @@ use smithy_server_runtime::MultiServiceRouter;
 // "the emulator", of a signed call, and of how a failed call's code is read, so
 // this suite and its siblings cannot drift about them. Only the GIT-specific
 // builders (pkt-lines, packfiles, objects) are local to this file.
+use crate::harness::error_with_message;
 use crate::repository_lifecycle::{
-    call, emulator, emulator_with_engine, error as error_code, from_base64, ok, string_at,
+    base64, call, emulator, emulator_with_engine, error as error_code, from_base64, ok, string_at,
 };
 
 /// The authority the shared harness addresses the emulator on, and so the one
@@ -2781,4 +2788,441 @@ async fn a_refusal_a_lookup_decides_is_answered_before_the_closure_walk() {
         code, "BranchDoesNotExistException",
         "case \"walk\": a refused command must move no ref, got {code}"
     );
+}
+
+// ------------------------------------------------- the tag namespace a push wrote
+
+/// The tag names the cases below push: a lightweight tag on the base commit, an
+/// annotated tag on the same commit, and a lightweight tag on the branch that is
+/// one commit ahead.
+const LIGHTWEIGHT_TAG: &str = "release-1";
+const ANNOTATED_TAG: &str = "release-2";
+const AHEAD_TAG: &str = "feature-1";
+
+/// The repository the two cases below share, the branch names in it, and the
+/// commits its references name.
+const TAGGED_REPOSITORY: &str = "tagged-refs";
+const TAGGED_DESTINATION: &str = "main";
+const TAGGED_SOURCE: &str = "feature";
+
+/// `BranchNameIsTagNameException`'s whole text, asserted as a literal rather than
+/// read from the crate: a fixed sentence for the error class, naming neither the
+/// reference, nor the repository, nor the member that carried it. The model
+/// documents the class as "The specified branch name is not valid because it is a
+/// tag name" (`smithy_query(query="shape",shape="BranchNameIsTagNameException")`).
+const BRANCH_NAME_IS_TAG_NAME: &str = "The specified branch name is not valid. Branch names \
+     cannot be tag names. Provide a valid branch name, and then try again.";
+
+/// A repository whose `main` holds one commit, whose `feature` is one commit ahead
+/// of it, and whose tag namespace holds the three tags above — each created the
+/// only way one can be, by a push of `refs/tags/<tag>`.
+struct Tagged {
+    router: MultiServiceRouter,
+    /// The commit `main` points at, which the lightweight and the annotated tag
+    /// both name.
+    base: String,
+    /// The commit `feature` points at, which [`AHEAD_TAG`] names.
+    ahead: String,
+}
+
+/// Build that repository, asserting the push's per-reference verdicts so a later
+/// row cannot read as passing on a tag that was never created.
+async fn tagged() -> Tagged {
+    let router = emulator();
+    let created = ok(
+        &router,
+        "CreateRepository",
+        &json!({ "repositoryName": TAGGED_REPOSITORY }),
+    )
+    .await;
+    let clone_url = string_at(&created, "/repositoryMetadata/cloneUrlHttp");
+
+    let written = ok(
+        &router,
+        "CreateCommit",
+        &tagged_commit_body(TAGGED_DESTINATION, None, "base.txt", b"base\n"),
+    )
+    .await;
+    let base = string_at(&written, "/commitId");
+    ok(
+        &router,
+        "CreateBranch",
+        &json!({
+            "repositoryName": TAGGED_REPOSITORY,
+            "branchName": TAGGED_SOURCE,
+            "commitId": base,
+        }),
+    )
+    .await;
+    let written = ok(
+        &router,
+        "CreateCommit",
+        &tagged_commit_body(TAGGED_SOURCE, Some(&base), "ahead.txt", b"ahead\n"),
+    )
+    .await;
+    let ahead = string_at(&written, "/commitId");
+
+    // One push creating all three tags. The annotated tag's object travels in the
+    // pack; the commits the references name are already in the object store,
+    // because the API face wrote them there.
+    let tag_object = annotated_tag(&base, ANNOTATED_TAG, "release two\n");
+    let annotated_id = id_of(&tag_object);
+    let reply = rpc(
+        &router,
+        &clone_url,
+        "git-receive-pack",
+        push_body(
+            &[
+                command(
+                    NULL_ID,
+                    &base,
+                    &format!("refs/tags/{LIGHTWEIGHT_TAG}"),
+                    "report-status",
+                ),
+                command(
+                    NULL_ID,
+                    &annotated_id,
+                    &format!("refs/tags/{ANNOTATED_TAG}"),
+                    "",
+                ),
+                command(NULL_ID, &ahead, &format!("refs/tags/{AHEAD_TAG}"), ""),
+            ],
+            std::slice::from_ref(&tag_object),
+        ),
+    )
+    .await;
+    let (report, _) = parse_pkts(&reply.body);
+    let expected: Vec<String> = vec![
+        "unpack ok\n".to_string(),
+        format!("ok refs/tags/{LIGHTWEIGHT_TAG}\n"),
+        format!("ok refs/tags/{ANNOTATED_TAG}\n"),
+        format!("ok refs/tags/{AHEAD_TAG}\n"),
+    ];
+    assert_eq!(
+        report, expected,
+        "the push must create all three tags, got {report:?}"
+    );
+
+    Tagged {
+        router,
+        base,
+        ahead,
+    }
+}
+
+/// A `CreateCommit` body writing one file on `branch` of that repository.
+fn tagged_commit_body(branch: &str, parent: Option<&str>, path: &str, content: &[u8]) -> Value {
+    let mut body = json!({
+        "repositoryName": TAGGED_REPOSITORY,
+        "branchName": branch,
+        "commitMessage": format!("{branch}: {path}"),
+        "putFiles": [{ "filePath": path, "fileContent": base64(content) }],
+    });
+    if let Some(parent) = parent {
+        body["parentCommitId"] = json!(parent);
+    }
+    body
+}
+
+/// A merge body naming the two specifiers, and a `targetBranch` only where a row
+/// asks for one.
+fn tagged_merge_body(source: &str, destination: &str, target: Option<&str>) -> Value {
+    let mut body = json!({
+        "repositoryName": TAGGED_REPOSITORY,
+        "sourceCommitSpecifier": source,
+        "destinationCommitSpecifier": destination,
+    });
+    if let Some(target) = target {
+        body["targetBranch"] = json!(target);
+    }
+    body
+}
+
+#[tokio::test]
+async fn a_pushed_tag_resolves_as_a_commit_specifier() {
+    let repository = tagged().await;
+
+    // Every row names a commit through the tag namespace: by the tag's own name and
+    // by its fully qualified reference, for a tag pointing straight at a commit and
+    // for one pointing at a tag object that names it.
+    let rows: Vec<(&str, String, &str, String, &[u8])> = vec![
+        (
+            "a lightweight tag by name",
+            LIGHTWEIGHT_TAG.to_string(),
+            "base.txt",
+            repository.base.clone(),
+            b"base\n",
+        ),
+        (
+            "a lightweight tag by reference",
+            format!("refs/tags/{LIGHTWEIGHT_TAG}"),
+            "base.txt",
+            repository.base.clone(),
+            b"base\n",
+        ),
+        (
+            "an annotated tag by name",
+            ANNOTATED_TAG.to_string(),
+            "base.txt",
+            repository.base.clone(),
+            b"base\n",
+        ),
+        (
+            "an annotated tag by reference",
+            format!("refs/tags/{ANNOTATED_TAG}"),
+            "base.txt",
+            repository.base.clone(),
+            b"base\n",
+        ),
+        (
+            "a tag on a commit the default branch does not hold",
+            AHEAD_TAG.to_string(),
+            "ahead.txt",
+            repository.ahead.clone(),
+            b"ahead\n",
+        ),
+        (
+            "that tag by reference",
+            format!("refs/tags/{AHEAD_TAG}"),
+            "ahead.txt",
+            repository.ahead.clone(),
+            b"ahead\n",
+        ),
+    ];
+
+    for (label, specifier, path, commit, content) in rows {
+        let read = ok(
+            &repository.router,
+            "GetFile",
+            &json!({
+                "repositoryName": TAGGED_REPOSITORY,
+                "commitSpecifier": specifier,
+                "filePath": path,
+            }),
+        )
+        .await;
+        let read_commit = string_at(&read, "/commitId");
+        assert_eq!(
+            read_commit, commit,
+            "case {label:?}: reading at {specifier:?} must report the commit that tag names, \
+             got {read_commit:?}"
+        );
+        let read_content = content_of(&read);
+        assert_eq!(
+            read_content, content,
+            "case {label:?}: the file at {specifier:?}, got {read_content:?}"
+        );
+
+        // The same resolution through another member the model types `CommitName`,
+        // so the rule is the repository's rather than one operation's.
+        let folder = ok(
+            &repository.router,
+            "GetFolder",
+            &json!({
+                "repositoryName": TAGGED_REPOSITORY,
+                "commitSpecifier": specifier,
+                "folderPath": "/",
+            }),
+        )
+        .await;
+        let folder_commit = string_at(&folder, "/commitId");
+        assert_eq!(
+            folder_commit, commit,
+            "case {label:?}: GetFolder at {specifier:?} must report the same commit, got \
+             {folder_commit:?}"
+        );
+    }
+
+    // The contrast: a reference in the tag namespace this repository does NOT hold
+    // still names no commit at all.
+    let code = error_code(
+        &repository.router,
+        "GetFile",
+        &json!({
+            "repositoryName": TAGGED_REPOSITORY,
+            "commitSpecifier": "refs/tags/never-pushed",
+            "filePath": "base.txt",
+        }),
+        400,
+    )
+    .await;
+    assert_eq!(
+        code, "CommitDoesNotExistException",
+        "case \"a tag the repository does not hold\": expected CommitDoesNotExistException, \
+         got {code}"
+    );
+
+    // And the source side of a merge is a commit specifier like any other, so the
+    // tag of the commit `feature` holds names it — and the branch really advances
+    // there, which is what makes the refusals in the next case about the NAME.
+    let merged = ok(
+        &repository.router,
+        "MergeBranchesByFastForward",
+        &tagged_merge_body(
+            &format!("refs/tags/{AHEAD_TAG}"),
+            TAGGED_DESTINATION,
+            None,
+        ),
+    )
+    .await;
+    let reported = string_at(&merged, "/commitId");
+    assert_eq!(
+        reported, repository.ahead,
+        "case \"a tag as the source of a merge\": the merge must report the commit that tag \
+         names, got {reported:?}"
+    );
+    let branch = ok(
+        &repository.router,
+        "GetBranch",
+        &json!({
+            "repositoryName": TAGGED_REPOSITORY,
+            "branchName": TAGGED_DESTINATION,
+        }),
+    )
+    .await;
+    let tip = string_at(&branch, "/branch/commitId");
+    assert_eq!(
+        tip, repository.ahead,
+        "case \"a tag as the source of a merge\": the target branch must be left at that \
+         commit, got {tip:?}"
+    );
+    // The merge advanced a BRANCH: the tag namespace is only ever written by a push,
+    // so the tag still names what it was pushed at.
+    let read = ok(
+        &repository.router,
+        "GetFile",
+        &json!({
+            "repositoryName": TAGGED_REPOSITORY,
+            "commitSpecifier": format!("refs/tags/{LIGHTWEIGHT_TAG}"),
+            "filePath": "base.txt",
+        }),
+    )
+    .await;
+    let still = string_at(&read, "/commitId");
+    assert_eq!(
+        still, repository.base,
+        "case \"a tag after a merge\": a tag must still name the commit it was pushed at, got \
+         {still:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_pushed_tag_is_no_branch_name_for_any_operation_that_needs_one() {
+    let repository = tagged().await;
+    let lightweight_reference = format!("refs/tags/{LIGHTWEIGHT_TAG}");
+    let annotated_reference = format!("refs/tags/{ANNOTATED_TAG}");
+
+    // The rows span the two members a merge can carry the name in — the explicit
+    // target branch, and the destination specifier the target comes from when the
+    // request names no target — each merge strategy, both forms of the reference,
+    // both forms of the tag, and each write that commits on a branch the request
+    // names.
+    let rows: Vec<(&str, &str, Value)> = vec![
+        (
+            "a fast-forward whose destination specifier is a tag name",
+            "MergeBranchesByFastForward",
+            tagged_merge_body(TAGGED_SOURCE, LIGHTWEIGHT_TAG, None),
+        ),
+        (
+            "a fast-forward whose destination specifier is a tag reference",
+            "MergeBranchesByFastForward",
+            tagged_merge_body(TAGGED_SOURCE, &lightweight_reference, None),
+        ),
+        (
+            "a fast-forward whose destination specifier is an annotated tag reference",
+            "MergeBranchesByFastForward",
+            tagged_merge_body(TAGGED_SOURCE, &annotated_reference, None),
+        ),
+        (
+            "a fast-forward whose target branch is a tag name",
+            "MergeBranchesByFastForward",
+            tagged_merge_body(TAGGED_SOURCE, TAGGED_DESTINATION, Some(LIGHTWEIGHT_TAG)),
+        ),
+        (
+            "a squash merge whose destination specifier is a tag reference",
+            "MergeBranchesBySquash",
+            tagged_merge_body(TAGGED_SOURCE, &lightweight_reference, None),
+        ),
+        (
+            "a squash merge whose target branch is a tag name",
+            "MergeBranchesBySquash",
+            tagged_merge_body(TAGGED_SOURCE, TAGGED_DESTINATION, Some(ANNOTATED_TAG)),
+        ),
+        (
+            "a three-way merge whose destination specifier is a tag reference",
+            "MergeBranchesByThreeWay",
+            tagged_merge_body(TAGGED_SOURCE, &lightweight_reference, None),
+        ),
+        (
+            "a three-way merge whose target branch is a tag name",
+            "MergeBranchesByThreeWay",
+            tagged_merge_body(TAGGED_SOURCE, TAGGED_DESTINATION, Some(ANNOTATED_TAG)),
+        ),
+        (
+            "a file written on a tag name",
+            "PutFile",
+            json!({
+                "repositoryName": TAGGED_REPOSITORY,
+                "branchName": LIGHTWEIGHT_TAG,
+                "filePath": "written.txt",
+                "fileContent": base64(b"written\n"),
+            }),
+        ),
+        (
+            "a file deleted from a tag name",
+            "DeleteFile",
+            json!({
+                "repositoryName": TAGGED_REPOSITORY,
+                "branchName": ANNOTATED_TAG,
+                "filePath": "base.txt",
+                "parentCommitId": repository.base.clone(),
+            }),
+        ),
+        (
+            "a commit made on a tag name",
+            "CreateCommit",
+            tagged_commit_body(LIGHTWEIGHT_TAG, None, "made.txt", b"made\n"),
+        ),
+    ];
+
+    for (label, operation, body) in rows {
+        let (code, message) = error_with_message(&repository.router, operation, &body, 400).await;
+        assert_eq!(
+            code, "BranchNameIsTagNameException",
+            "case {label:?}: expected BranchNameIsTagNameException, got {code} with {message:?}"
+        );
+        assert_eq!(
+            message, BRANCH_NAME_IS_TAG_NAME,
+            "case {label:?}: the refusal's message is fixed for the class, got {message:?}"
+        );
+    }
+
+    // The contrasts: a name the repository holds in NEITHER namespace is simply no
+    // branch of it, and a destination specifier naming a commit without naming a
+    // reference leaves the merge no target to be applied to. Neither is a tag name.
+    let contrasts: Vec<(&str, Value, &str)> = vec![
+        (
+            "a target branch the repository does not hold",
+            tagged_merge_body(TAGGED_SOURCE, TAGGED_DESTINATION, Some("never-created")),
+            "BranchDoesNotExistException",
+        ),
+        (
+            "a destination specifier naming a commit id and no target branch",
+            tagged_merge_body(TAGGED_SOURCE, &repository.base, None),
+            "InvalidTargetBranchException",
+        ),
+    ];
+    for (label, body, expected) in contrasts {
+        let code = error_code(
+            &repository.router,
+            "MergeBranchesByFastForward",
+            &body,
+            400,
+        )
+        .await;
+        assert_eq!(
+            code, expected,
+            "case {label:?}: expected {expected}, got {code}"
+        );
+    }
 }
