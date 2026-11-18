@@ -147,6 +147,11 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+// What one member of the updated baseline carries: the one reading of an omitted member
+// every update of this service that takes a `Replace` flag holds to
+// (`crate::state::replacing_update`).
+use crate::state::replacing_update::{updated_member, updated_optional_member};
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -179,11 +184,6 @@ impl From<UpdatePatchBaselineErrorModeled> for UpdatePatchBaselineError {
         crate::scaffolded::Scaffolded::Modeled(modeled)
     }
 }
-
-// What one member of the updated baseline carries: the one reading of an omitted member
-// every update of this service that takes a `Replace` flag holds to
-// (`crate::state::replacing_update`).
-use crate::state::replacing_update::{updated_member, updated_optional_member};
 
 /// The `UpdatePatchBaseline` operation.
 ///
