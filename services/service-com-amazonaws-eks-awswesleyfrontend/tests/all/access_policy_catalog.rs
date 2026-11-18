@@ -8,6 +8,11 @@
 //! request: the rows differ along the Region the request is signed for, the page
 //! size the listing is driven at, the shape of a foreign page token, and whether
 //! the account holds any cluster at all.
+//!
+//! Two suites drive the paging walk, and they assert different things: the
+//! fixed-size one that ONE page size, held for a whole walk, still yields the
+//! published catalogue; the changing-size one that a token resumes the same
+//! catalogue when the NEXT request asks for a different page size.
 
 use std::collections::BTreeSet;
 
@@ -247,6 +252,66 @@ async fn every_access_policy_arn_is_the_service_owned_form() {
 // last page carries no token.
 // ---------------------------------------------------------------------------
 
+/// Follow `nextToken` to exhaustion, asking each page for
+/// `sizes[page % sizes.len()]` entries — an EMPTY `sizes` sends no `maxResults`
+/// at all — and answer the `(name, arn)` pairs the walk reported, in the order
+/// they arrived.
+///
+/// The paging contract itself lives HERE, in one copy both suites below drive: a
+/// page never holds more than it was asked for, a token is offered only for a
+/// non-empty page, every entry on every page carries the ARN its own name
+/// determines, and the walk terminates.
+async fn walk(router: &MultiServiceRouter, case: &str, sizes: &[usize]) -> Vec<(String, String)> {
+    let mut seen: Vec<(String, String)> = Vec::new();
+    let mut token: Option<String> = None;
+    let mut pages = 0usize;
+    loop {
+        let size = (!sizes.is_empty()).then(|| sizes[pages % sizes.len()]);
+        let query = match (size, &token) {
+            (Some(size), None) => format!("maxResults={size}"),
+            (Some(size), Some(value)) => format!("maxResults={size}&nextToken={value}"),
+            (None, None) => String::new(),
+            (None, Some(value)) => format!("nextToken={value}"),
+        };
+        let answer = list(router, &query).await;
+        assert_eq!(
+            answer.status, 200,
+            "case {case}: page {pages} ({query:?}): expected 200, got {answer:?}"
+        );
+        let page = entries_of(&answer);
+        if let Some(size) = size {
+            assert!(
+                page.len() <= size,
+                "case {case}: page {pages} may hold at most {size} entries, got {page:?}"
+            );
+        }
+        for (name, arn) in &page {
+            assert_eq!(
+                arn,
+                &format!("{EXPECTED_ARN_PREFIX}{name}"),
+                "case {case}: page {pages}: the ARN must name the policy, got {arn:?}"
+            );
+        }
+        seen.extend(page.iter().cloned());
+        pages += 1;
+        assert!(
+            pages <= EXPECTED_POLICIES.len() + 1,
+            "case {case}: paging did not terminate after {pages} pages, seen {seen:?}"
+        );
+        match answer.body["nextToken"].as_str() {
+            Some(next) => {
+                assert!(
+                    !page.is_empty(),
+                    "case {case}: page {pages} was empty but carried a token"
+                );
+                token = Some(next.to_owned());
+            }
+            None => break,
+        }
+    }
+    seen
+}
+
 #[tokio::test]
 async fn paging_at_any_size_yields_every_policy_exactly_once() {
     let router = emulator();
@@ -259,59 +324,27 @@ async fn paging_at_any_size_yields_every_policy_exactly_once() {
     // Rows span the modelled 1..100 range of `maxResults`: both published bounds, a
     // size that divides the catalogue unevenly, one that exceeds it, and the absent
     // case (a whole page).
-    let sizes: Vec<Option<usize>> = vec![
-        Some(1),
-        Some(2),
-        Some(3),
-        Some(whole.len()),
-        Some(whole.len() + 1),
-        Some(100),
-        None,
+    // Each row holds the ONE size its whole walk asks for; the empty row is the
+    // absent case, which sends no `maxResults` at all.
+    let rows: Vec<Vec<usize>> = vec![
+        vec![1],
+        vec![2],
+        vec![3],
+        vec![whole.len()],
+        vec![whole.len() + 1],
+        vec![100],
+        vec![],
     ];
-    for size in sizes {
-        let case = match size {
-            Some(size) => format!("maxResults={size}"),
-            None => "maxResults absent".to_string(),
+    for sizes in rows {
+        let case = match sizes.as_slice() {
+            [] => "maxResults absent".to_string(),
+            sizes => format!("maxResults={sizes:?}"),
         };
-        let mut seen: Vec<String> = Vec::new();
-        let mut token: Option<String> = None;
-        let mut pages = 0;
-        loop {
-            let query = match (size, &token) {
-                (Some(size), None) => format!("maxResults={size}"),
-                (Some(size), Some(value)) => format!("maxResults={size}&nextToken={value}"),
-                (None, None) => String::new(),
-                (None, Some(value)) => format!("nextToken={value}"),
-            };
-            let answer = list(&router, &query).await;
-            assert_eq!(
-                answer.status, 200,
-                "case {case}: expected 200, got {answer:?}"
-            );
-            let page = names_of(&answer);
-            if let Some(size) = size {
-                assert!(
-                    page.len() <= size,
-                    "case {case}: a page may not exceed the requested size, got {page:?}"
-                );
-            }
-            seen.extend(page.clone());
-            pages += 1;
-            assert!(
-                pages <= whole.len() + 1,
-                "case {case}: paging did not terminate after {pages} pages"
-            );
-            match answer.body["nextToken"].as_str() {
-                Some(next) => {
-                    assert!(
-                        !page.is_empty(),
-                        "case {case}: a token was returned for an empty page"
-                    );
-                    token = Some(next.to_owned());
-                }
-                None => break,
-            }
-        }
+        let seen: Vec<String> = walk(&router, &case, &sizes)
+            .await
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect();
         assert_eq!(
             seen, whole,
             "case {case}: paging to exhaustion must yield the whole catalogue once, got {seen:?}"
@@ -321,6 +354,46 @@ async fn paging_at_any_size_yields_every_policy_exactly_once() {
             unique.len(),
             seen.len(),
             "case {case}: no policy may be reported twice, got {seen:?}"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// RULE: a page token names the entry to resume AFTER, so it resumes the SAME
+// published catalogue whatever page size the next request asks for — every
+// policy EKS publishes, each paired with the ARN its own name determines, once
+// and in one order, however the page size changes mid-walk. A policy at the TAIL
+// of the sorted catalogue is reached only by following the token to the end, so
+// this is the walk that shows a tail entry missing from the published set.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn paging_resumes_the_whole_catalogue_when_the_page_size_changes() {
+    let router = emulator();
+
+    // Rows differ along how `maxResults` moves between pages — up, down, in a
+    // short cycle, and in an uneven one that never divides the catalogue — and
+    // along the magnitudes used (the modelled floor of 1, its ceiling of 100, and
+    // sizes in between).
+    let cycles: [(&str, &[usize]); 6] = [
+        ("one then a whole page", &[1, 100]),
+        ("a whole page then one", &[100, 1]),
+        ("growing", &[1, 2, 3, 4]),
+        ("shrinking", &[9, 4, 2, 1]),
+        ("alternating", &[7, 1]),
+        ("uneven", &[5, 3, 11, 2]),
+    ];
+    let expected: Vec<(String, String)> = EXPECTED_POLICIES
+        .iter()
+        .map(|name| ((*name).to_owned(), format!("{EXPECTED_ARN_PREFIX}{name}")))
+        .collect();
+
+    for (case, sizes) in cycles {
+        let seen = walk(&router, case, sizes).await;
+        assert_eq!(
+            seen, expected,
+            "case {case}: following the token to the end must yield the whole published \
+             catalogue once, got {seen:?}"
         );
     }
 }
