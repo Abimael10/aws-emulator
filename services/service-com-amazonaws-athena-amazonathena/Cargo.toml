@@ -69,6 +69,20 @@ regex = "1.13"
 # rather than by a splitter written here — the separator, the quoting and the line
 # terminators come from the table's own SerDe.
 csv = "1.4"
+# `parquet`: the objects under a table whose storage descriptor names the columnar Parquet
+# format ARE Parquet files, so the records a read decodes out of them are read by the Apache
+# implementation of that format — the same one this workspace already writes such objects
+# with. Pure Rust, like the codecs it needs: `snap` reads a `SNAPPY`-compressed object and
+# `flate2` a `GZIP`-compressed one, which are the two compressions a writer of these objects
+# chooses between.
+parquet = { version = "60", default-features = false, features = [
+    "snap",
+    "flate2-rust_backend",
+] }
+# `chrono`: a Parquet date or timestamp leaf carries a count of days, milliseconds or
+# microseconds from the epoch, and the calendar text a `date` or `timestamp` column holds it
+# as is read from a maintained date library rather than computed here.
+chrono = { version = "0.4", default-features = false, features = ["std"] }
 # `StatementType` is read off the PARSE of the submitted SQL rather than off its leading
 # word, with the maintained parser this workspace already uses for caller-supplied SQL.
 sqlparser = { version = "0.59", features = ["visitor"] }

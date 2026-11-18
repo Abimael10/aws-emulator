@@ -10,6 +10,9 @@
 //! by the SerDe the catalog recorded — never values synthesised from the query or from the
 //! table's definition.
 
+/// The records one object of the columnar Parquet format holds.
+mod parquet_objects;
+
 use ::std::collections::HashMap;
 
 use ::service_com_amazonaws_glue_awsglue::state as glue_state;
@@ -103,6 +106,9 @@ enum Decoder {
     },
     /// One row per line, each line a JSON document whose members are the columns.
     Json,
+    /// One row per record of a Parquet file, whose leaves are the columns
+    /// ([`parquet_objects`]).
+    Parquet,
 }
 
 /// Everything about one catalog table that decides what rows a read of it produces.
@@ -188,13 +194,7 @@ impl Budget {
     pub fn charge_row(&mut self, relation: &Relation, width: usize) -> Result<(), Failure> {
         self.charge_deadline()?;
         if self.rows_left == 0 {
-            return Err(Failure::emulator(format!(
-                "reading {}.{} would materialise more than the {} rows this emulator holds \
-                 for one query",
-                relation.database,
-                relation.table,
-                query_engine::MAX_MATERIALISED_ROWS
-            )));
+            return Err(Self::too_many_rows(relation));
         }
         if width > self.cells_left {
             return Err(Failure::emulator(format!(
@@ -208,6 +208,44 @@ impl Budget {
         self.rows_left -= 1;
         self.cells_left -= width;
         Ok(())
+    }
+
+    /// Charge `bytes` of DECODED object data against this budget.
+    ///
+    /// What an object holds once decoded is not what it was stored as: a columnar or
+    /// compressed object expands when it is read, so a read of one charges what it holds at
+    /// the size it decoded to, over and above the stored bytes it was already charged for.
+    pub fn charge_decoded(&mut self, relation: &Relation, bytes: usize) -> Result<(), Failure> {
+        self.charge_deadline()?;
+        if bytes > self.bytes_left {
+            return Err(Self::too_many_bytes(relation));
+        }
+        self.bytes_left -= bytes;
+        Ok(())
+    }
+
+    /// Why a read of `relation` that would hold more rows than one query materialises is
+    /// refused — the one wording for that refusal, wherever it is reached.
+    pub fn too_many_rows(relation: &Relation) -> Failure {
+        Failure::emulator(format!(
+            "reading {}.{} would materialise more than the {} rows this emulator holds \
+             for one query",
+            relation.database,
+            relation.table,
+            query_engine::MAX_MATERIALISED_ROWS
+        ))
+    }
+
+    /// Why a read of `relation` that would read more object data than one query reads is
+    /// refused; see [`Self::too_many_rows`].
+    pub fn too_many_bytes(relation: &Relation) -> Failure {
+        Failure::emulator(format!(
+            "reading {}.{} would scan more than the {} bytes this emulator reads \
+             for one query",
+            relation.database,
+            relation.table,
+            query_engine::MAX_MATERIALISED_BYTES
+        ))
     }
 
     /// Whether the time this emulator gives one statement is spent.
@@ -411,22 +449,24 @@ impl DataSource {
             }
             budget.charge_deadline()?;
             if object.body.len() > budget.bytes_left {
-                return Err(Failure::emulator(format!(
-                    "reading {}.{} would scan more than the {} bytes this emulator reads \
-                     for one query",
-                    self.relation.database,
-                    self.relation.table,
-                    query_engine::MAX_MATERIALISED_BYTES
-                )));
+                return Err(Budget::too_many_bytes(&self.relation));
             }
             budget.bytes_left -= object.body.len();
             scanned = scanned.saturating_add(object.body.len());
-            self.decode(&object.body, &mut rows, budget)?;
+            self.decode(
+                &object.body,
+                &format!("s3://{bucket_name}/{key}"),
+                &mut rows,
+                budget,
+            )?;
         }
         Ok((rows, scanned))
     }
 
     /// Decode one object's bytes into the rows it holds, appending them to `rows`.
+    ///
+    /// `split` is where the object this reads lives, which a failure to OPEN it at all names
+    /// — the unit of work Hive calls a split is one object of the table's location.
     ///
     /// STREAMING, and budget-charged BEFORE each row is built: one record is read, charged
     /// and converted at a time, so a read stops at the first row over budget instead of
@@ -434,6 +474,7 @@ impl DataSource {
     fn decode(
         &self,
         body: &[u8],
+        split: &str,
         rows: &mut Vec<Vec<::rusqlite::types::Value>>,
         budget: &mut Budget,
     ) -> Result<(), Failure> {
@@ -500,8 +541,68 @@ impl DataSource {
                     }));
                 }
             }
+            // A Parquet object carries its own schema, so what each of its leaves holds is
+            // the format's own reading of it and the record's values are taken by NAME —
+            // the header lines a text SerDe skips are a property of TEXT objects and have
+            // no counterpart here.
+            Decoder::Parquet => {
+                // What the object's own footer declares a read of it would decode, checked
+                // against what this query may still hold BEFORE a page of it is read: a
+                // columnar object is held compressed, so what reading it costs is what it
+                // decodes to and not the stored bytes already charged above.
+                let limits = parquet_objects::Limits {
+                    records: budget.rows_left,
+                    decoded_bytes: budget.bytes_left,
+                };
+                parquet_objects::for_each_record(
+                    body,
+                    &self.relation,
+                    split,
+                    limits,
+                    |record| {
+                        budget.charge_row(&self.relation, width)?;
+                        let values = parquet_objects::values_of(record);
+                        budget.charge_decoded(
+                            &self.relation,
+                            values
+                                .values()
+                                .map(parquet_objects::Cell::size)
+                                .fold(0usize, usize::saturating_add),
+                        )?;
+                        rows.push(self.parquet_row(&materialised, &values));
+                        Ok(())
+                    },
+                )?;
+            }
         }
         Ok(())
+    }
+
+    /// One Parquet record as the row it holds: one value per MATERIALISED column, each read
+    /// out of the record by its column's own NAME.
+    fn parquet_row(
+        &self,
+        materialised: &[usize],
+        values: &HashMap<String, parquet_objects::Cell>,
+    ) -> Vec<::rusqlite::types::Value> {
+        materialised
+            .iter()
+            .filter_map(|position| self.columns.get(*position))
+            .map(|column| {
+                let held = values.get(&glue_state::fold_name(&column.name));
+                match held {
+                    // Binary data is held as the bytes the object carries: a binary
+                    // column's value is not text, so it is never read through one.
+                    Some(parquet_objects::Cell::Bytes(data))
+                        if engine_type(&column.data_type) == TYPE_BLOB =>
+                    {
+                        ::rusqlite::types::Value::Blob(data.clone())
+                    }
+                    Some(held) => self.cell(column, Some(&held.text())),
+                    None => self.cell(column, None),
+                }
+            })
+            .collect()
     }
 
     /// One record as the row it holds: one value per MATERIALISED column, in the table's
@@ -691,14 +792,21 @@ fn is_iceberg(
 ///
 /// BOTH halves of what the catalog records decide it: the serialization library says how a
 /// record's fields are written, and the input format says how the objects themselves are.
-/// A table whose input format is not the one delimited text is read with holds data in a
-/// format this engine cannot decode, whatever its SerDe says — so it is reported rather
-/// than decoded as text.
+/// A table whose objects are neither Parquet files nor the delimited text an input format of
+/// that kind names holds data in a format this engine cannot decode, whatever its SerDe says
+/// — so it is reported rather than decoded as text.
 fn decoder_of(
     library: &str,
     input_format: Option<&str>,
     parameters: &HashMap<String, String>,
 ) -> Option<Decoder> {
+    // A table whose descriptor names the COLUMNAR Parquet format holds Parquet files, which
+    // carry their own schema and their own per-column compression: they are read by the
+    // implementation of that format rather than as text, so this is decided before the text
+    // formats are considered at all.
+    if parquet_objects::stores_parquet(library, input_format) {
+        return Some(Decoder::Parquet);
+    }
     let text_objects = input_format
         .map(str::trim)
         .filter(|format| !format.is_empty())
