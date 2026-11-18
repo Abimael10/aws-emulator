@@ -20,13 +20,17 @@
 //! families is refused with `InvalidSubnet` naming the subnet and the type.
 //! `ServiceName` is RESOLVED before anything is
 //! written, against the one catalogue of endpoint services `DescribeVpcEndpointServices`
-//! reports from ([`crate::state::endpoint_service_name_is_offered`]): the services Amazon
-//! Web Services publishes in the Region the name carries and the account's own
-//! configurations, so a name neither offers is refused with `InvalidServiceName` instead of
-//! yielding an endpoint to a service that does not exist. The resolved service also decides
-//! which endpoint TYPES it can be reached through, so a type that service does not offer is
-//! refused with `InvalidParameter` naming the requested type and the service's own
-//! ([`crate::state::endpoint_type_mismatch`]). It decides TWO more things about the endpoint:
+//! reports from ([`crate::state::endpoint_service_name_is_offered`]), in the Region that HOSTS
+//! the service — the one `ServiceRegion` names, or the Region the name itself carries: the
+//! services Amazon Web Services publishes in that Region and the account's own configurations
+//! hosted there, so a name neither offers is refused with `InvalidServiceName` instead of
+//! yielding an endpoint to a service that does not exist.
+//! The resolved service also decides
+//! which endpoint TYPES it can be reached through, narrowed to the ones that reach a service of
+//! ITS Region from THIS one ([`crate::state::endpoint_types_available`]): a service hosted in
+//! another Region is reached across Regions, which only an interface endpoint does, so a type
+//! that cannot reach it is refused with `InvalidParameter` naming the requested type and the
+//! types available ([`crate::state::endpoint_type_mismatch`]). It decides TWO more things about the endpoint:
 //! whether an endpoint to it takes a policy that narrows access at all — a service that
 //! supports no endpoint policy allows full access to itself whatever document were attached,
 //! so a document granting less is refused with `InvalidParameter`
@@ -474,7 +478,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the current Region, so the name is what the default is read from rather than a
         // second source that could disagree with it. A name of ANOTHER Region therefore
         // reports that Region as the one hosting the service, which is what the member
-        // means, rather than the Region the request was signed for.
+        // means, rather than the Region the request was signed for: an endpoint to it is a
+        // CROSS-REGION endpoint, which is held to the types such an endpoint can be created
+        // as below.
+        let region = state::request_region(ctx.parts());
         let service_region = match input.service_region.as_deref() {
             None => service.region.clone(),
             Some(named) if state::region_name_is_well_formed(named) => named.to_string(),
@@ -540,7 +547,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let endpoints = state::require_service_state(&*self.engine)?;
-        let region = state::request_region(ctx.parts());
         let mut store = endpoints.lock();
         // Every move the clock already owed is applied before this request reads the store,
         // so the endpoint an idempotent replay answers with is not a stale one.
@@ -554,28 +560,34 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // "… and the specified endpoint service": the name is RESOLVED against the endpoint
-        // services this caller can reach — the ones Amazon Web Services publishes in the
-        // Region the name carries, and the account's own service configurations — before any
-        // state is written ([`crate::state::endpoint_service_name_is_offered`]). One
-        // catalogue serves both this create and `DescribeVpcEndpointServices`, so a name that
-        // describe refuses as naming no service cannot have an endpoint created to it either:
-        // a typo yields EC2's own refusal rather than an endpoint to a service that does not
-        // exist, which nothing could ever reach.
-        if !state::endpoint_service_name_is_offered(&store, service_name) {
+        // services this caller can reach in the Region that HOSTS the service — the ones
+        // Amazon Web Services publishes there, and the account's own service configurations
+        // hosted there — before any state is written
+        // ([`crate::state::endpoint_service_name_is_offered`]). One catalogue serves both this
+        // create and `DescribeVpcEndpointServices`, so a name that describe refuses as naming
+        // no service cannot have an endpoint created to it either: a typo yields EC2's own
+        // refusal rather than an endpoint to a service that does not exist, which nothing
+        // could ever reach.
+        if !state::endpoint_service_name_is_offered(&store, &service_region, service_name) {
             return Err(state::invalid_service_name(service_name));
         }
 
-        // "The type of endpoint" (`VpcEndpointType`) has to be one the SERVICE is reachable
-        // through ("the type of service", `ServiceDetail$ServiceType`): a gateway endpoint
-        // reaches a service only through that service's route-table prefix list and an
-        // interface endpoint only through endpoint network interfaces the service answers
-        // on, so an endpoint of a type the service does not offer would reach nothing at
-        // all. The types come from the one catalogue the describe reports from
-        // ([`crate::state::endpoint_service_types`]), so the pair the refusal names is the
-        // pair that describe shows, and a service whose types this emulator cannot know —
-        // one another account or a Marketplace partner offers — is held to its name's form
-        // alone rather than to a type list that does not exist here.
-        if let Some(service_types) = state::endpoint_service_types(&store, service_name) {
+        // "The type of endpoint" (`VpcEndpointType`) has to be one the endpoint can REACH the
+        // service through ("the type of service", `ServiceDetail$ServiceType`): a gateway
+        // endpoint reaches a service only through that service's route-table prefix list and
+        // an interface endpoint only through endpoint network interfaces the service answers
+        // on, so an endpoint of a type the service is not available through would reach
+        // nothing at all. The types come from the one catalogue the describe reports from,
+        // narrowed to the ones an endpoint of THIS VPC's Region can be created as
+        // ([`crate::state::endpoint_types_available`]) — a service hosted in another Region is
+        // reached across Regions, which only an interface endpoint does — so the pair the
+        // refusal names is the pair that describe shows for a service of this Region, and a
+        // service whose types this emulator cannot know — one another account or a Marketplace
+        // partner offers — is held to its name's form alone rather than to a type list that
+        // does not exist here.
+        if let Some(service_types) =
+            state::endpoint_types_available(&store, &region, &service_region, service_name)
+        {
             if !service_types.contains(&endpoint_type) {
                 return Err(state::endpoint_type_mismatch(&endpoint_type, &service_types));
             }
@@ -747,9 +759,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The destination of the route a gateway endpoint adds to each of those tables: "the
         // route … uses the prefix list for the service as the destination" (same guide), and
         // the prefix lists a Region publishes are exactly the services it serves gateway
-        // endpoints for ([`crate::state::service_prefix_lists_in_region`]). A route-table
-        // association to any other name therefore names no gateway endpoint service, which
-        // is the refusal EC2 answers for a service name it does not serve.
+        // endpoints for ([`crate::state::service_prefix_lists_in_region`]). A service of
+        // another Region publishes no list here, which is why only an interface endpoint
+        // reaches one ([`crate::state::endpoint_types_available`], asked above); a name this
+        // Region publishes no list for under a type it does offer names no gateway endpoint
+        // service at all, which is the refusal EC2 answers for a service name it does not
+        // serve.
         let endpoint_prefix_list = state::service_prefix_lists_in_region(&region)
             .into_iter()
             .find(|published| published.prefix_list_name == service_name)

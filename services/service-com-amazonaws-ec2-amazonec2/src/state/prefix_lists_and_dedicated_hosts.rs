@@ -3083,42 +3083,60 @@ pub fn vpc_endpoint_service_limit_exceeded<E>() -> Scaffolded<E> {
 }
 
 /// Whether an endpoint service called `service_name` is one a caller of this account can
-/// create a VPC endpoint TO.
+/// create a VPC endpoint TO, resolved in `region` — the Region that HOSTS the service
+/// (`VpcEndpoint$ServiceRegion`), which is the Region the name itself carries unless the
+/// request named another one.
 ///
 /// ONE catalogue decides which service names exist, so the create and
 /// `DescribeVpcEndpointServices` cannot disagree: a name that describe refuses as naming no
 /// service ([`invalid_service_name`]) is not a name an endpoint can be created to either.
-/// The two sources are the same two that describe reports — the services Amazon Web Services
-/// publishes in the Region the NAME carries ([`endpoint_services_in_region`]), and the
-/// account's own stored service configurations
+/// The two sources are the same two that describe reports for a Region — the services Amazon
+/// Web Services publishes in it ([`endpoint_services_in_region`]), and the account's own stored
+/// service configurations hosted in it
 /// ([`ComAmazonawsEc2Amazonec2State::vpc_endpoint_services`], read through
 /// [`account_endpoint_service_record`] so one reading of "a service a caller can reach" serves
 /// both).
 ///
+/// An endpoint service is a resource OF the Region that publishes it, so a name is resolved in
+/// the Region said to host it and nowhere else: a name carrying a DIFFERENT Region than the one
+/// hosting it names no service at all. Which TYPES of endpoint can reach a service of another
+/// Region is a separate question, and [`endpoint_types_available`] answers it.
+///
 /// The PARTNER family (`com.amazonaws.vpce.<region>.<service-id>`,
-/// [`PARTNER_ENDPOINT_SERVICE_LABEL`]) is the exception, and it is one about this emulator's
+/// [`PARTNER_ENDPOINT_SERVICE_LABEL`]) is read differently, and it is about this emulator's
 /// knowledge rather than about the rule: such a name belongs to a service ANOTHER account or
 /// an Amazon Web Services Marketplace partner offers, which this service holds no catalogue of
 /// at all — only the account's own configurations and the Region's published services are
 /// enumerable here. So a name of that family is read for FORM: its service label has to be an
 /// endpoint service id ([`VPC_ENDPOINT_SERVICE_ID_PREFIX`]), which is what a service of another
 /// account is named by ([`account_endpoint_service_name`]), and anything else names no service.
+/// Its Region label is still the Region it is hosted in, so it is held to `region` like any
+/// other name.
 pub fn endpoint_service_name_is_offered(
     store: &ComAmazonawsEc2Amazonec2State,
+    region: &str,
     service_name: &str,
 ) -> bool {
     let Some(parsed) = parse_endpoint_service_name(service_name) else {
         return false;
     };
     // The account's own services first: the cheapest source, and the one a name of either
-    // family may sit in.
+    // family may sit in. A configuration is offered in the Region it is hosted in, which is the
+    // Region describe reports it for.
     if store
         .vpc_endpoint_services
         .values()
         .filter_map(account_endpoint_service_record)
-        .any(|service| service.service_name == service_name)
+        .any(|service| {
+            service.service_name == service_name && service.service_region.as_str() == region
+        })
     {
         return true;
+    }
+    // A name whose own Region label is not the Region hosting the service names nothing: the
+    // catalogue of a Region holds the names of that Region.
+    if parsed.region != region {
+        return false;
     }
     if service_name.starts_with(AWS_ENDPOINT_SERVICE_PREFIX)
         && service_name[AWS_ENDPOINT_SERVICE_PREFIX.len()..]
@@ -3126,7 +3144,7 @@ pub fn endpoint_service_name_is_offered(
     {
         return prefixed_id_is_well_formed(VPC_ENDPOINT_SERVICE_ID_PREFIX, &parsed.service);
     }
-    endpoint_services_in_region(&parsed.region)
+    endpoint_services_in_region(region)
         .iter()
         .any(|service| service.service_name == service_name)
 }
@@ -3159,6 +3177,57 @@ pub fn endpoint_service_types(
         .find(|service| service.service_name == service_name)
         .map(|service| service.service_types)
 }
+
+/// The endpoint TYPES an endpoint created in `region` to the service called `service_name`,
+/// hosted in `service_region`, can be created as — or `None` for a name this service holds no
+/// catalogue entry for, which [`endpoint_service_types`] records the one exception for.
+///
+/// The types the SERVICE is available through are [`endpoint_service_types`]. What narrows them
+/// is the Region the endpoint is created in: an endpoint to a service hosted in ANOTHER Region
+/// reaches it ACROSS Regions, and the only type that does is the interface endpoint
+/// ([`CROSS_REGION_ENDPOINT_TYPES`]) — a gateway endpoint reaches its service through that
+/// service's prefix list in the route tables of its OWN Region
+/// ([`service_prefix_lists_in_region`], which publishes a list only for a service of that
+/// Region) and a Gateway Load Balancer endpoint through a load balancer of its own Region, so
+/// neither could carry traffic to a service of another one.
+///
+/// The ONE reading of "the types this endpoint may be created as", so the create holds one rule
+/// whether the service is of this Region or of another.
+///
+/// `None` is only ever answered for a service of THIS Region whose type list is not knowable here
+/// — the PARTNER family [`endpoint_service_types`] records, whose service belongs to another
+/// account — because the narrowing is a fact of the ENDPOINT rather than of the service: which
+/// types reach across Regions does not depend on knowing what the service itself offers, so a
+/// partner service of another Region is held to the cross-Region types all the same.
+pub fn endpoint_types_available(
+    store: &ComAmazonawsEc2Amazonec2State,
+    region: &str,
+    service_region: &str,
+    service_name: &str,
+) -> Option<Vec<String>> {
+    let service_types = endpoint_service_types(store, service_name);
+    if service_region == region {
+        return service_types;
+    }
+    let across_regions = || {
+        CROSS_REGION_ENDPOINT_TYPES
+            .iter()
+            .map(|service_type| (*service_type).to_string())
+            .collect()
+    };
+    Some(match service_types {
+        Some(service_types) => service_types
+            .into_iter()
+            .filter(|service_type| CROSS_REGION_ENDPOINT_TYPES.contains(&service_type.as_str()))
+            .collect(),
+        None => across_regions(),
+    })
+}
+
+/// The endpoint types that reach a service hosted in ANOTHER Region: the interface endpoint
+/// alone ([`VPC_ENDPOINT_TYPE_INTERFACE`]), which reaches its service over endpoint network
+/// interfaces in this VPC's own subnets rather than over anything the Region publishes for it.
+pub const CROSS_REGION_ENDPOINT_TYPES: &[&str] = &[VPC_ENDPOINT_TYPE_INTERFACE];
 
 /// The DEFAULT PUBLIC DNS NAME of the endpoint service called `service_name` — the name a
 /// private hosted zone resolves inside the VPC — or `None` when the service publishes none,
