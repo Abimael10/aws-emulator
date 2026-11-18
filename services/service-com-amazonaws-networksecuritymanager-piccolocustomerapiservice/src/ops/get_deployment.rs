@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetDeployment
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetDeployment`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Reads one deployment out of this service's deployment store
+//! (`crate::state::...State::deployments`), resolving `deploymentIdentifier` the way the
+//! model documents it: "This is the deployment's Amazon Resource Name (ARN)". A
+//! REPORTING operation — it writes nothing, so two reads of one identifier answer alike.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetDeployment::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! An identifier no stored deployment answers to is refused with the modelled
+//! `ResourceNotFoundException` (HTTP 404), never with the scaffold's 501: the model
+//! declares no 501 for this operation, so a client's `except ResourceNotFoundException`
+//! has to be what catches a miss.
 //!
 //! ## Shape of an operation
 //!
@@ -181,20 +181,56 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetDeployment` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetDeploymentErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetDeployment"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(GetDeploymentErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the deployment store is unavailable".to_string(),
+                },
+            )
+            .into());
+        };
+
+        let store = state.lock();
+        let Some(deployment) = store.deployment_by_identifier(&input.deployment_identifier) else {
+            // The modelled 404 for this class, worded as this service words it: the
+            // sentence is fixed text, and the identifier the request carried is reported
+            // in the optional `resourceId`/`resourceType` members rather than spliced
+            // into it.
+            return Err(GetDeploymentErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: crate::state::RESOURCE_NOT_FOUND_MESSAGE.to_string(),
+                    resource_id: Some(input.deployment_identifier.clone()),
+                    resource_type: Some(crate::state::RESOURCE_TYPE_DEPLOYMENT.to_string()),
+                },
+            )
+            .into());
+        };
+
+        Ok(GetDeploymentOutput {
+            deployment_id: deployment.deployment_id.clone(),
+            deployment_arn: deployment.deployment_arn.clone(),
+            deployment_name: deployment.deployment_name.clone(),
+            deployment_description: deployment.deployment_description.clone(),
+            status: deployment.status.clone(),
+            deployment_configuration: Some(deployment.deployment_configuration.clone()),
+            associated_policy_list: deployment.associated_policy_list.clone(),
+            associated_scope_list: deployment.associated_scope_list.clone(),
+            version: deployment.version_string(),
+            update_token: Some(deployment.update_token.clone()),
+            is_snapshot: Some(deployment.is_snapshot),
+            has_published_version: Some(deployment.has_published_version),
+            updated_at: Some(deployment.updated_at_timestamp()),
+            // `deploymentCoverage` lists "the resource types in the deployment's scope
+            // that this firewall type protects" and `warnings` reports e.g. "a policy
+            // that has no applicable resources in the deployment's scope". Both are read
+            // off the SCOPE a deployment names, and no operation of this emulator
+            // persists a scope yet, so neither is computable from state: an optional
+            // member is left absent rather than filled with a value nothing backs.
+            deployment_coverage: None,
+            warnings: None,
+        })
     }
 }
+

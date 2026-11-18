@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateDeployment
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateDeployment`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateDeployment::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Persists one deployment in this service's deployment store, which `GetDeployment`
+//! and `ListDeployments` read back. The response is rendered from the record about to be
+//! stored, so a read cannot disagree with the create that returned it.
 //!
 //! ## Shape of an operation
 //!
@@ -208,18 +202,139 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateDeployment` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateDeploymentErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateDeployment"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateDeploymentErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the deployment store is unavailable".to_string(),
+                },
+            )
+            .into());
+        };
+
+        // A reference whose identifier is not an ARN is one no read of this deployment
+        // could answer with, and the reference members carry no pattern the boundary
+        // validator could have refused it by.
+        if let Some((member, message)) = crate::state::deployment_reference_violation(
+            &input.associated_policy_list,
+            &input.associated_scope_list,
+        ) {
+            return Err(
+                CreateDeploymentErrorModeled::ValidationException(ValidationException {
+                    reason: Some(crate::state::VALIDATION_REASON_FIELD.to_string()),
+                    field_list: Some(vec![ValidationExceptionField {
+                        name: member.to_string(),
+                        message: message.clone(),
+                    }]),
+                    message,
+                })
+                .into(),
+            );
+        }
+
+        let region = crate::state::request_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
+        let idempotency_key = input
+            .client_token
+            .as_deref()
+            .map(|token| crate::state::idempotency_key(Self::NAME, token));
+
+        let mut store = state.lock();
+
+        // `clientToken` is `@idempotencyToken`: a retry with the same token answers with
+        // the original call's result out of the store instead of minting a second
+        // deployment.
+        if let Some(existing) = idempotency_key
+            .as_deref()
+            .and_then(|key| store.idempotent_call(key))
+            .map(|call| call.resource_id.clone())
+            .and_then(|deployment_id| store.deployments.get(&deployment_id))
+        {
+            return Ok(output_of(existing));
+        }
+
+        // The store is bounded: past its capacity a create is REFUSED with the modelled
+        // quota error rather than growing the process for as long as callers keep asking.
+        if store.deployments.len() >= crate::state::MAX_DEPLOYMENTS {
+            return Err(CreateDeploymentErrorModeled::ServiceQuotaExceededException(
+                ServiceQuotaExceededException {
+                    message: format!(
+                        "this account already holds the maximum of {} deployments; delete \
+                         one before creating another",
+                        crate::state::MAX_DEPLOYMENTS
+                    ),
+                    resource_type: Some(crate::state::RESOURCE_TYPE_DEPLOYMENT.to_string()),
+                    ..ServiceQuotaExceededException::default()
+                },
+            )
+            .into());
+        }
+
+        let deployment_id = store.mint_deployment_id();
+        let deployment = crate::state::Deployment {
+            deployment_arn: ::engine::emulator_arn(
+                crate::state::ARN_NAMESPACE,
+                &region,
+                &format!("deployment/{deployment_id}"),
+            ),
+            deployment_id: deployment_id.clone(),
+            deployment_name: input.deployment_name,
+            deployment_description: input.deployment_description,
+            status: crate::state::status_for(input.is_published).to_string(),
+            deployment_configuration: input.deployment_configuration,
+            associated_policy_list: input
+                .associated_policy_list
+                .iter()
+                .map(crate::state::associated_policy_of)
+                .collect(),
+            associated_scope_list: input
+                .associated_scope_list
+                .iter()
+                .map(crate::state::associated_scope_of)
+                .collect(),
+            // `EntityVersion` starts at 1; `UpdateDeployment` is what bumps it.
+            version: 1,
+            update_token: crate::state::mint_update_token(),
+            // What this operation creates is the live resource, not a snapshot of a
+            // published version (`CreateDeploymentSnapshot` makes those).
+            is_snapshot: false,
+            has_published_version: input.is_published,
+            tags: input.tags.unwrap_or_default().into_iter().collect(),
+            created_at: now,
+            updated_at: now,
+        };
+
+        // Rendered from the record that is about to be stored, so the response cannot
+        // disagree with what a later read returns.
+        let output = output_of(&deployment);
+        if let Some(key) = idempotency_key {
+            store.remember_idempotent_call(key, deployment_id.clone(), deployment.version);
+        }
+        store.deployments.insert(deployment_id, deployment);
+        Ok(output)
+    }
+}
+
+/// The `CreateDeploymentOutput` view of a persisted deployment.
+///
+/// `deploymentCoverage` and `warnings` are read off the SCOPE a deployment names, which
+/// no operation of this emulator persists yet, so both are left absent rather than filled
+/// with a value nothing backs — the same choice `GetDeployment` makes.
+fn output_of(deployment: &crate::state::Deployment) -> CreateDeploymentOutput {
+    CreateDeploymentOutput {
+        deployment_id: deployment.deployment_id.clone(),
+        deployment_arn: deployment.deployment_arn.clone(),
+        deployment_name: deployment.deployment_name.clone(),
+        deployment_description: deployment.deployment_description.clone(),
+        status: deployment.status.clone(),
+        deployment_configuration: Some(deployment.deployment_configuration.clone()),
+        associated_policy_list: deployment.associated_policy_list.clone(),
+        associated_scope_list: deployment.associated_scope_list.clone(),
+        version: deployment.version_string(),
+        update_token: Some(deployment.update_token.clone()),
+        is_snapshot: Some(deployment.is_snapshot),
+        has_published_version: Some(deployment.has_published_version),
+        deployment_coverage: None,
+        warnings: None,
+        updated_at: Some(deployment.updated_at_timestamp()),
     }
 }

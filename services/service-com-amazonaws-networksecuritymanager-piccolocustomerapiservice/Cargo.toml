@@ -26,6 +26,9 @@ tracing = { workspace = true }
 hex = { workspace = true }
 # Spreads the seed behind a minted `policyId`/`updateToken` (see `state::random_bytes`).
 sha2 = { workspace = true }
+# The fleet's shared refusal-wording home: the order an enumerated type's admissible
+# values are listed in (`service::enum_value_sets`).
+service-common = { path = "../common" }
 
 [dev-dependencies]
 # Declares one test suite per `tests/all/<name>.rs` from `tests/all/main.rs`.

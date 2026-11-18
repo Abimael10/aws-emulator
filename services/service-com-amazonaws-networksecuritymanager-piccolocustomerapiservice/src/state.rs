@@ -9,12 +9,17 @@
 //! here rather than in any one `src/ops/*.rs`, so all five operations agree on one copy
 //! of each.
 //!
-//! One entity per module: the Rule record and its lookups live in [`rules`], re-exported
-//! here so `crate::state::<name>` keeps naming every one of them.
+//! One entity per module: the Rule record and its lookups live in [`rules`], the
+//! Deployment record in [`deployments`] and the Template record in [`templates`],
+//! re-exported here so `crate::state::<name>` keeps naming every one of them.
 
+mod deployments;
 mod rules;
+mod templates;
 
+pub use deployments::*;
 pub use rules::*;
+pub use templates::*;
 
 use std::collections::BTreeMap;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -43,6 +48,16 @@ pub const FIREWALL_TYPE_SHIELD_ADVANCED: &str = "SHIELD_ADVANCED";
 /// `ServiceResourceType` naming a policy, for the `resourceType` member the modelled
 /// `ConflictException` / `ResourceNotFoundException` shapes carry.
 pub const RESOURCE_TYPE_POLICY: &str = "Policy";
+
+/// The `message` this service states when a read's identifier names no resource of the
+/// entity it reads: fixed text for the error class, naming neither the identifier nor the
+/// resource type, because the `ResourceNotFoundException` shape carries those in its own
+/// optional `resourceId` / `resourceType` members.
+///
+/// One home for the sentence, with one exception that is NOT this one: the rule read
+/// words its own miss as `Rule not found: <ruleId>`, so a read whose wording is known to
+/// differ states its own rather than taking this.
+pub const RESOURCE_NOT_FOUND_MESSAGE: &str = "The requested resource was not found.";
 
 /// The largest page `ListPolicies` can answer with, and so the page size used when the
 /// caller sends no `maxResults`: `PolicySummaryList` is modelled `@length(max: 100)`, so
@@ -350,6 +365,38 @@ pub fn association_list_violation(
 /// The `ValidationExceptionReason` a refused member carries.
 pub const VALIDATION_REASON_FIELD: &str = "FIELD_VALIDATION_FAILED";
 
+/// Refuse a create's reference member whose identifier is not an ARN, returning the
+/// offending LIST member and the message naming what is wrong — `None` when every
+/// identifier is usable.
+///
+/// Each item is `(list member, identifier member, the identifier submitted)`. A reference
+/// member (`PolicyReference`'s `policyIdentifier`, `ScopeReference`'s `scopeIdentifier`,
+/// `RuleReference`'s `ruleIdentifier`, …) carries no pattern of its own, so the boundary
+/// validator accepts any string — but the association it becomes is returned under a
+/// member that IS `@length(20..1010)` with the ARN `@pattern`, so an identifier outside
+/// that is one no read of the resource could serialize. Whether the referenced resource
+/// EXISTS is deliberately not checked: no create of this service models a
+/// `ResourceNotFoundException`, so a reference is stored as the caller gave it.
+///
+/// One home for the check, so every entity that holds references refuses alike.
+pub fn reference_arn_violation<'a>(
+    references: impl IntoIterator<Item = (&'static str, &'static str, &'a str)>,
+) -> Option<(&'static str, String)> {
+    references
+        .into_iter()
+        .find_map(|(list, member, identifier)| {
+            (!is_modelled_arn(identifier)).then(|| {
+                (
+                    list,
+                    format!(
+                        "{list} {member} must be an Amazon Resource Name of {MIN_ARN_LENGTH} to \
+                         {MAX_ARN_LENGTH} characters, but {identifier:?} is not one"
+                    ),
+                )
+            })
+        })
+}
+
 /// The most templates (as opposed to rules) one policy may associate, per the model's
 /// "of which at most 2 can be templates".
 const MAX_ASSOCIATED_TEMPLATES: usize = 2;
@@ -384,7 +431,8 @@ pub struct IdempotentCall {
 /// Per-service state for com-amazonaws-networksecuritymanager-piccolocustomerapiservice. A handler reaches it through [`service_state`].
 ///
 /// Every map here is bounded: `policies` (and with it `policy_name_index`, one entry per
-/// policy) by [`MAX_POLICIES`], `rules` by [`MAX_RULES`], and `idempotency` by
+/// policy) by [`MAX_POLICIES`], `rules` by [`MAX_RULES`], `deployments` by
+/// [`MAX_DEPLOYMENTS`], `templates` by [`MAX_TEMPLATES`], and `idempotency` by
 /// [`MAX_IDEMPOTENCY_RECORDS`], so no sequence of requests can grow this process without
 /// limit.
 #[derive(Debug, Default)]
@@ -416,6 +464,25 @@ pub struct ComAmazonawsNetworksecuritymanagerPiccolocustomerapiserviceState {
     pub rules: BTreeMap<String, Rule>,
     /// Monotonic counter feeding [`Self::mint_rule_id`].
     pub next_rule_seq: u64,
+    /// Every persisted deployment, keyed by its `deploymentId` and so iterated in a
+    /// stable order — which is what makes `ListDeployments`' `nextToken` resume exactly
+    /// where the previous page stopped. At most [`MAX_DEPLOYMENTS`] entries.
+    ///
+    /// Deployments are NOT indexed by name: no modelled trait and no documented rule
+    /// makes `deploymentName` unique, so two deployments may carry one name and remain
+    /// distinct resources, exactly as two rules may.
+    pub deployments: BTreeMap<String, Deployment>,
+    /// Monotonic counter feeding [`Self::mint_deployment_id`].
+    pub next_deployment_seq: u64,
+    /// Every persisted template, keyed by its `templateId` and so iterated in a stable
+    /// order — which is what makes `ListTemplates`' `nextToken` resume exactly where the
+    /// previous page stopped. At most [`MAX_TEMPLATES`] entries.
+    ///
+    /// Templates are NOT indexed by name, for the same reason rules are not: no modelled
+    /// trait and no documented rule makes `templateName` unique.
+    pub templates: BTreeMap<String, Template>,
+    /// Monotonic counter feeding [`Self::mint_template_id`].
+    pub next_template_seq: u64,
 }
 
 impl ComAmazonawsNetworksecuritymanagerPiccolocustomerapiserviceState {

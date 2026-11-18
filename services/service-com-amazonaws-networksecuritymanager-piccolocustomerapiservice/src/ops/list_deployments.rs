@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListDeployments
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListDeployments`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListDeployments::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Pages this service's deployment store, filtered by `status` when the caller sends
+//! one. A REPORTING operation — it writes nothing, and a deployment no
+//! `CreateDeployment` persisted is never listed.
 //!
 //! ## Shape of an operation
 //!
@@ -153,20 +147,85 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListDeployments` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListDeploymentsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListDeployments"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListDeploymentsErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the deployment store is unavailable".to_string(),
+                },
+            )
+            .into());
+        };
+
+        // A `nextToken` this service did not mint names no page, and the model expresses
+        // only its character set, so the boundary validator cannot refuse it.
+        let start_after = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => match crate::state::decode_next_token(token) {
+                Some(key) => Some(key),
+                None => {
+                    let message =
+                        "nextToken is not a token this service issued; restart the listing \
+                         without it"
+                            .to_string();
+                    return Err(ListDeploymentsErrorModeled::ValidationException(
+                        ValidationException {
+                            reason: Some(crate::state::VALIDATION_REASON_FIELD.to_string()),
+                            field_list: Some(vec![ValidationExceptionField {
+                                name: "nextToken".to_string(),
+                                message: message.clone(),
+                            }]),
+                            message,
+                        },
+                    )
+                    .into());
+                }
+            },
+        };
+
+        // `DeploymentSummaryList` is modelled `@length(max: 100)`, so an unbounded
+        // request still pages at 100 rather than returning a list it could not serialize.
+        let page_size = input
+            .max_results
+            .map_or(crate::state::MAX_DEPLOYMENT_PAGE, |requested| {
+                (requested as usize).clamp(1, crate::state::MAX_DEPLOYMENT_PAGE)
+            });
+
+        let store = state.lock();
+        // `deployments` is keyed by `deploymentId`, so this walk is in a stable order and
+        // the token below resumes immediately after the last summary returned.
+        let mut matching = store
+            .deployments
+            .values()
+            .filter(|deployment| {
+                start_after
+                    .as_deref()
+                    .is_none_or(|after| deployment.deployment_id.as_str() > after)
+            })
+            .filter(|deployment| {
+                input
+                    .status
+                    .as_deref()
+                    .is_none_or(|wanted| deployment.status == wanted)
+            });
+
+        let deployments: Vec<DeploymentSummary> = matching
+            .by_ref()
+            .take(page_size)
+            .map(crate::state::Deployment::summary)
+            .collect();
+        // A `nextToken` is emitted only when a further summary really exists, so a caller
+        // that follows it never gets an empty final page.
+        let next_token = matching.next().and_then(|_| {
+            deployments
+                .last()
+                .map(|last| crate::state::encode_next_token(&last.deployment_id))
+        });
+
+        Ok(ListDeploymentsOutput {
+            next_token,
+            deployments,
+        })
     }
 }

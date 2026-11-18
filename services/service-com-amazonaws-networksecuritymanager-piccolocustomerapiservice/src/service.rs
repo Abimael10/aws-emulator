@@ -45,6 +45,13 @@ use smithy_server_runtime::{
 };
 use std::sync::Arc;
 
+mod enum_value_sets;
+
+/// The error code this service answers a boundary constraint refusal with — the one the
+/// framework's own restJson1 default picks, named here so a reworded MESSAGE always
+/// travels with the code a client already branches on.
+const VALIDATION_EXCEPTION: &str = "ValidationException";
+
 /// The `com-amazonaws-networksecuritymanager-piccolocustomerapiservice` emulated service: the generated [`ServiceDefinition`] plus
 /// the behavioral seams this file owns.
 ///
@@ -97,16 +104,32 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
         // The centralized walk calls this on a framework-level refusal (an absent
-        // required member, or a value outside a declared bound) to let this
-        // service reword it. Returning `None` keeps the framework's default
-        // wording. To state a refusal the way the emulated service states it,
-        // replace this body with a `match refusal { .. }` that returns
-        // `Some(Refused { code, message })` for the cases you reword and `None`
-        // for the rest. Replace BOTH the code and the message: a client branches
-        // on the code, so a message without its matching code is worse than
-        // leaving both alone.
-        let _ = refusal;
-        None
+        // required member, or a value outside a declared bound) to let this service
+        // reword it.
+        //
+        // One thing about such a refusal is this service's own rather than the model's:
+        // the ORDER an enumerated type's admissible values are listed in
+        // ([`enum_value_sets`]), which follows the front door's own table of those values
+        // and not the order the model declares them in. That order is restated on the
+        // VIOLATION, so the counted envelope, the clause, the member path and the echoed
+        // value stay with the one place that writes them, and every other constraint
+        // class keeps the framework's wording exactly.
+        //
+        // `None` whenever nothing moved — a refusal with no enum clause, and anything
+        // that is not a constraint refusal (an unauthenticated caller keeps the
+        // framework's 403 and its wording) — so this seam can only change the order and
+        // never the rest of the sentence.
+        let Refusal::Invalid(violations) = refusal else {
+            return None;
+        };
+        let stated = enum_value_sets::as_this_service_states(violations);
+        if stated == *violations {
+            return None;
+        }
+        Some(Refused {
+            code: VALIDATION_EXCEPTION.to_string(),
+            message: aws_smithy_schema_server::envelope(&stated)?,
+        })
     }
 
     fn override_routing_error(

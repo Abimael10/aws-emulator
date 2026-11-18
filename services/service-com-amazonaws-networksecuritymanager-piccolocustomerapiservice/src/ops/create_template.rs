@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateTemplate
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateTemplate`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateTemplate::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Persists one template in this service's template store, which `GetTemplate` and
+//! `ListTemplates` read back. The response is rendered from the record about to be
+//! stored, so a read cannot disagree with the create that returned it.
 //!
 //! ## Shape of an operation
 //!
@@ -198,18 +192,126 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateTemplate` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateTemplateErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateTemplate"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateTemplateErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the template store is unavailable".to_string(),
+                },
+            )
+            .into());
+        };
+
+        // A rule reference whose identifier is not an ARN is one no read of this
+        // template could answer with, and the reference member carries no pattern the
+        // boundary validator could have refused it by.
+        if let Some((member, message)) =
+            crate::state::template_reference_violation(&input.associated_rule_list)
+        {
+            return Err(
+                CreateTemplateErrorModeled::ValidationException(ValidationException {
+                    reason: Some(crate::state::VALIDATION_REASON_FIELD.to_string()),
+                    field_list: Some(vec![ValidationExceptionField {
+                        name: member.to_string(),
+                        message: message.clone(),
+                    }]),
+                    message,
+                })
+                .into(),
+            );
+        }
+
+        let region = crate::state::request_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
+        let idempotency_key = input
+            .client_token
+            .as_deref()
+            .map(|token| crate::state::idempotency_key(Self::NAME, token));
+
+        let mut store = state.lock();
+
+        // `clientToken` is `@idempotencyToken`: a retry with the same token answers with
+        // the original call's result out of the store instead of minting a second
+        // template.
+        if let Some(existing) = idempotency_key
+            .as_deref()
+            .and_then(|key| store.idempotent_call(key))
+            .map(|call| call.resource_id.clone())
+            .and_then(|template_id| store.templates.get(&template_id))
+        {
+            return Ok(output_of(existing));
+        }
+
+        // The store is bounded: past its capacity a create is REFUSED with the modelled
+        // quota error rather than growing the process for as long as callers keep asking.
+        if store.templates.len() >= crate::state::MAX_TEMPLATES {
+            return Err(CreateTemplateErrorModeled::ServiceQuotaExceededException(
+                ServiceQuotaExceededException {
+                    message: format!(
+                        "this account already holds the maximum of {} templates; delete one \
+                         before creating another",
+                        crate::state::MAX_TEMPLATES
+                    ),
+                    resource_type: Some(crate::state::RESOURCE_TYPE_TEMPLATE.to_string()),
+                    ..ServiceQuotaExceededException::default()
+                },
+            )
+            .into());
+        }
+
+        let template_id = store.mint_template_id();
+        let template = crate::state::Template {
+            template_arn: ::engine::emulator_arn(
+                crate::state::ARN_NAMESPACE,
+                &region,
+                &format!("template/{template_id}"),
+            ),
+            template_id: template_id.clone(),
+            template_name: input.template_name,
+            template_description: input.template_description,
+            status: crate::state::status_for(input.is_published).to_string(),
+            firewall_type: input.firewall_type,
+            associated_rule_list: input
+                .associated_rule_list
+                .iter()
+                .map(crate::state::associated_rule_of)
+                .collect(),
+            // `EntityVersion` starts at 1; `UpdateTemplate` is what bumps it.
+            version: 1,
+            update_token: crate::state::mint_update_token(),
+            // What this operation creates is the live resource, not a snapshot of a
+            // published version (`CreateTemplateSnapshot` makes those).
+            is_snapshot: false,
+            has_published_version: input.is_published,
+            tags: input.tags.unwrap_or_default().into_iter().collect(),
+            created_at: now,
+            updated_at: now,
+        };
+
+        // Rendered from the record that is about to be stored, so the response cannot
+        // disagree with what a later read returns.
+        let output = output_of(&template);
+        if let Some(key) = idempotency_key {
+            store.remember_idempotent_call(key, template_id.clone(), template.version);
+        }
+        store.templates.insert(template_id, template);
+        Ok(output)
+    }
+}
+
+/// The `CreateTemplateOutput` view of a persisted template.
+fn output_of(template: &crate::state::Template) -> CreateTemplateOutput {
+    CreateTemplateOutput {
+        template_id: template.template_id.clone(),
+        template_arn: template.template_arn.clone(),
+        template_name: template.template_name.clone(),
+        template_description: template.template_description.clone(),
+        status: template.status.clone(),
+        version: template.version_string(),
+        associated_rule_list: template.associated_rule_list.clone(),
+        update_token: Some(template.update_token.clone()),
+        is_snapshot: Some(template.is_snapshot),
+        has_published_version: Some(template.has_published_version),
+        firewall_type: template.firewall_type.clone(),
+        updated_at: Some(template.updated_at_timestamp()),
     }
 }

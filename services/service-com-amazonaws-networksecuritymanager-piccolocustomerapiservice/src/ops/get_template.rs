@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetTemplate
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetTemplate`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetTemplate::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reads one template out of this service's template store, resolving
+//! `templateIdentifier` the way the model documents it. A REPORTING operation — it writes
+//! nothing, so two reads of one identifier answer alike. An identifier no stored template
+//! answers to is refused with the modelled `ResourceNotFoundException` (HTTP 404).
 //!
 //! ## Shape of an operation
 //!
@@ -172,20 +167,42 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetTemplate` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetTemplateErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetTemplate"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(GetTemplateErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the template store is unavailable".to_string(),
+                },
+            )
+            .into());
+        };
+
+        let store = state.lock();
+        let Some(template) = store.template_by_identifier(&input.template_identifier) else {
+            return Err(GetTemplateErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: crate::state::RESOURCE_NOT_FOUND_MESSAGE.to_string(),
+                    resource_id: Some(input.template_identifier.clone()),
+                    resource_type: Some(crate::state::RESOURCE_TYPE_TEMPLATE.to_string()),
+                },
+            )
+            .into());
+        };
+
+        Ok(GetTemplateOutput {
+            template_id: template.template_id.clone(),
+            template_arn: template.template_arn.clone(),
+            template_name: template.template_name.clone(),
+            template_description: template.template_description.clone(),
+            status: template.status.clone(),
+            version: template.version_string(),
+            associated_rule_list: template.associated_rule_list.clone(),
+            update_token: Some(template.update_token.clone()),
+            is_snapshot: Some(template.is_snapshot),
+            has_published_version: Some(template.has_published_version),
+            firewall_type: template.firewall_type.clone(),
+            updated_at: Some(template.updated_at_timestamp()),
+        })
     }
 }
