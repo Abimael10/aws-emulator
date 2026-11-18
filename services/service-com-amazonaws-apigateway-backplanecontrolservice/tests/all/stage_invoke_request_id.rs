@@ -8,7 +8,10 @@
 //! The rule asserted here is about the RESPONSE, not about any particular id: an id is
 //! minted per request and no value is ever a requirement, so what every row checks is that
 //! the header is THERE, that it has the shape every AWS request id has, and that two
-//! responses never report one id. The rows differ along what the rule generalises over —
+//! responses never report one id. The one request that names ITSELF is the exception the
+//! table carries beside them: API Gateway documents the request id as one a client may
+//! override by sending that same header, so such a response reports the id the request
+//! stated. The rows differ along what the rule generalises over —
 //! the outcome class (an integration served in full, each refusal class the data plane
 //! answers, a server-side configuration fault), the addressing (the api's own invoke host
 //! and the reserved data-plane path prefix), the verb, and whether the request carried a
@@ -50,8 +53,9 @@ const SIGNED: &str =
     "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20260101/us-east-1/execute-api/aws4_request, \
      SignedHeaders=host, Signature=0123456789abcdef";
 
-/// A request id a CLIENT made up and sent, so a row can assert the answer reports the id
-/// the endpoint minted for the request rather than echoing what the request carried.
+/// A request id a CLIENT made up and sent, so a row can assert the answer reports the id the
+/// request STATED for itself — the override API Gateway documents — and every row that sent
+/// none reports an id of the endpoint's own instead.
 const CLIENT_SENT_ID: &str = "11111111-2222-3333-4444-555555555555";
 
 /// One answered invoke: the status line, the reported request id, and the body verbatim.
@@ -303,7 +307,7 @@ async fn every_response_a_deployed_stage_serves_names_the_request_it_answered() 
             status: 500,
         },
         Case {
-            case: "a request that carries a request id of its own",
+            case: "a request that states a request id of its own",
             host: invoke_host(&api),
             verb: "GET",
             path: "/prod/pets".to_string(),
@@ -333,12 +337,26 @@ async fn every_response_a_deployed_stage_serves_names_the_request_it_answered() 
              {request_id:?}",
             case.case
         );
-        assert_ne!(
-            request_id, CLIENT_SENT_ID,
-            "case {:?}: expected the id the endpoint minted for this request, not the one the \
-             request carried, got {request_id:?}",
-            case.case
-        );
+        match case
+            .headers
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case(REQUEST_ID_HEADER))
+        {
+            // The request named ITSELF, which is the override API Gateway documents: the
+            // answer reports that id and not one of the endpoint's own.
+            Some((_, stated)) => assert_eq!(
+                request_id, *stated,
+                "case {:?}: expected the answer to report the id the request stated, got \
+                 {request_id:?}",
+                case.case
+            ),
+            None => assert_ne!(
+                request_id, CLIENT_SENT_ID,
+                "case {:?}: expected the id the endpoint minted for this request, which no \
+                 request stated, got {request_id:?}",
+                case.case
+            ),
+        }
         assert!(
             reported.insert(request_id.clone()),
             "case {:?}: expected an id no other response reported, got the already-reported \

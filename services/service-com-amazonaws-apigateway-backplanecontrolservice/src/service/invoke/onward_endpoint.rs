@@ -108,9 +108,11 @@ async fn reached(
     Ok(answer)
 }
 
-/// The header API Gateway reports the request IT answered in, on every response of this data
-/// plane (`::service_common::query_error_envelope::with_request_id_header`).
-const RESERVED_RESPONSE_HEADER: &str = "x-amzn-requestid";
+/// The headers API Gateway reports its OWN answer's identity in, on every response of this
+/// data plane: the request the api answered
+/// (`::service_common::query_error_envelope::with_request_id_header`) and that request's
+/// extended id (`super::call_identity`).
+const RESERVED_RESPONSE_HEADERS: &[&str] = &["x-amzn-requestid", "x-amz-apigw-id"];
 
 /// The prefix API Gateway remaps a reserved response header with, so a backend's own value
 /// for it still reaches the client under a name the api has not taken.
@@ -121,30 +123,28 @@ const REMAPPED_PREFIX: &str = "x-amzn-remapped-";
 /// to the api.
 ///
 /// A proxy integration passes a response through, and the api's own response names the
-/// request the api answered ([`RESERVED_RESPONSE_HEADER`]): both values cannot travel under
+/// request the api answered ([`RESERVED_RESPONSE_HEADERS`]): both values cannot travel under
 /// one name, and the one the client correlates its call by is the API's. So the backend's is
 /// renamed rather than dropped or allowed to displace it — which is how a client reads the
 /// backend's own id for a call it made through a proxy integration.
 fn remapped(mut answer: RtResponse) -> RtResponse {
-    let carried: Vec<String> = answer
-        .headers()
-        .get_all(RESERVED_RESPONSE_HEADER)
-        .map(str::to_string)
-        .collect();
-    if carried.is_empty() {
-        return answer;
-    }
-    answer.headers_mut().remove(RESERVED_RESPONSE_HEADER);
-    for value in carried {
-        if let Err(refused) = answer
-            .headers_mut()
-            .try_append(format!("{REMAPPED_PREFIX}{RESERVED_RESPONSE_HEADER}"), value)
-        {
-            ::tracing::warn!(
-                error = %refused,
-                "the backend's reserved response header cannot be remapped and is left off \
-                 the response"
-            );
+    for reserved in RESERVED_RESPONSE_HEADERS {
+        let carried: Vec<String> = answer.headers().get_all(*reserved).map(str::to_string).collect();
+        if carried.is_empty() {
+            continue;
+        }
+        answer.headers_mut().remove(*reserved);
+        for value in carried {
+            if let Err(refused) = answer
+                .headers_mut()
+                .try_append(format!("{REMAPPED_PREFIX}{reserved}"), value)
+            {
+                ::tracing::warn!(
+                    error = %refused,
+                    "the backend's reserved response header cannot be remapped and is left off \
+                     the response"
+                );
+            }
         }
     }
     answer

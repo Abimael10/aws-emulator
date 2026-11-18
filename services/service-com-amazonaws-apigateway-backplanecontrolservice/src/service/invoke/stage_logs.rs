@@ -314,12 +314,12 @@ pub(super) async fn delivered<Eng: Send + Sync + 'static>(
     engine: &Eng,
     req: &RtRequest,
     ctx: &OperationContext<'_>,
-    request_id: &str,
+    ids: &super::CallIds,
     response: &RtResponse,
     latency: Duration,
     recorded: &Recorded,
 ) {
-    let planned = planned(engine, req, request_id, response, latency, recorded);
+    let planned = planned(engine, req, ids, response, latency, recorded);
     let Some(planned) = planned.filter(|planned| !planned.is_empty()) else {
         return;
     };
@@ -358,7 +358,7 @@ pub(super) async fn delivered<Eng: Send + Sync + 'static>(
 fn planned<Eng: Send + Sync + 'static>(
     engine: &Eng,
     req: &RtRequest,
-    request_id: &str,
+    ids: &super::CallIds,
     response: &RtResponse,
     latency: Duration,
     recorded: &Recorded,
@@ -400,7 +400,7 @@ fn planned<Eng: Send + Sync + 'static>(
         // path asked for is this.
         &resource_path,
         req,
-        request_id,
+        ids,
         ::std::time::SystemTime::now(),
     );
     // What the request's own AUTHORIZATION published, under the same `$context` member paths
@@ -452,7 +452,7 @@ fn planned<Eng: Send + Sync + 'static>(
                 trace(
                     req,
                     response,
-                    request_id,
+                    &ids.request_id,
                     &request_verb,
                     matched_path,
                     deployment

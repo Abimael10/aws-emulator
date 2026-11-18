@@ -114,11 +114,13 @@
 //!
 //! Whatever the outcome, the response NAMES THE REQUEST it answered: every response this
 //! endpoint serves carries a per-request id in the header API Gateway reports it in, which
-//! is what lets a client correlate the answer it holds with what the API processed. The id is
-//! minted ONCE per request, by [`serve`] — the one funnel both seams reach, so no outcome can
-//! answer without one — and it is the same id the call carries as `$context.requestId` and
-//! `$context.extendedRequestId` ([`call_context`]), so a mapping template, a proxy event and
-//! the response header cannot name one request three ways.
+//! is what lets a client correlate the answer it holds with what the API processed. The ids a
+//! request is named by are resolved ONCE per request, by [`serve`] — the one funnel both
+//! seams reach, so no outcome can answer without one — and they are what the call carries as
+//! `$context.requestId` and `$context.extendedRequestId` ([`call_context`]), so a mapping
+//! template, a proxy event and the response header cannot name one request three ways. Of the
+//! two, the REQUEST id is one a client may state for itself and the EXTENDED one is always
+//! the endpoint's own ([`CallIds`]).
 //!
 //! # What it does not do, and what it answers instead
 //!
@@ -1441,24 +1443,26 @@ fn addresses_connections(path: &str) -> bool {
 /// `ctx` is what the router hands that operation: the IN-PROCESS transport an integration
 /// naming another emulated service's action is performed over ([`aws_integration`]).
 ///
-/// Every response leaves here NAMING THE REQUEST it answered, in the header API Gateway
-/// reports a request id in: this is the one funnel every outcome reaches, so a served
-/// integration, a gateway refusal and an endpoint that serves nothing all report one, and
+/// Every response leaves here NAMING THE REQUEST it answered, in both headers API Gateway
+/// reports a request's ids in: this is the one funnel every outcome reaches, so a served
+/// integration, a gateway refusal and an endpoint that serves nothing all report them, and
 /// a client can correlate the response it holds with the request the API processed.
-/// `service_common` owns both the minting and the header, so this data plane reports the
-/// id in the one spelling the rest of the emulator reports it in.
+/// `service_common` owns both the minting and the request-id header, so this data plane
+/// reports that id in the one spelling the rest of the emulator reports it in; the extended
+/// id is reported beside it ([`call_identity`]).
 pub async fn serve<Eng: Send + Sync + 'static>(
     engine: &Eng,
     req: &RtRequest,
     ctx: &OperationContext<'_>,
 ) -> RtResponse {
-    // Minted HERE, before anything is served, because the id names the request in TWO
-    // places: the header this response reports it in and the `$context.requestId` the
-    // call's own mapping templates and proxy event read, which a client correlates the
-    // answer it holds with what the API processed by. `service_common` owns the minting and
-    // the header, so this data plane reports the id in the one spelling the rest of the
-    // emulator reports it in.
-    let request_id = ::service_common::query_error_envelope::new_request_id();
+    // Minted HERE, before anything is served, because the request is named in TWO places:
+    // the header this response reports it in and the `$context.requestId` the call's own
+    // mapping templates and proxy event read, which a client correlates the answer it holds
+    // with what the API processed by. A request may STATE that id for itself, and the
+    // extended id beside it is the endpoint's own whatever the request carried
+    // ([`CallIds`]). `service_common` owns the minting and the header, so this data plane
+    // reports the id in the one spelling the rest of the emulator reports it in.
+    let ids = CallIds::of_request(req);
     // MEASURED over the whole invoke, because that is what the access log reports as the
     // latency of answering this request: the clock starts before anything is resolved and is
     // read once the response has been computed.
@@ -1472,30 +1476,37 @@ pub async fn serve<Eng: Send + Sync + 'static>(
     // the request), so they are carried out to the delivery rather than reaching the
     // integration alone ([`stage_logs`]).
     let mut recorded = stage_logs::Recorded::default();
-    let served = ::service_common::query_error_envelope::with_stated_request_id_header(
-        // The documented payload limit is the ENDPOINT's, and it is answered HERE, before
-        // anything the api's own records decide: not the stage, the route, the
-        // authorization, the validator or the integration, and not the content coding
-        // `minimumCompressionSize` asks for either — so a developer's records cannot change
-        // the bytes of a refusal taken before they were read.
-        match oversized_payload(req) {
-            Some(refusal) => {
-                tracing::warn!(
-                    limit = MAX_REQUEST_PAYLOAD_BYTES,
-                    "the request's payload is over the payload limit of a REST API"
-                );
-                refusal_response(None, refusal)
-            }
-            // COMPRESSED at the one funnel every other outcome reaches, so what the api's
-            // `minimumCompressionSize` asks for applies to a served integration, a cached
-            // response and a gateway refusal alike ([`compression`]).
-            None => compression::compressed(
-                engine,
-                req,
-                serve_resolved(engine, req, ctx, 0, &request_id, &mut recorded, None).await,
-            ),
-        },
-        &request_id,
+    // The documented payload limit is the ENDPOINT's, and it is answered HERE, before
+    // anything the api's own records decide: not the stage, the route, the authorization, the
+    // validator or the integration, and not the content coding `minimumCompressionSize` asks
+    // for either — so a developer's records cannot change the bytes of a refusal taken before
+    // they were read.
+    let answered = match oversized_payload(req) {
+        Some(refusal) => {
+            tracing::warn!(
+                limit = MAX_REQUEST_PAYLOAD_BYTES,
+                "the request's payload is over the payload limit of a REST API"
+            );
+            refusal_response(None, refusal)
+        }
+        // COMPRESSED at the one funnel every other outcome reaches, so what the api's
+        // `minimumCompressionSize` asks for applies to a served integration, a cached
+        // response and a gateway refusal alike ([`compression`]).
+        None => compression::compressed(
+            engine,
+            req,
+            serve_resolved(engine, req, ctx, 0, &ids, &mut recorded, None).await,
+        ),
+    };
+    // BOTH ids are reported on the answer: the request id in the header API Gateway reports a
+    // request in, and the extended id in its own, so a client reads the endpoint's own naming
+    // of the call beside the one the request may have stated.
+    let served = call_identity::with_extended_request_id_header(
+        ::service_common::query_error_envelope::with_stated_request_id_header(
+            answered,
+            &ids.request_id,
+        ),
+        &ids,
     );
     // How long answering the whole request took, read once the response has been computed and
     // reported by both of the things the stage says about a request it answered.
@@ -1508,7 +1519,7 @@ pub async fn serve<Eng: Send + Sync + 'static>(
     // execution log its method settings turn on — delivered to the destinations the stage
     // and the account name ([`stage_logs`]). After the response is computed and never
     // before: a record is about a request that was answered.
-    stage_logs::delivered(engine, req, ctx, &request_id, &served, latency, &recorded).await;
+    stage_logs::delivered(engine, req, ctx, &ids, &served, latency, &recorded).await;
     served
 }
 
@@ -1521,8 +1532,9 @@ pub async fn serve<Eng: Send + Sync + 'static>(
 /// what bounds a chain of them ([`MAX_PASSED_THROUGH_HOPS`]). The future is BOXED for
 /// exactly that reason: a function that awaits itself has no sized future.
 ///
-/// `request_id` is the id the response this computes is reported under, which is also what
-/// the call carries as `$context.requestId`.
+/// `ids` are the ids this request is named by: the one the response this computes is reported
+/// under, which the call also carries as `$context.requestId`, and the extended id beside it
+/// ([`CallIds`]).
 ///
 /// `delivered_through` is the interface VPC endpoint this plane itself delivered this request
 /// through, when it is the onward request of a private integration carried over a VPC link
@@ -1533,22 +1545,11 @@ fn serve_resolved<'a, 'c: 'a, Eng: Send + Sync + 'static>(
     req: &'a RtRequest,
     ctx: &'a OperationContext<'c>,
     hop: u8,
-    request_id: &'a str,
+    ids: &'a CallIds,
     recorded: &'a mut stage_logs::Recorded,
     delivered_through: Option<&'a str>,
 ) -> BoxFuture<'a, RtResponse> {
-    Box::pin(async move {
-        serving(
-            engine,
-            req,
-            ctx,
-            hop,
-            request_id,
-            recorded,
-            delivered_through,
-        )
-        .await
-    })
+    Box::pin(async move { serving(engine, req, ctx, hop, ids, recorded, delivered_through).await })
 }
 
 /// [`serve_resolved`]'s body, written as an ordinary `async fn` so only the recursion
@@ -1558,7 +1559,7 @@ async fn serving<Eng: Send + Sync + 'static>(
     req: &RtRequest,
     ctx: &OperationContext<'_>,
     hop: u8,
-    request_id: &str,
+    ids: &CallIds,
     recorded: &mut stage_logs::Recorded,
     delivered_through: Option<&str>,
 ) -> RtResponse {
@@ -1817,7 +1818,7 @@ async fn serving<Eng: Send + Sync + 'static>(
                 // the path asked for carries its value.
                 &resource_path,
                 req,
-                request_id,
+                ids,
                 SystemTime::now(),
             );
             // WHO the method's authorization authenticated for this call, under the same
@@ -2274,8 +2275,10 @@ async fn serving<Eng: Send + Sync + 'static>(
                 // of the answer the caller is served says what was sent ([`stage_logs`]).
                 sent = onward.body().bytes().unwrap_or_default().to_vec();
                 // The onward request is a request of its own at another endpoint, so it is
-                // answered under its own id, as AWS names each request it processes by one.
-                let onward_id = ::service_common::query_error_envelope::new_request_id();
+                // answered under its own ids, as AWS names each request it processes by
+                // them — read off that request, which is what names a request of this
+                // plane ([`CallIds`]).
+                let onward_ids = CallIds::of_request(&onward);
                 // A request of its own: what the endpoint it reaches publishes about ITS
                 // own authorization, and the configuration error that stopped its own
                 // integration, belong to that request and not to this one's record.
@@ -2301,7 +2304,7 @@ async fn serving<Eng: Send + Sync + 'static>(
                     &onward,
                     ctx,
                     hop + 1,
-                    &onward_id,
+                    &onward_ids,
                     &mut onward_recorded,
                     delivered_through.as_deref(),
                 )
@@ -4314,11 +4317,12 @@ fn request_host_of(req: &RtRequest) -> Option<String> {
 /// address it came from. A member no value here names is a reference the template is not
 /// rendered from at all.
 ///
-/// `request_id` is the id the response to this call is reported under, so
-/// `$context.requestId` and the header a client reads the id off name ONE request; it is
-/// also `$context.extendedRequestId`, which is "the same request's id under the member API
-/// Gateway reports it in" (`crate::ops::update_stage` holds that reading for an access-log
-/// format). The instants are `now`'s, in the units each member documents: `requestTime` in
+/// `ids` are the ids this call is named by ([`CallIds`]): `$context.requestId` is the one the
+/// response is reported under, so a mapping template and the header a client reads the id off
+/// name ONE request, and `$context.extendedRequestId` is "the same request's id under the
+/// member API Gateway reports it in" (`crate::ops::update_stage` holds that reading for an
+/// access-log format) — the one the endpoint minted, which nothing the request carried
+/// decides. The instants are `now`'s, in the units each member documents: `requestTime` in
 /// the Common Log Format the access log writes it in and `requestTimeEpoch` in milliseconds.
 ///
 /// `resource_path` is the TEMPLATE the deployment matched, which `$context.resourcePath`
@@ -4345,7 +4349,7 @@ fn call_context(
     resource_path: &str,
     request_path: &str,
     req: &RtRequest,
-    request_id: &str,
+    ids: &CallIds,
     now: SystemTime,
 ) -> BTreeMap<String, String> {
     let mut context: BTreeMap<String, String> = [
@@ -4355,8 +4359,8 @@ fn call_context(
         ("resourcePath", resource_path.to_string()),
         ("path", stage_qualified_path(stage, request_path)),
         ("accountId", ::engine::emulator_account_id().to_string()),
-        ("requestId", request_id.to_string()),
-        ("extendedRequestId", request_id.to_string()),
+        ("requestId", ids.request_id.clone()),
+        ("extendedRequestId", ids.extended_request_id.clone()),
         ("requestTimeEpoch", epoch_millis(now).to_string()),
         ("identity.sourceIp", source_address_of(req)),
         // "The request protocol, for example, HTTP/1.1" (`$context.protocol`): every
@@ -4906,3 +4910,8 @@ use authorizer_cache::authorizer_cache_key;
 /// form of a payload, in a file of its own: it is the one concern that is about the BYTES of
 /// a payload rather than about which payload is sent or served.
 mod content_handling;
+
+/// WHICH REQUEST an invoke is — the request id a client may state and the extended request id
+/// API Gateway mints — in a file of its own, with the tests of that reading.
+mod call_identity;
+use call_identity::CallIds;

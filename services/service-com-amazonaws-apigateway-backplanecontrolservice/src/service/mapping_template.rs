@@ -135,6 +135,10 @@ pub struct Overrides {
     /// The path parameters overridden, by name.
     pub path: BTreeMap<String, String>,
     /// The status the response is to be sent with, as the template stated it.
+    ///
+    /// A status is a NUMBER, where a parameter carries text: an override assigned a value of
+    /// any other type states no status, so this stays `None` and the response is sent with
+    /// the status its integration response declares.
     pub status: Option<String>,
 }
 
@@ -409,10 +413,21 @@ impl Render<'_> {
             // An override states a parameter of the request or the response the template is
             // building, so what is kept is the TEXT the expression comes to — the same text a
             // reference to that expression would render ([`Render::written`]), since a
-            // parameter carries text and nothing else.
+            // parameter carries text and nothing else. The one member that is NOT a parameter
+            // is the response's status, which is a number ([`Overrides::status`]).
             Directive::Override(overriding) => {
                 if inside {
                     let stated = self.value_of(&overriding.value, 0)?;
+                    // The STATUS a response is sent with is a NUMBER, where every other
+                    // parameter an override names carries text: a value of any other type
+                    // states no status at all — a quoted literal that happens to spell a
+                    // status number included — so the response is sent with the status its
+                    // integration response declares, and the directive states nothing.
+                    if overriding.target == directives::OverrideTarget::Status
+                        && !stated.is_number()
+                    {
+                        return Ok(());
+                    }
                     let text = Self::written(stated, OVERRIDE_SOURCE)?;
                     self.spend(text.len())?;
                     let side = if overriding.response {
@@ -2115,7 +2130,8 @@ mod tests {
 
     /// RULE: an override directive states the parameter it names, with the value its
     /// expression comes to, renders nothing itself, and keeps the FIRST value stated for a
-    /// parameter it names twice.
+    /// parameter it names twice. The response's STATUS is the one member it states that takes
+    /// a number: an expression coming to a value of any other type states no status at all.
     #[test]
     fn an_override_states_the_parameter_it_names() {
         /// (case, the template, the text it renders to, the parameters it stated as
@@ -2145,6 +2161,30 @@ mod tests {
                 "#set($context.responseOverride.status = 400)",
                 "",
                 &["response status=400"],
+            ),
+            (
+                "a double-quoted literal spelling a status, which states no status",
+                "#set($context.responseOverride.status = \"201\")",
+                "",
+                &[],
+            ),
+            (
+                "a single-quoted literal spelling a status, which states no status",
+                "#set($context.responseOverride.status = '503')",
+                "",
+                &[],
+            ),
+            (
+                "a status read off the call as text, which states no status",
+                "#set($context.responseOverride.status = $input.params('tenant'))",
+                "",
+                &[],
+            ),
+            (
+                "a header whose value is a quoted number, which a parameter carries as text",
+                "#set($context.responseOverride.header.x-code = \"201\")",
+                "",
+                &["response header x-code=201"],
             ),
             (
                 "the same parameter stated twice, which keeps the first value",

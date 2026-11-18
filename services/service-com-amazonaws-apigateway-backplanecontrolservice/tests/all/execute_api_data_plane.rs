@@ -46,6 +46,17 @@ use crate::rest_api_lifecycle::{create_api, create_resource, string_member, Gate
 #[path = "execute_api_data_plane/nonproxy_integration_transformations.rs"]
 mod nonproxy_integration_transformations;
 
+/// WHICH REQUEST a deployed stage says it answered — the request id a client may state for
+/// itself and the extended id the endpoint always mints — in its own file beside this one,
+/// declared as the sibling above is.
+#[path = "execute_api_data_plane/stated_request_identity.rs"]
+mod stated_request_identity;
+
+/// What a response template may override about the STATUS the method response is sent with,
+/// in its own file beside this one, declared as the siblings above are.
+#[path = "execute_api_data_plane/response_override_status_type.rs"]
+mod response_override_status_type;
+
 /// The region the invoke host is addressed in. Any region is served — the host's region
 /// label is not matched against a list — so one is enough to drive the data plane, and
 /// `src/service/invoke.rs`'s own unit test varies the label.
