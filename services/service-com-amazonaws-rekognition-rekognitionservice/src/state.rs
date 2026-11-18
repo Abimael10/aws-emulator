@@ -238,7 +238,9 @@ pub struct StoredFace {
     /// face is taken off that user again, and `None` for a face no user holds. It is
     /// honoured by `ListFaces`' `UserId` filter and `DeleteFaces`'
     /// `ASSOCIATED_TO_AN_EXISTING_USER` refusal, so one record answers for the face
-    /// wherever the association shows.
+    /// wherever the association shows. `DeleteUser` CLEARS it for every face of the user it
+    /// removes, which is the disassociation that operation documents: the face outlives
+    /// the user.
     pub user_id: Option<String>,
     /// The digest of the image content this face was indexed from: what lets
     /// `SearchFaces` tell whether two stored faces came from the same image.
@@ -274,8 +276,8 @@ impl StoredFace {
     }
 }
 
-/// One user of a collection, as created by `CreateUser` and populated by
-/// `AssociateFaces`.
+/// One user of a collection, as created by `CreateUser`, populated by `AssociateFaces`
+/// and removed by `DeleteUser`.
 #[derive(Debug, Clone)]
 pub struct StoredUser {
     /// `CreateUser.UserId` — the caller's own id for the user and the collection's key

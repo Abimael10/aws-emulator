@@ -1,15 +1,36 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteUser
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteUser`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Removes one user of a collection from this service's store, and answers with nothing
+//! — the record it removed is what `ListUsers` stops reporting and what
+//! `DescribeCollection` stops counting, so nothing is answered here without the store
+//! having been written first.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteUser::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Every face the removed user was associated with is DISASSOCIATED from it first, as
+//! the operation documents ("faces that are associated with the UserID are disassociated
+//! from the UserID before deleting the specified UserID"): the face itself stays in the
+//! collection and is reported by `ListFaces` with no `UserId`, so a face is never
+//! removed by, nor left pointing at, the deletion of a user.
+//!
+//! The call is IDEMPOTENT on its `ClientRequestToken`, through the one ledger this
+//! service classifies a token with ([`crate::state::idempotency`]): the token that
+//! carried out the deletion, sent again with the same collection and user, answers the
+//! same success rather than the refusal the now-absent user would otherwise get, and
+//! carries nothing out a second time — a user recorded under that id SINCE is not the one
+//! that request named, so it stays. The same token sent with a different request is
+//! refused with the modelled `IdempotentParameterMismatchException`. A token is remembered
+//! only once the deletion has been carried out, so a refused request leaves the caller
+//! free to send it again.
+//!
+//! A collection the store does not hold is refused with `ResourceNotFoundException`, the
+//! class this API keeps for the collection itself being absent. A `UserId` the named
+//! collection does not hold — one never created, one another collection holds, or one an
+//! earlier delete already removed — is refused with `InvalidParameterException` instead:
+//! the collection exists, so what the service rejects is the parameter value it was
+//! given, the same class a `FaceId` the collection does not hold is refused with. That is
+//! what a recorded delete of an already-deleted user answers
+//! (`rekognition.delete-user-removes-user`), so it is what this operation answers, even
+//! though the operation's own documentation names the not-found class for both halves.
 //!
 //! ## Shape of an operation
 //!
@@ -163,18 +184,89 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteUser` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteUserErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteUser"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DeleteUserErrorModeled::InternalServerError(
+                crate::state::modeled_error::store_unavailable(),
+            )
+        })?;
+        let mut state = state.lock();
+
+        // A user lives IN a collection, so the collection has to exist before anything
+        // about the user is read or written; this is the wording the operations on the
+        // contents of a collection refuse an absent one with.
+        if !state.collections.contains_key(&input.collection_id) {
+            return Err(DeleteUserErrorModeled::ResourceNotFoundException(
+                crate::state::modeled_error::collection_id_does_not_exist(&input.collection_id),
+            )
+            .into());
+        }
+
+        // What the token committed, if it committed anything: the request's own
+        // parameters beyond the token itself, which is what a reuse is compared against.
+        let parameters = [
+            ("CollectionId", input.collection_id.as_str()),
+            ("UserId", input.user_id.as_str()),
+        ];
+        let token_use = input.client_request_token.as_deref().map_or(
+            crate::state::idempotency::TokenUse::First,
+            |token| {
+                state
+                    .client_request_tokens
+                    .classify(Self::NAME, token, &parameters)
+            },
+        );
+        if token_use == crate::state::idempotency::TokenUse::Mismatch {
+            return Err(DeleteUserErrorModeled::IdempotentParameterMismatchException(
+                crate::state::modeled_error::idempotent_parameter_mismatch(),
+            )
+            .into());
+        }
+
+        // A deletion the caller is RETRYING under the token that carried it out answers
+        // the same success it answered then, and carries nothing out a second time: the
+        // request this token committed has already been performed, so a user the
+        // collection holds under that id now was recorded after it and is not the one
+        // that request named.
+        if token_use == crate::state::idempotency::TokenUse::Retry {
+            return Ok(DeleteUserOutput {});
+        }
+
+        let Some(collection) = state.collections.get_mut(&input.collection_id) else {
+            // The collection was there a moment ago, under this same lock, so this
+            // cannot be reached; resolving it again rather than unwrapping keeps the
+            // handler free of any construct a request could panic on.
+            return Err(DeleteUserErrorModeled::ResourceNotFoundException(
+                crate::state::modeled_error::collection_id_does_not_exist(&input.collection_id),
+            )
+            .into());
+        };
+
+        // The request names a user the collection has to hold.
+        if collection.users.remove(&input.user_id).is_none() {
+            return Err(DeleteUserErrorModeled::InvalidParameterException(
+                crate::state::modeled_error::invalid_parameters(),
+            )
+            .into());
+        }
+
+        // Removing the user disassociates the faces it held: each one stays in the
+        // collection, now associated with no user, which is what `ListFaces` reports
+        // and what frees `DeleteFaces` to remove it.
+        for face in &mut collection.faces {
+            if face.user_id.as_deref() == Some(input.user_id.as_str()) {
+                face.user_id = None;
+            }
+        }
+
+        if let Some(token) = input.client_request_token.as_deref() {
+            state
+                .client_request_tokens
+                .commit(Self::NAME, token, &parameters);
+        }
+
+        // `DeleteUserResponse` models no members: "if the action is successful with a 200
+        // response, an empty HTTP body is returned".
+        Ok(DeleteUserOutput {})
     }
 }

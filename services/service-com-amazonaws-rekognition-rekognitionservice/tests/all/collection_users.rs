@@ -26,6 +26,18 @@
 //!   mint names no position;
 //! * the store is bounded: past a collection's user capacity a create is refused with
 //!   the modelled quota error and stores nothing;
+//! * `DeleteUser` removes the one user it names from the collection it names, and that
+//!   removal is what every reader answers from afterwards: `ListUsers` stops reporting
+//!   it, `DescribeCollection` stops counting it, and no other user — in this collection
+//!   or in another — is touched. The rows span the same published `UserId` shape the
+//!   create is exercised over;
+//! * a delete is idempotent on its `ClientRequestToken` the same way a create is — the
+//!   token that carried the delete out answers the same success again and removes nothing
+//!   a second time; a collection the store does not hold is refused as not found, while a
+//!   user the named collection does not hold is a parameter refusal;
+//! * the faces a deleted user was associated with are disassociated rather than
+//!   removed: each stays in the collection, reported with no `UserId`, and is free to be
+//!   deleted on its own afterwards;
 //! * `AssociateFaces` decides each face the request names on its own — associating the
 //!   ones it can, ignoring the ones the user already holds and reporting every other one
 //!   as an unsuccessful association with the reason the model names for it — and what it
@@ -129,6 +141,21 @@ async fn create_user(
         body["ClientRequestToken"] = json!(token);
     }
     call(router, "CreateUser", body).await
+}
+
+/// `DeleteUser` in `collection_id` for `user_id`, with `token` as its
+/// `ClientRequestToken` when one is given.
+async fn delete_user(
+    router: &smithy_server_runtime::MultiServiceRouter,
+    collection_id: &str,
+    user_id: &str,
+    token: Option<&str>,
+) -> Reply {
+    let mut body = json!({ "CollectionId": collection_id, "UserId": user_id });
+    if let Some(token) = token {
+        body["ClientRequestToken"] = json!(token);
+    }
+    call(router, "DeleteUser", body).await
 }
 
 /// Every `(UserId, UserStatus)` `ListUsers` reports for `collection_id`, walking the
@@ -860,6 +887,502 @@ async fn the_store_refuses_to_grow_past_its_user_capacity() {
         user_count(&router, "full").await,
         Some(state::MAX_USERS_PER_COLLECTION as i64),
         "a refused create must store nothing"
+    );
+}
+
+#[tokio::test]
+async fn a_deleted_user_is_the_user_no_reader_reports() {
+    let router = harness();
+    create_collection(&router, "people").await;
+    create_collection(&router, "others").await;
+
+    // Rows span the published `UserId` shape rather than one example: every character
+    // class `^[a-zA-Z0-9_.\-:]+$` allows, and both ends of `len 1..128`. Each id is
+    // created in BOTH collections, so a delete that reached further than the collection
+    // it named fails here.
+    let cases: Vec<String> = vec![
+        "alice".to_string(),
+        "Bob".to_string(),
+        "user_42".to_string(),
+        "first.last".to_string(),
+        "team-east".to_string(),
+        "ns:member".to_string(),
+        "A".repeat(USER_ID_LEN_MIN),
+        "u".repeat(USER_ID_LEN_MAX),
+    ];
+    for user_id in &cases {
+        for collection_id in ["people", "others"] {
+            assert_eq!(
+                create_user(&router, collection_id, user_id, None)
+                    .await
+                    .status,
+                200,
+                "case {collection_id}/{user_id:?}: creating the user must succeed"
+            );
+        }
+    }
+
+    let untouched: Vec<(String, String)> = {
+        let mut users: Vec<(String, String)> = cases
+            .iter()
+            .map(|user_id| (user_id.clone(), CREATED.to_string()))
+            .collect();
+        users.sort();
+        users
+    };
+
+    // One delete at a time: after each one the deleted user is gone from the collection
+    // it was deleted from, every user not yet deleted is still reported, and the other
+    // collection still holds all of them.
+    for (deleted_so_far, user_id) in cases.iter().enumerate() {
+        let reply = delete_user(&router, "people", user_id, None).await;
+        assert_eq!(
+            reply.status, 200,
+            "case {user_id:?}: deleting the user must succeed, got {:?}",
+            reply.body
+        );
+        // `DeleteUserResponse` models no members: a successful delete answers an empty
+        // JSON object, so nothing about the removed user is echoed back.
+        assert_eq!(
+            reply.body,
+            json!({}),
+            "case {user_id:?}: the delete answers an empty body, got {:?}",
+            reply.body
+        );
+
+        let expected: Vec<(String, String)> = untouched
+            .iter()
+            .filter(|(reported, _)| !cases[..=deleted_so_far].contains(reported))
+            .cloned()
+            .collect();
+        let mut reported = list_users(&router, "people").await;
+        reported.sort();
+        assert_eq!(
+            reported, expected,
+            "case {user_id:?}: only the users not yet deleted may be reported"
+        );
+        assert_eq!(
+            user_count(&router, "people").await,
+            Some(expected.len() as i64),
+            "case {user_id:?}: the described user count must be the users that remain, \
+             got {reported:?}"
+        );
+        let mut others = list_users(&router, "others").await;
+        others.sort();
+        assert_eq!(
+            others, untouched,
+            "case {user_id:?}: another collection's users must be untouched by the delete"
+        );
+    }
+
+    assert_eq!(
+        list_users(&router, "people").await,
+        Vec::new(),
+        "every user created in the collection has been deleted from it"
+    );
+    assert_eq!(
+        user_count(&router, "people").await,
+        Some(0),
+        "a collection every user was deleted from counts none"
+    );
+}
+
+#[tokio::test]
+async fn a_delete_completes_once_per_client_request_token() {
+    let router = harness();
+    create_collection(&router, "people").await;
+    create_collection(&router, "others").await;
+    for collection_id in ["people", "others"] {
+        for user_id in ["alice", "bob"] {
+            create_user(&router, collection_id, user_id, None).await;
+        }
+    }
+
+    // The token that carries out the first delete. Every row below is about how a LATER
+    // request relates to it.
+    let committed = "token-one";
+    assert_eq!(
+        delete_user(&router, "people", "alice", Some(committed))
+            .await
+            .status,
+        200,
+        "the first delete must succeed"
+    );
+
+    // Rows: the same token with the same request (a retry, which answers the same
+    // success although the user it removed is gone); the same token with a different
+    // user, and with a different collection (a parameter mismatch, which must not
+    // delete the user it names); another token and no token at all for the user the
+    // first delete removed (a user the collection no longer holds, so not found).
+    let cases = vec![
+        TokenCase {
+            case: "same token, same request",
+            collection_id: "people",
+            user_id: "alice",
+            token: Some(committed),
+            status: 200,
+            error_code: "",
+            message: "",
+        },
+        TokenCase {
+            case: "same token, other user",
+            collection_id: "people",
+            user_id: "bob",
+            token: Some(committed),
+            status: 400,
+            error_code: "IdempotentParameterMismatchException",
+            // Spelled out, not read from the implementation's own constant: the text a
+            // recorded AWS refusal of a reused token carries.
+            message: "Service Unavailable",
+        },
+        TokenCase {
+            case: "same token, other collection",
+            collection_id: "others",
+            user_id: "alice",
+            token: Some(committed),
+            status: 400,
+            error_code: "IdempotentParameterMismatchException",
+            message: "Service Unavailable",
+        },
+        TokenCase {
+            case: "other token, deleted user",
+            collection_id: "people",
+            user_id: "alice",
+            token: Some("token-two"),
+            status: 400,
+            error_code: "InvalidParameterException",
+            // Spelled out, not read from the implementation's own constant: AWS's fixed
+            // wording for this class, which interpolates nothing.
+            message: "Request has invalid parameters",
+        },
+        TokenCase {
+            case: "no token, deleted user",
+            collection_id: "people",
+            user_id: "alice",
+            token: None,
+            status: 400,
+            error_code: "InvalidParameterException",
+            message: "Request has invalid parameters",
+        },
+    ];
+
+    for TokenCase {
+        case,
+        collection_id,
+        user_id,
+        token,
+        status,
+        error_code,
+        message,
+    } in cases
+    {
+        let reply = delete_user(&router, collection_id, user_id, token).await;
+        assert_eq!(
+            (reply.status, reply.error_code().as_str()),
+            (status, error_code),
+            "case {case:?}: expected {status} {error_code:?}, got {:?}",
+            reply.body
+        );
+        assert_eq!(
+            reply.string("Message").unwrap_or_default(),
+            message,
+            "case {case:?}: expected the message {message:?}, got {:?}",
+            reply.body
+        );
+        // Whatever the answer, the one completed delete removed exactly one user and
+        // every refusal removed none — in either collection.
+        assert_eq!(
+            list_users(&router, "people").await,
+            vec![("bob".to_string(), CREATED.to_string())],
+            "case {case:?}: the completed delete must have removed exactly one user"
+        );
+        assert_eq!(
+            list_users(&router, "others").await,
+            vec![
+                ("alice".to_string(), CREATED.to_string()),
+                ("bob".to_string(), CREATED.to_string()),
+            ],
+            "case {case:?}: the other collection's users must be untouched"
+        );
+    }
+
+    // A refused request commits nothing, so the token it was refused under is still
+    // free: used for a request that CAN be carried out, it carries it out.
+    assert_eq!(
+        delete_user(&router, "people", "bob", Some("token-two"))
+            .await
+            .status,
+        200,
+        "case token-two/bob: a token a refusal never committed stays usable"
+    );
+    assert_eq!(
+        list_users(&router, "people").await,
+        Vec::new(),
+        "both completed deletes must have removed their user"
+    );
+
+    // A user recorded AFTER the request a token committed is not the user that request
+    // named: the retry answers the same success it answered then and carries nothing out
+    // a second time, so the new user stays.
+    create_user(&router, "people", "alice", None).await;
+    assert_eq!(
+        delete_user(&router, "people", "alice", Some(committed))
+            .await
+            .status,
+        200,
+        "case retry after a recreate: the retry must answer the same success"
+    );
+    assert_eq!(
+        list_users(&router, "people").await,
+        vec![("alice".to_string(), CREATED.to_string())],
+        "case retry after a recreate: a retry must not remove a user recorded after the \
+         request it repeats"
+    );
+}
+
+/// One row of the refusal table: the collection and user a delete names, and the class
+/// and text the refusal carries. A collection the store does not hold is a
+/// `ResourceNotFoundException`; a user the NAMED collection does not hold is a parameter
+/// refusal, the class AWS answers a re-delete of a removed user with.
+struct MissingCase {
+    case: &'static str,
+    collection_id: &'static str,
+    user_id: &'static str,
+    error_code: &'static str,
+    message: String,
+}
+
+#[tokio::test]
+async fn a_user_is_deleted_only_where_the_store_holds_it() {
+    let router = harness();
+    create_collection(&router, "people").await;
+    create_collection(&router, "others").await;
+    create_user(&router, "people", "keeper", None).await;
+    create_user(&router, "others", "bob", None).await;
+    // A collection created and then deleted names no collection either.
+    call(
+        &router,
+        "CreateCollection",
+        json!({ "CollectionId": "vanished" }),
+    )
+    .await;
+    create_user(&router, "vanished", "alice", None).await;
+    call(
+        &router,
+        "DeleteCollection",
+        json!({ "CollectionId": "vanished" }),
+    )
+    .await;
+
+    // Rows: a collection id nothing created and one created then deleted (neither names
+    // a collection, so neither can hold a user); a user id nothing created; and a user
+    // that exists in ANOTHER collection only, which this collection does not hold.
+    let cases = vec![
+        MissingCase {
+            case: "collection never created",
+            collection_id: "missing",
+            user_id: "keeper",
+            error_code: "ResourceNotFoundException",
+            message: "The collection id: missing does not exist".to_string(),
+        },
+        MissingCase {
+            case: "collection deleted",
+            collection_id: "vanished",
+            user_id: "alice",
+            error_code: "ResourceNotFoundException",
+            message: "The collection id: vanished does not exist".to_string(),
+        },
+        MissingCase {
+            case: "user never created",
+            collection_id: "people",
+            user_id: "nobody",
+            error_code: "InvalidParameterException",
+            message: "Request has invalid parameters".to_string(),
+        },
+        MissingCase {
+            case: "user of another collection",
+            collection_id: "people",
+            user_id: "bob",
+            error_code: "InvalidParameterException",
+            message: "Request has invalid parameters".to_string(),
+        },
+    ];
+
+    for MissingCase {
+        case,
+        collection_id,
+        user_id,
+        error_code,
+        message,
+    } in cases
+    {
+        let reply = delete_user(&router, collection_id, user_id, None).await;
+        assert_eq!(
+            (reply.status, reply.error_code().as_str()),
+            (400, error_code),
+            "case {case:?}: a delete of what the store does not hold must be refused with \
+             {error_code}, got {:?}",
+            reply.body
+        );
+        assert_eq!(
+            reply.string("Message").as_deref(),
+            Some(message.as_str()),
+            "case {case:?}: expected the message {message:?}, got {:?}",
+            reply.body
+        );
+    }
+
+    // Every live user survived every refusal.
+    assert_eq!(
+        list_users(&router, "people").await,
+        vec![("keeper".to_string(), CREATED.to_string())],
+        "a refused delete must remove nothing"
+    );
+    assert_eq!(
+        list_users(&router, "others").await,
+        vec![("bob".to_string(), CREATED.to_string())],
+        "a refused delete must remove nothing from another collection either"
+    );
+}
+
+#[tokio::test]
+async fn deleting_a_user_disassociates_the_faces_it_held() {
+    let router = harness();
+    create_collection(&router, "people").await;
+    for user_id in ["alice", "bob"] {
+        create_user(&router, "people", user_id, None).await;
+    }
+
+    // Rows differ along how many of the collection's faces the deleted user holds: two
+    // for the user that is deleted, one for the user that is not, and one face no user
+    // holds at all — the last two being what the delete may not touch. Every face is
+    // indexed from the one portrait, so each association is decided by the user it is
+    // offered to and none by a measurement.
+    let portrait = one_face_png(23);
+    let alice_faces = vec![
+        index_face(&router, "people", &portrait).await,
+        index_face(&router, "people", &portrait).await,
+    ];
+    let bob_face = index_face(&router, "people", &portrait).await;
+    let unassociated = index_face(&router, "people", &portrait).await;
+    for (user_id, face_ids) in [
+        ("alice", alice_faces.clone()),
+        ("bob", vec![bob_face.clone()]),
+    ] {
+        let joined = associate_faces(&router, "people", user_id, &face_ids, None, None).await;
+        assert_eq!(
+            (joined.status, associated(&joined)),
+            (200, face_ids.clone()),
+            "case {user_id:?}: the faces must be associated first, got {:?}",
+            joined.body
+        );
+    }
+
+    // What the association recorded is what the reader reports before the delete: every
+    // assertion here goes over the wire.
+    let held_by = |user: &str| -> Vec<(String, Option<String>)> {
+        let mut faces: Vec<(String, Option<String>)> = match user {
+            "alice" => alice_faces
+                .iter()
+                .map(|face_id| (face_id.clone(), Some("alice".to_string())))
+                .collect(),
+            _ => vec![(bob_face.clone(), Some("bob".to_string()))],
+        };
+        faces.sort();
+        faces
+    };
+    for user_id in ["alice", "bob"] {
+        let mut reported = list_faces(&router, "people", Some(user_id)).await;
+        reported.sort();
+        assert_eq!(
+            reported,
+            held_by(user_id),
+            "case {user_id:?}: the user must hold the faces the association recorded"
+        );
+    }
+
+    let deleted = delete_user(&router, "people", "alice", None).await;
+    assert_eq!(
+        deleted.status, 200,
+        "deleting the user must succeed, got {:?}",
+        deleted.body
+    );
+
+    // Every face the deleted user held is still in the collection, now associated with no
+    // user; the other user's face and the face nobody held are exactly as they were.
+    let mut expected: Vec<(String, Option<String>)> = alice_faces
+        .iter()
+        .map(|face_id| (face_id.clone(), None))
+        .chain([
+            (bob_face.clone(), Some("bob".to_string())),
+            (unassociated.clone(), None),
+        ])
+        .collect();
+    expected.sort();
+    let mut reported = list_faces(&router, "people", None).await;
+    reported.sort();
+    assert_eq!(
+        reported, expected,
+        "the deleted user's faces must survive it, associated with no user"
+    );
+    assert_eq!(
+        list_faces(&router, "people", Some("alice")).await,
+        Vec::new(),
+        "the deleted user holds no face"
+    );
+    let remaining: Vec<String> = list_users(&router, "people")
+        .await
+        .into_iter()
+        .map(|(user_id, _)| user_id)
+        .collect();
+    assert_eq!(
+        remaining,
+        vec!["bob".to_string()],
+        "only the deleted user may be gone"
+    );
+
+    // A face no user holds can be deleted; one a live user still holds cannot, which is
+    // what tells the two apart over the wire.
+    let removed = call(
+        &router,
+        "DeleteFaces",
+        json!({ "CollectionId": "people", "FaceIds": [alice_faces[0], alice_faces[1], bob_face] }),
+    )
+    .await;
+    assert_eq!(
+        removed.status, 200,
+        "deleting the faces must be answered, got {:?}",
+        removed.body
+    );
+    let mut gone: Vec<String> = removed
+        .list("DeletedFaces")
+        .iter()
+        .map(|face_id| face_id.as_str().unwrap_or_default().to_string())
+        .collect();
+    gone.sort();
+    let mut freed = alice_faces.clone();
+    freed.sort();
+    assert_eq!(
+        gone, freed,
+        "exactly the faces the delete disassociated may be deletable now, got {:?}",
+        removed.body
+    );
+    let surviving: Vec<String> = removed
+        .list("UnsuccessfulFaceDeletions")
+        .iter()
+        .map(|entry| {
+            entry
+                .get("FaceId")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string()
+        })
+        .collect();
+    assert_eq!(
+        surviving,
+        vec![bob_face.clone()],
+        "a face a live user still holds must survive the deletion, got {:?}",
+        removed.body
     );
 }
 

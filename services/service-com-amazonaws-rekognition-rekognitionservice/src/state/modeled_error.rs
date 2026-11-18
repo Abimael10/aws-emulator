@@ -196,6 +196,12 @@ pub fn no_face_to_search_by() -> InvalidParameterException {
 
 /// A request whose parameters do not identify what the operation is to work on; see
 /// [`INVALID_PARAMETERS_MESSAGE`].
+///
+/// A `UserId` the named collection does not hold is one such parameter: the collection
+/// the request named exists, so what the service rejects is the VALUE it was given and
+/// not a resource it could not find — the same reasoning, and the same class, as a
+/// `FaceId` the collection does not hold ([`face_id_not_in_collection`]), with
+/// `ResourceNotFoundException` kept for the collection itself being absent.
 pub fn invalid_parameters() -> InvalidParameterException {
     InvalidParameterException::with_message(INVALID_PARAMETERS_MESSAGE)
 }
