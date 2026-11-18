@@ -27,9 +27,10 @@
 //!   before any handler ran. The default returns `None`, keeping the framework's
 //!   wording. See the inline note on that method for how to reword.
 //! - `override_routing_error` — how this service words a request that reached it
-//!   but named no modeled operation. The default returns `None`, so the entry
-//!   renders the protocol-correct default (query -> 400 InvalidAction, awsJson ->
-//!   404, …). Return `Some(resp)` to answer in your own envelope if desired.
+//!   but named no modeled operation. This service answers it itself: such a
+//!   request names no action for the layer ahead of the service to authorize, so
+//!   it is refused as an authorization failure rather than as an operation this
+//!   emulator has yet to write (see that method, and `unauthorizable_request`).
 //! - `override_framework_error` — how this service words a transport-level
 //!   failure the orchestrator detects up front (e.g. a malformed `aws-chunked`
 //!   body). The default returns `None`, keeping the entry's protocol-correct
@@ -40,6 +41,8 @@
 //! and is reached, not edited, through the one `definition` method below. You
 //! do not write it; editing the entry would let this file drift from the model.
 
+use aws_smithy_runtime_api::http::{Response as RtResponse, StatusCode};
+use aws_smithy_types::body::SdkBody;
 use smithy_server_runtime::{
     http, ErasedOperation, Refusal, Refused, Service,
 };
@@ -59,6 +62,50 @@ const BAD_REQUEST_EXCEPTION: &str = "BadRequestException";
 /// failed nor the rule it failed, because the check is made against the body as a
 /// whole rather than member by member.
 const INVALID_REQUEST_BODY: &str = "Invalid request body";
+
+/// The error code a request this endpoint cannot place on one of its operations is
+/// refused with: the authorization layer in front of this service derives the action to
+/// authorize from the request's method and URI, so a request it cannot place names no
+/// action, and what it answers is an authorization failure. The code is one this
+/// service's model declares (`AccessDeniedException`, `@httpError(403)`), which is what
+/// a client reads out of `x-amzn-errortype`.
+const ACCESS_DENIED_EXCEPTION: &str = "AccessDeniedException";
+
+/// The whole sentence that refusal carries: fixed text, naming neither the method, the
+/// URI nor any operation, because the layer got far enough to look for an action and no
+/// further.
+const UNAUTHORIZABLE_REQUEST: &str = "Unable to determine service/operation name to be authorized";
+
+/// The status it carries: the request was not authorized, so it is not a report that the
+/// emulator has yet to implement something.
+const UNAUTHORIZABLE_REQUEST_STATUS: u16 = 403;
+
+/// The media type that refusal's body carries: this service speaks `restJson1`, and the
+/// refusal is made ahead of any operation, so it is written here rather than through a
+/// modelled error shape.
+const JSON_MEDIA_TYPE: &str = "application/json";
+
+/// The refusal of a request that reached this service's endpoint but names no operation
+/// of its model.
+///
+/// The body carries the single lower-case `message` member and nothing else: the shape
+/// of this refusal is the authorization layer's, not one of the shapes this service's
+/// model declares, and `restJson1` resolves the error class from the
+/// `x-amzn-errortype` header. The sentence is a constant, so nothing of the request is
+/// echoed back into it.
+fn unauthorizable_request() -> RtResponse {
+    let body = ::serde_json::json!({ "message": UNAUTHORIZABLE_REQUEST }).to_string();
+    let mut response = RtResponse::new(
+        StatusCode::try_from(UNAUTHORIZABLE_REQUEST_STATUS)
+            .expect("the status is a constant of this module"),
+        SdkBody::from(body),
+    );
+    response.headers_mut().insert("content-type", JSON_MEDIA_TYPE);
+    response
+        .headers_mut()
+        .insert("x-amzn-errortype", ACCESS_DENIED_EXCEPTION);
+    response
+}
 
 /// The `com-amazonaws-drs-elasticdisasterrecoveryservice` emulated service: the generated [`ServiceDefinition`] plus
 /// the behavioral seams this file owns.
@@ -146,12 +193,24 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     ) -> Option<aws_smithy_runtime_api::http::Response> {
         // The router calls this when a request reached this service but named no
         // modeled operation — neither `override_operation` nor the generated
-        // routing table resolved it. Returning `None` renders the protocol-correct
-        // default for this service's envelope (query -> 400 InvalidAction text/xml,
-        // awsJson -> 404, rpcv2Cbor -> 404, rest -> 501). Return `Some(resp)` to
-        // word that routing failure in your own envelope instead.
+        // routing table resolved it. The framework's default for a `rest` service is
+        // a 501 `NotImplemented`, which reads as "this emulator has not written that
+        // operation yet"; for THIS endpoint that is the wrong claim, because the
+        // request named no operation of the service AT ALL.
+        //
+        // Elastic Disaster Recovery authorizes a request before it dispatches it, and
+        // the action it authorizes comes from the request's method and URI: a request
+        // those cannot place on one of the service's operations has no action to
+        // authorize, so the layer ahead of the service refuses it as the authorization
+        // failure it is ([`unauthorizable_request`]) rather than reporting on what the
+        // service implements. It is the SAME answer for every such request, whatever
+        // method and path it carried, which is why nothing of `req` is read.
+        //
+        // This says nothing about the operations this emulator has yet to implement: a
+        // request that DOES name one is routed to it and answered by its handler, which
+        // is where a scaffolded operation's 501 comes from.
         let _ = req;
-        None
+        Some(unauthorizable_request())
     }
 
     fn override_framework_error(

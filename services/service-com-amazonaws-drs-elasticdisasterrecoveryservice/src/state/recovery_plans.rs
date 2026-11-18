@@ -27,7 +27,10 @@ pub const ID_PREFIX: &str = "plan";
 
 /// The resource part of a Recovery Plan's ARN, as the resource's own ARN template
 /// spells it (`RecoveryPlanResource`: `recovery-plan/{recoveryPlanID}`).
-const ARN_RESOURCE_PREFIX: &str = "recovery-plan/";
+///
+/// Public because the tagging route reads the KIND of resource an ARN addresses off the
+/// same prefixes (`crate::state::tags`), and the two must not spell it differently.
+pub const ARN_RESOURCE_PREFIX: &str = "recovery-plan/";
 
 /// How this service names the Recovery Plan resource when it reports one in an
 /// error: the `resourceType` of a not-found refusal, and the subject of its message.

@@ -6,6 +6,7 @@ use std::collections::{BTreeMap, HashMap};
 
 pub mod ec2_subnets;
 pub mod recovery_plans;
+pub mod tags;
 
 use crate::ops::types::{
     CreateReplicationConfigurationTemplateOutput, DisconnectSourceServerOutput,
@@ -346,7 +347,10 @@ pub fn replication_configuration_template_arn(region: &str, id: &str) -> String 
     ::engine::emulator_arn(
         "drs",
         region,
-        &format!("replication-configuration-template/{id}"),
+        &format!(
+            "{}{id}",
+            tags::REPLICATION_CONFIGURATION_TEMPLATE_ARN_PREFIX
+        ),
     )
 }
 
