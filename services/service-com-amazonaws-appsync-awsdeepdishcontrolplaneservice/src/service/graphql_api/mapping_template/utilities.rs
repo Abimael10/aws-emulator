@@ -4,7 +4,9 @@
 //! to all templates" in the AppSync resolver mapping-template reference.
 //!
 //! One function per helper, over the same JSON value model the rest of the language works
-//! in ([`super::values`]). Three of them are not values at all and are answered as their own
+//! in ([`super::values`]). The `$util.dynamodb` family — the helpers that MARSHAL a value as
+//! the attribute value DynamoDB holds it as — lives in [`dynamodb`], one module for one
+//! family. Three of them are not values at all and are answered as their own
 //! outcome: `$util.quiet` produces nothing, and `$util.error` and `$util.unauthorized` RAISE
 //! — "throws a custom error", which is how a template refuses the field it is resolving.
 //!
@@ -15,6 +17,8 @@
 use ::serde_json::{Map as JsonMap, Value as Json};
 
 use super::values;
+
+pub mod dynamodb;
 
 /// What one `$util` call came to.
 #[derive(Debug, Clone)]
@@ -185,6 +189,13 @@ pub fn call(path: &[String], args: &[Json], context: &Json) -> Result<Answer, St
                 Err(_) => Err(NOT_A_PATTERN.to_string()),
             }
         }
+        // The DynamoDB marshalling helpers: each renders a value as the attribute value
+        // DynamoDB holds it as, and each has a sibling that answers the same representation
+        // serialized ([`dynamodb`]).
+        ["dynamodb", helper] => match dynamodb::call(helper, args)? {
+            Some(produced) => value(produced),
+            None => Err(format!("{NO_SUCH_HELPER}$util.dynamodb.{helper}")),
+        },
         // The clock helpers, which read the one clock this process has.
         ["time", "nowISO8601"] => value(Json::String(now_iso8601())),
         ["time", "nowEpochSeconds"] => value(values::number(unix_millis() as f64 / 1000.0)),

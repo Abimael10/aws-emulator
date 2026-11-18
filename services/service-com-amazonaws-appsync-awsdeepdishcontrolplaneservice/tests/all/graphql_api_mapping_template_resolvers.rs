@@ -416,7 +416,7 @@ pub(crate) async fn create_api(
     )
     .await;
     assert_eq!(status, 200, "CreateApiKey must answer 200, got {key}");
-    create_schema(router, &api_id).await;
+    install_schema(router, &api_id, SCHEMA).await;
     create_data_source(router, &api_id).await;
     create_resolvers(router, &api_id).await;
     GraphqlApi {
@@ -426,10 +426,16 @@ pub(crate) async fn create_api(
     }
 }
 
-/// Install [`SCHEMA`] on `api_id`, waiting for the clock to perform the creation.
-async fn create_schema(router: &MultiServiceRouter, api_id: &str) {
+/// Install the schema `document` on `api_id`, waiting for the clock to perform the creation.
+///
+/// The wait is on the CONDITION — the creation's own reported status — so nothing here depends
+/// on how fast the host runs. Shared with the suites that drive a data plane of their own over
+/// a schema of their own ([`crate::graphql_api_dynamodb_marshalling`],
+/// [`crate::graphql_api_published_uri`]), so one reading of how a schema is installed serves
+/// every one of them.
+pub(crate) async fn install_schema(router: &MultiServiceRouter, api_id: &str, document: &str) {
     use base64::Engine as _;
-    let definition = base64::engine::general_purpose::STANDARD.encode(SCHEMA);
+    let definition = base64::engine::general_purpose::STANDARD.encode(document);
     let (status, started) = appsync(
         router,
         "POST",
