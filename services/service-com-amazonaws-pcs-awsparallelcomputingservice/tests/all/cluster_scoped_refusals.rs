@@ -22,10 +22,17 @@
 //!    `ResourceNotFoundException` instead, and so does a child lookup whose cluster DID
 //!    resolve.
 //!
+//! 3. the ORDER in which a cluster-scoped operation decides the two questions: the cluster
+//!    it is scoped to first, the child it names only once that cluster has resolved — so
+//!    what the call is refused about follows the `clusterIdentifier` alone and never
+//!    whether some cluster holds a child of the name it gave.
+//!
 //! The rows span the class the rules generalise over: for rule 1 one row per error class
 //! the model declares for these operations, each with a different `@httpError`; for rule 2
 //! every cluster-scoped operation — read, list, create and delete, of both child kinds — in
-//! each of the two forms `ClusterIdentifier` admits.
+//! each of the two forms `ClusterIdentifier` admits; for rule 3 both cluster-scoped deletes
+//! against every form of cluster identifier at each published bound of its length, each
+//! naming children that exist and children nothing holds.
 
 use serde_json::{json, Value};
 use service_com_amazonaws_pcs_awsparallelcomputingservice::service::wire::CLIENT_ERROR_STATUS;
@@ -385,4 +392,250 @@ async fn a_resolvable_cluster_is_refused_about_the_resource_the_call_names() {
              {refused}"
         );
     }
+}
+
+/// Both cluster-scoped DELETEs, as `(operation, the request naming `cluster` and `child`,
+/// the kind of identifier a refusal about that child reports)`. Each addresses a child of a
+/// cluster in the member its own input declares for it
+/// (`smithy_query(query="operation",operation="DeleteQueue,DeleteComputeNodeGroup")`).
+fn cluster_scoped_deletes(
+    cluster: &str,
+    child: &str,
+) -> Vec<(&'static str, Value, &'static str)> {
+    vec![
+        (
+            "DeleteQueue",
+            json!({"clusterIdentifier": cluster, "queueIdentifier": child}),
+            "Queue ID",
+        ),
+        (
+            "DeleteComputeNodeGroup",
+            json!({
+                "clusterIdentifier": cluster,
+                "computeNodeGroupIdentifier": child,
+            }),
+            "Compute Node Group ID",
+        ),
+    ]
+}
+
+/// RULE (rule 3 of the header): a cluster-scoped DELETE decides the cluster it is scoped to
+/// BEFORE the child it names, so what it is refused about follows the `clusterIdentifier`
+/// alone — a cluster NAME nothing resolves is the permissions failure naming the caller, the
+/// action `pcs:<Operation>` and the identifier as supplied, in the `Message` member; a
+/// generated cluster id nothing holds is the cluster's own not-found; and only once the
+/// cluster HAS resolved is the call answered about the child, served when the child is there
+/// and the child's own not-found when it is not.
+///
+/// A delete is the call a teardown loop branches on — a not-found reads as "already gone",
+/// an authorization failure as terminal — so the rows span what the rule generalises over:
+/// both cluster-scoped deletes, every form of cluster identifier `ClusterIdentifier` admits
+/// at each published bound of its length, and children that a cluster of this account DOES
+/// hold beside children nothing holds, because what a refusal states must not depend on
+/// whether some other cluster holds a child of the name the request gave.
+#[tokio::test]
+async fn a_cluster_scoped_delete_is_refused_by_what_its_cluster_identifier_resolves_to() {
+    let router = emulator();
+
+    // A cluster that DOES exist, holding a queue and a compute node group under the very
+    // names the refused calls below name.
+    let (status, created) = call(&router, "CreateCluster", &create_cluster("held-cluster")).await;
+    assert_eq!(status, 200, "setup: CreateCluster: got {created}");
+    let cluster_id = created["cluster"]["id"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    wait_past_the_owed_transition().await;
+    let (status, group) = call(
+        &router,
+        "CreateComputeNodeGroup",
+        &create_compute_node_group("held-cluster", "nodes"),
+    )
+    .await;
+    assert_eq!(status, 200, "setup: CreateComputeNodeGroup: got {group}");
+    let (status, queue) = call(
+        &router,
+        "CreateQueue",
+        &json!({
+            "clusterIdentifier": "held-cluster",
+            "queueName": "work",
+            "computeNodeGroupConfigurations": [],
+        }),
+    )
+    .await;
+    assert_eq!(status, 200, "setup: CreateQueue: got {queue}");
+    wait_past_the_owed_transition().await;
+
+    // The forms and widths the NAME alternative of `ClusterIdentifier` admits
+    // (`smithy_query(query="shape",shape="ClusterIdentifier")`:
+    // `^(pcs_[a-zA-Z0-9]+|[A-Za-z][A-Za-z0-9-]{2,40})$`), at each published bound of its
+    // length — none of them a cluster this account holds.
+    let longest_name = format!("A{}", "a".repeat(40));
+    let unresolvable_names: [(&str, &str); 5] = [
+        ("the shortest name the pattern allows", "abc"),
+        ("a hyphenated name", "no-such-cluster"),
+        ("a mixed-case name", "AnotherMissingOne"),
+        ("a name opening with this service's own letters", "pcsx-cluster"),
+        ("the longest name the pattern allows", longest_name.as_str()),
+    ];
+    // What the child member names: a queue and a compute node group the EXISTING cluster
+    // holds, a child nothing holds anywhere, and the generated-id form of one.
+    let children = ["work", "nodes", "no-such-child", "pcs_00000000000000000000"];
+
+    for (named, identifier) in unresolvable_names {
+        for child in children {
+            for (operation, request, _) in cluster_scoped_deletes(identifier, child) {
+                let case = format!("{operation} on {named} {identifier:?} naming {child:?}");
+                let (status, refused) = call(&router, operation, &request).await;
+                assert_eq!(
+                    (status, error_code(&refused).as_str()),
+                    (CLIENT_ERROR_STATUS, "AccessDeniedException"),
+                    "case {case}: expected the permissions failure, got {status} with {refused}"
+                );
+                assert_eq!(
+                    refused["Message"].as_str(),
+                    Some(not_authorized(operation, identifier).as_str()),
+                    "case {case}: expected the IAM sentence in the Message member, got \
+                     {refused}"
+                );
+                // Nothing of a not-found is reported: the refusal does not claim the child
+                // was looked for, nor disclose whether such a cluster exists.
+                for member in ["message", "resourceId", "resourceType"] {
+                    assert!(
+                        refused.get(member).is_none(),
+                        "case {case}: a refusal of the caller must carry no {member}, got \
+                         {refused}"
+                    );
+                }
+            }
+        }
+    }
+
+    // The generated-id form: a value only this service mints, so one nothing holds names a
+    // cluster that is not there — the modelled not-found, carrying the identifier as
+    // supplied and the kind of identifier that did not resolve.
+    for identifier in ["pcs_0", "pcs_00000000000000000000", "pcs_9aF3"] {
+        for (operation, request, _) in cluster_scoped_deletes(identifier, "work") {
+            let case = format!("{operation} naming the absent cluster id {identifier:?}");
+            let (status, refused) = call(&router, operation, &request).await;
+            assert_eq!(
+                (status, error_code(&refused).as_str()),
+                (CLIENT_ERROR_STATUS, "ResourceNotFoundException"),
+                "case {case}: expected the cluster's not-found, got {status} with {refused}"
+            );
+            assert_eq!(
+                (
+                    refused["message"].as_str(),
+                    refused["resourceId"].as_str(),
+                    refused["resourceType"].as_str()
+                ),
+                (
+                    Some("AWS PCS couldn't find the cluster you specified."),
+                    Some(identifier),
+                    Some("Cluster ID")
+                ),
+                "case {case}: expected the cluster not-found and its modelled members, got \
+                 {refused}"
+            );
+            assert!(
+                refused.get("Message").is_none(),
+                "case {case}: a not-found carries no IAM sentence, got {refused}"
+            );
+        }
+    }
+
+    // A value the identifier's own pattern does not admit is refused for its FORM, before
+    // either question is decided: one character past the longest name it allows, and one
+    // short of the shortest.
+    let past_the_longest = format!("A{}", "a".repeat(41));
+    for (named, identifier) in [
+        ("one past the longest name", past_the_longest.as_str()),
+        ("one short of the shortest name", "ab"),
+    ] {
+        for (operation, request, _) in cluster_scoped_deletes(identifier, "work") {
+            let case = format!("{operation} naming {named} {identifier:?}");
+            let (status, refused) = call(&router, operation, &request).await;
+            assert_eq!(
+                (status, error_code(&refused).as_str()),
+                (CLIENT_ERROR_STATUS, "ValidationException"),
+                "case {case}: expected the identifier refused for its form, got {status} \
+                 with {refused}"
+            );
+        }
+    }
+
+    // Once the cluster DOES resolve — addressed by either form of ITS identifier — the same
+    // call is answered about the CHILD: the child's own not-found for one the cluster does
+    // not hold, and no refusal of the caller.
+    for cluster in [cluster_id.as_str(), "held-cluster"] {
+        for (operation, request, identifier_label) in
+            cluster_scoped_deletes(cluster, "no-such-child")
+        {
+            let case = format!("{operation} in the cluster {cluster:?}");
+            let (status, refused) = call(&router, operation, &request).await;
+            assert_eq!(
+                (status, error_code(&refused).as_str()),
+                (CLIENT_ERROR_STATUS, "ResourceNotFoundException"),
+                "case {case}: expected the child's not-found, got {status} with {refused}"
+            );
+            assert_eq!(
+                (
+                    refused["resourceId"].as_str(),
+                    refused["resourceType"].as_str()
+                ),
+                (Some("no-such-child"), Some(identifier_label)),
+                "case {case}: expected the child identifier it could not resolve and its \
+                 kind, got {refused}"
+            );
+            assert!(
+                refused.get("Message").is_none(),
+                "case {case}: a cluster that resolves must not be refused about the caller, \
+                 got {refused}"
+            );
+        }
+    }
+
+    // And a child that IS there deletes, so the refusals above are the cluster boundary and
+    // not a delete that never works: the queue addressed by the cluster's name, the compute
+    // node group by its generated id.
+    for (operation, request, reader, member) in [
+        (
+            "DeleteQueue",
+            json!({"clusterIdentifier": "held-cluster", "queueIdentifier": "work"}),
+            "GetQueue",
+            "queue",
+        ),
+        (
+            "DeleteComputeNodeGroup",
+            json!({
+                "clusterIdentifier": cluster_id.clone(),
+                "computeNodeGroupIdentifier": "nodes",
+            }),
+            "GetComputeNodeGroup",
+            "computeNodeGroup",
+        ),
+    ] {
+        let (status, deleted) = call(&router, operation, &request).await;
+        assert_eq!(
+            status, 200,
+            "case {operation} of a child the cluster holds: got {status} with {deleted}"
+        );
+        let (status, read) = call(&router, reader, &request).await;
+        assert_eq!(
+            (status, read[member]["status"].as_str()),
+            (200, Some("DELETING")),
+            "case {operation}: expected the child reported DELETING straight after the \
+             delete, got {status} with {read}"
+        );
+    }
+
+    // None of the refused calls wrote anything: the account still holds the one cluster the
+    // setup created.
+    let (status, listed) = call(&router, "ListClusters", &json!({})).await;
+    assert_eq!(
+        (status, listed["clusters"].as_array().map(Vec::len)),
+        (200, Some(1)),
+        "case after every refusal: expected the refusals to have created nothing, got \
+         {status} with {listed}"
+    );
 }
