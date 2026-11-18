@@ -91,6 +91,9 @@ chrono-tz = { version = "0.10", default-features = false, features = ["std"] }
 emulator-core-build-support = { workspace = true }
 
 [dev-dependencies]
+# `automod`: the single integration-test target declares one suite per `tests/all/<name>.rs`
+# from the directory itself, so a new suite is a new file and nothing lists it.
+automod = { workspace = true }
 sha2 = { workspace = true }
 hex = { workspace = true }
 # EventBridge and Amazon SQS are mounted beside Amazon EC2 Auto Scaling on one engine in the

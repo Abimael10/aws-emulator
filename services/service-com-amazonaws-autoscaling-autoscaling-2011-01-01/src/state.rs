@@ -155,8 +155,8 @@ pub use warm_pools::{
 pub mod suspended_processes;
 
 pub use suspended_processes::{
-    named_processes, suspension_reason, unknown_process_message, ProcessRefusal,
-    SuspendedProcesses, PROCESS_LAUNCH, PROCESS_TERMINATE,
+    named_processes, resumed_convergence_cause, suspension_reason, unknown_process_message,
+    ProcessRefusal, SuspendedProcesses, PROCESS_LAUNCH, PROCESS_TERMINATE,
 };
 
 /// The group metrics a group aggregates to CloudWatch: the collection
@@ -2740,7 +2740,12 @@ impl AutoScalingState {
                         group.launch_configuration_name = None;
                     }
                     if desired.mixed_instances_policy.is_some() {
-                        group.mixed_instances_policy = desired.mixed_instances_policy.clone();
+                        // The group spreads its capacity under the distribution the
+                        // refresh's policy states, each member it left out at the default
+                        // the group's own writers fill in ([`group_defaults`]).
+                        group.mixed_instances_policy = group_defaults::mixed_instances_policy(
+                            desired.mixed_instances_policy.clone(),
+                        );
                         group.launch_configuration_name = None;
                     }
                 }

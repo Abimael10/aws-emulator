@@ -146,6 +146,26 @@ pub fn selects_by_requirements(policy: Option<&MixedInstancesPolicy>) -> bool {
     })
 }
 
+/// Whether ANY override of `policy` states `InstanceRequirements`, so the group is one
+/// "that specif[ies] InstanceRequirements" — which is the kind of group the allocation
+/// strategies document their own defaults per
+/// (`smithy_query(query="doc",shape="InstancesDistribution",member="OnDemandAllocationStrategy")`).
+///
+/// Asked of every override rather than of the one a launch is made from
+/// ([`launch_override`]), because the question is about the POLICY the group runs under.
+#[must_use]
+pub fn states_requirements(policy: &MixedInstancesPolicy) -> bool {
+    policy
+        .launch_template
+        .as_ref()
+        .and_then(|template| template.overrides.as_ref())
+        .is_some_and(|overrides| {
+            overrides
+                .iter()
+                .any(|entry| entry.instance_requirements.is_some())
+        })
+}
+
 /// The type `policy`'s attribute-based selection comes to, resolved ONCE when a group is
 /// configured with that policy ([`super::StoredGroup::requirements_instance_type`]).
 ///

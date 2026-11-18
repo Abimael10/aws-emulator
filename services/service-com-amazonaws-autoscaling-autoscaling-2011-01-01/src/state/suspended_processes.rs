@@ -34,6 +34,11 @@
 //! while one of them is suspended a capacity change still records the capacity the caller
 //! asked for while the group adds — or removes — nothing
 //! ([`super::AutoScalingState::apply_capacity`]).
+//!
+//! So a resumption is not only a record either: the group does again what the resumed
+//! process does, which is to bring its instances to the capacity it holds — the capacity
+//! the changes made while the process was suspended recorded
+//! ([`resumed_convergence_cause`] is the cause that convergence records).
 
 use std::collections::BTreeMap;
 use std::time::SystemTime;
@@ -95,6 +100,25 @@ impl StoredGroup {
         Ok(())
     }
 
+    /// Resume the processes `requested` names — or every process of the catalog when it
+    /// names none — and answer the ones that were actually suspended until now.
+    ///
+    /// Every name is checked BEFORE the first write, exactly as a suspension checks it, so a
+    /// refused request leaves the group's suspensions exactly as they were. Resuming a
+    /// process the group was already running is not an error and changes nothing: a process
+    /// is either suspended or it is not.
+    ///
+    /// The names answered are what the group has STOPPED having suspended, which is what
+    /// tells a caller whether a process the group's own behaviour depends on
+    /// ([`PROCESS_LAUNCH`], [`PROCESS_TERMINATE`]) is now running again.
+    pub fn resume_processes(&mut self, requested: &[String]) -> Result<Vec<String>, ProcessRefusal> {
+        let named = named_processes(requested)?;
+        Ok(named
+            .into_iter()
+            .filter(|process| self.suspended_processes.remove(process).is_some())
+            .collect())
+    }
+
     /// Whether `process` is suspended for this group, so the group does not do what that
     /// process does.
     #[must_use]
@@ -150,6 +174,18 @@ pub fn suspension_reason(suspended_at: SystemTime) -> String {
     format!("User suspended at {}", whole_seconds_text(suspended_at))
 }
 
+/// The cause the capacity change a RESUMPTION makes records: that the group is doing again
+/// what the resumed process does, and the capacity it brings its instances to.
+///
+/// One variable part — the capacity the group holds, which the changes made while the
+/// process was suspended recorded; the rest is fixed text.
+pub fn resumed_convergence_cause(desired_capacity: i32) -> String {
+    format!(
+        "a user request resumed the scaling processes of the group: bringing its instances to \
+         the desired capacity of {desired_capacity}."
+    )
+}
+
 /// `at` as RFC 3339 UTC text truncated to the second, which is the precision a suspension
 /// reason states an instant to.
 fn whole_seconds_text(at: SystemTime) -> String {
@@ -166,12 +202,12 @@ fn whole_seconds_text(at: SystemTime) -> String {
 /// with.
 ///
 /// The fixed text names what the request contained and then the catalog the caller has to
-/// choose from; the one variable part is the names the request wrote that the catalog does
-/// not hold, EVERY one of them, since one call may name several and none of them is
-/// suspended.
+/// choose from, and closes the sentence with its full stop; the one variable part is the
+/// names the request wrote that the catalog does not hold, EVERY one of them, since one
+/// call may name several and none of them is suspended.
 pub fn unknown_process_message(processes: &[String]) -> String {
     format!(
-        "Request contained illegal suspendable process names: [{}].Valid names are :[{}]",
+        "Request contained illegal suspendable process names: [{}].Valid names are :[{}].",
         processes.join(", "),
         super::SCALING_PROCESS_TYPES.join(", ")
     )

@@ -671,7 +671,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             group.mixed_instances_policy = None;
         }
         if let Some(value) = input.mixed_instances_policy {
-            group.mixed_instances_policy = Some(value);
+            // Every member of the distribution the request left out is the one the group
+            // then spreads its capacity under, exactly as the create fills them in
+            // ([`crate::state::group_defaults::mixed_instances_policy`]).
+            group.mixed_instances_policy =
+                crate::state::group_defaults::mixed_instances_policy(Some(value));
             group.launch_configuration_name = None;
             group.launch_template = None;
         }

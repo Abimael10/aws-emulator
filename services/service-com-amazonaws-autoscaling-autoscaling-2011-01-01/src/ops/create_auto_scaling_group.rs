@@ -726,6 +726,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             launch_template.as_mut(),
             mixed_instances_policy.as_mut(),
         );
+        // And every member of the policy's instances distribution the request left out is
+        // the one the group then spreads its capacity under
+        // ([`crate::state::group_defaults::mixed_instances_policy`]).
+        let mixed_instances_policy =
+            crate::state::group_defaults::mixed_instances_policy(mixed_instances_policy);
 
         let now = ::std::time::SystemTime::now();
         let mut state = state.lock();

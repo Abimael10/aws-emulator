@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ResumeProcesses
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ResumeProcesses`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ResumeProcesses::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Turns the suspended scaling processes a group holds back on — the ones the request
+//! names, or every one of them when it names none — and lets the group do again what those
+//! processes do: a group whose `Launch` or `Terminate` was suspended brings its instances
+//! to the capacity it holds as soon as the process is running again.
 //!
 //! ## Shape of an operation
 //!
@@ -162,18 +158,91 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ResumeProcesses` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ResumeProcessesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ResumeProcesses"))
+        let Some(store) = crate::state::service_state(&*self.engine) else {
+            return Err(ResumeProcessesErrorModeled::ResourceContentionFault(
+                ResourceContentionFault {
+                    message: Some(
+                        "the Auto Scaling store is not mounted on this engine".to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+
+        let group_name = input.auto_scaling_group_name;
+        // "If you omit this property, all processes are specified"
+        // (`ScalingProcessQuery$ScalingProcesses`), and a request that carries the member
+        // with no entry named none either — the same reading a suspension takes of it.
+        let requested = input.scaling_processes.unwrap_or_default();
+
+        let now = ::std::time::SystemTime::now();
+        let mut state = store.lock();
+        state.materialize_due(&*self.engine, now);
+
+        // The group's suspensions are turned off under a borrow that ENDS here, so the
+        // convergence below reaches the whole store again.
+        let (converge, desired_capacity) = {
+            // A resumption belongs to a group, so a name no group answers to is refused
+            // with the wording this service's group-scoped WRITE paths answer with: the
+            // detail field after the dash is left unfilled, so no part of the request
+            // appears in it.
+            let Some(group) = state.groups.get_mut(&group_name) else {
+                return Err(crate::scaffolded::Scaffolded::validation_error(
+                    crate::state::ABSENT_GROUP_MESSAGE_WITHOUT_DETAIL,
+                ));
+            };
+            // A process outside this service's own catalog names no process to resume,
+            // which is about what the request carries rather than about the group — so it
+            // is answered `ValidationError`, and nothing is written.
+            let resumed = group.resume_processes(&requested).map_err(|refusal| {
+                crate::scaffolded::Scaffolded::validation_error(refusal.message())
+            })?;
+
+            // `Launch` is what adds instances to a group and `Terminate` is what removes
+            // them, so a group that has either of them back does again what it did not do
+            // while the process was suspended: it brings its instances to the capacity it
+            // holds — which is the capacity every change made while the process was
+            // suspended recorded. A convergence is owed only where the group is actually
+            // away from that capacity in the direction the resumed process moves it, so a
+            // resumption that resumed no instance-moving process, resumed one the group was
+            // already running, or left the group holding exactly what its capacity says it
+            // should, moves nothing and leaves its cooldown where it was.
+            let desired_capacity = group.desired_capacity;
+            let resumed_process = |process: &str| resumed.iter().any(|name| name == process);
+            let short = resumed_process(crate::state::PROCESS_LAUNCH)
+                && group.launches_needed(desired_capacity) > 0;
+            let surplus = resumed_process(crate::state::PROCESS_TERMINATE)
+                && group.surplus_capacity_units(desired_capacity) > 0;
+            // A capacity change the group is already waiting on converges it itself when it
+            // falls due ([`crate::state::AutoScalingState::materialize_due`]), to THAT
+            // change's capacity — so a resumption leaves a deferred change waiting rather
+            // than applying this capacity over it.
+            let deferred = group.pending_capacity.is_some();
+            ((short || surplus) && !deferred, desired_capacity)
+        };
+
+        if converge {
+            let cause = crate::state::resumed_convergence_cause(desired_capacity);
+            state.apply_capacity(&*self.engine, &group_name, desired_capacity, &cause, now);
+        }
+
+        crate::state::audit(
+            ctx.parts(),
+            "ResumeProcesses",
+            &group_name,
+            "scaling processes resumed",
+        );
+        // The instances the convergence above launched or scaled in settle on the clock, and
+        // the lifecycle events that report them are published as they fall due. The store's
+        // lock is released first: the pump takes it itself.
+        drop(state);
+        if converge {
+            // Those instances are also registered with the load balancers the group is
+            // attached to, through the ONE call every write that moved a group's instances
+            // makes for it, so both kinds of attachment are settled here.
+            crate::state::settle_group_load_balancers(&*self.engine, &group_name);
+            crate::state::drive_lifecycle_clock(ctx, &self.engine);
+        }
+        Ok(ResumeProcessesOutput)
     }
 }
