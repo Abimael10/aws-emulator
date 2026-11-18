@@ -23,6 +23,12 @@
 //! and keeps being served, and a refused mutation, which leaves the resource exactly as it
 //! was.
 //!
+//! Two further tables take the explicit `Deny` apart, since it is the one statement that
+//! decides a request on its own: one spans the forms its `Resource` element takes against
+//! one and the same read by a principal holding no `Allow` of that read at all, the other
+//! spans what the ARN in the request path can be — held here, never created, or another
+//! Region's — to pin that the decision is taken ahead of the lookup.
+//!
 //! The principals are made with IAM's and STS's OWN operations over the same engine, so
 //! the documents this service reads are the ones those services wrote.
 
@@ -894,5 +900,279 @@ async fn the_accounts_own_credential_is_served() {
             "case {case:?}: expected the account's own credential to be served, got \
              {status} / {answer:?}"
         );
+    }
+}
+
+/// One identity-based document of the shape a caller denied a single action carries: it
+/// ALLOWS the listing of configuration managers (and a call to another service, which this
+/// endpoint's decision has nothing to say about) and DENIES the read of one manager on
+/// `denied_resource` — so no statement in it ALLOWS the read, and only the explicit `Deny`
+/// can be about it.
+fn allow_the_listing_but_deny_the_read(denied_resource: &str) -> String {
+    json!({
+        "Version": "2012-10-17",
+        "Statement": [
+            {"Effect": "Allow", "Action": "sts:GetCallerIdentity", "Resource": ANY_RESOURCE},
+            {
+                "Effect": "Allow",
+                "Action": format!("{ACTION_PREFIX}:ListConfigurationManagers"),
+                "Resource": ANY_RESOURCE,
+            },
+            {
+                "Effect": "Deny",
+                "Action": format!("{ACTION_PREFIX}:GetConfigurationManager"),
+                "Resource": denied_resource,
+            },
+        ],
+    })
+    .to_string()
+}
+
+/// How many pages [`listed_across_pages`] follows before it gives up: a listing that never
+/// reports an empty `NextToken` fails the case rather than paging for ever. Far above the
+/// number of managers any case here creates.
+const PAGE_LIMIT: usize = 64;
+
+/// Every manager ARN the listing reports to `access_key_id`, collected ONE MANAGER PER PAGE
+/// (`MaxItems` of 1, the smallest the model's range admits) by following `NextToken` until
+/// the listing reports it empty.
+async fn listed_across_pages(aws: &Emulator, case: &str, access_key_id: &str) -> Vec<String> {
+    let mut arns: Vec<String> = Vec::new();
+    let mut token = String::new();
+    for page in 0..PAGE_LIMIT {
+        let mut body = json!({ "MaxItems": 1 });
+        if !token.is_empty() {
+            body["StartingToken"] = Value::String(token.clone());
+        }
+        let (status, answer) = aws
+            .call_as(access_key_id, "POST", "/listConfigurationManagers", Some(&body))
+            .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected page {page} of the listing to be served, got {status} / \
+             {answer:?}"
+        );
+        let entries = answer
+            .get("ConfigurationManagersList")
+            .and_then(Value::as_array)
+            .unwrap_or_else(|| {
+                panic!(
+                    "case {case:?}: expected a ConfigurationManagersList on page {page}, got \
+                     {answer:?}"
+                )
+            });
+        arns.extend(
+            entries
+                .iter()
+                .filter_map(|entry| entry.get("ManagerArn").and_then(Value::as_str))
+                .map(str::to_string),
+        );
+        token = answer
+            .get("NextToken")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        if token.is_empty() {
+            return arns;
+        }
+    }
+    panic!("case {case:?}: the listing never exhausted within {PAGE_LIMIT} pages, got {arns:?}")
+}
+
+/// RULE: an explicit `Deny` about the request decides it whatever else the calling
+/// principal's documents say — including when NO `Allow` of that action is among them at
+/// all, where the refusal still states IAM's explicit-deny clause rather than its
+/// default-deny one — and a `Deny` statement is about the request exactly when its
+/// `Resource` element matches the ARN the request named, with `*` standing for any run of
+/// characters and `?` for one. Whichever way it is written, it withholds only the action it
+/// names: the listing the same principal is granted keeps answering and keeps reporting the
+/// manager the deny was written about, on whatever page it falls.
+///
+/// The rows span the forms a `Resource` element takes over one and the same request: the
+/// very ARN named, IAM's any-resource wildcard, a trailing wildcard over the account's
+/// managers, a single-character wildcard inside the ARN, another manager's ARN, and a
+/// resource of another service — the last two of which are about no request this endpoint
+/// serves.
+#[tokio::test]
+async fn an_explicit_deny_decides_the_read_by_the_resource_it_names() {
+    let aws = Emulator::new();
+    let manager = create_manager(&aws, "denied-by-resource").await;
+    let other_manager = create_manager(&aws, "untouched-by-the-deny").await;
+    let label = manager.replace('/', "%2F");
+    // The ARN without its uuid: what a policy scoped to every configuration manager of the
+    // account spells with a trailing wildcard.
+    let (collection, _) = manager
+        .rsplit_once('/')
+        .expect("a manager ARN carries its uuid as the last segment of its resource part");
+
+    // (case, the `Resource` element the deny names, the reason clause the refusal states)
+    let rows: Vec<(&str, String, String)> = vec![
+        (
+            "the very ARN the request names",
+            manager.clone(),
+            EXPLICIT_DENY.to_string(),
+        ),
+        (
+            "IAM's any-resource wildcard",
+            ANY_RESOURCE.to_string(),
+            EXPLICIT_DENY.to_string(),
+        ),
+        (
+            "every manager of the account, by a trailing wildcard",
+            format!("{collection}/*"),
+            EXPLICIT_DENY.to_string(),
+        ),
+        (
+            "the ARN with its last character left to IAM's single-character wildcard",
+            format!("{}?", &manager[..manager.len() - 1]),
+            EXPLICIT_DENY.to_string(),
+        ),
+        (
+            "another manager's ARN",
+            other_manager.clone(),
+            default_deny("GetConfigurationManager"),
+        ),
+        (
+            "a resource of another service",
+            format!("arn:aws:ssm:{REGION}::parameter/*"),
+            default_deny("GetConfigurationManager"),
+        ),
+    ];
+
+    for (index, (case, denied_resource, reason)) in rows.iter().enumerate() {
+        let principal = assumed_role(
+            &aws,
+            &format!("lister-{index}"),
+            &[allow_the_listing_but_deny_the_read(denied_resource)],
+        )
+        .await;
+        let (status, answer) = aws
+            .call_as(
+                &principal.access_key_id,
+                "GET",
+                &format!("/configurationManager/{label}"),
+                None,
+            )
+            .await;
+        assert_refused(
+            case,
+            status,
+            &answer,
+            &not_authorized(
+                &principal.arn,
+                "GetConfigurationManager",
+                &manager,
+                reason,
+            ),
+        );
+
+        // Scoped to the one action: the listing this same principal holds is served, and it
+        // still reports both managers — the one the deny was written about included.
+        let listed = listed_across_pages(&aws, case, &principal.access_key_id).await;
+        for expected in [&manager, &other_manager] {
+            assert!(
+                listed.contains(expected),
+                "case {case:?}: expected the listing to still report {expected:?}, got \
+                 {listed:?}"
+            );
+        }
+    }
+}
+
+/// RULE: the authorization decision is taken against the ARN the REQUEST carried, ahead of
+/// any record being looked up, so a denied read is refused the same way whether or not that
+/// ARN names anything this endpoint holds — HTTP 403 `AccessDeniedException` rather than
+/// the 404 the lookup would reach — and the resource the sentence names is the ARN from the
+/// request path, whichever one that is.
+///
+/// The rows span what the ARN in the path can be for one and the same denied principal: a
+/// manager this endpoint holds, a well-formed manager ARN of this Region the account never
+/// created, and one of another Region, which this Region-scoped endpoint does not serve
+/// either. The control at the end reads the same three ARNs with the account's own
+/// credential, which no document bounds: it is served the manager and NOT FOUND for the
+/// other two, so the refusals above came from the authorization step rather than from the
+/// store.
+#[tokio::test]
+async fn a_denied_read_is_refused_before_the_manager_is_looked_up() {
+    let aws = Emulator::new();
+    let held = create_manager(&aws, "held-by-this-endpoint").await;
+    // Both ARNs satisfy the `ManagerArn` member's modelled pattern
+    // (`smithy_query(query="operation",operation="GetConfigurationManager")`), so the
+    // request reaches the handler and it is the authorization step that answers.
+    let absent = service_com_amazonaws_ssmquicksetup_quicksetup::state::manager_arn(
+        REGION,
+        "11111111-2222-3333-4444-555555555555",
+    );
+    let elsewhere = service_com_amazonaws_ssmquicksetup_quicksetup::state::manager_arn(
+        "eu-west-1",
+        "99999999-8888-7777-6666-555555555555",
+    );
+    let principal = assumed_role(
+        &aws,
+        "denied-reader",
+        &[allow_the_listing_but_deny_the_read(ANY_RESOURCE)],
+    )
+    .await;
+
+    // (case, the ARN the request addresses, whether this endpoint holds it)
+    let rows: Vec<(&str, &String, bool)> = vec![
+        ("a manager this endpoint holds", &held, true),
+        ("a manager ARN the account never created", &absent, false),
+        ("a manager ARN of another Region", &elsewhere, false),
+    ];
+    for (case, arn, _) in &rows {
+        let (status, answer) = aws
+            .call_as(
+                &principal.access_key_id,
+                "GET",
+                &format!("/configurationManager/{}", arn.replace('/', "%2F")),
+                None,
+            )
+            .await;
+        assert_refused(
+            case,
+            status,
+            &answer,
+            &not_authorized(
+                &principal.arn,
+                "GetConfigurationManager",
+                arn,
+                EXPLICIT_DENY,
+            ),
+        );
+    }
+
+    for (case, arn, held_here) in &rows {
+        let (status, answer) = aws
+            .call_as(
+                ACCOUNT_KEY,
+                "GET",
+                &format!("/configurationManager/{}", arn.replace('/', "%2F")),
+                None,
+            )
+            .await;
+        if *held_here {
+            assert_eq!(
+                status, 200,
+                "case {case:?}: expected the unbounded caller's read to be served, got \
+                 {status} / {answer:?}"
+            );
+            assert_eq!(
+                answer.get("ManagerArn").and_then(Value::as_str),
+                Some(arn.as_str()),
+                "case {case:?}: expected the manager that was read back, got {answer:?}"
+            );
+        } else {
+            assert_eq!(
+                status, 404,
+                "case {case:?}: expected the unbounded caller's read to reach the lookup, got \
+                 {status} / {answer:?}"
+            );
+            let code = error_code(&answer);
+            assert_eq!(
+                code, "ResourceNotFoundException",
+                "case {case:?}: expected ResourceNotFoundException, got {code:?} in {answer:?}"
+            );
+        }
     }
 }
