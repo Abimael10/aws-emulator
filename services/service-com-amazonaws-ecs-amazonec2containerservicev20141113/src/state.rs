@@ -328,6 +328,11 @@ pub use task_events::*;
 mod service_action_events;
 pub use service_action_events::*;
 
+/// The `ECS Deployment State Change` events this service publishes as a service DEPLOYMENT
+/// moves through its rollout states — started, completed, failed.
+mod deployment_events;
+pub use deployment_events::*;
+
 /// What a container's `command` DOES: the session one container's program runs in, and the
 /// output and exit status running it produces.
 mod container_shell;
@@ -4526,6 +4531,9 @@ pub struct ComAmazonawsEcsAmazonec2containerservicev20141113State {
     /// The service actions this store's scheduler has taken and not published to
     /// EventBridge yet, oldest first — see [`service_action_events`].
     pending_service_action_events: VecDeque<ServiceActionEvent>,
+    /// The service-deployment transitions this store has materialised and not published to
+    /// EventBridge yet, oldest first — see [`deployment_events`].
+    pending_deployment_state_changes: VecDeque<DeploymentStateChange>,
     /// `taskArn` -> the `(lastStatus, desiredStatus)` pair last published for that task, so
     /// a transition is recognised once however it was written and published exactly once
     /// ([`Self::record_task_state_changes`]).

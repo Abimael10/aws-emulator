@@ -318,6 +318,18 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
         service.deployment_stable_due_at = None;
         service.deployment_rollback_due_at = rollback.then(|| at + CIRCUIT_BREAKER_ROLLBACK_SPAN);
         service.record_events([event]);
+        let service_arn = service.arn.clone();
+        // The rollout has reached the TERMINAL state of the deployment state machine, so the
+        // move is published as an `ECS Deployment State Change` beside the entry it writes on
+        // the service's own event stream: a client watching the bus learns that this rollout
+        // failed, and why, without calling Amazon ECS again ([`super::deployment_events`]).
+        self.record_deployment_state_change(
+            &service_arn,
+            &deployment_id,
+            ROLLOUT_FAILED,
+            CIRCUIT_BREAKER_FAILURE_REASON,
+            at,
+        );
         let Some(record) = deployment_arn.and_then(|arn| self.service_deployments.get_mut(&arn))
         else {
             return;

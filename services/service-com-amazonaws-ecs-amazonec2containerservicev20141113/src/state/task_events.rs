@@ -252,7 +252,10 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
         now: SystemTime,
         generation: u64,
     ) -> Option<SystemTime> {
-        if !self.pending_task_events.is_empty() || self.has_pending_service_actions() {
+        if !self.pending_task_events.is_empty()
+            || self.has_pending_service_actions()
+            || self.has_pending_deployment_state_changes()
+        {
             return Some(now);
         }
         // The service scheduler's own next step is an instant the pump waits for too: a
@@ -589,7 +592,7 @@ async fn publish_pending<Eng: Send + Sync + 'static>(
     };
     let client = ::service_common::eventbridge_client::eventbridge_client(callback, region);
     loop {
-        let (changes, actions) = {
+        let (changes, actions, deployments) = {
             let mut store = state.lock();
             store.record_task_state_changes(SystemTime::now());
             (
@@ -599,13 +602,17 @@ async fn publish_pending<Eng: Send + Sync + 'static>(
                 // pump publishes everything this service owes the bus
                 // ([`super::service_action_events`]).
                 store.take_service_action_events(MAX_PUBLISHED_PER_DRAIN),
+                // And so do the rollout states this store's service DEPLOYMENTS have moved
+                // into ([`super::deployment_events`]).
+                store.take_deployment_state_changes(MAX_PUBLISHED_PER_DRAIN),
             )
         };
-        if changes.is_empty() && actions.is_empty() {
+        if changes.is_empty() && actions.is_empty() && deployments.is_empty() {
             return;
         }
         publish_batch(&client, &changes).await;
         super::service_action_events::publish_service_actions(&client, &actions).await;
+        super::deployment_events::publish_deployment_state_changes(&client, &deployments).await;
     }
 }
 

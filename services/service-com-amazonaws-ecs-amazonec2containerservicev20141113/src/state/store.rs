@@ -351,6 +351,12 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
             // ([`super::unhealthy_task_replacement`]), so a task still being evaluated is a
             // task it is still waiting on.
             let awaits_health = self.rollout_awaits_container_health(service);
+            // Whether THIS rollout has already reached its steady state once. A later pass
+            // can settle the same deployment again — a scale-out gives the scheduler the
+            // same rollout's task set to settle afresh — but the deployment state machine
+            // moves to its `COMPLETED` state once, so the event that announces that move is
+            // published once ([`super::deployment_events`]).
+            let rollout_was_completed = service.deployment_rollout_completed;
             let settled = service.deployment_steady_due_at.filter(|due| {
                 *due <= now
                     && service.places_tasks()
@@ -479,11 +485,30 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
                 // What the action NAMES: the service itself, and the cluster the scheduler
                 // acted in — read off the record here, in the pass that settled it, rather
                 // than for every service of every pass.
-                let (service_arn, cluster_arn) = match self.services.get(&key) {
-                    Some(service) => (service.arn.clone(), service.cluster_arn.clone()),
+                let (service_arn, cluster_arn, deployment_id) = match self.services.get(&key) {
+                    Some(service) => (
+                        service.arn.clone(),
+                        service.cluster_arn.clone(),
+                        service.deployment_id.clone(),
+                    ),
                     None => continue,
                 };
                 self.record_service_action(&service_arn, &cluster_arn, SERVICE_STEADY_STATE, due);
+                // That steady state is also where the ROLLOUT ends: "When the service
+                // reaches a steady state, the deployment transitions to a COMPLETED state",
+                // so the deployment's own state machine moves here too and the move is
+                // published as an `ECS Deployment State Change`
+                // ([`super::deployment_events`]) — on the move itself, so a rollout that
+                // settles again announces no second completion.
+                if !rollout_was_completed {
+                    self.record_deployment_state_change(
+                        &service_arn,
+                        &deployment_id,
+                        ROLLOUT_COMPLETED,
+                        &rollout_state_reason(&deployment_id, true),
+                        due,
+                    );
+                }
             }
         }
     }
@@ -944,6 +969,19 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
             &format!("ECS deployment {deployment_id} replaced this deployment."),
         );
         let arn = self.next_service_deployment_arn(region, &cluster_name, &service_name);
+        // The rollout STARTS here, which is the first state of the deployment state machine
+        // and so the first `ECS Deployment State Change` a client watching the bus receives
+        // ([`super::deployment_events`]). Queued where the rollout was started, so it is
+        // queued exactly once however this door was reached — a create, an update that
+        // releases a revision, or the redeployment a rollback performs — and dated by the
+        // instant the rollout itself carries as its `createdAt`.
+        self.record_deployment_state_change(
+            &service_arn,
+            &deployment_id,
+            ROLLOUT_IN_PROGRESS,
+            &rollout_state_reason(&deployment_id, false),
+            SystemTime::try_from(at).unwrap_or(now),
+        );
         self.service_deployments.insert(
             arn.clone(),
             ServiceDeploymentRecord {
