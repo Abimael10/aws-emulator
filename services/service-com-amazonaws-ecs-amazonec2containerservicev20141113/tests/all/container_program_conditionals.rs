@@ -8,22 +8,26 @@
 //! status with the forms a shell gives it and the utilities whose whole effect is inside its
 //! own session: `test` (and its `[ ... ]` spelling) answers a question about the words it was
 //! given, `if` runs the branch its condition chose, `case` runs the branch whose shell
-//! pattern its word matched, `${#NAME}` is how many characters a variable's value has, and a
-//! backslash escape stands for the character it escapes. A program built from those reports
-//! the status it ended with — every one of them is answered inside the session, so there is
-//! nothing outside this process for any of them to reach.
+//! pattern its word matched, a `while` or `for` loop repeats its body, `$((…))` is the number
+//! its expression comes to, `${#NAME}` is how many characters a variable's value has, `$?` is
+//! the status of the command before it, `set` turns the shell options a program asks for on,
+//! and a backslash escape stands for the character it escapes. A program built from those
+//! reports the status it ended with — every one of them is answered inside the session, so
+//! there is nothing outside this process for any of them to reach.
 //!
 //! What a container has no program for is unchanged by that: a question about a FILE needs a
-//! filesystem this container does not have, and a `for` loop is a form it does not perform,
-//! so a program that reaches one of those ran none of the program its image holds and claims
-//! no status at all — which is the rule `container_program_not_performed` pins.
+//! filesystem this container does not have, and a function definition is a form it does not
+//! perform, so a program that reaches one of those ran none of the program its image holds
+//! and claims no status at all — which is the rule `container_program_not_performed` pins.
 //!
 //! The rows differ along what the rule generalises over: WHICH form decides the status (a
 //! `test` string comparison, a `test` integer comparison, a negated `test`, an `if`, an
 //! `if`/`elif`/`else`, a `case` with one pattern, a `case` with alternatives, a `case` whose
-//! wildcard catches the value, a `case` matching one character, a length expansion, an
-//! escaped quote inside a double-quoted word), and the status each program chooses is a
-//! DIFFERENT number per row, so a row cannot pass on another row's answer.
+//! wildcard catches the value, a `case` matching one character, a length expansion, a counted
+//! `while` loop, a `for` loop, the `set` options, an unset parameter under `set -u`, a
+//! pipeline under `set -o pipefail`, an escaped quote inside a double-quoted word), and the
+//! status each program chooses is a DIFFERENT number per row, so a row cannot pass on another
+//! row's answer.
 //!
 //! Nothing here reaches into a state struct: every status asserted is read back through
 //! `DescribeTasks`.
@@ -142,6 +146,37 @@ const ROWS: &[Row] = &[
         exit_code: 24,
     },
     Row {
+        // The shape a retrying workload takes: a counted loop whose counter is an arithmetic
+        // expansion, so the loop ends by its own count.
+        case: "a `while` loop counting with an arithmetic expansion",
+        program: "N=0; while [ \"$N\" -lt 3 ]; do N=$((N + 1)); done; exit $N",
+        exit_code: 3,
+    },
+    Row {
+        case: "a `for` loop over the words of its list",
+        program: "T=0; for W in a b c d; do T=$((T + 1)); done; exit $T",
+        exit_code: 4,
+    },
+    Row {
+        case: "the options a program sets with `set -eu`, and `$?` after a command",
+        program: "set -eu; V=set; [ \"$V\" = set ]; exit $?",
+        exit_code: 0,
+    },
+    Row {
+        // `set -u` is what the program asked to be ended by: "the shell shall write a message
+        // to standard error … and … shall exit", so the exit status is the shell's own and
+        // not the status of a command that never ran.
+        case: "an unset parameter under `set -u`, which ends the program",
+        program: "set -u; echo \"$NOTHING_AT_ALL\"; exit 42",
+        exit_code: 1,
+    },
+    Row {
+        // Without `pipefail` the status is the last stage's, which succeeded.
+        case: "a pipeline whose earlier stage failed, under `set -o pipefail`",
+        program: "set -o pipefail; false | cat; exit $?",
+        exit_code: 1,
+    },
+    Row {
         case: "a length expansion of a variable nothing set, which is zero",
         program: "[ ${#NOTHING} -eq 0 ] && exit 25; exit 78",
         exit_code: 25,
@@ -186,8 +221,8 @@ const UNPERFORMED: &[Row] = &[
         exit_code: 0,
     },
     Row {
-        case: "a `for` loop, a compound form this container does not perform",
-        program: "for name in one two; do echo $name; done; exit 33",
+        case: "a function definition, a form this container does not perform",
+        program: "greet() { echo hello; }; greet; exit 33",
         exit_code: 0,
     },
 ];

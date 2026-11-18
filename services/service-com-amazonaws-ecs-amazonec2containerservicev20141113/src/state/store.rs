@@ -4037,6 +4037,9 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
             // task is kept in place by its scheduler either way
             // ([`CONTAINER_WORK_SPAN`]).
             work_done_due_at: None,
+            // The credential its containers present is vended by the launch step that mints
+            // one for the task role ([`crate::state::settle_task_role_credentials`]).
+            task_role_credentials: None,
         };
         self.tasks.insert(task_arn, record);
     }

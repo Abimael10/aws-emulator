@@ -571,8 +571,8 @@ async fn a_stop_sends_the_container_the_signal_its_program_answers() {
 /// leaves the emulator serving every other call.
 ///
 /// The rows span what the bound has to hold for: a loop whose commands this container
-/// PERFORMS, and loops whose condition and body are forms it DECLINES (so they perform no
-/// command at all) — in both polarities, `until` on a declined form and `while` on a
+/// PERFORMS, and loops whose condition and body are commands it DECLINES (so they perform no
+/// command at all) — in both polarities, `until` on a declined command and `while` on a
 /// negated one.
 #[tokio::test]
 async fn a_program_that_never_ends_is_bounded_and_claims_no_exit_status() {
@@ -587,12 +587,12 @@ async fn a_program_that_never_ends_is_bounded_and_claims_no_exit_status() {
             "echo up; while true; do :; done",
         ),
         (
-            "an until loop whose condition and body are forms it declines",
-            "echo up; until for x in x; do :; done; do for x in x; do :; done; done",
+            "an until loop whose condition and body are commands it declines",
+            "echo up; until definitely-not-a-utility; do definitely-not-a-utility; done",
         ),
         (
-            "a while loop whose condition is a declined form negated",
-            "echo up; while ! for x in x; do :; done; do for x in x; do :; done; done",
+            "a while loop whose condition is a declined command negated",
+            "echo up; while ! definitely-not-a-utility; do definitely-not-a-utility; done",
         ),
     ];
 

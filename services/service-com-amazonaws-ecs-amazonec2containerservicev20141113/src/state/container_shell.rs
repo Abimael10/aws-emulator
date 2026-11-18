@@ -42,6 +42,10 @@
 //! is therefore no language subset to keep in step with a specification: a command either
 //! names one of those utilities, or it did not run.
 //!
+//! The one program of the container's ENVIRONMENT this session provides beside those
+//! utilities is the AWS CLI ([`super::container_aws_cli`]): a container's image is routinely
+//! one whose program calls the account's services, and those calls are made as the task role.
+//!
 //! A run that reached such a command CLAIMS NOTHING about the container
 //! ([`ContainerOutcome::Abandoned`]): the status above is what the declining command answered
 //! INSIDE the session — which is what the `&&`, `||` and loop conditions around it read — and
@@ -502,6 +506,23 @@ pub struct ContainerShell {
     /// Whether the pipeline just performed was written with `!`, which is the other form
     /// `set -e` does not end the program for.
     negated_pipeline: bool,
+    /// Whether the program asked to be ENDED by an expansion of a parameter this session
+    /// holds nothing for (`set -u`).
+    nounset: bool,
+    /// The parameter an expansion found unset while [`Self::nounset`] was on, which is what
+    /// ends the session rather than leaving the command one it could not run
+    /// ([`Self::word_failure`]).
+    unset_parameter: Option<String>,
+    /// Whether a pipeline's status is its LAST FAILING stage's rather than its last stage's
+    /// (`set -o pipefail`).
+    pipefail: bool,
+    /// The status of the last pipeline this session performed, which is what the special
+    /// parameter `$?` expands to.
+    last_status: i32,
+    /// The AWS CLI this container's environment provides, and `None` for a session given
+    /// none — one whose commands reach no account service at all, so an `aws` command is one
+    /// it could not run ([`super::container_aws_cli`]).
+    aws: Option<Arc<ContainerAwsCli>>,
 }
 
 impl ContainerShell {
@@ -545,7 +566,21 @@ impl ContainerShell {
             errexit: false,
             condition_depth: 0,
             negated_pipeline: false,
+            nounset: false,
+            unset_parameter: None,
+            pipefail: false,
+            last_status: EXIT_SUCCESS,
+            aws: None,
         }
+    }
+
+    /// This session with the AWS CLI its container's environment provides on it: the
+    /// `aws s3` transfers of the container, made as the task role
+    /// ([`super::container_aws_cli`]). A session built without it provides no such program.
+    #[must_use]
+    pub fn with_aws_cli(mut self, aws: ContainerAwsCli) -> Self {
+        self.aws = Some(Arc::new(aws));
+        self
     }
 
     /// Run `program` to its end and answer what the container's run ended as.
@@ -587,6 +622,25 @@ impl ContainerShell {
     fn declined(&mut self) -> i32 {
         self.unperformed = true;
         EXIT_COMMAND_NOT_FOUND
+    }
+
+    /// The status a command whose WORD had no expansion answers.
+    ///
+    /// Two different things end a word that way. A parameter this session holds nothing for
+    /// while the program asked to be ended by exactly that (`set -u`) is the SHELL's own
+    /// failure: "the shell shall write a message to standard error … and … shall exit", so the
+    /// diagnostic is written and the session ends with the status a shell gives it — which is
+    /// the container's own exit status, because that is what the program it ran did. Every
+    /// other word is an expansion this container does not perform, which claims nothing about
+    /// the container ([`Self::declined`]).
+    async fn word_failure(&mut self) -> i32 {
+        let Some(name) = self.unset_parameter.take() else {
+            return self.declined();
+        };
+        self.write_output(&format!("{SHELL_NAME}: {name}: parameter not set\n"))
+            .await;
+        self.exit_status = Some(EXIT_FAILURE);
+        EXIT_FAILURE
     }
 
     /// Run one shell PROGRAM text and answer the status the shell answered for it.
@@ -639,14 +693,14 @@ impl ContainerShell {
     /// Run one of the COMPOUND command forms this container performs.
     ///
     /// A brace group and a subshell are the list they hold; a `while`/`until` loop runs its
-    /// body for as long as its condition says, an `if` runs the branch its condition chose,
-    /// and a `case` runs the branch whose pattern its word matched. The loop needs no bound
-    /// of its own: every command it performs comes out of the run's command budget, and a
-    /// loop that outlasts it abandons the run.
+    /// body for as long as its condition says, a `for` loop runs it once per word of its
+    /// list, an `if` runs the branch its condition chose, and a `case` runs the branch whose
+    /// pattern its word matched. No loop needs a bound of its own: every command it performs
+    /// comes out of the run's command budget, and a loop that outlasts it abandons the run.
     ///
     /// A subshell's effects are NOT confined to a child session here: there is no process
-    /// to fork, so a variable it sets is set in this one. Every other compound form — a
-    /// `for` loop, an arithmetic command — is one this container does not perform.
+    /// to fork, so a variable it sets is set in this one. Every other compound form — an
+    /// arithmetic command, a function definition — is one this container does not perform.
     fn run_compound_command<'a>(
         &'a mut self,
         compound: &'a ::brush_parser::ast::CompoundCommand,
@@ -670,6 +724,9 @@ impl ContainerShell {
                 }
                 ::brush_parser::ast::CompoundCommand::CaseClause(clause) => {
                     self.run_case_clause(clause).await
+                }
+                ::brush_parser::ast::CompoundCommand::ForClause(clause) => {
+                    self.run_for_clause(clause).await
                 }
                 _ => self.declined(),
             }
@@ -800,6 +857,47 @@ impl ContainerShell {
                     return status;
                 }
             }
+        })
+    }
+
+    /// Run a `for NAME in WORD…; do LIST; done`: the body once per word of the list, with
+    /// the loop's variable holding that word — "the for loop shall execute a sequence of
+    /// commands for each member in a list of items", with the variable "set to the next word
+    /// taken from the `in` word list".
+    ///
+    /// The words are expanded first, as the shell expands them, so a list written as one
+    /// expansion is the words that expansion produced. A `for` written with NO word list
+    /// iterates over nothing here: it would take the positional parameters, which a container
+    /// whose program is its argument vector has none of.
+    ///
+    /// Each ITERATION takes a step out of the run's budget before its body is reached, the
+    /// way a `while` iteration does ([`Self::take_command_budget`]), so a list of many words
+    /// is bounded exactly as a loop with no end of its own is.
+    fn run_for_clause<'a>(
+        &'a mut self,
+        clause: &'a ::brush_parser::ast::ForClauseCommand,
+    ) -> ShellFuture<'a, i32> {
+        Box::pin(async move {
+            let mut status = EXIT_SUCCESS;
+            let Some(values) = clause.values.as_ref() else {
+                return status;
+            };
+            for word in values {
+                if !self.take_command_budget().await {
+                    return status;
+                }
+                let Some(value) = self.expand_word(&word.value).await else {
+                    return self.declined();
+                };
+                if !self.set_variable(clause.variable_name.clone(), value) {
+                    return self.declined();
+                }
+                status = self.run_compound_list(&clause.body.list).await;
+                if self.stopped() {
+                    return status;
+                }
+            }
+            status
         })
     }
 
@@ -1026,7 +1124,9 @@ impl ContainerShell {
     }
 
     /// Run a pipeline and answer its status: "the exit status of a pipeline shall be the
-    /// exit status of the last command", negated when the pipeline is written with `!`.
+    /// exit status of the last command", negated when the pipeline is written with `!` — or,
+    /// where the program asked for it (`set -o pipefail`), the status of its last FAILING
+    /// stage.
     ///
     /// A pipeline CONNECTS its commands: "the standard output of the first command shall be
     /// connected to the standard input of the second command", so every stage but the last
@@ -1045,6 +1145,9 @@ impl ContainerShell {
     ) -> ShellFuture<'a, i32> {
         Box::pin(async move {
             let mut status = EXIT_SUCCESS;
+            // The last stage that FAILED, which is the pipeline's status where the program
+            // asked for it (`set -o pipefail`).
+            let mut failed: Option<i32> = None;
             let last = pipeline.seq.len().saturating_sub(1);
             // Which form the pipeline took is what `set -e` reads after it
             // ([`Self::run_and_or_list`]).
@@ -1063,6 +1166,9 @@ impl ContainerShell {
                 // pipeline was reading is put back after it.
                 let held_input = ::std::mem::replace(&mut self.piped_input, upstream.take());
                 status = self.run_command(command).await;
+                if status != EXIT_SUCCESS {
+                    failed = Some(status);
+                }
                 self.piped_input = held_input;
                 if connected {
                     let captured = self.captures.pop().unwrap_or_default();
@@ -1075,6 +1181,14 @@ impl ContainerShell {
                     break;
                 }
             }
+            // "If set, the return value of a pipeline is the value of the last (rightmost)
+            // command to exit with a non-zero status, or zero if all commands exit
+            // successfully" — which is what `set -o pipefail` asked for.
+            if self.pipefail {
+                if let Some(answered) = failed {
+                    status = answered;
+                }
+            }
             if pipeline.bang {
                 status = if status == EXIT_SUCCESS {
                     EXIT_FAILURE
@@ -1082,6 +1196,9 @@ impl ContainerShell {
                     EXIT_SUCCESS
                 };
             }
+            // "?: Expands to the decimal exit status of the most recent pipeline", which is
+            // this one from here on.
+            self.last_status = status;
             status
         })
     }
@@ -1178,7 +1295,7 @@ impl ContainerShell {
                 match item {
                     ::brush_parser::ast::CommandPrefixOrSuffixItem::Word(word) => {
                         let Some(expanded) = self.expand_word(&word.value).await else {
-                            return self.declined();
+                            return self.word_failure().await;
                         };
                         words.push(expanded);
                     }
@@ -1187,13 +1304,13 @@ impl ContainerShell {
                         _,
                     ) => {
                         let Some(pair) = self.assignment_of(assignment).await else {
-                            return self.declined();
+                            return self.word_failure().await;
                         };
                         assignments.push(pair);
                     }
                     ::brush_parser::ast::CommandPrefixOrSuffixItem::IoRedirect(redirect) => {
                         let Some(applied) = self.apply_redirect(redirect).await else {
-                            return self.declined();
+                            return self.word_failure().await;
                         };
                         applied.record(&mut redirections);
                     }
@@ -1203,7 +1320,7 @@ impl ContainerShell {
             let name = match simple.word_or_name.as_ref() {
                 Some(word) => match self.expand_word(&word.value).await {
                     Some(expanded) => Some(expanded),
-                    None => return self.declined(),
+                    None => return self.word_failure().await,
                 },
                 None => None,
             };
@@ -1449,6 +1566,12 @@ impl ContainerShell {
             if ::service_common::posix_shell_text_filters::TEXT_FILTER_COMMANDS.contains(&name) {
                 return self.run_text_filter(name, arguments, redirections).await;
             }
+            // The AWS CLI, which is a program of the container's ENVIRONMENT rather than a
+            // utility of this session: what it performs is the shared reading of that program
+            // ([`super::container_aws_cli`]).
+            if name == ::service_common::aws_s3_cli::CLI_PROGRAM {
+                return self.run_aws_cli(arguments, redirections).await;
+            }
             // The catalogs are what this container provides: a command outside them needs a
             // program or a network this container does not have.
             if !BUILT_IN_COMMANDS.contains(&name) {
@@ -1571,14 +1694,26 @@ impl ContainerShell {
         ::service_common::posix_shell_files::file_test_answer(arguments, &self.filesystem)
     }
 
-    /// `set [-e|+e]`: turn the shell option its argument names on or off.
+    /// `set [-e|+e|-u|+u|-o pipefail|+o pipefail]`: turn the shell options its arguments name
+    /// on or off.
     ///
-    /// `-e` is the option a container's program is written with: "when this option is on, if
-    /// a simple command fails … the shell shall immediately exit" — except where the command
-    /// that failed is a CONDITION (an `if`'s, a loop's), stands before a `&&` or `||`, or is a
-    /// pipeline written with `!`, which are the exemptions POSIX states and
-    /// [`Self::run_and_or_list`] applies. A command this SESSION declines is exempt too, for
-    /// the reason stated there. `+e` turns it off again.
+    /// The options a container's program is written with, each performed as the shell
+    /// specifies it:
+    ///
+    /// * `-e` — "when this option is on, if a simple command fails … the shell shall
+    ///   immediately exit" — except where the command that failed is a CONDITION (an `if`'s, a
+    ///   loop's), stands before a `&&` or `||`, or is a pipeline written with `!`, which are
+    ///   the exemptions POSIX states and [`Self::run_and_or_list`] applies. A command this
+    ///   SESSION declines is exempt too, for the reason stated there;
+    /// * `-u` — "the shell shall write a message to standard error when it tries to expand a
+    ///   variable that is not set and … shall exit", which is what
+    ///   [`Self::expand_parameter`] then answers for such a parameter;
+    /// * `-o pipefail` — the status of a pipeline is then its LAST FAILING stage's rather than
+    ///   its last stage's ([`Self::run_pipeline`]).
+    ///
+    /// Options are read as the shell reads them: one argument may carry several letters
+    /// (`set -eu`), `+` turns them off again, and `-o`/`+o` takes the long option's name as
+    /// the argument after it.
     ///
     /// Every other invocation is one this session does not perform: a bare `set` writes a
     /// listing of the session's variables, which this writes none of, and the other options
@@ -1588,11 +1723,28 @@ impl ContainerShell {
         if arguments.is_empty() {
             return self.declined();
         }
-        for argument in arguments {
-            match argument.as_str() {
-                "-e" => self.errexit = true,
-                "+e" => self.errexit = false,
+        let mut words = arguments.iter();
+        while let Some(argument) = words.next() {
+            let on = match argument.chars().next() {
+                Some('-') => true,
+                Some('+') => false,
                 _ => return self.declined(),
+            };
+            let letters: Vec<char> = argument.chars().skip(1).collect();
+            if letters.is_empty() {
+                return self.declined();
+            }
+            for letter in letters {
+                match letter {
+                    'e' => self.errexit = on,
+                    'u' => self.nounset = on,
+                    // `-o NAME`: the long option the argument AFTER this one names.
+                    'o' => match words.next().map(String::as_str) {
+                        Some("pipefail") => self.pipefail = on,
+                        _ => return self.declined(),
+                    },
+                    _ => return self.declined(),
+                }
             }
         }
         EXIT_SUCCESS
@@ -1927,6 +2079,43 @@ impl ContainerShell {
         EXIT_SUCCESS
     }
 
+    /// Perform the container's `aws` command: the `aws s3` transfers of
+    /// [`super::container_aws_cli`], against the account's object store as the task role.
+    ///
+    /// The invocation itself is read by the shared reading of that program, so an invocation
+    /// it performs nothing of — another command group, another command, an option, an operand
+    /// form — is a command this container could not run ([`Self::declined`]) rather than a
+    /// transfer, and so is an `aws` command in a session the container's environment provides
+    /// no CLI to. What the command WROTE goes through this session's own streams: the
+    /// transfer's report on standard output, and the account of one that was not made on
+    /// standard error, which is where the CLI writes it.
+    ///
+    /// Standard input is TAKEN only for the one invocation that reads it — an upload from the
+    /// CLI's stream operand — so every other command leaves the stream to whoever reads it.
+    async fn run_aws_cli(&mut self, arguments: &[String], redirections: &Redirections) -> i32 {
+        let Some(cli) = self.aws.clone() else {
+            return self.declined();
+        };
+        let input = if ::service_common::aws_s3_cli::reads_standard_input(arguments) {
+            self.standard_input(redirections)
+        } else {
+            None
+        };
+        let performed = cli
+            .perform(arguments, input.as_deref(), &mut self.filesystem)
+            .await;
+        let Some(outcome) = performed else {
+            return self.declined();
+        };
+        if !outcome.errors.is_empty() {
+            self.write_stderr(&outcome.errors, redirections).await;
+        }
+        if !outcome.output.is_empty() && !self.write_stdout(&outcome.output, redirections).await {
+            return EXIT_FAILURE;
+        }
+        outcome.status
+    }
+
     /// `word` with its expansions resolved, or `None` when it carries an expansion this
     /// container cannot resolve.
     ///
@@ -1982,6 +2171,9 @@ impl ContainerShell {
                     }
                     ::brush_parser::word::WordPiece::EscapeSequence(sequence) => {
                         escaped_text(&sequence, double_quoted)?
+                    }
+                    ::brush_parser::word::WordPiece::ArithmeticExpression(expression) => {
+                        self.expand_arithmetic(&expression.value).await?
                     }
                     _ => return None,
                 };
@@ -2053,28 +2245,95 @@ impl ContainerShell {
         })
     }
 
+    /// The value of an ARITHMETIC expansion (`$((…))`): the number its expression comes to in
+    /// this session.
+    ///
+    /// The text's own parameter expansions are resolved first — `$((count + 1))` and
+    /// `$(($count + 1))` are both written — and then the expression is parsed by
+    /// `brush-parser`'s arithmetic grammar and evaluated over this session's variables by this
+    /// workspace's one reading of shell arithmetic
+    /// ([`::service_common::posix_shell_arithmetic`]), so an expansion that ASSIGNS sets the
+    /// variable of this session.
+    ///
+    /// `None` is an expansion with no value, which makes the word carrying it one this
+    /// container does not perform: text past the bound a parse is given
+    /// ([`within_parse_bounds`], applied to what the expansion materialised rather than only
+    /// to the line it came from), an expression that does not parse, one that module does not
+    /// evaluate, and one whose arithmetic has no answer (a division by zero, an overflow).
+    fn expand_arithmetic<'a>(&'a mut self, text: &str) -> ShellFuture<'a, Option<String>> {
+        let text = text.to_string();
+        Box::pin(async move {
+            let resolved = self
+                .expand_word(&text)
+                .await
+                .unwrap_or_else(|| text.clone());
+            // The expansion above can have MATERIALISED text far longer and far more deeply
+            // nested than the line itself — a variable's value expands inside the expression
+            // — so the same bound a program is read under is applied to it before it reaches
+            // a grammar.
+            if !within_parse_bounds(&resolved) {
+                return None;
+            }
+            let expression = ::brush_parser::arithmetic::parse(&resolved).ok()?;
+            let value =
+                ::service_common::posix_shell_arithmetic::evaluate(&expression, MAX_WORD_DEPTH, self)?;
+            Some(value.to_string())
+        })
+    }
+
     /// The value a parameter expansion resolves to in this session.
     ///
     /// The plain form (`$NAME`, `${NAME}`) is the variable's value, empty when the session
-    /// holds none. The default-value form is the value or the default the expansion names,
-    /// and WHICH values take the default is the form's own: `${NAME:-WORD}` substitutes it
-    /// for a parameter that is unset or empty, `${NAME-WORD}` only for one that is unset,
-    /// so a variable the container's environment sets to the empty string keeps it under
-    /// the second form. The length form (`${#NAME}`) is how many characters that value has.
-    /// Every other form — a substring, a replacement, an indirection, a positional or
-    /// special parameter — is one this container does not resolve.
-    fn expand_parameter(&self, parameter: &::brush_parser::word::ParameterExpr) -> Option<String> {
+    /// holds none — unless the program asked to be ended by exactly that (`set -u`), in which
+    /// case the expansion has no value and the session ends with the shell's own diagnostic
+    /// ([`Self::word_failure`]). The default-value form is the value or the default the
+    /// expansion names, and WHICH values take the default is the form's own: `${NAME:-WORD}`
+    /// substitutes it for a parameter that is unset or empty, `${NAME-WORD}` only for one that
+    /// is unset, so a variable the container's environment sets to the empty string keeps it
+    /// under the second form — and neither form reads an unset parameter as an error, because
+    /// each STATES what to use instead. The length form (`${#NAME}`) is how many characters
+    /// that value has. The two SPECIAL parameters a session answers about itself are resolved
+    /// too: `$?`, "the decimal exit status of the most recent pipeline", and `$0`, "the name of
+    /// the shell". Every other form — a substring, a replacement, an indirection, a positional
+    /// parameter or another special one — is one this container does not resolve.
+    fn expand_parameter(
+        &mut self,
+        parameter: &::brush_parser::word::ParameterExpr,
+    ) -> Option<String> {
         match parameter {
             ::brush_parser::word::ParameterExpr::Parameter {
                 parameter: ::brush_parser::word::Parameter::Named(name),
                 indirect: false,
-            } => Some(
-                self.variables
-                    .get(name)
-                    .map(String::as_str)
-                    .unwrap_or_default()
-                    .to_string(),
-            ),
+            } => {
+                let held = self.variables.get(name).map(String::as_str);
+                if held.is_none() && self.nounset {
+                    self.unset_parameter = Some(name.clone());
+                    return None;
+                }
+                Some(held.unwrap_or_default().to_string())
+            }
+            ::brush_parser::word::ParameterExpr::Parameter {
+                parameter:
+                    ::brush_parser::word::Parameter::Special(
+                        ::brush_parser::word::SpecialParameter::LastExitStatus,
+                    ),
+                indirect: false,
+            } => {
+                // "?: Expands to the decimal exit status of the most recent pipeline", which
+                // is how a program reads the status of the command before it.
+                Some(self.last_status.to_string())
+            }
+            ::brush_parser::word::ParameterExpr::Parameter {
+                parameter:
+                    ::brush_parser::word::Parameter::Special(
+                        ::brush_parser::word::SpecialParameter::ShellName,
+                    ),
+                indirect: false,
+            } => {
+                // "0: Expands to the name of the shell or shell script", which is the name
+                // this container's program was invoked under.
+                Some(SHELL_NAME.to_string())
+            }
             ::brush_parser::word::ParameterExpr::UseDefaultValues {
                 parameter: ::brush_parser::word::Parameter::Named(name),
                 indirect: false,
@@ -2112,6 +2371,20 @@ impl ContainerShell {
             }
             _ => None,
         }
+    }
+}
+
+/// The variables an arithmetic expansion of this container's session reads and assigns: the
+/// session's own, under the session's own bounds — an assignment the session will not take
+/// (it is at [`MAX_SESSION_BYTES`] or [`MAX_SESSION_VARIABLES`]) is one the expansion could
+/// not perform.
+impl ::service_common::posix_shell_arithmetic::ArithmeticVariables for ContainerShell {
+    fn arithmetic_value(&self, name: &str) -> Option<String> {
+        self.variables.get(name).cloned()
+    }
+
+    fn set_arithmetic_value(&mut self, name: &str, value: i64) -> bool {
+        self.set_variable(name.to_string(), value.to_string())
     }
 }
 

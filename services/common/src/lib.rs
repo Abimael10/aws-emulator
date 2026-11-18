@@ -610,6 +610,10 @@ pub mod on_behalf_of_calls;
 /// The ONE construction of the in-process Amazon S3 client a service writing an object
 /// drives, so no two services configure that hop differently.
 pub mod s3_client;
+/// The ONE reading of the AWS CLI's `aws s3` commands a caller-supplied command line asks
+/// for, and the ONE performance of the transfers they name over that hop, for every service
+/// that runs such a line.
+pub mod aws_s3_cli;
 /// The ONE construction of the in-process Amazon SNS client a service publishing a
 /// notification drives, so no two services configure that hop differently.
 pub mod sns_client;

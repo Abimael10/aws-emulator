@@ -703,6 +703,11 @@ pub fn drive_task_clock<Eng: Send + Sync + 'static>(
     // containers take read before the clock could start it, whether or not a pump was already
     // running ([`super::settle_secret_retrievals`]).
     super::settle_secret_retrievals(ctx.callback(), engine);
+    // And so are the task-role CREDENTIALS of every task that has not been vended them: the
+    // containers of a task that resolves a task role wait for the step that mints one, and
+    // minting it needs the credential store this request's own context carries
+    // ([`super::settle_task_role_credentials`]), which the pump has none of.
+    super::settle_task_role_credentials(ctx.credential_store(), &**engine);
     // The container data plane is settled BEFORE the pump's claim is taken, so a door that
     // finds a pump already running still has the containers of the task it just wrote
     // started or signalled ([`super::settle_container_runtime`]).

@@ -426,6 +426,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the clock pump drives: it starts nothing for a task that is not running and nothing
         // twice, so it settles what the clock already made due and never what this call
         // happened to ask about).
+        // The task-role credentials of a task no call of this service has vended them for are
+        // minted first, since a container of such a task waits for them
+        // ([`crate::state::settle_task_role_credentials`]).
+        crate::state::settle_task_role_credentials(ctx.credential_store(), &*self.engine);
         crate::state::settle_container_runtime(ctx.callback(), &self.engine, &region);
 
         Ok(ListTasksOutput {

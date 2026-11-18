@@ -42,6 +42,13 @@
 //! execution role. A container whose secrets cannot be read starts no program at all, so it
 //! reports no exit code: nothing ran to produce one.
 //!
+//! What the program may CALL is the account's services as the TASK ROLE: its credentials are
+//! vended for the task before any container of it starts
+//! ([`super::task_role_credentials`]), the AWS CLI the session provides signs with them
+//! ([`super::container_aws_cli`]), and a container of a task that resolves a task role is not
+//! started until they have been vended — a call signed with nothing would be a call made as a
+//! role the task was never handed.
+//!
 //! # Who starts and ends a run
 //!
 //! Runs are RECONCILED from the task map, never started by whoever happened to call:
@@ -191,6 +198,13 @@ pub struct ContainerLaunch {
     working_directory: Option<String>,
     /// The signals it answers.
     signals: Arc<ContainerSignals>,
+    /// What the AWS calls this container's program makes PRESENT: the session of the task
+    /// role, vended for the task before any container of it starts
+    /// ([`super::task_role_credentials`]). It is held beside the run and never put in the
+    /// session's variables, its filesystem or anything the container writes.
+    credential: TaskRoleCredential,
+    /// The Region those calls are addressed in, which is the Region the task was placed in.
+    region: String,
 }
 
 impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
@@ -257,6 +271,18 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
             let launch_region = super::request_arn::RequestArn::parse(&task.task_arn)
                 .map(|arn| arn.region.to_string())
                 .unwrap_or_else(|| region.to_string());
+            // The credential this task's containers present on the AWS calls their programs
+            // make. A task that resolves a task role waits for the step that vends one — the
+            // agent has the task's credentials before any container of it runs, exactly as it
+            // has the values it fetched for them — and one that resolves none holds nothing
+            // ([`super::task_role_credentials`]).
+            let credential = match resolved_task_role_arn(task.overrides.as_ref(), &definition) {
+                Some(_) => match &task.task_role_credentials {
+                    Some(vended) => vended.clone(),
+                    None => continue,
+                },
+                None => TaskRoleCredential::Absent,
+            };
             let mut started: Vec<(String, Arc<ContainerSignals>, bool)> = Vec::new();
             for container in &task.containers {
                 // A container that has not STARTED yet runs nothing: one whose
@@ -356,6 +382,8 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
                     mounts: mount_requests(&definition, stored, task),
                     working_directory: stored.working_directory.clone(),
                     signals,
+                    credential: credential.clone(),
+                    region: launch_region.clone(),
                 });
             }
             for (container_arn, signals, runs_a_program) in started {
@@ -579,7 +607,14 @@ async fn run_container(
         Arc::clone(&launch.signals),
         deadline,
         filesystem,
-    );
+    )
+    // The AWS CLI this container's program reaches the account's services through, signing
+    // as the task role ([`super::container_aws_cli`]).
+    .with_aws_cli(ContainerAwsCli::new(
+        callback.clone(),
+        &launch.region,
+        launch.credential.clone(),
+    ));
     let outcome = shell.run(program).await;
     state
         .lock()

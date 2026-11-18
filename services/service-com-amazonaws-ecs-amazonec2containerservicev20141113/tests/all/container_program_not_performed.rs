@@ -81,8 +81,8 @@ const ROWS: &[Row] = &[
         exit_code: None,
     },
     Row {
-        case: "a compound form this container does not perform",
-        command: &["sh", "-c", "for name in one two; do echo $name; done"],
+        case: "a function definition, a form this container does not perform",
+        command: &["sh", "-c", "greet() { echo hello; }; greet"],
         exit_code: None,
     },
     Row {

@@ -130,6 +130,21 @@ service-com-amazonaws-cloudwatch-graniteserviceversion20100801 = { workspace = t
 # stores in the shared engine, so the creation is answered by the service that owns them
 # rather than by a copy kept here. No cycle: that crate does not depend on this one.
 service-com-amazonaws-cloudwatchlogs-logs-20140328 = { workspace = true }
+# The AWS Lambda service, for the tree's ONE mint of a role SESSION for a service that runs
+# other work as a role (`…state::execution::execution_role_session::execution_role_identity`):
+# the task-role credentials this service's containers present on the AWS calls their programs
+# make (`crate::state::task_role_credentials`) are that session, so a call a container makes is
+# judged on the policies in force on the task role, exactly as a Lambda handler's own call is.
+# Reached cross-crate for the same reason Amazon EMR's step commands and AWS Glue's job scripts
+# reach it: the mint records the session wherever a temporary credential's principal is read
+# from, and a second copy of it would be a second answer to one question. No cycle: that crate
+# does not depend on this one.
+service-com-amazonaws-lambda-awsgirapiservice = { workspace = true }
+# The AWS SDK for Amazon S3, driven over the same in-process callback: a container's program
+# reaches the account's object store through the AWS CLI its session provides
+# (`state::container_aws_cli`), signed as the task role, so the object a container wrote is the
+# object a client reads back from the service that holds it.
+aws-sdk-s3 = { version = "1", default-features = false }
 # The AWS SDK for Secrets Manager, driven over the same in-process callback: a container's
 # `secrets` entry is read through that service's own `GetSecretValue` before the container's
 # program starts (`state::container_secrets`), so the value injected into a container is the

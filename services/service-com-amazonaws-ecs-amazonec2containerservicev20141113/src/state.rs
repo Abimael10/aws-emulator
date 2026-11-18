@@ -359,6 +359,16 @@ pub use container_credentials::*;
 mod container_runtime;
 pub use container_runtime::*;
 
+/// The CREDENTIAL a task's containers present on the AWS calls their programs make: a session
+/// of the task's own task role.
+mod task_role_credentials;
+pub use task_role_credentials::*;
+
+/// The AWS CLI a container's session provides: the `aws s3` transfers its program asks for,
+/// performed against this emulator's object store as the task role.
+mod container_aws_cli;
+pub use container_aws_cli::*;
+
 /// The FILESYSTEM a container's program runs over: its own writable layer, and the volumes
 /// the task definition mounts into it.
 mod container_filesystem;
@@ -4164,6 +4174,15 @@ pub struct TaskRecord {
     /// task that has not started, for one that is already on its way out, and for a task a
     /// service's scheduler placed (see [`CONTAINER_WORK_SPAN`]).
     pub work_done_due_at: Option<SystemTime>,
+    /// What this task's containers PRESENT on the AWS calls their programs make: the session
+    /// of the task role this task runs under ([`settle_task_role_credentials`]), and `None`
+    /// until that step has been taken for the task — a container of a task that resolves a
+    /// task role waits for it, exactly as it waits for the values the agent fetches for it.
+    ///
+    /// Kept on the task because the credential is THIS task's: it is named for the task and
+    /// lasts as long as the task's containers run. It is never reported, logged or exposed to
+    /// a container's program (its debug form carries no field).
+    pub task_role_credentials: Option<TaskRoleCredential>,
 }
 
 impl TaskRecord {

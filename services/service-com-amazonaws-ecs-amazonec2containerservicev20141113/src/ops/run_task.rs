@@ -947,6 +947,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // instant it is finished at is owed from the instant it starts
                 // ([`crate::state::CONTAINER_WORK_SPAN`]).
                 work_done_due_at: None,
+                // The credential this task's containers present is vended by the launch step
+                // that mints one for the task role
+                // ([`crate::state::settle_task_role_credentials`]).
+                task_role_credentials: None,
             };
             // `RunTask` has no `include` member to narrow the response with, so the
             // task it just created is reported with the tags it was created with.

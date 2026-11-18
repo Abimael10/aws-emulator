@@ -1295,6 +1295,9 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
             // ([`Self::maintain_daemon_tasks`]), so no end of its work is owed: it runs for
             // as long as the instance under it does.
             work_done_due_at: None,
+            // The credential its containers present is vended by the launch step that mints
+            // one for the task role ([`crate::state::settle_task_role_credentials`]).
+            task_role_credentials: None,
         };
         self.tasks.insert(task_arn, record);
     }

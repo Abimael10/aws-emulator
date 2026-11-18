@@ -347,6 +347,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // OUR guard is dropped first, since the reconcile takes this store's lock itself.
         drop(matching);
         drop(guard);
+        // The task-role credentials of a task no call of this service has vended them for are
+        // minted first, since a container of such a task waits for them
+        // ([`crate::state::settle_task_role_credentials`]).
+        crate::state::settle_task_role_credentials(ctx.credential_store(), &*self.engine);
         crate::state::settle_container_runtime(
             ctx.callback(),
             &self.engine,

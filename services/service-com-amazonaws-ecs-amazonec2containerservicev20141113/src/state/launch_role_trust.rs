@@ -259,7 +259,7 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
     /// longer holds — a revision that is gone says nothing about the role the task runs
     /// under. The execution role needs no such lookup: it is kept on the task itself
     /// ([`TaskRecord::execution_role_arn`]), because the image pull is made as it.
-    fn launched_task_role_arn(&self, task: &TaskRecord) -> Option<String> {
+    pub(super) fn launched_task_role_arn(&self, task: &TaskRecord) -> Option<String> {
         let definition = self.revision_of_arn(&task.task_definition_arn)?;
         resolved_task_role_arn(task.overrides.as_ref(), definition).map(ToString::to_string)
     }
