@@ -22,10 +22,16 @@
 //! The tables span what the rule generalises over: separation (hundreds of metres to
 //! hundreds of kilometres), bearing (east-west, north-south, diagonal), hemisphere, the
 //! class of road travelled, the travel mode and the routing objective.
-
+//!
+//! The numbered roads are the network's through-road grid, joined and left where they meet
+//! one another rather than wherever a street crosses them, so a third rule follows: whether
+//! a journey can travel them is decided by its own LENGTH against the spacing of those
+//! access points, not by how near one its endpoints happen to fall. A journey shorter than
+//! that spacing is paced by the local streets, and the connections OptimizeWaypoints reports
+//! are read off the same traversal as every other metric of this service.
 use serde_json::{json, Value};
 
-use crate::routing::{great_circle_m, int, post, routes_service, MATRIX, ROUTES};
+use crate::routing::{great_circle_m, int, post, routes_service, MATRIX, OPTIMIZE, ROUTES};
 
 /// The grid's road spacing in degrees, as `src/state.rs` holds it (`ROAD_SPACING_DEG`): a
 /// submitted position is matched onto a road at most half of it away in each axis, which is
@@ -343,6 +349,157 @@ async fn the_matrix_cell_and_the_direct_route_report_the_same_traversal() {
             );
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Reaching the numbered through-roads
+// ---------------------------------------------------------------------------
+
+/// How many grid roads apart the network's numbered through-roads sit, as `src/state.rs`
+/// holds it (`TRUNK_EVERY`). It is also the spacing of the ACCESS POINTS travel joins and
+/// leaves the numbered network at (`access_spacing_m` in `src/state/road_graph.rs`): a
+/// numbered road is joined where it meets another of them, not wherever a street crosses it.
+const TRUNK_EVERY: i64 = 100;
+
+/// Metres per degree of latitude, as `src/state.rs` holds it (`METRES_PER_DEGREE_LAT`).
+const METRES_PER_DEGREE_LAT: f64 = 110_574.0;
+
+/// The shortest journey near `latitude` that can join the numbered network at all: the
+/// closer together of the two orientations' access points, because a journey shorter than
+/// that has no way onto a through-road at either of its ends whichever way it runs.
+fn shortest_journey_that_joins_a_through_road_m(latitude: f64) -> f64 {
+    let along_a_parallel = TRUNK_EVERY as f64 * block_m(latitude);
+    let along_a_meridian = TRUNK_EVERY as f64 * ROAD_SPACING_DEG * METRES_PER_DEGREE_LAT;
+    along_a_parallel.min(along_a_meridian)
+}
+
+/// The quickest pace, in metres per second, that travel of `mode` makes along a LOCAL
+/// STREET: a north-south run, where the grid's crossings are furthest apart and so the least
+/// is given up at them. Nothing confined to the streets covers ground faster than this.
+fn fastest_street_pace_mps(mode: &str) -> f64 {
+    let free_flow = (STREET_SPEED_KPH * KPH_TO_MPS).min(top_speed_kph(mode) * KPH_TO_MPS);
+    let block = ROAD_SPACING_DEG * METRES_PER_DEGREE_LAT;
+    block / (block / free_flow + STREET_JUNCTION_DELAY_S)
+}
+
+/// Whether `position` sits on LOCAL STREETS in both axes rather than on one of the numbered
+/// through-roads. A journey from an end that already sits on a numbered road travels it from
+/// where it sits and needs no access point, so such a pair would not exercise the rule.
+fn is_on_local_streets(position: [f64; 2]) -> bool {
+    position
+        .iter()
+        .all(|coordinate| (coordinate / ROAD_SPACING_DEG).round() as i64 % TRUNK_EVERY != 0)
+}
+
+/// Journeys between positions on local streets, spanning fractions and multiples of the
+/// spacing of the numbered network's access points, the bearing the journey runs on and both
+/// hemispheres. Each is a pair the network routes; the expectation per row is derived from
+/// the row's own separation rather than written down, so the table says only what the
+/// journeys ARE.
+const JOURNEYS: [(&str, [f64; 2], [f64; 2]); 10] = [
+    ("a third of the access spacing, diagonally", [-122.3327, 47.60615], [-122.322096, 47.613349]),
+    ("two thirds of it, diagonally", [-122.3327, 47.60615], [-122.311487, 47.620552]),
+    ("just under it, diagonally", [-122.3327, 47.60615], [-122.299116, 47.628949]),
+    ("half of it, due east", [-122.3327, 47.60615], [-122.307708, 47.60615]),
+    ("half of it, due north", [-122.3327, 47.60615], [-122.3327, 47.623116]),
+    ("half again, diagonally", [-122.3327, 47.60615], [-122.279667, 47.642153]),
+    ("four times it, diagonally", [-122.3327, 47.60615], [-122.191277, 47.702158]),
+    ("twelve times it, diagonally", [-122.3327, 47.60615], [-121.90843, 47.894173]),
+    ("under half of it, southern hemisphere", [151.2071, -33.8679], [151.22124, -33.85608]),
+    ("six times it, southern hemisphere", [151.2071, -33.8679], [151.419242, -33.690565]),
+];
+
+/// A journey too short to reach the numbered network is paced by the LOCAL STREETS it is
+/// confined to; one long enough to join it covers ground faster than any street carries
+/// travel.
+///
+/// The numbered roads are joined where they meet one another, [`TRUNK_EVERY`] grid roads
+/// apart, so what decides whether a journey can travel them is its own LENGTH — not how near
+/// one of them its endpoints happen to fall. Each row is asked for through OptimizeWaypoints,
+/// whose connection metrics are read off the same traversal, and the row's separation decides
+/// which side of the access spacing it is on.
+#[tokio::test]
+async fn a_journey_travels_the_through_roads_only_once_it_is_long_enough_to_join_them() {
+    let router = routes_service();
+    let street_pace = fastest_street_pace_mps("Car");
+
+    for (case, origin, destination) in JOURNEYS {
+        assert!(
+            is_on_local_streets(origin) && is_on_local_streets(destination),
+            "case {case:?}: both ends must sit on local streets for the journey to have to \
+             reach a numbered road, got {origin:?} and {destination:?}"
+        );
+        let connection = sole_connection(&router, origin, destination, "Car", "FastestRoute", case).await;
+        let distance = int(&connection, "Distance", case);
+        let duration = int(&connection, "TravelDuration", case);
+        assert!(
+            duration > 0 && distance > 0,
+            "case {case:?}: a journey covers ground and takes time, got {connection:?}"
+        );
+        let rectilinear = rectilinear_m(origin, destination);
+        // A match moves each end onto a road at most half the grid spacing away in each
+        // axis: that is the only part of a reported distance that is not travel along a road.
+        let slack_m = 4.0 * ROAD_SPACING_DEG * 111_320.0;
+        assert!(
+            distance as f64 + slack_m >= rectilinear,
+            "case {case:?}: the roads run north-south and east-west, so the journey covers the \
+             {rectilinear:.0} m rectilinear journey at least, got {distance}"
+        );
+
+        let implied = distance as f64 / duration as f64;
+        let separation = great_circle_m(origin, destination);
+        let access = shortest_journey_that_joins_a_through_road_m((origin[1] + destination[1]) / 2.0);
+        if separation < access {
+            assert!(
+                implied <= street_pace + 0.1,
+                "case {case:?}: a {separation:.0} m journey cannot reach the numbered network, \
+                 whose access points are {access:.0} m apart, so it is paced by the streets at \
+                 {street_pace:.2} m/s at most, got {distance} m in {duration} s, i.e. \
+                 {implied:.2} m/s"
+            );
+        } else {
+            assert!(
+                implied > street_pace,
+                "case {case:?}: a {separation:.0} m journey reaches the numbered network, whose \
+                 access points are {access:.0} m apart, so it covers ground faster than the \
+                 {street_pace:.2} m/s a street carries travel at, got {distance} m in \
+                 {duration} s, i.e. {implied:.2} m/s"
+            );
+        }
+    }
+}
+
+/// The single connection OptimizeWaypoints answers a one-stop journey with.
+async fn sole_connection(
+    router: &smithy_server_runtime::MultiServiceRouter,
+    origin: [f64; 2],
+    destination: [f64; 2],
+    travel_mode: &str,
+    objective: &str,
+    case: &str,
+) -> Value {
+    let (status, answer, _) = post(
+        router,
+        OPTIMIZE,
+        &json!({
+            "Origin": origin,
+            "OriginOptions": { "Id": "depot" },
+            "Waypoints": [{ "Id": "stop", "Position": destination }],
+            "TravelMode": travel_mode,
+            "OptimizeSequencingFor": objective,
+        }),
+    )
+    .await;
+    assert_eq!(status, 200, "case {case:?}: expected 200, got {status} with {answer:?}");
+    let connections = answer["Connections"]
+        .as_array()
+        .unwrap_or_else(|| panic!("case {case:?}: Connections is required, got {answer:?}"));
+    assert_eq!(
+        connections.len(),
+        1,
+        "case {case:?}: an origin and one waypoint make one connection, got {connections:?}"
+    );
+    connections[0].clone()
 }
 
 /// The single cell of a 1x1 matrix for `origin` -> `destination`, which must be routed.

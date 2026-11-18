@@ -16,10 +16,12 @@
 //! runs diagonally — and its DURATION is each stretch's length at the posted speed of the
 //! road THAT stretch runs on, held down to the travel mode's own top speed
 //! ([`ComAmazonawsGeoroutesRoutesserviceState::travel_mode_speeds`]) wherever the mode
-//! cannot keep up with the road. So the road CLASSES are part of the cost: a leg that is
-//! worth reaching the numbered classes for travels most of its length near their posted
-//! speed, while a short leg spends a larger share on the local roads it needs to reach
-//! them and comes out slower. Which roads a leg takes is chosen by the request's own
+//! cannot keep up with the road. So the road CLASSES are part of the cost: the numbered
+//! classes are the network's through-roads and are joined and left where they meet one
+//! another rather than wherever a street crosses them, so a journey long enough to reach
+//! one of those access points travels most of its length near their posted speed, while a
+//! journey too short to reach one is confined to the local streets and comes out at their
+//! pace. Which roads a leg takes is chosen by the request's own
 //! routing objective — the quickest way through the graph for `FastestRoute`, the shortest
 //! for `ShortestRoute` — and its alternatives are the next-best distinct ways through it.
 //!
@@ -146,9 +148,13 @@ const FOOTPATH_EVERY: i64 = 10;
 /// Every 100th road of either orientation is a trunk road: the network's through-road grid,
 /// numbered and controlled-access, posted at [`TRUNK_SPEED_KPH`]. At the grid's ~55 m
 /// spacing that puts one every ~5 km, the spacing of the highways that carry traffic across
-/// a metropolitan area — so a journey of a few hundred metres is on the local streets
-/// throughout, and one of tens of kilometres reaches a trunk road and spends most of its
-/// length on it.
+/// a metropolitan area.
+///
+/// It is also the spacing of the ACCESS POINTS the numbered network is joined and left at
+/// (`access_spacing_m` in [`road_graph`]): a numbered road meets another of them that far
+/// apart, and nothing joins one between two of those. So a journey of a few hundred metres
+/// is on the local streets throughout, and one of tens of kilometres reaches a numbered road
+/// and spends most of its length on it.
 const TRUNK_EVERY: i64 = 100;
 /// Every 400th road of either orientation is a motorway: the network's long-haul class, the
 /// fastest road around, and so what `MajorRoadLabels` reports for a route that uses one. It

@@ -22,11 +22,19 @@
 //!
 //! WHICH roads a leg takes is chosen here, by the request's own objective. A bounded set of
 //! candidate through-roads per orientation ([`MAX_CANDIDATES`]) — the road each end sits on,
-//! the roads of each numbered class around the corridor, and roads further out again — is
+//! the roads of each numbered class around the corridor that this journey can reach an
+//! access point of ([`numbered_roads_are_within_reach`]), and roads further out again — is
 //! costed by [`cost_of`], and the cheapest in the objective's own currency (time for
 //! `FastestRoute`, length for `ShortestRoute`) is the route. The next-best ways with a
 //! distinct length are this leg's alternatives, so an alternative is another path of the
 //! same graph rather than the same path pushed sideways.
+//!
+//! The numbered roads are the network's THROUGH-ROAD grid, and they are joined and left
+//! where they meet one another rather than wherever a street crosses them. A journey
+//! shorter than the spacing of those access points therefore has no way onto them at either
+//! end and stays on the local streets for the whole of it: a journey across a town is paced
+//! by its streets, and only a journey long enough to join the through-roads is paced by
+//! them.
 //!
 //! The work per leg is bounded by the network's own rule and by nothing a request can grow:
 //! at most [`MAX_CANDIDATES`] roads per orientation are weighed, a way is at most
@@ -190,8 +198,26 @@ pub fn traverse(
     let (first, last) = (GridRoad::of(&start.road), GridRoad::of(&end.road));
     let (from, to) = (start.position, end.position);
 
-    let meridians = through_roads(RoadOrientation::Meridian, from[0], to[0], mode);
-    let parallels = through_roads(RoadOrientation::Parallel, from[1], to[1], mode);
+    // How long the journey is, and whereabouts on the globe it runs: what decides which
+    // roads it can reach an access point of ([`numbered_roads_are_within_reach`]).
+    let separation_m = haversine_m(from, to);
+    let latitude = (from[1] + to[1]) / 2.0;
+    let meridians = through_roads(
+        RoadOrientation::Meridian,
+        from[0],
+        to[0],
+        mode,
+        separation_m,
+        latitude,
+    );
+    let parallels = through_roads(
+        RoadOrientation::Parallel,
+        from[1],
+        to[1],
+        mode,
+        separation_m,
+        latitude,
+    );
     // The roads of a way alternate orientation, and both ends' own roads are fixed, so the
     // orientation of every through-road between them is fixed too.
     let (crossing, along) = match first.orientation {
@@ -376,14 +402,22 @@ fn stretches_of(
 /// the LONGITUDE of a road running north-south, the LATITUDE of one running east-west. A
 /// road between the two carries travel at no detour at all; one outside them is a detour,
 /// which pays only where the road it reaches is enough faster to earn it back — so the set
-/// carries both kinds and [`cost_of`] decides. Every road in it is one `mode` may travel.
-fn through_roads(orientation: RoadOrientation, from: f64, to: f64, mode: TravelMode) -> Vec<i64> {
+/// carries both kinds and [`cost_of`] decides. Every road in it is one `mode` may travel,
+/// and every numbered road in it is one this journey can reach an access point of
+/// ([`numbered_roads_are_within_reach`]).
+fn through_roads(
+    orientation: RoadOrientation,
+    from: f64,
+    to: f64,
+    mode: TravelMode,
+    separation_m: f64,
+    latitude: f64,
+) -> Vec<i64> {
     let (lo, hi) = if from <= to { (from, to) } else { (to, from) };
-    let lo_index = (lo / ROAD_SPACING_DEG).round() as i64;
-    let hi_index = (hi / ROAD_SPACING_DEG).round() as i64;
+    let (lo_index, hi_index) = (grid_index(lo), grid_index(hi));
     let mut candidates: Vec<i64> = Vec::with_capacity(MAX_CANDIDATES);
     {
-        let mut push = |index: i64| {
+        let mut offer = |index: i64| {
             if candidates.len() < MAX_CANDIDATES
                 && !candidates.contains(&index)
                 && (GridRoad { orientation, index }).allows(mode)
@@ -391,9 +425,20 @@ fn through_roads(orientation: RoadOrientation, from: f64, to: f64, mode: TravelM
                 candidates.push(index);
             }
         };
-        // The roads the two ends sit beside: travel along them is travel with no detour.
-        push(nearest_usable(orientation, lo_index, mode));
-        push(nearest_usable(orientation, hi_index, mode));
+        // The roads the two ends sit beside: travel along them is travel with no detour,
+        // and a road an end already sits on is travelled from where it sits rather than
+        // joined at an access point, so its class is not asked about.
+        offer(nearest_usable(orientation, lo_index, mode));
+        offer(nearest_usable(orientation, hi_index, mode));
+        // A numbered road this journey cannot reach an access point of is no candidate for
+        // it, so a journey across a town is not offered the through-roads only a journey
+        // between towns can join ([`numbered_roads_are_within_reach`]).
+        let reachable = numbered_roads_are_within_reach(orientation, separation_m, latitude);
+        let mut push = |index: i64| {
+            if reachable || !class_of(orientation, index).is_numbered() {
+                offer(index);
+            }
+        };
         // The numbered classes, which is what a leg long enough to pay for reaching one
         // travels: the road of each class nearest each end, on either side of it.
         for class in [RoadClass::Motorway, RoadClass::Trunk] {
@@ -403,18 +448,99 @@ fn through_roads(orientation: RoadOrientation, from: f64, to: f64, mode: TravelM
             let every = spacing_of(class);
             for anchor in [lo_index, hi_index] {
                 let base = anchor.div_euclid(every);
-                push(base * every);
-                push((base + 1) * every);
+                // A road whose index the grid cannot express is not a road of this
+                // network, so it is no candidate: every index here is built with
+                // arithmetic that answers for itself rather than wrapping.
+                for index in [
+                    base.checked_mul(every),
+                    base.checked_add(1).and_then(|next| next.checked_mul(every)),
+                ]
+                .into_iter()
+                .flatten()
+                {
+                    push(index);
+                }
             }
         }
         // Further out again: a longer way through the graph, which is what makes a leg's
         // alternatives distinct from its route.
         for step in 1..=DETOUR_STEPS {
-            push(nearest_usable(orientation, lo_index - step * TRUNK_EVERY, mode));
-            push(nearest_usable(orientation, hi_index + step * TRUNK_EVERY, mode));
+            let away = step.checked_mul(TRUNK_EVERY);
+            for index in [
+                away.and_then(|away| lo_index.checked_sub(away)),
+                away.and_then(|away| hi_index.checked_add(away)),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                push(nearest_usable(orientation, index, mode));
+            }
         }
     }
     candidates
+}
+
+/// The grid index of a coordinate: which multiple of [`ROAD_SPACING_DEG`] the road nearest
+/// it sits at.
+///
+/// Every coordinate a request of this service is admitted with lies inside the WGS 84
+/// domain ([`LONGITUDE_BOUNDS`], [`LATITUDE_BOUNDS`]), so the index of one lies inside
+/// [`GRID_INDEX_BOUND`]. A value outside that domain, or one that is no number at all, is
+/// held to the bound here rather than left to a float-to-integer cast, so the index the
+/// candidate arithmetic below starts from is one the grid can express whatever reaches it.
+fn grid_index(coordinate: f64) -> i64 {
+    if !coordinate.is_finite() {
+        return 0;
+    }
+    let bound = GRID_INDEX_BOUND as f64;
+    (coordinate / ROAD_SPACING_DEG).round().clamp(-bound, bound) as i64
+}
+
+/// The furthest grid index a position of the WGS 84 domain sits at: half a turn of
+/// longitude in multiples of [`ROAD_SPACING_DEG`].
+const GRID_INDEX_BOUND: i64 = 360_000;
+
+/// Whether a journey of `separation_m`, running near `latitude`, can join the NUMBERED
+/// roads that run `orientation`: whether it is at least as long as the spacing of their
+/// access points ([`access_spacing_m`]), so that one of them lies within the journey's own
+/// length of each of its ends.
+///
+/// A numbered road is not joined wherever something crosses it — a motorway is reached by
+/// its ramps and a priority road at its own junctions, and the network puts neither at every
+/// block; a street that meets one between two of its access points passes it rather than
+/// joining it. So a journey shorter than that spacing has no way onto the numbered network
+/// at either end and travels the local streets for the whole of it, which is why a journey
+/// across a town is paced by its streets while one between towns is paced by the
+/// through-roads it is long enough to join. Without the rule the pace of a journey would
+/// turn on how near a numbered road its endpoints happened to fall, and a journey of a
+/// kilometre or two could be reported travelling at a through-road's pace — quicker than a
+/// journey ten times as long.
+///
+/// The road an END of the journey already sits on is travelled from where it sits rather
+/// than joined at an access point, so its class is not asked about: it is offered whatever
+/// it is.
+fn numbered_roads_are_within_reach(
+    orientation: RoadOrientation,
+    separation_m: f64,
+    latitude: f64,
+) -> bool {
+    separation_m >= access_spacing_m(orientation, latitude)
+}
+
+/// How far apart the access points of the numbered network sit along one of its roads
+/// running `orientation`, in metres at `latitude`.
+///
+/// The numbered classes ARE this network's through-road grid, and they meet one another
+/// every [`TRUNK_EVERY`] grid roads; those meetings are where travel joins and leaves them.
+/// They are spaced along the road, so the axis is the one the road RUNS on — latitude for a
+/// meridian road, longitude for a parallel one.
+fn access_spacing_m(orientation: RoadOrientation, latitude: f64) -> f64 {
+    let (per_lon, per_lat) = metres_per_degree(latitude);
+    let per_degree = match orientation {
+        RoadOrientation::Meridian => per_lat,
+        RoadOrientation::Parallel => per_lon,
+    };
+    TRUNK_EVERY as f64 * ROAD_SPACING_DEG * per_degree
 }
 
 /// The road of `orientation` nearest grid index `index` that `mode` may travel.
@@ -424,7 +550,10 @@ fn through_roads(orientation: RoadOrientation, from: f64, to: f64, mode: TravelM
 /// mode of this network may use is answered with itself rather than searched for forever.
 fn nearest_usable(orientation: RoadOrientation, index: i64, mode: TravelMode) -> i64 {
     for step in 0..=TRUNK_EVERY {
-        for candidate in [index + step, index - step] {
+        for candidate in [index.checked_add(step), index.checked_sub(step)] {
+            let Some(candidate) = candidate else {
+                continue;
+            };
             if (GridRoad { orientation, index: candidate }).allows(mode) {
                 return candidate;
             }
