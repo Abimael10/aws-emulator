@@ -15,9 +15,9 @@
 //!   value-for-value under the operator it was declared in;
 //! * "a backup plan can only be deleted after all associated selections of
 //!   resources have been deleted": the delete of a plan that still holds one is
-//!   refused `InvalidRequestException` with the condition's own fixed sentence —
-//!   which names neither the plan nor how many selections it holds — and the plan
-//!   is deleted once they are gone.
+//!   refused `InvalidRequestException` with the condition's own token and its
+//!   fixed sentence — which names neither the plan nor how many selections it
+//!   holds — and the plan is deleted once they are gone.
 //!
 //! Each rule is asserted over a table rather than one request: the selection rows
 //! differ in WHICH grammar the create uses and how much of it, and the deletion
@@ -30,13 +30,15 @@
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
-use super::plan_and_selection_refusals::{create_role, router_with_iam};
+use super::plan_and_selection_refusals::{create_role, put_role_policy, router_with_iam};
 use super::vault_and_backup_job::call;
 
 /// The sentence AWS states for a plan delete its own selections bar
-/// (`crate::state`'s `MESSAGE_PLAN_SELECTIONS_EXIST`).
+/// (`crate::state`'s `MESSAGE_PLAN_SELECTIONS_EXIST`), with the token it carries
+/// for it (`ERROR_CODE_PLAN_SELECTIONS_EXIST`).
 const SELECTIONS_EXIST_MESSAGE: &str =
     "Related backup plan selections must be deleted prior to backup plan deletion";
+const SELECTIONS_EXIST_CODE: &str = "ERROR_9201";
 
 /// A trust document admitting this service's principal, so IAM answers that the
 /// role the selections name is one AWS Backup can assume.
@@ -47,6 +49,22 @@ fn backup_trust() -> String {
             "Effect": "Allow",
             "Principal": {"Service": "backup.amazonaws.com"},
             "Action": "sts:AssumeRole",
+        }],
+    })
+    .to_string()
+}
+
+/// An identity policy allowing the tagging read AWS Backup makes under a
+/// selection's role to resolve a TAG-based selection, so a row that selects by
+/// tag gets as far as the rule under test (the read AWS Backup's own managed
+/// service-role policy grants: `tag:GetResources`).
+fn tag_read_policy() -> String {
+    json!({
+        "Version": "2012-10-17",
+        "Statement": [{
+            "Effect": "Allow",
+            "Action": "tag:GetResources",
+            "Resource": "*",
         }],
     })
     .to_string()
@@ -118,7 +136,10 @@ fn condition(key: &str, value: &str) -> Value {
 /// which members the create declared.
 fn selection_rows() -> Vec<(&'static str, Value)> {
     vec![
-        ("no selection grammar at all", json!({})),
+        (
+            "the smallest selection, one resource ARN",
+            json!({"Resources": ["arn:aws:s3:::probe-only"]}),
+        ),
         (
             "two resource ARNs only",
             json!({"Resources": ["arn:aws:s3:::probe-one", "arn:aws:s3:::probe-two"]}),
@@ -195,6 +216,7 @@ async fn a_selection_reads_back_with_every_grammar_and_operator_reported() {
     for (index, (case, declared)) in selection_rows().into_iter().enumerate() {
         let router = router_with_iam();
         let role = create_role(&router, "/", "AWSBackupDefaultServiceRole", &backup_trust()).await;
+        put_role_policy(&router, "AWSBackupDefaultServiceRole", &tag_read_policy()).await;
         let plan_id = create_plan(&router, "selection-plan").await;
 
         let mut sent = declared.clone();
@@ -261,6 +283,7 @@ async fn a_plan_delete_is_barred_by_its_selections_with_one_fixed_sentence() {
                 &json!({
                     "SelectionName": format!("assigned-{index}"),
                     "IamRoleArn": role,
+                    "Resources": [format!("arn:aws:s3:::probe-{index}")],
                 }),
             )
             .await;
@@ -274,9 +297,17 @@ async fn a_plan_delete_is_barred_by_its_selections_with_one_fixed_sentence() {
         let (status, refused) =
             call(&router, "DELETE", &format!("/backup/plans/{plan_id}"), None).await;
         assert_eq!(
-            (status, member(&refused, "Message")),
-            (400, SELECTIONS_EXIST_MESSAGE.to_string()),
-            "case {case:?}: expected the fixed selections-exist sentence, got {status} \
+            (
+                status,
+                member(&refused, "Code"),
+                member(&refused, "Message"),
+            ),
+            (
+                400,
+                SELECTIONS_EXIST_CODE.to_string(),
+                SELECTIONS_EXIST_MESSAGE.to_string(),
+            ),
+            "case {case:?}: expected the selections-exist token and fixed sentence, got {status} \
              {refused:?}"
         );
         let message = member(&refused, "Message");

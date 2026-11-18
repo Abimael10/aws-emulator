@@ -193,11 +193,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // ARN this service mints could name. The check and its sentence are
         // `crate::state`'s, shared with every other member this service types
         // as a vault ARN, and it hands back the fields the ARN names.
-        let source = crate::state::resolved_backup_vault_arn(
-            "SourceBackupVaultArn",
-            &input.source_backup_vault_arn,
-        )
-        .map_err(CreateRestoreAccessBackupVaultErrorModeled::InvalidParameterValueException)?;
+        let source = crate::state::resolved_backup_vault_arn(&input.source_backup_vault_arn)
+            .map_err(CreateRestoreAccessBackupVaultErrorModeled::InvalidParameterValueException)?;
         let tags: ::std::collections::BTreeMap<String, String> = input
             .backup_vault_tags
             .clone()

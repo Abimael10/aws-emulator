@@ -725,17 +725,27 @@ async fn a_stack_provisions_the_backup_resources_its_template_declares() {
     }
 }
 
-/// The refusal a plan id nothing created still gets: `GetBackupPlan` answers HTTP 400
-/// `ResourceNotFoundException` for an id no stack and no client ever minted — which is what
-/// makes the 200 above evidence that the stack really created the plan rather than that the
-/// read answers anything at all.
+/// The refusal a plan id nothing created still gets: `GetBackupPlan` answers HTTP 400 for an
+/// id no stack and no client ever minted — which is what makes the 200 above evidence that
+/// the stack really created the plan rather than that the read answers anything at all. The
+/// CLASS tells the two conditions apart: an id of the form AWS Backup gives a plan that this
+/// account holds nothing under is the modelled not-found, while a value that is not such an
+/// identifier at all is refused as the parameter it came in.
 #[tokio::test]
 async fn an_id_no_stack_created_is_still_refused() {
     let router = build_router();
     let region = "us-east-2";
-    for (case, plan_id) in [
-        ("an id of the form the service mints", "8f81f553-3a74-4a3f-b93d-b3360dc80c50"),
-        ("a name of the form CloudFormation generates", "backup-estate-Plan-ABCDEFGH1234"),
+    for (case, plan_id, expected_type) in [
+        (
+            "an id of the form the service mints",
+            "8f81f553-3a74-4a3f-b93d-b3360dc80c50",
+            "ResourceNotFoundException",
+        ),
+        (
+            "a name of a form no plan id takes",
+            "backup-estate-Plan-ABCDEFGH1234",
+            "InvalidParameterValueException",
+        ),
     ] {
         let (status, refused) =
             backup(&router, region, "GET", &format!("/backup/plans/{plan_id}")).await;
@@ -748,8 +758,8 @@ async fn an_id_no_stack_created_is_still_refused() {
             refused
                 .get("__type")
                 .and_then(Value::as_str)
-                .is_some_and(|code| code.ends_with("ResourceNotFoundException")),
-            "case {case:?}: expected ResourceNotFoundException, got {refused}"
+                .is_some_and(|code| code.ends_with(expected_type)),
+            "case {case:?}: expected {expected_type}, got {refused}"
         );
     }
 }

@@ -262,9 +262,15 @@ fn role_arn(role: &str) -> String {
     format!("arn:aws:iam::{ACCOUNT}:role/{role}")
 }
 
-/// A selection body naming `name` and `role_arn`.
+/// A selection body naming `name` and `role_arn`, assigning one resource — a
+/// selection has to select something to be stored at all
+/// (`crate::state`'s `rejected_empty_backup_selection`).
 fn selection_body(name: &str, role_arn: &str) -> Value {
-    json!({"SelectionName": name, "IamRoleArn": role_arn})
+    json!({
+        "SelectionName": name,
+        "IamRoleArn": role_arn,
+        "Resources": [format!("arn:aws:dynamodb:{REGION}:{ACCOUNT}:table/demo")],
+    })
 }
 
 /// The schedule expressions a plan body is measured against.
@@ -734,6 +740,39 @@ fn trust(effect: &str, principal: &str, action: &str) -> String {
         }],
     })
     .to_string()
+}
+
+/// Store `document` on the role `role_name` as an inline identity policy, through
+/// IAM's OWN awsQuery wire, so the permissions a backup decision reads are the
+/// ones IAM holds.
+///
+/// `pub(crate)` for the reason [`create_role`] is: every suite whose rule turns on
+/// what a role may DO needs exactly this one way of giving it permissions.
+pub(crate) async fn put_role_policy(
+    router: &MultiServiceRouter,
+    role_name: &str,
+    document: &str,
+) {
+    let body = format!(
+        "Action=PutRolePolicy&Version=2010-05-08&RoleName={}&PolicyName={}&PolicyDocument={}",
+        form_value(role_name),
+        form_value("backup-selection-permissions"),
+        form_value(document)
+    );
+    let request = http::Request::builder()
+        .method("POST")
+        .uri("/")
+        .header("host", "iam.amazonaws.com")
+        .header("content-type", "application/x-www-form-urlencoded")
+        .body(bytes::Bytes::from(body))
+        .expect("a well-formed request");
+    let response = router.dispatch(request).await;
+    let status = response.status().as_u16();
+    let xml = String::from_utf8(response.into_body().to_vec()).expect("a UTF-8 response body");
+    assert_eq!(
+        status, 200,
+        "PutRolePolicy {role_name:?} expected 200, got {status} {xml}"
+    );
 }
 
 /// The trust documents the rule generalises over, and whether a selection whose

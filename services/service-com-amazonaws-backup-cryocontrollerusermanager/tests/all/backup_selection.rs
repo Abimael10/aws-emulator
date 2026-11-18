@@ -174,10 +174,11 @@ fn role_arn(role: &str) -> String {
 fn round_trip_cases() -> Vec<(&'static str, Value)> {
     vec![
         (
-            "only the two required members",
+            "the required members plus the one resource it selects",
             json!({
                 "SelectionName": "everything",
                 "IamRoleArn": role_arn("AWSBackupDefaultServiceRole"),
+                "Resources": ["arn:aws:s3:::probe-everything"],
             }),
         ),
         (
@@ -310,6 +311,7 @@ async fn a_second_create_replays_or_is_refused() {
             "BackupSelection": {
                 "SelectionName": name,
                 "IamRoleArn": role_arn("S3Access"),
+                "Resources": ["arn:aws:s3:::probe-bucket"],
             },
             "CreatorRequestId": "creator-request-1",
         })
@@ -339,6 +341,7 @@ async fn a_second_create_replays_or_is_refused() {
             "BackupSelection": {
                 "SelectionName": "tagged",
                 "IamRoleArn": role_arn("S3Access"),
+                "Resources": ["arn:aws:s3:::probe-bucket"],
             }
         }),
     )
@@ -361,6 +364,7 @@ async fn a_second_create_replays_or_is_refused() {
             "BackupSelection": {
                 "SelectionName": "orphan",
                 "IamRoleArn": role_arn("S3Access"),
+                "Resources": ["arn:aws:s3:::probe-bucket"],
             }
         }),
     )
@@ -393,6 +397,7 @@ async fn a_pair_the_account_does_not_hold_is_not_found() {
             "BackupSelection": {
                 "SelectionName": "transient",
                 "IamRoleArn": role_arn("S3Access"),
+                "Resources": ["arn:aws:s3:::probe-bucket"],
             }
         }),
     )
@@ -563,6 +568,7 @@ async fn a_plan_is_deleted_only_after_its_selections_are() {
             "BackupSelection": {
                 "SelectionName": "assigned",
                 "IamRoleArn": role_arn("S3Access"),
+                "Resources": ["arn:aws:s3:::probe-bucket"],
             }
         }),
     )
@@ -664,6 +670,7 @@ async fn the_selections_of_a_plan_are_listed_a_page_at_a_time() {
                 "BackupSelection": {
                     "SelectionName": name,
                     "IamRoleArn": role_arn("S3Access"),
+                    "Resources": ["arn:aws:s3:::probe-bucket"],
                 }
             }),
         )

@@ -163,6 +163,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
         })?;
 
+        // The `SelectionId` this read is bound to is validated BEFORE the store
+        // is asked about it: a value that is not an identifier a resource
+        // selection could be addressed by at all is one the caller has to
+        // correct, which is a different condition from a well-formed id the plan
+        // does not hold.
+        if let Some(refusal) = crate::state::rejected_backup_selection_id(&input.selection_id) {
+            return Err(
+                GetBackupSelectionErrorModeled::InvalidParameterValueException(refusal).into(),
+            );
+        }
+
         let store = state.lock();
         // A read, so nothing here writes: the selection is reported exactly as
         // it was stored.

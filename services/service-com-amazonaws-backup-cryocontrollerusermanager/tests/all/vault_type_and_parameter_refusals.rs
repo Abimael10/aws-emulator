@@ -15,8 +15,9 @@
 //!   the one-sentence `Parameter <MemberName> is invalid.` — on every operation
 //!   and every member of that class, with the member name the only thing that
 //!   varies between two of them; a member that names a BACKUP VAULT by ARN
-//!   carries the narrower class's own sentence instead (`Invalid backup vault
-//!   ARN`), since what it required was that KIND of ARN;
+//!   carries the narrower condition's own token (`ERROR_2307`) and its own fixed
+//!   sentence (`Invalid backup vault ARN`) instead, naming nothing of the
+//!   request, since what it required was that KIND of ARN;
 //! * which values name an MPA approval team is the form the service that MINTS
 //!   one publishes, so a value outside it is refused as that member and a value
 //!   inside it is recorded on the vault and read back;
@@ -46,6 +47,12 @@ const INVALID_PARAMETER: &str = "InvalidParameterValueException";
 /// this service cannot accept": one token for the class, with the member named
 /// in `Context`.
 const INVALID_PARAMETER_VALUE: &str = "INVALID_PARAMETER_VALUE";
+
+/// The `Code` AWS Backup fills in for "a member that names a BACKUP VAULT by
+/// ARN carries a value that is not one" (`crate::state`'s
+/// `ERROR_CODE_BACKUP_VAULT_ARN_INVALID`): the condition's own token, stated
+/// with nothing of the request beside it.
+const VAULT_ARN_INVALID_CODE: &str = "ERROR_2307";
 
 /// The retention window every air-gapped vault in this suite is created with:
 /// the documented floor of `MinRetentionDays` and a year.
@@ -228,9 +235,8 @@ async fn assert_parameter_refusal(router: &MultiServiceRouter, row: &Rejected) {
     assert_refusal(router, row, &parameter_sentence(row.member)).await;
 }
 
-/// Assert one row earns the class's refusal, naming its member and stating
-/// `sentence` — which is the class's own for a plain ARN member and the
-/// vault-ARN class's for a member that names a vault.
+/// Assert one row earns the class's refusal: the class's token and the member
+/// it blames in `Context`, with the member's own generic sentence.
 async fn assert_refusal(router: &MultiServiceRouter, row: &Rejected, sentence: &str) {
     let (status, errortype, refused) =
         call_reported(router, row.method, &row.path, row.body.as_deref()).await;
@@ -259,6 +265,36 @@ async fn assert_refusal(router: &MultiServiceRouter, row: &Rejected, sentence: &
     );
 }
 
+/// Assert one row that names a BACKUP VAULT by ARN earns the narrower
+/// condition's refusal: its own token and its own fixed sentence, with nothing
+/// of the request in the body — neither the member nor the value it carried.
+async fn assert_vault_arn_refusal(router: &MultiServiceRouter, row: &Rejected) {
+    let (status, errortype, refused) =
+        call_reported(router, row.method, &row.path, row.body.as_deref()).await;
+    let answered = (
+        status,
+        errortype.clone(),
+        error_code(&refused),
+        string_at(&refused, "Code"),
+        string_at(&refused, "Context"),
+        string_at(&refused, "Message"),
+    );
+    assert_eq!(
+        answered,
+        (
+            400,
+            INVALID_PARAMETER.to_string(),
+            INVALID_PARAMETER.to_string(),
+            VAULT_ARN_INVALID_CODE.to_string(),
+            String::new(),
+            VAULT_ARN_SENTENCE.to_string(),
+        ),
+        "case {:?}: expected 400 {INVALID_PARAMETER} with Code={VAULT_ARN_INVALID_CODE}, no \
+         Context and the sentence {VAULT_ARN_SENTENCE:?}, got {status} {refused:?}",
+        row.case
+    );
+}
+
 /// A member whose value is not of the form that member requires is refused as
 /// THAT member, with the class's token and sentence — on every operation and
 /// member of the class.
@@ -283,13 +319,14 @@ async fn a_member_value_of_the_wrong_form_is_refused_as_that_member() {
         assert_refusal(&router, row, &parameter_sentence(row.member)).await;
     }
     // A member that names a BACKUP VAULT states the kind of ARN it required
-    // instead, which is the sentence AWS answers that narrower class with.
+    // instead, with the narrower condition's own token and nothing of the
+    // request beside it.
     let mut vaults: Vec<Rejected> = Vec::new();
     for (case, value) in not_vault_arns() {
         vaults.extend(vault_arn_rows(case, &value));
     }
     for row in &vaults {
-        assert_refusal(&router, row, VAULT_ARN_SENTENCE).await;
+        assert_vault_arn_refusal(&router, row).await;
     }
 
     // Non-vacuity: the same operations SERVE the same requests when every

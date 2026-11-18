@@ -214,6 +214,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
+        // A selection is how a plan's rules find the resources they protect, so
+        // one that selects nothing assigns nothing: it is refused with the
+        // condition's fixed sentence rather than stored as a plan that protects
+        // nothing.
+        if let Some(refusal) = crate::state::rejected_empty_backup_selection(&selection) {
+            return Err(
+                CreateBackupSelectionErrorModeled::InvalidParameterValueException(refusal).into(),
+            );
+        }
+
         // A selection assigns resources to be backed up AS the role it names, so
         // the role is resolved against this account's IAM BEFORE anything is
         // stored and one AWS Backup could not assume is refused rather than
@@ -221,6 +231,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // store guard below is taken, so no lock is held across the hop.
         if let Some(refusal) =
             crate::state::rejected_selection_role(ctx, &region, &selection.iam_role_arn).await
+        {
+            return Err(
+                CreateBackupSelectionErrorModeled::InvalidParameterValueException(refusal).into(),
+            );
+        }
+
+        // A selection that assigns resources BY TAG is resolved by reading this
+        // account's resource tags under that role, so what the role may do
+        // decides whether such a selection can be stored at all. Awaited for the
+        // same reason, with no lock held.
+        if let Some(refusal) =
+            crate::state::rejected_tag_selection_role(ctx, &region, &selection).await
         {
             return Err(
                 CreateBackupSelectionErrorModeled::InvalidParameterValueException(refusal).into(),

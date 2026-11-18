@@ -20,9 +20,9 @@
 //! either side of it — crossed with every surface of this service that takes a
 //! `Lifecycle`: a plan rule's own, the lifecycle of one of that rule's copy
 //! actions, the same rule stored by `UpdateBackupPlan`, and the lifecycle a
-//! `StartBackupJob` keeps its recovery point under. A refusal inside a plan body
-//! carries the per-rule validation envelope; a job's own carries the reason by
-//! itself.
+//! `StartBackupJob` keeps its recovery point under. The condition is ONE, so
+//! every surface answers it with one refusal: the condition's own token, its
+//! fixed sentence, and the interval the service enforces in `Context`.
 //!
 //! The request harness (`router`, `call`, `call_reported`) is the one
 //! `vault_and_backup_job.rs` exposes to this test binary, so there is ONE wire
@@ -33,16 +33,16 @@ use smithy_server_runtime::MultiServiceRouter;
 
 use super::vault_and_backup_job::{call, call_reported, router, ACCOUNT, REGION};
 
-/// The per-rule validation token a plan body's refusal carries (`crate::state`'s
-/// `ERROR_CODE_BACKUP_PLAN_RULE_INVALID`).
-const RULE_INVALID_CODE: &str = "ERROR_3015";
+/// The token AWS states for a lifecycle that leaves too little time in cold
+/// storage (`crate::state`'s `ERROR_CODE_LIFECYCLE_COLD_STORAGE_INTERVAL`).
+const INTERVAL_CODE: &str = "ERROR_3011";
 
-/// The fixed prefix a plan body's per-rule refusal states before the reason
-/// (`MESSAGE_BACKUP_PLAN_RULES_PREFIX`).
-const RULE_PREFIX: &str = "Error in some rules due to : ";
+/// The interval the service enforces, which the refusal carries in `Context`
+/// (`MIN_COLD_STORAGE_DAYS`, the 90 days the model documents).
+const INTERVAL_CONTEXT: &str = "90";
 
-/// The reason AWS states for a lifecycle that leaves too little time in cold
-/// storage (`MESSAGE_LIFECYCLE_COLD_STORAGE_INTERVAL`).
+/// The sentence AWS states for that condition
+/// (`MESSAGE_LIFECYCLE_COLD_STORAGE_INTERVAL`).
 const INTERVAL_REASON: &str = "Invalid lifecycle. DeleteAfterDays cannot be less than 90 days \
                                apart from MoveToColdStorageAfterDays";
 
@@ -237,9 +237,9 @@ async fn vault(router: &MultiServiceRouter) {
     );
 }
 
-/// Assert a plan-body row: a pair outside the interval earns the per-rule
-/// envelope and stores nothing, and one inside it is stored with the lifecycle
-/// it named.
+/// Assert a plan-body row: a pair outside the interval earns the condition's
+/// own refusal and stores nothing, and one inside it is stored with the
+/// lifecycle it named.
 async fn assert_plan_surface(surface: &str, row: &Row, on_rule: bool) {
     let router = router();
     vault(&router).await;
@@ -256,11 +256,11 @@ async fn assert_plan_surface(surface: &str, row: &Row, on_rule: bool) {
             ),
             (
                 400,
-                RULE_INVALID_CODE.to_string(),
-                format!("{RULE_PREFIX}{INTERVAL_REASON}"),
+                INTERVAL_CODE.to_string(),
                 INTERVAL_REASON.to_string(),
+                INTERVAL_CONTEXT.to_string(),
             ),
-            "case {surface}/{:?}: expected the per-rule interval refusal, got {status} \
+            "case {surface}/{:?}: expected the interval refusal, got {status} \
              {answered:?}",
             row.case
         );
@@ -351,13 +351,15 @@ async fn a_plan_body_is_stored_only_with_a_lifecycle_that_leaves_the_cold_storag
                     status,
                     member(&answered, "Code"),
                     member(&answered, "Message"),
+                    member(&answered, "Context"),
                 ),
                 (
                     400,
-                    RULE_INVALID_CODE.to_string(),
-                    format!("{RULE_PREFIX}{INTERVAL_REASON}"),
+                    INTERVAL_CODE.to_string(),
+                    INTERVAL_REASON.to_string(),
+                    INTERVAL_CONTEXT.to_string(),
                 ),
-                "case UpdateBackupPlan/{:?}: expected the per-rule interval refusal, got \
+                "case UpdateBackupPlan/{:?}: expected the interval refusal, got \
                  {status} {answered:?}",
                 row.case
             );
@@ -377,8 +379,8 @@ async fn a_plan_body_is_stored_only_with_a_lifecycle_that_leaves_the_cold_storag
 
 /// The same interval rule decides whether a backup JOB is started: the
 /// recovery point it would create is kept under the lifecycle the request
-/// names, and the refusal states the reason by itself — a job carries no
-/// per-rule envelope.
+/// names, and the refusal is the SAME one a plan body's lifecycle earns —
+/// one condition, one token, one sentence, one `Context`.
 #[tokio::test]
 async fn a_backup_job_is_started_only_with_a_lifecycle_that_leaves_the_cold_storage_interval() {
     for row in rows() {
@@ -403,11 +405,19 @@ async fn a_backup_job_is_started_only_with_a_lifecycle_that_leaves_the_cold_stor
             continue;
         }
         assert_eq!(
-            (status, errortype, member(&answered, "Message")),
+            (
+                status,
+                errortype,
+                member(&answered, "Code"),
+                member(&answered, "Message"),
+                member(&answered, "Context"),
+            ),
             (
                 400,
                 "InvalidParameterValueException".to_string(),
+                INTERVAL_CODE.to_string(),
                 INTERVAL_REASON.to_string(),
+                INTERVAL_CONTEXT.to_string(),
             ),
             "case StartBackupJob/{:?}: expected the interval refusal, got {status} {answered:?}",
             row.case

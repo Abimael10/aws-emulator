@@ -255,10 +255,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> StartCopyJob<Eng>
         // `DestinationBackupVaultArn` carries the narrower rule: it names a
         // BACKUP VAULT, so a value that is the ARN of something else is a bad
         // parameter value rather than a vault to look for.
-        if let Some(refusal) = crate::state::rejected_backup_vault_arn(
-            "DestinationBackupVaultArn",
-            &input.destination_backup_vault_arn,
-        ) {
+        if let Some(refusal) =
+            crate::state::rejected_backup_vault_arn(&input.destination_backup_vault_arn)
+        {
             return Err(StartCopyJobErrorModeled::InvalidParameterValueException(refusal).into());
         }
         // The lifecycle the copy would be kept under keeps the interval the

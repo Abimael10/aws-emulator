@@ -331,6 +331,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
 
         let now = SystemTime::now();
+        // The `BackupPlanId` this read is bound to is validated BEFORE the store
+        // is asked about it: a value that is not an identifier a backup plan
+        // could be addressed by at all is one the caller has to correct, which
+        // is a different condition from a well-formed id whose plan or version
+        // is not there to read.
+        if let Some(refusal) = crate::state::rejected_backup_plan_id(&input.backup_plan_id) {
+            return Err(
+                GetBackupPlanErrorModeled::InvalidParameterValueException(refusal).into(),
+            );
+        }
         let store = state.lock();
         // A read, so nothing here writes: the plan is reported exactly as it was
         // stored, and only while the account still holds the version asked for.

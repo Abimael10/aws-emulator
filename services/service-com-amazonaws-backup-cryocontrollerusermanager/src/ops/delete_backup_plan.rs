@@ -197,14 +197,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // "A backup plan can only be deleted after all associated selections of
             // resources have been deleted": the plan still assigns resources, so the
             // refusal is the one its STATE makes rather than an absent resource, and
-            // its sentence states what has to be deleted first — fixed text, naming
+            // it carries the condition's own token and fixed sentence, naming
             // neither the plan nor how many selections bar the delete.
             if !store.backup_selections_of(&input.backup_plan_id).is_empty() {
                 return Err(DeleteBackupPlanErrorModeled::InvalidRequestException(
-                    InvalidRequestException {
-                        message: Some(crate::state::MESSAGE_PLAN_SELECTIONS_EXIST.to_string()),
-                        ..Default::default()
-                    },
+                    crate::state::plan_selections_exist(),
                 )
                 .into());
             }

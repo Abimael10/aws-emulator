@@ -1011,6 +1011,12 @@ pub const MESSAGE_CRON_INVALID_PREFIX: &str = "Cron expression is not valid: ";
 /// what fails is the parse and no part of the expression is quoted back.
 pub const MESSAGE_CRON_INVALID: &str = "Invalid cron expression";
 
+/// `Code` for "the `Lifecycle` this request carries leaves too little time in
+/// cold storage". ONE token for the condition, wherever a lifecycle is stated:
+/// a plan rule's own, a copy action's, or the one a job keeps its recovery
+/// point under.
+pub const ERROR_CODE_LIFECYCLE_COLD_STORAGE_INTERVAL: &str = "ERROR_3011";
+
 /// The sentence AWS states for a `Lifecycle` whose deletion falls less than
 /// [`MIN_COLD_STORAGE_DAYS`] days after its transition to cold storage —
 /// FIXED text: it quotes neither day count, naming the two members and the
@@ -1024,16 +1030,25 @@ pub const MESSAGE_LIFECYCLE_COLD_STORAGE_INTERVAL: &str =
     "Invalid lifecycle. DeleteAfterDays cannot be less than 90 days apart from \
      MoveToColdStorageAfterDays";
 
+/// `Code` for "a member that names a BACKUP VAULT by ARN carries a value that
+/// is not one". ONE token for the condition, which AWS states without naming
+/// the member it refused.
+pub const ERROR_CODE_BACKUP_VAULT_ARN_INVALID: &str = "ERROR_2307";
+
 /// The sentence AWS states for a BACKUP VAULT named by an ARN that is not one
 /// — FIXED text: the rejected value is not quoted back into it.
 pub const MESSAGE_BACKUP_VAULT_ARN_INVALID: &str = "Invalid backup vault ARN";
+
+/// `Code` for "the backup plan this delete addresses still has resource
+/// selections, which have to be deleted first".
+pub const ERROR_CODE_PLAN_SELECTIONS_EXIST: &str = "ERROR_9201";
 
 /// The sentence AWS states for a backup-plan delete the plan's own resource
 /// selections still bar — FIXED text: it names neither the plan nor how many
 /// selections it holds, only what has to be deleted first. "A backup plan can
 /// only be deleted after all associated selections of resources have been
-/// deleted" (model doc for `DeleteBackupPlan`). No `Code`: this condition has
-/// no observed token.
+/// deleted" (model doc for `DeleteBackupPlan`). Its token is
+/// [`ERROR_CODE_PLAN_SELECTIONS_EXIST`].
 pub const MESSAGE_PLAN_SELECTIONS_EXIST: &str =
     "Related backup plan selections must be deleted prior to backup plan deletion";
 
@@ -1062,6 +1077,44 @@ pub const MESSAGE_BACKUP_PLAN_NOT_FOUND_BY_ID: &str = "Cannot find Backup plan w
 
 /// `Code` for "the selection asked about is not one the named plan holds".
 pub const ERROR_CODE_BACKUP_SELECTION_NOT_FOUND: &str = "ERROR_2303";
+
+/// `Code` for "the `BackupPlanId` a plan READ carries is not an identifier of
+/// the form this service gives a backup plan at all", which AWS numbers per
+/// call like every other token it states ([`ERROR_CODE_SELECTION_READ_PLAN_NOT_FOUND`]).
+pub const ERROR_CODE_BACKUP_PLAN_ID_INVALID: &str = "ERROR_3208";
+/// The sentence AWS states for that condition — FIXED text: the value it
+/// refused is not quoted back into it.
+pub const MESSAGE_BACKUP_PLAN_ID_INVALID: &str = "Invalid Backup plan ID";
+
+/// `Code` for the same condition on the `SelectionId` a selection READ carries:
+/// a value that is not an identifier of the form a resource selection is given.
+pub const ERROR_CODE_BACKUP_SELECTION_ID_INVALID: &str = "ERROR_3314";
+/// The sentence AWS states for that condition — FIXED text, worded as the plan
+/// half of the pair words it ([`MESSAGE_BACKUP_PLAN_ID_INVALID`]).
+pub const MESSAGE_BACKUP_SELECTION_ID_INVALID: &str = "Invalid Backup selection ID";
+
+/// The sentence AWS states for a `BackupSelection` that selects nothing to back
+/// up — FIXED text naming the two member names the model gives the grammars a
+/// selection is built from (`BackupSelection$ListOfTags`,
+/// `BackupSelection$Resources`), with nothing taken from the request. No
+/// `Code`: this condition has no observed token.
+pub const MESSAGE_SELECTION_SELECTS_NOTHING: &str =
+    "Invalid backup selection. Either 'ListOfTags' or 'Resources' section must be non-empty.";
+
+/// The tagging-API read AWS Backup makes under a selection's role to resolve the
+/// resources a TAG-based selection assigns: "`ListOfTags` … the conditions that
+/// you define to assign resources to your backup plans using tags" (model doc
+/// for the member), and the tags of this account's resources are read through
+/// `tag:GetResources`.
+pub const TAG_RESOURCE_DISCOVERY_ACTION: &str = "tag:GetResources";
+
+/// `Code` for "the role this selection would be resolved under may not make
+/// that tagging-API read".
+pub const ERROR_CODE_SELECTION_ROLE_CANNOT_READ_TAGS: &str = "ERROR_3018";
+/// The sentence AWS states for that condition — FIXED text: it names the call
+/// the role may not make, and no part of the request.
+pub const MESSAGE_SELECTION_ROLE_CANNOT_READ_TAGS: &str =
+    "IAM Role is not authorized to call tag:GetResources";
 
 /// The sentence AWS states for "the recovery point asked about is not one the
 /// named vault holds" — fixed, and worded as this service words the same
@@ -1526,6 +1579,75 @@ pub async fn rejected_selection_role(
     unassumable.then(role_not_assumable)
 }
 
+/// The modelled refusal for a TAG-based backup selection whose role may not make
+/// the tagging-API read that resolves it, or `None` when nothing shows it may
+/// not.
+///
+/// A selection that assigns resources BY TAG is resolved by reading this
+/// account's resource tags under the role the selection names
+/// ([`TAG_RESOURCE_DISCOVERY_ACTION`]), so AWS Backup settles that question
+/// before the selection is stored and refuses one whose role cannot make that
+/// read — a plan that would otherwise resolve no resources at all. A selection
+/// that names its resources by ARN alone needs no such read, so nothing is
+/// asked about it.
+///
+/// What the role may do is the account's IAM to answer, asked over the
+/// emulator's own in-process hop through the shared reading of a role's
+/// permissions ([`::service_common::iam_role::role_withholds_action`]) rather
+/// than a copy of it here: the role has to be ALLOWED the read, the way any
+/// principal acting under a policy set does, because AWS Backup makes that call
+/// itself before it stores the selection — a role whose policies do not allow it
+/// cannot resolve one resource. Everything that is NOT such an answer leaves the
+/// request alone, as that reading defines: a value that names no role of this
+/// account, an answer this emulator could not read, and an emulator with no IAM
+/// mounted to ask. Awaited with NO store guard held.
+pub async fn rejected_tag_selection_role(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    selection: &BackupSelection,
+) -> Option<InvalidParameterValueException> {
+    if !selection_resolves_by_tag(selection) {
+        return None;
+    }
+    // The tagging API's read is account-wide: it reports the tagged resources of
+    // the Region it is called in, so there is no resource to narrow it to.
+    let withheld = ::service_common::iam_role::role_withholds_action(
+        ctx,
+        region,
+        selection.iam_role_arn.as_str(),
+        TAG_RESOURCE_DISCOVERY_ACTION,
+        "*",
+    )
+    .await;
+    withheld.then(|| InvalidParameterValueException {
+        code: Some(ERROR_CODE_SELECTION_ROLE_CANNOT_READ_TAGS.to_string()),
+        message: Some(MESSAGE_SELECTION_ROLE_CANNOT_READ_TAGS.to_string()),
+        ..Default::default()
+    })
+}
+
+/// Whether `selection` assigns its resources BY TAG, which is what makes the
+/// tagging-API read part of resolving it: either the `ListOfTags` conditions or
+/// any operator list of `Conditions` states a tag the resources are selected by
+/// (`smithy_query(query="shape",shape="BackupSelection")` for both grammars).
+#[must_use]
+fn selection_resolves_by_tag(selection: &BackupSelection) -> bool {
+    if selection.list_of_tags.iter().flatten().next().is_some() {
+        return true;
+    }
+    let Some(conditions) = selection.conditions.as_ref() else {
+        return false;
+    };
+    [
+        conditions.string_equals.as_ref(),
+        conditions.string_not_equals.as_ref(),
+        conditions.string_like.as_ref(),
+        conditions.string_not_like.as_ref(),
+    ]
+    .iter()
+    .any(|parameters| parameters.is_some_and(|parameters| !parameters.is_empty()))
+}
+
 /// The modelled refusal for a selection-scoped call whose `BackupPlanId` names
 /// no backup plan this account holds — see
 /// [`MESSAGE_BACKUP_PLAN_NOT_FOUND_BY_ID`].
@@ -1601,6 +1723,93 @@ pub fn backup_selection_not_found() -> ResourceNotFoundException {
         message: Some(MESSAGE_BACKUP_SELECTION_NOT_FOUND.to_string()),
         ..Default::default()
     }
+}
+
+/// The modelled refusal for a backup-plan delete the plan's own resource
+/// selections still bar — see [`MESSAGE_PLAN_SELECTIONS_EXIST`], with the
+/// condition's own token. ONE builder for the class, so the plan's STATE is
+/// stated the same way wherever a delete is refused for it.
+pub fn plan_selections_exist() -> InvalidRequestException {
+    InvalidRequestException {
+        code: Some(ERROR_CODE_PLAN_SELECTIONS_EXIST.to_string()),
+        message: Some(MESSAGE_PLAN_SELECTIONS_EXIST.to_string()),
+        ..Default::default()
+    }
+}
+
+/// Whether `value` has the form of an identifier this service gives a resource
+/// it mints one for ([`ComAmazonawsBackupCryocontrollerusermanagerState::next_id`]):
+/// the hyphenated 8-4-4-4-12 hex form, read case-insensitively because AWS
+/// Backup documents its own ids in upper case
+/// (`arn:aws:backup:us-east-1:123456789012:plan:8F81F553-3A74-4A3F-B93D-B3360DC80C50`,
+/// the model doc for `BackupPlanArn`).
+///
+/// The parse is the `uuid` crate's, which this service already mints version
+/// tokens with, bounded to the hyphenated spelling by the length: a value of
+/// any other form is one no backup plan and no resource selection could ever be
+/// addressed by, whatever this account holds.
+#[must_use]
+pub fn is_minted_backup_identifier(value: &str) -> bool {
+    const HYPHENATED_LENGTH: usize = 36;
+    value.len() == HYPHENATED_LENGTH && ::uuid::Uuid::try_parse(value).is_ok()
+}
+
+/// The modelled refusal for a `BackupPlanId` that is not an identifier a backup
+/// plan could be addressed by at all, or `None` when it has that form.
+///
+/// A member whose VALUE the service cannot read is refused before the store is
+/// asked about it: "not a plan id" and "no plan of this account under that id"
+/// are different conditions, and a client that reads the token
+/// ([`ERROR_CODE_BACKUP_PLAN_ID_INVALID`] against
+/// [`ERROR_CODE_BACKUP_PLAN_VERSION_UNREADABLE`]) is told to correct the
+/// argument rather than to retry a read.
+pub fn rejected_backup_plan_id(plan_id: &str) -> Option<InvalidParameterValueException> {
+    (!is_minted_backup_identifier(plan_id)).then(|| InvalidParameterValueException {
+        code: Some(ERROR_CODE_BACKUP_PLAN_ID_INVALID.to_string()),
+        message: Some(MESSAGE_BACKUP_PLAN_ID_INVALID.to_string()),
+        ..Default::default()
+    })
+}
+
+/// The modelled refusal for a `SelectionId` that is not an identifier a resource
+/// selection could be addressed by at all, or `None` when it has that form.
+///
+/// The selection half of the pair [`rejected_backup_plan_id`] answers for, read
+/// by the same rule and refused with its own token
+/// ([`ERROR_CODE_BACKUP_SELECTION_ID_INVALID`]), which AWS Backup numbers per
+/// member exactly as it numbers the not-found tokens of the two halves.
+pub fn rejected_backup_selection_id(
+    selection_id: &str,
+) -> Option<InvalidParameterValueException> {
+    (!is_minted_backup_identifier(selection_id)).then(|| InvalidParameterValueException {
+        code: Some(ERROR_CODE_BACKUP_SELECTION_ID_INVALID.to_string()),
+        message: Some(MESSAGE_BACKUP_SELECTION_ID_INVALID.to_string()),
+        ..Default::default()
+    })
+}
+
+/// The modelled refusal for a `BackupSelection` that selects nothing to back up,
+/// or `None` when it selects something.
+///
+/// A selection is how a plan's rules find the resources they protect, so one
+/// that names no resource and states no tag condition assigns nothing: it is
+/// refused with the condition's fixed sentence
+/// ([`MESSAGE_SELECTION_SELECTS_NOTHING`]) rather than stored as a plan that
+/// protects nothing. Every grammar the model gives a selection counts as naming
+/// something — `Resources` and `NotResources`, which name resources by ARN, the
+/// `ListOfTags` conditions and the four operator lists of `Conditions`
+/// (`smithy_query(query="shape",shape="BackupSelection")`) — so a selection that
+/// states any of them is stored.
+pub fn rejected_empty_backup_selection(
+    selection: &BackupSelection,
+) -> Option<InvalidParameterValueException> {
+    let selects_something = selection.resources.iter().flatten().next().is_some()
+        || selection.not_resources.iter().flatten().next().is_some()
+        || selection_resolves_by_tag(selection);
+    (!selects_something).then(|| InvalidParameterValueException {
+        message: Some(MESSAGE_SELECTION_SELECTS_NOTHING.to_string()),
+        ..Default::default()
+    })
 }
 
 /// The modelled refusal for a (vault, `RecoveryPointArn`) pair that names no
@@ -1961,30 +2170,47 @@ pub fn rejected_arn(member: &str, value: &str) -> Option<InvalidParameterValueEx
 /// `Lifecycle` shape's doc), so either member set to it states no transition and
 /// no deletion to measure an interval between.
 ///
-/// The REASON is returned rather than a refusal, because the operations that
-/// take a lifecycle state it differently: one inside a plan body carries the
-/// per-rule validation envelope ([`rejected_backup_plan_rule`]), while a job's
-/// own carries the reason by itself.
+/// Whether the interval is kept is returned rather than a refusal, because a
+/// caller may only need the question answered; the refusal every surface states
+/// for it is [`rejected_lifecycle`], one class for the one condition.
 #[must_use]
-pub fn lifecycle_refusal_reason(lifecycle: Option<&Lifecycle>) -> Option<&'static str> {
-    let lifecycle = lifecycle?;
-    let cold = lifecycle.move_to_cold_storage_after_days?;
-    let delete = lifecycle.delete_after_days?;
+pub fn lifecycle_keeps_cold_storage_interval(lifecycle: Option<&Lifecycle>) -> bool {
+    let Some(lifecycle) = lifecycle else {
+        return true;
+    };
+    let (Some(cold), Some(delete)) = (
+        lifecycle.move_to_cold_storage_after_days,
+        lifecycle.delete_after_days,
+    ) else {
+        return true;
+    };
     if cold == INDEFINITE_LIFECYCLE_DAYS || delete == INDEFINITE_LIFECYCLE_DAYS {
-        return None;
+        return true;
     }
-    let interval = delete.checked_sub(cold)?;
-    (interval < MIN_COLD_STORAGE_DAYS).then_some(MESSAGE_LIFECYCLE_COLD_STORAGE_INTERVAL)
+    delete
+        .checked_sub(cold)
+        .is_none_or(|interval| interval >= MIN_COLD_STORAGE_DAYS)
 }
 
-/// The modelled refusal for a `Lifecycle` an operation takes on its OWN (not
-/// inside a plan body), or `None` when the lifecycle is one AWS accepts: the
-/// reason [`lifecycle_refusal_reason`] decides, stated as the refusal's whole
-/// sentence.
+/// The modelled refusal for a `Lifecycle` AWS Backup does not accept, or `None`
+/// when the lifecycle is one it does.
+///
+/// ONE refusal for the condition, stated the same way wherever a lifecycle is
+/// stated — a plan rule's own, the lifecycle of one of that rule's copy actions,
+/// and the lifecycle a job or a recovery-point update carries — because the
+/// condition is one: the class's own token
+/// ([`ERROR_CODE_LIFECYCLE_COLD_STORAGE_INTERVAL`]), the condition's fixed
+/// sentence ([`MESSAGE_LIFECYCLE_COLD_STORAGE_INTERVAL`]), and the interval the
+/// service enforces in `Context`, which is the only variable part — a client
+/// reads the required spread in days from it rather than from the sentence.
 pub fn rejected_lifecycle(lifecycle: Option<&Lifecycle>) -> Option<InvalidParameterValueException> {
-    let reason = lifecycle_refusal_reason(lifecycle)?;
+    if lifecycle_keeps_cold_storage_interval(lifecycle) {
+        return None;
+    }
     Some(InvalidParameterValueException {
-        message: Some(reason.to_string()),
+        code: Some(ERROR_CODE_LIFECYCLE_COLD_STORAGE_INTERVAL.to_string()),
+        message: Some(MESSAGE_LIFECYCLE_COLD_STORAGE_INTERVAL.to_string()),
+        context: Some(MIN_COLD_STORAGE_DAYS.to_string()),
         ..Default::default()
     })
 }
@@ -2027,7 +2253,7 @@ pub enum RejectedBackupPlanBody {
 ///   stored whose schedule nothing resolves;
 /// * every `Lifecycle` the rule carries \u2014 its own and each copy action's \u2014
 ///   leaves the interval the model requires between the transition to cold
-///   storage and the deletion ([`lifecycle_refusal_reason`]);
+///   storage and the deletion ([`rejected_lifecycle`]);
 /// * the members that name a BACKUP VAULT by ARN carry one
 ///   ([`rejected_backup_vault_arn`]), rather than a rule being stored whose
 ///   destination no vault ARN resolves to.
@@ -2080,9 +2306,11 @@ pub fn rejected_backup_plan_body(plan: &BackupPlanInput) -> Option<RejectedBacku
         }
         // The lifecycle of the rule, and of each of its copy actions, keeps the
         // interval the model requires between a transition to cold storage and
-        // the deletion that follows it; a rule that does not is refused with
-        // the same per-rule envelope, rather than stored with a retention the
-        // service could never honour.
+        // the deletion that follows it; one that does not is refused as the
+        // LIFECYCLE it is, with the class's own token and sentence
+        // ([`rejected_lifecycle`]) rather than the per-rule envelope, so a
+        // lifecycle inside a plan body and one an operation takes on its own
+        // answer the same refusal.
         let lifecycles = ::std::iter::once(rule.lifecycle.as_ref()).chain(
             rule.copy_actions
                 .iter()
@@ -2090,10 +2318,8 @@ pub fn rejected_backup_plan_body(plan: &BackupPlanInput) -> Option<RejectedBacku
                 .map(|copy| copy.lifecycle.as_ref()),
         );
         for lifecycle in lifecycles {
-            if let Some(reason) = lifecycle_refusal_reason(lifecycle) {
-                return Some(RejectedBackupPlanBody::Value(rejected_backup_plan_rule(
-                    reason,
-                )));
+            if let Some(refusal) = rejected_lifecycle(lifecycle) {
+                return Some(RejectedBackupPlanBody::Value(refusal));
             }
         }
         // `TargetLogicallyAirGappedBackupVaultArn` and a copy action's
@@ -2104,16 +2330,15 @@ pub fn rejected_backup_plan_body(plan: &BackupPlanInput) -> Option<RejectedBacku
         let vault_arns = rule
             .target_logically_air_gapped_backup_vault_arn
             .as_deref()
-            .map(|arn| ("TargetLogicallyAirGappedBackupVaultArn", arn))
             .into_iter()
-            .chain(rule.copy_actions.iter().flatten().map(|copy| {
-                (
-                    "DestinationBackupVaultArn",
-                    copy.destination_backup_vault_arn.as_str(),
-                )
-            }));
-        for (member, arn) in vault_arns {
-            if let Some(refusal) = rejected_backup_vault_arn(member, arn) {
+            .chain(
+                rule.copy_actions
+                    .iter()
+                    .flatten()
+                    .map(|copy| copy.destination_backup_vault_arn.as_str()),
+            );
+        for arn in vault_arns {
+            if let Some(refusal) = rejected_backup_vault_arn(arn) {
                 return Some(RejectedBackupPlanBody::Value(refusal));
             }
         }
@@ -2152,11 +2377,8 @@ pub fn rejected_mpa_approval_team_arn(
 /// can be named by it, so a value that is an ARN of something else is a parameter
 /// value AWS refuses rather than a resource it looks for. See
 /// [`backup_vault_arn_parts`] for the form.
-pub fn rejected_backup_vault_arn(
-    member: &str,
-    value: &str,
-) -> Option<InvalidParameterValueException> {
-    resolved_backup_vault_arn(member, value).err()
+pub fn rejected_backup_vault_arn(value: &str) -> Option<InvalidParameterValueException> {
+    resolved_backup_vault_arn(value).err()
 }
 
 /// The fields a backup-vault ARN names, or the modelled refusal for a value
@@ -2167,23 +2389,22 @@ pub fn rejected_backup_vault_arn(
 /// fields, so the parse and the refusal cannot drift apart and neither needs a
 /// second parse that could fail.
 pub fn resolved_backup_vault_arn(
-    member: &str,
     value: &str,
 ) -> Result<BackupVaultArnParts, InvalidParameterValueException> {
-    backup_vault_arn_parts(value).ok_or_else(|| rejected_backup_vault_arn_value(member))
+    backup_vault_arn_parts(value).ok_or_else(rejected_backup_vault_arn_value)
 }
 
 /// The modelled refusal every member that names a BACKUP VAULT by ARN answers a
-/// value that is not one with: the class's own `Code`
-/// ([`ERROR_CODE_INVALID_PARAMETER_VALUE`]) and the condition's own fixed
-/// sentence ([`MESSAGE_BACKUP_VAULT_ARN_INVALID`]), which states the KIND of ARN
-/// that was required rather than the member or the value — the member is still
-/// carried in `Context`, where a client reads which input to fix.
-fn rejected_backup_vault_arn_value(member: &str) -> InvalidParameterValueException {
+/// value that is not one with: the condition's own `Code`
+/// ([`ERROR_CODE_BACKUP_VAULT_ARN_INVALID`]) and its own fixed sentence
+/// ([`MESSAGE_BACKUP_VAULT_ARN_INVALID`]), which states the KIND of ARN that was
+/// required rather than the member or the value. Nothing of the request is
+/// carried: the refusal is the condition's, so neither the rejected value nor
+/// the member it came from appears in the body.
+fn rejected_backup_vault_arn_value() -> InvalidParameterValueException {
     InvalidParameterValueException {
-        code: Some(ERROR_CODE_INVALID_PARAMETER_VALUE.to_string()),
+        code: Some(ERROR_CODE_BACKUP_VAULT_ARN_INVALID.to_string()),
         message: Some(MESSAGE_BACKUP_VAULT_ARN_INVALID.to_string()),
-        context: Some(member.to_string()),
         ..Default::default()
     }
 }
