@@ -3219,11 +3219,9 @@ impl CatalogBaseline {
 /// assesses inheritance drift on it and whether enabling it brings a target under
 /// governance); see [`CatalogBaseline`] for the rule behind each.
 ///
-/// One caveat on the text: the descriptions of `BackupAdminBaseline`, `BackupBaseline`,
-/// `CentralConfigBaseline` and `ConfigBaseline` follow AWS's documented wording for those
-/// baselines as closely as it could be established rather than being known verbatim, so
-/// they are the entries to correct first if AWS's exact sentence for one of them comes to
-/// hand; every other description here is AWS's own text.
+/// Every description below is AWS's own sentence for that baseline, reproduced verbatim —
+/// fixed text with no request-, state- or run-derived part — so none of it is summarised,
+/// shortened or re-worded here.
 pub const BASELINE_CATALOG: &[CatalogBaseline] = &[
     CatalogBaseline {
         id: "4T4HA1KMO10S6311",
@@ -3250,8 +3248,7 @@ pub const BASELINE_CATALOG: &[CatalogBaseline] = &[
     CatalogBaseline {
         id: "H6C5JFCJJ3CPU3J5",
         name: "BackupAdminBaseline",
-        description: "Sets up a delegated administrator account for AWS Backup in your \
-                      organization.",
+        description: "Sets up AWS Backup Audit Manager.",
         versions: &["1.0"],
         parameters: &[],
         detects_inheritance_drift: false,
@@ -3260,8 +3257,8 @@ pub const BASELINE_CATALOG: &[CatalogBaseline] = &[
     CatalogBaseline {
         id: "APO9ATVPBKFRRGLK",
         name: "BackupBaseline",
-        description: "Sets up backup resources for member accounts within the target \
-                      OU.",
+        description: "Sets up a local AWS Backup vault and attaches multiple AWS Backup \
+                      plans.",
         versions: &["1.0"],
         parameters: &[],
         detects_inheritance_drift: true,
@@ -3279,7 +3276,8 @@ pub const BASELINE_CATALOG: &[CatalogBaseline] = &[
     CatalogBaseline {
         id: "YX7VMZML5IG8EJUD",
         name: "CentralConfigBaseline",
-        description: "Sets up central resources for AWS Config in your organization.",
+        description: "Sets up central resources for compliance monitoring and auditing \
+                      within your organization using AWS Config.",
         versions: &["1.0"],
         parameters: &[],
         detects_inheritance_drift: false,
@@ -3298,8 +3296,9 @@ pub const BASELINE_CATALOG: &[CatalogBaseline] = &[
     CatalogBaseline {
         id: "1QBGH2G48YVGDQ3Y",
         name: "ConfigBaseline",
-        description: "Sets up resources for AWS Config in accounts in your \
-                      organization.",
+        description: "Sets up AWS Config resources for member accounts within the target \
+                      OU, required for Detective Controls enablement. The resources set \
+                      up are a subset of resources of AWSControlTowerBaseline.",
         versions: &["1.0"],
         parameters: &[],
         detects_inheritance_drift: false,

@@ -48,15 +48,25 @@ const REQUEST_REGION: &str = SIGNED_REGION;
 
 /// One listed baseline, as a client reads it off the response body.
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct Listed {
-    arn: String,
-    name: String,
-    description: String,
+pub(crate) struct Listed {
+    pub(crate) arn: String,
+    pub(crate) name: String,
+    pub(crate) description: String,
 }
 
 /// POST `/list-baselines` with whatever pagination members `body` carries.
 async fn list_baselines(router: &MultiServiceRouter, body: serde_json::Value) -> Answer {
-    call(router, "/list-baselines", body).await
+    list_baselines_in(router, REQUEST_REGION, body).await
+}
+
+/// As [`list_baselines`], signed for `region`: the one request-building path of this
+/// suite, with the region a case varies as a parameter.
+async fn list_baselines_in(
+    router: &MultiServiceRouter,
+    region: &str,
+    body: serde_json::Value,
+) -> Answer {
+    call_in_region(router, region, "/list-baselines", body).await
 }
 
 /// The `baselines` member of a successful answer, as [`Listed`] rows.
@@ -94,11 +104,17 @@ fn page_entries(case: &str, answer: &Answer) -> Vec<Listed> {
         .collect()
 }
 
-/// The whole listing walked page by page with `max_results`, plus the number of pages it
-/// took. `None` for `max_results` means the member is omitted entirely.
-async fn walk(
+/// The whole listing walked page by page with `max_results`, signed for `region`, plus the
+/// number of pages it took. `None` for `max_results` means the member is omitted entirely.
+///
+/// `pub(crate)` because the walk is the one way to read the WHOLE listing, whatever page
+/// size a case uses: the sibling suite that pins the published catalog
+/// ([`crate::published_baseline_catalog`]) reads it through this helper rather than
+/// assembling a second copy of the same token loop.
+pub(crate) async fn walk(
     router: &MultiServiceRouter,
     case: &str,
+    region: &str,
     max_results: Option<i64>,
 ) -> (Vec<Listed>, usize) {
     let mut collected: Vec<Listed> = Vec::new();
@@ -114,7 +130,7 @@ async fn walk(
             body.insert("nextToken".to_string(), serde_json::json!(token));
         }
 
-        let answer = list_baselines(router, serde_json::Value::Object(body)).await;
+        let answer = list_baselines_in(router, region, serde_json::Value::Object(body)).await;
         let entries = page_entries(case, &answer);
         pages += 1;
 
@@ -222,7 +238,7 @@ async fn every_page_size_walks_the_same_listing() {
 
     let expected = expected_listing();
     for (case, max_results) in cases {
-        let (listed, pages) = walk(&router, &case, max_results).await;
+        let (listed, pages) = walk(&router, &case, REQUEST_REGION, max_results).await;
         assert_eq!(
             listed, expected,
             "case {case:?}: a paginated walk must yield the whole catalog in its published \
@@ -247,7 +263,7 @@ async fn every_page_size_walks_the_same_listing() {
 #[tokio::test]
 async fn every_listed_arn_resolves_through_get_baseline() {
     let router = emulator();
-    let (listed, _) = walk(&router, "a 4-per-page walk", Some(4)).await;
+    let (listed, _) = walk(&router, "a 4-per-page walk", REQUEST_REGION, Some(4)).await;
     assert!(
         !listed.is_empty(),
         "the catalog must publish at least one baseline, got {listed:?}"
