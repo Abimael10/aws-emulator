@@ -7,10 +7,12 @@
 //! that wires a function to such a source and finds the policies in force on that function's
 //! execution role withholding one of them is refused with the modelled
 //! `InvalidParameterValueException` (HTTP 400), persists nothing and takes nothing out of the
-//! source, and the refusal is AWS's fixed sentence for that class — "The function execution
-//! role does not have permissions to call `<Call>` on `<Service>`" — whose only varying parts
-//! are the call the poller may not make and the service it would have been made to; the
-//! sentence names neither the role, nor the function, nor the source.
+//! source, and the refusal is AWS's fixed sentence for that CLASS OF SOURCE: a QUEUE's names
+//! the call the poller may not make and the service it would have been made to — "The function
+//! execution role does not have permissions to call `<Call>` on `<Service>`", naming neither
+//! the role, nor the function, nor the source — while a CLUSTER's names the cluster the
+//! request carried and the grant a reader of it is written, and a BROKER's names the request
+//! member that carried the source.
 //!
 //! The rows differ along what the rule generalises over: WHICH source service the mapping
 //! would read (a queue, a cluster, a broker, so the sentence's service and call both change),
@@ -32,8 +34,8 @@ use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::event_source_mapping_role_access::{
-    allow, assert_refused, call_refusal, create_function_as, given_role, logs_only,
-    router_with_iam, QUEUE_READS,
+    allow, assert_refused, call_refusal, cluster_refusal, create_function_as, given_role,
+    logs_only, router_with_iam, QUEUE_READS,
 };
 use crate::event_source_mappings::{
     create_mapping, create_queue, create_request, get_mapping, given_broker, list_mappings,
@@ -87,6 +89,13 @@ impl Source {
             Self::Cluster => json!({ "Topics": ["order-events"] }),
             Self::Broker => json!({ "Queues": ["order-jobs"] }),
         }
+    }
+
+    /// Whether this source's sentence QUOTES the source the request named, which only a
+    /// cluster's does: a queue's names the call and the service alone, and a broker's names
+    /// the request member rather than its value.
+    fn sentence_names_the_source(self) -> bool {
+        matches!(self, Self::Cluster)
     }
 }
 
@@ -169,7 +178,7 @@ fn rows() -> Vec<Row> {
             case: "an msk cluster, with no cluster call granted at all",
             source: Source::Cluster,
             statements: json!([logs_only()]),
-            withheld: Some(call_refusal(MSK_READ, "MSK")),
+            withheld: Some(cluster_refusal(MSK_SOURCE)),
         },
         Row {
             case: "an msk cluster, with the cluster describe granted on it",
@@ -257,7 +266,13 @@ async fn a_withheld_source_read_is_refused_with_awss_fixed_sentence() {
             .string("message")
             .or_else(|| answer.string("Message"))
             .unwrap_or_default();
-        assert_names_nothing_of_the_request(case, &message, &[&role, &function, source]);
+        // Neither the role nor the function is ever named; the source is named only by the
+        // sentence whose class quotes it.
+        let mut withheld_of_the_request: Vec<&str> = vec![&role, &function];
+        if !row.source.sentence_names_the_source() {
+            withheld_of_the_request.push(source);
+        }
+        assert_names_nothing_of_the_request(case, &message, &withheld_of_the_request);
         // The refusal is instead of the mapping, not beside it.
         let listed = list_mappings(&router, &format!("FunctionName={function}")).await;
         assert_eq!(

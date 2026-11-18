@@ -398,6 +398,18 @@ impl<Eng: Send + Sync + 'static> InvokeWithResponseStream<Eng> {
             .cloned()
             .unwrap_or_else(|| record.config.clone());
 
+        // "Tenant isolation mode allows for invocation to be sent to a corresponding
+        // execution environment dedicated to a specific tenant ID": a response-streaming
+        // invocation is an invocation of the function, so a function configured that way
+        // requires one to name its tenant here exactly as `Invoke` does (see
+        // [`crate::state::untenanted_invocation_refusal`]).
+        if let Some(message) = crate::state::untenanted_invocation_refusal(
+            resolved_config.tenancy_config.as_ref(),
+            input.tenant_id.as_deref(),
+        ) {
+            return Err(invalid_parameter(message));
+        }
+
         if invocation_type == INVOCATION_TYPE_DRY_RUN {
             // "DryRun – Validate parameter values and verify that the user or role has
             // permission to invoke the function." Nothing runs for a dry run even on the

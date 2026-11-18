@@ -25,6 +25,7 @@ CreateFunction
 Eight distinct root causes in Lambda's control plane and its refusal messages. They are separate work items; all eight must be closed.
 
 Cause 1 of 8 — a deployment package over the account's CodeSizeZipped limit is answered with a bare HTTP 413 instead of a modelled error.
+STILL OPEN, re-filed on its own as `issues/things-that-do-not-work/20261110T000000Z-lambda-oversize-createfunction-request-refused-without-an-error-code.md`: the service's own 413 (`src/service/request_quota.rs`) is implemented and tested, but the vendored core answers a status-only 413 from `read_production_body` (`vendor/server/src/lib.rs:913`, `:993-1017`) before any service sees a body over 16 MiB, so this cause cannot be closed from `services/`. The remaining seven causes below are closed.
 AWS: CreateFunction refuses a request entity larger than the account's CodeSizeZipped limit (as reported by GetAccountSettings) with RequestEntityTooLargeException and HTTP 413, carrying an error code and message a client can read; the Lambda Smithy model's CreateFunction errors (CodeStorageExceededException 400, InvalidParameterValueException 400, ResourceConflictException 409, ...) are all code-carrying JSON errors, never a bodyless status.
 Emulator: answers a bare `413` with no error code the SDK can map, so the SDK surfaces the status rather than an exception type.
 Why: a client cannot catch the over-size case by error type; it sees an unmodelled transport status and treats a deterministic validation refusal as an unknown failure.
@@ -53,6 +54,7 @@ Fix: the UpdateFunctionConfiguration layer-attach path — consult the attached 
 Traces: lambda.code-signing-config-switched-to-enforce-refuses-the-next-unsigned-layer-attach.
 
 Cause 5 of 8 — Invoke of a tenant-isolated function without a tenant id succeeds.
+ADMISSION FIXED; the refusal's SENTENCE is carried forward as `issues/things-that-do-not-work/20261110T000100Z-lambda-untenanted-invoke-refusal-sentence-is-not-awss-wording.md`: such an invoke is now refused HTTP 400 `InvalidParameterValueException` with nothing run, which this cause's own code check confirms, but AWS's wording for that sentence is recorded nowhere this emulator can read (the issue quotes none, the model carries none, and the harness withholds it), so the sentence stays open on its own.
 AWS: Smithy TenancyConfig.TenantIsolationMode is required on a function configured for tenant isolation; an Invoke that carries no tenant id is refused (HTTP 4xx with a code-carrying error) and the handler is not run.
 Emulator: Invoke returns 200 with a payload.
 Why: tenant isolation is a hard boundary. Accepting an untenanted invoke means a client's multi-tenant function runs with no tenant context, which is exactly the case the configuration exists to prevent.

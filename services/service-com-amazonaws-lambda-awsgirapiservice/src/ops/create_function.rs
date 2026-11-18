@@ -967,6 +967,18 @@ fn package_code(
                 crate::state::unsupported_package_member_message("Handler", package_type),
             ));
         }
+        // "You can use code signing if your deployment package is a .zip file archive":
+        // the signature code signing verifies is borne by a .zip package, while an image
+        // is a reference into a registry, so asking for both at once names a control
+        // Lambda cannot apply to this function. It is refused on the PARAMETERS alone —
+        // before the image reference is followed, which is why it is stated here with the
+        // other package-type rules rather than beside the configuration lookup (see
+        // [`crate::state::CODE_SIGNING_UNSUPPORTED_FOR_IMAGE_MESSAGE`]).
+        if input.code_signing_config_arn.is_some() {
+            return Err(invalid_parameter(
+                crate::state::CODE_SIGNING_UNSUPPORTED_FOR_IMAGE_MESSAGE.to_string(),
+            ));
+        }
         // "A list of function layers to add to the function's EXECUTION ENVIRONMENT":
         // a layer is unpacked into the execution environment Lambda builds from a .zip
         // package, and a container image brings its own whole filesystem, so there is

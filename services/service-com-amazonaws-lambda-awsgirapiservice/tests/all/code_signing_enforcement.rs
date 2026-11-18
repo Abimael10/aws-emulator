@@ -18,6 +18,8 @@
 //!    `Warn`. It applies to each operation the model binds that error to: `CreateFunction`
 //!    and `UpdateFunctionCode` for the function's own deployment package, and
 //!    `UpdateFunctionConfiguration` for the layer packages a configuration change mounts.
+//!    The refusal names the artifact whose signature was checked: the function for a
+//!    deployment of its own package, the layer version for a layer attach.
 //!    A configuration change that mounts no layer deploys nothing and is admitted.
 //! 2. Every READ of a code-signing configuration renders `CodeSigningConfig$Description`
 //!    (`@length 0..256`), as the empty string for a configuration nobody described —
@@ -91,7 +93,8 @@ const CODE_VERIFICATION_FAILED: &str = "CodeVerificationFailedException";
 const DESCRIPTION_MAX: usize = 256;
 
 /// The refusal Lambda words for a deployment its code-signing checks rejected under the
-/// `Enforce` policy: two fixed sentences, and the function the deployment addressed.
+/// `Enforce` policy: two fixed sentences, and the ARTIFACT whose signature was checked —
+/// the function for a deployment of its own package, the layer version for a layer attach.
 fn blocked_deployment_message(resource: &str) -> String {
     format!(
         "Lambda cannot deploy the function. The function or layer might be signed using a \
@@ -773,7 +776,8 @@ async fn updating_code_under_an_enforcing_configuration_is_blocked_and_keeps_the
 
 /// RULE 1, on `UpdateFunctionConfiguration`: the layer packages a configuration change mounts
 /// are deployed to the function, so an `Enforce` configuration blocks a change that mounts
-/// one and admits a change that mounts none.
+/// one — naming the layer version whose signature was checked — and admits a change that
+/// mounts none.
 #[tokio::test]
 async fn mounting_a_layer_under_an_enforcing_configuration_is_blocked() {
     let engine = Arc::new(engine::InMemoryEngine::new());
@@ -810,12 +814,10 @@ async fn mounting_a_layer_under_an_enforcing_configuration_is_blocked() {
 
         let blocked = mounts_layer && policy == POLICY_ENFORCE;
         if blocked {
-            assert_blocked(
-                label,
-                "UpdateFunctionConfiguration",
-                &function_arn(function),
-                &answer,
-            );
+            // The artifact whose signature was checked is the LAYER VERSION's own package,
+            // so that version is what the refusal names — not the function it would have
+            // been mounted into.
+            assert_blocked(label, "UpdateFunctionConfiguration", &layer, &answer);
         } else {
             assert_eq!(
                 answer.status,

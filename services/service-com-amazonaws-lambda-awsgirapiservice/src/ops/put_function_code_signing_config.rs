@@ -263,8 +263,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
-        record.code_signing_config_arn = Some(config_arn);
+        // "You can use code signing if your deployment package is a .zip file archive"
+        // (the model's own `CreateFunction` documentation): the signature a code-signing
+        // configuration's checks are made against is borne by a .zip package, and a
+        // function deployed from a container image has none — so the association names a
+        // control Lambda could never apply to this function and is refused, with nothing
+        // stored. The same rule `CreateFunction` applies to a request that asks for both at
+        // once ([`crate::state::CODE_SIGNING_UNSUPPORTED_FOR_IMAGE_MESSAGE`]).
+        if record.config.package_type == crate::state::PACKAGE_TYPE_IMAGE {
+            return Err(invalid_parameter(
+                crate::state::CODE_SIGNING_UNSUPPORTED_FOR_IMAGE_MESSAGE.to_string(),
+            ));
+        }
 
+        record.code_signing_config_arn = Some(config_arn);
         // Answered by reading the record back, so the response reports the association
         // that is stored and the name the stored function carries.
         Ok(PutFunctionCodeSigningConfigOutput {

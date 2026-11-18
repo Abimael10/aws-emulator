@@ -222,6 +222,12 @@ const REPORTED_ENUM_ORDERS: &[&[&str]] = &[
     // `lambda-function-invocation-paths` and `lambda-lsrno-traj-invoke-reproduces-timeout`
     // carry for an `InvocationType` outside its value set.
     &["DryRun", "RequestResponse", "Event"],
+    // com.amazonaws.lambda#EventSourcePosition (`TRIM_HORIZON | LATEST | AT_TIMESTAMP` in
+    // the model), reported by AWS as below. Source: the answers the corpus units
+    // `lambda.msk-esm-invalid-starting-position-rejected` and
+    // `lambda.msk-esm-topics-list-too-long-rejected` carry for a `StartingPosition`
+    // outside its value set.
+    &["LATEST", "AT_TIMESTAMP", "TRIM_HORIZON"],
 ];
 
 /// `allowed` in the order this service reports that enum in, or in the order the model

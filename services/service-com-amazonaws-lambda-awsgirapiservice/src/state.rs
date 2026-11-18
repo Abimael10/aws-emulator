@@ -4629,6 +4629,10 @@ pub use policy_identity::{
 /// What the code-signing configuration a function is attached to does to a DEPLOYMENT of a
 /// package to it; see the module's own header.
 mod code_signing;
+/// What a function's TENANT ISOLATION configuration requires of an invocation of it; see the
+/// module's own header.
+mod tenant_isolation;
+pub use tenant_isolation::{untenanted_invocation_refusal, ABSENT_TENANT_ID_MESSAGE};
 /// The LAYER records: a layer, its versions and where each version's archive came from; see
 /// the module's own header.
 mod layer_records;
@@ -4641,5 +4645,5 @@ pub use policy_record::*;
 pub use layer_records::*;
 pub use code_signing::{
     code_verification_failed_message, untrusted_deployment_refusal, DeployedArtifact,
-    CODE_SIGNING_POLICY_ENFORCE,
+    CODE_SIGNING_POLICY_ENFORCE, CODE_SIGNING_UNSUPPORTED_FOR_IMAGE_MESSAGE,
 };

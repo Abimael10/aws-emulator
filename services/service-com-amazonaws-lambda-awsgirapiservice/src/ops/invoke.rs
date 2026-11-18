@@ -570,6 +570,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .cloned()
             .unwrap_or_else(|| record.config.clone());
 
+        // "Tenant isolation mode allows for invocation to be sent to a corresponding
+        // execution environment dedicated to a specific tenant ID": a function configured
+        // that way has no un-tenanted environment to run in, so an invocation of it that
+        // names no tenant is refused here — before the run, before an environment is chosen
+        // and before the invocation is metered — rather than served with no tenant context.
+        // The requirement is the FUNCTION's and conditional on its stored configuration,
+        // which no input constraint can state, so Lambda words it itself — the sentence this
+        // service words every other conditionally required member's refusal in — carried by
+        // the modelled 400 AWS answers this refusal with (see
+        // [`crate::state::untenanted_invocation_refusal`]). The DRY RUN
+        // returns below this point deliberately: it "validate[s] parameter values", and this
+        // is one of them.
+        if let Some(message) = crate::state::untenanted_invocation_refusal(
+            resolved_config.tenancy_config.as_ref(),
+            input.tenant_id.as_deref(),
+        ) {
+            return Err(InvokeErrorModeled::InvalidParameterValueException(
+                InvalidParameterValueException {
+                    r#type: None,
+                    message: Some(message),
+                },
+            )
+            .into());
+        }
+
         if invocation_type == INVOCATION_TYPE_DRY_RUN {
             // "DryRun – Validate parameter values and verify that the user or role has
             // permission to invoke the function." Nothing runs for a dry run even on

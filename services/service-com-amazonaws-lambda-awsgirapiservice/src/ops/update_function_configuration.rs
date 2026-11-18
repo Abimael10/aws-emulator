@@ -641,12 +641,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // a configuration whose policy is `Enforce` has layers Lambda cannot attribute to
         // one of that configuration's allowed publishers BLOCKED, with nothing stored, and
         // the same change lands under the `Warn` policy ([`crate::state::DeployedArtifact`]).
-        // A request that names no layers mounts none and deploys nothing.
-        if layers.as_ref().is_some_and(|layers| !layers.is_empty()) {
+        // A request that names no layers mounts none and deploys nothing. The versions
+        // handed over are the RESOLVED ones, because each of them is the package whose
+        // signature is verified and whose own ARN the refusal names.
+        if let Some(layers) = layers.as_deref().filter(|layers| !layers.is_empty()) {
             if let Some(config) = &signing_config {
                 if let Some(message) = crate::state::untrusted_deployment_refusal(
                     config,
-                    crate::state::DeployedArtifact::Layers,
+                    crate::state::DeployedArtifact::Layers(layers),
                     &record.arn,
                 ) {
                     return Err(code_verification_failed(message));

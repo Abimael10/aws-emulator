@@ -73,10 +73,15 @@ pub enum DeployedArtifact<'a> {
     /// and verified alongside the function's, which is what the refusal means by "The
     /// function or layer might be signed using a signature that the client is not
     /// configured to accept."
-    Layers,
+    ///
+    /// The versions carried here are the ones the request RESOLVED to
+    /// ([`super::resolve_function_layers`]), because each of them is the package whose
+    /// signature is verified and whose own ARN the refusal names
+    /// ([`DeployedArtifact::named_subject`]).
+    Layers(&'a [FunctionLayer]),
 }
 
-impl DeployedArtifact<'_> {
+impl<'a> DeployedArtifact<'a> {
     /// The signing profile version this artifact's signature attests to, when it bears one.
     ///
     /// `None` for every artifact this emulator is handed, and that is a statement about
@@ -103,7 +108,28 @@ impl DeployedArtifact<'_> {
     fn is_verified(&self) -> bool {
         match self {
             Self::Package(code) => !code.is_image(),
-            Self::Layers => true,
+            Self::Layers(_) => true,
+        }
+    }
+
+    /// WHICH artifact the refusal names: the one whose signature the checks were made
+    /// against.
+    ///
+    /// A deployment of the function's own package is named by the function it deploys to,
+    /// as the operation making it addresses one (`resource`) — the ARN of the function an
+    /// update changes, the name a create was given for a function that does not exist yet.
+    /// A LAYER attach deploys the layer version's own package instead: "A list of function
+    /// layers to add to the function's execution environment", each a package of its own
+    /// signed on its own, so the artifact whose signature is in question is that layer
+    /// version and the refusal names it by its version ARN. A change mounting several names
+    /// the first of them, which is the one the checks were made on.
+    #[must_use]
+    fn named_subject(self, resource: &'a str) -> &'a str {
+        match self {
+            Self::Package(_) => resource,
+            Self::Layers(layers) => layers
+                .first()
+                .map_or(resource, |layer| layer.arn.as_str()),
         }
     }
 
@@ -130,8 +156,9 @@ impl DeployedArtifact<'_> {
 /// * an artifact whose signature attests to one of the configuration's allowed publishers
 ///   passes every check there is to make and lands;
 /// * an artifact that does not, under [`CODE_SIGNING_POLICY_ENFORCE`], is the deployment
-///   Lambda BLOCKS — the caller gets [`code_verification_failed_message`] and the store is
-///   left as it was;
+///   Lambda BLOCKS — the caller gets [`code_verification_failed_message`] naming the
+///   artifact whose signature was checked ([`DeployedArtifact::named_subject`]) and the
+///   store is left as it was;
 /// * an artifact that does not, under any other policy — `Warn`, the documented default —
 ///   lands, because that policy "allows the deployment".
 #[must_use]
@@ -149,8 +176,24 @@ pub fn untrusted_deployment_refusal(
     if config.untrusted_artifact_on_deployment != CODE_SIGNING_POLICY_ENFORCE {
         return None;
     }
-    Some(code_verification_failed_message(resource))
+    Some(code_verification_failed_message(
+        artifact.named_subject(resource),
+    ))
 }
+
+/// Lambda's sentence for a request that asks for code signing on a function whose
+/// deployment package is a CONTAINER IMAGE.
+///
+/// "You can use code signing if your deployment package is a .zip file archive" (the
+/// model's own `CreateFunction` documentation): the signature the checks here are made
+/// against is borne by a .zip package, while an image is a reference into a registry that
+/// the function is pinned to the manifest digest of ([`super::image_source`]) — so there is
+/// no package signature to verify and the combination names a control Lambda cannot apply.
+/// It is the one fixed sentence every operation that would form that pairing answers, as a
+/// `InvalidParameterValueException` (400): the create that asks for both at once, and the
+/// association made against a function already deployed from an image.
+pub const CODE_SIGNING_UNSUPPORTED_FOR_IMAGE_MESSAGE: &str =
+    "Code signing is not supported for functions created with container images.";
 
 impl ComAmazonawsLambdaAwsgirapiserviceState {
     /// The code-signing configuration the function `function_name` is attached to, when it
@@ -170,5 +213,87 @@ impl ComAmazonawsLambdaAwsgirapiserviceState {
             .code_signing_config_arn
             .as_deref()?;
         self.code_signing_configs.get(arn)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// One stored configuration, under the policy `policy`, allowing one publisher.
+    fn config(policy: &str) -> CodeSigningConfigRecord {
+        CodeSigningConfigRecord {
+            id: "csc-0123456789abcdefg".to_string(),
+            arn: "arn:aws:lambda:us-east-1:000000000000:code-signing-config:csc-0123456789abcdefg"
+                .to_string(),
+            description: None,
+            signing_profile_version_arns: vec![
+                "arn:aws:signer:us-east-1:000000000000:/signing-profiles/Profile1/00000001"
+                    .to_string(),
+            ],
+            untrusted_artifact_on_deployment: policy.to_string(),
+            last_modified: "2026-01-01T00:00:00.000+0000".to_string(),
+            tags: BTreeMap::new(),
+        }
+    }
+
+    /// One resolved layer version, as `resolve_function_layers` hands one over.
+    fn layer(version: u32) -> FunctionLayer {
+        FunctionLayer {
+            arn: format!("arn:aws:lambda:us-east-1:000000000000:layer:shared:{version}"),
+            code_size: 64,
+            uncompressed_code_size: 128,
+            zip_bytes: None,
+        }
+    }
+
+    /// RULE: the refusal names the ARTIFACT whose signature was checked, so a LAYER ATTACH
+    /// is named by the layer version it mounts rather than by the function it mounts it into
+    /// — one row per number of layers the change mounts, since a change mounting several is
+    /// decided on the first of them.
+    #[test]
+    fn a_blocked_layer_attach_names_the_layer_version_it_mounts() {
+        let function = "arn:aws:lambda:us-east-1:000000000000:function:probe";
+        let mounted = [layer(1), layer(2), layer(3)];
+        // (case, the layers the change mounts, the artifact the sentence must name)
+        let rows: Vec<(&str, &[FunctionLayer], String)> = vec![
+            ("one layer version", &mounted[..1], mounted[0].arn.clone()),
+            ("two layer versions", &mounted[..2], mounted[0].arn.clone()),
+            (
+                "every layer a change may mount",
+                &mounted[..],
+                mounted[0].arn.clone(),
+            ),
+            // A change that mounts nothing deploys nothing, so the sentence falls back to
+            // the function the change addressed rather than naming no artifact at all.
+            ("no layer at all", &[], function.to_string()),
+        ];
+        for (case, layers, named) in rows {
+            let stated = untrusted_deployment_refusal(
+                &config(CODE_SIGNING_POLICY_ENFORCE),
+                DeployedArtifact::Layers(layers),
+                function,
+            );
+            assert_eq!(
+                stated.as_deref(),
+                Some(code_verification_failed_message(&named).as_str()),
+                "case {case:?}: expected the refusal to name {named:?}, got {stated:?}"
+            );
+        }
+    }
+
+    /// RULE: the `Warn` policy "allows the deployment", so the same attach lands under it —
+    /// the artifact named above is the Enforce path's, not every path's.
+    #[test]
+    fn the_same_attach_lands_under_the_admitting_policy() {
+        let stated = untrusted_deployment_refusal(
+            &config("Warn"),
+            DeployedArtifact::Layers(&[layer(1)]),
+            "arn:aws:lambda:us-east-1:000000000000:function:probe",
+        );
+        assert_eq!(
+            stated, None,
+            "expected the Warn policy to admit the attach, got {stated:?}"
+        );
     }
 }

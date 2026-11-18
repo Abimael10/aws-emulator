@@ -99,10 +99,15 @@ pub(super) fn report(
         used_mb,
     } = measured;
     if !json {
-        return format!(
+        let mut line = format!(
             "REPORT RequestId: {request_id}\tDuration: {duration_ms:.2} ms\tBilled Duration: \
              {billed_ms} ms\tMemory Size: {memory_size} MB\tMax Memory Used: {used_mb} MB"
         );
+        if let Some(status) = reported_status(completion) {
+            line.push_str("\tStatus: ");
+            line.push_str(status);
+        }
+        return line;
     }
     platform(
         at,
@@ -118,6 +123,22 @@ pub(super) fn report(
             "status": status(completion),
         }),
     )
+}
+
+/// The status the plain-text `REPORT` line closes on, or `None` for a run that carries none.
+///
+/// The line states a status for a run the PLATFORM ended — one stopped at the function's own
+/// `Timeout`, or one whose environment failed — because that outcome is reported nowhere else
+/// in the plain-text framing: the handler never answered, so there is no error payload to read
+/// it off, and a client telling a timed-out invocation from a slow one that answered has only
+/// this line. A run the HANDLER itself completed, returning or raising, carries no status
+/// clause: what it came to is in its own answer.
+///
+/// The status named is the one the structured record states for the same run ([`status`]), so
+/// the two formats report one outcome rather than two.
+fn reported_status(completion: &Completion) -> Option<&'static str> {
+    let status = status(completion);
+    (status == STATUS_TIMEOUT || status == STATUS_ERROR).then_some(status)
 }
 
 /// ONE platform record: the instant it was written, the kind of record it is, and the fields
@@ -287,6 +308,47 @@ mod tests {
             (
                 "the frame that states what the run spent",
                 report(false, at(), "req-1", &completion, measured()),
+                "REPORT RequestId: req-1\tDuration: 12.35 ms\tBilled Duration: 13 ms\tMemory \
+                 Size: 256 MB\tMax Memory Used: 42 MB",
+            ),
+            (
+                "the same frame for a run stopped at the function's own Timeout, which \
+                 states the status the handler never answered with",
+                report(
+                    false,
+                    at(),
+                    "req-1",
+                    &Completion::Stopped(Stop::Deadline),
+                    measured(),
+                ),
+                "REPORT RequestId: req-1\tDuration: 12.35 ms\tBilled Duration: 13 ms\tMemory \
+                 Size: 256 MB\tMax Memory Used: 42 MB\tStatus: timeout",
+            ),
+            (
+                "the same frame for a run whose environment failed",
+                report(
+                    false,
+                    at(),
+                    "req-1",
+                    &Completion::Stopped(Stop::Memory),
+                    measured(),
+                ),
+                "REPORT RequestId: req-1\tDuration: 12.35 ms\tBilled Duration: 13 ms\tMemory \
+                 Size: 256 MB\tMax Memory Used: 42 MB\tStatus: error",
+            ),
+            (
+                "the same frame for a handler that raised, which answered for itself",
+                report(
+                    false,
+                    at(),
+                    "req-1",
+                    &Completion::Raised {
+                        error_type: "ValueError".to_string(),
+                        error_message: "no".to_string(),
+                        stack_trace: Vec::new(),
+                    },
+                    measured(),
+                ),
                 "REPORT RequestId: req-1\tDuration: 12.35 ms\tBilled Duration: 13 ms\tMemory \
                  Size: 256 MB\tMax Memory Used: 42 MB",
             ),

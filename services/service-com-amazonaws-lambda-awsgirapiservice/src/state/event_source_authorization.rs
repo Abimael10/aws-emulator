@@ -132,6 +132,21 @@ enum Refusal {
         /// What closes the sentence after the noun it ends on.
         tail: &'static str,
     },
+    /// An Amazon MSK CLUSTER, whose bootstrap brokers Lambda reads off the cluster itself
+    /// before it can connect at all: one sentence naming the cluster the request named and
+    /// the grant a reader of it is written, worded as the shard sources' is.
+    ///
+    /// The grant is stated as its own PHRASE rather than as the action table rendered: this
+    /// sentence names the describe AWS recommends and the pair that stands in for it, in
+    /// AWS's own words, which no listing of an action set produces.
+    Cluster {
+        /// What that sentence calls the source.
+        noun: &'static str,
+        /// The grant it advises, as the sentence words it.
+        grant: &'static str,
+        /// What closes the sentence after the noun it ends on.
+        tail: &'static str,
+    },
 }
 
 /// The member of the request that named the event source, in the lowerCamel spelling the
@@ -276,7 +291,14 @@ const EVENT_SOURCE_ACCESS: &[EventSourceAccess] = &[
             advises("GetBootstrapBrokers"),
             advises("ListScramSecrets"),
         ],
-        refusal: Refusal::Call { service: "MSK" },
+        refusal: Refusal::Cluster {
+            noun: "cluster",
+            // The describe AWS recommends, and the pair a role may carry instead, as the
+            // sentence words them.
+            grant: "DescribeClusterV2 (recommended) or DescribeCluster and \
+                    GetBootstrapBrokers",
+            tail: " in IAM.",
+        },
     },
     EventSourceAccess {
         vendor: super::EVENT_SOURCE_VENDOR_MQ,
@@ -354,6 +376,10 @@ impl EventSourceAccess {
                 "Cannot access {noun} {named}. Please ensure the role can perform the \
                  {actions} action on your {noun}{tail}",
                 actions = self.action_list()
+            ),
+            Refusal::Cluster { noun, grant, tail } => format!(
+                "Cannot access {noun} {event_source_arn}. Please ensure the role can perform \
+                 the {grant} actions on your {noun}{tail}"
             ),
         }
     }
@@ -716,7 +742,7 @@ mod tests {
     #[test]
     fn the_refusal_is_worded_as_the_source_words_that_error_class() {
         // (the event source, the sentence AWS answers for it)
-        let rows: [(&str, &str); 3] = [
+        let rows: [(&str, &str); 4] = [
             (
                 "arn:aws:kinesis:us-east-1:000000000000:stream/order-events",
                 "Cannot access stream arn:aws:kinesis:us-east-1:000000000000:stream/order-events. \
@@ -736,6 +762,16 @@ mod tests {
                 "arn:aws:mq:us-east-1:000000000000:broker:order-broker:b-1111",
                 "Cannot access broker eventSourceArn. Please ensure the role can perform the \
                  DescribeBroker action on your broker in IAM.",
+            ),
+            (
+                // A cluster's sentence names the cluster the request carried and states the
+                // grant AWS advises as its own phrase: the recommended describe, or the pair
+                // that stands in for it.
+                "arn:aws:kafka:us-east-1:000000000000:cluster/order-stream/11111111-2222-3333-4444-555555555555-1",
+                "Cannot access cluster arn:aws:kafka:us-east-1:000000000000:cluster/order-stream/\
+                 11111111-2222-3333-4444-555555555555-1. Please ensure the role can perform the \
+                 DescribeClusterV2 (recommended) or DescribeCluster and GetBootstrapBrokers \
+                 actions on your cluster in IAM.",
             ),
         ];
         for (event_source, expected) in rows {

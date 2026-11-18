@@ -308,6 +308,21 @@ pub(crate) fn call_refusal(action: &str, on: &str) -> String {
     format!("The function execution role does not have permissions to call {action} on {on}")
 }
 
+/// How AWS words the refusal of a role that may not read an Amazon MSK CLUSTER: the cluster
+/// the request named, and the grant a reader of it is written — the describe AWS recommends,
+/// or the pair that stands in for it — as one fixed phrase.
+///
+/// `pub(crate)` for the same reason [`call_refusal`] is: the suite over this error class's
+/// wording across the source services reads the sentence from here
+/// (`tests/all/event_source_read_refusal_sentence.rs`).
+pub(crate) fn cluster_refusal(event_source_arn: &str) -> String {
+    format!(
+        "Cannot access cluster {event_source_arn}. Please ensure the role can perform the \
+         DescribeClusterV2 (recommended) or DescribeCluster and GetBootstrapBrokers actions on \
+         your cluster in IAM."
+    )
+}
+
 /// A statement allowing `actions` of `namespace` on `resource`.
 pub(crate) fn allow(namespace: &str, actions: &[&str], resource: &str) -> Value {
     json!({
@@ -452,11 +467,12 @@ fn rows() -> Vec<Row> {
         },
         Row {
             // A cluster is reached through a DESCRIBE of the named resource first, so the
-            // role that may not make it is refused by the call that names the cluster.
+            // role that may not make it is refused by the sentence that names the cluster
+            // and the grant a reader of it is written.
             case: "an msk cluster, with only logs granted",
             event_source: MSK_SOURCE,
             statements: json!([logs_only()]),
-            refusal: Some(call_refusal("DescribeClusterV2", "MSK")),
+            refusal: Some(cluster_refusal(MSK_SOURCE)),
         },
         Row {
             case: "an msk cluster, with the cluster describe granted on it",
