@@ -773,3 +773,119 @@ async fn a_batch_invoke_resolver_merges_one_field_across_its_sibling_parents() {
         "case {case:?}: expected the error on the failing parent's own path, got {answered}"
     );
 }
+
+/// The `batchSize` each of `siblings` resolutions is answered with, where the resolver merges
+/// at most [`MAX_BATCH_SIZE`] of them per invocation: the length of the event list the
+/// invocation its own resolution travelled in carried.
+fn merged_sizes(siblings: usize) -> Vec<i64> {
+    let per_invocation = usize::try_from(MAX_BATCH_SIZE).unwrap_or(1);
+    (0..siblings)
+        .map(|index| {
+            let invocation = index / per_invocation;
+            let merged = (siblings - invocation * per_invocation).min(per_invocation);
+            i64::try_from(merged).unwrap_or_default()
+        })
+        .collect()
+}
+
+/// How long the handler of the suite below takes to answer ONE invocation, as the wait it asks
+/// for itself: a span the Lambda runtime charges against the function's own `Timeout`, so it is
+/// a span the data source really takes on every host rather than one this test measures.
+///
+/// It is HALF AGAIN the span one request's mapping templates are evaluated in, which is the
+/// point of the rows: the answer of ONE invocation already outlasts that span on every host, so
+/// no row below turns on how fast this one answers. It is also a small fraction of what this
+/// endpoint allows one request to be SERVED in, so the rows have room to spare at the other end
+/// too — a wait raised much past it would make the suite's own margin the thing under test.
+const ANSWERED_AFTER_SECONDS: u64 = 3;
+
+/// The same handler as the rows above, which WAITS the span above before it answers.
+///
+/// The answer itself is [`BATCH_HANDLER`]'s, so what one invocation computes is the suite's one
+/// reading of it and only the time it takes differs.
+fn slow_handler() -> String {
+    format!(
+        "import time\n\
+         {BATCH_HANDLER}\n\
+         _answer = handler\n\
+         \n\
+         \n\
+         def handler(event, context):\n    \
+         time.sleep({ANSWERED_AFTER_SECONDS})\n    \
+         return _answer(event, context)\n"
+    )
+}
+
+/// RULE — the span this endpoint evaluates ONE request's definitions in is spent by those
+/// EVALUATIONS alone: however long the data sources of that request took to answer, every step
+/// of it is still evaluated, because waiting for an answer is the data source's time and not
+/// evaluating this endpoint performed.
+///
+/// A step renders its request half, CALLS its data source and then renders its response half,
+/// so what a request has left of that span is what the response half of a slow call gets — and
+/// one invocation of a Lambda data source is allowed far longer to answer than a whole request
+/// is allowed to evaluate the definitions of every field it selects. A field whose invocation
+/// outlasted that span must resolve from what the function returned all the same, which is what
+/// these rows pin: every sibling resolves, and the result reports no error at all.
+///
+/// The rows differ along what the rule generalises over: the definition FORM the step is written
+/// in (mapping templates, whose span is the one a request's templates share, and APPSYNC_JS
+/// code, whose span is the one its engine runs share), and HOW MANY invocations one request
+/// waits through before its last step is evaluated — one, and the two that four siblings of a
+/// resolver merging three per invocation come to, which is that wait over again.
+#[tokio::test]
+async fn a_step_is_evaluated_however_long_its_data_source_took_to_answer() {
+    let router = build_router();
+    let function = create_function(&router, "slow-answer-handler", &slow_handler()).await;
+    let role = create_role(&router, "appsync-slow-answer").await;
+    let api = create_api(&router, "slow-answer", &function, &role).await;
+
+    // The ids the siblings of one row are resolved for, one per alias it selects.
+    let ids = ["a", "b", "c", "d"];
+    for (form, field) in [
+        ("a definition written in mapping templates", "item"),
+        ("a definition written in APPSYNC_JS code", "jsItem"),
+    ] {
+        for siblings in [1usize, 4] {
+            let per_invocation = usize::try_from(MAX_BATCH_SIZE).unwrap_or(1);
+            let case = format!(
+                "{form}: {siblings} sibling resolutions, which is {} invocation(s) this request \
+                 waits through",
+                siblings.div_ceil(per_invocation)
+            );
+            let selections: Vec<String> = ids[..siblings]
+                .iter()
+                .enumerate()
+                .map(|(index, id)| format!("s{index}: {field}(id: \"{id}\") {{ id batchSize }}"))
+                .collect();
+            let query = format!("query {{ {} }}", selections.join(" "));
+            let expected: Value = Value::Object(
+                merged_sizes(siblings)
+                    .into_iter()
+                    .zip(ids[..siblings].iter())
+                    .enumerate()
+                    .map(|(index, (merged, id))| {
+                        (format!("s{index}"), json!({"id": id, "batchSize": merged}))
+                    })
+                    .collect(),
+            );
+            let (status, answered) = post_published(&case, &api, &json!({"query": query})).await;
+            assert_eq!(
+                status, 200,
+                "case {case:?}: expected HTTP 200, got {status} {answered}"
+            );
+            // No field was reported as one whose definition was refused the time to run: a
+            // request that waited through its invocations reports no error of its own.
+            let reported = reported_errors(&answered);
+            assert!(
+                reported.is_empty(),
+                "case {case:?}: expected every field to resolve with no error reported, got \
+                 {reported:?}"
+            );
+            assert_eq!(
+                answered["data"], expected,
+                "case {case:?}: expected the data {expected}, got {answered}"
+            );
+        }
+    }
+}

@@ -184,13 +184,18 @@ const MAX_SELECTION_DEPTH: usize = 16;
 const MAX_RESOLVER_RUNS: usize = 64;
 const MAX_ENGINE_RUNS: usize = 256;
 
-/// How long ALL the APPSYNC_JS evaluations of ONE request may be STARTED over, between them.
+/// How long ALL the APPSYNC_JS evaluations of ONE request may RUN FOR, between them.
 ///
 /// The same guard the mapping templates of one request share ([`MAX_TEMPLATE_RUNTIME`]), for
 /// the same reason: every evaluation is handed to a blocking worker with a budget of its own,
 /// so what one request can occupy is bounded by this span rather than by the sum of the
 /// budgets of the runs it asks for. A field whose step would start past it is reported as the
 /// field that met the bound.
+///
+/// Only the evaluations THEMSELVES are charged against it ([`Execution::engine_spent`]): the
+/// time a request spends waiting for a data source to answer is that data source's, not
+/// evaluation this endpoint performed, so a slow answer never spends what the next step's code
+/// is given.
 const MAX_ENGINE_RUNTIME: ::std::time::Duration = ::std::time::Duration::from_secs(10);
 
 /// How many steps of a `PIPELINE` resolver one field may run: "Functions per pipeline
@@ -271,6 +276,12 @@ const MAX_ANSWER_BYTES: usize = 32 * 1024 * 1024;
 /// How long ALL the mapping templates of ONE request may run, between them: the evaluations
 /// of one request share this, so a request selecting many template-defined fields cannot
 /// hold a thread for the sum of their own budgets.
+///
+/// What is charged against it is the time those evaluations themselves took
+/// ([`Execution::template_spent`]), never the span the request has been alive for: a step
+/// renders its request half, CALLS its data source and then renders its response half, so
+/// charging the wait for that answer here would leave the response half of a slow call with
+/// no budget to render in.
 const MAX_TEMPLATE_RUNTIME: ::std::time::Duration = ::std::time::Duration::from_secs(2);
 
 /// How long the CALLER waits for one evaluation, past the budget that evaluation was given:
@@ -383,8 +394,8 @@ pub async fn execute(context: &PlaneContext, request: &GraphqlRequest) -> Answer
         trace_bytes: MAX_TRACE_BYTES,
         steps: Vec::new(),
         appended: Vec::new(),
-        template_deadline: ::std::time::Instant::now() + MAX_TEMPLATE_RUNTIME,
-        engine_deadline: ::std::time::Instant::now() + MAX_ENGINE_RUNTIME,
+        template_spent: ::std::time::Duration::ZERO,
+        engine_spent: ::std::time::Duration::ZERO,
     };
     let data = execution
         .resolve_fields(&root_type, &Json::Null, &fields, Vec::new(), 0)
@@ -495,13 +506,14 @@ struct Execution<'a> {
     /// (`$util.appendError`, which "does not interrupt the evaluation"), drained onto
     /// [`Self::errors`] under that field's own path once it is resolved.
     appended: Vec<Raised>,
-    /// When this request's mapping templates have had all the time they get between them:
-    /// each evaluation is given what is left of it, so the PRODUCT of the fields a request
-    /// selects and the templates each one runs is bounded, not just each run.
-    template_deadline: ::std::time::Instant,
-    /// The same for its APPSYNC_JS evaluations: no step of a resolver is STARTED past it
-    /// ([`MAX_ENGINE_RUNTIME`]).
-    engine_deadline: ::std::time::Instant,
+    /// How long this request's mapping templates have RUN FOR between them: each evaluation
+    /// is given what is left of [`MAX_TEMPLATE_RUNTIME`] and charges what it took back here,
+    /// so the PRODUCT of the fields a request selects and the templates each one runs is
+    /// bounded, not just each run — and nothing else a request does spends that budget.
+    template_spent: ::std::time::Duration,
+    /// The same for its APPSYNC_JS evaluations: no step of a resolver is run once they have
+    /// run for [`MAX_ENGINE_RUNTIME`] between them.
+    engine_spent: ::std::time::Duration,
 }
 
 impl Execution<'_> {
@@ -1178,11 +1190,13 @@ impl Execution<'_> {
     }
 
     /// ONE APPSYNC_JS evaluation of this request, charged against what the request may run
-    /// ([`MAX_ENGINE_RUNS`]) and started only inside the span its evaluations share
+    /// ([`MAX_ENGINE_RUNS`]) and against the span its evaluations share
     /// ([`MAX_ENGINE_RUNTIME`]).
     ///
     /// Every evaluation of a resolver's code goes through here, so one request's runs are
-    /// counted in one place however many steps its fields expand into.
+    /// counted in one place however many steps its fields expand into — and what each run TOOK
+    /// is charged back here, so the span bounds the evaluating this endpoint did and not how
+    /// long the data sources between those runs took to answer.
     async fn evaluated(
         &mut self,
         code: &str,
@@ -1193,7 +1207,7 @@ impl Execution<'_> {
         if self.engine_runs >= MAX_ENGINE_RUNS {
             return Err(format!("{TOO_MANY_ENGINE_RUNS} {MAX_ENGINE_RUNS}.").into());
         }
-        if ::std::time::Instant::now() >= self.engine_deadline {
+        if self.engine_spent >= MAX_ENGINE_RUNTIME {
             return Err(format!(
                 "{EVALUATIONS_TOOK_TOO_LONG} {:?}.",
                 MAX_ENGINE_RUNTIME
@@ -1201,7 +1215,10 @@ impl Execution<'_> {
             .into());
         }
         self.engine_runs = self.engine_runs.saturating_add(1);
-        returned(code, function, context, stash).await
+        let ran = ::std::time::Instant::now();
+        let returned = returned(code, function, context, stash).await;
+        self.engine_spent = self.engine_spent.saturating_add(ran.elapsed());
+        returned
     }
 
     /// Run ONE step that is defined by MAPPING TEMPLATES: evaluate the request template to
@@ -1348,17 +1365,16 @@ impl Execution<'_> {
     /// on the blocking pool rather than on the connection's own task — the same seam the
     /// APPSYNC_JS runs of this service use ([`appsync_js`]) — and the caller waits no longer
     /// than [`TEMPLATE_WAIT_CEILING`] for it. The budget it is given is what is LEFT of this
-    /// request's own template time ([`MAX_TEMPLATE_RUNTIME`]), so the templates of one
-    /// request cannot add up past it however many fields it selects.
+    /// request's own template time ([`MAX_TEMPLATE_RUNTIME`]), which each evaluation charges
+    /// what it took back against, so the templates of one request cannot add up past it
+    /// however many fields it selects and nothing a request waits for spends it.
     async fn rendered(
         &mut self,
         template: &str,
         context: &Json,
         stash: &mut Json,
     ) -> Result<String, Failure> {
-        let budget = self
-            .template_deadline
-            .saturating_duration_since(::std::time::Instant::now());
+        let budget = MAX_TEMPLATE_RUNTIME.saturating_sub(self.template_spent);
         if budget.is_zero() {
             return Err(format!(
                 "{TEMPLATES_TOOK_TOO_LONG} {} seconds.",
@@ -1368,11 +1384,13 @@ impl Execution<'_> {
         }
         let owned = template.to_string();
         let over = context.clone();
+        let ran = ::std::time::Instant::now();
         let evaluated = ::tokio::time::timeout(
             TEMPLATE_WAIT_CEILING,
             ::tokio::task::spawn_blocking(move || mapping_template::evaluate(&owned, &over, budget)),
         )
         .await;
+        self.template_spent = self.template_spent.saturating_add(ran.elapsed());
         let evaluation = match evaluated {
             Ok(Ok(evaluation)) => evaluation?,
             // The run did not finish, or did not come back at all: the field is reported as
