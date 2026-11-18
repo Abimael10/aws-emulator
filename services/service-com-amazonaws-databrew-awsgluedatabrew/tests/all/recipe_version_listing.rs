@@ -58,14 +58,21 @@ async fn publish_recipe(emulator: &Emulator, name: &str, description: Option<&st
         .await
 }
 
-/// `UpdateRecipe`: `PUT /recipes/{Name}`, which moves the working draft on.
-async fn update_recipe(emulator: &Emulator, name: &str, steps: &Value) -> Reply {
+/// `UpdateRecipe`: `PUT /recipes/{Name}`, which moves the working draft on. The PUT
+/// carries the draft's WHOLE definition, so a request with no `Description` leaves the
+/// draft without one (model: `UpdateRecipeRequest`).
+async fn update_recipe(
+    emulator: &Emulator,
+    name: &str,
+    description: Option<&str>,
+    steps: &Value,
+) -> Reply {
+    let mut body = json!({"Steps": steps.clone()});
+    if let Some(description) = description {
+        body["Description"] = json!(description);
+    }
     emulator
-        .call(
-            "PUT",
-            &format!("/recipes/{}", label(name)),
-            Some(json!({"Steps": steps.clone()})),
-        )
+        .call("PUT", &format!("/recipes/{}", label(name)), Some(body))
         .await
 }
 
@@ -106,6 +113,19 @@ fn listed(reply: &Reply) -> Vec<Value> {
         .as_array()
         .cloned()
         .unwrap_or_default()
+}
+
+/// The `Description` each listed item reports — `None` where the item carries none — in
+/// the order the reply carries them.
+fn listed_descriptions(reply: &Reply) -> Vec<Option<String>> {
+    listed(reply)
+        .iter()
+        .map(|item| {
+            item.get("Description")
+                .and_then(Value::as_str)
+                .map(ToString::to_string)
+        })
+        .collect()
 }
 
 /// The `RecipeVersion` of each listed item, in the order the reply carries them.
@@ -366,7 +386,7 @@ async fn each_listed_version_holds_the_definition_it_froze() {
     );
     for (index, steps) in [&first, &second, &third].into_iter().enumerate() {
         if index > 0 {
-            let redrafted = update_recipe(&emulator, name, steps).await;
+            let redrafted = update_recipe(&emulator, name, None, steps).await;
             assert_eq!(
                 redrafted.status, 200,
                 "case {case:?}: redraft {index} must answer 200, got {} {:?}",
@@ -395,6 +415,177 @@ async fn each_listed_version_holds_the_definition_it_froze() {
             Some(steps),
             "case {case:?}: version {version} must hold the definition it froze, got {item:?}"
         );
+    }
+}
+
+/// One publish in a recipe's history, as a case describes it: the description to write
+/// onto the draft first, and the description the publish request itself carries.
+struct Publish<'a> {
+    /// `None` leaves the draft's description as it stands; `Some(description)` redrafts
+    /// it first, where `Some(None)` is a redraft that leaves the draft with none.
+    redraft: Option<Option<&'a str>>,
+    /// What the `PublishRecipe` request says about the recipe it publishes (model:
+    /// `PublishRecipeRequest$Description`).
+    carrying: Option<&'a str>,
+}
+
+/// A listed version reports the description the definition it froze held, and a later
+/// publish never changes the description reported for a version already frozen.
+#[tokio::test]
+async fn each_listed_version_reports_the_description_it_froze() {
+    // The longest description the model allows (model: `RecipeDescription @length
+    // 0..1024`); the empty description below is the lower bound of the same range.
+    let longest = "d".repeat(1024);
+    // Rows differ along what the rule generalises over: the description the draft held
+    // when each version was frozen (absent, empty, at the upper bound, redrafted between
+    // publishes, cleared between publishes), the description each publish request
+    // carried, and how many versions the recipe holds.
+    let timelines = vec![
+        (
+            "a draft kept as it is while each publish carries a description of its own",
+            Some("the draft body"),
+            vec![
+                Publish {
+                    redraft: None,
+                    carrying: Some("published for release"),
+                },
+                Publish {
+                    redraft: None,
+                    carrying: Some("published again"),
+                },
+            ],
+        ),
+        (
+            "a draft redescribed between publishes",
+            Some("the first draft"),
+            vec![
+                Publish {
+                    redraft: None,
+                    carrying: Some("published 1"),
+                },
+                Publish {
+                    redraft: Some(Some("the second draft")),
+                    carrying: Some("published 2"),
+                },
+                Publish {
+                    redraft: Some(Some("the third draft")),
+                    carrying: None,
+                },
+            ],
+        ),
+        (
+            "a draft with no description at all, published with one",
+            None,
+            vec![Publish {
+                redraft: None,
+                carrying: Some("published from an undescribed draft"),
+            }],
+        ),
+        (
+            "a draft whose description is cleared between publishes",
+            Some("described before the clear"),
+            vec![
+                Publish {
+                    redraft: None,
+                    carrying: None,
+                },
+                Publish {
+                    redraft: Some(None),
+                    carrying: Some("published after the clear"),
+                },
+            ],
+        ),
+        (
+            "a draft described with the empty string",
+            Some(""),
+            vec![Publish {
+                redraft: None,
+                carrying: Some("published from an empty description"),
+            }],
+        ),
+        (
+            "a draft described at the modelled upper bound",
+            Some(longest.as_str()),
+            vec![Publish {
+                redraft: None,
+                carrying: Some("published from the longest description"),
+            }],
+        ),
+    ];
+
+    let emulator = Emulator::new();
+    let steps = json!([{"Action": {"Operation": "UPPER_CASE", "Parameters": {"sourceColumn": "dept"}}}]);
+    for (index, (case, created_with, publishes)) in timelines.into_iter().enumerate() {
+        let name = format!("described-{index}");
+        assert_eq!(
+            create_recipe(&emulator, &name, created_with, &steps, None)
+                .await
+                .status,
+            200,
+            "case {case:?}: the recipe under test must be created"
+        );
+
+        // The description the draft holds right now, which is the snapshot the NEXT
+        // publish freezes, whatever that publish request says about the recipe.
+        let mut drafted = created_with;
+        let mut frozen: Vec<Option<String>> = Vec::new();
+        for publish in publishes {
+            if let Some(description) = publish.redraft {
+                let redrafted = update_recipe(&emulator, &name, description, &steps).await;
+                assert_eq!(
+                    redrafted.status, 200,
+                    "case {case:?}: redrafting the description to {description:?} must answer \
+                     200, got {} {:?}",
+                    redrafted.status, redrafted.body
+                );
+                drafted = description;
+            }
+            let published = publish_recipe(&emulator, &name, publish.carrying).await;
+            assert_eq!(
+                published.status, 200,
+                "case {case:?}: the publish carrying {:?} must answer 200, got {} {:?}",
+                publish.carrying, published.status, published.body
+            );
+            frozen.push(drafted.map(ToString::to_string));
+
+            // Every version held so far — the one this publish just froze and the ones
+            // frozen before it — still reports its own snapshot, so the publish text did
+            // not become any version's description.
+            let listing = list_recipe_versions(&emulator, &name, None, None).await;
+            assert_eq!(
+                listing.status, 200,
+                "case {case:?}: the listing must answer 200, got {} {:?}",
+                listing.status, listing.body
+            );
+            assert_eq!(
+                listed_descriptions(&listing),
+                frozen,
+                "case {case:?}: expected the descriptions the versions froze, {frozen:?}, \
+                 got {:?}",
+                listing.body["Recipes"]
+            );
+        }
+
+        // The listing serves the stored version record: a describe of each version by its
+        // number answers the same description.
+        let listing = list_recipe_versions(&emulator, &name, None, None).await;
+        for (position, item) in listed(&listing).iter().enumerate() {
+            let version = format!("{}.0", position + 1);
+            let described = describe_recipe(&emulator, &name, &version).await;
+            assert_eq!(
+                described.status, 200,
+                "case {case:?}: version {version} must resolve, got {} {:?}",
+                described.status, described.body
+            );
+            assert_eq!(
+                item.get("Description"),
+                described.body.get("Description"),
+                "case {case:?}: version {version} must report one description, got {:?} from \
+                 the listing and {:?} from the describe",
+                item.get("Description"),
+                described.body.get("Description")
+            );
+        }
     }
 }
 
