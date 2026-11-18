@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetResourceMetricsConfiguration
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetResourceMetricsConfiguration`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetResourceMetricsConfiguration::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the resource metrics configuration this service holds for one resource.
+//! Implemented here, and the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -74,6 +67,13 @@
 //! ## Errors
 //!
 //! * `ResourceNotFoundException` (HTTP 404) — The named resource does not exist.
+//! * `InternalServiceFault` (HTTP 500) — widened in through `extra_errors` (see below): the
+//!   shared store being unreachable is a server failure, and this operation's own error list
+//!   declares no shape for one.
+//!
+//! A request naming a resource whose detailed metrics this service collects none of is refused
+//! with the request-validation class in this service's own wording (HTTP 400 `ValidationError`,
+//! [`crate::state::UNSUPPORTED_RESOURCE_TYPE`]), which the model declares no shape for.
 
 #[allow(unused_imports)]
 use super::types::*;
@@ -89,9 +89,17 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-cloudwatch-graniteservi
 // here — hence the `GetResourceMetricsConfigurationError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.cloudwatch#GetResourceMetricsConfiguration")]
+// `InternalServiceFault` is widened in through `extra_errors`: this SERVICE models the shape —
+// every metric operation declares it — and this operation does not list it, so widening it in
+// is what gives an unreachable shared store a modelled server failure to answer with, instead
+// of a refusal that would read as a fault of the request.
+#[smithy_macros::operation_error(
+    "com.amazonaws.cloudwatch#GetResourceMetricsConfiguration",
+    extra_errors = ["InternalServiceFault"]
+)]
 #[derive(Debug)]
 pub enum GetResourceMetricsConfigurationErrorModeled {
+    InternalServiceFault(InternalServiceFault),
     ResourceNotFoundException(ResourceNotFoundException),
 }
 
@@ -146,18 +154,59 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetResourceMetricsConfiguration` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetResourceMetricsConfigurationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetResourceMetricsConfiguration"))
+        // "Retrieves the current resource metrics configuration for an Amazon Web Services
+        // resource": a pure REPORT of what this configuration's writers last stored, so nothing
+        // is written here and a later caller sees exactly what this call reported. A
+        // configuration is held under the ARN of the resource it applies to, and that ARN
+        // carries the partition, Region and account that resource lives in — so the Region the
+        // request was signed for does not select it.
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            GetResourceMetricsConfigurationErrorModeled::InternalServiceFault(
+                InternalServiceFault {
+                    message: Some(
+                        "the CloudWatch resource metrics configuration store is unavailable"
+                            .into(),
+                    ),
+                },
+            )
+        })?;
+
+        // The ARN is judged as a VALUE before anything is looked up: a resource whose detailed
+        // metrics this service collects none of can hold no configuration at all, so naming one
+        // is a fault of the request rather than a configuration that happens to be missing — and
+        // the two are different answers to a client deciding whether to create the configuration
+        // or repair the request ([`crate::state::collects_detailed_metrics`], the one rule every
+        // resource metrics configuration operation reads).
+        if !crate::state::collects_detailed_metrics(&input.resource_arn) {
+            return Err(crate::scaffolded::Scaffolded::validation_error(
+                crate::state::UNSUPPORTED_RESOURCE_TYPE,
+            ));
+        }
+
+        let store = state.lock();
+        let configuration = store
+            .resource_metrics_configuration(&input.resource_arn)
+            .ok_or_else(|| {
+                // "This operation returns a ResourceNotFoundException if no resource metrics
+                // configuration exists for the specified resource ARN." The refusal carries NO
+                // message: the resource is named by the two members that carry it — the type of
+                // resource and the id it was looked up by, which for a configuration is the ARN
+                // of the resource it would apply to — so `message` is absent rather than present
+                // and empty, exactly as every other read of this service states a resource it
+                // does not hold.
+                GetResourceMetricsConfigurationErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        resource_type: Some(
+                            crate::state::RESOURCE_METRICS_CONFIGURATION.to_string(),
+                        ),
+                        resource_id: Some(input.resource_arn.clone()),
+                        message: None,
+                    },
+                )
+            })?;
+        Ok(GetResourceMetricsConfigurationOutput {
+            resource_metrics_configuration: configuration.clone(),
+        })
     }
 }
