@@ -20,6 +20,15 @@
 //! request and nothing of EC2's own answer in it. MSK answers for the request it was given
 //! rather than reporting the call it made on the caller's behalf; the member at fault is
 //! named by the refusal's `invalidParameter`, which is the handler's to pass.
+//!
+//! Whether those subnets exist is one question; WHICH VPC holds them is the other, and a
+//! request that declares the VPC it is placed in (`CreateVpcConnectionRequest$VpcId`) is
+//! answered about both: a placement's elastic network interfaces are created inside a subnet
+//! and attached to security groups, and each of those belongs to exactly one VPC, so a
+//! request naming one of another VPC describes a placement that cannot be made
+//! ([`subnet_outside_vpc_refusal`], [`security_group_outside_vpc_refusal`]). Those are the
+//! only EC2 facts this module reads: nothing here is stored, and a VPC the request declares
+//! is compared against what EC2 reported rather than looked up on its own.
 
 /// An AWS SDK client over the in-process callback into this same emulator.
 ///
@@ -100,6 +109,201 @@ pub async fn placement_subnet_refusal(
     }
 }
 
+/// How many security groups ONE create may attach a placement to.
+///
+/// CHOSEN as a process-safety backstop, not a published AWS quota (the model declares no
+/// `length` on `CreateVpcConnectionRequest$SecurityGroups`), for the same reason
+/// [`MAX_PLACEMENT_SUBNETS`] exists: the list comes from the request and is both cloned into
+/// the resolving call below and walked against what EC2 answered, so without a ceiling one
+/// create would size that work. The same ceiling, because it is the same question — how many
+/// EC2 ids may one create name.
+pub const MAX_ATTACHED_SECURITY_GROUPS: usize = MAX_PLACEMENT_SUBNETS;
+
+/// The EC2 filter that selects subnets by id (`DescribeSubnetsRequest$Filters`, `subnet-id`).
+///
+/// The membership reading below narrows with a FILTER rather than with `SubnetIds`, because
+/// it asks a different question from the existence gate: it needs what EC2 holds for the ids
+/// it does resolve, and a filtered read answers that for those while simply not reporting
+/// the rest, where naming an absent id makes EC2 refuse the whole read.
+const SUBNET_ID_FILTER: &str = "subnet-id";
+
+/// The EC2 filter that selects security groups by id
+/// (`DescribeSecurityGroupsRequest$Filters`, `group-id`), used for the reason
+/// [`SUBNET_ID_FILTER`] is.
+const SECURITY_GROUP_ID_FILTER: &str = "group-id";
+
+/// What Amazon MSK answers a VPC connection whose client subnet EC2 reports in a VPC other
+/// than the one the request declares.
+///
+/// No recording of this refusal was available, so the sentence is built from the two members'
+/// OWN documentation (`ClientSubnets` is "the list of client subnets", `VpcId` "the VPC ID of
+/// VPC connection") rather than from another refusal's wording. Its two variable parts are
+/// the caller's own request: the id it named and the VPC it declared.
+#[must_use]
+pub fn subnet_outside_vpc_message(subnet_id: &str, vpc_id: &str) -> String {
+    format!("'{subnet_id}' is not a subnet of the VPC '{vpc_id}'.")
+}
+
+/// The same refusal for a SECURITY GROUP EC2 reports in another VPC
+/// ([`subnet_outside_vpc_message`] for how the sentence is arrived at; `SecurityGroups` is
+/// "the list of security groups").
+#[must_use]
+pub fn security_group_outside_vpc_message(group_id: &str, vpc_id: &str) -> String {
+    format!("'{group_id}' is not a security group of the VPC '{vpc_id}'.")
+}
+
+/// Why the subnets `subnet_ids` names cannot carry a placement in the VPC `vpc_id` declares,
+/// or `None` when every subnet EC2 reported for them is that VPC's.
+///
+/// A placement's elastic network interfaces live in ONE VPC: an interface is created inside a
+/// subnet, and a subnet belongs to exactly one VPC, so a request that declares the VPC it is
+/// placed in and names a subnet of another VPC describes a placement that cannot be made.
+/// Which VPC holds a subnet is EC2's fact, like the subnet itself, so EC2 is asked
+/// ([`resolve_placement_subnets`] asks the existence question of the same inventory) and the
+/// answer decides WHETHER the create is refused, not what the refusal says.
+///
+/// `None` — refuse nothing — for everything that is not EC2 reporting a subnet of another
+/// VPC: an id it reports no subnet for (that absence is the existence gate's to answer), a
+/// subnet it reports no VPC for, an answer this emulator could not read, and an emulator with
+/// no EC2 to ask. A refusal is grounded in what EC2 answered rather than assumed from
+/// silence.
+pub async fn subnet_outside_vpc_refusal(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    vpc_id: &str,
+    subnet_ids: &[String],
+) -> Option<String> {
+    if vpc_id.is_empty() || subnet_ids.is_empty() {
+        return None;
+    }
+    // The caller-sized list is clamped before it is cloned into the call below or walked
+    // against what EC2 answered, exactly as the existence reading clamps it.
+    if subnet_ids.len() > MAX_PLACEMENT_SUBNETS {
+        return Some(too_many_ids("subnets", MAX_PLACEMENT_SUBNETS, subnet_ids.len()));
+    }
+    let endpoint = peer_endpoint("ec2", region)?;
+    let answer = callback_client!(aws_sdk_ec2, ctx, endpoint, region)
+        .describe_subnets()
+        .filters(id_filter(SUBNET_ID_FILTER, subnet_ids))
+        .send()
+        .await;
+    let output = match answer {
+        Ok(output) => output,
+        Err(error) => {
+            warn_unresolved(&error, "the subnets");
+            return None;
+        }
+    };
+    first_outside_vpc(subnet_ids, vpc_id, |subnet_id| {
+        output
+            .subnets()
+            .iter()
+            .find(|subnet| subnet.subnet_id() == Some(subnet_id))
+            .and_then(::aws_sdk_ec2::types::Subnet::vpc_id)
+    })
+    .map(|subnet_id| subnet_outside_vpc_message(subnet_id, vpc_id))
+}
+
+/// Why the security groups `group_ids` names cannot be attached to a placement in the VPC
+/// `vpc_id` declares, or `None` when every group EC2 reported for them is that VPC's.
+///
+/// The same rule [`subnet_outside_vpc_refusal`] applies to the subnets, for the other EC2
+/// resource a placement's network interfaces are created with: a security group belongs to
+/// one VPC and can only be attached to an interface in that VPC, so a group of another VPC
+/// describes a placement that cannot be made. The grounds and the non-answers are that
+/// reading's too — only EC2 reporting a group of another VPC refuses anything.
+pub async fn security_group_outside_vpc_refusal(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    vpc_id: &str,
+    group_ids: &[String],
+) -> Option<String> {
+    if vpc_id.is_empty() || group_ids.is_empty() {
+        return None;
+    }
+    if group_ids.len() > MAX_ATTACHED_SECURITY_GROUPS {
+        return Some(too_many_ids(
+            "security groups",
+            MAX_ATTACHED_SECURITY_GROUPS,
+            group_ids.len(),
+        ));
+    }
+    let endpoint = peer_endpoint("ec2", region)?;
+    let answer = callback_client!(aws_sdk_ec2, ctx, endpoint, region)
+        .describe_security_groups()
+        .filters(id_filter(SECURITY_GROUP_ID_FILTER, group_ids))
+        .send()
+        .await;
+    let output = match answer {
+        Ok(output) => output,
+        Err(error) => {
+            warn_unresolved(&error, "the security groups");
+            return None;
+        }
+    };
+    first_outside_vpc(group_ids, vpc_id, |group_id| {
+        output
+            .security_groups()
+            .iter()
+            .find(|group| group.group_id() == Some(group_id))
+            .and_then(::aws_sdk_ec2::types::SecurityGroup::vpc_id)
+    })
+    .map(|group_id| security_group_outside_vpc_message(group_id, vpc_id))
+}
+
+/// The first id of `ids` that `held_by` reports in a VPC other than `vpc_id`, or `None` when
+/// none of them is reported in another VPC.
+///
+/// The ONE statement of the membership rule both readings above take, so the two kinds of EC2
+/// resource are judged the same way and only the answer they are read out of differs. Walked
+/// over the ids the REQUEST named, so a refusal names the caller's own first offending entry
+/// rather than whichever row EC2 happened to report first; an id `held_by` answers nothing for
+/// establishes nothing, for the reason each reading's own documentation gives.
+fn first_outside_vpc<'a>(
+    ids: &'a [String],
+    vpc_id: &str,
+    held_by: impl Fn(&str) -> Option<&'a str>,
+) -> Option<&'a String> {
+    ids.iter()
+        .find(|id| held_by(id).is_some_and(|holder| holder != vpc_id))
+}
+
+/// What a reading answers a list of EC2 ids longer than the ceiling it asks about
+/// ([`MAX_PLACEMENT_SUBNETS`], [`MAX_ATTACHED_SECURITY_GROUPS`]) with, in the ONE wording every
+/// one of them uses: `kind` names the resources as the sentence reads them, so the ceilings
+/// cannot drift into different sentences for the same condition.
+fn too_many_ids(kind: &str, limit: usize, named: usize) -> String {
+    format!("A create may name at most {limit} {kind}, not {named}.")
+}
+
+/// The EC2 filter that selects the resources `values` names by the id filter `name`.
+fn id_filter(name: &str, values: &[String]) -> ::aws_sdk_ec2::types::Filter {
+    ::aws_sdk_ec2::types::Filter::builder()
+        .name(name)
+        .set_values(Some(values.to_vec()))
+        .build()
+}
+
+/// Report an EC2 read that answered nothing about what a request named.
+///
+/// Worth a warning for the reason the existence reading gives: a deployment with no EC2 to
+/// ask is one where the gate behind this read does not run, and a request is refused on what
+/// EC2 answered rather than on a read that failed.
+fn warn_unresolved<E>(
+    error: &::aws_smithy_runtime_api::client::result::SdkError<
+        E,
+        ::aws_smithy_runtime_api::client::orchestrator::HttpResponse,
+    >,
+    named: &str,
+) where
+    E: ::std::error::Error + ::std::fmt::Debug + 'static,
+{
+    ::tracing::warn!(
+        error = %::aws_smithy_types::error::display::DisplayErrorContext(error),
+        "{named} a request named could not be resolved against EC2"
+    );
+}
+
 /// What EC2 answered about the subnets a request named as a placement.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PlacementSubnets {
@@ -147,9 +351,10 @@ pub async fn resolve_placement_subnets(
     // The caller-sized list is clamped here, before it is cloned into the call below or
     // walked against what EC2 answered, so neither is sized by the request.
     if subnet_ids.len() > MAX_PLACEMENT_SUBNETS {
-        return PlacementSubnets::Refused(format!(
-            "A create may name at most {MAX_PLACEMENT_SUBNETS} subnets, not {}.",
-            subnet_ids.len()
+        return PlacementSubnets::Refused(too_many_ids(
+            "subnets",
+            MAX_PLACEMENT_SUBNETS,
+            subnet_ids.len(),
         ));
     }
     // No Region label, so no endpoint to ask EC2 at: the same answer an unreachable EC2

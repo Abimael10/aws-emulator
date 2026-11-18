@@ -25,7 +25,11 @@
 //! resolved against the account's EC2 inventory
 //! ([`crate::state::network::placement_subnet_refusal`]) before any ARN is minted:
 //! a subnet the account does not have is a `BadRequestException` and no connection
-//! record is written.
+//! record is written. `VpcId` says which VPC the connection is placed in, and a
+//! subnet or a security group EC2 reports in another VPC is refused the same way
+//! ([`crate::state::network::subnet_outside_vpc_refusal`],
+//! [`crate::state::network::security_group_outside_vpc_refusal`]): an interface is
+//! created inside one subnet and attached to groups of that subnet's own VPC.
 //!
 //! ## Shape of an operation
 //!
@@ -292,6 +296,34 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .await
         {
             return Err(bad_request("ClientSubnets", reason));
+        }
+
+        // And the VPC those subnets and security groups belong to: a VPC connection's
+        // interfaces are created INSIDE the subnets `ClientSubnets` names and attached to
+        // the groups `SecurityGroups` names, each of which belongs to exactly one VPC, so a
+        // request that declares `VpcId` and names a resource of another VPC describes a
+        // connection that cannot be made. Asked of EC2 in the order the shape declares the
+        // members, after their existence and before anything is minted, so a cross-VPC
+        // request leaves no record behind.
+        if let Some(reason) = crate::state::network::subnet_outside_vpc_refusal(
+            ctx,
+            &region,
+            &input.vpc_id,
+            &input.client_subnets,
+        )
+        .await
+        {
+            return Err(bad_request("ClientSubnets", reason));
+        }
+        if let Some(reason) = crate::state::network::security_group_outside_vpc_refusal(
+            ctx,
+            &region,
+            &input.vpc_id,
+            &input.security_groups,
+        )
+        .await
+        {
+            return Err(bad_request("SecurityGroups", reason));
         }
 
         let mut state = state.lock();
