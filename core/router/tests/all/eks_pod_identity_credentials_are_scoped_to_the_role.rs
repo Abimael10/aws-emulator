@@ -26,7 +26,9 @@
 //! association's `policy` where it carries one ("the permissions for the Pod Identity
 //! association", `PodIdentityAssociation$policy`). A call those documents allow is served;
 //! one nothing in force allows is refused HTTP 403 `AccessDenied` with IAM's sentence,
-//! naming the SESSION as the principal.
+//! naming the SESSION as the principal, closed by the clause every authorization refusal of
+//! the identity service carries — the pointer at that request's authorization details, whose
+//! reader is `iam_authorization_details_pointer.rs` beside this file.
 //!
 //! Four services on one engine make the pair of rules: EKS publishes the address and serves
 //! the Kubernetes API behind it, EKS Auth exchanges the pod's token, STS records the session
@@ -51,7 +53,6 @@ use aws_emulator_router::{build_router, InMemoryEngine};
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::eks_wire::{cluster_body, ec2, eks, iam, iam_as, role_arn, send};
-use crate::iam_authorization_details_pointer::{DETAILS_PAGE, POINTER_HEAD, POINTER_TAIL};
 use crate::query_wire::{element, elements, opt_element};
 
 /// Keep this at or above `boot_serve.rs`'s stack: the same assembly runs here.
@@ -108,8 +109,10 @@ fn allow_and_deny(action: &str) -> String {
     )
 }
 
-/// What IAM answers a refused [`ACTION`] with: the sentence naming the principal, the
-/// action, the resource the request was made on and why the decision went that way.
+/// The SENTENCE of what IAM answers a refused [`ACTION`] with: the principal, the action,
+/// the resource the request was made on and why the decision went that way. The refusal goes
+/// on to point at the request's own authorization details, under a per-request id that
+/// suite's reader takes rather than this one pinning it.
 ///
 /// `ListRoles` is decided on the account's `role` collection under the path prefix being
 /// listed, which for a request naming none is the default path. The sentence is the whole
@@ -613,23 +616,14 @@ fn a_pod_identity_credential_from_the_published_endpoint_carries_the_roles_permi
                         );
                         // Every authorization refusal of the identity service closes with a
                         // pointer at THAT request's own authorization details, whose id is
-                        // per-run — the rule [`super::iam_authorization_details_pointer`]
-                        // owns — so the SENTENCE is compared to the wording this call is
-                        // owed and the continuation is held to the fixed text it carries.
-                        let message = element(&listed.text, "Message");
-                        let (sentence, pointer) = message
-                            .split_once(POINTER_HEAD)
-                            .unwrap_or((message.as_str(), ""));
-                        assert_eq!(
-                            sentence,
-                            refusal(&session_arn, &reason),
-                            "case {case:?}: expected IAM's refusal naming the session, got {}",
-                            listed.text
-                        );
-                        assert!(
-                            pointer.starts_with(DETAILS_PAGE) && pointer.contains(POINTER_TAIL),
-                            "case {case:?}: expected the refusal to point at this request's \
-                             authorization details, got {message:?}"
+                        // per-run, so the SENTENCE this row set up is what is pinned and the
+                        // continuation is read by the suite that owns that clause
+                        // (`iam_authorization_details_pointer.rs`), which holds it to its
+                        // fixed text and to naming ONE id in both of its slots.
+                        crate::iam_authorization_details_pointer::assert_points_at_details(
+                            case,
+                            &element(&listed.text, "Message"),
+                            &refusal(&session_arn, &reason),
                         );
                     }
                 }
