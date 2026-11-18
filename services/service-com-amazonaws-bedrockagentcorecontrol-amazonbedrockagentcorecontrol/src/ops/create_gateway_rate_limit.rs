@@ -219,23 +219,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // A rule entry's dimensions are the rate limit's own dimension keys, so a
         // rule naming a dimension this limit is not scoped by is refused before
-        // anything is written — by the one helper the batch write applies to each
-        // entry it stores, so the two writes cannot disagree about what a rate
-        // limit may hold.
-        let declared: ::std::collections::BTreeSet<&str> =
-            input.dimension_keys.iter().map(String::as_str).collect();
-        if let Some(unknown) = crate::state::undeclared_dimension(&declared, &input.entries) {
-            return Err(CreateGatewayRateLimitErrorModeled::ValidationException(
-                crate::state::field_validation_failed(
-                    ENTRIES_MEMBER,
-                    &format!(
-                        "names the dimension {unknown} in a rule entry; a rule entry's \
-                         dimensions are the rate limit's own dimension keys {}",
-                        input.dimension_keys.join(", ")
-                    ),
-                ),
-            )
-            .into());
+        // anything is written — by the one helper every write of a single rate
+        // limit shares, so the create and the update cannot disagree about what a
+        // rate limit may hold, nor word the refusal differently.
+        if let Some(refusal) =
+            crate::state::refusal_for_entries(&input.dimension_keys, &input.entries)
+        {
+            return Err(CreateGatewayRateLimitErrorModeled::ValidationException(refusal).into());
         }
 
         let gateway = store.gateways.get(&input.gateway_identifier).ok_or_else(|| {
@@ -348,6 +338,3 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         Ok(output)
     }
 }
-
-/// The request member a refused rule entry names.
-const ENTRIES_MEMBER: &str = "entries";

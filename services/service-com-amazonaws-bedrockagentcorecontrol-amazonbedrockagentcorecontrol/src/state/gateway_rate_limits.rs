@@ -14,7 +14,7 @@ use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
     BatchPutLimitEntry, CreateGatewayRateLimitOutput, GatewayRateLimitDetail,
-    GetGatewayRateLimitOutput, LimitEntry, ValidationException,
+    GetGatewayRateLimitOutput, LimitEntry, UpdateGatewayRateLimitOutput, ValidationException,
 };
 
 use super::{field_validation_failed, gateway_status_conflict, timestamp, GatewayRecord};
@@ -50,6 +50,10 @@ pub const MAX_RATE_LIMITS_PER_GATEWAY: usize = 50;
 
 /// The request member a refused batch names.
 const RATE_LIMITS_MEMBER: &str = "rateLimits";
+
+/// The request member a refused rule entry names, on every request that carries
+/// one rate limit's rule entries.
+const ENTRIES_MEMBER: &str = "entries";
 
 /// One rate limit configured on a gateway: what the caller submitted for it, and
 /// the transition to `ACTIVE` the clock owes it.
@@ -192,6 +196,53 @@ impl GatewayRateLimitRecord {
             updated_at: detail.updated_at,
         }
     }
+
+    /// This rate limit as `UpdateGatewayRateLimit`'s response envelope, which
+    /// declares the same members [`Self::get_output`] does, read off the same
+    /// record: what the update reports is what the next read reports.
+    pub fn update_output(
+        &self,
+        gateway_identifier: &str,
+        now: SystemTime,
+    ) -> UpdateGatewayRateLimitOutput {
+        let detail = self.detail(gateway_identifier, now);
+        UpdateGatewayRateLimitOutput {
+            rate_limit_id: detail.rate_limit_id,
+            gateway_identifier: detail.gateway_identifier,
+            description: detail.description,
+            dimension_keys: detail.dimension_keys,
+            entries: detail.entries,
+            status: detail.status,
+            created_at: detail.created_at,
+            updated_at: detail.updated_at,
+        }
+    }
+}
+
+/// The refusal a write of ONE rate limit owes when a submitted rule entry names
+/// a dimension that limit is not scoped by, or `None` when every entry is in
+/// scope.
+///
+/// The rule [`undeclared_dimension`] decides, worded once here so every write of
+/// a single rate limit refuses it in the same sentence naming the same member:
+/// the create, which is scoped by the `dimensionKeys` the request carries, and
+/// the update, which is scoped by the keys the stored limit was created with
+/// because they are immutable after creation.
+pub fn refusal_for_entries(
+    dimension_keys: &[String],
+    entries: &[LimitEntry],
+) -> Option<ValidationException> {
+    let declared: BTreeSet<&str> = dimension_keys.iter().map(String::as_str).collect();
+    undeclared_dimension(&declared, entries).map(|unknown| {
+        field_validation_failed(
+            ENTRIES_MEMBER,
+            &format!(
+                "names the dimension {unknown} in a rule entry; a rule entry's dimensions are \
+                 the rate limit's own dimension keys {}",
+                dimension_keys.join(", ")
+            ),
+        )
+    })
 }
 
 /// The dimension a rule entry names that a rate limit scoped by `declared` does

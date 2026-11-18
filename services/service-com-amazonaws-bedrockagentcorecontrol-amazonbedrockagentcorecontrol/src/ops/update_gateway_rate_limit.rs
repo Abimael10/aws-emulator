@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateGatewayRateLimit
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateGatewayRateLimit`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateGatewayRateLimit::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Replaces the configuration of ONE rate limit the gateway the path names already holds,
+//! in [`crate::state`] beside that gateway, and reports it with the status the clock owes
+//! it: an updated rate limit is `UPDATING` until the transition back to `ACTIVE` comes due.
+//! A mutation — the entries it writes are the ones every later read of that limit reports,
+//! while the dimension keys the limit was created with are immutable and survive the call.
 //!
 //! ## Shape of an operation
 //!
@@ -175,18 +172,90 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateGatewayRateLimit` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateGatewayRateLimitErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            UpdateGatewayRateLimitErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the gateway store is unavailable".to_string()),
+            })
+        })?;
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        // A gateway whose deletion the clock has already made due is gone before
+        // this call looks for it, and the rate limits it held with it: the removal
+        // was owed at this instant whether or not anybody called.
+        store.expire_deleted_gateways_and_targets(now);
+
+        let gateway = store.gateways.get(&input.gateway_identifier).ok_or_else(|| {
+            UpdateGatewayRateLimitErrorModeled::ResourceNotFoundException(
+                crate::state::resource_not_found(crate::state::RESOURCE_GATEWAY),
+            )
+        })?;
+        // A rate limit is enforced BY the gateway, so the gateway has to exist and
+        // not be on its way out. The one precondition every write of a gateway's
+        // rate limits puts on it, decided in `crate::state` so the create, the
+        // batch write and this update cannot drift: a gateway the clock is still
+        // moving through a transient status TAKES a rate-limit write, because the
+        // limit carries a clock-owed status of its own.
+        if let Some(refusal) = crate::state::refusal_for_gateway(Self::NAME, gateway, now) {
+            return Err(UpdateGatewayRateLimitErrorModeled::ValidationException(refusal).into());
+        }
+        let gateway_id = gateway.gateway_id.clone();
+        // An update reconfigures a STORED rate limit, it does not mint one, so an
+        // id no limit of this gateway holds is the modelled 404 for the rate limit
+        // rather than for the gateway, which was found. Cloned out from under the
+        // read borrow: the write below needs the store mutably, and the record the
+        // update replaces is what dates and scopes the new one.
+        let replaced = gateway
+            .rate_limits
+            .get(&input.rate_limit_id)
+            .ok_or_else(|| {
+                UpdateGatewayRateLimitErrorModeled::ResourceNotFoundException(
+                    crate::state::resource_not_found(crate::state::RESOURCE_GATEWAY_RATE_LIMIT),
+                )
+            })?
+            .clone();
+
+        // "The dimension keys are immutable after creation and cannot be changed":
+        // this request carries none, so the limit stays scoped by the keys it was
+        // created with — and those keys, not any the request could name, are what
+        // the submitted rule entries have to name, refused by the one helper every
+        // write of a single rate limit shares.
+        if let Some(refusal) =
+            crate::state::refusal_for_entries(&replaced.dimension_keys, &input.entries)
+        {
+            return Err(UpdateGatewayRateLimitErrorModeled::ValidationException(refusal).into());
+        }
+
+        // The update REPLACES the limit's configurable members with what this
+        // request carries: the rule entries it submits, and the description, which
+        // a body that names none clears rather than keeps — the whole updated
+        // configuration of the limit, as the operation this service words a
+        // target's update by also treats an omitted member.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateGatewayRateLimit"))
+        // What it does NOT touch: the id it was addressed by, the dimension keys it
+        // was created with, and the instant it was created. Written through the one
+        // constructor every write of a rate limit stores it by, so an updated limit
+        // reports `UPDATING` until the clock owes it `ACTIVE` exactly as a created
+        // one reports `CREATING`.
+        let record = crate::state::GatewayRateLimitRecord::written(
+            replaced.rate_limit_id.clone(),
+            input.description,
+            replaced.dimension_keys.clone(),
+            input.entries,
+            Some(&replaced),
+            now,
+        );
+        let output = record.update_output(&gateway_id, now);
+        if let Some(gateway) = store.gateways.get_mut(&gateway_id) {
+            // The gateway's configuration includes the rate limits it enforces, so
+            // reconfiguring one touches the gateway too — the same bookkeeping the
+            // create does when it adds one.
+            gateway.updated_at = now;
+            gateway
+                .rate_limits
+                .insert(record.rate_limit_id.clone(), record);
+        }
+
+        Ok(output)
     }
 }
