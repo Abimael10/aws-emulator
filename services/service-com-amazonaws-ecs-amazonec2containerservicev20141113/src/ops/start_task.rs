@@ -309,6 +309,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             &region,
             input.network_configuration.as_ref(),
         );
+        // Which network each of those subnets, and each security group named beside them, is
+        // in is read out of that same store under the same lock order: the one interface this
+        // task is allocated lives in ONE network
+        // ([`crate::state::misplaced_network_resource_refusal`]).
+        let misplaced_network_resource = crate::state::misplaced_network_resource_refusal(
+            &*self.engine,
+            input.network_configuration.as_ref(),
+        );
         // Where each subnet it names is, read out of the same store under the same rule
         // ([`crate::state::subnet_placements`]).
         let placement_subnets =
@@ -397,6 +405,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Amazon VPC has none of cannot be made and no task is stored
         // ([`crate::state::unresolved_subnet_refusal`]).
         if let Some(message) = unresolved_subnet {
+            return Err(StartTaskErrorModeled::InvalidParameterException(
+                InvalidParameterException {
+                    message: Some(message),
+                },
+            )
+            .into());
+        }
+        // And those subnets, with the security groups governing the interface created in one of
+        // them, have to be in ONE VPC: an interface of another network could not be created, so
+        // the placement is refused and no task is stored
+        // ([`crate::state::misplaced_network_resource_refusal`]).
+        if let Some(message) = misplaced_network_resource {
             return Err(StartTaskErrorModeled::InvalidParameterException(
                 InvalidParameterException {
                     message: Some(message),

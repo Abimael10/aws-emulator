@@ -582,6 +582,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             &region,
             input.network_configuration.as_ref(),
         );
+        // Which network each of those subnets, and each security group named beside them, is
+        // in is read out of that same store under the same lock order: the one interface a
+        // task of this service is allocated lives in ONE network
+        // ([`crate::state::misplaced_network_resource_refusal`]).
+        let misplaced_network_resource = crate::state::misplaced_network_resource_refusal(
+            &*self.engine,
+            input.network_configuration.as_ref(),
+        );
         // Where those subnets are, read out of the same store under the same rule
         // ([`crate::state::subnet_placements`]), for the placements this service's SCHEDULER
         // makes afterwards; an update that names no configuration moves the service into no
@@ -830,6 +838,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // the service into a subnet Amazon VPC has none of is refused and nothing of it
             // is written ([`crate::state::unresolved_subnet_refusal`]).
             if let Some(message) = unresolved_subnet {
+                return Err(UpdateServiceErrorModeled::InvalidParameterException(
+                    InvalidParameterException {
+                        message: Some(message),
+                    },
+                )
+                .into());
+            }
+            // And those subnets, with the security groups governing the interface created in
+            // one of them, have to be in ONE VPC: an update that moves the service across two
+            // networks is refused and nothing of it is written
+            // ([`crate::state::misplaced_network_resource_refusal`]).
+            if let Some(message) = misplaced_network_resource {
                 return Err(UpdateServiceErrorModeled::InvalidParameterException(
                     InvalidParameterException {
                         message: Some(message),

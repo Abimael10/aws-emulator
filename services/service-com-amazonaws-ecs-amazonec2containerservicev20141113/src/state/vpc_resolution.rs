@@ -164,6 +164,79 @@ pub fn unresolved_subnet_refusal<Eng: Send + Sync + 'static>(
     missing.map(|missing| subnet_lookup_message(&requested, &missing))
 }
 
+/// `InvalidParameterException$message` for a placement whose `awsvpcConfiguration` names
+/// resources of two networks — a security group outside the VPC its subnets are in, or subnets
+/// of more than one VPC.
+///
+/// The interface is created by Amazon EC2, which answers ONE sentence whenever a request
+/// combines resources of two networks — "You have specified two resources that belong to
+/// different networks." — and Amazon ECS reports that answer, the way it reports Amazon EC2's
+/// sentence for a subnet that resolves to nothing ([`subnet_lookup_message`]). The member docs
+/// state the rule the sentence reports: "All specified subnets must be from the same VPC"
+/// (`AwsVpcConfiguration$subnets`) and "All specified security groups must be from the same
+/// VPC" (`$securityGroups`) — one VPC for the one interface the placement configures. The whole
+/// sentence is fixed text, naming nothing of the request.
+pub const AWSVPC_RESOURCES_IN_DIFFERENT_NETWORKS_MESSAGE: &str =
+    "You have specified two resources that belong to different networks.";
+
+/// The refusal a placement earns when the subnets and security groups its
+/// `awsvpcConfiguration` names are not all in ONE VPC, or `None` when they are.
+///
+/// The rule: an `awsvpc` placement configures ONE elastic network interface, which is created
+/// in one subnet of one VPC and governed by the groups of that same VPC — "All specified
+/// subnets must be from the same VPC" (`AwsVpcConfiguration$subnets`) and "All specified
+/// security groups must be from the same VPC" (`$securityGroups`), and a security group belongs
+/// to exactly one VPC (`SecurityGroup$vpcId`), so a group outside the subnets' VPC could never
+/// be applied to that interface. A placement spread across two networks describes an interface
+/// that could not be created, so it is refused and nothing of it is stored.
+///
+/// Which VPC each named resource is in is Amazon EC2's record, so both are read out of that
+/// service's own store: a subnet or a group Amazon VPC holds no VPC id for places the interface
+/// in no network this can compare against, so it decides nothing here — and an id that resolves
+/// to no group at all is a lookup of its own rather than this rule.
+///
+/// Shared by every operation that places a task from a stored revision, so `RunTask` and
+/// `CreateService` cannot answer differently about the same configuration.
+///
+/// LOCK ORDER: this takes the Amazon EC2 store's lock, holds no other while it does, and hands
+/// back an owned message — so it is called with NO guard of this service's store held, exactly
+/// as [`unresolved_subnet_refusal`] is.
+pub fn misplaced_network_resource_refusal<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    configuration: Option<&NetworkConfiguration>,
+) -> Option<String> {
+    let awsvpc = configuration?.awsvpc_configuration.as_ref()?;
+    if awsvpc.subnets.is_empty() {
+        return None;
+    }
+    let groups = awsvpc.security_groups.clone().unwrap_or_default();
+    let ec2 = ::service_com_amazonaws_ec2_amazonec2::state::service_state(engine)?;
+    let store = ec2.lock();
+    // Which network each named subnet is in, in the order the placement named them: the
+    // interface is created in the FIRST of them Amazon VPC holds a network for, so that
+    // subnet's VPC is the one every other resource the placement names has to be in.
+    let mut named_networks = awsvpc.subnets.iter().filter_map(|subnet| {
+        store
+            .subnets
+            .get(subnet.as_str())
+            .and_then(|held| held.vpc_id.clone())
+    });
+    let vpc_id = named_networks.next()?;
+    // Subnets of two VPCs leave no ONE network for the interface, and a group outside the
+    // network the subnets name could never govern it: both are the same fault, so both carry
+    // the one sentence AWS answers for it.
+    let subnets_of_two_networks = named_networks.any(|other| other != vpc_id);
+    let group_of_another_network = groups.iter().any(|group| {
+        store
+            .security_groups
+            .get(group.as_str())
+            .and_then(|held| held.vpc_id.as_deref())
+            .is_some_and(|held| held != vpc_id)
+    });
+    (subnets_of_two_networks || group_of_another_network)
+        .then(|| AWSVPC_RESOURCES_IN_DIFFERENT_NETWORKS_MESSAGE.to_string())
+}
+
 /// Where ONE subnet of the account is, as Amazon VPC holds it: what a placement into that
 /// subnet puts the task — and the interface it is allocated — in.
 #[derive(Debug, Clone)]

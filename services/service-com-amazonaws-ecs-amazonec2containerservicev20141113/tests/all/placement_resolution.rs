@@ -3,8 +3,7 @@
 //! What a PLACEMENT is resolved against before it is made, driven end to end over the
 //! shared wire harness in [`crate::ecs_wire`].
 //!
-//! Three rules, each asserted over a table that spans its class rather than over one
-//! request:
+//! Four rules, each asserted over a table of inputs rather than over one request:
 //!
 //! * the `awsvpcConfiguration` a placement carries is resolved in Amazon VPC — the
 //!   interface an `awsvpc` task is allocated is created IN one of the subnets it names
@@ -21,7 +20,13 @@
 //!   cluster (`PutClusterCapacityProviders` takes "the capacity providers to associate with
 //!   the cluster", and `Cluster$capacityProviders` is the list it leaves behind), so a
 //!   strategy naming one outside that list is refused — including the providers Amazon ECS
-//!   publishes for every account, which a cluster holds the same way as any other.
+//!   publishes for every account, which a cluster holds the same way as any other;
+//! * every subnet and security group an `awsvpcConfiguration` names has to be in ONE VPC:
+//!   the placement configures ONE elastic network interface, created in one subnet of one
+//!   VPC and governed by the groups of that same VPC (`AwsVpcConfiguration$subnets`: "All
+//!   specified subnets must be from the same VPC"; `$securityGroups`: "All specified
+//!   security groups must be from the same VPC"), so a placement spread across two networks
+//!   is refused and nothing of it is stored.
 //!
 //! Every refusal below also has to leave the store as it was: a placement Amazon ECS
 //! refuses runs nothing and stores nothing, which is what lets a client correct the request
@@ -31,10 +36,11 @@ use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::ecs_wire::{
-    answered, cluster_with_capacity, list, ok, refusal, register_capacity, service, string,
-    AWSVPC_SUBNET,
+    answered, cluster_with_capacity, create_cluster, ec2_element, ec2_form, emulator_with_ec2,
+    list, ok, refusal, register_capacity, service, string, AWSVPC_SUBNET, SIGNED_REGION,
 };
 use crate::task_lifecycle::container;
+use crate::task_sets::{create_external_service, describe_task_sets};
 
 /// The cluster every placement below is made in.
 const CLUSTER: &str = "placementscope";
@@ -49,6 +55,10 @@ const BRIDGE_FAMILY: &str = "placementbridgefamily";
 
 /// The one error code every refusal below carries.
 const INVALID_PARAMETER: &str = "InvalidParameterException";
+
+/// The sentence a placement whose named resources are not all in ONE VPC earns.
+const DIFFERENT_NETWORKS: &str = "You have specified two resources that belong to different \
+                                  networks.";
 
 /// The image every container starts from; irrelevant to every rule here, so one value.
 const IMAGE: &str = "public.ecr.aws/nginx/nginx:latest";
@@ -542,7 +552,199 @@ async fn a_run_is_refused_a_capacity_provider_its_cluster_does_not_hold() {
     assert_eq!(
         string(&tasks[0], "capacityProviderName", case),
         "FARGATE",
-        "case {case:?}: expected the task to name the provider it was placed through, got \
+        "case {case:?}: expected the task to place through the provider it names, got \
          {run}"
+    );
+}
+
+/// The cluster the one-network rows below place their task sets in.
+const NETWORK_CLUSTER: &str = "placementnetwork";
+
+/// The service those task sets are attached to: an `EXTERNAL`-controlled one, which is what
+/// `CreateTaskSet` places for ("This is used when a service uses the EXTERNAL deployment
+/// controller type").
+const NETWORK_SERVICE: &str = "placementnetworksvc";
+
+/// One network of the account as Amazon EC2 holds it, built through EC2's own operations: a
+/// VPC with one subnet and one security group. `block` is the second octet of its `/16`, so
+/// two calls of this build two VPCs that share no address.
+async fn ec2_network(router: &MultiServiceRouter, label: &str, block: u8, case: &str) -> (String, String) {
+    let vpc = ec2_element(
+        &ec2_form(
+            router,
+            "CreateVpc",
+            &[("CidrBlock", &format!("10.{block}.0.0/16"))],
+            case,
+        )
+        .await,
+        "vpcId",
+        case,
+    );
+    let subnet = ec2_element(
+        &ec2_form(
+            router,
+            "CreateSubnet",
+            &[
+                ("VpcId", &vpc),
+                ("CidrBlock", &format!("10.{block}.1.0/24")),
+                ("AvailabilityZone", &format!("{SIGNED_REGION}a")),
+            ],
+            case,
+        )
+        .await,
+        "subnetId",
+        case,
+    );
+    let group = ec2_element(
+        &ec2_form(
+            router,
+            "CreateSecurityGroup",
+            &[
+                ("GroupName", &format!("{label}-group")),
+                ("GroupDescription", "a group of this network"),
+                ("VpcId", &vpc),
+            ],
+            case,
+        )
+        .await,
+        "groupId",
+        case,
+    );
+    (subnet, group)
+}
+
+/// A `networkConfiguration` naming `subnets` and `groups`.
+fn placement_in(subnets: &[&str], groups: &[&str]) -> Value {
+    json!({
+        "awsvpcConfiguration": { "subnets": subnets, "securityGroups": groups },
+    })
+}
+
+#[tokio::test]
+async fn a_task_set_is_refused_unless_its_subnets_and_security_groups_are_in_one_vpc() {
+    // `CreateTaskSet` names a configuration for the same interface a service's or a run's
+    // does, so it answers the one-network rule the same way: the rows differ along which
+    // resource comes from the second VPC, and the positive control shows the refusal is the
+    // second network rather than the request's shape.
+    //
+    // Amazon EC2 is mounted beside this service on one engine, because the VPC each named
+    // resource belongs to is EC2's own record: every id below is one EC2 minted.
+    let router = emulator_with_ec2();
+    let case = "setup";
+    create_cluster(&router, NETWORK_CLUSTER, case).await;
+    ok(
+        &router,
+        "RegisterTaskDefinition",
+        json!({
+            "family": FAMILY,
+            "networkMode": "awsvpc",
+            "cpu": "256",
+            "memory": "512",
+            "requiresCompatibilities": ["FARGATE"],
+            "containerDefinitions": [container("web", IMAGE)],
+        }),
+        case,
+    )
+    .await;
+    create_external_service(&router, NETWORK_CLUSTER, NETWORK_SERVICE, 0, case).await;
+    let (here_subnet, here_group) = ec2_network(&router, "here", 70, case).await;
+    let (there_subnet, there_group) = ec2_network(&router, "there", 71, case).await;
+
+    // (case, the subnets named, the groups named, whether ONE VPC holds all of them)
+    let rows: [(&str, Vec<&str>, Vec<&str>, bool); 4] = [
+        (
+            "a subnet and a group of one VPC",
+            vec![&here_subnet],
+            vec![&here_group],
+            true,
+        ),
+        (
+            "a group of another VPC",
+            vec![&here_subnet],
+            vec![&there_group],
+            false,
+        ),
+        (
+            "a group of this VPC beside one of another",
+            vec![&here_subnet],
+            vec![&here_group, &there_group],
+            false,
+        ),
+        (
+            "subnets of two VPCs",
+            vec![&here_subnet, &there_subnet],
+            vec![&here_group],
+            false,
+        ),
+    ];
+
+    let mut created = 0usize;
+    for (case, subnets, groups, one_network) in rows.iter() {
+        let (status, body) = answered(
+            &router,
+            "CreateTaskSet",
+            json!({
+                "cluster": NETWORK_CLUSTER,
+                "service": NETWORK_SERVICE,
+                "taskDefinition": FAMILY,
+                "launchType": "FARGATE",
+                "networkConfiguration": placement_in(subnets, groups),
+            }),
+        )
+        .await;
+        if *one_network {
+            assert_eq!(
+                status, 200,
+                "case {case:?}: expected the task set to be created, got {status} with {body}"
+            );
+            created += 1;
+            let configured =
+                &body["taskSet"]["networkConfiguration"]["awsvpcConfiguration"];
+            let reported: Vec<String> = list(configured, "securityGroups", case)
+                .iter()
+                .map(|group| group.as_str().unwrap_or_default().to_string())
+                .collect();
+            let expected: Vec<String> =
+                groups.iter().map(|group| (*group).to_string()).collect();
+            assert_eq!(
+                reported, expected,
+                "case {case:?}: expected the groups {expected:?} to read back, got {body}"
+            );
+            continue;
+        }
+        assert_eq!(
+            status, 400,
+            "case {case:?}: expected a task set across two networks to be refused, got \
+             {status} with {body}"
+        );
+        let code = body["__type"]
+            .as_str()
+            .unwrap_or_default()
+            .rsplit('#')
+            .next()
+            .unwrap_or_default();
+        let message = body["message"].as_str().unwrap_or_default();
+        assert_eq!(
+            (code, message),
+            (INVALID_PARAMETER, DIFFERENT_NETWORKS),
+            "case {case:?}: expected the cross-network refusal, got {body}"
+        );
+    }
+
+    // Only the accepted row left a task set behind: every refusal stored nothing, so a client
+    // that corrects its network and retries finds the service as it was.
+    let described = describe_task_sets(
+        &router,
+        NETWORK_CLUSTER,
+        NETWORK_SERVICE,
+        None,
+        false,
+        "the task sets the service holds",
+    )
+    .await;
+    assert_eq!(
+        list(&described, "taskSets", "the task sets the service holds").len(),
+        created,
+        "expected only the {created} accepted row(s) to be stored, got {described}"
     );
 }
