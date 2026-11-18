@@ -13,17 +13,21 @@
 //! `IntegrationLatency` sample per integration that answered, and `ClientError`,
 //! `ExecutionError` and `IntegrationError` once per CALL — carrying 1 for the ONE class that
 //! call earned and an explicit 0 for the two classes it did not — and publishes the same
-//! counters additionally under {ApiId, Stage, Route} for a route whose stage has
-//! `DetailedMetricsEnabled`, while a stage without it publishes the stage-wide series
+//! counters additionally under {ApiId, Stage, Route} for a route whose stage turns
+//! `DetailedMetricsEnabled` on — in that route's own `RouteSettings` where the stage names
+//! them, and in the `DefaultRouteSettings` every route it does not name is served under
+//! otherwise — while a route the setting is off for is counted in the stage-wide series
 //! alone.**
 //!
-//! The rows span what the rule generalises over: the stage (two stages of ONE api, one with
-//! detailed metrics and one without, each carrying its own traffic), the kind of call (the
+//! The rows span what the rule generalises over: the stage (several stages of ONE api, each
+//! carrying its own traffic), the kind of call (the
 //! connection request, a two-way route, a route whose function raises, a message the api
 //! routes nowhere, the close), the direction of the message (a frame in, a reply out, a
 //! gateway frame out, a push out), the outcome (an integration that answered, one that
 //! produced no reply, a connection request refused with a client-error status, an api that
-//! fronts no `$connect` integration at all) and the dimension set each lands under.
+//! fronts no `$connect` integration at all), where `DetailedMetricsEnabled` is stated (nowhere,
+//! the stage default, one route alone, and one route contradicting the default in either
+//! direction) and the dimension set each measurement lands under.
 //!
 //! Nothing here is a value this emulator fills in: the traffic is driven over a real socket
 //! against functions AWS Lambda RAN, and every assertion is on what CloudWatch answers for the
@@ -271,9 +275,39 @@ pub(crate) async fn given_stage(
     stage: &str,
     detailed: bool,
 ) {
+    given_configured_stage(emulator, case, api_id, stage, detailed.then_some(true), &[]).await;
+}
+
+/// Create one stage of `api_id` and release a deployment to it, stating
+/// `DetailedMetricsEnabled` where the caller places it: in the stage's `DefaultRouteSettings`
+/// (`default_detailed`, left out of the request entirely when `None`) and in the
+/// `RouteSettings` of each route `route_detailed` names.
+///
+/// The ONE create-and-deploy both forms go through, so every stage a case of this suite drives
+/// is provisioned the same way.
+async fn given_configured_stage(
+    emulator: &MultiServiceRouter,
+    case: &str,
+    api_id: &str,
+    stage: &str,
+    default_detailed: Option<bool>,
+    route_detailed: &[(&str, bool)],
+) {
     let mut body = json!({ "stageName": stage });
-    if detailed {
-        body["defaultRouteSettings"] = json!({ "detailedMetricsEnabled": true });
+    if let Some(enabled) = default_detailed {
+        body["defaultRouteSettings"] = json!({ "detailedMetricsEnabled": enabled });
+    }
+    if !route_detailed.is_empty() {
+        let settings: serde_json::Map<String, Value> = route_detailed
+            .iter()
+            .map(|(route_key, enabled)| {
+                (
+                    (*route_key).to_string(),
+                    json!({ "detailedMetricsEnabled": enabled }),
+                )
+            })
+            .collect();
+        body["routeSettings"] = Value::Object(settings);
     }
     created(
         emulator,
@@ -765,4 +799,199 @@ async fn a_refused_call_is_metered_as_the_class_it_was_refused_with() {
         ],
     )
     .await;
+}
+
+/// WHERE a stage states `DetailedMetricsEnabled` — in the `RouteSettings` of one route, or in
+/// the `DefaultRouteSettings` every route it does not name is served under — and what each
+/// placement makes the stage publish.
+struct SeriesScope {
+    /// What this row varies, for the failure message.
+    what: &'static str,
+    /// The stage this row creates, deploys and drives its traffic through.
+    stage: &'static str,
+    /// `DetailedMetricsEnabled` in the stage's `DefaultRouteSettings`, or `None` for a stage
+    /// that names no default route settings at all.
+    default_detailed: Option<bool>,
+    /// `DetailedMetricsEnabled` in the `RouteSettings` of the routes this row names.
+    route_detailed: &'static [(&'static str, bool)],
+    /// The routes the stage must publish per-route series for; every other route of the api
+    /// must have none.
+    own_series: &'static [&'static str],
+}
+
+/// What the traffic every row below carries owes EACH route's own series, for a stage that
+/// publishes one for that route: the `MessageCount`, the number of `IntegrationLatency`
+/// samples, and the `ConnectCount`.
+///
+/// The connection request is one message sent to the `$connect` route's integration, the
+/// two-way frame is a message in and a reply out of its route, and the close is one message of
+/// the `$disconnect` route; each of the three integrations answered once.
+const PER_ROUTE_TRAFFIC: [(&str, f64, f64, f64); 3] = [
+    ("$connect", 1.0, 1.0, 1.0),
+    ("reply", 2.0, 1.0, 0.0),
+    ("$disconnect", 1.0, 1.0, 0.0),
+];
+
+/// Create the stage `row` configures and release a deployment to it, stating
+/// `detailedMetricsEnabled` only where that row places it.
+async fn given_scoped_stage(
+    emulator: &MultiServiceRouter,
+    case: &str,
+    api_id: &str,
+    row: &SeriesScope,
+) {
+    given_configured_stage(
+        emulator,
+        case,
+        api_id,
+        row.stage,
+        row.default_detailed,
+        row.route_detailed,
+    )
+    .await;
+}
+
+/// Which routes of a stage have series of their own is decided by `DetailedMetricsEnabled` of
+/// the route's OWN `RouteSettings` where the stage names them, and by the stage's
+/// `DefaultRouteSettings` otherwise — while the stage-wide series, the total across the
+/// stage's routes, are published whatever that setting says.
+///
+/// The rows span where the setting lives: nowhere at all, the stage default alone, one route
+/// alone, and one route contradicting the default in each direction. Every row carries the
+/// SAME traffic through its own stage of ONE api — a handshake the stage upgrades, one two-way
+/// frame answered by its route, and the close — so what differs between the rows is only the
+/// dimension sets the datapoints land under.
+#[tokio::test]
+async fn the_route_settings_that_name_detailed_metrics_decide_which_routes_have_own_series() {
+    let case = "DetailedMetricsEnabled placed in a stage's default and in one route's settings";
+    let (emulator, engine) = emulator();
+
+    let lifecycle = given_function(&emulator, &engine, case, "ws-scope-lifecycle", OK_HANDLER).await;
+    let echo = given_function(&emulator, &engine, case, "ws-scope-echo", ECHO_HANDLER).await;
+
+    let api = given_api(&emulator, case, "detailed-metrics-scope-api").await;
+    for (route_key, function, two_way) in [
+        ("$connect", &lifecycle, false),
+        ("$disconnect", &lifecycle, false),
+        ("reply", &echo, true),
+    ] {
+        given_route(&emulator, case, &api.api_id, route_key, function, two_way).await;
+    }
+
+    let rows = [
+        SeriesScope {
+            what: "a stage that states detailed metrics nowhere",
+            stage: "unstated",
+            default_detailed: None,
+            route_detailed: &[],
+            own_series: &[],
+        },
+        SeriesScope {
+            what: "a stage that turns detailed metrics on in its default route settings",
+            stage: "default_on",
+            default_detailed: Some(true),
+            route_detailed: &[],
+            own_series: &["$connect", "reply", "$disconnect"],
+        },
+        SeriesScope {
+            what: "one route alone turning detailed metrics on, the stage stating no default",
+            stage: "one_route",
+            default_detailed: None,
+            route_detailed: &[("reply", true)],
+            own_series: &["reply"],
+        },
+        SeriesScope {
+            what: "one route turning detailed metrics on against a default that is off",
+            stage: "route_over_off",
+            default_detailed: Some(false),
+            route_detailed: &[("$connect", true)],
+            own_series: &["$connect"],
+        },
+        SeriesScope {
+            what: "one route turning detailed metrics off against a default that is on",
+            stage: "route_over_on",
+            default_detailed: Some(true),
+            route_detailed: &[("reply", false)],
+            own_series: &["$connect", "$disconnect"],
+        },
+    ];
+
+    for row in &rows {
+        let row_case = format!("{what} (stage {stage:?})", what = row.what, stage = row.stage);
+        let case = row_case.as_str();
+        given_scoped_stage(&emulator, case, &api.api_id, row).await;
+
+        let path = format!("/{stage}", stage = row.stage);
+        let mut socket: ClientSocket = handshake_at(case, &api.authority, &path)
+            .await
+            .unwrap_or_else(|status| {
+                panic!(
+                    "case {case:?}: a deployed WEBSOCKET stage must answer the opening \
+                     handshake with 101 Switching Protocols, got {status}"
+                )
+            });
+        let replied = exchanged_reply(case, &mut socket, r#"{"action":"reply"}"#).await;
+        assert!(
+            replied.contains("MESSAGE"),
+            "case {case:?}: the two-way route must answer its own event, got {replied:?}"
+        );
+        closed(case, socket).await;
+
+        // The totals the traffic owes this stage, every one of them a figure no stage publishes
+        // by standing still: waited for, because the last call of the connection
+        // (`$disconnect`) is served after the client has closed.
+        let mut owed = vec![
+            counter("ConnectCount", 1.0),
+            counter("MessageCount", 4.0),
+            latency_samples(3.0),
+            // One observation of each error class per CALL the stage served: the connection
+            // request, the frame and the close.
+            samples("ClientError", 3.0),
+        ];
+        // The per-route series of the routes this row's settings DO give one, beside them.
+        for (route, messages, latencies, connects) in PER_ROUTE_TRAFFIC {
+            if !row.own_series.contains(&route) {
+                continue;
+            }
+            owed.push(per_route("MessageCount", route, messages));
+            owed.push(per_route("IntegrationLatency", route, latencies));
+            if connects > 0.0 {
+                owed.push(per_route("ConnectCount", route, connects));
+            }
+        }
+        reached(&emulator, case, &api.api_id, row.stage, &owed).await;
+
+        // Every datapoint of the connection has landed by the time those totals hold — the
+        // `$disconnect` call they count is its last — so what a series must NOT hold is read
+        // ONCE here rather than waited for: a zero that is asserted after the traffic settled
+        // is an absence, while one waited for would hold before the traffic had happened.
+        let mut settled: Vec<Expected> = vec![
+            counter("ClientError", 0.0),
+            counter("ExecutionError", 0.0),
+            counter("IntegrationError", 0.0),
+        ];
+        for (route, messages, latencies, connects) in PER_ROUTE_TRAFFIC {
+            let owed_for = |value: f64| {
+                if row.own_series.contains(&route) {
+                    value
+                } else {
+                    0.0
+                }
+            };
+            settled.push(per_route("MessageCount", route, owed_for(messages)));
+            settled.push(per_route("IntegrationLatency", route, owed_for(latencies)));
+            settled.push(per_route("ConnectCount", route, owed_for(connects)));
+        }
+        for want in &settled {
+            let got = observed(&emulator, case, &api.api_id, row.stage, want).await;
+            assert!(
+                (got - want.value).abs() < 0.5,
+                "case {case:?}: the {metric} series of route {route:?} must stand at \
+                 {expected} once the stage's totals are in, got {got}",
+                metric = want.metric,
+                route = want.route,
+                expected = want.value
+            );
+        }
+    }
 }
