@@ -13,6 +13,11 @@
 //! listing still reports it. Only once the LAST such reference is gone does the
 //! identical delete converge, after which the model reads back absent.
 //!
+//! The held-back delete IS a write the model accepted, though, so it takes the
+//! model to its next `assetModelVersion` — the version counts the writes the model
+//! accepted, whichever state each of them settles at — while the version that was
+//! last `ACTIVE` stays the one a read scoped to the active version answers from.
+//!
 //! The rows differ along what the rule generalises over: how many other models
 //! name the subject (none, one, two), whether the naming model holds hierarchies
 //! besides the one that names it, whether the subject is itself the parent of a
@@ -36,7 +41,7 @@ use crate::asset_lifecycle::{call, error_code, router};
 use crate::asset_model_settle_failures::{
     create, delete, describe, measurement, update, REFERENCED_BY_PARENT, VALIDATION_ERROR,
 };
-use crate::support::settled_asset_model_status;
+use crate::support::{named_by_stored_id, settled_asset_model_status};
 
 /// Every member `DescribeAssetModelResponse` marks @required, from
 /// `smithy_query(query="operation", operation="DescribeAssetModel")`. A model the
@@ -53,12 +58,12 @@ const REQUIRED_PROJECTION: [&str; 9] = [
     "assetModelStatus",
 ];
 
-/// The members of that projection a held-back delete may NOT change: it writes
-/// nothing of the model but the transition it now owes, so the model's identity,
-/// its definition, its creation date and its version read back as they were.
-/// `assetModelStatus` is what the delete does change, and `assetModelVersion`
-/// rides along here because a delete states no new definition to carry a version.
-const UNCHANGED_BY_A_HELD_BACK_DELETE: [&str; 8] = [
+/// The members of that projection a held-back delete may NOT change: it states no
+/// new definition, so the model's identity, its definition and its creation date
+/// read back as they were. `assetModelStatus` is what the delete settles, and
+/// `assetModelVersion` is what the accepted write advances — both are asserted on
+/// their own below.
+const UNCHANGED_BY_A_HELD_BACK_DELETE: [&str; 7] = [
     "assetModelId",
     "assetModelArn",
     "assetModelName",
@@ -66,8 +71,38 @@ const UNCHANGED_BY_A_HELD_BACK_DELETE: [&str; 8] = [
     "assetModelProperties",
     "assetModelHierarchies",
     "assetModelCreationDate",
-    "assetModelVersion",
 ];
+
+/// `assetModelVersion` as the counter it spells.
+///
+/// The member targets `Version` with the pattern `^(0|([1-9]{1}\d*))$`, from
+/// `smithy_query(query="operation", operation="DescribeAssetModel")`, so it is a
+/// decimal counter carried as a string — which the spelling is checked against
+/// here before it is read as a number.
+fn version_of(case: &str, described: &Value) -> u64 {
+    let raw = described["assetModelVersion"]
+        .as_str()
+        .unwrap_or_else(|| panic!("case {case:?}: no assetModelVersion in {described}"));
+    assert!(
+        raw == "0"
+            || (!raw.starts_with('0') && raw.chars().all(|digit| digit.is_ascii_digit())),
+        "case {case:?}: expected a decimal assetModelVersion, got {raw:?}"
+    );
+    raw.parse()
+        .unwrap_or_else(|_| panic!("case {case:?}: unreadable assetModelVersion {raw:?}"))
+}
+
+/// `GET /asset-models/{label}?assetModelVersion=ACTIVE`: the model as the version
+/// a read scoped to the ACTIVE one answers from.
+async fn described_active(router: &MultiServiceRouter, case: &str, label: &str) -> Value {
+    let uri = format!("/asset-models/{label}?assetModelVersion=ACTIVE");
+    let (status, described) = call(router, "GET", &uri, None).await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: DescribeAssetModel({uri}): got {status} {described}"
+    );
+    described
+}
 
 /// How many single-model pages [`listed`] walks before it gives up: no row here
 /// builds more than a handful of asset models, so a walk longer than this means
@@ -324,6 +359,10 @@ async fn delete_is_held_back_until_the_last_reference_goes(
         "case {case:?}: describing the subject before the delete: got {status} {before}"
     );
 
+    // The version the subject carries going into each delete: every accepted
+    // write advances it by one, and the held-back delete is one of them.
+    let mut version = version_of(case, &before);
+
     for (dropped, holder) in subject.holders.iter().enumerate() {
         let left = subject.holders.len() - dropped;
         let step = format!("case {case:?}: with {left} reference(s) still naming the subject");
@@ -382,6 +421,27 @@ async fn delete_is_held_back_until_the_last_reference_goes(
                 before[member], after[member]
             );
         }
+        // The accepted delete took the model to its next version, and the version
+        // it wrote never becomes the ACTIVE one: that stays the last version the
+        // model settled ACTIVE at.
+        version += 1;
+        let read = version_of(case, &after);
+        assert_eq!(
+            read, version,
+            "{step}: expected assetModelVersion {version}, got {read} in {after}"
+        );
+        let active = described_active(router, case, &subject.label).await;
+        assert_eq!(
+            active["assetModelStatus"]["state"].as_str(),
+            Some("ACTIVE"),
+            "{step}: the active version reads ACTIVE, got {active}"
+        );
+        let active_version = version_of(case, &active);
+        assert!(
+            active_version < version,
+            "{step}: the held-back delete's version {version} must not be the active one, \
+             got {active_version} in {active}"
+        );
         let summary = listed(router, case, &subject.id).await;
         let summary = summary
             .unwrap_or_else(|| panic!("{step}: the surviving model is absent from the listing"));
@@ -461,5 +521,106 @@ async fn a_delete_a_hierarchy_reference_holds_back_leaves_the_model_served_uncha
         let router = router();
         let subject = build(&router, case, shape).await;
         delete_is_held_back_until_the_last_reference_goes(&router, case, subject).await;
+    }
+}
+
+#[tokio::test]
+async fn a_held_back_delete_takes_the_model_to_its_next_version() {
+    // Rows: how many writes the subject already accepted before the delete lands,
+    // so the version the delete settles at is not one constant — and a row where
+    // the delete is itself the second held-back one, so the version advances per
+    // accepted delete rather than once per model.
+    let rows: [(&str, u64, usize); 5] = [
+        ("the create is the model's only write", 0, 1),
+        ("one update before the delete", 1, 1),
+        ("two updates before the delete", 2, 1),
+        ("five updates before the delete", 5, 1),
+        ("two held-back deletes in a row", 1, 2),
+    ];
+
+    for (case, updates, deletes) in rows {
+        let router = router();
+        let subject = build(&router, case, Shape::OneParent).await;
+
+        for _ in 0..updates {
+            // A write that restates the definition the model already carries is
+            // still a write the model accepted, so it advances the version too.
+            // The property is named by the id the model already holds for it, the
+            // way a client resubmitting a stored property keeps it.
+            let properties =
+                named_by_stored_id(&router, &subject.id, json!([measurement("Power")])).await;
+            let (status, answered) = update(
+                &router,
+                &subject.label,
+                json!({
+                    "assetModelName": "Turbine",
+                    "assetModelDescription": "the model the row deletes",
+                    "assetModelProperties": properties,
+                }),
+            )
+            .await;
+            assert_eq!(
+                status, 202,
+                "case {case:?}: the update must be accepted, got {status} {answered}"
+            );
+            settled_active(&router, case, &subject.id).await;
+        }
+
+        let (status, before) = describe(&router, &subject.label).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: describing the subject before the delete: got {status} {before}"
+        );
+        // The create is the model's first version, and each accepted update since
+        // took it to the next one.
+        let mut expected = version_of(case, &before);
+        assert_eq!(
+            expected,
+            1 + updates,
+            "case {case:?}: expected version {} after {updates} update(s), got {expected}",
+            1 + updates
+        );
+
+        for attempt in 1..=deletes {
+            let step = format!("case {case:?}: held-back delete {attempt}");
+            let (status, answered) = delete(&router, &subject.label).await;
+            assert_eq!(
+                status, 202,
+                "{step}: the delete must be accepted, got {status} {answered}"
+            );
+            let settled = settled_asset_model_status(&router, &subject.label).await;
+            assert_eq!(
+                settled["state"].as_str(),
+                Some("FAILED"),
+                "{step}: the held-back delete settles FAILED, got {settled}"
+            );
+            expected += 1;
+            let (status, after) = describe(&router, &subject.label).await;
+            assert_eq!(
+                status, 200,
+                "{step}: the model must stay describable, got {status} {after}"
+            );
+            let read = version_of(case, &after);
+            assert_eq!(
+                read, expected,
+                "{step}: expected assetModelVersion {expected}, got {read} in {after}"
+            );
+        }
+
+        // What the delete advanced is the LATEST version: the active one is still
+        // the last version the model settled ACTIVE at, which is the one the read
+        // before the delete reported.
+        let active = described_active(&router, case, &subject.label).await;
+        assert_eq!(
+            version_of(case, &active),
+            1 + updates,
+            "case {case:?}: the active version must stay {}, got {active}",
+            1 + updates
+        );
+        assert_eq!(
+            active["assetModelStatus"]["state"].as_str(),
+            Some("ACTIVE"),
+            "case {case:?}: the active version reads ACTIVE, got {active}"
+        );
     }
 }

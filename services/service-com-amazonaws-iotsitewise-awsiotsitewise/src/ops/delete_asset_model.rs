@@ -378,9 +378,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // holds — but it is NOT a refusal of the call: the delete is accepted,
         // reports DELETING like any other, and the model then settles at FAILED
         // carrying that diagnosis while staying exactly where it is, listed and
-        // describable under the definition it already had. Nothing of the model
-        // changes but the transition it now owes, so its version, its definition
-        // and its entity tag stay as they were.
+        // describable under the definition it already had.
+        //
+        // It is a write the model ACCEPTED, so it takes the model to its next
+        // version exactly as every other accepted write to a model does
+        // ([`crate::state::AssetModelRecord::begin_update`]): what the version
+        // counts is the writes the model accepted, not the ones that changed its
+        // definition, so the state the write settles at — `ACTIVE` or `FAILED` —
+        // and the fact that a delete states no new definition do not change it.
+        // The definition this write supersedes is therefore kept as the model's
+        // ACTIVE version, since the version this call wrote never becomes active,
+        // and the latest version's entity tag moves with the version.
         if store.referenced_by_parent_hierarchy(&id) {
             let record = store.asset_models.get_mut(&id).ok_or_else(|| {
                 DeleteAssetModelError::Modeled(
@@ -391,8 +399,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     ),
                 )
             })?;
+            let superseded = record.definition();
+            record.begin_update(superseded, now);
+            // The transition this write owes is a DELETING one, not the UPDATING
+            // one a definition-stating write owes, and it settles at the diagnosis
+            // that the reference has to be dropped first.
             record.settling_state = crate::state::STATE_DELETING.to_string();
-            record.active_at = now + crate::state::ACTIVATION_DELAY;
             record.settle_failure = Some(crate::state::validation_failure(
                 crate::state::REFERENCED_BY_PARENT_HIERARCHY_FAILURE,
             ));
