@@ -40,9 +40,14 @@ pub const INSTANCE_CREATING: &str = "creating";
 /// A replication instance that finished provisioning.
 pub const INSTANCE_AVAILABLE: &str = "available";
 
-/// The status an endpoint carries. DMS creates an endpoint ready — it provisions
-/// nothing — so this is the only endpoint status this slice reports.
+/// The status an endpoint carries once it is usable. DMS creates an endpoint ready —
+/// it provisions nothing — so this is the status every create reports.
 pub const ENDPOINT_ACTIVE: &str = "active";
+
+/// The status an endpoint `DeleteEndpoint` has accepted carries while it is on its way
+/// out of the account: the record is owed removal ([`Owed::Removal`]), so a caller that
+/// reads straight after the delete still sees the endpoint leaving.
+pub const ENDPOINT_DELETING: &str = "deleting";
 
 /// A task `CreateReplicationTask` has accepted but not finished creating: "the task
 /// is being created in response to running the CreateReplicationTask operation"
@@ -753,6 +758,9 @@ pub struct EndpointRecord {
     pub settings: EngineSettings,
     /// The endpoint's tags.
     pub tags: Vec<Tag>,
+    /// The transition the clock owes this endpoint, if any: `DeleteEndpoint` owes a
+    /// deleting endpoint its removal.
+    pub pending: Option<Pending>,
     /// Creation order, so a describe scans endpoints oldest first.
     pub sequence: u64,
 }
@@ -1018,6 +1026,43 @@ impl ComAmazonawsDatabasemigrationserviceAmazondmsv20160101State {
                     instance.pending = None;
                     if let Owed::ToStatus(next) = pending.owed {
                         instance.status = next.to_string();
+                    }
+                }
+            }
+        }
+
+        // An endpoint whose `deleting` span has elapsed leaves the store, and the
+        // `EndpointIdentifier` it held becomes free for a new endpoint: an identifier is
+        // unique only among the endpoints the account HOLDS.
+        let removed: Vec<(String, String)> = self
+            .endpoints
+            .values()
+            .filter(|endpoint| {
+                endpoint
+                    .pending
+                    .is_some_and(|pending| now >= pending.due && pending.owed == Owed::Removal)
+            })
+            .map(|endpoint| (endpoint.arn.clone(), endpoint.identifier.clone()))
+            .collect();
+        for (arn, identifier) in removed {
+            self.endpoints.remove(&arn);
+            // Only while the identifier still points at the endpoint that is leaving: a
+            // create that has already taken the identifier owns the entry.
+            if self
+                .endpoint_arn_by_identifier
+                .get(&identifier)
+                .is_some_and(|held| *held == arn)
+            {
+                self.endpoint_arn_by_identifier.remove(&identifier);
+            }
+        }
+
+        for endpoint in self.endpoints.values_mut() {
+            if let Some(pending) = endpoint.pending {
+                if now >= pending.due {
+                    endpoint.pending = None;
+                    if let Owed::ToStatus(next) = pending.owed {
+                        endpoint.status = next.to_string();
                     }
                 }
             }

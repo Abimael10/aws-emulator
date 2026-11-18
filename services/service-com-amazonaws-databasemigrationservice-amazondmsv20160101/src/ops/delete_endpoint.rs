@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteEndpoint
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteEndpoint`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteEndpoint::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: takes the endpoint the request names out of the account — it moves to
+//! `deleting` and the store owes its removal, which is also what frees the
+//! `EndpointIdentifier` it held — and answers with the endpoint that was deleted. An
+//! endpoint a replication task still names cannot go: "All tasks associated with the
+//! endpoint must be deleted before you can delete the endpoint". The notes below are
+//! the scaffold's, kept for the next reader.
 //!
 //! ## Shape of an operation
 //!
@@ -137,20 +134,86 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteEndpoint` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteEndpointErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteEndpoint"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(invalid_state(
+                "the dms emulator is mounted on an engine that holds no state for it".to_string(),
+            ));
+        };
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        store.settle(now);
+
+        // "All tasks associated with the endpoint must be deleted before you can delete
+        // the endpoint": a task the account still holds names its endpoints by ARN, at
+        // either end, so an endpoint either end of one names stays. Read before the
+        // endpoint is taken mutably, oldest task first, so the refusal names the first
+        // task that holds it.
+        let referencing = store
+            .ordered_tasks()
+            .into_iter()
+            .find(|task| {
+                task.source_endpoint_arn == input.endpoint_arn
+                    || task.target_endpoint_arn == input.endpoint_arn
+            })
+            .map(|task| task.arn.clone());
+
+        let Some(endpoint) = store.endpoints.get_mut(&input.endpoint_arn) else {
+            return Err(DeleteEndpointErrorModeled::ResourceNotFoundFault(
+                ResourceNotFoundFault {
+                    // This operation's own sentence for an `EndpointArn` that names no
+                    // endpoint the account holds: fixed text with the ARN the CALLER
+                    // sent as its only variable part.
+                    message: Some(format!("Endpoint for {} not found.", input.endpoint_arn)),
+                },
+            )
+            .into());
+        };
+
+        if let Some(task_arn) = referencing {
+            return Err(invalid_state(format!(
+                "endpoint {} is used by replication task {task_arn}, and all tasks \
+                 associated with the endpoint must be deleted before you can delete the \
+                 endpoint",
+                endpoint.arn
+            )));
+        }
+
+        // An endpoint that is already on its way out cannot be deleted a second time:
+        // what it is owed is its removal.
+        if endpoint.status == crate::state::ENDPOINT_DELETING {
+            return Err(invalid_state(format!(
+                "endpoint {} is {} and cannot be deleted in that status",
+                endpoint.arn, endpoint.status
+            )));
+        }
+
+        endpoint.status = crate::state::ENDPOINT_DELETING.to_string();
+        // `deleting` is not terminal: the endpoint is owed removal, which is also what
+        // frees the `EndpointIdentifier` it holds, so a caller that reads straight after
+        // the delete still sees the endpoint leaving.
+        endpoint.pending = Some(crate::state::Pending::after(
+            now,
+            crate::state::Owed::Removal,
+        ));
+
+        // "The endpoint that was deleted", through the one projection every operation
+        // that answers with an endpoint goes through.
+        Ok(DeleteEndpointOutput {
+            endpoint: Some(endpoint.to_shape()),
+        })
     }
+}
+
+/// The error this operation models for a resource that cannot be used for a database
+/// migration in the state it is in. The DMS model declares no server-side fault, so the
+/// unreachable "no store" branch uses it too rather than a 501, which would claim the
+/// operation is unimplemented.
+fn invalid_state(message: String) -> DeleteEndpointError {
+    DeleteEndpointErrorModeled::InvalidResourceStateFault(InvalidResourceStateFault {
+        message: Some(message),
+    })
+    .into()
 }

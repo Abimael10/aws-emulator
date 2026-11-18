@@ -431,6 +431,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // no secret and no response can echo one.
             settings,
             tags: crate::state::tags_for(&arn, input.tags),
+            // Only `DeleteEndpoint` owes an endpoint a transition.
+            pending: None,
             sequence,
         };
 

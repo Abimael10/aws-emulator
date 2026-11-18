@@ -3,19 +3,20 @@
 //! End-to-end cover for the DMS migration-task slice this crate implements:
 //! `CreateReplicationInstance`, `CreateEndpoint`, `CreateReplicationTask`,
 //! `DescribeReplicationInstances`, `DescribeEndpoints`, `DescribeReplicationTasks`,
-//! `StartReplicationTask` and `DeleteReplicationTask`.
+//! `StartReplicationTask`, `DeleteReplicationTask` and `DeleteEndpoint`.
 //!
 //! Every case drives the real wire path — `POST /` with
 //! `X-Amz-Target: AmazonDMSv20160101.<Operation>` through the multi-service router — so
 //! what is asserted is what a client sees, body and HTTP status included.
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant, SystemTime};
 
 use bytes::Bytes;
 use serde_json::{json, Value};
 use service_com_amazonaws_databasemigrationservice_amazondmsv20160101::state::{
-    MAX_RECORDS_MAX, MAX_RECORDS_MIN, RESOURCE_IDENTIFIER_MAX_LEN, TRANSITION_DELAY,
+    ENDPOINT_ACTIVE, ENDPOINT_DELETING, INSTANCE_AVAILABLE, MAX_RECORDS_MAX, MAX_RECORDS_MIN,
+    RESOURCE_IDENTIFIER_MAX_LEN, TRANSITION_DELAY,
 };
 use service_com_amazonaws_databasemigrationservice_amazondmsv20160101::EmulatedService;
 use smithy_server_runtime::{EmbeddedEmulator, MultiServiceRouter};
@@ -1467,6 +1468,606 @@ async fn every_documented_filter_narrows_the_describe() {
             (400, true),
             "case \"undocumented filter\" on {operation}: expected 400 ValidationException, \
              got {status} {response}"
+        );
+    }
+}
+
+// ---- DeleteEndpoint, and what a deleted endpoint leaves behind ----------------------
+//
+// RULE: a delete takes the endpoint it names out of the account — the endpoint moves to
+// the transient `deleting` status whose removal the clock owes, and once that removal has
+// been applied the account no longer holds it: a describe narrowed to the endpoint raises
+// the one error `DescribeEndpoints` models, a second delete is refused as an ARN that
+// names nothing, and the `EndpointIdentifier` it carried is free again, so a later create
+// may use that identifier and mints a fresh `EndpointArn` for the endpoint it creates. An
+// endpoint a replication task still names is not deleted at all: "All tasks associated
+// with the endpoint must be deleted before you can delete the endpoint".
+//
+// The rows span what the rule generalises over: the endpoint type, the engine, the
+// connection parameter the two endpoints of a case differ in and the members a response
+// reports it through, the port, and whether DMS minted the ARN's resource id or the caller
+// supplied it.
+
+/// How long one poll of a clock-owed transition waits before asking again.
+const POLL_INTERVAL: Duration = Duration::from_millis(25);
+
+/// How long a poll loop waits for a clock-owed transition before giving up. Far past
+/// every span this emulator gives one, so a loaded machine does not fail a case the clock
+/// would have settled.
+const POLL_BUDGET: Duration = Duration::from_secs(60);
+
+/// How far out a held transition is pushed, so a case about the transient state a delete
+/// creates reads that state instead of racing the clock that ends it.
+const HELD_FOR: Duration = Duration::from_secs(3600);
+
+/// The members a create carries to distinguish the two endpoints of one delete case: the
+/// value goes into the connection parameter its engine reports it through.
+type Members = fn(&str) -> Value;
+
+/// The server the endpoint database resides on (`CreateEndpoint$ServerName`), which every
+/// relational engine's settings structure reports a copy of.
+fn server_name(value: &str) -> Value {
+    json!({ "ServerName": value })
+}
+
+/// The bucket an Amazon S3 endpoint reads or writes (`S3Settings$BucketName`): an S3
+/// endpoint names no server, so its settings structure is where its case's two endpoints
+/// differ.
+fn s3_bucket(value: &str) -> Value {
+    json!({ "S3Settings": { "BucketName": value } })
+}
+
+/// One delete-and-re-create case.
+struct DeleteCase {
+    /// What the case is, named in every assertion of it.
+    case: &'static str,
+    /// `source` or `target`, as `ReplicationEndpointTypeValue` models them.
+    endpoint_type: &'static str,
+    /// The engine the endpoint runs, from the catalog `CreateEndpoint$EngineName`
+    /// publishes.
+    engine_name: &'static str,
+    /// The members carrying the value the case's two endpoints differ in.
+    members: Members,
+    /// Where a described endpoint must report that value.
+    reported_at: &'static [&'static str],
+    /// The value the endpoint the case deletes carries, and the port it runs on.
+    first: (&'static str, i64),
+    /// The value the endpoint re-created under the released identifier carries, and its
+    /// port.
+    second: (&'static str, i64),
+    /// The `ResourceIdentifier` both creates supply, where the case supplies one: with one
+    /// the ARN's last field is the caller's, without one DMS mints it.
+    resource_identifier: Option<&'static str>,
+}
+
+/// The delete cases, spanning the engines, both endpoint types, the connection parameter
+/// each engine reports and both ways the ARN's resource id is arrived at.
+const DELETE_CASES: &[DeleteCase] = &[
+    DeleteCase {
+        case: "a target postgres endpoint re-pointed at a second server",
+        endpoint_type: "target",
+        engine_name: "postgres",
+        members: server_name,
+        reported_at: &["/ServerName", "/PostgreSQLSettings/ServerName"],
+        first: ("pg1.example.invalid", 5432),
+        second: ("pg2.example.invalid", 5433),
+        resource_identifier: None,
+    },
+    DeleteCase {
+        case: "a source mysql endpoint",
+        endpoint_type: "source",
+        engine_name: "mysql",
+        members: server_name,
+        reported_at: &["/ServerName", "/MySQLSettings/ServerName"],
+        first: ("my1.example.invalid", 3306),
+        second: ("my2.example.invalid", 3307),
+        resource_identifier: None,
+    },
+    DeleteCase {
+        case: "a source oracle endpoint whose resource id the caller supplied",
+        endpoint_type: "source",
+        engine_name: "oracle",
+        members: server_name,
+        reported_at: &["/ServerName", "/OracleSettings/ServerName"],
+        first: ("ora1.example.invalid", 1521),
+        second: ("ora2.example.invalid", 1522),
+        resource_identifier: Some("Example-App-ARN1"),
+    },
+    DeleteCase {
+        case: "a target sqlserver endpoint",
+        endpoint_type: "target",
+        engine_name: "sqlserver",
+        members: server_name,
+        reported_at: &["/ServerName", "/MicrosoftSQLServerSettings/ServerName"],
+        first: ("mssql1.example.invalid", 1433),
+        second: ("mssql2.example.invalid", 1434),
+        resource_identifier: None,
+    },
+    DeleteCase {
+        case: "a target s3 endpoint, which names a bucket rather than a server",
+        endpoint_type: "target",
+        engine_name: "s3",
+        members: s3_bucket,
+        reported_at: &["/S3Settings/BucketName"],
+        first: ("dms-first-bucket", 443),
+        second: ("dms-second-bucket", 443),
+        resource_identifier: None,
+    },
+];
+
+/// A `Filters` request narrowing a describe to one endpoint identifier.
+fn by_endpoint_id(identifier: &str) -> Value {
+    json!({ "Filters": [{ "Name": "endpoint-id", "Values": [identifier] }] })
+}
+
+/// A `Filters` request narrowing a describe to one endpoint ARN.
+fn by_endpoint_arn(arn: &str) -> Value {
+    json!({ "Filters": [{ "Name": "endpoint-arn", "Values": [arn] }] })
+}
+
+/// The create body for one delete case: the shared connection parameters, the case's
+/// engine and distinguishing value, and the `ResourceIdentifier` it supplies, if any.
+fn delete_case_body(case: &DeleteCase, identifier: &str, value: &str, port: i64) -> Value {
+    let mut body = json!({
+        "EndpointIdentifier": identifier,
+        "EndpointType": case.endpoint_type,
+        "EngineName": case.engine_name,
+        "Port": port,
+        "DatabaseName": "inventory",
+        "Username": "migrator",
+    });
+    let members = (case.members)(value);
+    for (name, member) in members.as_object().expect("the members are an object") {
+        body[name.as_str()] = member.clone();
+    }
+    if let Some(resource_identifier) = case.resource_identifier {
+        body["ResourceIdentifier"] = json!(resource_identifier);
+    }
+    body
+}
+
+/// The one endpoint a describe narrowed by `request` reports, failing the case when it
+/// reports anything else.
+async fn one_endpoint(emulator: &Emulator, case: &str, request: &Value) -> Value {
+    let answered = emulator.ok(case, "DescribeEndpoints", request).await;
+    let endpoints = answered
+        .pointer("/Endpoints")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    assert_eq!(
+        endpoints.len(),
+        1,
+        "case {case:?}: expected the describe to report exactly one endpoint, got {answered}"
+    );
+    endpoints[0].clone()
+}
+
+/// Poll `DescribeEndpoints` narrowed by `request` until it is refused because nothing
+/// matches, and report the refusal body. A describe still reporting an endpoint past
+/// [`POLL_BUDGET`] fails the case.
+async fn poll_until_no_endpoint_matches(
+    emulator: &Emulator,
+    case: &str,
+    request: &Value,
+) -> Value {
+    let deadline = Instant::now() + POLL_BUDGET;
+    loop {
+        let (status, response) = emulator.call("DescribeEndpoints", request).await;
+        if status != 200 {
+            return response;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "case {case:?}: the deleted endpoint never left the account; the describe still \
+             answered {status} with {response}"
+        );
+        tokio::time::sleep(POLL_INTERVAL).await;
+    }
+}
+
+/// Poll `DescribeReplicationInstances` until the instance `arn` names has finished
+/// provisioning, which is what a replication task needs of the instance that carries it.
+async fn poll_until_instance_available(emulator: &Emulator, case: &str, arn: &str) {
+    let deadline = Instant::now() + POLL_BUDGET;
+    loop {
+        let described = emulator
+            .ok(
+                case,
+                "DescribeReplicationInstances",
+                &json!({
+                    "Filters": [{ "Name": "replication-instance-arn", "Values": [arn] }],
+                }),
+            )
+            .await;
+        let status = text(
+            &described,
+            "/ReplicationInstances/0/ReplicationInstanceStatus",
+        );
+        if status == INSTANCE_AVAILABLE {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "case {case:?}: the replication instance never became available, last {status:?}"
+        );
+        tokio::time::sleep(POLL_INTERVAL).await;
+    }
+}
+
+/// Poll `DescribeReplicationTasks` until the task `arn` names has left the account.
+async fn poll_until_task_is_gone(emulator: &Emulator, case: &str, arn: &str) {
+    let deadline = Instant::now() + POLL_BUDGET;
+    loop {
+        let described = emulator
+            .ok(
+                case,
+                "DescribeReplicationTasks",
+                &json!({
+                    "Filters": [{ "Name": "replication-task-arn", "Values": [arn] }],
+                }),
+            )
+            .await;
+        let remaining = described
+            .pointer("/ReplicationTasks")
+            .and_then(Value::as_array)
+            .map(Vec::len)
+            .unwrap_or_default();
+        if remaining == 0 {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "case {case:?}: the deleted replication task never left the account, {described}"
+        );
+        tokio::time::sleep(POLL_INTERVAL).await;
+    }
+}
+
+/// Push every removal the store still owes an endpoint an hour out, so a case about the
+/// `deleting` state a delete creates reads that state.
+///
+/// This writes only the due instant the emulator itself stores; the removal is still
+/// applied by the store's own settling on the next request, exactly as in production.
+fn hold_endpoint_removals(engine: &engine::InMemoryEngine) {
+    let store = engine.state::<
+        service_com_amazonaws_databasemigrationservice_amazondmsv20160101::ComAmazonawsDatabasemigrationserviceAmazondmsv20160101State,
+    >();
+    let mut store = store.lock();
+    let held = SystemTime::now() + HELD_FOR;
+    for endpoint in store.endpoints.values_mut() {
+        if let Some(pending) = endpoint.pending.as_mut() {
+            pending.due = held;
+        }
+    }
+}
+
+/// A delete takes the endpoint it names out of the account and frees its identifier, so
+/// the same identifier creates a NEW endpoint, with its own ARN and its own connection
+/// parameters, while every other endpoint the account holds stays where it was.
+#[tokio::test]
+async fn a_deleted_endpoint_leaves_the_account_and_releases_its_identifier() {
+    let emulator = Emulator::new();
+
+    // An endpoint no case deletes: a delete removes the endpoint it names, not the store.
+    let bystander_arn = emulator.endpoint("kept-endpoint", "source", "postgres").await;
+
+    for (index, case_row) in DELETE_CASES.iter().enumerate() {
+        let case = case_row.case;
+        let identifier = format!("reused-identifier-{index}");
+
+        // ---- the endpoint the case deletes -------------------------------------------
+        let created = emulator
+            .ok(
+                case,
+                "CreateEndpoint",
+                &delete_case_body(case_row, &identifier, case_row.first.0, case_row.first.1),
+            )
+            .await;
+        let first_arn = text(&created, "/Endpoint/EndpointArn");
+        let described = one_endpoint(&emulator, case, &by_endpoint_id(&identifier)).await;
+        for pointer in case_row.reported_at {
+            assert_eq!(
+                text(&described, pointer),
+                case_row.first.0,
+                "case {case:?}: expected the created endpoint to report {:?} at {pointer}, \
+                 got {described}",
+                case_row.first.0
+            );
+        }
+
+        // ---- the delete ----------------------------------------------------------------
+        let deleted = emulator
+            .ok(case, "DeleteEndpoint", &json!({ "EndpointArn": first_arn }))
+            .await;
+        assert_eq!(
+            (
+                text(&deleted, "/Endpoint/EndpointArn"),
+                text(&deleted, "/Endpoint/EndpointIdentifier"),
+                text(&deleted, "/Endpoint/Status"),
+            ),
+            (
+                first_arn.clone(),
+                identifier.clone(),
+                ENDPOINT_DELETING.to_string(),
+            ),
+            "case {case:?}: expected the delete to answer with the endpoint it deleted, on \
+             its way out, got {deleted}"
+        );
+
+        // ---- what the account holds afterwards -----------------------------------------
+        let refused =
+            poll_until_no_endpoint_matches(&emulator, case, &by_endpoint_id(&identifier)).await;
+        assert_eq!(
+            (error_code(&refused), text(&refused, "/message")),
+            (
+                "ResourceNotFoundFault".to_string(),
+                "No Endpoints found matching provided filters".to_string(),
+            ),
+            "case {case:?}: expected the describe of the deleted endpoint to be refused as a \
+             resource DMS cannot find, got {refused}"
+        );
+        let (arn_status, by_arn) = emulator
+            .call("DescribeEndpoints", &by_endpoint_arn(&first_arn))
+            .await;
+        assert_eq!(
+            (arn_status, error_code(&by_arn)),
+            (400, "ResourceNotFoundFault".to_string()),
+            "case {case:?}: expected a describe narrowed to the deleted ARN to be refused, \
+             got {arn_status} {by_arn}"
+        );
+        let (again_status, again) = emulator
+            .call("DeleteEndpoint", &json!({ "EndpointArn": first_arn }))
+            .await;
+        assert_eq!(
+            (
+                again_status,
+                error_code(&again),
+                text(&again, "/message")
+            ),
+            (
+                400,
+                "ResourceNotFoundFault".to_string(),
+                format!("Endpoint for {first_arn} not found."),
+            ),
+            "case {case:?}: expected a second delete of the gone endpoint to be refused as an \
+             ARN that names nothing, got {again_status} {again}"
+        );
+
+        // ---- the released identifier ----------------------------------------------------
+        let recreated = emulator
+            .ok(
+                case,
+                "CreateEndpoint",
+                &delete_case_body(case_row, &identifier, case_row.second.0, case_row.second.1),
+            )
+            .await;
+        let second_arn = text(&recreated, "/Endpoint/EndpointArn");
+        // An ARN whose resource id DMS minted is a fresh one; one whose resource id the
+        // caller supplied is the same string again, because the caller named it.
+        if case_row.resource_identifier.is_none() {
+            assert_ne!(
+                second_arn, first_arn,
+                "case {case:?}: expected the re-created endpoint to carry a freshly minted \
+                 ARN, got the deleted endpoint's"
+            );
+        } else {
+            assert_eq!(
+                second_arn, first_arn,
+                "case {case:?}: expected the ARN to carry the ResourceIdentifier the request \
+                 supplied"
+            );
+        }
+
+        let described = one_endpoint(&emulator, case, &by_endpoint_id(&identifier)).await;
+        assert_eq!(
+            (
+                text(&described, "/EndpointArn"),
+                described.pointer("/Port").and_then(Value::as_i64),
+                text(&described, "/Status"),
+            ),
+            (
+                second_arn.clone(),
+                Some(case_row.second.1),
+                ENDPOINT_ACTIVE.to_string(),
+            ),
+            "case {case:?}: expected the describe to report the endpoint that now carries the \
+             identifier, got {described}"
+        );
+        for pointer in case_row.reported_at {
+            assert_eq!(
+                text(&described, pointer),
+                case_row.second.0,
+                "case {case:?}: expected the re-created endpoint to report {:?} at {pointer}, \
+                 got {described}",
+                case_row.second.0
+            );
+        }
+    }
+
+    // The endpoint no case deleted is still held, beside exactly one endpoint per case.
+    let held = emulator
+        .ok("the bystander endpoint", "DescribeEndpoints", &json!({}))
+        .await;
+    let arns = column(&held, "/Endpoints", "EndpointArn");
+    assert!(
+        arns.contains(&bystander_arn),
+        "case \"the bystander endpoint\": expected the endpoint no case deleted to still be \
+         held, got {arns:?}"
+    );
+    assert_eq!(
+        arns.len(),
+        DELETE_CASES.len() + 1,
+        "case \"the bystander endpoint\": expected the bystander and one re-created endpoint \
+         per case, got {arns:?}"
+    );
+}
+
+/// The span between the delete and the removal it owes is observable: the endpoint reads
+/// `deleting`, a second delete is refused in that status, and the identifier is still
+/// taken — the delete is not a change the caller cannot see.
+#[tokio::test]
+async fn a_deleting_endpoint_is_still_held_until_its_removal_falls_due() {
+    let case = "an endpoint inside its deleting span";
+    let emulator = Emulator::new();
+    let created = emulator
+        .ok(
+            case,
+            "CreateEndpoint",
+            &json!({
+                "EndpointIdentifier": "leaving-endpoint",
+                "EndpointType": "target",
+                "EngineName": "postgres",
+                "ServerName": "leaving.example.invalid",
+                "Port": 5432,
+            }),
+        )
+        .await;
+    let arn = text(&created, "/Endpoint/EndpointArn");
+
+    emulator
+        .ok(case, "DeleteEndpoint", &json!({ "EndpointArn": arn }))
+        .await;
+    // Hold the removal the store owes, so the case reads the state the delete created
+    // rather than whichever side of the span the host happened to land on.
+    hold_endpoint_removals(emulator.engine());
+
+    let described = one_endpoint(&emulator, case, &by_endpoint_arn(&arn)).await;
+    assert_eq!(
+        text(&described, "/Status"),
+        ENDPOINT_DELETING,
+        "case {case:?}: expected the endpoint to read as leaving, got {described}"
+    );
+
+    let (status, refused) = emulator
+        .call("DeleteEndpoint", &json!({ "EndpointArn": arn }))
+        .await;
+    let message = text(&refused, "/message");
+    assert_eq!(
+        (
+            status,
+            error_code(&refused).contains("InvalidResourceStateFault"),
+            message.contains(&arn) && message.contains(ENDPOINT_DELETING),
+        ),
+        (400, true, true),
+        "case {case:?}: expected a delete of an endpoint already leaving to be refused in the \
+         state it is in, naming the endpoint and that status, got {status} {refused}"
+    );
+
+    let (taken_status, taken) = emulator
+        .call(
+            "CreateEndpoint",
+            &json!({
+                "EndpointIdentifier": "leaving-endpoint",
+                "EndpointType": "target",
+                "EngineName": "postgres",
+                "ServerName": "second.example.invalid",
+                "Port": 5432,
+            }),
+        )
+        .await;
+    assert_eq!(
+        (
+            taken_status,
+            error_code(&taken).contains("ResourceAlreadyExistsFault")
+        ),
+        (400, true),
+        "case {case:?}: expected the identifier of an endpoint that has not left yet to still \
+         be in use, got {taken_status} {taken}"
+    );
+}
+
+/// "All tasks associated with the endpoint must be deleted before you can delete the
+/// endpoint": an endpoint either end of a replication task stays, at both ends, and goes
+/// once the task has left the account.
+#[tokio::test]
+async fn an_endpoint_a_replication_task_names_is_not_deleted_until_the_task_is_gone() {
+    let case = "an endpoint a replication task names";
+    let emulator = Emulator::new();
+
+    let instance = emulator
+        .ok(
+            case,
+            "CreateReplicationInstance",
+            &json!({
+                "ReplicationInstanceIdentifier": "task-carrier",
+                "ReplicationInstanceClass": "dms.t3.medium",
+            }),
+        )
+        .await;
+    let instance_arn = text(&instance, "/ReplicationInstance/ReplicationInstanceArn");
+    poll_until_instance_available(&emulator, case, &instance_arn).await;
+
+    let source_arn = emulator.endpoint("task-source", "source", "postgres").await;
+    let target_arn = emulator.endpoint("task-target", "target", "postgres").await;
+    let task = emulator
+        .ok(
+            case,
+            "CreateReplicationTask",
+            &json!({
+                "ReplicationTaskIdentifier": "endpoint-holder",
+                "SourceEndpointArn": source_arn,
+                "TargetEndpointArn": target_arn,
+                "ReplicationInstanceArn": instance_arn,
+                "MigrationType": "full-load",
+                "TableMappings": table_mappings(),
+            }),
+        )
+        .await;
+    let task_arn = text(&task, "/ReplicationTask/ReplicationTaskArn");
+
+    // BOTH ends of the task are refused, which is what makes this a rule about the
+    // association rather than about one member of the task.
+    for (end, arn) in [("source", &source_arn), ("target", &target_arn)] {
+        let (status, refused) = emulator
+            .call("DeleteEndpoint", &json!({ "EndpointArn": arn }))
+            .await;
+        let message = text(&refused, "/message");
+        assert_eq!(
+            (
+                status,
+                error_code(&refused).contains("InvalidResourceStateFault"),
+                message.contains(arn.as_str()) && message.contains(&task_arn),
+            ),
+            (400, true, true),
+            "case {case:?}: expected the {end} endpoint of a task to be refused, naming the \
+             endpoint and the task that holds it, got {status} {refused}"
+        );
+        let still_there = one_endpoint(&emulator, case, &by_endpoint_arn(arn)).await;
+        assert_eq!(
+            text(&still_there, "/Status"),
+            ENDPOINT_ACTIVE,
+            "case {case:?}: expected the refused delete to leave the {end} endpoint as it was, \
+             got {still_there}"
+        );
+    }
+
+    // Once the task has left the account, the endpoints it named can go.
+    emulator
+        .ok(
+            case,
+            "DeleteReplicationTask",
+            &json!({ "ReplicationTaskArn": task_arn }),
+        )
+        .await;
+    poll_until_task_is_gone(&emulator, case, &task_arn).await;
+
+    for (end, arn) in [("source", &source_arn), ("target", &target_arn)] {
+        let deleted = emulator
+            .ok(case, "DeleteEndpoint", &json!({ "EndpointArn": arn }))
+            .await;
+        assert_eq!(
+            text(&deleted, "/Endpoint/EndpointArn"),
+            *arn.as_str(),
+            "case {case:?}: expected the {end} endpoint of the deleted task to be deletable, \
+             got {deleted}"
+        );
+        let refused =
+            poll_until_no_endpoint_matches(&emulator, case, &by_endpoint_arn(arn)).await;
+        assert_eq!(
+            error_code(&refused),
+            "ResourceNotFoundFault",
+            "case {case:?}: expected the {end} endpoint to leave the account, got {refused}"
         );
     }
 }
