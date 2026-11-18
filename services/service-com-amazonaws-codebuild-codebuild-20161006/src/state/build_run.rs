@@ -419,7 +419,7 @@ async fn perform<Eng: Send + Sync + 'static>(
     // Nothing is put anywhere for a build that never reached its own finishing work.
     if !run.reached_output {
         return RecordedRun {
-            run: super::finish_build(run, None, claimed.due_millis),
+            run: super::finish_build(run, None),
             artifacts: None,
             secondary_artifacts: Vec::new(),
             cache_saved_millis: None,
@@ -506,7 +506,7 @@ async fn perform<Eng: Send + Sync + 'static>(
     };
 
     RecordedRun {
-        run: super::finish_build(run, refusal, claimed.due_millis),
+        run: super::finish_build(run, refusal),
         artifacts: uploaded,
         secondary_artifacts,
         cache_saved_millis: cached.then_some(claimed.due_millis),

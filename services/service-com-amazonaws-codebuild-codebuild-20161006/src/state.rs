@@ -2317,6 +2317,10 @@ impl ComAmazonawsCodebuildCodebuild20161006State {
         // one that was written ([`Build::report_arns`]).
         let report_arns =
             build_reports::record_build_reports(self, claimed, region, &recorded.reports);
+        // The instant the build's last phase ended at, which is the instant the build ended
+        // at ([`buildspec::BuildRun::ended_millis`]) — read before the run is recorded, and
+        // what the metrics this build is metered by are stamped with.
+        let ended_millis = recorded.run.ended_millis;
         let mut completed = None;
         if let Some(stored) = self.builds.get_mut(&claimed.id) {
             let was_complete = stored.build.build_complete;
@@ -2327,10 +2331,7 @@ impl ComAmazonawsCodebuildCodebuild20161006State {
                 report_arns,
             );
             if !was_complete && stored.build.build_complete {
-                completed = Some(stored.completed_build(
-                    &claimed.project_name,
-                    stored.settle_due_millis,
-                ));
+                completed = Some(stored.completed_build(&claimed.project_name, ended_millis));
             }
         }
         if let Some(saved) = recorded.cache_saved_millis {
@@ -2894,7 +2895,10 @@ impl StoredBuild {
         self.build.build_status = Some(run.status);
         self.build.current_phase = Some("COMPLETED".to_string());
         self.build.build_complete = true;
-        self.build.end_time = Some(datetime(self.settle_due_millis));
+        // The build ENDED where its last phase ended: the phases a build ran occupy the time
+        // their own commands took ([`buildspec::BuildClock`]), so the build's own window is
+        // the one every phase window it reports lies inside.
+        self.build.end_time = Some(datetime(run.ended_millis));
         self.build.phases = Some(run.phases);
         self.build.exported_environment_variables = run.exported_variables;
         // Once the environment has been provisioned, the build reports the environment it

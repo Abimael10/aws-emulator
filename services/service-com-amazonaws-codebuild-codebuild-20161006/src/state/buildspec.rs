@@ -28,6 +28,11 @@
 //! this reading only states which files each of them declared and in what format, and
 //! [`super::build_reports`] reads the runs out of those files.
 //!
+//! Each phase a build reports occupies the time ITS OWN commands took, and the build's
+//! window is the one every phase window lies inside: that is the clock [`BuildClock`]
+//! keeps, and it is also what ends a build whose execution timeout fell due while a phase
+//! was still running — the phase that was running then is the one that `TIMED_OUT`.
+//!
 //! The buildspec is YAML, read through the one bounded parse this crate reads a
 //! buildspec with ([`super::batchspec::buildspec_document`]), and its command lines are
 //! run by the build environment's shell ([`super::build_shell`]) — which performs, beside
@@ -57,6 +62,13 @@ use crate::ops::types::{Build, BuildPhase, ExportedEnvironmentVariable, PhaseCon
 pub const BUILD_STATUS_SUCCEEDED: &str = "SUCCEEDED";
 /// See [`BUILD_STATUS_SUCCEEDED`].
 pub const BUILD_STATUS_FAILED: &str = "FAILED";
+
+/// The `StatusType` the phase a build's EXECUTION timeout ended reports
+/// (`smithy_query(query="shape",shape="StatusType")`: SUCCEEDED, FAILED, FAULT, TIMED_OUT,
+/// IN_PROGRESS, STOPPED, documented on `BuildPhase$phaseStatus` as "the build phase timed
+/// out"). The build itself is `FAILED`: the scalar `TIMED_OUT` is the outcome of a build
+/// that never left the queue at all, whose own wait is `queuedTimeoutInMinutes`.
+const PHASE_STATUS_TIMED_OUT: &str = "TIMED_OUT";
 
 /// `BuildPhaseType` values, in the order a build reaches them.
 const PHASE_SUBMITTED: &str = "SUBMITTED";
@@ -135,6 +147,26 @@ fn phase_contexts(reported: Option<PhaseContext>) -> Option<Vec<PhaseContext>> {
 /// the status that command exited with.
 fn command_failure_message(command: &str, status: i32) -> String {
     format!("Error while executing command: {command}. Reason: exit status {status}")
+}
+
+/// What the phase that was RUNNING when the build's execution timeout fell due reports: the
+/// build did not get marked as completed inside the wait it was given, so CodeBuild ended it
+/// there.
+///
+/// `minutes` is the wait that build was given, which is the one variable part of it
+/// (`Build$timeoutInMinutes`, "How long, in minutes, from 5 to 2160 (36 hours), for
+/// CodeBuild to wait before timing out this build if it does not get marked as completed").
+/// AWS publishes no sentence for the condition, so this states it in this service's own
+/// terms, and classifies it with no status code: the phase's own `TIMED_OUT` status is what
+/// says which condition it was.
+fn timed_out_context(minutes: i32) -> PhaseContext {
+    PhaseContext {
+        status_code: None,
+        message: Some(format!(
+            "The build was not completed within the build timeout of {minutes} minutes, so \
+             AWS CodeBuild ended it"
+        )),
+    }
 }
 
 /// The buildspec's `env/variables` key: "variables … you want to make available".
@@ -470,6 +502,10 @@ pub struct BuildRun {
     /// ([`super::StoredBuild::record_run`]) — `false` for a build whose provisioning phase
     /// failed, since there was no environment for it to run in.
     pub environment_provisioned: bool,
+    /// Epoch millis the build's LAST phase ended at, on the build's own clock
+    /// ([`BuildClock`]): the instant the build itself ended, which is what its `endTime`
+    /// reports and what every phase window it reports lies inside.
+    pub ended_millis: i64,
 }
 
 /// What the build environment already holds when the build's phases run, and why the
@@ -511,11 +547,12 @@ pub struct CommandRun {
     /// does one a phase failure ABORTED ([`Self::aborted`]), since the phases after that
     /// failure were never attempted.
     pub reached_output: bool,
-    /// Whether a phase failure ENDED the build: `on-failure: ABORT` (the default) stops the
-    /// build at the phase that failed, so every phase after it — the later buildspec phases
-    /// and the upload of the build's artifacts — is one the build never attempted, and the
-    /// build reports none of them. The build's own finishing work still runs, so
-    /// [`finish_build`] still reports that.
+    /// Whether a phase failure, or the build's execution timeout, ENDED the build:
+    /// `on-failure: ABORT` (the default) stops the build at the phase that failed, and a
+    /// build whose execution timeout fell due is ended at the phase that was running then,
+    /// so every phase after it — the later buildspec phases and the upload of the build's
+    /// artifacts — is one the build never attempted, and the build reports none of them. The
+    /// build's own finishing work still runs, so [`finish_build`] still reports that.
     pub aborted: bool,
     /// The buildspec it ran, which is what declares WHICH files its artifacts and its
     /// cache are made of — `None` for a build that never got one.
@@ -528,6 +565,9 @@ pub struct CommandRun {
     pub written: Vec<String>,
     /// See [`BuildRun::exported_variables`].
     pub exported_variables: Option<Vec<ExportedEnvironmentVariable>>,
+    /// Epoch millis the last phase that RAN ended at, on the build's own clock
+    /// ([`BuildClock`]) — where the build's own finishing work then begins.
+    pub ended_millis: i64,
 }
 
 /// The phases every build reports before its environment is provisioned: it was submitted,
@@ -574,6 +614,75 @@ pub fn environment_failure(start_millis: i64, due_millis: i64, context: PhaseCon
         phases,
         exported_variables: None,
         environment_provisioned: false,
+        // Nothing of this build ran, so its last phase ended where the environment it was
+        // to be given failed to appear.
+        ended_millis: due_millis,
+    }
+}
+
+/// One build's own clock while its phases run: where the build stands, and when its
+/// execution timeout falls due.
+///
+/// # The rule it implements
+///
+/// A phase's `durationInSeconds` is "how long, in seconds, between the starting and ending
+/// times of the build's phase", so the window a phase reports has to be the window that
+/// phase OCCUPIED — and what a phase occupies is the time its own commands took. This
+/// session performs those commands in process and spends none of the host's clock on them,
+/// so the time they took is the time they STATE they took
+/// ([`super::build_shell::BuildShell::slept_millis`]): the clock advances by that stated
+/// time, and the phase windows the build reports partition it in order, each one beginning
+/// where the one before it ended.
+///
+/// The same clock decides the build's execution timeout: `Build$timeoutInMinutes` is "how
+/// long, in minutes, from 5 to 2160 (36 hours), for CodeBuild to wait before timing out this
+/// build if it does not get marked as completed", counted from the instant the build began
+/// executing — the queue has its own wait, `queuedTimeoutInMinutes`. A build still running
+/// at the deadline is ended there, so the clock never reports an instant past it.
+#[derive(Debug)]
+struct BuildClock {
+    /// Epoch millis the build began EXECUTING at, which is the instant its environment was
+    /// provisioned at.
+    started_millis: i64,
+    /// Epoch millis the build stands at now, where the next phase begins.
+    at_millis: i64,
+    /// Epoch millis the build's execution timeout falls due at.
+    deadline_millis: i64,
+    /// The wait that deadline came from, which is what the phase it ends reports.
+    timeout_minutes: i32,
+}
+
+impl BuildClock {
+    /// The clock of a build that began executing at `started_millis`, with the wait
+    /// `build`'s own record states.
+    ///
+    /// `Build$timeoutInMinutes` is the project's wait with `StartBuild`'s
+    /// `timeoutInMinutesOverride` already applied, so the record carries the EFFECTIVE one;
+    /// a record that states none is given the default AWS documents for a project
+    /// ([`super::DEFAULT_BUILD_TIMEOUT_MINUTES`]), which is the value `CreateProject`
+    /// stores when the caller omits one.
+    fn new(build: &Build, started_millis: i64) -> Self {
+        let timeout_minutes = build
+            .timeout_in_minutes
+            .unwrap_or(super::DEFAULT_BUILD_TIMEOUT_MINUTES);
+        let wait = i64::from(timeout_minutes.max(0)).saturating_mul(super::MILLIS_PER_MINUTE);
+        Self {
+            started_millis,
+            at_millis: started_millis,
+            deadline_millis: started_millis.saturating_add(wait),
+            timeout_minutes,
+        }
+    }
+
+    /// Advance to the instant `shell`'s commands have now stated the build stands at, and
+    /// answer whether the build is still inside its execution timeout.
+    ///
+    /// The instant is clamped at the deadline: a build the timeout ENDED stands where it was
+    /// ended, because no phase of it occupied the time after that.
+    fn advance(&mut self, shell: &BuildShell) -> bool {
+        let stated = self.started_millis.saturating_add(shell.slept_millis());
+        self.at_millis = stated.min(self.deadline_millis);
+        stated <= self.deadline_millis
     }
 }
 
@@ -581,9 +690,9 @@ pub fn environment_failure(start_millis: i64, due_millis: i64, context: PhaseCon
 /// commands did.
 ///
 /// `start_millis` is the instant the build was submitted and `due_millis` the instant the
-/// clock owed its terminal transition at, so the queue closes at `due_millis` and every
-/// phase that then ran is reported inside the same instant: this session runs the whole
-/// buildspec at once rather than over wall-clock time.
+/// clock owed its transition out of the queue at, so the queue closes at `due_millis` and
+/// the build begins EXECUTING there: every phase that then ran occupies the time its own
+/// commands took, on the build's own clock ([`BuildClock`]).
 ///
 /// `tools` are the tools the build environment carries ([`super::build_tools`]), whose calls
 /// this build's commands really make; an environment given none has no program for them, so
@@ -646,6 +755,7 @@ pub fn run_commands(
                 produced: Vec::new(),
                 written: Vec::new(),
                 exported_variables: None,
+                ended_millis: due_millis,
             };
         }
     };
@@ -672,6 +782,7 @@ pub fn run_commands(
                 produced: Vec::new(),
                 written: Vec::new(),
                 exported_variables: None,
+                ended_millis: due_millis,
             };
         }
     };
@@ -704,9 +815,30 @@ pub fn run_commands(
     }
     let mut failed = false;
     let mut aborted = false;
+    // The build began executing when it left the queue, and every phase below occupies the
+    // time its own commands took, measured on this clock ([`BuildClock`]).
+    let mut clock = BuildClock::new(build, due_millis);
     for declared in &read.phases {
-        let outcome = run_phase(&mut shell, declared);
-        let phase_failed = outcome.is_some();
+        let phase_start_millis = clock.at_millis;
+        let reported = match run_phase(&mut shell, declared, &mut clock) {
+            PhaseOutcome::Ran(reported) => reported,
+            PhaseOutcome::TimedOut => {
+                // The build's execution timeout fell due while this phase was running, so
+                // CodeBuild ended the build HERE: this phase is the one that timed out, it
+                // ends at the deadline, and the phases after it were never attempted.
+                failed = true;
+                aborted = true;
+                phases.push(finished_phase(
+                    declared.phase_type,
+                    PHASE_STATUS_TIMED_OUT,
+                    phase_start_millis,
+                    clock.at_millis,
+                    Some(vec![timed_out_context(clock.timeout_minutes)]),
+                ));
+                break;
+            }
+        };
+        let phase_failed = reported.is_some();
         failed |= phase_failed;
         phases.push(finished_phase(
             declared.phase_type,
@@ -715,9 +847,9 @@ pub fn run_commands(
             } else {
                 BUILD_STATUS_SUCCEEDED
             },
-            due_millis,
-            due_millis,
-            phase_contexts(outcome),
+            phase_start_millis,
+            clock.at_millis,
+            phase_contexts(reported),
         ));
         // A phase whose failure aborts the build is the last phase that ran, so the build
         // reports none of the ones after it; `on-failure: CONTINUE` goes on to the next
@@ -754,6 +886,9 @@ pub fn run_commands(
         written: shell.written(),
         exported_variables: exported_variables(&shell, &read),
         spec: Some(read),
+        // Where the last phase that ran left the build's clock, which is where its own
+        // finishing work begins.
+        ended_millis: clock.at_millis,
     }
 }
 
@@ -764,16 +899,21 @@ pub fn run_commands(
 /// where it belongs (which includes a build with nothing to put anywhere), and the context
 /// CodeBuild reports for one that could not.
 ///
-/// A build a phase failure ABORTED attempted no upload at all, so it reports no
-/// `UPLOAD_ARTIFACTS` phase — its own finishing work still ran, which is the phase it does
-/// report before the terminal marker.
-pub fn finish_build(run: CommandRun, upload: Option<PhaseContext>, due_millis: i64) -> BuildRun {
+/// A build a phase failure ABORTED, or its execution timeout ENDED, attempted no upload at
+/// all, so it reports no `UPLOAD_ARTIFACTS` phase — its own finishing work still ran, which
+/// is the phase it does report before the terminal marker.
+///
+/// The finishing phases are stamped where the build's clock stands
+/// ([`CommandRun::ended_millis`]): they come after every phase that ran, so the windows the
+/// build reports stay in order and none of them overlaps.
+pub fn finish_build(run: CommandRun, upload: Option<PhaseContext>) -> BuildRun {
     let CommandRun {
         mut failed,
         mut phases,
         reached_output,
         aborted,
         exported_variables,
+        ended_millis,
         ..
     } = run;
     if reached_output {
@@ -786,8 +926,8 @@ pub fn finish_build(run: CommandRun, upload: Option<PhaseContext>, due_millis: i
             } else {
                 BUILD_STATUS_SUCCEEDED
             },
-            due_millis,
-            due_millis,
+            ended_millis,
+            ended_millis,
             phase_contexts(upload),
         ));
     }
@@ -797,12 +937,12 @@ pub fn finish_build(run: CommandRun, upload: Option<PhaseContext>, due_millis: i
         phases.push(finished_phase(
             PHASE_FINALIZING,
             BUILD_STATUS_SUCCEEDED,
-            due_millis,
-            due_millis,
+            ended_millis,
+            ended_millis,
             empty_contexts(),
         ));
     }
-    phases.push(open_phase(PHASE_COMPLETED, due_millis));
+    phases.push(open_phase(PHASE_COMPLETED, ended_millis));
     BuildRun {
         status: if failed {
             BUILD_STATUS_FAILED.to_string()
@@ -815,46 +955,85 @@ pub fn finish_build(run: CommandRun, upload: Option<PhaseContext>, due_millis: i
         // ([`run_commands`] is the only caller, and a build whose environment was not
         // provisioned answers through [`environment_failure`] instead).
         environment_provisioned: true,
+        ended_millis,
     }
 }
 
-/// Run one phase's command lines in `shell`, and answer the context of the first command
-/// that failed — `None` when every command of the phase exited zero, which is the phase
-/// having succeeded.
+/// What running one phase of a buildspec came to.
+#[derive(Debug, Clone)]
+enum PhaseOutcome {
+    /// Every command the phase declares ran: `Some` is the context of the first that
+    /// failed, and `None` is the phase having succeeded.
+    Ran(Option<PhaseContext>),
+    /// The build's execution timeout fell due while this phase was running, so the build
+    /// was ended here and the commands after that instant never ran.
+    TimedOut,
+}
+
+/// Run one phase's command lines in `shell`, and answer what the phase came to.
 ///
 /// A phase stops at its first failing command ("CodeBuild runs each command, one at a
 /// time, in the order listed"), and at an `exit` that ended the session. Its `finally`
 /// block then runs whatever the commands block answered — "the commands in a finally block
 /// are run even if a command in the commands block fails" — as the program it is, so an
 /// `exit` that ended the commands block does not end it too.
-fn run_phase(shell: &mut BuildShell, declared: &DeclaredPhase) -> Option<PhaseContext> {
-    let failure = run_command_block(shell, &declared.commands);
+///
+/// A phase the build's execution timeout fell due in runs nothing further, `finally` block
+/// included: the build was ended at that instant, so no command of it ran afterwards.
+fn run_phase(
+    shell: &mut BuildShell,
+    declared: &DeclaredPhase,
+    clock: &mut BuildClock,
+) -> PhaseOutcome {
+    let failure = match run_command_block(shell, &declared.commands, clock) {
+        Ok(failure) => failure,
+        Err(TimedOut) => return PhaseOutcome::TimedOut,
+    };
     if declared.finally.is_empty() {
-        return failure;
+        return PhaseOutcome::Ran(failure);
     }
     shell.clear_exit();
-    let finally_failure = run_command_block(shell, &declared.finally);
-    // The phase failed if either block failed, and what it reports is the FIRST failure:
-    // the command a client has to fix is the one that failed first.
-    failure.or(finally_failure)
+    match run_command_block(shell, &declared.finally, clock) {
+        // The phase failed if either block failed, and what it reports is the FIRST failure:
+        // the command a client has to fix is the one that failed first.
+        Ok(finally_failure) => PhaseOutcome::Ran(failure.or(finally_failure)),
+        Err(TimedOut) => PhaseOutcome::TimedOut,
+    }
 }
 
+/// That the build's execution timeout fell due while a block of commands was running.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TimedOut;
+
 /// Run one block of command lines in `shell` — a phase's `commands` or its `finally` — and
-/// answer the context of the first command that failed.
-fn run_command_block(shell: &mut BuildShell, commands: &[String]) -> Option<PhaseContext> {
+/// answer the context of the first command that failed, or that the build's execution
+/// timeout ended the block.
+///
+/// The build's clock is advanced after each command by the time that command took, and the
+/// timeout is decided on it BEFORE the command's status is read: a command still running at
+/// the deadline is one the build was ended in the middle of, so it answered nothing and the
+/// commands after it never started.
+fn run_command_block(
+    shell: &mut BuildShell,
+    commands: &[String],
+    clock: &mut BuildClock,
+) -> Result<Option<PhaseContext>, TimedOut> {
     for command in commands {
         let status = shell.run(command);
+        if !clock.advance(shell) {
+            return Err(TimedOut);
+        }
         if status != 0 {
-            return Some(PhaseContext {
+            return Ok(Some(PhaseContext {
                 status_code: Some(COMMAND_EXECUTION_ERROR.to_string()),
                 message: Some(command_failure_message(command, status)),
-            });
+            }));
         }
         if shell.exit_status().is_some() {
-            return None;
+            return Ok(None);
         }
     }
-    None
+    Ok(None)
 }
 
 /// The image this build's commands run in: its effective environment's `image`, which is
@@ -975,4 +1154,272 @@ fn exported_variables(
         })
         .collect();
     (!exported.is_empty()).then_some(exported)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        finish_build, run_commands, BuildSeed, BUILD_STATUS_FAILED, BUILD_STATUS_SUCCEEDED,
+        PHASE_STATUS_TIMED_OUT,
+    };
+    use crate::ops::types::{Build, BuildPhase, ProjectSource};
+
+    /// The instants the store would hand a run: the build was submitted here, and it left the
+    /// queue (and so began executing) a settle span later.
+    const STARTED_MILLIS: i64 = 1_700_000_000_000;
+    /// See [`STARTED_MILLIS`].
+    const DUE_MILLIS: i64 = STARTED_MILLIS + super::super::BUILD_SETTLE_MILLIS;
+
+    /// A build whose inline buildspec is `spec` and whose execution timeout is `minutes` —
+    /// `None` leaving the record without one, which is the documented default.
+    fn build_with(spec: &str, minutes: Option<i32>) -> Build {
+        Build {
+            source: Some(ProjectSource {
+                r#type: "NO_SOURCE".to_string(),
+                buildspec: Some(spec.to_string()),
+                ..ProjectSource::default()
+            }),
+            timeout_in_minutes: minutes,
+            ..Build::default()
+        }
+    }
+
+    /// A buildspec declaring `commands` for each phase named, in buildspec order.
+    fn buildspec(phases: &[(&str, &str)]) -> String {
+        let mut spec = String::from("version: 0.2\nphases:\n");
+        for (phase, command) in phases {
+            spec.push_str(&format!("  {phase}:\n    commands:\n      - {command}\n"));
+        }
+        spec
+    }
+
+    /// Run `spec` as a whole build — the commands and then the build's own finishing work,
+    /// with nothing to put anywhere — and answer the phases it reports and its status.
+    fn ran(spec: &str, minutes: Option<i32>) -> (String, Vec<BuildPhase>) {
+        let build = build_with(spec, minutes);
+        let run = run_commands(&build, STARTED_MILLIS, DUE_MILLIS, BuildSeed::default(), None);
+        let finished = finish_build(run, None);
+        (finished.status, finished.phases)
+    }
+
+    /// The `(phaseType, phaseStatus, durationInSeconds)` of each phase, in the order the
+    /// build reached them.
+    fn reported(phases: &[BuildPhase]) -> Vec<(String, Option<String>, Option<i64>)> {
+        phases
+            .iter()
+            .map(|phase| {
+                (
+                    phase.phase_type.clone().unwrap_or_default(),
+                    phase.phase_status.clone(),
+                    phase.duration_in_seconds,
+                )
+            })
+            .collect()
+    }
+
+    /// One row of the duration table: the case, the buildspec the build runs, and the
+    /// `durationInSeconds` each named phase must report.
+    type DurationRow = (&'static str, String, Vec<(&'static str, i64)>);
+
+    /// RULE: each phase's window is the time ITS OWN commands took, so `durationInSeconds` is
+    /// the span between that phase's `startTime` and `endTime` and the phase whose commands
+    /// took the longest is the one that reports the longest.
+    ///
+    /// The rows differ along what the rule generalises over: which phase takes the time, how
+    /// much of it, the form the command states it in, how many phases take time at once, and
+    /// a build no command of which takes any.
+    #[test]
+    fn a_phases_duration_is_the_span_of_its_own_window() {
+        // (case, the buildspec, the seconds each named phase must report)
+        let rows: Vec<DurationRow> = vec![
+            (
+                "the build phase takes twenty-four seconds",
+                buildspec(&[
+                    ("install", "echo installing"),
+                    ("pre_build", "echo before"),
+                    ("build", "sleep 24"),
+                    ("post_build", "echo after"),
+                ]),
+                vec![
+                    ("INSTALL", 0),
+                    ("PRE_BUILD", 0),
+                    ("BUILD", 24),
+                    ("POST_BUILD", 0),
+                ],
+            ),
+            (
+                "the install phase is the slow one",
+                buildspec(&[("install", "sleep 7"), ("build", "echo building")]),
+                vec![("INSTALL", 7), ("BUILD", 0)],
+            ),
+            (
+                "a wait stated in minutes",
+                buildspec(&[("build", "sleep 3m")]),
+                vec![("BUILD", 180)],
+            ),
+            (
+                "a fractional wait, which is a whole second of duration",
+                buildspec(&[("build", "sleep 2.25")]),
+                vec![("BUILD", 2)],
+            ),
+            (
+                "two phases that each take their own time",
+                buildspec(&[("pre_build", "sleep 4"), ("build", "sleep 9")]),
+                vec![("PRE_BUILD", 4), ("BUILD", 9)],
+            ),
+            (
+                "no command of the build takes any time",
+                buildspec(&[("build", "echo building")]),
+                vec![("INSTALL", 0), ("BUILD", 0), ("POST_BUILD", 0)],
+            ),
+        ];
+
+        for (case, spec, expected) in rows {
+            let (status, phases) = ran(&spec, None);
+            assert_eq!(
+                status, BUILD_STATUS_SUCCEEDED,
+                "case {case:?}: a build whose commands all succeeded is {BUILD_STATUS_SUCCEEDED}, \
+                 got {status} with {:?}",
+                reported(&phases)
+            );
+            // The documented definition, read for every phase that ended: the duration IS the
+            // span between the two instants it reports.
+            for phase in &phases {
+                let name = phase.phase_type.clone().unwrap_or_default();
+                let (Some(start), Some(end)) = (phase.start_time, phase.end_time) else {
+                    continue;
+                };
+                let span = (end.to_millis().unwrap_or_default()
+                    - start.to_millis().unwrap_or_default())
+                    / 1_000;
+                assert_eq!(
+                    phase.duration_in_seconds,
+                    Some(span),
+                    "case {case:?}: phase {name} must report the span of its own window \
+                     ({span} s), got {phase:?}"
+                );
+            }
+            for (phase_type, seconds) in expected {
+                let found = phases
+                    .iter()
+                    .find(|phase| phase.phase_type.as_deref() == Some(phase_type))
+                    .and_then(|phase| phase.duration_in_seconds);
+                assert_eq!(
+                    found,
+                    Some(seconds),
+                    "case {case:?}: expected {phase_type} to have taken {seconds} s, got \
+                     {:?}",
+                    reported(&phases)
+                );
+            }
+        }
+    }
+
+    /// RULE: a build still running when its execution timeout falls due is ended there — the
+    /// phase that was running carries `TIMED_OUT` with the explanation, the phases after it
+    /// are not reported, and the build is `FAILED`. A build inside its wait is untouched.
+    ///
+    /// The rows differ along what the rule generalises over: which phase is running when the
+    /// wait runs out, the length of the wait (the record's own, and the documented default a
+    /// record that states none is given), and how far past or short of it the commands run.
+    #[test]
+    fn the_phase_running_when_the_wait_runs_out_is_the_one_that_timed_out() {
+        // (case, the buildspec, the record's timeoutInMinutes, the phase that timed out)
+        let rows: Vec<(&str, String, Option<i32>, Option<&str>)> = vec![
+            (
+                "the build phase runs an hour under a five-minute wait",
+                buildspec(&[("build", "sleep 3600"), ("post_build", "echo never")]),
+                Some(5),
+                Some("BUILD"),
+            ),
+            (
+                "an earlier phase is the one running when the wait runs out",
+                buildspec(&[("install", "sleep 1200"), ("build", "echo never")]),
+                Some(5),
+                Some("INSTALL"),
+            ),
+            (
+                "the documented default wait a record that states none is given",
+                buildspec(&[("build", "sleep 4000")]),
+                None,
+                Some("BUILD"),
+            ),
+            (
+                "a build whose commands finish inside its wait",
+                buildspec(&[("build", "sleep 30"), ("post_build", "echo after")]),
+                Some(5),
+                None,
+            ),
+            (
+                "a build that takes no time at all",
+                buildspec(&[("build", "echo building")]),
+                Some(5),
+                None,
+            ),
+        ];
+
+        for (case, spec, minutes, timed_out) in rows {
+            let (status, phases) = ran(&spec, minutes);
+            let table = reported(&phases);
+            let Some(timed_out) = timed_out else {
+                assert_eq!(
+                    status, BUILD_STATUS_SUCCEEDED,
+                    "case {case:?}: a build inside its wait runs to success, got {table:?}"
+                );
+                assert!(
+                    !table
+                        .iter()
+                        .any(|(_, state, _)| state.as_deref() == Some(PHASE_STATUS_TIMED_OUT)),
+                    "case {case:?}: no phase of a build inside its wait timed out, got {table:?}"
+                );
+                continue;
+            };
+            assert_eq!(
+                status, BUILD_STATUS_FAILED,
+                "case {case:?}: a build its execution timeout ended is {BUILD_STATUS_FAILED}, got \
+                 {table:?}"
+            );
+            let phase = phases
+                .iter()
+                .find(|phase| phase.phase_type.as_deref() == Some(timed_out))
+                .unwrap_or_else(|| panic!("case {case:?}: expected a {timed_out} phase, got {table:?}"));
+            assert_eq!(
+                phase.phase_status.as_deref(),
+                Some(PHASE_STATUS_TIMED_OUT),
+                "case {case:?}: {timed_out} was running when the wait ran out, got {table:?}"
+            );
+            let explained = phase.contexts.iter().flatten().any(|context| {
+                context
+                    .message
+                    .as_deref()
+                    .is_some_and(|message| !message.trim().is_empty())
+            });
+            assert!(
+                explained,
+                "case {case:?}: the phase that timed out carries the explanation, got {phase:?}"
+            );
+            // It ended AT the deadline, so it reports no more time than the wait allowed.
+            let allowed = i64::from(minutes.unwrap_or(super::super::DEFAULT_BUILD_TIMEOUT_MINUTES))
+                * 60;
+            assert_eq!(
+                phase.duration_in_seconds,
+                Some(allowed),
+                "case {case:?}: the phase the wait ended ran from the start of the build's \
+                 execution to its deadline ({allowed} s), got {table:?}"
+            );
+            // And nothing after it was attempted, while the build's own finishing work was.
+            for absent in ["POST_BUILD", "UPLOAD_ARTIFACTS"] {
+                assert!(
+                    !table.iter().any(|(phase, _, _)| phase == absent),
+                    "case {case:?}: {absent} was never attempted, got {table:?}"
+                );
+            }
+            for present in ["FINALIZING", "COMPLETED"] {
+                assert!(
+                    table.iter().any(|(phase, _, _)| phase == present),
+                    "case {case:?}: expected {present} to be reported, got {table:?}"
+                );
+            }
+        }
+    }
 }

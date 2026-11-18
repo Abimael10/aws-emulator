@@ -59,6 +59,16 @@ pub const MAX_LOG_LINES: usize = 2_048;
 /// [`MAX_LOG_LINES`].
 pub const MAX_LOG_LINE_BYTES: usize = 16 * 1024;
 
+/// How many seconds of `sleep` ONE build's commands may state they took, in total.
+///
+/// A build runs no longer than the longest execution timeout it may be given:
+/// `Build$timeoutInMinutes` is "How long, in minutes, from 5 to 2160 (36 hours), for
+/// CodeBuild to wait before timing out this build if it does not get marked as completed",
+/// so a build is already over at 2160 minutes and no phase of it occupies the time past
+/// that. The session states no time beyond this
+/// ([`::service_common::posix_shell_session::Bounds::sleep_seconds`]).
+pub const MAX_SLEEP_SECONDS: u64 = 2_160 * 60;
+
 /// The session one build's commands run in: the shared session, configured as a build's,
 /// with the programs the runtimes this build installed provide.
 #[derive(Debug)]
@@ -87,6 +97,13 @@ impl BuildShell {
                         lines: MAX_LOG_LINES,
                         line_bytes: MAX_LOG_LINE_BYTES,
                     }),
+                    // A build REPORTS how long each of its phases took, so the time its
+                    // commands state they took is time this session may state
+                    // ([`MAX_SLEEP_SECONDS`]).
+                    bounds: ::service_common::posix_shell_session::Bounds {
+                        sleep_seconds: MAX_SLEEP_SECONDS,
+                        ..::service_common::posix_shell_session::Bounds::default()
+                    },
                     ..::service_common::posix_shell_session::SessionConfig::default()
                 },
                 Box::new(programs),
@@ -145,6 +162,17 @@ impl BuildShell {
     /// The status `exit` ended this session with, or `None` while nothing has.
     pub(super) fn exit_status(&self) -> Option<i32> {
         self.session.exit_status()
+    }
+
+    /// How long this build's commands have stated they took so far, in milliseconds.
+    ///
+    /// The session performs the commands in process and spends none of the host's clock on
+    /// them, so what a command states it took is the time it took
+    /// ([`::service_common::posix_shell_session::ShellSession::slept`]) — and a build
+    /// REPORTS that time, as the window each of its phases occupied. Saturating: a session
+    /// may state no more than [`MAX_SLEEP_SECONDS`], which is far inside this range.
+    pub(super) fn slept_millis(&self) -> i64 {
+        i64::try_from(self.session.slept().as_millis()).unwrap_or(i64::MAX)
     }
 
     /// Run one command LINE and answer the status the shell answered for it.
