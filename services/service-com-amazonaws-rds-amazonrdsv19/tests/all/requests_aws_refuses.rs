@@ -26,8 +26,9 @@
 //!   through its own API, so every topic in an assertion is a topic that service really
 //!   holds;
 //! * a `GlobalClusterIdentifier` has to satisfy the identifier rule the API publishes for a
-//!   global database, over every clause of it and both members that name one — and the
-//!   global database a create mints is read back through `DescribeGlobalClusters`.
+//!   global database, over every clause of it, both members that name one and the two
+//!   wordings RDS refuses it with — and the global database a create mints is read back
+//!   through `DescribeGlobalClusters`.
 //!
 //! Every call goes over the wire through the harness in `db_instances.rs`, so the assertions
 //! read the XML the emulator itself answered with.
@@ -897,41 +898,68 @@ fn not_a_valid_identifier(member: &str) -> String {
     )
 }
 
+/// How Amazon RDS words the refusal of a value the member that names a global database will
+/// not take.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Wording {
+    /// The member's SUBJECT, with the rejected value after it — the two spaces after the
+    /// colon are part of RDS's own text.
+    Subject,
+    /// The sentence pair that states the whole identifier rule and names the member.
+    TheRule,
+    /// The modelled constraint refused the value at the boundary, before this service's own
+    /// rule ran, so the wording is the framework's rather than RDS's.
+    AtTheBoundary,
+}
+
+/// The wording a global-database identifier refusal carries for `member` and `value`.
+fn expected_wording(member: &str, value: &str, wording: Wording) -> Option<String> {
+    match wording {
+        Wording::Subject => Some(format!("Invalid global cluster identifier:  {value}")),
+        Wording::TheRule => Some(not_a_valid_identifier(member)),
+        Wording::AtTheBoundary => None,
+    }
+}
+
 /// A `GlobalClusterIdentifier` has to satisfy the identifier rule the API publishes for a
 /// global database — "from 1 to 63 letters, numbers, or hyphens. The first character must be a
 /// letter. Can't end with a hyphen or contain two consecutive hyphens" — whichever member
-/// names one, and a value outside it is refused with `InvalidParameterValue` naming the member.
+/// names one, and a value outside it is refused with `InvalidParameterValue`.
 ///
 /// The table spans every clause of the rule, each side of its length bound, and the characters
-/// the modelled `@pattern` would admit that an identifier may not carry. A value the model's
-/// OWN constraint already refuses — one that does not begin with a letter, which its
-/// `@pattern` requires too — is refused at the boundary before any handler runs, under the
-/// same code; that row is marked, because the wording is then the framework's and not this
-/// service's.
+/// the modelled `@pattern` would admit that an identifier may not carry. It also spans the TWO
+/// wordings RDS answers a bad identifier with, by the clause the value broke: a value that is
+/// no identifier TOKEN of the member at all — past its length bound, or carrying a character
+/// outside the alphabet — is worded by the member's subject with the value after it, while a
+/// token of that shape which breaks one of the two HYPHEN rules states the whole rule and
+/// names the member. A value the model's OWN constraint already refuses — one that does not
+/// begin with a letter, which its `@pattern` requires too — is refused at the boundary before
+/// any handler runs, under the same code; that row is marked, because the wording is then the
+/// framework's and not this service's.
 #[tokio::test]
 async fn a_global_cluster_identifier_outside_the_published_rule_is_refused() {
     let router = emulator();
     let longest = format!("g{}", "a".repeat(MAX_GLOBAL_CLUSTER_IDENTIFIER_LEN - 1));
     let too_long = format!("g{}", "a".repeat(MAX_GLOBAL_CLUSTER_IDENTIFIER_LEN));
 
-    // (case, identifier, admitted, the refusal is this service's own sentence)
-    let rows: [(&str, &str, bool, bool); 11] = [
-        ("letters, digits and hyphens", "emu-gc-1", true, false),
-        ("a single letter", "g", true, false),
-        ("the longest admitted identifier", &longest, true, false),
-        ("one character past the bound", &too_long, false, true),
-        ("mixed case, stored lowercase", "EMU-GC-Mixed", true, false),
+    // (case, identifier, the wording its refusal carries, or `None` where it is SERVED)
+    let rows: [(&str, &str, Option<Wording>); 11] = [
+        ("letters, digits and hyphens", "emu-gc-1", None),
+        ("a single letter", "g", None),
+        ("the longest admitted identifier", &longest, None),
+        ("one character past the bound", &too_long, Some(Wording::Subject)),
+        ("mixed case, stored lowercase", "EMU-GC-Mixed", None),
         // The model's own `@pattern` requires a leading letter as well, so this one never
         // reaches the handler.
-        ("a leading digit", "1emu-gc", false, false),
-        ("an underscore", "emu_gc", false, true),
-        ("a dot", "emu.gc", false, true),
-        ("a colon", "emu:gc", false, true),
-        ("a trailing hyphen", "emu-gc-", false, true),
-        ("two consecutive hyphens", "emu--gc", false, true),
+        ("a leading digit", "1emu-gc", Some(Wording::AtTheBoundary)),
+        ("an underscore", "emu_gc", Some(Wording::Subject)),
+        ("a dot", "emu.gc", Some(Wording::Subject)),
+        ("a colon", "emu:gc", Some(Wording::Subject)),
+        ("a trailing hyphen", "emu-gc-", Some(Wording::TheRule)),
+        ("two consecutive hyphens", "emu--gc", Some(Wording::TheRule)),
     ];
 
-    for (case, identifier, admitted, own_sentence) in rows {
+    for (case, identifier, wording) in rows {
         let answered = call(
             &router,
             "CreateGlobalCluster",
@@ -941,7 +969,7 @@ async fn a_global_cluster_identifier_outside_the_published_rule_is_refused() {
             ],
         )
         .await;
-        if admitted {
+        let Some(wording) = wording else {
             let created = expect_ok(case, answered);
             // "This parameter is stored as a lowercase string", and the create's own answer
             // already reports the stored form.
@@ -965,19 +993,19 @@ async fn a_global_cluster_identifier_outside_the_published_rule_is_refused() {
                 "case {case:?}: the created global database must read back, got {read_back}"
             );
             continue;
-        }
+        };
         let refused = expect_error(case, answered, 400, INVALID_PARAMETER_VALUE);
-        if !own_sentence {
+        let Some(expected) = expected_wording("GlobalClusterIdentifier", identifier, wording)
+        else {
             // The model's own constraint refused it at the boundary, in the framework's
             // wording, and the same constraint refuses the value on every other member that
             // carries it — so there is no read of this identifier to make either.
             continue;
-        }
+        };
         let message = text(&refused, "Message");
         assert_eq!(
-            message,
-            not_a_valid_identifier("GlobalClusterIdentifier"),
-            "case {case:?}: expected the published refusal wording, got {message:?}"
+            message, expected,
+            "case {case:?}: expected the {wording:?} wording, got {message:?}"
         );
         // The refusal stored nothing.
         expect_error(
@@ -993,7 +1021,8 @@ async fn a_global_cluster_identifier_outside_the_published_rule_is_refused() {
         );
 
         // The same rule holds for the member that RENAMES a global database onto an
-        // identifier, so a value this create refuses cannot be reached by a rename either.
+        // identifier, so a value this create refuses cannot be reached by a rename either —
+        // and it carries the wording for the same clause, under that member's name.
         let renamed = expect_error(
             case,
             call(
@@ -1008,10 +1037,13 @@ async fn a_global_cluster_identifier_outside_the_published_rule_is_refused() {
             400,
             INVALID_PARAMETER_VALUE,
         );
+        let expected_rename =
+            expected_wording("NewGlobalClusterIdentifier", identifier, wording)
+                .expect("a row refused at the boundary returned above");
         assert_eq!(
             text(&renamed, "Message"),
-            not_a_valid_identifier("NewGlobalClusterIdentifier"),
-            "case {case:?}: expected the published refusal wording, got {renamed}"
+            expected_rename,
+            "case {case:?}: expected the {wording:?} wording, got {renamed}"
         );
     }
 }

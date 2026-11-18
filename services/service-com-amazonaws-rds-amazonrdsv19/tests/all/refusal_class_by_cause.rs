@@ -451,8 +451,12 @@ async fn a_refusal_of_what_the_request_carries_is_a_query_api_parameter_error() 
             ],
             status: 400,
             code: INVALID_PARAMETER_VALUE,
-            // The service states the value it would not take and the range it will.
-            wording: Wording::Says("Serverless v2 capacity value 256.5 is not valid."),
+            // The ceiling belongs to the engine VERSION, so the service states the ceiling
+            // and the version that imposes it rather than quoting the value it refused.
+            wording: Wording::Says(
+                "Invalid scaling configuration. The capacity values greater than 256.0 ACUs \
+                 are not supported by the current engine version",
+            ),
         },
         Row {
             case: "ModifyDBCluster with a capacity off the half-step grid",

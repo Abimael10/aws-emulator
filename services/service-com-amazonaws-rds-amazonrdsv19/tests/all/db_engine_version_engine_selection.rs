@@ -41,7 +41,10 @@ const INVALID_PARAMETER_VALUE: &str = "InvalidParameterValue";
 /// this front door publishes. `docdb` and `neptune` are left to their own suite
 /// (`docdb_query_surface.rs`): they are published by the two sibling control planes' models
 /// rather than by this one's members.
-const MODEL_ENGINE_VOCABULARY: &[&str] = &[
+///
+/// Shared with the other suites that resolve an `Engine` against this vocabulary rather
+/// than copying it (`db_major_engine_version_engine_names.rs`).
+pub(crate) const MODEL_ENGINE_VOCABULARY: &[&str] = &[
     "aurora-mysql",
     "aurora-postgresql",
     "custom-oracle-ee",
@@ -83,7 +86,10 @@ fn versions_are_account_minted(engine: &str) -> bool {
 
 /// `(case, value)` rows that LOOK like an engine of a family this service publishes but
 /// name no engine of the published vocabulary.
-const NEAR_MISS_ENGINES: &[(&str, &str)] = &[
+///
+/// Shared with the other suites that resolve an `Engine` against that vocabulary
+/// (`db_major_engine_version_engine_names.rs`), so the near-miss class is written once.
+pub(crate) const NEAR_MISS_ENGINES: &[(&str, &str)] = &[
     ("an edition prefix that is not an engine", "sqlserver-dev"),
     ("an engine with its release glued on", "sqlserver-dev-se-17.0"),
     ("an engine with a typo in its edition", "sqlserver-dev-sse"),

@@ -764,6 +764,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             if let Some(asked) = &input.serverless_v2_scaling_configuration {
                 crate::state::check_serverless_v2_scaling(
                     resolved_version.and_then(|entry| entry.profile.serverless_v2_scaling_range()),
+                    resolved_version.map(|entry| entry.engine_version),
                     asked.min_capacity,
                     asked.max_capacity,
                     asked.seconds_until_auto_pause,

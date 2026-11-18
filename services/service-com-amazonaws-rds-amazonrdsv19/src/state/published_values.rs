@@ -1554,10 +1554,33 @@ pub fn is_published_engine(engine: &str) -> bool {
 /// the WHOLE published vocabulary ([`is_published_engine`]), so an engine the model
 /// publishes on one member and not on another is still an engine here.
 pub fn check_published_engine(engine: &str) -> Result<(), String> {
+    check_engine_resolves(engine, "Unrecognized engine name")
+}
+
+/// Refuse an `Engine` that names no database engine ([`is_published_engine`]) where the
+/// member resolves an engine family for the MAJOR-VERSION catalogue read.
+///
+/// The GATE is [`check_published_engine`]'s — the whole published vocabulary, held in ONE
+/// place ([`check_engine_resolves`]), so the two catalogue reads cannot disagree about which
+/// names are engines — and the SENTENCE is this report's own: it states the rejected name
+/// after a lower-case subject where the engine-version report beside it capitalises the
+/// sentence. Which wording an operation answers is the service's own and is recorded per
+/// operation, the way the two identifier wordings are, so each is written down once here
+/// rather than in a handler.
+pub fn check_engine_of_major_version_report(engine: &str) -> Result<(), String> {
+    check_engine_resolves(engine, "unrecognized engine name")
+}
+
+/// The gate both catalogue reads above hold an `Engine` to: the value has to name an engine
+/// of the published vocabulary, and a value that does not is refused with `subject`
+/// followed by the name the request carried — the one sentence shape this front door words
+/// an unresolvable engine name with, differing between the two reads only in the subject
+/// each of them records.
+fn check_engine_resolves(engine: &str, subject: &str) -> Result<(), String> {
     if is_published_engine(engine) {
         return Ok(());
     }
-    Err(format!("Unrecognized engine name: {engine}"))
+    Err(format!("{subject}: {engine}"))
 }
 
 /// The text Amazon RDS refuses an `Engine` that names no database engine it serves with:

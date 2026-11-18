@@ -605,10 +605,6 @@ async fn a_value_outside_a_modelled_constraint_carries_the_same_invalid_paramete
             vec![("MaxRecords", MAX_RECORDS_RANGE.end().to_string())],
         ),
         (
-            "the longest Engine the member admits",
-            vec![("Engine", "a".repeat(MAX_ENGINE_LEN))],
-        ),
-        (
             "the longest MajorEngineVersion the member admits",
             vec![("MajorEngineVersion", "a".repeat(MAX_ENGINE_LEN))],
         ),
@@ -618,6 +614,29 @@ async fn a_value_outside_a_modelled_constraint_carries_the_same_invalid_paramete
             call(&router, "DescribeDBMajorEngineVersions", &params).await,
         );
     }
+
+    // An `Engine` AT its length bound passes the boundary and is then refused by the
+    // HANDLER, which resolves the value against the engines this front door publishes —
+    // same code, the service's own text — which is what shows the bound row above was
+    // refused for the constraint it broke rather than for being long.
+    let longest_engine = "a".repeat(MAX_ENGINE_LEN);
+    let body = expect_error(
+        "the longest Engine the member admits",
+        call(
+            &router,
+            "DescribeDBMajorEngineVersions",
+            &[("Engine", longest_engine.clone())],
+        )
+        .await,
+        400,
+        "InvalidParameterValue",
+    );
+    assert_eq!(
+        text(&body, "Message"),
+        format!("unrecognized engine name: {longest_engine}"),
+        "case \"the longest Engine the member admits\": expected the handler's own refusal, \
+         got {body}"
+    );
 
     // A `Marker` at its length bound passes the boundary and is then refused by the
     // paginator instead — same code, the service's own text — which is what shows the

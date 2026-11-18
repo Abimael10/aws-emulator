@@ -649,15 +649,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             let effective_version = resolved_engine_version
                 .clone()
                 .or_else(|| current_engine_version.clone());
-            let capacity = crate::ops::describe_db_engine_versions::resolve_version(
+            let resolved = crate::ops::describe_db_engine_versions::resolve_version(
                 &engine,
                 effective_version.as_deref(),
             )
             .ok()
-            .flatten()
-            .and_then(|entry| entry.profile.serverless_v2_scaling_range());
+            .flatten();
             crate::state::check_serverless_v2_scaling(
-                capacity,
+                resolved.and_then(|entry| entry.profile.serverless_v2_scaling_range()),
+                // The version the cluster will be running, as the catalogue spells it where
+                // it carries the version at all — a request may name a MAJOR version, and
+                // what imposes the ceiling is the build behind it.
+                resolved
+                    .map(|entry| entry.engine_version)
+                    .or(effective_version.as_deref()),
                 asked.min_capacity,
                 asked.max_capacity,
                 asked.seconds_until_auto_pause,

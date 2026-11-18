@@ -387,6 +387,11 @@ async fn an_identifier_scoped_instance_report_refuses_an_instance_nothing_create
     );
 }
 
+/// The capacity ceiling the Neptune Serverless engine version this suite creates on
+/// publishes, which the rows below are written against: the ceiling a configuration past it
+/// is refused by, and the value that refusal names.
+const NEPTUNE_SERVERLESS_CEILING: f64 = 128.0;
+
 /// The scaling configurations a cluster create is spanned over: `(case, min, max)`, with
 /// whether the configuration is one the Neptune engine serves.
 ///
@@ -478,7 +483,7 @@ async fn a_neptune_serverless_cluster_is_created_inside_the_published_capacity_r
             let body = expect_error(case, response, 400, "InvalidParameterValue");
             let message = text(&body, "Message");
             // A floor above the ceiling is the one case AWS words with a fixed sentence of
-            // its own; a value outside the range states the value and the range.
+            // its own; the other refusals are worded by the clause the value broke.
             if min.parse::<f64>().unwrap_or_default() > max.parse::<f64>().unwrap_or_default() {
                 assert_eq!(
                     message, SERVERLESS_V2_FLOOR_ABOVE_CEILING_MESSAGE,
@@ -486,10 +491,24 @@ async fn a_neptune_serverless_cluster_is_created_inside_the_published_capacity_r
                      {SERVERLESS_V2_FLOOR_ABOVE_CEILING_MESSAGE:?}, got {message:?} in {body}"
                 );
             } else {
+                // A capacity ABOVE the ceiling is refused by the engine VERSION that
+                // imposes it, naming that ceiling; one off the half-step grid states the
+                // value and the increment.
+                let above_ceiling = [min, max].iter().any(|value| {
+                    value.parse::<f64>().unwrap_or_default() > NEPTUNE_SERVERLESS_CEILING
+                });
+                let expected = if above_ceiling {
+                    format!(
+                        "Invalid scaling configuration. The capacity values greater than \
+                         {NEPTUNE_SERVERLESS_CEILING:?} ACUs are not supported by the \
+                         current engine version"
+                    )
+                } else {
+                    "Serverless v2 capacity value".to_string()
+                };
                 assert!(
-                    message.contains("Serverless v2 capacity value"),
-                    "case {case:?}: expected a refusal naming the capacity it would not \
-                     take, got {message:?}"
+                    message.contains(&expected),
+                    "case {case:?}: expected a refusal saying {expected:?}, got {message:?}"
                 );
             }
             continue;

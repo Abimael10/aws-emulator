@@ -4070,6 +4070,14 @@ fn identifier_wording(member: &str) -> IdentifierWording {
         "SourceDBSnapshotIdentifier" | "TargetDBSnapshotIdentifier" => {
             IdentifierWording::Subject("snapshot identifier")
         }
+        // The identifier of a GLOBAL database, whether `CreateGlobalCluster` is naming the
+        // one to create or `ModifyGlobalCluster` the one to rename to: RDS answers the DB
+        // instance's split here too — its subject for a value that is no identifier token
+        // of the member at all, the rule for a token of that shape which breaks one of the
+        // two hyphen rules — with the subject a global database carries.
+        "GlobalClusterIdentifier" | "NewGlobalClusterIdentifier" => {
+            IdentifierWording::SubjectForAValueThatIsNoToken("global cluster identifier")
+        }
         // Every other identifier member — a DB parameter group's name, a subscription's, a
         // shard group's, a tenant database's — states the rule and names itself.
         _ => IdentifierWording::TheRule,

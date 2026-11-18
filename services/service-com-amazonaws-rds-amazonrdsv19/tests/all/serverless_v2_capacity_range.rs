@@ -1,9 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! End-to-end tests for how this service answers an Aurora Serverless v2 scaling
-//! configuration whose capacity FLOOR is above its CEILING.
+//! configuration whose capacities the cluster cannot run: a FLOOR above its CEILING, and a
+//! capacity outside the range the cluster's engine version publishes.
 //!
-//! The rule under test: a `ServerlessV2ScalingConfiguration` whose `MinCapacity` is greater
+//! The first rule under test: a `ServerlessV2ScalingConfiguration` whose `MinCapacity` is
+//! greater
 //! than its `MaxCapacity` names a capacity floor the member does not accept, so every
 //! operation that carries the member refuses the call at HTTP 400 with `Error/Type`
 //! `Sender`, `Error/Code` `InvalidParameterValue` and ONE fixed sentence that interpolates
@@ -13,7 +15,15 @@
 //! pair whose floor EQUALS its ceiling is inside the rule and is served, as is any pair
 //! whose floor is below it.
 //!
-//! The tables span what the rule generalises over rather than one request: the three
+//! The second: the capacity ceiling is a property of the engine VERSION the cluster runs
+//! (`ServerlessV2FeaturesSupport` reports the limits that "differ between Aurora engine
+//! versions"), so a capacity ABOVE it is refused by that version — the sentence states the
+//! ceiling, names the version that imposes it and points at the published requirements,
+//! without quoting the value it rejected — while the ceiling itself is served. A capacity
+//! below the floor the version scales down to keeps the range sentence, which is what makes
+//! the two clauses distinguishable to a caller.
+//!
+//! The tables span what the rules generalise over rather than one request: the three
 //! operations that carry the member and are served here (`CreateDBCluster`,
 //! `ModifyDBCluster`, `RestoreDBClusterFromSnapshot` — `RestoreDBClusterToPointInTime` and
 //! `RestoreDBClusterFromS3` carry it too and are still stubs), two Aurora engines, and four
@@ -42,6 +52,34 @@ const FLOOR_ABOVE_CEILING: &str =
 
 /// The Query API's own code for a member value the service will not serve.
 const INVALID_PARAMETER_VALUE: &str = "InvalidParameterValue";
+
+/// The whole sentence a capacity ABOVE the ceiling the cluster's engine version reaches is
+/// refused with, spelled out here rather than taken from the code under test. Its only
+/// variable parts are the ceiling that version publishes and the version itself — the
+/// rejected capacity is not in it.
+fn above_the_engine_versions_ceiling(ceiling: f64, engine_version: &str) -> String {
+    format!(
+        "Invalid scaling configuration. The capacity values greater than {} ACUs are not \
+         supported by the current engine version {engine_version}. Please refer to this doc \
+         https://docs.aws.amazon.com/AmazonRDS/latest/AuroraUserGuide/\
+         aurora-serverless-v2.requirements.html for instructions on fixing the issue.",
+        acu(ceiling)
+    )
+}
+
+/// The sentence a capacity BELOW the floor the cluster scales down to keeps: it states the
+/// value it would not take and the range it will, which is what distinguishes the two
+/// clauses for a caller reading the refusal.
+fn below_the_clusters_range(value: f64, floor: f64, ceiling: f64) -> String {
+    format!(
+        "Serverless v2 capacity value {} is not valid. The valid scaling range for this \
+         cluster is {} to {}. To change the cluster's scaling range, use the ModifyDBCluster \
+         call.",
+        acu(value),
+        acu(floor),
+        acu(ceiling)
+    )
+}
 
 /// Who the Query API's error envelope blames for a request it will not serve.
 const SENDER: &str = "Sender";
@@ -488,6 +526,154 @@ async fn a_capacity_floor_at_or_below_its_ceiling_is_served_by_every_one_of_them
             reported,
             (acu(0.5), acu(16.0)),
             "case {case:?}: expected the restored cluster to carry the overridden range, got \
+             {reported:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_capacity_outside_the_engine_versions_range_is_refused_by_the_clause_it_broke() {
+    let router = emulator();
+
+    // The live clusters, settled together, and a snapshot of each for the restore rows.
+    let mut versions = Vec::new();
+    for subject in SUBJECTS {
+        versions.push(create_live_cluster(&router, subject).await);
+    }
+    wait_for_settle();
+    for subject in SUBJECTS {
+        expect_ok(
+            subject.label,
+            call(
+                &router,
+                "CreateDBClusterSnapshot",
+                &[
+                    ("DBClusterIdentifier", subject.cluster),
+                    ("DBClusterSnapshotIdentifier", subject.snapshot),
+                ],
+            )
+            .await,
+        );
+    }
+    wait_for_settle();
+
+    for (subject, version) in SUBJECTS.iter().zip(&versions) {
+        let (floor, ceiling) =
+            published_range(&router, subject.label, subject.engine, version).await;
+
+        // (case, floor, ceiling, the sentence the clause the pair broke is worded with)
+        let rows: Vec<(String, f64, f64, String)> = vec![
+            (
+                "a ceiling one half-step above the version's".to_string(),
+                floor,
+                ceiling + CAPACITY_STEP,
+                above_the_engine_versions_ceiling(ceiling, version),
+            ),
+            (
+                "a ceiling whole ACUs above the version's".to_string(),
+                floor,
+                ceiling + 44.0,
+                above_the_engine_versions_ceiling(ceiling, version),
+            ),
+            (
+                // The FLOOR is a capacity too, so it is held to the same ceiling — and the
+                // value check runs before the pair is compared, so this is the ceiling
+                // refusal rather than the inverted-range one.
+                "a floor above the version's ceiling".to_string(),
+                ceiling + CAPACITY_STEP,
+                ceiling + CAPACITY_STEP,
+                above_the_engine_versions_ceiling(ceiling, version),
+            ),
+            (
+                "a floor one half-step below the version's".to_string(),
+                floor - CAPACITY_STEP,
+                ceiling,
+                below_the_clusters_range(floor - CAPACITY_STEP, floor, ceiling),
+            ),
+        ];
+
+        for (index, (label, min, max, expected)) in rows.into_iter().enumerate() {
+            for carrier in CARRIERS {
+                let case = format!("{} / {} / {label}", subject.label, carrier.action());
+                let fresh = format!(
+                    "{}-cap-{}{index}",
+                    subject.cluster,
+                    match carrier {
+                        Carrier::Create => "c",
+                        Carrier::Modify => "m",
+                        Carrier::Restore => "r",
+                    }
+                );
+                let mut request: Vec<(&'static str, String)> = match carrier {
+                    Carrier::Create => vec![
+                        ("DBClusterIdentifier", fresh.clone()),
+                        ("Engine", subject.engine.to_string()),
+                    ],
+                    Carrier::Modify => vec![
+                        ("DBClusterIdentifier", subject.cluster.to_string()),
+                        ("ApplyImmediately", "true".to_string()),
+                    ],
+                    Carrier::Restore => vec![
+                        ("DBClusterIdentifier", fresh.clone()),
+                        ("SnapshotIdentifier", subject.snapshot.to_string()),
+                        ("Engine", subject.engine.to_string()),
+                    ],
+                };
+                request.extend(scaling_params(min, max));
+
+                let refused = expect_error(
+                    &case,
+                    call(&router, carrier.action(), &request).await,
+                    400,
+                    INVALID_PARAMETER_VALUE,
+                );
+                let blamed = text(&refused, "Type");
+                assert_eq!(
+                    blamed, SENDER,
+                    "case {case:?}: expected the sender to be blamed, got {blamed:?}"
+                );
+                let message = text(&refused, "Message");
+                assert_eq!(
+                    message, expected,
+                    "case {case:?}: expected {expected:?}, got {message:?}"
+                );
+
+                // The refusal is total: a rescale left the live cluster at the range it was
+                // created with, and a create or restore left no cluster behind.
+                match carrier {
+                    Carrier::Modify => {
+                        let live = describe_one(&router, &case, subject.cluster).await;
+                        let reported = reported_range(&case, &live);
+                        assert_eq!(
+                            reported,
+                            (acu(LIVE_MIN), acu(LIVE_MAX)),
+                            "case {case:?}: expected the live range to be untouched, got \
+                             {reported:?}"
+                        );
+                    }
+                    Carrier::Create | Carrier::Restore => {
+                        expect_no_such_cluster(&router, &case, &fresh).await;
+                    }
+                }
+            }
+        }
+
+        // The version's own ceiling IS served, which is what makes the rows above a bound
+        // rather than a blanket refusal — and the rescale that reaches it is what the
+        // cluster then reports.
+        let case = format!("{} / the version's published ceiling", subject.label);
+        let mut request: Vec<(&'static str, String)> = vec![
+            ("DBClusterIdentifier", subject.cluster.to_string()),
+            ("ApplyImmediately", "true".to_string()),
+        ];
+        request.extend(scaling_params(floor, ceiling));
+        expect_ok(&case, call(&router, "ModifyDBCluster", &request).await);
+        let live = describe_one(&router, &case, subject.cluster).await;
+        let reported = reported_range(&case, &live);
+        assert_eq!(
+            reported,
+            (acu(floor), acu(ceiling)),
+            "case {case:?}: expected the published bounds to be the range in effect, got \
              {reported:?}"
         );
     }

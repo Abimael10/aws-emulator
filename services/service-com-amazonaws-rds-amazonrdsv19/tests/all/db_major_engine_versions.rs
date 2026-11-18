@@ -14,11 +14,13 @@
 //!    version catalogue `DescribeDBEngineVersions` publishes, each once, in that
 //!    catalogue's order — so the expectation is READ from that report rather than
 //!    hand-listed, and every engine it carries is a row.
-//! 2. `Engine` and `MajorEngineVersion` narrow that report and refuse nothing: the table
-//!    spans an engine alone, a major version alone, both together, a name in another
-//!    case, and three values that select nothing (an engine whose versions only an
-//!    account mints, an engine of another control plane, and a major version no entry
-//!    carries).
+//! 2. `Engine` and `MajorEngineVersion` narrow that report: the table spans an engine
+//!    alone, a major version alone, both together, a name in another case, and three
+//!    values that select nothing (an engine whose versions only an account mints, an
+//!    engine of another control plane, and a major version no entry carries). An `Engine`
+//!    that names no engine of the published vocabulary resolves no family at all and is
+//!    refused instead — that rule has its own suite
+//!    (`db_major_engine_version_engine_names.rs`).
 //! 3. A support lifecycle is published only for the open-source engines, with Amazon RDS
 //!    Extended Support only for the four that are offered it; a window covers whole UTC
 //!    days — it opens at the first instant of its start day and closes at the LAST instant
@@ -324,12 +326,6 @@ const NARROWINGS: &[Narrowing] = &[
         case: "a major version no entry of that engine carries",
         engine: Some("mysql"),
         major_engine_version: Some("9.9"),
-        selects: false,
-    },
-    Narrowing {
-        case: "a value that is not an engine",
-        engine: Some("not-an-engine"),
-        major_engine_version: None,
         selects: false,
     },
 ];

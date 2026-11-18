@@ -423,11 +423,41 @@ pub const SERVERLESS_V2_FLOOR_ABOVE_CEILING_MESSAGE: &str =
 /// call that changes that range; it names neither the member nor the engine version, so a
 /// floor and a ceiling outside the range are refused with the same sentence shape. The two
 /// capacities are written as the doubles the member takes (`256.0`, not `256`).
+///
+/// This is the refusal for a capacity BELOW what the cluster scales down to; one ABOVE the
+/// ceiling its engine version reaches is worded by that version
+/// ([`serverless_v2_capacity_above_engine_ceiling_message`]).
 pub fn serverless_v2_capacity_out_of_range_message(value: f64, min: f64, max: f64) -> String {
     format!(
         "Serverless v2 capacity value {value:?} is not valid. The valid scaling range for \
          this cluster is {min:?} to {max:?}. To change the cluster's scaling range, use the \
          ModifyDBCluster call."
+    )
+}
+
+/// Where Amazon RDS points a caller whose scaling configuration asks for more capacity than
+/// the cluster's engine version reaches: the Aurora Serverless v2 requirements the Amazon
+/// Aurora User Guide publishes, which is where the per-version ACU ceilings are written down.
+const SERVERLESS_V2_REQUIREMENTS_DOC: &str = "https://docs.aws.amazon.com/AmazonRDS/latest/\
+                                              AuroraUserGuide/aurora-serverless-v2.requirements.html";
+
+/// What a capacity value ABOVE the ceiling the cluster's engine version reaches is refused
+/// with.
+///
+/// The ceiling is a property of the engine VERSION — `ServerlessV2FeaturesSupport` reports
+/// the limits that "differ between Aurora engine versions" — so the service states the
+/// ceiling, the version that imposes it and where the per-version requirements are
+/// published, and does NOT quote the rejected value: the two ways out are a lower capacity
+/// or a version whose ceiling reaches it, and naming the version is what tells the caller
+/// which. The ceiling is written as the double the member takes (`256.0`, not `256`).
+pub fn serverless_v2_capacity_above_engine_ceiling_message(
+    max: f64,
+    engine_version: &str,
+) -> String {
+    format!(
+        "Invalid scaling configuration. The capacity values greater than {max:?} ACUs are \
+         not supported by the current engine version {engine_version}. Please refer to this \
+         doc {SERVERLESS_V2_REQUIREMENTS_DOC} for instructions on fixing the issue."
     )
 }
 
@@ -470,13 +500,21 @@ const SERVERLESS_V2_PUBLISHED_CAPACITY: (f64, f64) = (0.0, 256.0);
 /// one the configuration itself is refused for — whether a `db.serverless` DB instance can
 /// then be created in that cluster is that create's own answer.
 ///
+/// `engine_version` is the version the cluster will be RUNNING, which the refusal of a
+/// capacity above the ceiling names ("the current engine version"); `None` where this call
+/// resolved no version to name, and then that refusal falls back to the range sentence
+/// rather than naming a version the service does not know.
+///
 /// A capacity value is checked against that range
-/// ([`serverless_v2_capacity_out_of_range_message`]) and against the half-step
+/// ([`serverless_v2_capacity_above_engine_ceiling_message`] above the ceiling the version
+/// reaches, [`serverless_v2_capacity_out_of_range_message`] below the floor it scales to)
+/// and against the half-step
 /// increments the member documents ("You can specify ACU values in half-step increments,
 /// such as 8, 8.5, 9, and so on"), and the pair against each other (the floor cannot exceed
 /// the ceiling).
 pub fn check_serverless_v2_scaling(
     capacity: Option<(f64, f64)>,
+    engine_version: Option<&str>,
     min_capacity: Option<f64>,
     max_capacity: Option<f64>,
     seconds_until_auto_pause: Option<i32>,
@@ -484,7 +522,17 @@ pub fn check_serverless_v2_scaling(
     let (min_acu, max_acu) = capacity.unwrap_or(SERVERLESS_V2_PUBLISHED_CAPACITY);
     for value in [min_capacity, max_capacity] {
         let Some(value) = value else { continue };
-        if !(min_acu..=max_acu).contains(&value) {
+        if value > max_acu {
+            // The ceiling belongs to the engine version, so the refusal names that version
+            // where this call resolved one.
+            return Err(ServerlessV2Rejection::Value(match engine_version {
+                Some(version) => {
+                    serverless_v2_capacity_above_engine_ceiling_message(max_acu, version)
+                }
+                None => serverless_v2_capacity_out_of_range_message(value, min_acu, max_acu),
+            }));
+        }
+        if value < min_acu {
             return Err(ServerlessV2Rejection::Value(
                 serverless_v2_capacity_out_of_range_message(value, min_acu, max_acu),
             ));

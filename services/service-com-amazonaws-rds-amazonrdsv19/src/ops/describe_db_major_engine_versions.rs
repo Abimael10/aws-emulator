@@ -184,6 +184,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // branch — "Default: 100" — is reachable here.
         let page_size = crate::state::check_max_records(input.max_records)
             .map_err(DescribeDBMajorEngineVersionsError::invalid_parameter_value)?;
+        // `Engine`: "The database engine to return major version details for." The member
+        // RESOLVES an engine family rather than merely narrowing the rows, so a value that
+        // names no engine this front door publishes names no family at all and is refused
+        // — not answered with the empty report that would read as "this engine has no
+        // major versions". It is the gate `DescribeDBEngineVersions` holds its own `Engine`
+        // to, over the same published vocabulary
+        // ([`crate::state::is_published_engine`]), so the two catalogue reads cannot
+        // disagree about which names are engines; this report words the refusal its own way
+        // ([`crate::state::check_engine_of_major_version_report`]).
+        //
+        // An engine the vocabulary DOES carry is narrowed for, whatever this report
+        // publishes for it: an engine of a sibling control plane and one whose versions
+        // only an account mints are engines, so each is the empty report rather than a
+        // refusal.
+        if let Some(engine) = &input.engine {
+            crate::state::check_engine_of_major_version_report(engine)
+                .map_err(DescribeDBMajorEngineVersionsError::invalid_parameter_value)?;
+        }
         // `families()` yields the families in catalogue order, so the keys below ascend
         // and `paginate` can cut a page from them directly.
         let matching: Vec<(String, DBMajorEngineVersion)> = families()
@@ -252,11 +270,12 @@ fn is_same_family(entry: &CatalogVersion, engine: &str, major_engine_version: &s
 
 /// Whether `family` is in the report this request asks for.
 ///
-/// Both members narrow and neither refuses: each is documented as the engine / the major
-/// engine version "to return details for", so a value naming a family this service does
-/// not publish selects none of them — the same answer the engine-version report gives a
-/// value no entry carries. Engine and version names are matched case-insensitively, the
-/// way every describe operation in this service matches them.
+/// Both members NARROW the report: each is documented as the engine / the major engine
+/// version "to return details for", so a value naming a family this service does not
+/// publish selects none of them — the same answer the engine-version report gives a value
+/// no entry carries. An `Engine` that names no engine at all never reaches here: it
+/// resolves no family and is refused in `handle`. Engine and version names are matched
+/// case-insensitively, the way every describe operation in this service matches them.
 fn matches_request(family: &CatalogVersion, input: &DescribeDBMajorEngineVersionsInput) -> bool {
     if let Some(engine) = &input.engine {
         if !family.engine.eq_ignore_ascii_case(engine) {
