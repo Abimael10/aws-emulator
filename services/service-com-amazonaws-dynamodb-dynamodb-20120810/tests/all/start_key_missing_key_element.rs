@@ -6,10 +6,10 @@
 //! RULE: a resume token that does not carry every key attribute of the schema being paged
 //! carries no key of that schema, so the read refuses it with `ValidationException` and the
 //! one fixed invalid-token sentence — "The provided starting key is invalid" — with nothing
-//! appended to it; only a token that carries exactly those key attributes while stating one
-//! of them in another TYPE than the schema declares is diagnosed further, with the
-//! key-schema reason after a colon. The sentence is fixed text: it names neither the
-//! attribute that is missing nor the schema, and echoes nothing the request sent.
+//! appended to it; a token that carries exactly those key attributes while stating one
+//! of them in another TYPE than the schema declares is no key of it either and earns that
+//! same sentence. The sentence is fixed text: it names neither the missing
+//! attribute nor the schema, and echoes nothing the request sent.
 //!
 //! The rows span what the rule generalises over: WHICH schema is being paged (a composite
 //! base table, a global secondary index whose own key is composite, and a local one), WHICH
@@ -35,9 +35,9 @@ use crate::emulator::{call, describe_when_active, emulator, error_code, message,
 const START_KEY_INVALID: &str = "The provided starting key is invalid";
 
 /// The sentence a token that carries those key attributes with one of them typed against
-/// the schema earns: the same statement with the key-schema reason after a colon.
-const START_KEY_TYPE_MISMATCH: &str =
-    "The provided starting key is invalid: The provided key element does not match the schema";
+/// the schema earns: the same statement, since such a token is no key of that schema
+/// either.
+const START_KEY_TYPE_MISMATCH: &str = START_KEY_INVALID;
 
 /// A table whose primary key is composite (`pk` HASH, `sk` RANGE), carrying a global
 /// secondary index of its own composite key and a local one.

@@ -184,13 +184,35 @@ pub fn is_expression_word_char(character: char) -> bool {
 pub fn expression_size_exceeded(member: &str) -> RequestError {
     expression_refusal(
         envelopes_expression_refusals(member),
-        format!("Invalid {member}: Expression size has exceeded the maximum allowed size;"),
+        expression_clause(member, "Expression size has exceeded the maximum allowed size;"),
     )
+}
+
+/// The MEMBER a PartiQL statement's expressions are read as: the statement itself is what
+/// the request carries, so it is the one "member" that is not an expression member of a
+/// request at all ([`super::partiql`] renders a statement's clauses into this grammar and
+/// parses them under this name).
+pub(super) const STATEMENT_MEMBER: &str = "Statement";
+
+/// One clause about an expression, stated for the member it travelled in.
+///
+/// Every refusal the expression languages raise names the member that carried the text —
+/// `Invalid <member>: <clause>` — because that is what tells a caller which member of its
+/// request holds the mistake. The PartiQL surface has no such member: the request carries
+/// a `Statement`, whose clauses are lowered onto this grammar, so AWS states those
+/// refusals as the bare clause and a client reading one gets the defect class without a
+/// member name in front of it ([`STATEMENT_MEMBER`]).
+fn expression_clause(member: &str, detail: &str) -> String {
+    if member == STATEMENT_MEMBER {
+        return detail.to_string();
+    }
+    format!("Invalid {member}: {detail}")
 }
 
 /// One clause of the validation envelope for a refusal the EXPRESSION language raises:
 /// AWS states the detail behind the expression member it came from, so a caller reading
-/// the message knows which member of the request carried the mistake.
+/// the message knows which member of the request carried the mistake — except on the
+/// statement surface, whose refusals are stated bare ([`expression_clause`]).
 ///
 /// Whether the clause is wrapped in the `<N> validation error(s) detected: ` envelope
 /// follows the MEMBER: the members a WRITE states its intent through are validated
@@ -199,7 +221,7 @@ pub fn expression_size_exceeded(member: &str) -> RequestError {
 fn invalid_expression_member(member: &str, detail: &str) -> RequestError {
     expression_refusal(
         envelopes_expression_refusals(member),
-        format!("Invalid {member}: {detail}"),
+        expression_clause(member, detail),
     )
 }
 
@@ -715,8 +737,9 @@ pub fn tokenize_expression_spanned(
     let mut at = 0;
     while at < characters.len() {
         if tokens.len() >= MAX_EXPRESSION_TOKENS {
-            return Err(RequestError::Validation(format!(
-                "Invalid {member}: an expression may hold at most {MAX_EXPRESSION_TOKENS} tokens"
+            return Err(RequestError::Validation(expression_clause(
+                member,
+                &format!("an expression may hold at most {MAX_EXPRESSION_TOKENS} tokens"),
             )));
         }
         let character = characters[at];
@@ -836,11 +859,33 @@ pub fn tokenize_expression_spanned(
 fn too_many_expression_operators(member: &str, operators: usize) -> RequestError {
     expression_refusal(
         envelopes_expression_refusals(member),
-        format!(
-            "Invalid {member}: The expression contains too many operators; operator count: \
-             {operators}"
+        expression_clause(
+            member,
+            &format!("The expression contains too many operators; operator count: {operators}"),
         ),
     )
+}
+
+/// The words this grammar reads as OPERATORS rather than as names: the logical
+/// connectives, the membership test and the range comparator the condition and filter
+/// languages are written with ("AND", "OR", "NOT", "IN", "BETWEEN" — the operators
+/// `Query$FilterExpression` and `ConditionExpression` spell).
+///
+/// An operator keyword is a token of the grammar wherever the text spells it, so it is
+/// never an attribute NAME: a position that wants a name or an operand has no place for
+/// one, and the parse stops AT it ([`ExprParser::path_name`]) rather than reading it as a
+/// name and stopping at whatever follows. That is why they are counted as the operators
+/// they are ([`stated_operators`]) too, and why an attribute actually called one of them
+/// is reached through `ExpressionAttributeNames`, which is what that member is for.
+pub(super) const EXPRESSION_OPERATOR_KEYWORDS: [&str; 5] =
+    ["AND", "OR", "NOT", "IN", BETWEEN_OPERATOR];
+
+/// Whether a bare word is one of those operator keywords. The operator keywords are
+/// case-insensitive, as [`ExprParser::eat_keyword`] matches them.
+pub(super) fn is_expression_operator_keyword(word: &str) -> bool {
+    EXPRESSION_OPERATOR_KEYWORDS
+        .iter()
+        .any(|keyword| word.eq_ignore_ascii_case(keyword))
 }
 
 /// How many operators and functions the tokens of one expression state, the way the quota
@@ -873,7 +918,7 @@ fn stated_operators(tokens: &[ExprToken]) -> usize {
                     ranges += 1;
                 }
                 "AND" if ranges > 0 => ranges -= 1,
-                "AND" | "OR" | "NOT" | "IN" => operators += 1,
+                other if is_expression_operator_keyword(other) => operators += 1,
                 _ => {}
             },
             _ => {}
@@ -3437,9 +3482,9 @@ impl<'a> ExprParser<'a> {
     fn descend(&mut self) -> Result<(), RequestError> {
         self.depth += 1;
         if self.depth > MAX_EXPRESSION_DEPTH {
-            return Err(RequestError::Validation(format!(
-                "Invalid {}: an expression may nest at most {MAX_EXPRESSION_DEPTH} levels deep",
-                self.member
+            return Err(RequestError::Validation(expression_clause(
+                self.member,
+                &format!("an expression may nest at most {MAX_EXPRESSION_DEPTH} levels deep"),
             )));
         }
         Ok(())
@@ -3450,9 +3495,9 @@ impl<'a> ExprParser<'a> {
         let mut steps = vec![PathStep::Attribute(self.path_name()?)];
         loop {
             if steps.len() >= MAX_ATTRIBUTE_DEPTH {
-                return Err(RequestError::Validation(format!(
-                    "Invalid {}: a document path may name at most {MAX_ATTRIBUTE_DEPTH} levels",
-                    self.member
+                return Err(RequestError::Validation(expression_clause(
+                    self.member,
+                    &format!("a document path may name at most {MAX_ATTRIBUTE_DEPTH} levels"),
                 )));
             }
             match self.peek().cloned() {
@@ -3483,6 +3528,17 @@ impl<'a> ExprParser<'a> {
         if self
             .peek()
             .is_some_and(|token| matches!(token, ExprToken::Word(word) if starts_with_digit(word)))
+        {
+            return Err(self.syntax());
+        }
+        // Nor is a word this grammar reads as an OPERATOR a name
+        // ([`EXPRESSION_OPERATOR_KEYWORDS`]): the text spells the operator it spells, so a
+        // name position holding one is a position the grammar cannot take that token at,
+        // and the parse stops there — which is what makes a dangling `AND` report the
+        // `AND` the operand should have followed rather than the token after it.
+        if self
+            .peek()
+            .is_some_and(|token| matches!(token, ExprToken::Word(word) if is_expression_operator_keyword(word)))
         {
             return Err(self.syntax());
         }
@@ -3816,9 +3872,9 @@ impl<'a> ExprParser<'a> {
                 .copied()
                 .ok_or_else(|| self.syntax())?;
             if !seen.insert(section) {
-                return Err(RequestError::Validation(format!(
-                    "Invalid {}: the {section} section can only be used once in an expression",
-                    self.member
+                return Err(RequestError::Validation(expression_clause(
+                    self.member,
+                    &format!("the {section} section can only be used once in an expression"),
                 )));
             }
             loop {

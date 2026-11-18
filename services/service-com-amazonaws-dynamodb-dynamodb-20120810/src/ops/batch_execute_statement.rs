@@ -774,7 +774,7 @@ fn update_item(
     }
     store
         .active_table(region, name, now)?
-        .check_index_keys(&item)?;
+        .check_index_keys_of_update(&item)?;
     let capacity = store
         .active_table(region, name, now)?
         .write_capacity(before.as_ref(), Some(&item));

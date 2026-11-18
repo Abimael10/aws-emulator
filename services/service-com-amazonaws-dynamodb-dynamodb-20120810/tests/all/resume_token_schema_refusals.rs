@@ -7,11 +7,10 @@
 //! no key of that schema is refused as the invalid TOKEN it is — AWS's fixed sentence
 //! naming neither the attribute nor the schema, with nothing appended — whether it names an
 //! attribute the schema declares no key for, carries one beside the key, LEAVES A DECLARED
-//! KEY ATTRIBUTE OUT, or carries no attribute at all. Only a token that carries exactly that
-//! schema's key attributes while stating one of them in another TYPE than the schema declares
-//! is diagnosed further: that sentence states the token invalid and then the key-schema
-//! reason after a colon. The type defect is stated that way on the BASE table and on an
-//! INDEX cursor alike, since an index cursor carries both schemas' key attributes.
+//! KEY ATTRIBUTE OUT, carries no attribute at all, or carries exactly that schema's key
+//! attributes while stating one of them in another TYPE than the schema declares. That one
+//! sentence is what every such token earns, on the BASE table and on an INDEX cursor alike,
+//! since an index cursor carries both schemas' key attributes.
 //!
 //! The rows differ along HOW the token fails to be that key, along the SCHEMA being paged
 //! (a single-attribute table, a composite one, a global secondary index and a local one),
@@ -30,9 +29,10 @@ use crate::emulator::{call, describe_when_active, emulator, error_code, message,
 const INVALID: &str = "The provided starting key is invalid";
 
 /// AWS's sentence for a token that carries exactly the key attributes of the schema being
-/// paged while stating one of them in another type than that schema declares.
-const TYPE_MISMATCH: &str =
-    "The provided starting key is invalid: The provided key element does not match the schema";
+/// paged while stating one of them in another type than that schema declares: a key element
+/// of another type is no key of that schema either, so it is the same sentence, with the
+/// schema reason NOT appended to it.
+const TYPE_MISMATCH: &str = INVALID;
 
 /// A table whose primary key is ONE attribute.
 const SOLO: &str = "ResumeTokenSolo";

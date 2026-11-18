@@ -179,23 +179,11 @@ pub fn missing_item_key_message(attribute: &str) -> String {
 /// an attribute the schema declares no key for, one carrying a spare attribute beside the
 /// key, one that LEAVES OUT a key attribute the schema declares, and one carrying no
 /// attribute at all are all of them tokens that are not this schema's key, so all of them
-/// earn it. Only a token that carries exactly that schema's key attributes while stating one
-/// of them in another TYPE than the schema declares is diagnosed further
-/// ([`START_KEY_SCHEMA_MISMATCH_MESSAGE`]).
+/// earn it — and so does a token that carries exactly those key attributes while stating one
+/// of them in another TYPE than the schema declares: a key element of another type is no key
+/// of that schema either, and the sentence reports neither which element it was nor what the
+/// schema declares for it.
 pub const START_KEY_INVALID_MESSAGE: &str = "The provided starting key is invalid";
-
-/// How an `ExclusiveStartKey` that carries the key attributes of the schema being paged,
-/// with one of them typed against that schema, is refused: AWS states the token invalid and
-/// then says WHY after a colon — the same key-schema sentence a `Key`
-/// member is refused with ([`KEY_SCHEMA_MISMATCH_MESSAGE`]), which tells the caller its
-/// token holds this schema's key attributes wrongly rather than being no key of it at all.
-/// Both halves are fixed text.
-///
-/// ONE defect earns it: an element carrying another TYPE than the schema declares for it. A
-/// token that leaves a declared key attribute out does not carry that schema's key at all,
-/// so it is the invalid TOKEN ([`START_KEY_INVALID_MESSAGE`]) with nothing appended.
-pub const START_KEY_SCHEMA_MISMATCH_MESSAGE: &str =
-    "The provided starting key is invalid: The provided key element does not match the schema";
 
 /// Which request member a primary key is being read out of.
 ///
@@ -204,18 +192,17 @@ pub const START_KEY_SCHEMA_MISMATCH_MESSAGE: &str =
 /// primary key, so any way it differs from the schema is the one mismatch; an `Item` a
 /// SINGLE-item write carries is the whole item, so a key attribute it does not carry is
 /// reported as the value it did not give, and one of another type as the mismatch between
-/// the two types; an `ExclusiveStartKey` is a resume token, so a map that is no key of the
-/// schema being paged makes it an invalid token, while a token that carries exactly that
-/// schema's key attributes with one of them in another TYPE than the schema declares is
-/// diagnosed further
-/// ([`Self::typed_against_schema`]); a BATCHED write's element is held to the schema as a
+/// the two types; an `ExclusiveStartKey` is a resume token, so EVERY map that is no key of
+/// the schema being paged — including one whose elements are that schema's key attributes
+/// with one of them in another TYPE than it declares — makes it the invalid token it is; a
+/// BATCHED write's element is held to the schema as a
 /// whole, so every way it differs from it is the one mismatch sentence; and a
 /// TRANSACTIONAL write's element is reported per defect for its TYPE, as a single-item
 /// write's is, which is the mismatch its cancellation reason states.
 ///
 /// A resume token that leaves a declared key element OUT is no key of the schema being
-/// paged, so it earns that member's one invalid-token sentence rather than the further
-/// diagnosis ([`START_KEY_INVALID_MESSAGE`]).
+/// paged either, so it earns that same one invalid-token sentence
+/// ([`START_KEY_INVALID_MESSAGE`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum KeySource {
     Item,
@@ -234,9 +221,7 @@ impl KeySource {
             // A resume token that leaves out a key attribute the schema declares carries
             // no key of that schema, so it is the invalid TOKEN with nothing appended —
             // the same sentence every other map that is not this schema's key earns, which
-            // is why it shares the arm below; only a token that carries them all with one
-            // of them TYPED against the schema is diagnosed further
-            // ([`Self::typed_against_schema`]).
+            // is why it shares the arm below.
             Self::StartKey | Self::BatchItem | Self::TransactItem | Self::Key => self.mismatch(),
         }
     }
@@ -251,21 +236,6 @@ impl KeySource {
     /// TRANSACTIONAL write's element state the two types instead.
     fn hides_the_type_mismatch(self) -> bool {
         matches!(self, Self::BatchItem | Self::Key | Self::StartKey)
-    }
-
-    /// How this source words a key attribute carrying another TYPE than the schema
-    /// declares for it, where the source states the key as a whole
-    /// ([`Self::hides_the_type_mismatch`]). A resume token is the one member AWS diagnoses
-    /// that defect of ([`START_KEY_SCHEMA_MISMATCH_MESSAGE`]), which separates a token whose
-    /// elements ARE this schema's key attributes from one that is no key of it at all;
-    /// every other member states its own mismatch sentence for it.
-    fn typed_against_schema(self) -> RequestError {
-        match self {
-            Self::StartKey => {
-                RequestError::Validation(START_KEY_SCHEMA_MISMATCH_MESSAGE.to_string())
-            }
-            Self::Item | Self::BatchItem | Self::TransactItem | Self::Key => self.mismatch(),
-        }
     }
 
     /// The one sentence a key that is not this table's primary key is refused
@@ -898,6 +868,11 @@ pub const KEY_CONDITION_REQUIRED_MESSAGE: &str = "Either the KeyConditions or \
 /// and not in a key one — and the refusal names the key it was supplied for.
 /// Not a constraint-envelope refusal: AWS states it as a parameter-value
 /// sentence of its own.
+///
+/// This is the sentence for a value stated against the TABLE's own key schema. A value
+/// stated against a SECONDARY INDEX — an item projected into one, or a resume token read
+/// back through one — names that index instead
+/// ([`empty_index_key_attribute`]).
 fn empty_key_attribute(attribute: &str, kind: &str) -> RequestError {
     RequestError::Validation(format!(
         "One or more parameter values are not valid. The AttributeValue for a key attribute \
@@ -928,6 +903,13 @@ fn empty_key_value_kind(value: &AttributeValue) -> Option<&'static str> {
 /// it is for the table's own key — but the sentence names the INDEX whose key
 /// schema the attribute belongs to and the attribute's role in it, because that
 /// is what tells the caller which projection it broke.
+///
+/// It is the sentence for every empty key value a request states AGAINST AN INDEX, and
+/// not only for one an item carries: a resume token read back through an index's order
+/// is held to that index too ([`Table::index_key_of_start_key`]), so an empty element of
+/// one earns this wording over the index being paged, whichever of the two schemas that
+/// cursor spans declares the attribute. A value stated against the table alone earns the
+/// plain sentence ([`empty_key_attribute`]).
 fn empty_index_key_attribute(attribute: &str, kind: &str, index_name: &str) -> RequestError {
     RequestError::Validation(format!(
         "One or more parameter values are not valid. A value specified for a secondary index \
@@ -3964,6 +3946,20 @@ pub fn being_deleted_message(resource_arn: &str, action: &str) -> String {
     format!("Resource {resource_arn} is being deleted and cannot be {action}")
 }
 
+/// How a tag key in the reserved namespace is refused: AWS's fixed sentence for that
+/// rule, over the offending key as the request spelled it.
+///
+/// "Amazon Web Services-assigned tag names and values are automatically assigned the
+/// `aws:` prefix, which the user cannot assign" (the `Tag` doc), so the refusal states
+/// the prefix the key may not carry and then names the key — the one variable part, read
+/// off the request, with the case the caller sent, since a key is matched by the prefix
+/// however it is spelled ([`RESERVED_TAG_PREFIX`]).
+fn reserved_tag_prefix(key: &str) -> RequestError {
+    RequestError::Validation(format!(
+        "Tag Key cannot be prefixed with {RESERVED_TAG_PREFIX}, Key: {key}"
+    ))
+}
+
 /// Fold a request's `TagList` into the stored [`TagSet`], refusing a list AWS does not
 /// accept.
 ///
@@ -3975,7 +3971,10 @@ pub fn being_deleted_message(resource_arn: &str, action: &str) -> String {
 ///   for two tags that cannot both exist, and is refused ([`duplicate_tag_key`])
 ///   instead of collapsing to whichever value happens to win;
 /// * a key in the reserved `aws:` namespace is refused — the user "cannot assign" it —
-///   so no stored key is ever one AWS alone mints.
+///   so no stored key is ever one AWS alone mints ([`reserved_tag_prefix`]).
+///
+/// Either refusal is raised before ANY tag of the list is folded in, so a call carrying
+/// one key AWS turns down applies none of the keys beside it.
 ///
 /// Keys are compared as sent: tag keys are case sensitive, so `Env` and `env` are two
 /// keys rather than one repeated.
@@ -3987,11 +3986,7 @@ pub fn tag_set_from_request(tags: &[Tag]) -> Result<TagSet, RequestError> {
             .to_ascii_lowercase()
             .starts_with(RESERVED_TAG_PREFIX)
         {
-            return Err(RequestError::Validation(format!(
-                "Invalid tag key {}: the {RESERVED_TAG_PREFIX} prefix is reserved for Amazon \
-                 Web Services-assigned tags and cannot be assigned by a caller",
-                tag.key
-            )));
+            return Err(reserved_tag_prefix(&tag.key));
         }
         if set.insert(tag.key.clone(), tag.value.clone()).is_some() {
             return Err(duplicate_tag_key(&tag.key));

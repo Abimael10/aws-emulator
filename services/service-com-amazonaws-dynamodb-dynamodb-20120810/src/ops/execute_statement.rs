@@ -854,7 +854,7 @@ fn update_item(
     store
         .active_table(region, name, now)
         .map_err(lift)?
-        .check_index_keys(&item)
+        .check_index_keys_of_update(&item)
         .map_err(lift)?;
     store
         .put_item(region, name, now, key, item.clone())

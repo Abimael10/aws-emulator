@@ -237,6 +237,20 @@ impl Table {
         attribute: &str,
         value: &AttributeValue,
     ) -> Result<AttributeValueKey, RequestError> {
+        self.key_value_worded(attribute, value, EmptyStartKeyElement::NamesTheKey)
+    }
+
+    /// The same encoding, with the wording an EMPTY `S`/`B` value is refused in stated by
+    /// the caller ([`EmptyStartKeyElement`]).
+    ///
+    /// Only the resume token of a `Scan` states the other one, so every other member
+    /// reaches this through [`Self::key_value`] and keeps the plain sentence.
+    fn key_value_worded(
+        &self,
+        attribute: &str,
+        value: &AttributeValue,
+        empty_element: EmptyStartKeyElement<'_>,
+    ) -> Result<AttributeValueKey, RequestError> {
         // CreateTable refuses a key schema whose attributes are not all defined, so
         // a key attribute always has a declared type; an undefined one is a bad
         // request rather than something to guess a type for.
@@ -248,11 +262,18 @@ impl Table {
         // "The AttributeValue for a key attribute cannot contain an empty string
         // value" / an empty binary value: a key attribute's value must be non-empty,
         // however the table declared its type, and the refusal names the key it was
-        // supplied for. A value of ANOTHER type than the one declared is the type
+        // supplied for — or the INDEX the caller stated the value against, where the
+        // member that carried it is held to one ([`EmptyStartKeyElement`]). A value of
+        // ANOTHER type than the one declared is the type
         // mismatch below, whether or not it is also empty.
         if declared == attribute_value_type(value) {
             if let Some(kind) = empty_key_value_kind(value) {
-                return Err(empty_key_attribute(attribute, kind));
+                return Err(match empty_element {
+                    EmptyStartKeyElement::NamesTheKey => empty_key_attribute(attribute, kind),
+                    EmptyStartKeyElement::NamesTheIndexKey(index_name) => {
+                        empty_index_key_attribute(attribute, kind, index_name)
+                    }
+                });
             }
         }
         let encoded = match (declared, value) {
@@ -415,7 +436,8 @@ impl Table {
     /// which NAMES the attribute ([`missing_item_key_message`]) — and that is not how it
     /// words the same gap in a `Key`-shaped member (see [`Self::key_of_key_map`]).
     pub fn key_of_item(&self, item: &Item) -> Result<ItemKey, RequestError> {
-        self.key_from(item, KeySource::Item).map_err(Into::into)
+        self.key_from(item, KeySource::Item, EmptyStartKeyElement::NamesTheKey)
+            .map_err(Into::into)
     }
 
     /// The primary key of an item ONE ELEMENT of a BATCHED write carries (a
@@ -431,7 +453,8 @@ impl Table {
     /// ([`Self::key_of_transact_item`]), and a `Key`-shaped member of either surface is
     /// read through [`Self::key_of_key_map`], which states the same mismatch sentence.
     pub fn key_of_multi_item(&self, item: &Item) -> Result<ItemKey, RequestError> {
-        self.key_from(item, KeySource::BatchItem).map_err(Into::into)
+        self.key_from(item, KeySource::BatchItem, EmptyStartKeyElement::NamesTheKey)
+            .map_err(Into::into)
     }
 
     /// The primary key named by a `Key` member: exactly the key attributes, no more.
@@ -441,26 +464,31 @@ impl Table {
     /// attribute it omits, a key attribute of another type — is the one mismatch
     /// AWS states with [`KEY_SCHEMA_MISMATCH_MESSAGE`].
     pub fn key_of_key_map(&self, key: &Item) -> Result<ItemKey, RequestError> {
-        self.key_of_map(key, KeySource::Key).map_err(Into::into)
+        self.key_of_map(key, KeySource::Key, EmptyStartKeyElement::NamesTheKey)
+            .map_err(Into::into)
     }
 
     /// The primary key a paging member (`ExclusiveStartKey`) resumes from: read
     /// through the same key schema as a `Key`, and refused as the INVALID RESUME
     /// TOKEN it is when it is no key of that schema — an attribute the schema declares no
-    /// key for, a spare attribute beside the key, or a declared key attribute the token
-    /// leaves out ([`START_KEY_INVALID_MESSAGE`]) — with the schema reason stated after it
-    /// only when the token carries exactly that schema's key attributes and states one of
-    /// them in another TYPE than the schema declares
-    /// ([`START_KEY_SCHEMA_MISMATCH_MESSAGE`]).
+    /// key for, a spare attribute beside the key, a declared key attribute the token
+    /// leaves out, or a declared key attribute stated in another TYPE than the schema
+    /// declares ([`START_KEY_INVALID_MESSAGE`]), with nothing appended to it in any of
+    /// those cases.
     ///
     /// A clause about a VALUE the token carried is stated BARE, out of the
     /// `<N> validation error(s) detected: ` envelope: a resume token is a member only a
     /// paged READ carries, and a read states a clause about a value it was handed as the
     /// sentence it is ([`unenveloped`]), which is the split this service states everywhere
     /// between the members a write states its intent through and the members a read is
-    /// pointed at.
-    pub fn key_of_start_key(&self, key: &Item) -> Result<ItemKey, RequestError> {
-        self.key_of_map(key, KeySource::StartKey)
+    /// pointed at. `empty_element` is the wording the READ states an empty element of the
+    /// token in ([`EmptyStartKeyElement`]).
+    pub fn key_of_start_key(
+        &self,
+        key: &Item,
+        empty_element: EmptyStartKeyElement<'_>,
+    ) -> Result<ItemKey, RequestError> {
+        self.key_of_map(key, KeySource::StartKey, empty_element)
             .map_err(RequestError::from)
             .map_err(unenveloped)
     }
@@ -478,14 +506,18 @@ impl Table {
     /// schema or against the request's own shape, which is what decides whether the
     /// transaction cancels that element or refuses the call.
     pub fn key_of_transact_item(&self, item: &Item) -> Result<ItemKey, KeyRefusal> {
-        self.key_from(item, KeySource::TransactItem)
+        self.key_from(
+            item,
+            KeySource::TransactItem,
+            EmptyStartKeyElement::NamesTheKey,
+        )
     }
 
     /// The primary key named by the `Key` member of a transactional `Delete`,
     /// `ConditionCheck` or `Update`, with WHICH side decided a refusal of it
     /// ([`KeyRefusal`]) — the classified half of [`Self::key_of_key_map`].
     pub fn key_of_transact_key_map(&self, key: &Item) -> Result<ItemKey, KeyRefusal> {
-        self.key_of_map(key, KeySource::Key)
+        self.key_of_map(key, KeySource::Key, EmptyStartKeyElement::NamesTheKey)
     }
 
     /// The one walk a `Key`-shaped map is read through, whichever member carried it:
@@ -503,7 +535,12 @@ impl Table {
     /// names an attribute this table's key schema declares no key for, or leaves one it
     /// declares out, is held to THAT schema — so inside a transaction it cancels the
     /// element that carried it rather than refusing the call.
-    fn key_of_map(&self, key: &Item, source: KeySource) -> Result<ItemKey, KeyRefusal> {
+    fn key_of_map(
+        &self,
+        key: &Item,
+        source: KeySource,
+        empty_element: EmptyStartKeyElement<'_>,
+    ) -> Result<ItemKey, KeyRefusal> {
         // A map carrying NOTHING names no key element of this schema to be held to it, so
         // it is not shaped like a key at all rather than a key stated wrongly.
         if key.is_empty() {
@@ -526,13 +563,18 @@ impl Table {
                 return Err(KeyRefusal::Schema(source.absent(&element.attribute_name)));
             }
         }
-        self.key_from(key, source)
+        self.key_from(key, source, empty_element)
     }
 
     /// The one walk over the key schema both `Key` and `Item` are read through:
     /// each declared key attribute is taken from `supplied` and encoded, and
     /// `source` decides only how a missing or wrongly-typed element is WORDED.
-    fn key_from(&self, supplied: &Item, source: KeySource) -> Result<ItemKey, KeyRefusal> {
+    fn key_from(
+        &self,
+        supplied: &Item,
+        source: KeySource,
+        empty_element: EmptyStartKeyElement<'_>,
+    ) -> Result<ItemKey, KeyRefusal> {
         let mut partition = None;
         let mut sort = None;
         for element in &self.key_schema {
@@ -548,10 +590,10 @@ impl Table {
                     .declared_type(name)
                     .is_some_and(|declared| declared != attribute_value_type(value))
             {
-                return Err(KeyRefusal::Schema(source.typed_against_schema()));
+                return Err(KeyRefusal::Schema(source.mismatch()));
             }
             let encoded = self
-                .key_value(name, value)
+                .key_value_worded(name, value, empty_element)
                 .map_err(|error| self.classified_key_value_refusal(name, value, error))?;
             if element.key_type == "HASH" {
                 partition = Some(encoded);
@@ -846,6 +888,24 @@ impl Table {
         }
     }
 
+    /// The FIRST secondary index this table declares, global indexes before local ones —
+    /// the order every walk over a table's indexes in this crate takes
+    /// ([`Self::index_key_values`]) — or `None` for a table that declares none.
+    ///
+    /// A `Scan` validates the resume token it was handed against a secondary index of the
+    /// table even where the request names none, so the index its refusal reports is this
+    /// one ([`EmptyStartKeyElement::NamesTheIndexKey`]).
+    pub fn first_secondary_index_name(&self) -> Option<&str> {
+        self.global_secondary_indexes
+            .first()
+            .map(|index| index.name.as_str())
+            .or_else(|| {
+                self.local_secondary_indexes
+                    .first()
+                    .map(|index| index.name.as_str())
+            })
+    }
+
     /// The secondary index an `IndexName` names, whichever kind it is, or `None` when
     /// this table declares no index by that name.
     ///
@@ -932,21 +992,20 @@ impl Table {
     /// The place in `index`'s order an `ExclusiveStartKey` resumes a read from.
     ///
     /// A resume token is read back through the two schemas the read reported it from, so
-    /// a map that names an attribute neither declares or leaves one of them out is the
-    /// INVALID RESUME TOKEN it is ([`START_KEY_INVALID_MESSAGE`]), and one carrying a key
-    /// attribute with a type other than the table declared states the schema reason after
-    /// it ([`START_KEY_SCHEMA_MISMATCH_MESSAGE`]) — as a base-table token does
-    /// ([`Self::key_of_start_key`]), which words a DROPPED table key attribute as the
-    /// invalid token too. An index cursor carries both schemas' key attributes, so one it
-    /// does not carry in full is not that cursor at all.
+    /// a map that names an attribute neither declares, leaves one of them out, or states
+    /// one of them in a type other than the table declared is the INVALID RESUME TOKEN it
+    /// is ([`START_KEY_INVALID_MESSAGE`]) — as a base-table token is
+    /// ([`Self::key_of_start_key`]). An index cursor carries both schemas' key
+    /// attributes, so one it does not carry in full is not that cursor at all.
     ///
-    /// Those two sentences are about the token's SHAPE. Each element it does carry is then
+    /// Those sentences are about the token's SHAPE. Each element it does carry is then
     /// held to the rules every key attribute's value is held to — the documented numeric
     /// domain, the non-emptiness an `S`/`B` key value must have, the size limit of the role
     /// the schema gives it — and a value that breaks one of them earns that rule's own
-    /// sentence, naming the attribute ([`Self::key_value`]), exactly as the same value does
-    /// in a base-table token: the rule belongs to the value, so which schema the attribute
-    /// is a key of does not change what it says.
+    /// sentence, naming the attribute ([`Self::key_value`]). The one such rule stated in
+    /// two wordings is the non-emptiness, and which of them this cursor states is the
+    /// READ's ([`EmptyStartKeyElement`]), for every element of the token alike: the
+    /// index's own key attributes and the table's that the cursor carries beside them.
     ///
     /// Every one of those clauses is stated BARE, for the reason
     /// [`Self::key_of_start_key`] states it: a resume token is a member only a paged READ
@@ -955,8 +1014,10 @@ impl Table {
         &self,
         index: &SecondaryIndex<'_>,
         key: &Item,
+        empty_element: EmptyStartKeyElement<'_>,
     ) -> Result<IndexItemKey, RequestError> {
-        self.index_cursor(index, key).map_err(unenveloped)
+        self.index_cursor(index, key, empty_element)
+            .map_err(unenveloped)
     }
 
     /// That cursor, with each refusal worded as the rule that raised it states it; the
@@ -965,6 +1026,7 @@ impl Table {
         &self,
         index: &SecondaryIndex<'_>,
         key: &Item,
+        empty_element: EmptyStartKeyElement<'_>,
     ) -> Result<IndexItemKey, RequestError> {
         let named: BTreeSet<&str> = Self::index_key_elements(index.key_schema)
             .chain(self.key_schema.iter())
@@ -988,13 +1050,13 @@ impl Table {
                 .declared_type(name)
                 .is_some_and(|declared| declared != attribute_value_type(value))
             {
-                return Err(KeySource::StartKey.typed_against_schema());
+                return Err(KeySource::StartKey.mismatch());
             }
-            values.push(self.key_value(name, value)?);
+            values.push(self.key_value_worded(name, value, empty_element)?);
         }
         // The table's own half of the token is read through the one walk every
         // `ExclusiveStartKey` is read through, over just the attributes it declares.
-        let table = self.key_of_start_key(&self.key_attributes(key))?;
+        let table = self.key_of_start_key(&self.key_attributes(key), empty_element)?;
         Ok(IndexItemKey {
             index: values,
             table,

@@ -401,7 +401,8 @@ async fn a_bare_word_where_a_name_belongs_is_diagnosed_by_the_word_it_spells() {
 /// empty name.
 ///
 /// A `DELETE` leaves no item to report, so the only projection it can ask for is the one
-/// reporting the item it replaced, and the refusal echoes the clause the caller wrote. A
+/// reporting the WHOLE item it replaced, and the refusal echoes the clause the caller
+/// wrote. A
 /// `"quoted"` component of a source path names a table or an index of it, and the empty
 /// name names neither, so such a path is refused as the malformed path it is rather than
 /// resolved and reported as a lookup failure.
@@ -409,11 +410,13 @@ async fn a_bare_word_where_a_name_belongs_is_diagnosed_by_the_word_it_spells() {
 async fn a_delete_returning_clause_and_an_empty_path_component_state_their_own_rule() {
     let router = seeded().await;
 
-    // Both forms that report the item as it stands AFTER the write, in the two spellings
-    // the grammar has for them.
+    // Every form the grammar spells but this verb may not ask for: the two that report the
+    // item as it stands AFTER the write, and the one that names the attributes a write
+    // MODIFIED, which is a projection of an update rather than of a removal.
     for (case, clause) in [
         ("the whole item after the write", "ALL NEW *"),
         ("the changed attributes after the write", "MODIFIED NEW *"),
+        ("the changed attributes as they stood", "MODIFIED OLD *"),
     ] {
         let statement = format!("DELETE FROM \"{TABLE}\" WHERE pk = 'a' RETURNING {clause}");
         let expected = format!(
@@ -430,9 +433,7 @@ async fn a_delete_returning_clause_and_an_empty_path_component_state_their_own_r
     }
 
     // The one form the sentence above names is served, so those refusals are about the
-    // projection the clause asks for and not about the clause being stated. (Which of the
-    // OLD forms a `DELETE` admits is the subject of `partiql_returned_images`, so only the
-    // form this sentence names is read here.)
+    // projection the clause asks for and not about the clause being stated.
     for (case, clause) in [("the whole item as it stood", "ALL OLD *")] {
         let key = format!("deleted-{}", clause.replace(' ', "-"));
         ok(

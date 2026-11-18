@@ -135,18 +135,15 @@ fn delete_table() -> Vec<DeleteRow> {
             refused: None,
         },
         DeleteRow {
+            // "Only RETURNING ALL OLD * is allowed in DELETE statements": the clause
+            // that asks for what an UPDATE modified is refused, and the item stays.
             case: "the key holds the item, MODIFIED OLD",
             statement: format!(
                 "DELETE FROM \"{PAIRED}\" WHERE pk = 'p1' AND sk = 's1' RETURNING MODIFIED \
                  OLD *"
             ),
-            images: vec![json!({
-                "pk": {"S": "p1"},
-                "sk": {"S": "s1"},
-                "qty": {"N": "4"},
-                "note": {"S": "n1"},
-            })],
-            refused: None,
+            images: Vec::new(),
+            refused: Some("ValidationException"),
         },
         DeleteRow {
             case: "the key holds the item and no RETURNING clause is stated",

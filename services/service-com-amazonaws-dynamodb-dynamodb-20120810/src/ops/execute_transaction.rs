@@ -813,7 +813,9 @@ fn write_transaction<Eng: ::std::marker::Send + ::std::marker::Sync + 'static>(
                     {
                         let table = store.active_table(region, &name, now).map_err(lift)?;
                         table.check_index_key_types(&item).map_err(keying)?;
-                        table.check_index_key_values(&item).map_err(lift)?;
+                        table
+                            .check_index_key_values_of_update(&item)
+                            .map_err(lift)?;
                         table.check_vector_attributes(&item).map_err(lift)?;
                     }
                     let reported = crate::state::projected_return_values(

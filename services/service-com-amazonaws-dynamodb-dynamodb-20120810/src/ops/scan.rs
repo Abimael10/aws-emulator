@@ -16,7 +16,9 @@
 //! (`Segment`/`TotalSegments`) divides the key space being walked into one block of
 //! PARTITIONS per segment, so the segments together evaluate every item exactly once and
 //! every item sharing a partition key is evaluated by one of them ([`Segmentation`],
-//! [`Partitions`]).
+//! [`Partitions`]); a resume token belongs to the segment whose block holds it, so one
+//! presented under another segment of the same scan is refused rather than resumed
+//! ([`start_key_of_another_segment`]).
 //!
 //! `FilterExpression` is applied AFTER the page has been read — "a filter
 //! expression is applied after a Scan finishes but before the results are returned"
@@ -573,13 +575,40 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         };
         // Where a previous page stopped, read back through the schema this scan walks
-        // ([`crate::state::resume_from`]).
+        // ([`crate::state::resume_from`]). An EMPTY element of the token is refused
+        // against a SECONDARY INDEX: this reader validates its token against one — the
+        // index the request named, or the first the table declares where it named none —
+        // so the refusal names that index and the element, whichever schema declares the
+        // element as a key ([`crate::state::EmptyStartKeyElement`]). A table that declares
+        // no index at all leaves the plain sentence, since there is no index to report.
+        let empty_element = index
+            .as_ref()
+            .map(|index| index.name)
+            .or_else(|| table.first_secondary_index_name())
+            .map_or(
+                crate::state::EmptyStartKeyElement::NamesTheKey,
+                crate::state::EmptyStartKeyElement::NamesTheIndexKey,
+            );
         let resumed = crate::state::resume_from(
             table,
             index.as_ref(),
             input.exclusive_start_key.as_ref(),
+            empty_element,
         )
         .map_err(lift)?;
+        // "In a parallel scan, a Scan request that includes ExclusiveStartKey must specify
+        // the same segment whose previous Scan returned the corresponding value of
+        // LastEvaluatedKey" (`Scan$ExclusiveStartKey`). A segment is a block of the key
+        // space ([`Segmentation::owns`]), so the place a token resumes from belongs to
+        // exactly one of them: a token presented under another segment names a place this
+        // request's segment does not scan, and resuming it there would read a slice of the
+        // table twice and leave another unread. It is refused rather than served
+        // ([`start_key_of_another_segment`]).
+        if let Some(from) = resumed.as_ref() {
+            if !segmentation.owns(from.partition(index.as_ref())) {
+                return Err(lift(start_key_of_another_segment(&segmentation)));
+            }
+        }
 
         // Segment membership is decided from the row's own PARTITION KEY, not from where
         // the row sits in this walk ([`Segmentation::owns`]), so a later page of the same
@@ -801,6 +830,24 @@ fn lift(error: crate::state::RequestError) -> ScanError {
 /// matches this refusal matches one string whatever it sent.
 const SEGMENT_NOT_BELOW_TOTAL_SEGMENTS_MESSAGE: &str =
     "The Segment parameter is zero-based and must be less than parameter TotalSegments";
+
+/// How a parallel scan resuming an `ExclusiveStartKey` of ANOTHER segment is refused: the
+/// invalid-token statement every unusable resume token earns
+/// ([`crate::state::START_KEY_INVALID_MESSAGE`]) and then WHY — that the token has to be
+/// presented with its own segment — over the pair the request asked for.
+///
+/// "The value of LastEvaluatedKey returned from a parallel Scan request must be used as
+/// ExclusiveStartKey with the same segment ID in a subsequent Scan operation"
+/// (`Scan$Segment`), so the two numbers the sentence states are the request's own
+/// `TotalSegments` and `Segment`: they are what tells a worker which share it asked for,
+/// and the key itself is not echoed back.
+fn start_key_of_another_segment(segmentation: &Segmentation) -> crate::state::RequestError {
+    crate::state::RequestError::Validation(format!(
+        "{}: Invalid ExclusiveStartKey. Please use ExclusiveStartKey with correct Segment. \
+         TotalSegments: {} Segment: {}",
+        crate::state::START_KEY_INVALID_MESSAGE, segmentation.total, segmentation.segment
+    ))
+}
 
 // Which ASK each of this reader's legacy members states, as the position of the expression
 // member that replaced it in the list passed beside them

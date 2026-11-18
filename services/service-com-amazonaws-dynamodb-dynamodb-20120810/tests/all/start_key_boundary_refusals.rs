@@ -8,10 +8,9 @@
 //! 1. a token that is no key of the schema being paged is refused as the invalid TOKEN
 //!    it is — the sentence states the starting key invalid, names neither the attribute
 //!    nor the schema and appends nothing to it — whichever paged read carries it, whether it
-//!    names an attribute that schema declares no key for, carries a spare one beside the key
-//!    or leaves a declared key attribute out, while one that carries exactly that schema's
-//!    key attributes with one of them in another type than declared states the key-schema
-//!    reason after a colon;
+//!    names an attribute that schema declares no key for, carries a spare one beside the key,
+//!    leaves a declared key attribute out, or states one of them in another type than
+//!    declared;
 //! 2. a `Query` token that IS a key of that schema but names a key the
 //!    `KeyConditionExpression` does not select is refused by the HALF of the condition it
 //!    falls outside, each with its own fixed sentence: a token in another partition is
@@ -34,17 +33,16 @@ use smithy_server_runtime::MultiServiceRouter;
 
 use crate::emulator::{call, describe_when_active, emulator, error_code, message, ok};
 
-/// AWS's fixed sentence for a starting key that carries the key attributes of the schema
-/// being paged while stating one of them in another type than that schema declares for it:
-/// the invalid-token statement and the key-schema reason after the colon.
-const START_KEY_TYPE_MISMATCH: &str =
-    "The provided starting key is invalid: The provided key element does not match the schema";
-
 /// AWS's fixed sentence for a starting key that is no key of the schema being paged — an
 /// attribute that schema declares no key for, a spare attribute beside the key, a declared
-/// key attribute left out, or no attribute at all: the invalid-token statement alone, with
-/// nothing appended.
+/// key attribute left out, a declared key attribute stated in another type than the schema
+/// declares, or no attribute at all: the invalid-token statement alone, with nothing
+/// appended.
 const START_KEY_INVALID: &str = "The provided starting key is invalid";
+
+/// The same sentence for a token whose key elements are TYPED against the schema: a key
+/// element of another type is no key of that schema either.
+const START_KEY_TYPE_MISMATCH: &str = START_KEY_INVALID;
 
 /// AWS's fixed sentence for a starting key that is a key of the schema but lies outside
 /// the PARTITION the query's condition selects.
@@ -344,9 +342,8 @@ async fn a_starting_key_that_is_no_key_of_the_schema_states_the_schema_reason() 
 
     // Each row: HOW the token fails to be a key of the table's schema, and the sentence
     // that failure earns — the bare invalid-token sentence for every map that is not this
-    // schema's key, a declared key attribute left out among them, and the schema reason for
-    // a token that carries exactly those key attributes with one of them typed against the
-    // schema.
+    // schema's key, a declared key attribute left out and a key element of another type
+    // among them.
     let tokens: Vec<(&str, Value, &str)> = vec![
         (
             "an attribute the schema does not declare",

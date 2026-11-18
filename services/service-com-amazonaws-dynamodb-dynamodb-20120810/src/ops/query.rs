@@ -670,9 +670,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if let Some(start) = input.exclusive_start_key.as_ref() {
             // Read back through the schema this query walks, so a token that is not a
             // key of that schema is the invalid resume token it is
-            // ([`crate::state::resume_from`]).
-            let resumed = crate::state::resume_from(table, index.as_ref(), Some(start))
-                .map_err(lift)?;
+            // ([`crate::state::resume_from`]). An EMPTY element of it is refused naming
+            // the key attribute alone, which is the wording this reader states for that
+            // rule whichever schema it pages
+            // ([`crate::state::EmptyStartKeyElement::NamesTheKey`]).
+            let resumed = crate::state::resume_from(
+                table,
+                index.as_ref(),
+                Some(start),
+                crate::state::EmptyStartKeyElement::NamesTheKey,
+            )
+            .map_err(lift)?;
             // A page resumes at a key the condition SELECTS — "The primary key of the
             // first item that this operation will evaluate" (`Query$ExclusiveStartKey`)
             // — whichever schema the query walks; a key outside what the condition

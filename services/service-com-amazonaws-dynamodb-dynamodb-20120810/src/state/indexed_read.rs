@@ -449,6 +449,44 @@ pub enum ReadResume {
     Index(IndexItemKey),
 }
 
+impl ReadResume {
+    /// The PARTITION-key component of the place this token resumes from, in the key space
+    /// being walked — the same component a row of that walk sits at
+    /// ([`ReadPosition::partition`]), which is what decides which SEGMENT of a parallel
+    /// walk a place belongs to.
+    pub fn partition(&self, index: Option<&SecondaryIndex<'_>>) -> &[AttributeValueKey] {
+        match self {
+            Self::Table(key) => std::slice::from_ref(&key.partition),
+            Self::Index(key) => index_partition(key, index),
+        }
+    }
+}
+
+/// The leading `HASH` components of one index key.
+///
+/// An index may declare several partition-key elements
+/// ([`crate::state::MAX_INDEX_PARTITION_KEYS`]) and an index key lays its `HASH` values
+/// first ([`Table::index_item_key`]), so the partition of a place in an index walk is
+/// that leading run. Stated once, for the two places that hold one: a row the walk
+/// reached ([`ReadPosition::partition`]) and the place a token resumes from
+/// ([`ReadResume::partition`]).
+fn index_partition<'k>(
+    key: &'k IndexItemKey,
+    index: Option<&SecondaryIndex<'_>>,
+) -> &'k [AttributeValueKey] {
+    let leading = index
+        .map(|index| {
+            index
+                .key_schema
+                .iter()
+                .filter(|element| element.key_type == "HASH")
+                .count()
+        })
+        .unwrap_or(1)
+        .clamp(1, key.index.len().max(1));
+    key.index.get(..leading).unwrap_or(&key.index)
+}
+
 impl ReadPosition<'_> {
     /// The PARTITION-key component of this row's place in the key space being walked:
     /// the table's partition key value, or the `HASH` values of the index's key when the
@@ -462,19 +500,7 @@ impl ReadPosition<'_> {
     pub fn partition(&self, index: Option<&SecondaryIndex<'_>>) -> &[AttributeValueKey] {
         match self {
             Self::Table(key) => std::slice::from_ref(&key.partition),
-            Self::Index(key) => {
-                let leading = index
-                    .map(|index| {
-                        index
-                            .key_schema
-                            .iter()
-                            .filter(|element| element.key_type == "HASH")
-                            .count()
-                    })
-                    .unwrap_or(1)
-                    .clamp(1, key.index.len().max(1));
-                key.index.get(..leading).unwrap_or(&key.index)
-            }
+            Self::Index(key) => index_partition(key, index),
         }
     }
 
@@ -505,6 +531,28 @@ impl ReadPosition<'_> {
     }
 }
 
+/// Which sentence a paged read states for an EMPTY `S`/`B` element of the
+/// `ExclusiveStartKey` it was handed.
+///
+/// The non-emptiness a key value must have is one rule ("Attribute values of type String
+/// and Binary must have a length greater than zero if the attribute is used as a key
+/// attribute for a table or index"), and DynamoDB states it in two wordings: the plain
+/// sentence naming the key attribute, and the one that states a value is not supported for
+/// a SECONDARY INDEX key and names the index beside the element. Which of the two a
+/// resume token earns follows the READ the token was handed to, so each reader names its
+/// own ([`resume_from`]) rather than the rule guessing from the token.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EmptyStartKeyElement<'i> {
+    /// The plain sentence, naming the key attribute alone: what `Query` states, whichever
+    /// schema it pages.
+    NamesTheKey,
+    /// The secondary-index sentence, over the index named here: what `Scan` states, which
+    /// validates its token against a secondary index of the table and reports that index
+    /// beside the element — for EVERY element of the token, the table key attributes that
+    /// index does not declare included.
+    NamesTheIndexKey(&'i str),
+}
+
 /// The place an `ExclusiveStartKey` resumes a read from, read back through the schema
 /// that read walks.
 ///
@@ -515,12 +563,15 @@ pub fn resume_from(
     table: &Table,
     index: Option<&SecondaryIndex<'_>>,
     start: Option<&Item>,
+    empty_element: EmptyStartKeyElement<'_>,
 ) -> Result<Option<ReadResume>, RequestError> {
     match (start, index) {
         (None, _) => Ok(None),
-        (Some(start), None) => Ok(Some(ReadResume::Table(table.key_of_start_key(start)?))),
+        (Some(start), None) => Ok(Some(ReadResume::Table(
+            table.key_of_start_key(start, empty_element)?,
+        ))),
         (Some(start), Some(index)) => Ok(Some(ReadResume::Index(
-            table.index_key_of_start_key(index, start)?,
+            table.index_key_of_start_key(index, start, empty_element)?,
         ))),
     }
 }

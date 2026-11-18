@@ -347,12 +347,12 @@ fn operand_rows() -> Vec<Row> {
 /// A source path with more components than a table and an index of it, and a write
 /// addressed through an index qualifier.
 ///
-/// A verb that names its source inside a CLAUSE — a `SELECT`'s and a `DELETE`'s `FROM`,
-/// an `INSERT`'s `INTO` — is held to what that clause may spell: at most two components
-/// at all (the arity sentence), and, for a write, the single table name (the positioned
-/// sentence, over the token the path opens at). An `UPDATE` names its target with no
-/// clause around it, so a qualifier there asks for the update through an index and earns
-/// the fixed index sentence.
+/// An `INSERT` names WHERE a new item goes inside its `INTO` clause, so that clause is
+/// held to what it may spell: at most two components at all (the arity sentence), and the
+/// single table name (the positioned sentence, over the token the path opens at). An
+/// `UPDATE` and a `DELETE` ADDRESS a stored item through the path they name, so a
+/// qualifier there asks for the write through an index and earns the fixed index sentence.
+/// A `SELECT`'s `FROM` is a read and takes the qualifier, so only its arity is bounded.
 fn source_rows() -> Vec<Row> {
     const PATH_ARITY: &str = "A path may contain at most 2 components in the FROM clause";
     const ON_AN_INDEX: &str = "This operation is not supported on an index";
@@ -404,11 +404,23 @@ fn source_rows() -> Vec<Row> {
             parameters: Value::Null,
             expected: ON_AN_INDEX.to_string(),
         },
+        Row {
+            case: "a DELETE through an index qualifier",
+            statement: format!("DELETE FROM \"keyed\".\"{INDEX}\" WHERE pk = 'a' AND sk = 1"),
+            parameters: Value::Null,
+            expected: ON_AN_INDEX.to_string(),
+        },
+        Row {
+            case: "a DELETE through a bare index qualifier",
+            statement: "DELETE FROM keyed.anyindex WHERE pk = 'a' AND sk = 1".to_string(),
+            parameters: Value::Null,
+            expected: ON_AN_INDEX.to_string(),
+        },
     ];
-    // The two verbs that name their source inside a clause earn the one positioned
-    // sentence, and the position it reports is where the statement OPENS that source
-    // path: the token the path begins with, with that token's own width, so a qualifier
-    // spelled after it moves neither the column nor the width.
+    // The one verb whose clause only NAMES where an item goes earns the positioned
+    // sentence, and the position it reports is where the statement OPENS that path: the
+    // token the path begins with, with that token's own width, so a qualifier spelled
+    // after it moves neither the column nor the width.
     for (case, statement, opens) in [
         (
             "an INSERT through an index qualifier",
@@ -416,13 +428,8 @@ fn source_rows() -> Vec<Row> {
             "\"keyed\"".to_string(),
         ),
         (
-            "a DELETE through an index qualifier",
-            format!("DELETE FROM \"keyed\".\"{INDEX}\" WHERE pk = 'a' AND sk = 1"),
-            "\"keyed\"".to_string(),
-        ),
-        (
-            "a DELETE through a bare index qualifier",
-            "DELETE FROM keyed.anyindex WHERE pk = 'a' AND sk = 1".to_string(),
+            "an INSERT through a bare index qualifier",
+            "INSERT INTO keyed.anyindex VALUE {'pk':'b','sk':2}".to_string(),
             "keyed".to_string(),
         ),
     ] {
@@ -1045,7 +1052,7 @@ async fn a_reported_position_is_counted_in_the_statements_own_lines_and_characte
         ),
         (
             "a source path behind leading indentation",
-            format!("DELETE\n        FROM \"keyed\".\"{INDEX}\"\n    WHERE pk = 'a'"),
+            format!("INSERT\n        INTO \"keyed\".\"{INDEX}\"\n    VALUE {{'pk':'b','sk':2}}"),
         ),
     ] {
         let stated = refused(&router, case, json!({"Statement": statement})).await;
@@ -1062,12 +1069,13 @@ async fn a_reported_position_is_counted_in_the_statements_own_lines_and_characte
 ///
 /// RULE: a data-manipulation statement changes an item of ONE TABLE — an index holds a
 /// projection of a table's items rather than items of its own — so a qualified source is
-/// refused `ValidationException`, and WHICH sentence it states follows how the verb spells
-/// that source. A verb that names it inside a clause (`INSERT INTO`, `DELETE FROM`) is
-/// held to what that clause may spell: the single table name, stated with the position of
-/// the TOKEN the path opens at, and at most two components at all, past which the arity
-/// sentence is what the clause earns. An `UPDATE` names its target with no clause around
-/// it, so a qualifier there asks for the write through an index and states that. The same
+/// refused `ValidationException`, and WHICH sentence it states follows what the verb names
+/// through that path. An `INSERT` names only WHERE a new item goes, inside its `INTO`
+/// clause, so it is held to what that clause may spell: the single table name, stated with
+/// the position of the TOKEN the path opens at, and at most two components at all, past
+/// which the arity sentence is what the clause earns. An `UPDATE` and a `DELETE` ADDRESS a
+/// stored item through the path they name, so a qualifier there asks for the write through
+/// an index and states that. The same
 /// two-component path is a legal source for a READ, which is the control below.
 ///
 /// The rows differ along what the rule generalises over: the verb (`INSERT`, `UPDATE`,
@@ -1080,7 +1088,7 @@ async fn a_reported_position_is_counted_in_the_statements_own_lines_and_characte
 async fn a_write_through_a_qualified_source_names_the_rule_its_verb_broke() {
     let router = seeded().await;
 
-    /// The sentence an `UPDATE` through a qualified target earns.
+    /// The sentence a write that ADDRESSES an item through a qualified path earns.
     const ON_AN_INDEX: &str = "This operation is not supported on an index";
 
     // Each two-component path, spelled four ways, once with whitespace around its
@@ -1128,7 +1136,7 @@ async fn a_write_through_a_qualified_source_names_the_rule_its_verb_broke() {
             (
                 "DELETE",
                 format!("DELETE FROM {path} WHERE pk = 'a' AND sk = 1"),
-                true,
+                false,
             ),
             (
                 "UPDATE",
@@ -1175,8 +1183,7 @@ async fn a_write_through_a_qualified_source_names_the_rule_its_verb_broke() {
 
     // An `UPDATE` has no such clause, so a longer qualifier still asks for the write
     // through an index.
-    let statement = "UPDATE keyed.qual.more SET note = 'two' WHERE pk = 'a' AND sk = 1";
-    let stated = refused(
+    let statement = "UPDATE keyed.qual.more SET note = 'two' WHERE pk = 'a' AND sk = 1";    let stated = refused(
         &router,
         "a three-component UPDATE target",
         json!({"Statement": statement}),
@@ -1273,8 +1280,9 @@ async fn a_qualified_write_source_is_reported_at_the_token_the_path_opens_with()
     // Each row is a source path and the token it opens with: the rows differ along the
     // width of that token, the width of what the path spells after it, the quoting of
     // each component, and the characters the opening token itself spells — one of them
-    // wider than a byte, since the length is counted in characters. Both verbs that name
-    // their source inside a clause run every row.
+    // wider than a byte, since the length is counted in characters. The verb that names
+    // where an item goes inside a clause runs every row; the verbs that ADDRESS an item
+    // through the path report no position at all.
     let paths: Vec<(String, String, String)> = vec![
         (
             "a narrow bare table and a wide quoted qualifier".to_string(),
@@ -1309,18 +1317,14 @@ async fn a_qualified_write_source_is_reported_at_the_token_the_path_opens_with()
     ];
 
     for (spelling, path, opens) in &paths {
-        for (verb, statement) in [
-            ("INSERT", format!("INSERT INTO {path} VALUE {{'pk':'b'}}")),
-            ("DELETE", format!("DELETE FROM {path} WHERE pk = 'a'")),
-        ] {
-            let case = format!("{verb} with {spelling}");
-            let stated = refused(&router, &case, json!({"Statement": statement})).await;
-            let expected = single_table_at(&statement, opens);
-            assert_eq!(
-                stated, expected,
-                "case {case:?}: statement {statement:?} expected {expected:?}, got {stated:?}"
-            );
-        }
+        let statement = format!("INSERT INTO {path} VALUE {{'pk':'b'}}");
+        let case = format!("INSERT with {spelling}");
+        let stated = refused(&router, &case, json!({"Statement": statement.clone()})).await;
+        let expected = single_table_at(&statement, opens);
+        assert_eq!(
+            stated, expected,
+            "case {case:?}: statement {statement:?} expected {expected:?}, got {stated:?}"
+        );
     }
 }
 

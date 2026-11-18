@@ -250,13 +250,18 @@ fn incorrect_operand_count(operator_or_function: &str, operands: usize) -> Reque
     RequestError::Validation(operand_count_clause(operator_or_function, operands))
 }
 
-/// How a data-manipulation statement whose source carries an index qualifier is refused:
-/// the positioned sentence about the clause that names the source.
+/// How an `INSERT` whose `INTO` clause carries an index qualifier is refused: the
+/// positioned sentence about the clause that names the target.
 ///
 /// An index projects a table's items and is written through no statement ("attributes
 /// that are copied (projected) from the table into the global secondary index",
-/// `GlobalSecondaryIndex$Projection`), so the clause naming the source of an `INSERT`, an
-/// `UPDATE` or a `DELETE` names one table and nothing else. The position reported is
+/// `GlobalSecondaryIndex$Projection`), so the clause naming WHERE an inserted item goes
+/// names one table and nothing else. An `INSERT` states no condition on a stored item and
+/// reads none: its clause only names the destination, which is why this is a refusal of
+/// that CLAUSE, positioned in the text. The verbs that address an existing item through
+/// the path they name — an `UPDATE`'s target and a `DELETE`'s `FROM` — ask for the write
+/// through the index instead, and state that ([`unsupported_on_an_index`]). The position
+/// reported is
 /// where the statement OPENS that source path — the token the path begins with, with
 /// that token's own width ([`Position`]) — so every part of the message is a fact of the
 /// request.
@@ -267,15 +272,15 @@ fn single_table_in_data_manipulation(at: Position) -> RequestError {
     ))
 }
 
-/// How an `UPDATE` whose target carries a qualifier is refused: the fixed sentence
-/// DynamoDB states for an operation asked of an index, which is the same one the classic
-/// surface states for one.
+/// How a write that ADDRESSES an item through a qualified path is refused: the fixed
+/// sentence DynamoDB states for an operation asked of an index, which is the same one the
+/// classic surface states for one.
 ///
-/// An `UPDATE` names the item it changes through the statement's own TARGET, with no
-/// clause around it, so a qualifier there does not make a clause name two things — it
-/// asks for the update through an index, and an index holds a projection of a table's
-/// items rather than items of its own. The verbs that name their source inside a clause
-/// (`INSERT INTO`, `DELETE FROM`) earn that clause's own sentence
+/// An `UPDATE` and a `DELETE` name the stored item they change through the path their
+/// statement states — the one they read the item at and write it back to — so a qualifier
+/// there asks for that write through an index, and an index holds a projection of a
+/// table's items rather than items of its own. An `INSERT` names only WHERE a new item
+/// goes, so its clause is refused as the clause it is
 /// ([`single_table_in_data_manipulation`]) instead.
 fn unsupported_on_an_index() -> RequestError {
     RequestError::Validation("This operation is not supported on an index".to_string())
@@ -302,12 +307,14 @@ fn unexpected_path_component(at: Position) -> RequestError {
     RequestError::Validation(format!("Unexpected path component at {}", at.stated()))
 }
 
-/// How a `DELETE` whose `RETURNING` clause asks for the item as it stands AFTER the
-/// write is refused, echoing the clause the statement wrote.
+/// How a `DELETE` whose `RETURNING` clause asks for anything but the item it removed is
+/// refused, echoing the clause the statement wrote.
 ///
-/// A `DELETE` leaves no item to report, so the only projection it can return is the one
-/// it replaced; the sentence names the clause the caller spelled and the one clause that
-/// is allowed instead.
+/// A `DELETE` leaves no item to report, so the only projection it can return is the WHOLE
+/// item it replaced: a clause asking for the item as it stands after the write has nothing
+/// to project, and one asking for the attributes the write MODIFIED names a projection of
+/// an update rather than of a removal. The sentence names the clause the caller spelled
+/// and the one clause that is allowed instead.
 fn invalid_returning_clause(clause: &str) -> RequestError {
     RequestError::Validation(format!(
         "Invalid returning clause: RETURNING {clause}. Only RETURNING ALL OLD * is allowed in \
@@ -989,10 +996,13 @@ impl ReturnedValues {
         }
     }
 
-    /// Whether this form reports the item as it stands AFTER the write, which a
-    /// `DELETE` leaves nothing of.
-    pub fn reports_new(self) -> bool {
-        matches!(self, Self::AllNew | Self::ModifiedNew)
+    /// Whether a `DELETE` may ask for this form: "Only RETURNING ALL OLD * is allowed in
+    /// DELETE statements" ([`invalid_returning_clause`]), so the one form a removal
+    /// projects is the whole item it removed — the forms that report the item as it stands
+    /// AFTER the write have nothing to project, and the `MODIFIED` forms name a projection
+    /// of an update. Every other form is refused as the clause it is rather than served.
+    pub fn allowed_in_a_delete(self) -> bool {
+        matches!(self, Self::AllOld)
     }
 
     /// The `RETURNING` clause that asks for this form, as a refusal about the clause
@@ -1008,13 +1018,11 @@ impl ReturnedValues {
 }
 
 /// The source a statement's `FROM` clause names: the table and the index of it a read
-/// is served through, with the position of the token the path OPENS at — what a refusal
-/// about that path reports its position as ([`Position`]).
+/// is served through.
 #[derive(Debug, Clone)]
 struct StatementSource {
     table: String,
     index: Option<String>,
-    at: Position,
 }
 
 /// A `SELECT`: which stored items to report, and in which order.
@@ -1716,16 +1724,16 @@ impl StatementParser<'_> {
         let source = self.read_source(&["where", "returning"])?;
         let table = source.table;
         if source.index.is_some() {
-            // A `DELETE` removes an item of the TABLE, and an index holds a projection
-            // of one rather than items of its own, so a qualified source names more than
-            // the single table a data-manipulation statement's clause may: the positioned
-            // sentence over the token that path opens with, the same refusal the other
-            // two verbs' targets earn ([`single_table_in_data_manipulation`]).
-            return Err(single_table_in_data_manipulation(source.at));
+            // A `DELETE` addresses an item THROUGH the source it names, and an index holds
+            // a projection of a table's items rather than items of its own, so a qualified
+            // source asks for the removal through an index — the same ask an `UPDATE`'s
+            // qualified target states, and the same fixed sentence
+            // ([`unsupported_on_an_index`]).
+            return Err(unsupported_on_an_index());
         }
         let filter = self.required_where_clause()?;
         let returning = self.returning()?;
-        if let Some(values) = returning.filter(|values| values.reports_new()) {
+        if let Some(values) = returning.filter(|values| !values.allowed_in_a_delete()) {
             return Err(invalid_returning_clause(values.as_clause()));
         }
         Ok(DeleteStatement {
@@ -1747,7 +1755,6 @@ impl StatementParser<'_> {
     /// The source a `FROM` clause names — a `SELECT`'s and a `DELETE`'s: `table` or
     /// `table.index`, either part quoted or bare.
     fn read_source(&mut self, continues: &[&str]) -> Result<StatementSource, RequestError> {
-        let opens_at = self.position();
         let table = self.path_component()?;
         let index = if self.accept(&Token::Dot) {
             Some(self.path_component()?)
@@ -1761,11 +1768,7 @@ impl StatementParser<'_> {
                 FROM_PATH_ARITY_MESSAGE.to_string(),
             ));
         }
-        let source = StatementSource {
-            table,
-            index,
-            at: opens_at,
-        };
+        let source = StatementSource { table, index };
         self.read_table_alias(continues);
         Ok(source)
     }
@@ -1787,8 +1790,7 @@ impl StatementParser<'_> {
     /// The path is READ whole, qualifier included, so a statement whose target carries one
     /// is refused for the target rather than for the token after it, and the position that
     /// comes back is where the path OPENS ([`Position`]). WHICH refusal that is belongs to
-    /// the verb, because it depends on whether the verb names its source inside a clause
-    /// ([`StatementParser::insert`], [`StatementParser::update`]).
+    /// the verb ([`StatementParser::insert`], [`StatementParser::update`]).
     fn write_target(
         &mut self,
         continues: &[&str],
@@ -1804,11 +1806,11 @@ impl StatementParser<'_> {
         Ok((components, opens_at))
     }
 
-    /// The ONE table a source path names, for a verb that spells that path inside a clause
-    /// — an `INSERT`'s `INTO` and a `DELETE`'s `FROM`.
+    /// The ONE table the clause a write names its target in may spell — an `INSERT`'s
+    /// `INTO`.
     ///
-    /// Such a clause names one table and nothing else, so a path of two components is
-    /// refused with the positioned single-table sentence
+    /// Such a clause names WHERE the item goes and nothing else, so a path of two
+    /// components is refused with the positioned single-table sentence
     /// ([`single_table_in_data_manipulation`]), at the token the path opens with, and a
     /// longer one is past what any source path may spell at all, which is the arity
     /// sentence a read's source earns too ([`FROM_PATH_ARITY_MESSAGE`]).

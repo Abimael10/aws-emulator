@@ -9,13 +9,11 @@
 //!    the pages it drives partition the matching items with none lost and none repeated;
 //! 2. a starting key that is NO key of the schema being paged — an attribute the
 //!    schema does not declare, an extra attribute beside the key, a declared key attribute
-//!    left out — is refused as the
+//!    left out, a declared key attribute stated in another TYPE than the schema declares —
+//!    is refused as the
 //!    invalid TOKEN it is: 400 `ValidationException` stating that the starting key is
 //!    invalid, and not the bare mismatch AWS words for a `Key` member, which addresses ONE
-//!    item and is what `GetItem` and `DeleteItem` carry; only a token that carries exactly
-//!    that schema's key attributes while stating one of them in another TYPE than the
-//!    schema declares states that schema reason
-//!    after a colon;
+//!    item and is what `GetItem` and `DeleteItem` carry;
 //! 3. the refusal is the same for both paged reads and for both key schemas a table can
 //!    declare, and a refused request pages nothing.
 //!
@@ -35,10 +33,9 @@ const START_KEY_INVALID: &str =
     service_com_amazonaws_dynamodb_dynamodb_20120810::state::START_KEY_INVALID_MESSAGE;
 
 /// The sentence AWS states for a starting key that carries that schema's key
-/// attributes with one of them in another TYPE than the schema declares, which is the
-/// defect it diagnoses after the colon.
-const START_KEY_TYPE_MISMATCH: &str =
-    service_com_amazonaws_dynamodb_dynamodb_20120810::state::START_KEY_SCHEMA_MISMATCH_MESSAGE;
+/// attributes with one of them in another TYPE than the schema declares: a key element of
+/// another type is no key of that schema either, so it is the same sentence.
+const START_KEY_TYPE_MISMATCH: &str = START_KEY_INVALID;
 
 /// The sentence AWS states for a `Key` MEMBER that is not the table's primary key, which
 /// the paged reads must NOT borrow.

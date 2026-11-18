@@ -1225,34 +1225,52 @@ async fn an_index_cursor_holds_each_key_value_to_the_rule_of_its_own_type() {
     create_cursor_table(&router).await;
 
     // Each row: the index the read pages (`None` for the base table), the cursor it
-    // carries, and the sentence the rule that cursor's value breaks states. The rows span
-    // the schema being paged (the base table, a global index's hash and sort key, a second
-    // global index's binary key, a local index's sort key), the rule broken (an empty `S`
-    // value, an empty `B` value, a text that is no number, a set listing one member twice)
-    // and the attribute's role in the schema that declares it.
-    let empty_string = "One or more parameter values are not valid. The AttributeValue for a key \
-                        attribute cannot contain an empty string value. Key:";
-    let empty_binary = "One or more parameter values are not valid. The AttributeValue for a key \
-                        attribute cannot contain an empty binary value. Key:";
-    let rows: Vec<(&str, Option<&str>, Value, String)> = vec![
+    // carries, and the sentence the rule that cursor's value breaks states — once as
+    // `Query` states it and once as `Scan` does, which differ for the one rule the two
+    // readers word differently (an empty `S`/`B` key value: `Query` names the key
+    // attribute, `Scan` names the secondary index it validated the cursor against). The
+    // rows span the schema being paged (the base table, a global index's hash and sort key,
+    // a second global index's binary key, a local index's sort key), the rule broken (an
+    // empty `S` value, an empty `B` value, a text that is no number, a set listing one
+    // member twice) and the attribute's role in the schema that declares it.
+    let empty_key = |kind: &str, attribute: &str| {
+        format!(
+            "One or more parameter values are not valid. The AttributeValue for a key attribute \
+             cannot contain an empty {kind} value. Key: {attribute}"
+        )
+    };
+    let empty_index_key = |kind: &str, index: &str, attribute: &str| {
+        format!(
+            "One or more parameter values are not valid. A value specified for a secondary index \
+             key is not supported. The AttributeValue for a key attribute cannot contain an empty \
+             {kind} value. IndexName: {index}, IndexKey: {attribute}"
+        )
+    };
+    // (case, index paged, cursor, what `Query` states, what `Scan` states)
+    let rows: Vec<(&str, Option<&str>, Value, String, String)> = vec![
         (
             "the base table's partition key, empty",
             None,
             json!({"pk": {"S": ""}, "sk": {"N": "1"}}),
-            format!("{empty_string} pk"),
+            empty_key("string", "pk"),
+            // A `Scan` naming no index still validates the cursor against one: the first
+            // index the table declares.
+            empty_index_key("string", "ByTag", "pk"),
         ),
         (
             "a global index's hash key, empty",
             Some("ByTag"),
             json!({"tag": {"S": ""}, "rank": {"N": "2"},
                    "pk": {"S": "k"}, "sk": {"N": "1"}}),
-            format!("{empty_string} tag"),
+            empty_key("string", "tag"),
+            empty_index_key("string", "ByTag", "tag"),
         ),
         (
             "a global index's binary hash key, empty",
             Some("ByBlob"),
             json!({"bkey": {"B": ""}, "pk": {"S": "k"}, "sk": {"N": "1"}}),
-            format!("{empty_binary} bkey"),
+            empty_key("binary", "bkey"),
+            empty_index_key("binary", "ByBlob", "bkey"),
         ),
         (
             "a global index's sort key, no number",
@@ -1260,11 +1278,13 @@ async fn an_index_cursor_holds_each_key_value_to_the_rule_of_its_own_type() {
             json!({"tag": {"S": "t"}, "rank": {"N": "nope"},
                    "pk": {"S": "k"}, "sk": {"N": "1"}}),
             "The parameter cannot be converted to a numeric value: nope".to_string(),
+            "The parameter cannot be converted to a numeric value: nope".to_string(),
         ),
         (
             "a local index's sort key, no number",
             Some("ByRank"),
             json!({"pk": {"S": "k"}, "rank": {"N": "1.2.3"}, "sk": {"N": "1"}}),
+            "The parameter cannot be converted to a numeric value: 1.2.3".to_string(),
             "The parameter cannot be converted to a numeric value: 1.2.3".to_string(),
         ),
         (
@@ -1273,10 +1293,11 @@ async fn an_index_cursor_holds_each_key_value_to_the_rule_of_its_own_type() {
             json!({"tag": {"SS": ["a", "a"]}, "rank": {"N": "2"},
                    "pk": {"S": "k"}, "sk": {"N": "1"}}),
             format!("{INVALID_PARAMETER}: Input collection [\"a\", \"a\"] contains duplicates."),
+            format!("{INVALID_PARAMETER}: Input collection [\"a\", \"a\"] contains duplicates."),
         ),
     ];
 
-    for (case, index, cursor, clause) in rows {
+    for (case, index, cursor, queried, scanned) in rows {
         for operation in ["Query", "Scan"] {
             let mut request = json!({"TableName": "Cursors", "ExclusiveStartKey": cursor.clone()});
             if let Some(index) = index {
@@ -1293,6 +1314,11 @@ async fn an_index_cursor_holds_each_key_value_to_the_rule_of_its_own_type() {
                 request["KeyConditionExpression"] = json!(format!("{attribute} = :p"));
                 request["ExpressionAttributeValues"] = json!({":p": value});
             }
+            let clause = if operation == "Query" {
+                queried.clone()
+            } else {
+                scanned.clone()
+            };
             let case = format!("{case} on {operation}");
             let stated = refusal(&router, &case, operation, request).await;
             assert_eq!(
