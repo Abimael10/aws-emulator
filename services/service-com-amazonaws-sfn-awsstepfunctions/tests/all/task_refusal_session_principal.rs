@@ -32,13 +32,17 @@ use service_com_amazonaws_sfn_awsstepfunctions::state::EVENT_TASK_FAILED;
 
 use crate::execution_data_encryption::xml_element;
 use crate::state_machine_lifecycle::{string, REGION};
-use crate::task_execution_role::{trust_document, Chain};
+use crate::task_execution_role::{masked, refusal_metadata, trust_document, Chain, ACCESS_DENIED_CODE};
 
 /// The account id every ARN this emulator mints carries.
 const ACCOUNT: &str = "000000000000";
 
-/// The `Error Code:` fragment every row's cause carries.
-const REFUSAL_CODE: &str = "Error Code: AccessDeniedException";
+/// The status a service that answers an authorization failure as a FORBIDDEN carries,
+/// and the one a service whose front door answers every client error as a BAD REQUEST
+/// carries for the same refusal.
+const FORBIDDEN: u16 = 403;
+/// See [`FORBIDDEN`].
+const CLIENT_ERROR: u16 = 400;
 
 /// The ARN of the SESSION the refusal in `cause` must blame, built the way
 /// `sts:AssumeRole` reports one: the `sts` vendor, no Region, the role's own account, and
@@ -196,6 +200,11 @@ struct Row {
     /// The code the INVOKED service's own answer to an unauthorized call names the class
     /// by, which the relayed metadata reports.
     code: &'static str,
+    /// The name the client this row's FAMILY is served by gives the invoked service, and
+    /// the status that service answers the refusal with — both of which the relayed
+    /// metadata names.
+    service: &'static str,
+    status: u16,
 }
 
 /// RULE: a refused `Task` state's cause names the assumed-role SESSION of the state
@@ -222,7 +231,9 @@ async fn a_refused_tasks_cause_names_the_assumed_role_session_of_the_execution_r
             action: "lambda:InvokeFunction",
             resource_arn: function_arn.clone(),
             because: "because no identity-based policy allows the lambda:InvokeFunction action",
-            code: REFUSAL_CODE,
+            code: ACCESS_DENIED_CODE,
+            service: "AWSLambda",
+            status: FORBIDDEN,
         },
         Row {
             // The same call, refused by an explicit `Deny`, under a role IAM holds beneath
@@ -237,7 +248,9 @@ async fn a_refused_tasks_cause_names_the_assumed_role_session_of_the_execution_r
             action: "lambda:InvokeFunction",
             resource_arn: function_arn.clone(),
             because: "with an explicit deny in an identity-based policy",
-            code: REFUSAL_CODE,
+            code: ACCESS_DENIED_CODE,
+            service: "AWSLambda",
+            status: FORBIDDEN,
         },
         Row {
             // Another service's call, addressed by a queue url, for another state machine:
@@ -256,6 +269,8 @@ async fn a_refused_tasks_cause_names_the_assumed_role_session_of_the_execution_r
             because: "because no identity-based policy allows the sqs:sendmessage action",
             // Amazon SQS's own front door names it `AccessDenied`.
             code: "AccessDenied",
+            service: "AmazonSQS",
+            status: FORBIDDEN,
         },
         Row {
             // And a call of THIS service, made through the AWS SDK integration family.
@@ -269,7 +284,11 @@ async fn a_refused_tasks_cause_names_the_assumed_role_session_of_the_execution_r
             action: "states:StartExecution",
             resource_arn: child_arn.clone(),
             because: "because no identity-based policy allows the states:StartExecution action",
-            code: REFUSAL_CODE,
+            code: ACCESS_DENIED_CODE,
+            // That family names the service as the AWS SDK does, and this service's own
+            // front door answers an authorization failure as a client error.
+            service: "Sfn",
+            status: CLIENT_ERROR,
         },
     ];
 
@@ -344,11 +363,13 @@ async fn a_refused_tasks_cause_names_the_assumed_role_session_of_the_execution_r
                  {named:?} in {cause:?}"
             );
         }
-        // The refusal is still the invoked service's own answer to an unauthorized call.
+        // The refusal is still the invoked service's own answer to an unauthorized call,
+        // rendered by the client this row's family is served by.
+        let expected = refusal_metadata(row.resource, row.service, row.code, row.status);
+        let reported = masked(&cause);
         assert!(
-            cause.contains(row.code),
-            "case {case:?}: expected the cause to carry {:?}, got {cause:?}",
-            row.code
+            reported.ends_with(&expected),
+            "case {case:?}: expected the cause to close {expected:?}, got {reported:?}"
         );
     }
 }

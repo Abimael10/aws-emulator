@@ -95,7 +95,8 @@ use ::std::sync::Arc;
 use ::service_common::iam_authorization::{self as iam, Decision};
 
 use super::integration::{
-    access_request, Api, Call, Denied, Failed, Handovers, MapRuns, RoleGate, TASK_FAILED_ERROR,
+    access_request, Api, Call, Denied, Failed, Family, Handovers, MapRuns, RoleGate,
+    TASK_FAILED_ERROR,
 };
 
 /// The GLOBAL service principal Step Functions assumes a state machine's execution
@@ -372,9 +373,12 @@ pub fn role_gate<Eng: Send + Sync + 'static>(
             },
             &action,
             &resource,
-            call.api.sdk_client,
-            code,
-            status,
+            Answered {
+                api: call.api,
+                family: call.family,
+                code,
+                status,
+            },
         ) {
             // The refusal reaches the state as the error the invoked OPERATION models for
             // an unauthorized call, where it models one; an operation that models none
@@ -518,9 +522,12 @@ pub fn job_report_denial<Eng: Send + Sync + 'static>(
         },
         &call.api.refused_action(&call.action()),
         resource,
-        call.api.sdk_client,
-        code,
-        status,
+        Answered {
+            api: call.api,
+            family: call.family,
+            code,
+            status,
+        },
     )?;
     Some(Failed {
         error: TASK_FAILED_ERROR.to_string(),
@@ -597,26 +604,42 @@ struct Acts<'a> {
 /// per refusal through the tree's one minter of a response's own id — a correlation
 /// value, so it is no part of the sentence and two refusals never share it.
 ///
-/// `code` and `status` are what the invoked operation's own answer to an unauthorized
-/// call carries ([`denied_answer`]), because that is the answer this gate is standing
-/// in for.
+/// `answered` is the answer this gate is standing in for: whose answer it is, and what
+/// the invoked operation's own answer to an unauthorized call carries
+/// ([`denied_answer`]).
 fn refusal(
     iam: &IamState,
     acts: Acts<'_>,
     action: &str,
     resource: &str,
-    service: &str,
-    code: &str,
-    status: u16,
+    answered: Answered<'_>,
 ) -> Option<String> {
     let sentence = not_authorized(iam, acts, action, resource)?;
     Some(super::integration::sdk_exception_message(
-        service,
+        answered.api,
+        answered.family,
         &sentence,
-        code,
-        status,
+        answered.code,
+        answered.status,
         Some(&::service_common::query_error_envelope::new_request_id()),
     ))
+}
+
+/// The answer this gate stands in for, as the state sees it: WHOSE answer it is — the
+/// invoked service, and the integration family whose client the call was made with,
+/// which together decide how the exception is rendered
+/// ([`super::integration::sdk_exception_message`]) — and the code and status that answer
+/// carries.
+#[derive(Debug, Clone, Copy)]
+struct Answered<'a> {
+    /// The service whose API refused the call.
+    api: &'a Api,
+    /// The family whose `Resource` named the call, which is the client it was made with.
+    family: Family,
+    /// The code the answer names the class by.
+    code: &'a str,
+    /// The status it carries.
+    status: u16,
 }
 
 /// IAM's own not-authorized sentence for the identity `acts` performing `action` on

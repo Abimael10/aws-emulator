@@ -76,7 +76,18 @@ const REFUSAL_ERROR: &str = "DynamoDB.AmazonDynamoDBException";
 const SDK_REFUSAL_ERROR: &str = "DynamoDb.AmazonDynamoDBException";
 
 /// The code the refused answer came back under, as the cause reports it.
-const REFUSAL_CODE: &str = "Error Code: AccessDeniedException";
+const REFUSAL_CODE: &str = "AccessDeniedException";
+
+/// The name the client each family is served by gives DynamoDB in the metadata of that
+/// refusal: the earlier client's own name, and the name the current AWS SDK's client
+/// carries.
+const REFUSAL_SERVICE: &str = "AmazonDynamoDBv2";
+/// See [`REFUSAL_SERVICE`].
+const SDK_REFUSAL_SERVICE: &str = "DynamoDb";
+
+/// The status DynamoDB's own front door answers an unauthorized call with: that service
+/// words every client error as a BAD REQUEST.
+const REFUSAL_STATUS: u16 = 400;
 
 /// Step Functions, IAM and DynamoDB over ONE engine.
 struct Chain {
@@ -463,6 +474,12 @@ async fn a_tasks_dynamodb_call_is_made_only_when_the_execution_role_allows_it() 
             true => SDK_REFUSAL_ERROR,
             false => REFUSAL_ERROR,
         };
+        // The metadata the refusal closes with is the one the client that family is
+        // served by writes, naming the service as that client names it.
+        let refusal_service = match resource.contains(":aws-sdk:") {
+            true => SDK_REFUSAL_SERVICE,
+            false => REFUSAL_SERVICE,
+        };
         let (table, table_arn) = match addressed {
             Addressed::Granted => ("granted", granted.as_str()),
             Addressed::GrantedByArn => (granted.as_str(), granted.as_str()),
@@ -537,7 +554,6 @@ async fn a_tasks_dynamodb_call_is_made_only_when_the_execution_role_allows_it() 
         let principal =
             crate::task_refusal_session_principal::session_principal(&role_arn, &cause);
         for fragment in [
-            REFUSAL_CODE,
             &format!("on resource: {table_arn} "),
             &format!("dynamodb:{}", upper_first(action)),
             &principal,
@@ -547,6 +563,17 @@ async fn a_tasks_dynamodb_call_is_made_only_when_the_execution_role_allows_it() 
                 "case {case:?}: expected the cause to carry {fragment:?}, got {cause:?}"
             );
         }
+        let expected = crate::task_execution_role::refusal_metadata(
+            resource,
+            refusal_service,
+            REFUSAL_CODE,
+            REFUSAL_STATUS,
+        );
+        let reported = crate::task_execution_role::masked(&cause);
+        assert!(
+            reported.ends_with(&expected),
+            "case {case:?}: expected the cause to close {expected:?}, got {reported:?}"
+        );
         assert!(
             !types.contains(&EVENT_TASK_SUBMITTED.to_string()),
             "case {case:?}: nothing was submitted, so no {EVENT_TASK_SUBMITTED} may appear, got \

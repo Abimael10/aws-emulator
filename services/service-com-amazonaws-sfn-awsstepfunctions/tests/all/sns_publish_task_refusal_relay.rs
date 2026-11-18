@@ -13,7 +13,11 @@
 //!    for an `awsQuery` service is the class of the ERROR SHAPE its model binds the
 //!    legacy query code to — not that code with an `Exception` suffix;
 //! 2. the CAUSE is that exception's own message: the service's sentence, then the
-//!    metadata the answer carried, the id of the refused request included.
+//!    metadata the answer carried, the id of the refused request included — rendered by
+//!    the client the `Resource`'s own integration FAMILY is served by, which is the
+//!    current AWS SDK for an `arn:aws:states:::aws-sdk:<service>:<action>` `Resource`
+//!    and the earlier generation of client for an optimized one
+//!    (`crate::task_execution_role::refusal_metadata` states the two renderings).
 //!
 //! The rows differ along what each rule generalises over: which refusal of SNS the
 //! publish meets and therefore whether its query code names its own shape (`NotFound`,
@@ -38,8 +42,21 @@ use service_com_amazonaws_sfn_awsstepfunctions::EmulatedService;
 
 use crate::execution_data_encryption::{form_encode, xml_element};
 use crate::state_machine_lifecycle::{string, REGION};
-use crate::task_execution_role::trust_document;
+use crate::task_execution_role::{masked, refusal_metadata, trust_document, REQUEST_ID};
 use crate::task_refusal_session_principal::session_principal;
+
+/// The `Resource` each integration family names this publish by: the two are the same
+/// call on the same topic, served by two different clients of Amazon SNS.
+const OPTIMIZED_PUBLISH: &str = "arn:aws:states:::sns:publish";
+/// See [`OPTIMIZED_PUBLISH`].
+const SDK_PUBLISH: &str = "arn:aws:states:::aws-sdk:sns:publish";
+
+/// The name the client each family is served by gives Amazon SNS, which is what its
+/// rendering of an exception reports the service under: the earlier client's own name,
+/// and the name the current AWS SDK's `Sns` client carries.
+const SNS_CLIENT: &str = "AmazonSNS";
+/// See [`SNS_CLIENT`].
+const SNS_SDK_NAME: &str = "Sns";
 
 /// The access-key id every request below is signed with: the account's own published
 /// credential, which no identity policy governs.
@@ -362,12 +379,12 @@ impl Chain {
     }
 }
 
-/// A one-state definition whose `Task` publishes `parameters`, with a `Catch` that keeps
-/// what failed when `caught`, and no handler otherwise.
-fn definition(parameters: Value, caught: bool) -> String {
+/// A one-state definition whose `Task` names `resource` and publishes `parameters`, with
+/// a `Catch` that keeps what failed when `caught`, and no handler otherwise.
+fn definition(resource: &str, parameters: Value, caught: bool) -> String {
     let mut state = json!({
         "Type": "Task",
-        "Resource": "arn:aws:states:::sns:publish",
+        "Resource": resource,
         "Parameters": parameters,
         "End": true,
     });
@@ -429,30 +446,33 @@ fn reported(case: &str, described: &Value) -> (String, String) {
     )
 }
 
-/// The metadata an AWS SDK closes an exception's message with, up to the identifier of
-/// the refused request — which is one call's own value, so what is asserted is that the
-/// segment is there and carries one.
-fn metadata(status: u16, code: &str) -> String {
-    format!("(Service: AmazonSNS; Status Code: {status}; Error Code: {code}; Request ID: ")
-}
-
-/// Hold `cause` to `sentence` followed by that metadata: the id is read out of it and
-/// required to be a non-empty value of this call's own.
-fn assert_cause(case: &str, cause: &str, sentence: &str, status: u16, code: &str) {
-    let expected = format!("{sentence} {}", metadata(status, code));
-    assert!(
-        cause.starts_with(&expected),
-        "case {case:?}: expected the cause to open {expected:?}, got {cause:?}"
+/// Hold `cause` to `sentence` followed by the metadata the client the `Resource`
+/// `resource` belongs to is served by closes an exception's message with, with the id of
+/// the refused request masked ([`masked`]): that id is one call's own value, so what is
+/// held is the whole text around it — and the field has to carry one, which is asserted
+/// of the cause as it came.
+fn assert_cause(case: &str, cause: &str, resource: &str, sentence: &str, status: u16, code: &str) {
+    let service = match resource.contains(":aws-sdk:") {
+        true => SNS_SDK_NAME,
+        false => SNS_CLIENT,
+    };
+    let expected = format!(
+        "{sentence}{}",
+        refusal_metadata(resource, service, code, status)
     );
-    assert!(
-        cause.ends_with("; Proxy: null)"),
-        "case {case:?}: expected the cause to close \"; Proxy: null)\", got {cause:?}"
+    let reported = masked(cause);
+    assert_eq!(
+        reported, expected,
+        "case {case:?}: expected the cause {expected:?}, got {reported:?} (read from {cause:?})"
     );
-    let request_id = cause[expected.len()..cause.len() - "; Proxy: null)".len()].to_string();
-    assert!(
-        !request_id.is_empty() && !request_id.contains(';'),
-        "case {case:?}: expected the metadata to name the refused request, got {cause:?}"
-    );
+    // The id the mask stood in for is a value of this call's own: a field carrying none
+    // closes straight after it, and nothing in the message spells the mask itself.
+    for unnamed in ["Request ID: ;", "Request ID: )", REQUEST_ID] {
+        assert!(
+            !cause.contains(unnamed),
+            "case {case:?}: expected the metadata to name the refused request, got {cause:?}"
+        );
+    }
 }
 
 /// A state machine name as long as one may be: `Name` is `length 1..80`
@@ -620,7 +640,7 @@ async fn a_refused_sns_publish_task_reports_the_modelled_exception_and_its_messa
         let machine = chain
             .machine(
                 &machine_name,
-                &definition(parameters, row.caught),
+                &definition(OPTIMIZED_PUBLISH, parameters, row.caught),
                 &role_arn,
             )
             .await;
@@ -664,7 +684,7 @@ async fn a_refused_sns_publish_task_reports_the_modelled_exception_and_its_messa
                 None => "Topic does not exist".to_string(),
             },
         };
-        assert_cause(case, &cause, &sentence, row.status, row.code);
+        assert_cause(case, &cause, OPTIMIZED_PUBLISH, &sentence, row.status, row.code);
 
         // The same message reaches the history the failed work was reported in.
         let events = chain.history(&execution_arn).await;
@@ -710,6 +730,7 @@ async fn a_publish_task_is_refused_once_its_grant_is_withdrawn() {
         .machine(
             machine_name,
             &definition(
+                OPTIMIZED_PUBLISH,
                 json!({ "TopicArn": topic, "Message.$": "$.message" }),
                 true,
             ),
@@ -768,7 +789,14 @@ async fn a_publish_task_is_refused_once_its_grant_is_withdrawn() {
          identity-based policy allows the SNS:Publish action",
         session_principal(&role_arn, &cause)
     );
-    assert_cause("withdrawn", &cause, &sentence, 403, "AuthorizationError");
+    assert_cause(
+        "withdrawn",
+        &cause,
+        OPTIMIZED_PUBLISH,
+        &sentence,
+        403,
+        "AuthorizationError",
+    );
     let events = chain.history(&execution_arn).await;
     let failed: Vec<String> = events
         .iter()
@@ -787,4 +815,203 @@ async fn a_publish_task_is_refused_once_its_grant_is_withdrawn() {
         delivered.is_empty(),
         "case \"withdrawn\": a refused publish delivers nothing, got {delivered:?}"
     );
+}
+
+/// A destination that is not an ARN at all, and the sentence Amazon SNS refuses an
+/// ARN-typed member holding one with: the member it names and the reason it failed — an
+/// ARN has six colon-separated elements, and this value has one.
+const NOT_AN_ARN: &str = "not-an-arn";
+/// See [`NOT_AN_ARN`].
+const NOT_AN_ARN_SENTENCE: &str =
+    "Invalid parameter: TopicArn Reason: An ARN must have at least 6 elements, not 1";
+
+/// The fixed sentence SNS answers a publish to a well-formed topic ARN naming no topic
+/// with.
+const NO_SUCH_TOPIC_SENTENCE: &str = "Topic does not exist";
+
+/// Which refusal of the publish a row meets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Refusal {
+    /// A well-formed topic ARN that names no topic of the account: SNS's own modelled
+    /// `NotFoundException`.
+    AbsentTopic,
+    /// A destination that is not an ARN, which is bad input rather than a lookup miss.
+    NotAnArn,
+    /// The publish itself, which the documents in force on the execution role say
+    /// nothing about — the refusal the role gate answers for the service.
+    Unauthorized,
+}
+
+impl Refusal {
+    /// The code the answer names the class by, and the status it carries.
+    fn answered(self) -> (&'static str, u16) {
+        match self {
+            Self::AbsentTopic => ("NotFound", 404),
+            Self::NotAnArn => ("InvalidParameter", 400),
+            Self::Unauthorized => ("AuthorizationError", 403),
+        }
+    }
+
+    /// What the execution role is granted: the publish on everything for a row the
+    /// SERVICE refuses, so nothing but that refusal decides the task, and nothing about
+    /// the publish for the row the role itself is refused by.
+    fn granted(self) -> &'static [&'static str] {
+        match self {
+            Self::AbsentTopic | Self::NotAnArn => &["SNS:Publish"],
+            Self::Unauthorized => &[],
+        }
+    }
+}
+
+/// One row: the `Resource` the publish is named by, the refusal it meets, and the error
+/// name the task reports for it.
+struct Envelope {
+    case: &'static str,
+    resource: &'static str,
+    refusal: Refusal,
+    error: &'static str,
+    /// Whether the state carries a `Catch`, which is where a handled failure's `Cause`
+    /// is read from.
+    caught: bool,
+}
+
+/// RULE: the cause a failed `Task` reports is the invoked service's exception as the
+/// client its integration FAMILY is served by renders it — the current AWS SDK through an
+/// `arn:aws:states:::aws-sdk:<service>:<action>` `Resource`, whose message closes with
+/// one COMMA-separated group naming the service as that SDK names it, the status and the
+/// refused request, and then a group naming how many attempts the call took, and the
+/// earlier generation of client through an optimized `Resource`, whose message closes
+/// with SEMICOLON-separated fields naming its own client, the status, the error code, the
+/// request and `Proxy: null`.
+///
+/// The rows differ along what the rule generalises over: which family named the publish,
+/// which refusal of SNS it meets (a topic the account does not hold, a destination that
+/// is no ARN at all, and the publish the role may not make, which the gate answers for
+/// the service) and therefore the status it carries and whether the sentence is the
+/// service's own fixed text or IAM's, and whether a `Catch` routes the failure.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_refused_publish_carries_the_envelope_of_the_client_its_family_is_served_by() {
+    let chain = Chain::new();
+    let topic = chain.topic("envelope-orders").await;
+    let url = chain.subscriber("envelope-orders-queue", &topic).await;
+    let absent = format!("arn:aws:sns:{REGION}:000000000000:no-such-topic");
+
+    let rows: &[Envelope] = &[
+        Envelope {
+            case: "a topic the account does not hold, through the AWS SDK family",
+            resource: SDK_PUBLISH,
+            refusal: Refusal::AbsentTopic,
+            error: "Sns.NotFoundException",
+            caught: true,
+        },
+        Envelope {
+            // The same refusal of the same publish through the other family, whose
+            // client renders the exception its own way.
+            case: "the same topic through the optimized integration",
+            resource: OPTIMIZED_PUBLISH,
+            refusal: Refusal::AbsentTopic,
+            error: "SNS.NotFoundException",
+            caught: true,
+        },
+        Envelope {
+            case: "a destination that is no ARN, through the AWS SDK family",
+            resource: SDK_PUBLISH,
+            refusal: Refusal::NotAnArn,
+            error: "Sns.InvalidParameterException",
+            caught: false,
+        },
+        Envelope {
+            case: "the same destination through the optimized integration",
+            resource: OPTIMIZED_PUBLISH,
+            refusal: Refusal::NotAnArn,
+            error: "SNS.InvalidParameterException",
+            caught: false,
+        },
+        Envelope {
+            // The refusal the role gate answers FOR the service reaches the state the
+            // same way, so it is rendered by the same client.
+            case: "a publish the execution role may not make, through the AWS SDK family",
+            resource: SDK_PUBLISH,
+            refusal: Refusal::Unauthorized,
+            error: "Sns.AuthorizationErrorException",
+            caught: true,
+        },
+        Envelope {
+            case: "the same refused publish through the optimized integration",
+            resource: OPTIMIZED_PUBLISH,
+            refusal: Refusal::Unauthorized,
+            error: "SNS.AuthorizationErrorException",
+            caught: false,
+        },
+    ];
+
+    for (index, row) in rows.iter().enumerate() {
+        let case = row.case;
+        let addressed = match row.refusal {
+            Refusal::AbsentTopic => absent.clone(),
+            Refusal::NotAnArn => NOT_AN_ARN.to_string(),
+            Refusal::Unauthorized => topic.clone(),
+        };
+        let role_arn = chain
+            .role(
+                &format!("EnvelopeRole{index}"),
+                "/",
+                Some(&policy(row.refusal.granted(), "*")),
+            )
+            .await;
+        let machine = chain
+            .machine(
+                &format!("envelope-{index}"),
+                &definition(
+                    row.resource,
+                    json!({ "TopicArn": addressed, "Message.$": "$.message" }),
+                    row.caught,
+                ),
+                &role_arn,
+            )
+            .await;
+        let input = json!({ "message": "a notification" });
+        let (execution_arn, described) = chain.ran(&machine, "only", &input, case).await;
+        let (error, cause) = reported(case, &described);
+        assert_eq!(
+            error, row.error,
+            "case {case:?}: expected the error {:?}, got {error:?} with cause {cause:?}",
+            row.error
+        );
+
+        let (code, status) = row.refusal.answered();
+        let sentence = match row.refusal {
+            Refusal::AbsentTopic => NO_SUCH_TOPIC_SENTENCE.to_string(),
+            Refusal::NotAnArn => NOT_AN_ARN_SENTENCE.to_string(),
+            Refusal::Unauthorized => format!(
+                "User: {} is not authorized to perform: SNS:Publish on resource: {topic} because \
+                 no identity-based policy allows the SNS:Publish action",
+                session_principal(&role_arn, &cause)
+            ),
+        };
+        assert_cause(case, &cause, row.resource, &sentence, status, code);
+
+        // The same message reaches the history the failed work was reported in, which is
+        // where a log reader and an alarm see it.
+        let events = chain.history(&execution_arn).await;
+        let failed: Vec<String> = events
+            .iter()
+            .filter(|event| event.get("type").and_then(Value::as_str) == Some(EVENT_TASK_FAILED))
+            .filter_map(|event| event.get("taskFailedEventDetails").cloned())
+            .map(|details| string(&details, "cause"))
+            .collect();
+        assert_eq!(
+            failed,
+            vec![cause.clone()],
+            "case {case:?}: expected exactly one {EVENT_TASK_FAILED} carrying the cause \
+             {cause:?}, got {events:?}"
+        );
+
+        // And a refused publish publishes nothing: the subscribed queue stays empty.
+        let delivered = chain.drain(&url).await;
+        assert!(
+            delivered.is_empty(),
+            "case {case:?}: a refused publish delivers nothing, got {delivered:?}"
+        );
+    }
 }

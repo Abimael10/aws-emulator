@@ -41,6 +41,11 @@ use bytes::Bytes;
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
+// The two renderings of an SDK exception's metadata, and the masking of the request id
+// inside one, which `all/sfn_task_target_authorization.rs` already owns: `tests/all.rs`
+// is one crate root, so this suite borrows both rather than carrying a second copy.
+use crate::sfn_task_target_authorization::{masked, refusal_metadata};
+
 /// The region every request here is signed for.
 const REGION: &str = "us-west-2";
 
@@ -291,13 +296,27 @@ struct Row {
 /// com-amazonaws-dynamodb-dynamodb-20120810.json")` reports `httpError` 400 for both.
 const REFUSAL_STATUS: u16 = 400;
 
+/// The name the client each integration family is served by gives DynamoDB, which is
+/// what its rendering of an exception reports the service under: the earlier client's own
+/// name, and the name the current AWS SDK's `DynamoDb` client carries.
+const CLIENT_NAME: &str = "AmazonDynamoDBv2";
+/// See [`CLIENT_NAME`].
+const SDK_CLIENT_NAME: &str = "DynamoDb";
+
 /// The id the relayed sentence names the refused request by, with the WHOLE sentence
 /// pinned around it.
 ///
 /// Everything but the id is fixed text this suite writes out — the service's own sentence,
-/// the client the call was made with, the status, the error code — so the id is the one
-/// part read out of the answer, and it is judged by its FORM alone.
-fn relayed_request_id(case: &str, cause: &str, sentence: &Sentence, code: &str) -> String {
+/// the client the call was made with, the status, and whatever else that client's
+/// rendering carries — so the id is the one part read out of the answer, and it is judged
+/// by its FORM alone.
+fn relayed_request_id(
+    case: &str,
+    cause: &str,
+    sentence: &Sentence,
+    code: &str,
+    resource: &str,
+) -> String {
     let (stated, metadata) = cause.split_once(METADATA_MARKER).unwrap_or_else(|| {
         panic!(
             "case {case:?}: expected the invoked service's sentence followed by \
@@ -318,15 +337,25 @@ fn relayed_request_id(case: &str, cause: &str, sentence: &Sentence, code: &str) 
     let at = metadata.find(MARKER).unwrap_or_else(|| {
         panic!("case {case:?}: expected the relayed metadata to name the request, got {cause:?}")
     });
-    let rest = &metadata[at + MARKER.len()..];
-    let id = rest[..rest.find(';').unwrap_or(rest.len())].to_string();
+    // The id runs up to whichever delimiter closes its field.
+    let id: String = metadata[at + MARKER.len()..]
+        .chars()
+        .take_while(|character| !";)".contains(*character))
+        .collect();
+    // The whole metadata around it is the fixed text the client that made the call
+    // writes, which is the one its integration family is served by.
+    let service = match resource.contains(":aws-sdk:") {
+        true => SDK_CLIENT_NAME,
+        false => CLIENT_NAME,
+    };
+    let expected = format!(
+        "{stated}{}",
+        refusal_metadata(resource, service, code, REFUSAL_STATUS)
+    );
+    let reported = masked(cause);
     assert_eq!(
-        metadata,
-        format!(
-            "AmazonDynamoDBv2; Status Code: {REFUSAL_STATUS}; Error Code: {code}; \
-             Request ID: {id}; Proxy: null)"
-        ),
-        "case {case:?}: expected the metadata DynamoDB's own SDK client appends, got {cause:?}"
+        reported, expected,
+        "case {case:?}: expected the metadata DynamoDB's own client appends, got {cause:?}"
     );
     assert!(
         names_a_dynamodb_request(&id),
@@ -451,7 +480,7 @@ async fn a_relayed_dynamodb_answer_names_its_request_the_way_dynamodb_does() {
             row.error
         );
         let cause = string(&described, "cause");
-        let id = relayed_request_id(case, &cause, &row.sentence, row.code);
+        let id = relayed_request_id(case, &cause, &row.sentence, row.code, row.resource);
         assert!(
             named.insert(id.clone()),
             "case {case:?}: every call is named by its own request id, and {id} was already \

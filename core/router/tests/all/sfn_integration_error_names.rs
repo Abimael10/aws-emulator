@@ -13,10 +13,13 @@
 //! with the `Exception` suffix the SDKs give it — and under that service's BASE
 //! exception where the answer named no shape of its model: one of AWS's common errors,
 //! or a shape of the request framework in front of the service. The cause is that
-//! exception's own message: the service's sentence, then the metadata the answer carried
-//! — the client it was made with, the status, the error code (the LEGACY query code for
-//! a query-compatible service, which is the code its own client matches on) and the
-//! identifier of the request.
+//! exception's own message: the service's sentence, then the metadata the answer carried,
+//! as the client the integration family is served by renders it — the current AWS SDK
+//! naming the service, the status and the request in comma-separated fields and then the
+//! attempts the call took, and the earlier generation of client naming its own client,
+//! the status, the error code (the LEGACY query code for a query-compatible service,
+//! which is the code that client matches on), the request and the proxy, separated by
+//! semicolons.
 //!
 //! Two crates have to agree for that to hold — Amazon SQS and Lambda answer the refusal,
 //! Step Functions names it — so the suite lives here rather than in either of them, and
@@ -141,7 +144,12 @@ async fn a_refused_integration_call_is_named_after_the_services_own_exception() 
             resource: "arn:aws:states:::aws-sdk:sqs:sendMessage",
             parameters: json!({ "QueueUrl": absent_url.clone(), "MessageBody": "nowhere" }),
             error: "Sqs.QueueDoesNotExistException",
-            carries: vec!["The specified queue does not exist.".to_string()],
+            carries: vec![
+                "The specified queue does not exist.".to_string(),
+                // That family is served by the current AWS SDK, whose rendering names
+                // the service as that SDK does and carries no error code at all.
+                "(Service: Sqs, Status Code: 400, Request ID: ".to_string(),
+            ],
         },
         Row {
             // A second service, and the arm of the rule where the shape's own name
@@ -188,10 +196,16 @@ async fn a_refused_integration_call_is_named_after_the_services_own_exception() 
             );
         }
         // Every one of them is the rendering of an SDK exception, which ends in the
-        // metadata the answer carried.
+        // metadata the answer carried — closed as the client this row's family is served
+        // by closes it.
+        let closing = match row.resource.contains(":aws-sdk:") {
+            true => ") (SDK Attempt Count: 1)",
+            false => "; Proxy: null)",
+        };
         assert!(
-            cause.ends_with("Proxy: null)"),
-            "case {case:?}: expected the SDK exception's own message, got {cause:?}"
+            cause.ends_with(closing),
+            "case {case:?}: expected the SDK exception's own message to close {closing:?}, got \
+             {cause:?}"
         );
         // The cause is the same sentence the execution's own record reports.
         assert_eq!(

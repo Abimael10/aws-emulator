@@ -55,14 +55,73 @@ pub(crate) const ACCOUNT: &str = "000000000000";
 /// How long a row waits for an execution to leave `RUNNING`.
 const PATIENCE: Duration = Duration::from_secs(20);
 
-/// The fragment the cause of an access-denied refusal carries: the code the answer came
-/// back under, which is the invoked service's own — the AWS-common one for all but the
-/// services whose front door words it differently.
-const REFUSAL_CODE: &str = "Error Code: AccessDeniedException";
+/// The code the cause of an access-denied refusal names the class by, which is the
+/// invoked service's own — the AWS-common one for all but the services whose front door
+/// words it differently.
+pub(crate) const REFUSAL_CODE: &str = "AccessDeniedException";
 
 /// Amazon SQS's own: its front door answers an unauthorized call `AccessDenied`, and names
 /// the action it refused in the lower case its authorization layer reports.
-const SQS_REFUSAL_CODE: &str = "Error Code: AccessDenied";
+const SQS_REFUSAL_CODE: &str = "AccessDenied";
+
+/// The status a service that answers an authorization failure as a FORBIDDEN carries.
+const FORBIDDEN: u16 = 403;
+
+/// How a suite names the id of the refused request: an AWS service names every call it
+/// refuses by an id of that call's own, so no particular value is part of the text and
+/// what a suite holds is everything around it.
+pub(crate) const REQUEST_ID: &str = "<id>";
+
+/// `cause` with the id of the refused request replaced by [`REQUEST_ID`].
+///
+/// `pub(crate)` for the same reason the harness is: every suite here that holds a failed
+/// `Task` state's cause to the text its client wrote reads it this way, and
+/// `tests/all.rs` is one crate root.
+pub(crate) fn masked(cause: &str) -> String {
+    const NAMES: &str = "Request ID: ";
+    let Some((sentence, named)) = cause.split_once(NAMES) else {
+        return cause.to_string();
+    };
+    // The id runs up to whichever delimiter closes its field: the separator for a client
+    // that writes a field after it, the closing parenthesis for one that writes it last.
+    let id: String = named
+        .chars()
+        .take_while(|character| !";)".contains(*character))
+        .collect();
+    format!("{sentence}{NAMES}{REQUEST_ID}{}", &named[id.len()..])
+}
+
+/// The metadata the client a `Task`'s integration family is served by closes a refused
+/// call's message with, with the refused request's id masked ([`masked`]).
+///
+/// Step Functions serves the AWS SDK family (`arn:aws:states:::aws-sdk:<service>:<op>`)
+/// through the current AWS SDK, whose exception message closes with ONE group of
+/// COMMA-separated fields — the service as that SDK's own client names it, the status and
+/// the refused request — and then a second group naming how many attempts the call took;
+/// an optimized `Resource` is served by the earlier generation of client, whose message
+/// closes with SEMICOLON-separated fields: that client's own name, the status, the code
+/// the answer named the class by, the refused request, and the proxy the call went
+/// through — there is none, so `Proxy: null`.
+///
+/// `service` is the name the client of `resource`'s own family gives the invoked service,
+/// which is not the same name for both families.
+pub(crate) fn refusal_metadata(
+    resource: &str,
+    service: &str,
+    code: &str,
+    status: u16,
+) -> String {
+    match resource.contains(":aws-sdk:") {
+        true => format!(
+            " (Service: {service}, Status Code: {status}, Request ID: {REQUEST_ID}) \
+             (SDK Attempt Count: 1)"
+        ),
+        false => format!(
+            " (Service: {service}; Status Code: {status}; Error Code: {code}; \
+             Request ID: {REQUEST_ID}; Proxy: null)"
+        ),
+    }
+}
 
 /// The ARN of the SESSION a refusal of one of an execution's calls blames, read back out of
 /// the refusal `cause`: Step Functions
@@ -436,6 +495,9 @@ struct Row {
     parameters: Value,
     action: &'static str,
     code: &'static str,
+    /// The name the client this row's FAMILY is served by gives the invoked service,
+    /// which is what its rendering of the exception reports the service under.
+    service: &'static str,
     refusal_error: &'static str,
 }
 
@@ -464,6 +526,7 @@ async fn an_integration_call_the_role_is_not_granted_is_not_made() {
             parameters: json!({ "QueueUrl": queue_url.clone(), "MessageBody": "hello" }),
             action: "sqs:sendmessage",
             code: SQS_REFUSAL_CODE,
+            service: "AmazonSQS",
             refusal_error: "SQS.AmazonSQSException",
         },
         Row {
@@ -475,6 +538,7 @@ async fn an_integration_call_the_role_is_not_granted_is_not_made() {
             action: "sqs:sendmessage",
             code: SQS_REFUSAL_CODE,
             // That family names the service as the AWS SDK does.
+            service: "Sqs",
             refusal_error: "Sqs.AmazonSQSException",
         },
         Row {
@@ -483,6 +547,7 @@ async fn an_integration_call_the_role_is_not_granted_is_not_made() {
             parameters: json!({ "FunctionName": function_arn.clone(), "Payload": {} }),
             action: "lambda:InvokeFunction",
             code: REFUSAL_CODE,
+            service: "AWSLambda",
             refusal_error: "Lambda.AWSLambdaException",
         },
         Row {
@@ -491,6 +556,7 @@ async fn an_integration_call_the_role_is_not_granted_is_not_made() {
             parameters: json!({ "FunctionName": function_arn.clone(), "Payload": {} }),
             action: "lambda:InvokeFunction",
             code: REFUSAL_CODE,
+            service: "Lambda",
             refusal_error: "Lambda.AWSLambdaException",
         },
         Row {
@@ -501,6 +567,7 @@ async fn an_integration_call_the_role_is_not_granted_is_not_made() {
             parameters: json!({ "FunctionName": "absent-handler" }),
             action: "lambda:InvokeFunction",
             code: REFUSAL_CODE,
+            service: "AWSLambda",
             refusal_error: "Lambda.AWSLambdaException",
         },
     ];
@@ -530,10 +597,14 @@ async fn an_integration_call_the_role_is_not_granted_is_not_made() {
         );
         let details = task_failure(&router, &execution_arn, case).await;
         let cause = string(&details, "cause");
+        // The metadata the cause closes with is the one the client this row's family is
+        // served by writes: the invoked service as that client names it, the status and
+        // the code its answer carried.
+        let expected = refusal_metadata(row.resource, row.service, row.code, FORBIDDEN);
+        let reported = masked(&cause);
         assert!(
-            cause.contains(row.code),
-            "case {case:?}: expected the cause to carry {:?}, got {cause:?}",
-            row.code
+            reported.ends_with(&expected),
+            "case {case:?}: expected the cause to close {expected:?}, got {reported:?}"
         );
         assert!(
             cause.contains(row.action),

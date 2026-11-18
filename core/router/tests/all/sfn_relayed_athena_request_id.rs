@@ -7,10 +7,13 @@
 //!
 //! RULE: every AWS response names the request it answered, and an AWS SDK renders a
 //! service exception as the service's own sentence followed by the metadata that answer
-//! carried — `<message> (Service: <client>; Status Code: <status>; Error Code: <code>;
-//! Request ID: <id>; Proxy: null)`, whose key names, order, separators and closing
-//! `Proxy: null` are fixed text. Step Functions puts that rendering in a failed task's
-//! `cause`, so the `Request ID: <id>;` segment is there for every refusal a task relays,
+//! carried, whose key names, order and separators are fixed text of the client that made
+//! the call — the current AWS SDK through an `arn:aws:states:::aws-sdk:<service>:<action>`
+//! `Resource` (`<message> (Service: <sdk name>, Status Code: <status>, Request ID: <id>)
+//! (SDK Attempt Count: <n>)`) and the earlier generation of client through an optimized
+//! one (`<message> (Service: <client>; Status Code: <status>; Error Code: <code>; Request
+//! ID: <id>; Proxy: null)`). Step Functions puts that rendering in a failed task's
+//! `cause`, so the `Request ID: <id>` segment is there for every refusal a task relays,
 //! and a succeeded task reports the same id in the `SdkResponseMetadata.RequestId` of the
 //! SDK response it answers with. Each call is named by its OWN id, so no two of them
 //! repeat one.
@@ -46,7 +49,8 @@ use smithy_server_runtime::MultiServiceRouter;
 // Functions itself. `tests/all/main.rs` is one crate root, so this suite borrows them
 // rather than carrying a second copy.
 use crate::sfn_task_target_authorization::{
-    allow, logs_only, machine, ran, ran_with_input, role, string, task_failure, REGION,
+    allow, logs_only, machine, masked, ran, ran_with_input, refusal_metadata, role, string,
+    task_failure, REGION,
 };
 
 /// How long a poll waits for the condition it is waiting on — a query leaving `RUNNING`.
@@ -60,9 +64,12 @@ const GLANCE: Duration = Duration::from_millis(25);
 /// client appends to it.
 const METADATA_MARKER: &str = " (Service: ";
 
-/// The name the Athena SDK client carries, which is what its exceptions report the service
-/// under.
+/// The name the client each integration family is served by gives Athena, which is what
+/// its rendering of an exception reports the service under: the earlier client's own name,
+/// and the name the current AWS SDK's `Athena` client carries.
 const SDK_CLIENT: &str = "AmazonAthena";
+/// See [`SDK_CLIENT`].
+const CURRENT_SDK_NAME: &str = "Athena";
 
 /// The refusal class a read of an execution Athena never minted comes back under, and the
 /// status that class is answered with:
@@ -169,9 +176,10 @@ fn names_an_athena_request(id: &str) -> bool {
 /// pinned around it.
 ///
 /// Everything but the id is fixed text this suite writes out — the service's own sentence,
-/// the client the call was made with, the status, the error code — so the id is the one
-/// part read out of the answer, and it is judged by its FORM alone.
-fn relayed_request_id(case: &str, cause: &str, sentence: &str) -> String {
+/// the client the call was made with, the status, and whatever else that client's rendering
+/// carries — so the id is the one part read out of the answer, and it is judged by its
+/// FORM alone.
+fn relayed_request_id(case: &str, cause: &str, sentence: &str, resource: &str) -> String {
     let (stated, metadata) = cause.split_once(METADATA_MARKER).unwrap_or_else(|| {
         panic!(
             "case {case:?}: expected the invoked service's sentence followed by \
@@ -186,15 +194,23 @@ fn relayed_request_id(case: &str, cause: &str, sentence: &str) -> String {
     let at = metadata.find(MARKER).unwrap_or_else(|| {
         panic!("case {case:?}: expected the relayed metadata to name the request, got {cause:?}")
     });
-    let rest = &metadata[at + MARKER.len()..];
-    let id = rest[..rest.find(';').unwrap_or(rest.len())].to_string();
+    // The id runs up to whichever delimiter closes its field.
+    let id: String = metadata[at + MARKER.len()..]
+        .chars()
+        .take_while(|character| !";)".contains(*character))
+        .collect();
+    let service = match resource.contains(":aws-sdk:") {
+        true => CURRENT_SDK_NAME,
+        false => SDK_CLIENT,
+    };
+    let expected = format!(
+        "{stated}{}",
+        refusal_metadata(resource, service, REFUSAL_CODE, REFUSAL_STATUS)
+    );
+    let reported = masked(cause);
     assert_eq!(
-        metadata,
-        format!(
-            "{SDK_CLIENT}; Status Code: {REFUSAL_STATUS}; Error Code: {REFUSAL_CODE}; \
-             Request ID: {id}; Proxy: null)"
-        ),
-        "case {case:?}: expected the metadata Athena's own SDK client appends, got {cause:?}"
+        reported, expected,
+        "case {case:?}: expected the metadata Athena's own client appends, got {cause:?}"
     );
     assert!(
         names_an_athena_request(&id),
@@ -309,7 +325,7 @@ async fn a_relayed_athena_answer_names_the_request_it_answered() {
             "case {case:?}: expected the error {REFUSAL_ERROR:?}, got {described:?}"
         );
         let cause = string(&described, "cause");
-        let id = relayed_request_id(case, &cause, &row.sentence);
+        let id = relayed_request_id(case, &cause, &row.sentence, row.resource);
         assert!(
             named.insert(id.clone()),
             "case {case:?}: every call is named by its own request id, and {id} was already \

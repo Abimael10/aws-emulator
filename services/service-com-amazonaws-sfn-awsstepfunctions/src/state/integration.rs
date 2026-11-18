@@ -4482,12 +4482,11 @@ fn answer_of(
             // matches the class on: the legacy query code where the service names
             // one, and the error shape's name where it does not.
             sdk_exception_cause(
-                api,
+                called,
                 &message,
                 query_code.unwrap_or_else(|| bare_name(&shape)),
                 status,
                 request_id,
-                operation,
             ),
         ),
         None => (
@@ -4546,50 +4545,103 @@ const RESPONSE_METADATA_ELEMENT: &str = "ResponseMetadata";
 /// invoked service's SDK raised carries.
 ///
 /// An AWS SDK renders a service exception as the service's own message followed by the
-/// metadata that answer carried — the client the call was made with, the status, the
-/// error code and the identifier of the request — and that rendering is what Step
-/// Functions puts in the task's cause, which is why a `Catch` path reading the cause
-/// finds the service's error code in it. The ONE rendering of it: a refusal the
-/// authorization gate makes on the service's behalf is reported the same way, through
-/// [`sdk_exception_message`] below. A fact the answer did not carry is left out rather
-/// than invented: a refusal naming no request is reported without one, and a refusal
-/// carrying no message of its own says which call of which service came back under that
-/// code.
+/// metadata that answer carried, and that rendering is what Step Functions puts in the
+/// task's cause — which is why a `Catch` path reading the cause finds the status and the
+/// service in it. WHICH rendering is the serving client's
+/// ([`sdk_exception_message`]). The ONE rendering of it: a refusal the authorization gate
+/// makes on the service's behalf is reported the same way, through that same function. A
+/// fact the answer did not carry is left out rather than invented: a refusal naming no
+/// request is reported without one, and a refusal carrying no message of its own says
+/// which call of which service came back under that code.
 fn sdk_exception_cause(
-    api: &Api,
+    called: Called<'_>,
     message: &str,
     code: &str,
     status: u16,
     request_id: Option<&str>,
-    operation: &str,
 ) -> String {
+    let Called {
+        api,
+        family,
+        operation,
+    } = called;
     let message = match message.is_empty() {
         true => format!("{} refused the '{operation}' call with {code}", api.sdk_id),
         false => message.to_string(),
     };
-    sdk_exception_message(api.sdk_client, &message, code, status, request_id)
+    sdk_exception_message(api, family, &message, code, status, request_id)
 }
 
 /// One SDK exception as its own client renders it: the service's sentence, then the
 /// metadata the answer carried.
 ///
+/// Step Functions serves the two integration families through two different clients of
+/// the invoked service ([`Family`]), and each generation of client renders a service
+/// exception in its own form — so the cause carries the form the SERVING client wrote:
+///
+/// * the AWS SDK family is served by the current AWS SDK, whose message is the sentence
+///   followed by ONE parenthesised group of COMMA-separated fields — the service as that
+///   SDK's own client names it ([`Api::sdk_error_prefix`]), the status, and the refused
+///   request — and then a second group naming how many attempts the call took
+///   ([`sdk_attempt_metadata`]). It names no error code and no proxy;
+/// * an optimized integration is served by the earlier generation of clients, whose
+///   message is the sentence followed by SEMICOLON-separated fields: the name that
+///   client carries ([`Api::sdk_client`]), the status, the code the answer named the
+///   class by, the refused request, and the proxy the call went through — there is none,
+///   so `Proxy: null`.
+///
 /// Public to this crate because a refusal the emulator answers FOR the invoked service
 /// ([`super::task_authorization`]) is the same exception reaching the state the same
-/// way: one rendering, so the two cannot drift. `client` is the name that service's own
-/// SDK client carries ([`Api::sdk_client`]), which is what an exception reports the
-/// service under; `request_id` is the identifier the answer named the request by, left
-/// out where there is none — a call that was never made has no request to name.
+/// way: one rendering, so the two cannot drift. `request_id` is the identifier the
+/// answer named the request by, left out where there is none — a call that was never
+/// made has no request to name.
 pub fn sdk_exception_message(
-    client: &str,
+    api: &Api,
+    family: Family,
     message: &str,
     code: &str,
     status: u16,
     request_id: Option<&str>,
 ) -> String {
-    let request = request_id.map_or_else(String::new, |id| format!("Request ID: {id}; "));
+    match family {
+        Family::AwsSdk => {
+            sdk_attempt_metadata(api.sdk_error_prefix, message, status, request_id)
+        }
+        Family::Optimized => {
+            let request = request_id.map_or_else(String::new, |id| format!("Request ID: {id}; "));
+            format!(
+                "{message} (Service: {}; Status Code: {status}; Error Code: {code}; \
+                 {request}Proxy: null)",
+                api.sdk_client
+            )
+        }
+    }
+}
+
+/// How many attempts the client made for the call a refusal came back from, which the
+/// current SDK's rendering reports last.
+///
+/// One: this emulator's client makes each integration call once and does not make it
+/// again, so a refusal is the first attempt's. A `Retry` in the state's own definition
+/// does not add to it — each retry is a fresh call, made by a client of its own.
+const SDK_ATTEMPTS: u32 = 1;
+
+/// A refusal as the CURRENT AWS SDK renders it: `service`'s own sentence, the metadata
+/// the answer carried, and how many attempts the call took ([`SDK_ATTEMPTS`]).
+///
+/// `pub(super)` because a KMS refusal this service relays ([`super::encryption`]) reached
+/// it through a client of that same generation, so it is rendered here too rather than
+/// worded a second time. `service` is the name that SDK's own client gives the service.
+pub(super) fn sdk_attempt_metadata(
+    service: &str,
+    message: &str,
+    status: u16,
+    request_id: Option<&str>,
+) -> String {
+    let request = request_id.map_or_else(String::new, |id| format!(", Request ID: {id}"));
     format!(
-        "{message} (Service: {client}; Status Code: {status}; Error Code: {code}; \
-         {request}Proxy: null)"
+        "{message} (Service: {service}, Status Code: {status}{request}) \
+         (SDK Attempt Count: {SDK_ATTEMPTS})"
     )
 }
 

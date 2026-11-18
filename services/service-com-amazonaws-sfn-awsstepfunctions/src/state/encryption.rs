@@ -142,11 +142,6 @@ const KMS_SERVICE_NAME: &str = "Kms";
 /// `Kms*` shapes this service relays them as carry.
 const KMS_REFUSAL_STATUS: u16 = 400;
 
-/// How many attempts the refused KMS call took, which the relayed metadata reports
-/// last: a key state and an authorization decision are both conditions retrying cannot
-/// change, so the call that was refused was made once and not again.
-const KMS_ATTEMPTS: u32 = 1;
-
 /// The ENCRYPTION CONTEXT entry Step Functions binds every cryptographic operation on a
 /// STATE MACHINE's data to: the name is the one a key policy or a grant conditioned on
 /// `kms:EncryptionContext:<entry>` is written against, and its value is the ARN of the
@@ -295,11 +290,17 @@ macro_rules! kms_key_refusal {
 /// own sentence followed by the metadata an AWS error carries — the service that
 /// refused, the status and the id of the request that was refused, then how many
 /// attempts it took.
+///
+/// The call that failed was made with the current AWS SDK, so the rendering is that
+/// SDK's own — the one this crate renders every exception of that generation with
+/// ([`super::integration::sdk_attempt_metadata`]), so a relayed KMS refusal and a
+/// relayed refusal of an integration call cannot drift apart.
 fn relayed(message: &str) -> String {
-    format!(
-        "{message} (Service: {KMS_SERVICE_NAME}, Status Code: {KMS_REFUSAL_STATUS}, \
-         Request ID: {}) (SDK Attempt Count: {KMS_ATTEMPTS})",
-        ::service_common::query_error_envelope::new_request_id()
+    super::integration::sdk_attempt_metadata(
+        KMS_SERVICE_NAME,
+        message,
+        KMS_REFUSAL_STATUS,
+        Some(&::service_common::query_error_envelope::new_request_id()),
     )
 }
 

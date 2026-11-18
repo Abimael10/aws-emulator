@@ -32,11 +32,18 @@ use serde_json::{json, Value};
 use service_com_amazonaws_sfn_awsstepfunctions::state::EVENT_TASK_FAILED;
 
 use crate::state_machine_lifecycle::{string, REGION};
-use crate::task_execution_role::{Chain, REFUSAL_CODE};
+use crate::task_execution_role::{masked, refusal_metadata, Chain, ACCESS_DENIED_CODE};
 
 /// The code Amazon SQS's OWN front door names an authorization refusal by, which is not
-/// the AWS-common one every other service here answers ([`REFUSAL_CODE`]).
+/// the AWS-common one every other service here answers ([`ACCESS_DENIED_CODE`]).
 const SQS_REFUSAL_CODE: &str = "AccessDenied";
+
+/// The status a service that answers an authorization failure as a FORBIDDEN carries,
+/// and the one a service whose front door answers every client error as a BAD REQUEST
+/// carries for the same refusal.
+const FORBIDDEN: u16 = 403;
+/// See [`FORBIDDEN`].
+const CLIENT_ERROR: u16 = 400;
 
 /// The account id every ARN this emulator mints carries.
 const ACCOUNT: &str = "000000000000";
@@ -72,10 +79,17 @@ struct Row {
     action: &'static str,
     resource_arn: String,
     refusal_error: &'static str,
-    /// The `Error Code:` fragment the cause carries: the code the invoked operation's
-    /// OWN answer to an unauthorized call names its class by, which is
-    /// [`REFUSAL_CODE`] for an operation that models no such error.
+    /// The code the cause's metadata names the class by: the code the invoked
+    /// operation's OWN answer to an unauthorized call carries, which is
+    /// [`ACCESS_DENIED_CODE`] for an operation that models no such error.
     refusal_code: &'static str,
+    /// The name the client this row's FAMILY is served by gives the invoked service,
+    /// which is what that client's rendering of the exception names it under: the
+    /// earlier client's own name through an optimized `Resource`, and the current AWS
+    /// SDK's name for the service through the AWS SDK family.
+    service: &'static str,
+    /// The status the invoked service answers that refusal with.
+    status: u16,
 }
 
 /// A call whose published action the execution role is not granted is refused with the
@@ -120,6 +134,8 @@ async fn an_integration_call_is_judged_by_its_own_action_and_addressed_resource(
             resource_arn: queue_arn.clone(),
             refusal_error: "SQS.AmazonSQSException",
             refusal_code: SQS_REFUSAL_CODE,
+            service: "AmazonSQS",
+            status: FORBIDDEN,
         },
         Row {
             // The other family makes the same call on the same queue, so the refusal
@@ -132,6 +148,8 @@ async fn an_integration_call_is_judged_by_its_own_action_and_addressed_resource(
             // That family names the service as the AWS SDK does.
             refusal_error: "Sqs.AmazonSQSException",
             refusal_code: SQS_REFUSAL_CODE,
+            service: "Sqs",
+            status: FORBIDDEN,
         },
         // `Publish` MODELS the refusal of an unauthorized call
         // (`AuthorizationErrorException`, HTTP 403 under the query code
@@ -144,7 +162,9 @@ async fn an_integration_call_is_judged_by_its_own_action_and_addressed_resource(
             action: "SNS:Publish",
             resource_arn: topic_arn.clone(),
             refusal_error: "SNS.AuthorizationErrorException",
-            refusal_code: "Error Code: AuthorizationError",
+            refusal_code: "AuthorizationError",
+            service: "AmazonSNS",
+            status: FORBIDDEN,
         },
         Row {
             case: "the same publish through the AWS SDK integration",
@@ -154,7 +174,9 @@ async fn an_integration_call_is_judged_by_its_own_action_and_addressed_resource(
             resource_arn: topic_arn,
             // That family names the service as the AWS SDK does.
             refusal_error: "Sns.AuthorizationErrorException",
-            refusal_code: "Error Code: AuthorizationError",
+            refusal_code: "AuthorizationError",
+            service: "Sns",
+            status: FORBIDDEN,
         },
         Row {
             case: "an invocation, the function named by its ARN",
@@ -163,7 +185,9 @@ async fn an_integration_call_is_judged_by_its_own_action_and_addressed_resource(
             action: "lambda:InvokeFunction",
             resource_arn: function_arn.clone(),
             refusal_error: "Lambda.AWSLambdaException",
-            refusal_code: REFUSAL_CODE,
+            refusal_code: ACCESS_DENIED_CODE,
+            service: "AWSLambda",
+            status: FORBIDDEN,
         },
         Row {
             case: "the same invocation through the AWS SDK integration",
@@ -172,7 +196,10 @@ async fn an_integration_call_is_judged_by_its_own_action_and_addressed_resource(
             action: "lambda:InvokeFunction",
             resource_arn: function_arn.clone(),
             refusal_error: "Lambda.AWSLambdaException",
-            refusal_code: REFUSAL_CODE,
+            refusal_code: ACCESS_DENIED_CODE,
+            // That family names the service as the AWS SDK does.
+            service: "Lambda",
+            status: FORBIDDEN,
         },
         Row {
             // A bare function name names the same function, so it is the same access
@@ -183,7 +210,9 @@ async fn an_integration_call_is_judged_by_its_own_action_and_addressed_resource(
             action: "lambda:InvokeFunction",
             resource_arn: function_arn.clone(),
             refusal_error: "Lambda.AWSLambdaException",
-            refusal_code: REFUSAL_CODE,
+            refusal_code: ACCESS_DENIED_CODE,
+            service: "AWSLambda",
+            status: FORBIDDEN,
         },
         Row {
             // The partial form Lambda documents names it too.
@@ -193,7 +222,9 @@ async fn an_integration_call_is_judged_by_its_own_action_and_addressed_resource(
             action: "lambda:InvokeFunction",
             resource_arn: function_arn,
             refusal_error: "Lambda.AWSLambdaException",
-            refusal_code: REFUSAL_CODE,
+            refusal_code: ACCESS_DENIED_CODE,
+            service: "AWSLambda",
+            status: FORBIDDEN,
         },
         Row {
             // A backup is taken INTO the vault the request names by name, so the access
@@ -210,7 +241,11 @@ async fn an_integration_call_is_judged_by_its_own_action_and_addressed_resource(
             action: "backup:StartBackupJob",
             resource_arn: vault_arn,
             refusal_error: "Backup.AWSBackupException",
-            refusal_code: REFUSAL_CODE,
+            refusal_code: ACCESS_DENIED_CODE,
+            // AWS Backup's front door answers an unauthorized call as a client error,
+            // and that family names the service as the AWS SDK does.
+            service: "Backup",
+            status: CLIENT_ERROR,
         },
     ];
 
@@ -250,10 +285,15 @@ async fn an_integration_call_is_judged_by_its_own_action_and_addressed_resource(
             .get("taskFailedEventDetails")
             .unwrap_or_else(|| panic!("case {case:?}: expected taskFailedEventDetails"));
         let cause = string(details, "cause");
+        // The metadata the cause closes with is the one the client this row's family is
+        // served by writes: the invoked service as that client names it, the status and
+        // the code its answer carried, and — for the current SDK — the attempts the call
+        // took, with no error code or proxy field.
+        let expected = refusal_metadata(row.resource, row.service, row.refusal_code, row.status);
+        let reported = masked(&cause);
         assert!(
-            cause.contains(row.refusal_code),
-            "case {case:?}: expected the cause to carry {:?}, got {cause:?}",
-            row.refusal_code
+            reported.ends_with(&expected),
+            "case {case:?}: expected the cause to close {expected:?}, got {reported:?}"
         );
         assert!(
             cause.contains(row.action),

@@ -145,7 +145,9 @@ async fn pairs(emulator: &Emulator) -> Vec<Pair> {
             optimized_service: "DynamoDB",
             sdk_service: "DynamoDb",
             exception: "ResourceNotFoundException",
-            carries: "Error Code: ResourceNotFoundException".to_string(),
+            // The sentence DynamoDB answers for a table it does not hold, which is the
+            // service's own answer whichever family named the call.
+            carries: "Requested resource not found".to_string(),
         },
         Pair {
             // Amazon SQS models `QueueDoesNotExist` WITHOUT the suffix its class
@@ -193,7 +195,8 @@ async fn pairs(emulator: &Emulator) -> Vec<Pair> {
             optimized_service: "StepFunctions",
             sdk_service: "Sfn",
             exception: "StateMachineDoesNotExistException",
-            carries: "Error Code: StateMachineDoesNotExist".to_string(),
+            // This service's own sentence for a state machine it does not hold.
+            carries: "State Machine Does Not Exist".to_string(),
         },
     ]
 }

@@ -65,9 +65,76 @@ const REFUSAL_ERROR: &str = "StepFunctions.AWSStepFunctionsException";
 /// the service as the AWS SDK does.
 const SDK_REFUSAL_ERROR: &str = "Sfn.AWSStepFunctionsException";
 
-/// The fragments the cause of that refusal carries: the code the answer came back
-/// under, and the resource the call was refused ON.
-pub(crate) const REFUSAL_CODE: &str = "Error Code: AccessDeniedException";
+/// The code the answer to an unauthorized call names its class by, where the invoked
+/// operation models no error of its own for one.
+pub(crate) const ACCESS_DENIED_CODE: &str = "AccessDeniedException";
+
+/// The name the client each family is served by gives THIS service in the metadata of a
+/// refusal: the earlier client's own name, and the name the current AWS SDK's client
+/// carries.
+const REFUSAL_SERVICE: &str = "AWSStepFunctions";
+/// See [`REFUSAL_SERVICE`].
+const SDK_REFUSAL_SERVICE: &str = "Sfn";
+
+/// The status this service's own front door answers an unauthorized call with.
+const REFUSAL_STATUS: u16 = 400;
+
+/// How a suite names the id of the refused request: an AWS service names every call it
+/// refuses by an id of that call's own, so no particular value is part of the text and
+/// what a suite holds is everything around it.
+pub(crate) const REQUEST_ID: &str = "<id>";
+
+/// `cause` with the id of the refused request replaced by [`REQUEST_ID`].
+///
+/// `pub(crate)` because every suite that holds a refused `Task` state's cause to the
+/// text its client wrote reads it this way: `tests/all.rs` is one crate root, so the
+/// masking is stated here once.
+pub(crate) fn masked(cause: &str) -> String {
+    const NAMES: &str = "Request ID: ";
+    let Some((sentence, named)) = cause.split_once(NAMES) else {
+        return cause.to_string();
+    };
+    // The id runs up to whichever delimiter closes its field, which is the separator for
+    // a client that writes one field after it and the closing parenthesis for one that
+    // writes it last.
+    let id: String = named
+        .chars()
+        .take_while(|character| !";)".contains(*character))
+        .collect();
+    format!("{sentence}{NAMES}{REQUEST_ID}{}", &named[id.len()..])
+}
+
+/// The metadata the client a `Task`'s integration family is served by closes a refused
+/// call's message with, with the refused request's id masked ([`masked`]).
+///
+/// Step Functions serves the AWS SDK family (`arn:aws:states:::aws-sdk:<service>:<op>`)
+/// through the current AWS SDK, whose exception message closes with ONE group of
+/// COMMA-separated fields — the service as that SDK's own client names it, the status and
+/// the refused request — and then a second group naming how many attempts the call took;
+/// an optimized `Resource` is served by the earlier generation of client, whose message
+/// closes with SEMICOLON-separated fields: that client's own name, the status, the code
+/// the answer named the class by, the refused request, and the proxy the call went
+/// through — there is none, so `Proxy: null`.
+///
+/// `service` is the name the client of `resource`'s own family gives the invoked
+/// service, which is not the same name for both families.
+pub(crate) fn refusal_metadata(
+    resource: &str,
+    service: &str,
+    code: &str,
+    status: u16,
+) -> String {
+    match resource.contains(":aws-sdk:") {
+        true => format!(
+            " (Service: {service}, Status Code: {status}, Request ID: {REQUEST_ID}) \
+             (SDK Attempt Count: 1)"
+        ),
+        false => format!(
+            " (Service: {service}; Status Code: {status}; Error Code: {code}; \
+             Request ID: {REQUEST_ID}; Proxy: null)"
+        ),
+    }
+}
 
 /// A child definition that finishes at once.
 const CHILD: &str = r#"{"StartAt":"Done","States":{"Done":{"Type":"Pass","End":true}}}"#;
@@ -477,9 +544,17 @@ async fn a_tasks_call_is_made_only_when_the_execution_role_allows_it() {
             "case {case:?}: expected the task's own error to name the refusal, got {details:?}"
         );
         let cause = string(details, "cause");
+        // The metadata the cause closes with is the one the client this row's family is
+        // served by writes, naming this service's own answer to an unauthorized call.
+        let service = match resource == AWS_SDK {
+            true => SDK_REFUSAL_SERVICE,
+            false => REFUSAL_SERVICE,
+        };
+        let expected = refusal_metadata(resource, service, ACCESS_DENIED_CODE, REFUSAL_STATUS);
+        let reported = masked(&cause);
         assert!(
-            cause.contains(REFUSAL_CODE),
-            "case {case:?}: expected the cause to carry {REFUSAL_CODE:?}, got {cause:?}"
+            reported.ends_with(&expected),
+            "case {case:?}: expected the cause to close {expected:?}, got {reported:?}"
         );
         // The resource it was refused ON is the one the request named, taken from the
         // state's own parameters.

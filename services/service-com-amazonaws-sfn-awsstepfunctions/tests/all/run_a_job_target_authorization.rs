@@ -33,10 +33,14 @@ use serde_json::{json, Value};
 use service_com_amazonaws_sfn_awsstepfunctions::state::EVENT_TASK_FAILED;
 
 use crate::state_machine_lifecycle::{string, REGION};
-use crate::task_execution_role::{Chain, REFUSAL_CODE};
+use crate::task_execution_role::{masked, refusal_metadata, Chain, ACCESS_DENIED_CODE};
 
 /// The account id every ARN this emulator mints carries.
 const ACCOUNT: &str = "000000000000";
+
+/// The status the front doors of the services called here answer an unauthorized call
+/// with: both word every client error as a BAD REQUEST.
+const CLIENT_ERROR: u16 = 400;
 
 /// The workgroup an Athena query runs in when its request names none: "if a workgroup
 /// is not specified, a list of available query execution IDs for the queries in the
@@ -71,6 +75,9 @@ struct Row {
     action: &'static str,
     resource_arn: String,
     refusal_error: &'static str,
+    /// The name the client this row's FAMILY is served by gives the invoked service,
+    /// which is what the relayed metadata names it under.
+    service: &'static str,
 }
 
 /// The work a run-a-job integration starts is judged by the action the invoked
@@ -108,6 +115,7 @@ async fn a_started_jobs_call_is_judged_on_the_resource_the_job_belongs_to() {
             action: "athena:StartQueryExecution",
             resource_arn: work_group_arn.clone(),
             refusal_error: "Athena.AmazonAthenaException",
+            service: "AmazonAthena",
         },
         Row {
             // The run-a-job pattern makes the same starting call on the same
@@ -118,6 +126,7 @@ async fn a_started_jobs_call_is_judged_on_the_resource_the_job_belongs_to() {
             action: "athena:StartQueryExecution",
             resource_arn: work_group_arn.clone(),
             refusal_error: "Athena.AmazonAthenaException",
+            service: "AmazonAthena",
         },
         Row {
             // And so does the other family, whose parameters are the invoked
@@ -128,6 +137,8 @@ async fn a_started_jobs_call_is_judged_on_the_resource_the_job_belongs_to() {
             action: "athena:StartQueryExecution",
             resource_arn: work_group_arn,
             refusal_error: "Athena.AmazonAthenaException",
+            // That family names the service as the AWS SDK does.
+            service: "Athena",
         },
         Row {
             // A request naming no workgroup runs in the account's default one, which
@@ -138,6 +149,7 @@ async fn a_started_jobs_call_is_judged_on_the_resource_the_job_belongs_to() {
             action: "athena:StartQueryExecution",
             resource_arn: default_work_group_arn,
             refusal_error: "Athena.AmazonAthenaException",
+            service: "AmazonAthena",
         },
         Row {
             case: "a Glue job run, the job named",
@@ -146,6 +158,7 @@ async fn a_started_jobs_call_is_judged_on_the_resource_the_job_belongs_to() {
             action: "glue:StartJobRun",
             resource_arn: job_arn.clone(),
             refusal_error: "Glue.AWSGlueException",
+            service: "AWSGlue",
         },
         Row {
             case: "the same job run through the AWS SDK integration",
@@ -154,6 +167,7 @@ async fn a_started_jobs_call_is_judged_on_the_resource_the_job_belongs_to() {
             action: "glue:StartJobRun",
             resource_arn: job_arn,
             refusal_error: "Glue.AWSGlueException",
+            service: "Glue",
         },
     ];
 
@@ -193,9 +207,14 @@ async fn a_started_jobs_call_is_judged_on_the_resource_the_job_belongs_to() {
             .get("taskFailedEventDetails")
             .unwrap_or_else(|| panic!("case {case:?}: expected taskFailedEventDetails"));
         let cause = string(details, "cause");
+        // The metadata the cause closes with is the one the client this row's family is
+        // served by writes.
+        let expected =
+            refusal_metadata(row.resource, row.service, ACCESS_DENIED_CODE, CLIENT_ERROR);
+        let reported = masked(&cause);
         assert!(
-            cause.contains(REFUSAL_CODE),
-            "case {case:?}: expected the cause to carry {REFUSAL_CODE:?}, got {cause:?}"
+            reported.ends_with(&expected),
+            "case {case:?}: expected the cause to close {expected:?}, got {reported:?}"
         );
         assert!(
             cause.contains(row.action),
