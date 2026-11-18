@@ -46,6 +46,13 @@ pub(crate) struct Reply {
     /// The wire error code (`x-amzn-errortype`, else the body's `__type`), if any.
     pub(crate) error: Option<String>,
     pub(crate) body: Value,
+    /// The response entity EXACTLY as it came off the wire, before any JSON reading: what a
+    /// suite asserting the FRAMING of an answer (an answer that carries no content carries no
+    /// body) has to look at, which the parsed `body` above cannot show.
+    pub(crate) bytes: Bytes,
+    /// The `content-length` the answer states, if it states one — the other half of that
+    /// framing.
+    pub(crate) content_length: Option<String>,
 }
 
 impl Reply {
@@ -181,6 +188,11 @@ impl Braket {
             .get("x-amzn-errortype")
             .and_then(|v| v.to_str().ok())
             .map(ToString::to_string);
+        let content_length = response
+            .headers()
+            .get("content-length")
+            .and_then(|v| v.to_str().ok())
+            .map(ToString::to_string);
         let bytes = response.into_body();
         let body: Value = if bytes.is_empty() {
             Value::Null
@@ -201,6 +213,8 @@ impl Braket {
             status,
             error,
             body,
+            bytes,
+            content_length,
         }
     }
 

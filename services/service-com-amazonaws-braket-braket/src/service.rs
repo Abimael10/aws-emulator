@@ -96,15 +96,122 @@
 //! declared form really is `epoch-seconds` — `TimePeriod$startAt` and `TimePeriod$endAt` —
 //! keep it by declaring it on their own schemas
 //! (`crate::ops::types::shared_types::TimePeriod`).
+//!
+//! ## And how an answer that carries NO CONTENT is framed
+//!
+//! Braket's two tag mutations answer `204 No Content` (`SUCCESS_STATUS` in
+//! `src/ops/tag_resource.rs` and `src/ops/untag_resource.rs`), their modelled output
+//! structures declaring no member at all. Such a structure is not `smithy.api#Unit`, the one
+//! shape the renderers treat as bodyless, so the protocol renders it as the empty JSON
+//! object — content on an answer that states it has none.
+//!
+//! [`NoContentDateTimeRestJson`] is therefore what this service serves: the codec above, with
+//! a response at that status handed through `service_common::no_content_responses`, the
+//! tree's one reading of that framing. Every answer that DOES carry content — every reader's,
+//! every create's and every modelled refusal's — is left exactly as the codec rendered it,
+//! and the correction is made at the one place every response of this service passes through
+//! rather than per operation.
 
+use aws_smithy_runtime_api::http::{Request as WireRequest, Response as WireResponse};
+use aws_smithy_schema::serde::{SerializableStruct, ShapeDeserializer};
+use aws_smithy_schema::{Schema, ShapeId};
+use aws_smithy_schema_server::{ProtocolError, ServerProtocol};
 use service_common::date_time_json::DateTimeRestJson;
 use service_common::front_door::FrontDoor;
+use service_common::no_content_responses::without_content;
 use service_common::validation::SubmittedEcho;
 use smithy_server_runtime::{
     http, ErasedOperation, OperationRoutingTable, Refusal, Refused, Service, Violation,
     ViolationKind,
 };
 use std::sync::Arc;
+
+/// The wire protocol this service serves: [`DateTimeRestJson`] — the model's own `restJson1`
+/// with every `date-time` timestamp in the form the model declares — with one framing
+/// correction on the way out: an answer that carries no content carries no body.
+///
+/// See the module docs. The correction itself is `service_common::no_content_responses`, so
+/// what lives here is only the composition — which codec this service serves, and that every
+/// response it renders is framed.
+#[derive(Debug)]
+struct NoContentDateTimeRestJson {
+    inner: DateTimeRestJson,
+}
+
+impl NoContentDateTimeRestJson {
+    /// Build the protocol once, at service construction: [`Service::override_protocol`] hands
+    /// back a borrow of it and must never build one per request.
+    fn new() -> Self {
+        Self {
+            inner: DateTimeRestJson::new(),
+        }
+    }
+}
+
+impl ServerProtocol for NoContentDateTimeRestJson {
+    type Request = WireRequest;
+    type Response = WireResponse;
+
+    fn protocol_id(&self) -> &ShapeId {
+        self.inner.protocol_id()
+    }
+
+    fn routing_key<'a>(&self, request: &'a Self::Request) -> Result<&'a str, ProtocolError> {
+        self.inner.routing_key(request)
+    }
+
+    fn deserialize_input<'a>(
+        &self,
+        request: &'a Self::Request,
+        input_schema: &Schema,
+    ) -> Result<Box<dyn ShapeDeserializer + 'a>, ProtocolError> {
+        // The request side is the codec's own.
+        self.inner.deserialize_input(request, input_schema)
+    }
+
+    /// The codec's own rendering of the modelled success, framed as an answer that carries no
+    /// content when that is what its status says it is. A success whose output carries
+    /// members is returned exactly as rendered.
+    fn serialize_output(
+        &self,
+        output: &dyn SerializableStruct,
+        output_schema: &Schema,
+        operation_name: &str,
+        success_status: u16,
+    ) -> Result<Self::Response, ProtocolError> {
+        let rendered =
+            self.inner
+                .serialize_output(output, output_schema, operation_name, success_status)?;
+        Ok(without_content(rendered))
+    }
+
+    fn serialize_error(
+        &self,
+        error: &dyn SerializableStruct,
+        error_schema: &Schema,
+        error_code: &str,
+        http_status: u16,
+    ) -> Result<Self::Response, ProtocolError> {
+        // Every modelled failure of this service carries its error envelope at a 4xx or 5xx,
+        // so nothing here is emptied; the same call is made on both paths rather than leaving
+        // one of them to answer differently.
+        let rendered = self
+            .inner
+            .serialize_error(error, error_schema, error_code, http_status)?;
+        Ok(without_content(rendered))
+    }
+
+    fn serialize_event_stream_message(
+        &self,
+        event_type: &str,
+        is_exception: bool,
+        event: &dyn SerializableStruct,
+        event_schema: &Schema,
+    ) -> Result<Self::Response, ProtocolError> {
+        self.inner
+            .serialize_event_stream_message(event_type, is_exception, event, event_schema)
+    }
+}
 
 /// The error code every Braket operation models for input that fails its constraints,
 /// and the one the framework's own refusal channel names for this restJson1 service.
@@ -187,7 +294,7 @@ pub struct EmulatedService<Eng: Send + Sync + 'static> {
     entry: crate::ServiceDefinition<Eng>,
     /// This service's wire protocol, built ONCE here because
     /// [`Service::override_protocol`] hands back a borrow of it.
-    protocol: DateTimeRestJson,
+    protocol: NoContentDateTimeRestJson,
     /// The same modelled operations the generated table holds, each wrapped in
     /// [`FrontDoor`] so a request BODY that breaks a modelled constraint is refused
     /// with `BadRequestException` before the operation runs. Keyed by the routing key
@@ -253,7 +360,7 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
         );
         Self {
             entry: crate::ServiceDefinition::new(engine),
-            protocol: DateTimeRestJson::new(),
+            protocol: NoContentDateTimeRestJson::new(),
             front_door,
         }
     }
@@ -347,7 +454,9 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // The model's own `restJson1`, with a timestamp member that reports no format
         // written in the `date-time` form this model declares for all but two of them
         // (see the module docs). Those two declare `epoch-seconds` on their own member
-        // schemas, which this codec never overrides.
+        // schemas, which this codec never overrides. And an answer that carries no content —
+        // a tag mutation's success — carries no body rather than the empty JSON object the
+        // renderer writes for a members-less output structure.
         Some(&self.protocol)
     }
 }

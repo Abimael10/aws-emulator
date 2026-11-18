@@ -17,6 +17,11 @@
 //!   it holds no tag set — is HTTP 404 `NotFoundException` with a fixed sentence, and a
 //!   value that is not a Braket resource ARN is `ValidationException` (400). Neither
 //!   touches the store.
+//! * A SUCCESSFUL tag mutation leaves the caller nothing to parse — both response shapes
+//!   declare no member — so it answers 204 No Content with no body at all, where an answer
+//!   that does carry members keeps the 200 that says a body follows and a refusal keeps its
+//!   own status and error shape. The last two suites own that rule
+//!   ([`TAG_MUTATION_SUCCESS_STATUS`]).
 //!
 //! Each suite asserts its rule over a TABLE spanning the class rather than one recorded
 //! call: the rows differ along the KIND of resource tagged (quantum task, hybrid job,
@@ -33,6 +38,16 @@ use serde_json::{json, Value};
 use crate::hybrid_job_loop::job_body;
 use crate::quantum_task_loop::{create_body, encode, member, Braket, Reply};
 use crate::spending_limits::{a_device, create_limit, limit_body, limit_by_arn, CREATED};
+
+/// The status a SUCCESSFUL tag mutation answers: `TagResourceResponse` and
+/// `UntagResourceResponse` declare no member at all
+/// (`smithy_query(query="shape",shape="TagResourceResponse,UntagResourceResponse")`), so the
+/// answer carries nothing to parse and is 204 No Content rather than the 200 the restJson1
+/// protocol leaves defaulted for these two routes.
+const TAG_MUTATION_SUCCESS_STATUS: u16 = 204;
+
+/// The status an answer that DOES carry members keeps — the reads' and the creates'.
+const BODY_FOLLOWS_STATUS: u16 = 200;
 
 /// The fixed sentence the tagging doors word for a `resourceArn` that resolves to no
 /// resource they hold the tags of. It interpolates nothing from the request.
@@ -293,8 +308,8 @@ async fn the_tag_doors_write_the_set_list_tags_for_resource_reports() {
                 }
             };
             assert_eq!(
-                reply.status, 200,
-                "case {full:?}: expected 200, got {} {}",
+                reply.status, TAG_MUTATION_SUCCESS_STATUS,
+                "case {full:?}: expected {TAG_MUTATION_SUCCESS_STATUS}, got {} {}",
                 reply.status, reply.body
             );
             assert_eq!(
@@ -381,8 +396,8 @@ async fn a_resources_own_read_reports_the_tags_the_tag_doors_wrote() {
     for (case, arn) in &rows {
         let reply = tag_resource(&braket, arn, written).await;
         assert_eq!(
-            reply.status, 200,
-            "case {case:?}: tagging expected 200, got {} {}",
+            reply.status, TAG_MUTATION_SUCCESS_STATUS,
+            "case {case:?}: tagging expected {TAG_MUTATION_SUCCESS_STATUS}, got {} {}",
             reply.status, reply.body
         );
     }
@@ -418,8 +433,8 @@ async fn a_resources_own_read_reports_the_tags_the_tag_doors_wrote() {
     for (case, arn) in &rows {
         let reply = untag_resource(&braket, arn, &["team", "env"]).await;
         assert_eq!(
-            reply.status, 200,
-            "case {case:?}: untagging expected 200, got {} {}",
+            reply.status, TAG_MUTATION_SUCCESS_STATUS,
+            "case {case:?}: untagging expected {TAG_MUTATION_SUCCESS_STATUS}, got {} {}",
             reply.status, reply.body
         );
         let reported = reported_tags(&braket, arn, case).await;
@@ -474,7 +489,7 @@ async fn the_arn_decides_which_resource_the_tag_doors_resolve() {
     let written: &[(&str, &str)] = &[("team", "quantum")];
     let tagged = tag_resource(&braket, &arn, written).await;
     assert_eq!(
-        tagged.status, 200,
+        tagged.status, TAG_MUTATION_SUCCESS_STATUS,
         "tagging the task the refusals must not touch: got {} {}",
         tagged.status, tagged.body
     );
@@ -614,7 +629,7 @@ async fn the_arn_decides_which_resource_the_tag_doors_resolve() {
     );
     let served = untag_resource(&braket, &arn, &["team"]).await;
     assert_eq!(
-        served.status, 200,
+        served.status, TAG_MUTATION_SUCCESS_STATUS,
         "the ARN the create minted resolves for the removal too: got {} {}",
         served.status, served.body
     );
@@ -642,7 +657,7 @@ async fn listing_tags_changes_nothing_a_later_caller_sees() {
     let written: &[(&str, &str)] = &[("team", "quantum"), ("note", "")];
     assert_eq!(
         tag_resource(&braket, &arn, written).await.status,
-        200,
+        TAG_MUTATION_SUCCESS_STATUS,
         "tagging the task to read"
     );
 
@@ -709,14 +724,14 @@ async fn the_tag_set_a_resource_carries_is_bounded_by_count() {
     let (all_but_last, last) = pairs.split_at(MAX_TAGS_PER_RESOURCE - 1);
     let reply = tag_resource(&braket, &arn, all_but_last).await;
     assert_eq!(
-        reply.status, 200,
-        "case {:?}: expected 200, got {} {}",
+        reply.status, TAG_MUTATION_SUCCESS_STATUS,
+        "case {:?}: expected {TAG_MUTATION_SUCCESS_STATUS}, got {} {}",
         "one short of the limit", reply.status, reply.body
     );
     let reply = tag_resource(&braket, &arn, last).await;
     assert_eq!(
-        reply.status, 200,
-        "case {:?}: expected 200, got {} {}",
+        reply.status, TAG_MUTATION_SUCCESS_STATUS,
+        "case {:?}: expected {TAG_MUTATION_SUCCESS_STATUS}, got {} {}",
         "the key that reaches the limit", reply.status, reply.body
     );
     let at_limit = reported_tags(&braket, &arn, "at the limit").await;
@@ -750,7 +765,7 @@ async fn the_tag_set_a_resource_carries_is_bounded_by_count() {
         Over {
             case: "a key the resource already carries",
             submitted: vec![(pairs[0].0, "rewritten")],
-            status: 200,
+            status: TAG_MUTATION_SUCCESS_STATUS,
         },
         Over {
             case: "a carried key beside a new one",
@@ -803,14 +818,14 @@ async fn the_tag_set_a_resource_carries_is_bounded_by_count() {
     // size, not on how many calls have been made.
     let reply = untag_resource(&braket, &arn, &[pairs[0].0]).await;
     assert_eq!(
-        reply.status, 200,
-        "freeing one slot: expected 200, got {} {}",
+        reply.status, TAG_MUTATION_SUCCESS_STATUS,
+        "freeing one slot: expected {TAG_MUTATION_SUCCESS_STATUS}, got {} {}",
         reply.status, reply.body
     );
     let reply = tag_resource(&braket, &arn, &[("after-the-removal", "z")]).await;
     assert_eq!(
-        reply.status, 200,
-        "the key that takes the freed slot: expected 200, got {} {}",
+        reply.status, TAG_MUTATION_SUCCESS_STATUS,
+        "the key that takes the freed slot: expected {TAG_MUTATION_SUCCESS_STATUS}, got {} {}",
         reply.status, reply.body
     );
     let reported = reported_tags(&braket, &arn, "after the removal").await;
@@ -824,4 +839,224 @@ async fn the_tag_set_a_resource_carries_is_bounded_by_count() {
         MAX_TAGS_PER_RESOURCE,
         "the set is full again, got {reported:?}"
     );
+}
+
+/// The tag maps a successful write carries, as the rows of the no-content suite below: the
+/// empty map, one key, several at once, an empty value, a multi-byte value, and a batch the
+/// size of a realistic tag set. Each row's keys are the ones the removal then names, so a
+/// row leaves the resource exactly as it found it.
+const WRITTEN_MAPS: &[(&str, &[(&str, &str)])] = &[
+    ("no key at all", &[]),
+    ("one key", &[("team", "quantum")]),
+    (
+        "several keys at once",
+        &[("project", "shor"), ("stage", "alpha")],
+    ),
+    ("a key whose value is empty", &[("note", "")]),
+    ("a value spelled in multi-byte characters", &[("qubit", "⟩ψ")]),
+    (
+        "a batch of keys",
+        &[
+            ("a", "1"),
+            ("b", "2"),
+            ("c", "3"),
+            ("d", "4"),
+            ("e", "5"),
+        ],
+    ),
+];
+
+/// The length such an answer states for the body it does not carry. A Braket client reading
+/// the in-process front door (the inter-service callback, the SDK connector) is given the
+/// framing this service states; the HTTP/1.1 writer the network listener is built on removes
+/// it from a 204, which is below anything this crate decides.
+const NO_CONTENT_LENGTH: &str = "0";
+
+/// A key no row ever writes, so a removal naming it drops nothing.
+const NEVER_STORED_KEY: &str = "never-stored";
+
+/// Assert one tag mutation answered the no-content success: the status, and no body bytes at
+/// all — a 204 carrying an entity is the inconsistency the status rules out.
+fn assert_no_content(case: &str, door: &str, reply: &Reply) {
+    let body = String::from_utf8_lossy(&reply.bytes).to_string();
+    assert_eq!(
+        reply.status, TAG_MUTATION_SUCCESS_STATUS,
+        "case {case:?}/{door}: expected {TAG_MUTATION_SUCCESS_STATUS}, got {} {body:?}",
+        reply.status
+    );
+    assert!(
+        reply.bytes.is_empty(),
+        "case {case:?}/{door}: a no-content answer carries no body bytes, got {body:?}"
+    );
+    assert_eq!(
+        reply.error, None,
+        "case {case:?}/{door}: a served mutation carries no error, got {:?}",
+        reply.error
+    );
+    assert_eq!(
+        reply.content_length.as_deref(),
+        Some(NO_CONTENT_LENGTH),
+        "case {case:?}/{door}: it states the length it has, got {:?}",
+        reply.content_length
+    );
+}
+
+/// RULE: a tag mutation that is SERVED answers 204 No Content with no body, whatever it
+/// wrote and whatever kind of resource it addressed — the two response shapes declare no
+/// member, so there is nothing for the caller to parse.
+///
+/// The rows span what the rule generalises over: the kind of resource (quantum task, hybrid
+/// job, spending limit, each created bare and created with tags already on it), the shape of
+/// the map written ([`WRITTEN_MAPS`]), whether the call changed anything (each write is made
+/// twice, and each removal names a key the resource never carried), and whether a removal
+/// names the same key more than once. Every mutation is read back through
+/// `ListTagsForResource`, so the status asserted is a write that landed, not a refusal
+/// dressed as a success.
+#[tokio::test]
+async fn a_served_tag_mutation_answers_no_content_with_no_body() {
+    let braket = Braket::new();
+    let resources = taggable_resources(&braket).await;
+
+    for resource in &resources {
+        let created_with = expected(&resource.created_with);
+        for (row, written) in WRITTEN_MAPS {
+            let case = format!("{} / {row}", resource.case);
+
+            // Twice: the status says "nothing to parse", which cannot depend on whether the
+            // second, no-op assignment changed anything.
+            for attempt in 1..=2 {
+                let reply = tag_resource(&braket, &resource.arn, written).await;
+                assert_no_content(&case, &format!("TagResource attempt {attempt}"), &reply);
+            }
+
+            // The write LANDED: the status above is a real mutation's.
+            let mut held = created_with.clone();
+            held.extend(expected(written));
+            let reported = reported_tags(&braket, &resource.arn, &case).await;
+            assert_eq!(
+                reported, held,
+                "case {case:?}: the write must persist before its status means anything, \
+                 expected {held:?}, got {reported:?}"
+            );
+
+            // The removal names every key the row wrote PLUS one the resource never carried,
+            // so the status is asserted for a removal that drops something and for one that
+            // drops nothing — then again with every key named twice, the call being
+            // `@idempotent`.
+            let mut keys: Vec<&str> = written.iter().map(|(key, _)| *key).collect();
+            keys.push(NEVER_STORED_KEY);
+            let reply = untag_resource(&braket, &resource.arn, &keys).await;
+            assert_no_content(&case, "UntagResource", &reply);
+            let doubled: Vec<&str> = keys.iter().chain(keys.iter()).copied().collect();
+            let reply = untag_resource(&braket, &resource.arn, &doubled).await;
+            assert_no_content(&case, "UntagResource naming each key twice", &reply);
+
+            let reported = reported_tags(&braket, &resource.arn, &case).await;
+            assert_eq!(
+                reported, created_with,
+                "case {case:?}: the removal must persist too, expected the create's own \
+                 tags {created_with:?}, got {reported:?}"
+            );
+        }
+    }
+}
+
+/// RULE, the other side of it: only a SUCCESS with nothing to parse is answered without
+/// content. An answer that carries members keeps the status that says a body follows and
+/// carries one, and a REFUSED tag mutation keeps its own status and its error shape.
+#[tokio::test]
+async fn every_other_answer_of_the_tagging_plane_carries_its_body() {
+    let braket = Braket::new();
+    let device = braket.an_online_device().await;
+    let created = braket
+        .create_task(create_body("tok-task-framing", &device, 10))
+        .await;
+    assert_eq!(
+        created.status, BODY_FOLLOWS_STATUS,
+        "creating the quantum task: got {} {}",
+        created.status, created.body
+    );
+    let arn = created.str_member("quantumTaskArn");
+    let written: &[(&str, &str)] = &[("team", "quantum")];
+    assert_no_content(
+        "the mutation the contrast is drawn against",
+        "TagResource",
+        &tag_resource(&braket, &arn, written).await,
+    );
+
+    // The reads of the same resource carry members, so they keep the body-bearing status and
+    // carry a body.
+    for (case, reply) in [
+        ("ListTagsForResource", list_tags(&braket, &arn).await),
+        ("GetQuantumTask", braket.get_task(&arn).await),
+    ] {
+        assert_eq!(
+            reply.status, BODY_FOLLOWS_STATUS,
+            "case {case:?}: an answer carrying members keeps its {BODY_FOLLOWS_STATUS}, got \
+             {} {}",
+            reply.status, reply.body
+        );
+        assert!(
+            reply.body.is_object() && !reply.bytes.is_empty(),
+            "case {case:?}: an answer carrying members carries its body, got {} bytes: {}",
+            reply.bytes.len(),
+            reply.body
+        );
+    }
+
+    // (case, the ARN the refused call names, the status, the error code, the sentence) — a
+    // well-formed ARN resolving to no stored resource, and a value that is no Braket resource
+    // ARN at all: the two classes either tag door refuses.
+    let region = "eu-west-1";
+    let account = engine::EMULATOR_ACCOUNT_ID;
+    let rows: Vec<(&str, String, u16, &str, &str)> = vec![
+        (
+            "an ARN naming no stored resource",
+            format!("arn:aws:braket:{region}:{account}:quantum-task/ghost-framing"),
+            404,
+            NOT_FOUND_CODE,
+            RESOURCE_NOT_FOUND,
+        ),
+        (
+            "a value that is no Braket resource ARN",
+            "not-an-arn".to_string(),
+            400,
+            "ValidationException",
+            INVALID_ARN,
+        ),
+    ];
+    for (case, named, status, code, sentence) in &rows {
+        let replies: Vec<(&str, Reply)> = vec![
+            ("TagResource", tag_resource(&braket, named, written).await),
+            (
+                "UntagResource",
+                untag_resource(&braket, named, &["team"]).await,
+            ),
+        ];
+        for (door, reply) in replies {
+            let full = format!("{door} / {case}");
+            assert_eq!(
+                reply.status, *status,
+                "case {full:?}: a refusal keeps its own status {status}, got {} {}",
+                reply.status, reply.body
+            );
+            assert!(
+                !reply.bytes.is_empty(),
+                "case {full:?}: a refusal carries its error shape, got no body bytes"
+            );
+            assert_eq!(
+                reply.error.as_deref(),
+                Some(*code),
+                "case {full:?}: expected {code}, got {:?} in {}",
+                reply.error,
+                reply.body
+            );
+            assert_eq!(
+                reply.message(),
+                *sentence,
+                "case {full:?}: expected {sentence:?}, got {:?}",
+                reply.message()
+            );
+        }
+    }
 }

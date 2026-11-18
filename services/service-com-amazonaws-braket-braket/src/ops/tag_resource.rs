@@ -15,6 +15,12 @@
 //! nothing, so repeated tagging cannot grow a stored record without end. A key already
 //! on the resource does not grow the set, so overwriting a value is served at the limit.
 //!
+//! A successful write leaves the caller nothing to read: `TagResourceResponse` declares no
+//! member at all, so the answer is HTTP 204 No Content with an empty body rather than the
+//! 200 the protocol leaves defaulted (`SUCCESS_STATUS` below; the body itself is emptied at
+//! the one seam every response of this service passes through, see `crate::service`). A
+//! refusal keeps its own status and carries its error shape.
+//!
 //! `resourceArn` is the only thing that resolves the resource. A value that is not a
 //! Braket resource ARN names no resource to tag and is refused as invalid input before
 //! the store is touched; a well-formed ARN that no stored resource carries — one never
@@ -132,7 +138,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     const NAME: &'static str = "TagResource";
     const INPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::TAG_RESOURCE_INPUT_SCHEMA;
     const OUTPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::TAG_RESOURCE_OUTPUT_SCHEMA;
-    const SUCCESS_STATUS: u16 = 200u16;
+    /// A members-less output leaves nothing to parse, so a successful tag write answers
+    /// `204 No Content` — the shared reading of that status, which the framing correction in
+    /// `crate::service` empties the rendered body for.
+    const SUCCESS_STATUS: u16 = ::service_common::no_content_responses::NO_CONTENT_STATUS;
 
     async fn handle(
         &self,
