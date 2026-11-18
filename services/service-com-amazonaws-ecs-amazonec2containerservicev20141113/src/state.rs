@@ -308,6 +308,11 @@ pub use load_balancer_targets::*;
 mod container_insights;
 pub use container_insights::*;
 
+/// The `AWS/ECS` CPU and memory utilization a SERVICE publishes into CloudWatch while it
+/// holds a running task, on the cluster-and-service dimension pair that identifies it.
+mod service_utilization;
+pub use service_utilization::*;
+
 /// The CLASSIC load balancer a `loadBalancers` entry attaches a service to: whether the
 /// account holds it, and the network mode that kind of attachment can reach a task in.
 mod classic_load_balancers;
@@ -4545,6 +4550,12 @@ pub struct ComAmazonawsEcsAmazonec2containerservicev20141113State {
     /// caller assembled, so the position a token names cannot be forged or carried over to
     /// another listing.
     page_token_key: PageTokenKey,
+    /// `(clusterName, serviceName)` -> the `AWS/ECS` utilization series being published for
+    /// that service, and where that series' publish schedule stands (see
+    /// [`service_utilization`]). An entry exists only while the service is being METERED —
+    /// while it holds a running task — so the map is the set of services whose utilization
+    /// CloudWatch is receiving.
+    service_utilization: HashMap<(String, String), UtilizationSeries>,
     /// `containerArn` -> the in-process task performing that container's HEALTH-CHECK probe
     /// (see [`container_health`]). Kept for the same reason the runs above keep theirs: a
     /// probe whose container is gone is ABORTED rather than merely forgotten, so no probe

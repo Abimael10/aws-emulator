@@ -251,7 +251,7 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
 /// `at` as the epoch seconds a stored datapoint carries, which is the unit the metric
 /// store's own readers window by. An instant before the epoch (which no clock reports) reads
 /// as the epoch itself rather than failing the publish.
-fn epoch_seconds(at: SystemTime) -> f64 {
+pub(super) fn epoch_seconds(at: SystemTime) -> f64 {
     at.duration_since(::std::time::UNIX_EPOCH)
         .map_or(0.0, |since| since.as_secs_f64())
 }

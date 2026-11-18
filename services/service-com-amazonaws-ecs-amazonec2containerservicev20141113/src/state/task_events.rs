@@ -270,6 +270,11 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
             // owed: nothing calls again between the placement and the capacity appearing, so
             // the pump is what takes it ([`super::managed_capacity_scaling`]).
             self.next_managed_capacity_due_at(),
+            // And so is the next datapoint of the `AWS/ECS` utilization series of a service
+            // that is RUNNING: that series is published for as long as the service runs, and
+            // nothing calls again between one datapoint and the next
+            // ([`super::service_utilization`]).
+            self.next_service_utilization_due_at(),
         ]
         .into_iter()
         .flatten()
@@ -746,6 +751,11 @@ pub fn drive_task_clock<Eng: Send + Sync + 'static>(
             // ([`super::settle_container_insights`]) — taken off the very records the pass
             // above has just moved, with no guard of this store held.
             super::settle_container_insights(&*engine);
+            // The `AWS/ECS` utilization series each service holding a running task owes, which
+            // the publish cadence makes due whether or not anybody called
+            // ([`super::settle_service_utilization`]) — read off the same records the pass
+            // above has just moved, with no guard of this store held.
+            super::settle_service_utilization(&*engine);
             // A task the clock has just started is one whose containers are now running, and
             // one it has just stopped is one whose containers are signalled: the same side
             // effect the door that wrote a status settles, owed here for the statuses NO
