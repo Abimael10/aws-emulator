@@ -247,6 +247,19 @@ impl Documents {
     }
 }
 
+/// Whether the identity-based documents in force GRANT the request: `said` is what they
+/// said about it, and `allows` whether any readable `Allow` among them covers it.
+///
+/// ONE reading of IAM's order for both decisions below. An explicit `Deny` in a document
+/// that CAN be read refuses the request whatever any `Allow` says, so a grant this emulator
+/// cannot read ([`Caller::identity_is_unbounded`]) lifts the DEFAULT deny of a request no
+/// readable statement allows and nothing more: it never overturns a deny (see the module
+/// docs). Taken out of the grant here rather than weighed against it per decision, so the
+/// two decisions cannot read one stored deny differently.
+fn identity_grants(caller: &Caller, said: Decision, allows: bool) -> bool {
+    said != Decision::Denied && (allows || caller.identity_is_unbounded())
+}
+
 /// IAM's decision about `action` on `judged`, refused in the name of `named`.
 ///
 /// `named` is what a refusal states the request was refused ON — the resource the request
@@ -264,8 +277,11 @@ fn decide(
     // such element, so the decision below rests on the action and the resource.
     let request = iam::Request::new(action, judged, &caller.principals);
     let identity_said = iam::identity_decision_prepared(&documents.identity, &request);
-    let granted =
-        iam::is_allowed(identity_said, Decision::NotStated) || caller.identity_is_unbounded();
+    let granted = identity_grants(
+        caller,
+        identity_said,
+        iam::is_allowed(identity_said, Decision::NotStated),
+    );
     // "The resulting session's permissions are the intersection of the role's
     // identity-based policy and the session policies" (`AssumeRoleRequest$Policy`): the
     // SCOPE the mint of this credential passed caps the grant exactly as the boundary does,
@@ -320,8 +336,11 @@ fn decide_over_any_resource(
 ) -> Result<(), Denied> {
     let request = iam::Request::new(action, EVERY_RESOURCE, &caller.principals);
     let identity_said = iam::identity_decision_prepared(&documents.identity, &request);
-    let granted = iam::identity_may_allow_action(&documents.identity, action)
-        || caller.identity_is_unbounded();
+    let granted = identity_grants(
+        caller,
+        identity_said,
+        iam::identity_may_allow_action(&documents.identity, action),
+    );
     // The session policies are read by those same two readings (see the module docs): a
     // `Deny` covering every resource refuses the request, and a scope that allows the
     // action on no resource at all permits it nowhere — the weaker question the shared
@@ -340,11 +359,7 @@ fn decide_over_any_resource(
             _ => Decision::NotStated,
         }
     });
-    if granted
-        && identity_said != Decision::Denied
-        && scoped == Decision::Allowed
-        && capped == Decision::Allowed
-    {
+    if granted && scoped == Decision::Allowed && capped == Decision::Allowed {
         return Ok(());
     }
     // Which document the decision rested on, in the order [`decide`] names them.
