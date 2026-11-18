@@ -15,8 +15,8 @@
 //!
 //! Every case is asserted over a SET of inputs: the whole modelled
 //! `RelationshipStatus` catalog for the filter, the page sizes the filtered
-//! enumeration is walked with, and the `onlyAssociated` spellings a caller
-//! sends.
+//! enumeration is walked with, the `onlyAssociated` spellings a caller sends,
+//! and the status changes an association moves through.
 
 use std::collections::BTreeMap;
 use std::time::SystemTime;
@@ -197,6 +197,20 @@ fn account_of(index: usize) -> String {
     format!("5555{index:08}")
 }
 
+/// Whether an account carrying `status` is a current member of its
+/// administrator account, read off [`STATUS_CATALOG`]. A status that catalog
+/// does not name is not a modelled `RelationshipStatus`, so naming one is a
+/// mistake in the case rather than a result.
+fn is_current_member(status: &str, case: &str) -> bool {
+    STATUS_CATALOG
+        .iter()
+        .find(|row| row.status == status)
+        .unwrap_or_else(|| {
+            panic!("case {case:?}: {status:?} is not a modelled RelationshipStatus")
+        })
+        .is_current_member
+}
+
 /// The default view reports exactly the accounts whose membership is live, and
 /// the view that asks for all accounts reports every association — asserted
 /// over the whole modelled status catalog, over the page sizes the filtered
@@ -306,5 +320,62 @@ async fn an_association_no_invitation_has_been_sent_for_is_left_out_of_the_defau
             seen, want,
             "case {case:?}: expected {want:?}, got {seen:?}"
         );
+    }
+}
+
+/// Membership is read off the status an association CARRIES RIGHT NOW, not off
+/// the fact that a record exists, so a status change moves the account between
+/// the two views: it enters the default view when its membership becomes
+/// established and leaves it when it no longer is, while the view that asks for
+/// all accounts reports the association throughout. The rows are transitions
+/// across the modelled catalog, each on its own emulator so no other
+/// association can stand in for the one under test.
+#[tokio::test]
+async fn the_default_view_follows_a_status_change() {
+    // (from, to): the status an association is seeded in and the one it is then
+    // moved to. The rows cross the current/not-current partition in both
+    // directions and also stay on each side of it, so a view that ignored the
+    // status could not satisfy them all.
+    let transitions: [(&str, &str); 6] = [
+        ("Created", "Enabled"),
+        ("EmailVerificationInProgress", "Invited"),
+        ("Enabled", "Removed"),
+        ("Paused", "Resigned"),
+        ("Enabled", "Paused"),
+        ("Created", "RegionDisabled"),
+    ];
+
+    for (from, to) in transitions {
+        let case = format!("{from} -> {to}");
+        let (router, engine) = emulator_with_engine();
+        enable_in(&router, REGION, "{}").await;
+
+        let account = account_of(0);
+        for status in [from, to] {
+            seed_association(&engine, REGION, &account, status);
+
+            let expected: Vec<String> = if is_current_member(status, &case) {
+                vec![account.clone()]
+            } else {
+                Vec::new()
+            };
+            let seen = list_accounts(&router, &case, None, None).await;
+            assert_eq!(
+                seen, expected,
+                "case {case:?}: in status {status:?} the default view must report \
+                 {expected:?}, got {seen:?}"
+            );
+
+            // The same record, under either status, is reported to a request
+            // that asks for all accounts: the filter is the view's, not the
+            // store's.
+            let all = list_accounts(&router, &case, Some("false"), None).await;
+            assert_eq!(
+                all,
+                vec![account.clone()],
+                "case {case:?}: in status {status:?} the all-accounts view must report \
+                 the association, got {all:?}"
+            );
+        }
     }
 }
