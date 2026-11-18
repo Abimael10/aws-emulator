@@ -192,6 +192,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // CodeCommit failure; every handler in this crate refuses it this way.
             crate::scaffolded::Scaffolded::validation("the repository store is unavailable")
         })?;
+        // Whose call removes the reference, which is the identity a trigger's record
+        // names: resolved BEFORE this service's store is locked, because the
+        // resolution reads the registries that minted the request's credential.
+        let actor = crate::state::caller_identity_arn(&*self.engine, ctx);
+        let now = std::time::SystemTime::now();
         let mut store = state.lock();
 
         let repository = store
@@ -234,14 +239,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // it held is what the response reports: `deletedBranch` is "Information about
         // the branch deleted by the operation, including the branch name and the commit
         // ID that was the tip of the branch". The commits are NOT deleted — only the
-        // reference to them — so a commit this branch led to stays readable by id.
-        let Some(deleted) = repository.branches.remove(&input.branch_name) else {
+        // reference to them — so a commit this branch led to stays readable by id. It
+        // goes through the one place a reference is removed, so every trigger in scope
+        // for a removal of this branch runs.
+        let Some((deleted, published)) =
+            repository.remove_branch_tip(&input.branch_name, now, Some(&actor))
+        else {
             // This operation models no "branch does not exist" error and
             // `deletedBranch` is optional, so a name the repository does not hold
             // leaves the repository exactly as it was — `lastModifiedDate` included —
             // and reports no deleted branch. That is what makes deleting the same
             // branch twice, and deleting a name that never existed, the same
-            // successful no-op.
+            // successful no-op. Nothing was removed, so no trigger ran.
             return Ok(DeleteBranchOutput {
                 deleted_branch: None,
             });
@@ -251,11 +260,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // date and time the repository was last modified"
         // (`smithy_query(query="doc",shape="RepositoryMetadata",member="lastModifiedDate")`),
         // so it moves here exactly as it does for the reference `CreateBranch` adds.
-        repository.last_modified_date = std::time::SystemTime::now();
+        repository.last_modified_date = now;
         // The deleted reference was pinning its tip against the store's own retention
         // bound; with it gone, the history only that reference kept alive is released.
         repository.prune_history();
 
+        // The record each trigger in scope for the removal owes its destination is
+        // DELIVERED once this call's guard is gone.
+        drop(store);
+        published.publish_detached(ctx.callback());
         Ok(DeleteBranchOutput {
             deleted_branch: Some(BranchInfo {
                 branch_name: Some(deleted.name),

@@ -963,12 +963,13 @@ fn project(
 
 /// Apply an accepted ref update.
 ///
-/// A branch moves through [`Repository::set_branch_tip`], the one place a branch
-/// tip is set, so a push updates every OPEN pull request reading from that branch
-/// exactly as a commit written through the control plane does. A push carries no
-/// caller identity for the update to be attributed to — a git client
-/// authenticates with git credentials, which this emulator does not mint — so the
-/// event it records names no actor.
+/// A branch moves through [`Repository::set_branch_tip`] and is removed through
+/// [`Repository::remove_branch_tip`], the one place each, so a push updates every
+/// OPEN pull request reading from that branch — and runs the triggers the stored
+/// configuration is in scope for — exactly as a commit written through the control
+/// plane does. A push carries no caller identity for the update to be attributed to —
+/// a git client authenticates with git credentials, which this emulator does not mint
+/// — so the event it records names no actor.
 fn apply(repository: &mut Repository, command: &Command, at: SystemTime) {
     let Some((namespace, short)) = ref_namespace(&command.name) else {
         return;
@@ -977,15 +978,18 @@ fn apply(repository: &mut Repository, command: &Command, at: SystemTime) {
     let deleting = git_object::is_null_object_id(&command.new);
     match namespace {
         Namespace::Branch if deleting => {
-            repository.branches.remove(&name);
+            // Nothing this records is delivered, for the reason the branch arm below
+            // gives.
+            let _undelivered = repository.remove_branch_tip(&name, at, None);
         }
         Namespace::Branch => {
-            // The changes this records on the pull requests reading from the branch
-            // are not published: this path is served through the framework's
-            // synchronous routing hook, which is handed no callback to publish an
-            // event over, so a push records what happened and publishes nothing
-            // rather than publishing over a channel this crate does not have here.
-            let _unpublished = repository.set_branch_tip(&name, &command.new, at, None);
+            // What this records — the pull requests reading from the branch, and the
+            // records the repository's triggers owe their destinations — is not
+            // delivered: this path is served through the framework's synchronous
+            // routing hook, which is handed no callback to deliver over, so a push
+            // records what happened and delivers nothing rather than reaching for a
+            // channel this crate does not have here.
+            let _undelivered = repository.set_branch_tip(&name, &command.new, at, None);
         }
         Namespace::Tag if deleting => {
             repository.git_tags.remove(&name);

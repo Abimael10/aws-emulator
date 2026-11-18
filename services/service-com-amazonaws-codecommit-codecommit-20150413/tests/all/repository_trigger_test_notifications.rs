@@ -1,10 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! What `TestRepositoryTriggers` SENDS, read where a client reads it: off the Amazon
-//! SQS queue subscribed to the topic a trigger names, and through the answer Lambda
-//! gives for a function a trigger names.
+//! What a repository trigger SENDS to its destination, read where a client reads it: off
+//! the Amazon SQS queue subscribed to the topic a trigger names, and through the answer
+//! Lambda gives for a function a trigger names — both for a TEST of a trigger and for a
+//! reference that really changed.
 //!
-//! THE RULE UNDER TEST: "tests the functionality of repository triggers by sending
+//! THE FIRST RULE UNDER TEST: "tests the functionality of repository triggers by sending
 //! information to the trigger target. If real data is available in the repository, the
 //! test sends data from the last commit. If no data is available, sample data is
 //! generated"
@@ -16,13 +17,26 @@
 //! commit that reference points at; a trigger whose destination accepted the record is
 //! reported in `successfulExecutions` and one whose destination refused it in
 //! `failedExecutions`, with what the destination answered. A test is a test: it stores
-//! nothing, so the configuration the repository holds is the same before and after.
+//! nothing, so the configuration the repository holds is the same before and after, and
+//! its record is labelled `TriggerEventTest` rather than as a reference that moved.
 //!
-//! The tables below span what that rule generalises over: the kind of destination (a
+//! THE SECOND RULE UNDER TEST: `RepositoryTrigger$events` are "the repository events that
+//! cause the trigger to run actions in another service, such as sending a notification
+//! through Amazon SNS"
+//! (`smithy_query(query="doc",shape="RepositoryTrigger",member="events")`), and those
+//! events are the reference events `RepositoryTriggerEventEnum` declares. So a write that
+//! creates, moves or removes a reference runs every trigger of the STORED configuration
+//! that is in scope for both that branch and that class of event — and each trigger that
+//! runs sends one record, labelled `ReferenceChanges`, naming the fully qualified
+//! reference and the commit it now points at; a write no stored trigger is in scope for
+//! sends nothing.
+//!
+//! The tables below span what those rules generalise over: the kind of destination (a
 //! topic and a function), whether the destination exists, the branch scope a trigger
 //! names (none, an empty list, one branch, several, one the repository does not hold),
 //! whether the repository holds real data at all, whether the trigger carries custom
-//! data, and how many triggers one request submits — rather than one recorded request.
+//! data, how many triggers one request submits, and — for a reference write — the class
+//! of write and the operation that makes it, rather than one recorded request.
 //!
 //! Everything is driven over the real wire path: this service, Amazon SNS, Amazon SQS
 //! and Lambda are mounted on ONE shared engine, the topic, its queue subscription and
@@ -37,6 +51,7 @@ use smithy_server_runtime::MultiServiceRouter;
 
 use service_com_amazonaws_codecommit_codecommit_20150413::state::trigger_notifications::{
     SAMPLE_BRANCH, TRIGGER_EVENT_NAME, TRIGGER_EVENT_SOURCE, TRIGGER_EVENT_VERSION,
+    TRIGGER_TEST_EVENT_NAME,
 };
 
 use crate::harness::error_with_message;
@@ -446,7 +461,9 @@ fn sole_record(case: &str, records: &[Value], repository_arn: &str, trigger: &st
     let entry = entries[0].clone();
     for (member, expected) in [
         ("awsRegion", REGION),
-        ("eventName", TRIGGER_EVENT_NAME),
+        // A test's record is labelled as the probe it is rather than as a reference
+        // that changed, which is how a consumer tells the two apart.
+        ("eventName", TRIGGER_TEST_EVENT_NAME),
         ("eventSource", TRIGGER_EVENT_SOURCE),
         ("eventSourceARN", repository_arn),
         ("eventVersion", TRIGGER_EVENT_VERSION),
@@ -1144,5 +1161,372 @@ async fn a_test_stores_nothing_of_the_configuration_it_was_made_against() {
         ),
         (Some(stored_id.as_str()), stored),
         "a test must not replace the configuration a write stored, got {read}"
+    );
+}
+
+/// git's null object name: the value a reference update carries for a reference that
+/// points at nothing, which is what the record of a REMOVED reference names.
+const NULL_COMMIT: &str = "0000000000000000000000000000000000000000";
+
+/// The file a row adds and then removes, beside the one every commit writes.
+const EXTRA_FILE: &str = "extra.txt";
+
+/// What one row of [`a_reference_write_runs_the_triggers_in_scope_and_no_others`] writes,
+/// each through the operation a client makes it with.
+#[derive(Debug, Clone, Copy)]
+enum ReferenceWrite {
+    /// A commit on a branch that already has one, through `PutFile`.
+    Commit(&'static str),
+    /// A commit on a branch adding [`EXTRA_FILE`], through `CreateCommit`.
+    AddFile(&'static str),
+    /// A commit on a branch removing [`EXTRA_FILE`], through `DeleteFile`.
+    RemoveFile(&'static str),
+    /// A reference the repository did not hold, at `main`'s tip, through `CreateBranch`.
+    CreateReference(&'static str),
+    /// A reference the repository no longer holds, through `DeleteBranch`.
+    DeleteReference(&'static str),
+}
+
+impl ReferenceWrite {
+    /// The branch this write writes.
+    fn branch(self) -> &'static str {
+        match self {
+            Self::Commit(branch)
+            | Self::AddFile(branch)
+            | Self::RemoveFile(branch)
+            | Self::CreateReference(branch)
+            | Self::DeleteReference(branch) => branch,
+        }
+    }
+}
+
+/// The trigger names of `records`, sorted: which triggers one write ran.
+fn triggers_that_ran(records: &[Value]) -> Vec<String> {
+    let mut names: Vec<String> = records
+        .iter()
+        .map(|record| {
+            record["Records"][0]["eventTriggerName"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string()
+        })
+        .collect();
+    names.sort();
+    names
+}
+
+/// What every record of a REFERENCE WRITE has to say, whatever the trigger that ran: the
+/// class of event, the repository it is on, the configuration it belongs to, the identity
+/// whose call produced it, and the reference with the commit it now points at.
+fn assert_reference_record(
+    case: &str,
+    record: &Value,
+    repository_arn: &str,
+    configuration_id: &str,
+    reference: &str,
+    commit: &str,
+) {
+    let entry = record["Records"][0].clone();
+    for (member, expected) in [
+        ("awsRegion", REGION),
+        ("eventName", TRIGGER_EVENT_NAME),
+        ("eventSource", TRIGGER_EVENT_SOURCE),
+        ("eventSourceARN", repository_arn),
+        ("eventVersion", TRIGGER_EVENT_VERSION),
+        ("eventTriggerConfigId", configuration_id),
+        ("userIdentityARN", &caller_arn(DEFAULT_ACCESS_KEY_ID)),
+    ] {
+        assert_eq!(
+            entry[member].as_str(),
+            Some(expected),
+            "case {case:?}: {member} must be {expected:?}, got {entry}"
+        );
+    }
+    let (named_reference, named_commit) = sole_reference(case, &entry);
+    assert_eq!(
+        (named_reference.as_str(), named_commit.as_str()),
+        (reference, commit),
+        "case {case:?}: the record must name {reference} at {commit}, got {entry}"
+    );
+}
+
+#[tokio::test]
+async fn a_reference_write_runs_the_triggers_in_scope_and_no_others() {
+    let router = emulator();
+    let repository = "reference-change-triggers";
+    ok(
+        &router,
+        "CreateRepository",
+        &json!({ "repositoryName": repository }),
+    )
+    .await;
+    let repository_arn = format!(
+        "arn:aws:codecommit:{REGION}:{}:{repository}",
+        engine::emulator_account_id()
+    );
+    let (destination, queue) = given_topic(&router, "reference-changes").await;
+
+    let seed = put_file(&router, repository, "main", None, b"# seed\n").await;
+    create_branch(&router, repository, "unlisted", &seed).await;
+
+    // A write made while the repository held no configuration ran no trigger at all.
+    let unconfigured = "a write made before a configuration was stored";
+    let mut records: Vec<Value> = Vec::new();
+    drain_into(&router, &queue, &mut records).await;
+    assert!(
+        records.is_empty(),
+        "case {unconfigured:?}: a repository with no stored trigger owes nothing, got \
+         {records:?}"
+    );
+
+    // Four triggers of ONE configuration, all on the same topic, differing in the scope
+    // the rule reads: the branches they name and the events they name.
+    let configuration_id = put_triggers(
+        &router,
+        repository,
+        &json!([
+            {
+                "name": "main-updates",
+                "destinationArn": destination,
+                "branches": ["main"],
+                "events": ["updateReference"],
+            },
+            // No `branches` member at all: the trigger applies to every branch.
+            {"name": "every-branch", "destinationArn": destination, "events": ["all"]},
+            {
+                "name": "feature-life",
+                "destinationArn": destination,
+                "branches": ["feature"],
+                "events": ["createReference", "deleteReference"],
+            },
+            // In scope for `main`, but for a class of write no row below is.
+            {
+                "name": "main-creates",
+                "destinationArn": destination,
+                "branches": ["main"],
+                "events": ["createReference"],
+            },
+        ]),
+    )
+    .await;
+
+    // (case, the write, the triggers that must run for it)
+    let rows: &[(&str, ReferenceWrite, &[&str])] = &[
+        (
+            "a commit on a branch one trigger lists",
+            ReferenceWrite::Commit("main"),
+            &["every-branch", "main-updates"],
+        ),
+        (
+            "a commit on a branch no trigger lists",
+            ReferenceWrite::Commit("unlisted"),
+            &["every-branch"],
+        ),
+        (
+            "a commit written through CreateCommit",
+            ReferenceWrite::AddFile("main"),
+            &["every-branch", "main-updates"],
+        ),
+        (
+            "a commit written through DeleteFile",
+            ReferenceWrite::RemoveFile("main"),
+            &["every-branch", "main-updates"],
+        ),
+        (
+            "a reference the repository did not hold",
+            ReferenceWrite::CreateReference("feature"),
+            &["every-branch", "feature-life"],
+        ),
+        (
+            "a reference the repository no longer holds",
+            ReferenceWrite::DeleteReference("feature"),
+            &["every-branch", "feature-life"],
+        ),
+    ];
+
+    let mut tips: std::collections::BTreeMap<String, String> = std::collections::BTreeMap::new();
+    tips.insert("main".to_string(), seed.clone());
+    tips.insert("unlisted".to_string(), seed.clone());
+
+    for (index, (case, write, expected)) in rows.iter().enumerate() {
+        let branch = write.branch();
+        let parent = tips.get(branch).cloned();
+        let commit = match write {
+            ReferenceWrite::Commit(_) => {
+                put_file(
+                    &router,
+                    repository,
+                    branch,
+                    parent.as_deref(),
+                    format!("# revision {index}\n").as_bytes(),
+                )
+                .await
+            }
+            ReferenceWrite::AddFile(_) => string_at(
+                &ok(
+                    &router,
+                    "CreateCommit",
+                    &json!({
+                        "repositoryName": repository,
+                        "branchName": branch,
+                        "parentCommitId": parent,
+                        "commitMessage": "a file added",
+                        "putFiles": [{
+                            "filePath": EXTRA_FILE,
+                            "fileContent": base64(format!("added at {index}\n").as_bytes()),
+                        }],
+                    }),
+                )
+                .await,
+                "/commitId",
+            ),
+            ReferenceWrite::RemoveFile(_) => string_at(
+                &ok(
+                    &router,
+                    "DeleteFile",
+                    &json!({
+                        "repositoryName": repository,
+                        "branchName": branch,
+                        "filePath": EXTRA_FILE,
+                        "parentCommitId": parent,
+                        "commitMessage": "a file removed",
+                    }),
+                )
+                .await,
+                "/commitId",
+            ),
+            ReferenceWrite::CreateReference(_) => {
+                let at = tips
+                    .get("main")
+                    .cloned()
+                    .unwrap_or_else(|| panic!("case {case:?}: main holds no tip"));
+                create_branch(&router, repository, branch, &at).await;
+                at
+            }
+            ReferenceWrite::DeleteReference(_) => {
+                let removed = ok(
+                    &router,
+                    "DeleteBranch",
+                    &json!({ "repositoryName": repository, "branchName": branch }),
+                )
+                .await;
+                assert_eq!(
+                    removed["deletedBranch"]["branchName"].as_str(),
+                    Some(branch),
+                    "case {case:?}: the removal must report the reference it removed, got \
+                     {removed}"
+                );
+                // A removed reference points at nothing, which is what its record names.
+                NULL_COMMIT.to_string()
+            }
+        };
+        match write {
+            ReferenceWrite::DeleteReference(_) => {
+                tips.remove(branch);
+            }
+            _ => {
+                tips.insert(branch.to_string(), commit.clone());
+            }
+        }
+
+        // A received message stays invisible for the queue's visibility timeout, so every
+        // row reads into ONE accumulator and asserts over what arrived since.
+        let already = records.len();
+        await_records(&router, &queue, &mut records, already + expected.len()).await;
+        let arrived = records[already..].to_vec();
+        let ran = triggers_that_ran(&arrived);
+        let wanted: Vec<String> = expected.iter().map(|name| name.to_string()).collect();
+        assert_eq!(
+            ran, wanted,
+            "case {case:?}: expected the triggers {wanted:?} to run, got {ran:?} from {arrived:?}"
+        );
+        // A further look finds nothing more: a trigger out of scope sent no record.
+        let total = records.len();
+        drain_into(&router, &queue, &mut records).await;
+        assert_eq!(
+            records.len(),
+            total,
+            "case {case:?}: only the triggers in scope run, got the further records {:?}",
+            &records[total..]
+        );
+        let reference = format!("refs/heads/{branch}");
+        for record in &arrived {
+            assert_reference_record(
+                case,
+                record,
+                &repository_arn,
+                &configuration_id,
+                &reference,
+                &commit,
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_tested_trigger_is_labelled_a_probe_and_a_real_write_is_not() {
+    let router = emulator();
+    let repository = "probe-and-change";
+    ok(
+        &router,
+        "CreateRepository",
+        &json!({ "repositoryName": repository }),
+    )
+    .await;
+    let repository_arn = format!(
+        "arn:aws:codecommit:{REGION}:{}:{repository}",
+        engine::emulator_account_id()
+    );
+    let (destination, queue) = given_topic(&router, "probe-and-change").await;
+    let seed = put_file(&router, repository, "main", None, b"# seed\n").await;
+    let triggers = json!([{
+        "name": "everything",
+        "destinationArn": destination,
+        "branches": ["main"],
+        "events": ["all"],
+    }]);
+    let configuration_id = put_triggers(&router, repository, &triggers).await;
+
+    // The probe: labelled as the test it is, and reported as tested.
+    let case = "a test of the stored trigger";
+    let (successful, failed) = test_triggers(&router, repository, &triggers).await;
+    assert_eq!(
+        (successful.as_slice(), failed.as_slice()),
+        (&["everything".to_string()][..], &[][..]),
+        "case {case:?}: the trigger's destination accepted the probe"
+    );
+    let mut records: Vec<Value> = Vec::new();
+    await_records(&router, &queue, &mut records, 1).await;
+    let probe = records[0]["Records"][0].clone();
+    assert_eq!(
+        probe["eventName"].as_str(),
+        Some(TRIGGER_TEST_EVENT_NAME),
+        "case {case:?}: a test's record is labelled as a test, got {probe}"
+    );
+
+    // The same trigger, the same destination, a reference that really moved: labelled as
+    // a reference change, which is how a consumer tells the two apart.
+    let case = "a reference that really moved";
+    let commit = put_file(&router, repository, "main", Some(&seed), b"# revision\n").await;
+    await_records(&router, &queue, &mut records, 2).await;
+    let changed = records[1..].to_vec();
+    assert_eq!(
+        changed.len(),
+        1,
+        "case {case:?}: the one trigger in scope sends one record, got {changed:?}"
+    );
+    assert_reference_record(
+        case,
+        &changed[0],
+        &repository_arn,
+        &configuration_id,
+        "refs/heads/main",
+        &commit,
+    );
+    assert_eq!(
+        changed[0]["Records"][0]["eventTriggerName"].as_str(),
+        Some("everything"),
+        "case {case:?}: the record must name the trigger that ran, got {:?}",
+        changed[0]
     );
 }

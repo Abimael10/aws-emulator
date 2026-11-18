@@ -7,17 +7,30 @@
 //!
 //! A trigger exists to be acted on: `RepositoryTrigger$destinationArn` is "the ARN of
 //! the resource that is the target for a trigger (for example, the ARN of a topic in
-//! Amazon SNS)", and `TestRepositoryTriggers` "tests the functionality of repository
-//! triggers by SENDING INFORMATION TO THE TRIGGER TARGET. If real data is available in
-//! the repository, the test sends data from the last commit. If no data is available,
-//! sample data is generated"
+//! Amazon SNS)", and `RepositoryTrigger$events` are "the repository events that cause
+//! the trigger to RUN ACTIONS IN ANOTHER SERVICE, such as sending a notification
+//! through Amazon SNS"
+//! (`smithy_query(query="doc",shape="RepositoryTrigger",member="events")`). So a write
+//! that moves a reference a stored trigger is in scope for — one whose `branches` name
+//! the moved branch, or which names none at all, since "if you specify an empty array,
+//! the trigger applies to all branches" — sends ONE record to the destination that
+//! trigger names, labelled [`TRIGGER_EVENT_NAME`]; a write of a reference no stored
+//! trigger is in scope for sends nothing. Which triggers one write is in scope for is
+//! [`super::reference_changes`].
+//!
+//! `TestRepositoryTriggers` "tests the functionality of repository triggers by SENDING
+//! INFORMATION TO THE TRIGGER TARGET. If real data is available in the repository, the
+//! test sends data from the last commit. If no data is available, sample data is
+//! generated"
 //! (`smithy_query(query="operation",operation="TestRepositoryTriggers",model_path="services/service-com-amazonaws-codecommit-codecommit-20150413/smithy-model/com-amazonaws-codecommit-codecommit-20150413.json")`).
 //! So each trigger a caller submits is tested by DELIVERING one record to the
 //! destination it names, and what the test reports per trigger is whether that
 //! delivery was accepted: a test that only read the configuration back would leave
 //! both sentences unimplemented — a subscriber of the configured topic would receive
 //! nothing at all, and a destination nothing can be sent to could not be told apart
-//! from one that received the record.
+//! from one that received the record. That record is labelled as the test it is
+//! ([`TRIGGER_TEST_EVENT_NAME`]), so a consumer tells a probe apart from a reference
+//! that really moved.
 //!
 //! # What the destination receives
 //!
@@ -26,7 +39,7 @@
 //! the trigger is on (`eventSourceARN`), the trigger that produced it
 //! (`eventTriggerName`), the configuration it belongs to (`eventTriggerConfigId`), the
 //! identity the call was made by (`userIdentityARN`), the trigger's own `customData`
-//! when it carries any, and the reference the test is about with the commit that
+//! when it carries any, and the reference the record is about with the commit that
 //! reference points at (`codecommit.references`). Every value is read off the STORED
 //! repository, so a consumer of the record and a later `GetBranch`/`GetCommit` of the
 //! same repository report one fact — except for the repository that holds no commit at
@@ -60,11 +73,25 @@ use super::*;
 /// the service principal form a consumer matches a CodeCommit record on.
 pub const TRIGGER_EVENT_SOURCE: &str = "aws:codecommit";
 
-/// The `eventName` of a record about references that changed, which is what a
+/// The `eventName` of a record about references that REALLY changed, which is what a
 /// repository trigger is about: `RepositoryTriggerEventEnum` is the reference events
 /// `createReference`, `updateReference` and `deleteReference`
 /// (`smithy_query(query="shape",shape="RepositoryTriggerEventEnum")`).
 pub const TRIGGER_EVENT_NAME: &str = "ReferenceChanges";
+
+/// The `eventName` of the record a TEST of a trigger sends.
+///
+/// `TestRepositoryTriggers` "tests the functionality of repository triggers by sending
+/// information to the trigger target. If real data is available in the repository, the
+/// test sends data from the last commit. If no data is available, sample data is
+/// generated"
+/// (`smithy_query(query="operation",operation="TestRepositoryTriggers")`): the record it
+/// sends is a PROBE rather than a report of a reference that moved — the reference and
+/// commit it names may be data the test generated, and the repository's references are
+/// exactly where they were. So it is labelled as the test it is, and a consumer that
+/// branches on `eventName` tells the probe apart from [`TRIGGER_EVENT_NAME`] rather
+/// than building, notifying or deploying for a change nothing made.
+pub const TRIGGER_TEST_EVENT_NAME: &str = "TriggerEventTest";
 
 /// The `eventVersion` of the record layout rendered here.
 pub const TRIGGER_EVENT_VERSION: &str = "1.0";
@@ -152,22 +179,65 @@ fn test_notification(
     caller_arn: &str,
     at: SystemTime,
 ) -> TriggerNotification {
+    let (reference, commit_id) = tested_reference(repository, trigger);
+    notification(
+        repository,
+        trigger,
+        &RecordedChange {
+            configuration_id: &configuration_id(repository, at),
+            event_name: TRIGGER_TEST_EVENT_NAME,
+            reference: &reference,
+            commit_id: &commit_id,
+            caller_arn: Some(caller_arn),
+        },
+        at,
+    )
+}
+
+/// What one record is ABOUT: the configuration it belongs to, the class of event it
+/// reports, the reference and commit it names, and whose call produced it.
+///
+/// Stated once, so the two things a trigger's destination is sent a record for — a
+/// reference that really moved and a test of the trigger — differ only in the values
+/// here and are rendered by the one [`record`] that writes the envelope.
+pub struct RecordedChange<'a> {
+    /// The `eventTriggerConfigId` the record carries: the id of the configuration the
+    /// trigger belongs to.
+    pub configuration_id: &'a str,
+    /// The record's `eventName`: [`TRIGGER_EVENT_NAME`] for a reference that changed,
+    /// [`TRIGGER_TEST_EVENT_NAME`] for a test of the trigger.
+    pub event_name: &'a str,
+    /// The FULLY QUALIFIED reference the record is about, as
+    /// `codecommit.references[0].ref` names it ([`qualified_reference`]).
+    pub reference: &'a str,
+    /// The commit that reference points at.
+    pub commit_id: &'a str,
+    /// The identity whose call produced the record (`userIdentityARN`), for a transport
+    /// that carries one: the git transport authenticates with git credentials rather
+    /// than a caller's own, so a push names none and the member is left out rather than
+    /// sent empty.
+    pub caller_arn: Option<&'a str>,
+}
+
+/// One record of `change`, addressed to the destination `trigger` names.
+///
+/// The ONE construction of a record waiting to be sent, so what a reference change and
+/// a test deliver reach their destination the same way.
+#[must_use]
+pub fn notification(
+    repository: &Repository,
+    trigger: &RepositoryTrigger,
+    change: &RecordedChange<'_>,
+    at: SystemTime,
+) -> TriggerNotification {
     let addressed = super::trigger_destination(&trigger.destination_arn).and_then(
         |(vendor, region)| Destination::of(vendor).map(|kind| (kind, region.to_string())),
     );
-    let (reference, commit_id) = tested_reference(repository, trigger);
     TriggerNotification {
         trigger_name: trigger.name.clone(),
         destination_arn: trigger.destination_arn.clone(),
         addressed,
-        payload: record(
-            repository,
-            trigger,
-            &reference,
-            &commit_id,
-            caller_arn,
-            at,
-        ),
+        payload: record(repository, trigger, change, at),
     }
 }
 
@@ -231,19 +301,17 @@ pub fn sample_commit_id(repository: &Repository, branch: &str) -> String {
 fn record(
     repository: &Repository,
     trigger: &RepositoryTrigger,
-    reference: &str,
-    commit_id: &str,
-    caller_arn: &str,
+    change: &RecordedChange<'_>,
     at: SystemTime,
 ) -> String {
     let mut changed = ::serde_json::Map::new();
     changed.insert(
         "commit".to_string(),
-        ::serde_json::Value::String(commit_id.to_string()),
+        ::serde_json::Value::String(change.commit_id.to_string()),
     );
     changed.insert(
         "ref".to_string(),
-        ::serde_json::Value::String(reference.to_string()),
+        ::serde_json::Value::String(change.reference.to_string()),
     );
     let mut entry = ::serde_json::Map::new();
     let mut put = |member: &str, value: &str| {
@@ -254,14 +322,16 @@ fn record(
     };
     put("awsRegion", &repository.region);
     put("eventId", &event_id(repository, trigger, at));
-    put("eventName", TRIGGER_EVENT_NAME);
+    put("eventName", change.event_name);
     put("eventSource", TRIGGER_EVENT_SOURCE);
     put("eventSourceARN", &repository.arn);
     put("eventTime", &event_time(at));
-    put("eventTriggerConfigId", &configuration_id(repository, at));
+    put("eventTriggerConfigId", change.configuration_id);
     put("eventTriggerName", &trigger.name);
     put("eventVersion", TRIGGER_EVENT_VERSION);
-    put("userIdentityARN", caller_arn);
+    if let Some(caller_arn) = change.caller_arn {
+        put("userIdentityARN", caller_arn);
+    }
     // "Any custom data associated with the trigger to be INCLUDED IN THE INFORMATION
     // SENT TO THE TARGET of the trigger"
     // (`smithy_query(query="doc",shape="RepositoryTrigger",member="customData")`), so a
@@ -456,4 +526,59 @@ fn lambda_client(
         )
         .build();
     ::aws_sdk_lambda::Client::from_conf(config)
+}
+
+/// How many trigger deliveries run at once, over the whole store.
+///
+/// A write that moves a reference a trigger is in scope for starts one delivery, so a
+/// caller driving writes drives tasks: this permit is what keeps the work in flight
+/// bounded however many writes arrive, exactly as this crate bounds what one request
+/// can grow. A delivery waits for a permit rather than being dropped, because a record
+/// the configuration owes a destination is a record a consumer is owed.
+const CONCURRENT_DELIVERIES: usize = 16;
+
+/// The permits those deliveries take, one per delivery in flight.
+static DELIVERIES: ::tokio::sync::Semaphore =
+    ::tokio::sync::Semaphore::const_new(CONCURRENT_DELIVERIES);
+
+/// Send `notifications` to the destinations they name, on a task of its OWN, for a
+/// handler whose answer does not wait for the delivery.
+///
+/// A reference change's records reach the destination AFTER the write that caused them
+/// — which is what a consumer polling a subscribed queue observes — so they are handed
+/// to their own task rather than awaited under this service's store guard: a guard held
+/// across an await would make a handler's future non-`Send`, and the write's answer
+/// waits for nothing that is not part of it. That is also why a destination's refusal
+/// is TRACED here instead of reported: unlike `TestRepositoryTriggers`, whose whole
+/// answer is the per-trigger report, a write that moved a reference has already
+/// happened and nothing about it changes with what the destination said.
+///
+/// Nothing to send starts no task; a task that starts takes one of
+/// [`CONCURRENT_DELIVERIES`] permits before it sends, and sends in the order the
+/// records were rendered.
+pub fn deliver_all_detached(
+    notifications: Vec<TriggerNotification>,
+    callback: &::smithy_server_runtime::EmbeddedEmulator,
+) {
+    if notifications.is_empty() {
+        return;
+    }
+    let callback = callback.clone();
+    ::tokio::spawn(async move {
+        // A closed semaphore is not something this process creates, so a permit that
+        // cannot be taken leaves the records unsent rather than sent twice.
+        let Ok(_permit) = DELIVERIES.acquire().await else {
+            return;
+        };
+        for notification in notifications {
+            if let Err(message) = notification.send(&callback).await {
+                ::tracing::warn!(
+                    trigger = %notification.trigger_name,
+                    destination = %notification.destination_arn,
+                    %message,
+                    "a repository trigger's record could not be sent to its destination"
+                );
+            }
+        }
+    });
 }

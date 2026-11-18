@@ -555,8 +555,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })?;
         // The branch moves to the new commit, through the one place a branch tip
         // moves: every OPEN pull request reading from it follows the new tip, and
-        // each pull request that moved with it is PUBLISHED onto the account's
-        // default event bus once this call's guard is gone.
+        // what the write owes — each pull request that moved with it, and the record
+        // each trigger in scope for the write owes its destination — is DELIVERED
+        // once this call's guard is gone.
         let published = repository.set_branch_tip(&input.branch_name, &commit_id, now, Some(&actor));
         // The first branch a repository gets is its default branch.
         if repository.default_branch.is_none() {
@@ -568,7 +569,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         repository.prune_history();
 
         drop(store);
-        crate::state::pull_request_events::publish_all_detached(published, ctx.callback());
+        published.publish_detached(ctx.callback());
         Ok(PutFileOutput {
             commit_id,
             blob_id,

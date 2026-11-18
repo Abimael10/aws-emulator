@@ -73,20 +73,25 @@ impl Repository {
     /// A pull request that is no longer open is a record of what it was merged
     /// or closed at, so a later move of its source branch does not touch it.
     ///
-    /// Answers the change each updated pull request recorded, for the caller to
-    /// publish once this repository's store guard is gone
-    /// ([`pull_request_events::publish_all`]): a reference move is observable to a
-    /// consumer of the account's default event bus, and this is the one place that
-    /// knows which pull requests it moved. A move that updated no pull request —
-    /// a branch no open pull request reads from — answers nothing.
-    #[must_use = "a recorded pull-request change is published onto the default event bus"]
+    /// Answers what the write leaves to be DELIVERED once this repository's store
+    /// guard is gone ([`reference_changes::ReferenceChange::publish_detached`]): the
+    /// change each updated pull request recorded, which a consumer of the account's
+    /// default event bus observes, and the record each of the repository's triggers
+    /// that is in scope for this write owes its destination — a trigger naming this
+    /// branch, or naming none, and naming the class of write this is
+    /// ([`reference_changes`]). This is the one place that knows both which pull
+    /// requests the move updated and which reference moved how, so it is where both
+    /// are rendered. A move that updated no pull request and that no trigger is in
+    /// scope for answers nothing.
+    #[must_use = "a write of a reference runs the repository's triggers and publishes \
+                  the pull-request changes it recorded"]
     pub fn set_branch_tip(
         &mut self,
         branch: &str,
         commit_id: &str,
         at: SystemTime,
         actor: Option<&str>,
-    ) -> Vec<pull_request_events::PullRequestStateChange> {
+    ) -> reference_changes::ReferenceChange {
         let previous = self
             .branches
             .insert(
@@ -99,8 +104,8 @@ impl Repository {
             .map(|replaced| replaced.commit_id);
         if previous.as_deref() == Some(commit_id) {
             // The reference already pointed there, so nothing moved — and
-            // nothing reading from it changed either.
-            return Vec::new();
+            // nothing reading from it changed either, so no trigger ran.
+            return reference_changes::ReferenceChange::default();
         }
 
         let reference = qualified_reference(branch);
@@ -182,11 +187,25 @@ impl Repository {
             updated.push(pull_request_id);
         }
         // Rendered from the pull requests as they now stand, so what is published
-        // is what the next read of each of them reports.
-        updated
+        // is what the next read of each of them reports — together with the record
+        // each trigger in scope for this write owes its destination, read off the
+        // configuration the repository holds. A reference the repository did not
+        // hold before is a `createReference` write; one that moved from another
+        // commit is an `updateReference` write.
+        let event = match previous {
+            Some(_) => reference_changes::ReferenceEvent::Updated,
+            None => reference_changes::ReferenceEvent::Created,
+        };
+        let trigger_notifications =
+            self.reference_change_notifications(branch, commit_id, event, actor, at);
+        let pull_request_changes = updated
             .into_iter()
             .flat_map(|pull_request_id| self.pull_request_changes(pull_request_id, 1))
-            .collect()
+            .collect();
+        reference_changes::ReferenceChange {
+            pull_request_changes,
+            trigger_notifications,
+        }
     }
 
     /// Keep a commit no ref names readable: record it as a retained unreferenced

@@ -55,6 +55,21 @@ pub const MAX_TRIGGER_CUSTOM_DATA_CHARACTERS: usize = 1_000;
 /// (`smithy_query(query="doc",shape="RepositoryTrigger",member="events")`).
 pub const REPOSITORY_TRIGGER_EVENT_ALL: &str = "all";
 
+/// The `RepositoryTriggerEventEnum` values that each name ONE class of reference
+/// write (`smithy_query(query="shape",shape="RepositoryTriggerEventEnum")`): a
+/// reference the repository did not hold, a reference that moved from one commit to
+/// another, and a reference the repository no longer holds.
+///
+/// Named one by one as well as listed in the enum's value set, because which of
+/// them a write of a reference IS decides which triggers that write runs
+/// ([`reference_changes::ReferenceEvent`]), so both readings come from one
+/// declaration.
+pub const REPOSITORY_TRIGGER_EVENT_CREATE_REFERENCE: &str = "createReference";
+/// See [`REPOSITORY_TRIGGER_EVENT_CREATE_REFERENCE`].
+pub const REPOSITORY_TRIGGER_EVENT_UPDATE_REFERENCE: &str = "updateReference";
+/// See [`REPOSITORY_TRIGGER_EVENT_CREATE_REFERENCE`].
+pub const REPOSITORY_TRIGGER_EVENT_DELETE_REFERENCE: &str = "deleteReference";
+
 /// The ARN namespaces a trigger destination may name: a repository trigger
 /// "runs actions in another service, such as sending a notification through
 /// Amazon SNS" (`RepositoryTrigger.events`), and the two targets CodeCommit

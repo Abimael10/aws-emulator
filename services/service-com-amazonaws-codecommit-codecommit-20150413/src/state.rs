@@ -29,6 +29,9 @@ pub mod merge;
 mod merge_record;
 /// The EventBridge envelope a recorded change to a pull request is published as.
 pub mod pull_request_events;
+/// What a write of a REFERENCE runs: which of the repository's stored triggers are in
+/// scope for it, and the one handover a write makes once the store guard is gone.
+pub mod reference_changes;
 mod repository;
 /// What a repository TRIGGER is: how many of them a repository may hold, what a
 /// trigger's members have to say, and the modelled error each problem with one is

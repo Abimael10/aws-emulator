@@ -850,10 +850,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // here, together with every git object no remaining ref reaches.
         repository.prune_history();
 
-        // Each pull request that moved with the reference is PUBLISHED onto the
-        // account's default event bus, once this call's guard is gone.
+        // Each pull request that moved with the reference, and the record each
+        // trigger in scope for the write owes its destination, are DELIVERED once
+        // this call's guard is gone.
         drop(store);
-        crate::state::pull_request_events::publish_all_detached(published, ctx.callback());
+        published.publish_detached(ctx.callback());
         Ok(MergeBranchesByThreeWayOutput {
             commit_id: Some(commit_id),
             tree_id: Some(tree_id),

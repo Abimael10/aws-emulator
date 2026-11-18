@@ -1045,9 +1045,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The merge of the target and the close it caused are PUBLISHED onto the
         // account's default event bus, in the order the log records them, together
         // with any pull request the destination branch moved under.
-        published.extend(repository.pull_request_changes(pull_request_id, recorded));
+        published
+            .pull_request_changes
+            .extend(repository.pull_request_changes(pull_request_id, recorded));
         drop(store);
-        crate::state::pull_request_events::publish_all_detached(published, ctx.callback());
+        published.publish_detached(ctx.callback());
         Ok(output)
     }
 }
