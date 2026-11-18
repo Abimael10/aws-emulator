@@ -50,16 +50,16 @@ const PAST_STACK_SPAN: Duration = Duration::from_millis(900);
 /// Source: the `aws:cloudformation:*` keys CloudFormation's own documentation names for a
 /// stack's resources, which this emulator's CloudFormation crate carries as
 /// `state::provisioning::{STACK_NAME_TAG, STACK_ID_TAG, LOGICAL_ID_TAG}`.
-const STACK_NAME_TAG: &str = "aws:cloudformation:stack-name";
-const STACK_ID_TAG: &str = "aws:cloudformation:stack-id";
-const LOGICAL_ID_TAG: &str = "aws:cloudformation:logical-id";
+pub(crate) const STACK_NAME_TAG: &str = "aws:cloudformation:stack-name";
+pub(crate) const STACK_ID_TAG: &str = "aws:cloudformation:stack-id";
+pub(crate) const LOGICAL_ID_TAG: &str = "aws:cloudformation:logical-id";
 
 /// `GET /tags/{resourceArn}` — S3 Vectors' `ListTagsForResource`, as the status and the tag
 /// map it reports.
 ///
 /// The ARN travels as ONE path segment (`resourceArn` is an `@httpLabel`), so it is
 /// percent-encoded with this crate's one encoder.
-async fn vector_resource_tags(
+pub(crate) async fn vector_resource_tags(
     router: &MultiServiceRouter,
     region: &str,
     arn: &str,
@@ -243,19 +243,27 @@ const ROWS: &[Row] = &[
     },
 ];
 
-/// The tag set the rule says the resource `logical_id` of this row ends up carrying, in the
-/// stack `stack_name` whose id is `stack_id`.
-fn expected_tags(row: &Row, logical_id: &str, stack_name: &str, stack_id: &str) -> BTreeMap<String, String> {
+/// The ONE statement of what tag set the rule decides for a provisioned resource: the tags
+/// its own declaration asks for (`declared`), the stack-level tags in force (`stack_tags`,
+/// which do not displace a key the declaration already states) and the three
+/// CloudFormation records itself, which nothing displaces.
+///
+/// Parameterised rather than keyed to one suite's row type, so every suite that checks this
+/// rule states the expectation once — `s3vectors_stack_provenance_deployment_paths.rs`,
+/// which varies the provisioning path, reads it from here.
+pub(crate) fn expected_resource_tags(
+    declared: &[(&str, &str)],
+    stack_tags: &[(&str, &str)],
+    stack_name: &str,
+    stack_id: &str,
+    logical_id: &str,
+) -> BTreeMap<String, String> {
     let mut expected: BTreeMap<String, String> = BTreeMap::new();
-    for resource in row.resources {
-        if resource.logical_id == logical_id {
-            for (key, value) in resource.declared {
-                expected.insert((*key).to_string(), (*value).to_string());
-            }
-        }
+    for (key, value) in declared {
+        expected.insert((*key).to_string(), (*value).to_string());
     }
     // A stack tag whose key the declaration already states does not displace it.
-    for (key, value) in row.stack_tags {
+    for (key, value) in stack_tags {
         expected
             .entry((*key).to_string())
             .or_insert_with(|| (*value).to_string());
@@ -267,8 +275,20 @@ fn expected_tags(row: &Row, logical_id: &str, stack_name: &str, stack_id: &str) 
     expected
 }
 
+/// The tag set the rule says the resource `logical_id` of this row ends up carrying, in the
+/// stack `stack_name` whose id is `stack_id`.
+fn expected_tags(row: &Row, logical_id: &str, stack_name: &str, stack_id: &str) -> BTreeMap<String, String> {
+    let declared: Vec<(&str, &str)> = row
+        .resources
+        .iter()
+        .filter(|resource| resource.logical_id == logical_id)
+        .flat_map(|resource| resource.declared.iter().copied())
+        .collect();
+    expected_resource_tags(&declared, row.stack_tags, stack_name, stack_id, logical_id)
+}
+
 /// The `Tags.member.N.Key`/`Value` request members a stack-level tag list is.
-fn tag_members(tags: &[(&str, &str)]) -> Vec<(String, String)> {
+pub(crate) fn tag_members(tags: &[(&str, &str)]) -> Vec<(String, String)> {
     let mut members = Vec::new();
     for (index, (key, value)) in tags.iter().enumerate() {
         let position = index + 1;
