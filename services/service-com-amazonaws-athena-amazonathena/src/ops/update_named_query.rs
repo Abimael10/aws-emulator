@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateNamedQuery
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateNamedQuery`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateNamedQuery::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: writes the name, the query text and the description the request carries onto
+//! the saved query its `NamedQueryId` names, leaving the database and the workgroup that
+//! query was created in untouched, so `GetNamedQuery` reads the revised query back under the
+//! same id. An id this account minted no query under is refused with the same miss the read
+//! of one reports.
 //!
 //! ## Shape of an operation
 //!
@@ -137,20 +133,76 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateNamedQuery` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateNamedQueryErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateNamedQuery"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(UpdateNamedQueryErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("Athena state is not reachable on this engine".to_string()),
+                },
+            )
+            .into());
+        };
+        let mut store = state.lock();
+
+        // The database the addressed query belongs to — which this update may not change, so
+        // the size of what is about to be written is measured against the STORED database
+        // rather than against anything the request carries.
+        let Some(database) = store
+            .named_queries
+            .query(&input.named_query_id)
+            .map(|record| record.database.clone())
+        else {
+            // Athena models no not-found error for this operation, so an id this account
+            // minted no query under is "something wrong with the input to the request",
+            // reported exactly as the read of such an id reports it.
+            return Err(invalid_request(crate::state::named_query_not_found(
+                &input.named_query_id,
+            )));
+        };
+
+        // Measured before anything is written: the bytes of named queries this account holds
+        // are bounded, and a write that would take it past that bound is refused rather than
+        // stored. What this write overwrites is freed by it.
+        let query_bytes = crate::state::named_query_bytes(
+            &input.name,
+            &database,
+            &input.query_string,
+            input.description.as_deref(),
+        );
+        if store
+            .named_queries
+            .would_exceed_stored_bytes_on_revise(&input.named_query_id, query_bytes)
+        {
+            return Err(invalid_request(crate::state::named_queries_too_large()));
+        }
+
+        let Some(record) = store.named_queries.query_mut(&input.named_query_id) else {
+            return Err(invalid_request(crate::state::named_query_not_found(
+                &input.named_query_id,
+            )));
+        };
+
+        // "Updates a NamedQuery object. The database or workgroup cannot be updated": the
+        // three members the update carries are written and the rest of the record stands, so
+        // the query keeps the id it was minted under and stays in the database and the
+        // workgroup it was created in. The description is REPLACED rather than merged — the
+        // update carries the whole query — so one sent without a description leaves the query
+        // with none.
+        record.revise(input.name, input.query_string, input.description);
+
+        // `UpdateNamedQueryOutput` models no members: the revised query is read back through
+        // `GetNamedQuery`.
+        Ok(UpdateNamedQueryOutput {})
     }
+}
+
+/// The operation's own client error (HTTP 400), carrying `message`.
+///
+/// Both refusals above are caused by the request itself — an id this account holds no query
+/// under, and a revision past what this account can hold — which is the class
+/// `InvalidRequestException` reports ("Indicates that something is wrong with the input to
+/// the request"), under the code [`crate::state::ERROR_CODE_INVALID_INPUT`].
+fn invalid_request(message: impl Into<String>) -> UpdateNamedQueryError {
+    UpdateNamedQueryError::invalid_request(crate::state::ERROR_CODE_INVALID_INPUT, message)
 }

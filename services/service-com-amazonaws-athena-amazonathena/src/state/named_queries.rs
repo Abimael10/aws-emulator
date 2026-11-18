@@ -3,7 +3,8 @@
 //! The named (saved) queries each workgroup of this account holds.
 //!
 //! `CreateNamedQuery` writes a [`NamedQueryRecord`] into the [`NamedQueryRegistry`] on this
-//! service's store and `GetNamedQuery` answers out of that same record, so every value a
+//! service's store, `UpdateNamedQuery` revises that same record in place
+//! ([`NamedQueryRecord::revise`]) and `GetNamedQuery` answers out of it, so every value a
 //! read reports is one some earlier write persisted rather than one derived from the
 //! reading request.
 //!
@@ -64,6 +65,19 @@ pub struct NamedQueryRecord {
 }
 
 impl NamedQueryRecord {
+    /// Write `name`, `query_string` and `description` onto the query, as an update does.
+    ///
+    /// The database and the workgroup are NOT touched: "The database or workgroup cannot be
+    /// updated" (`UpdateNamedQuery`), so a query stays in the database and the workgroup its
+    /// create put it in. The description is REPLACED rather than merged, because the update
+    /// carries the whole query: one called without a description leaves the query with none,
+    /// exactly as a create without one does.
+    pub fn revise(&mut self, name: String, query_string: String, description: Option<String>) {
+        self.name = name;
+        self.query_string = query_string;
+        self.description = description;
+    }
+
     /// The record as the modelled `NamedQuery` shape a read answers with.
     pub fn to_named_query(&self) -> NamedQuery {
         NamedQuery {
@@ -127,6 +141,11 @@ impl NamedQueryRegistry {
         self.queries.get(id)
     }
 
+    /// The same query, for a caller that is going to write it (an update).
+    pub fn query_mut(&mut self, id: &str) -> Option<&mut NamedQueryRecord> {
+        self.queries.get_mut(id)
+    }
+
     /// The query a `ClientRequestToken` already minted, if it did.
     pub fn query_of_token(&self, token: &str) -> Option<&NamedQueryRecord> {
         self.queries.get(self.create_tokens.get(token)?)
@@ -163,7 +182,26 @@ impl NamedQueryRegistry {
     /// count a workgroup may hold is the create's other bound ([`Self::len_in`]), reported
     /// with its own sentence.
     pub fn would_exceed_stored_bytes(&self, query_bytes: usize) -> bool {
-        self.stored_bytes().saturating_add(query_bytes) > MAX_NAMED_QUERY_BYTES_TOTAL
+        self.stored_bytes_would_exceed(query_bytes, 0)
+    }
+
+    /// Whether an UPDATE writing `query_bytes` over the query `id` names would EXCEED that
+    /// same bound.
+    ///
+    /// The bytes it overwrites are freed by the same write, so they are not counted twice;
+    /// the count bound is not in question, an update adding no query.
+    pub fn would_exceed_stored_bytes_on_revise(&self, id: &str, query_bytes: usize) -> bool {
+        let freed = self
+            .query(id)
+            .map(NamedQueryRecord::stored_bytes)
+            .unwrap_or_default();
+        self.stored_bytes_would_exceed(query_bytes, freed)
+    }
+
+    /// Whether holding `added` more bytes, once `freed` are released, EXCEEDS
+    /// [`MAX_NAMED_QUERY_BYTES_TOTAL`].
+    fn stored_bytes_would_exceed(&self, added: usize, freed: usize) -> bool {
+        self.stored_bytes().saturating_sub(freed).saturating_add(added) > MAX_NAMED_QUERY_BYTES_TOTAL
     }
 
     /// Store `record`, under `token` when the request carried one.
@@ -239,8 +277,8 @@ pub fn too_many_named_queries(work_group: &str) -> String {
     )
 }
 
-/// The refusal message for a create that would take the account past
-/// [`MAX_NAMED_QUERY_BYTES_TOTAL`].
+/// The refusal message for a write — a create, or an update revising a query — that would
+/// take the account past [`MAX_NAMED_QUERY_BYTES_TOTAL`].
 pub fn named_queries_too_large() -> String {
     format!(
         "Cannot store this named query: this account already holds the maximum of \
