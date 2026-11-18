@@ -43,7 +43,7 @@ use std::time::{Duration, Instant};
 use bytes::Bytes;
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::query_wire::{element, elements, form_encode, opt_element};
+use crate::query_wire::{block_contains, element, elements, form_encode, opt_element};
 
 /// The Region every request below is signed for, and so the Region the resources belong to.
 const REGION: &str = "us-east-1";
@@ -360,36 +360,11 @@ async fn interfaces_in(
 
 /// Whether the IPv4 address `address` falls inside the IPv4 block `cidr`.
 ///
-/// Written here because the suite has to judge an address the OWNER chose against the block
-/// the subnet was created with, and `core/router/Cargo.toml` is a pinned path in this
-/// repository, so this test crate can take no dependency of its own (see `query_wire`).
+/// The shared reader (`query_wire::block_contains`), in this suite's argument order: the
+/// judgement — an address the OWNER chose against the block the subnet was created with — is
+/// read ONE way across the suites that make it.
 fn address_in_cidr(address: &str, cidr: &str) -> bool {
-    let octets = |text: &str| -> Option<u32> {
-        let parts: Vec<&str> = text.split('.').collect();
-        if parts.len() != 4 {
-            return None;
-        }
-        let mut value: u32 = 0;
-        for part in parts {
-            value = (value << 8) | u32::from(part.parse::<u8>().ok()?);
-        }
-        Some(value)
-    };
-    let Some((block, bits)) = cidr.split_once('/') else {
-        return false;
-    };
-    let Some(prefix) = bits.parse::<u32>().ok().filter(|bits| *bits <= 32) else {
-        return false;
-    };
-    let mask = if prefix == 0 {
-        0
-    } else {
-        u32::MAX << (32 - prefix)
-    };
-    match (octets(address), octets(block)) {
-        (Some(address), Some(block)) => (address & mask) == (block & mask),
-        _ => false,
-    }
+    block_contains(cidr, address)
 }
 
 /// Wait until `holds` is true of the answer to `action`, and answer with that reply.

@@ -28,6 +28,7 @@
 //! is written once, over the `<member>` that carries both.
 
 use std::collections::BTreeMap;
+use std::net::Ipv4Addr;
 
 /// Percent-encode one `application/x-www-form-urlencoded` component, leaving only RFC
 /// 3986's unreserved characters (`ALPHA / DIGIT / "-" / "." / "_" / "~"`) literal.
@@ -247,9 +248,97 @@ pub(crate) fn physical_ids_of(xml: &str) -> BTreeMap<String, String> {
     pairs_of(xml, "LogicalResourceId", "PhysicalResourceId")
 }
 
+/// Whether the IPv4 block `block` (`a.b.c.d/len`) holds the IPv4 address `address`.
+///
+/// Here, ONCE, for the reason this module exists: several suites judge an address a service
+/// CHOSE against the block the subnet it sits in was created with — an interface's private
+/// address, a directory's DNS address — and a suite that writes its own masking drifts from the
+/// others. Both values come from the services' own answers, so a malformed one is a defect in
+/// what was reported rather than a reason to answer "not inside": it panics quoting the value.
+pub(crate) fn block_contains(block: &str, address: &str) -> bool {
+    let (base, prefix) = block
+        .split_once('/')
+        .unwrap_or_else(|| panic!("expected a CIDR block of the form a.b.c.d/len, got {block:?}"));
+    let base: Ipv4Addr = base
+        .parse()
+        .unwrap_or_else(|_| panic!("expected an IPv4 base address, got {block:?}"));
+    let prefix: u32 = prefix
+        .parse()
+        .unwrap_or_else(|_| panic!("expected an IPv4 prefix length, got {block:?}"));
+    assert!(
+        prefix <= 32,
+        "expected a prefix length of at most 32, got {block:?}"
+    );
+    let address: Ipv4Addr = address
+        .parse()
+        .unwrap_or_else(|_| panic!("expected an IPv4 address, got {address:?}"));
+    // The whole block when the prefix covers no bits, which `u32::MAX << 32` would overflow on.
+    let mask = if prefix == 0 {
+        0
+    } else {
+        u32::MAX << (32 - prefix)
+    };
+    (u32::from(address) & mask) == (u32::from(base) & mask)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The containment reader answers for each bound of a block, over the block sizes a VPC's
+    /// subnets carry between the two published ones (`/16` is the largest block a VPC takes and
+    /// `/28` the smallest a subnet takes): each block's first and last address, and the address
+    /// just outside either end.
+    #[test]
+    fn the_containment_reader_answers_for_each_bound_of_a_block() {
+        // (case, the block, the address, whether the block holds it)
+        let rows: [(&str, &str, &str, bool); 11] = [
+            ("the first address of a /24", "10.80.1.0/24", "10.80.1.0", true),
+            ("the last address of a /24", "10.80.1.0/24", "10.80.1.255", true),
+            ("one past the end of a /24", "10.80.1.0/24", "10.80.2.0", false),
+            (
+                "one before the start of a /24",
+                "10.80.1.0/24",
+                "10.80.0.255",
+                false,
+            ),
+            ("an address inside a /28", "10.81.0.16/28", "10.81.0.20", true),
+            (
+                "one past the end of a /28",
+                "10.81.0.16/28",
+                "10.81.0.32",
+                false,
+            ),
+            (
+                "the last address of a /20",
+                "10.81.16.0/20",
+                "10.81.31.255",
+                true,
+            ),
+            (
+                "one past the end of a /20",
+                "10.81.16.0/20",
+                "10.81.32.0",
+                false,
+            ),
+            (
+                "the last address of a /16",
+                "10.82.0.0/16",
+                "10.82.255.255",
+                true,
+            ),
+            ("one past the end of a /16", "10.82.0.0/16", "10.83.0.0", false),
+            ("every address of a /0", "0.0.0.0/0", "198.51.100.7", true),
+        ];
+
+        for (case, block, address, expected) in rows {
+            let held = block_contains(block, address);
+            assert_eq!(
+                held, expected,
+                "case {case:?}: expected {block} to hold {address} = {expected}, got {held}"
+            );
+        }
+    }
 
     /// The encoder escapes everything outside the unreserved set and nothing inside it,
     /// over the classes an awsQuery component runs into.
