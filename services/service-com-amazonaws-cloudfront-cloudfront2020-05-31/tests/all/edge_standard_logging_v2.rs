@@ -20,7 +20,15 @@
 //!   or Raw format");
 //! * a distribution whose access logs no delivery carries — no pipeline at all, a source no
 //!   delivery pairs, or a delivery to a destination that is not a log group — leaves nothing in
-//!   any group.
+//!   any group;
+//! * a destination is "a log group in CloudWatch Logs, an Amazon S3 bucket, or a delivery stream
+//!   in Firehose" (`PutDeliveryDestination`), so the records fan out to EVERY destination the
+//!   distribution's deliveries name, whichever of those kinds each is: a bucket destination
+//!   receives the gzipped log file a reader of a bucket of vended logs fetches under the
+//!   published object layout, a delivery-stream destination receives one put record, which that
+//!   stream then delivers to its own destination, and the records of ONE request carry the same
+//!   `x-edge-request-id` — the identifier the edge answer handed the viewer as `X-Amz-Cf-Id` —
+//!   so a consumer can join them.
 //!
 //! Every record read back here is read through CloudWatch Logs' own `FilterLogEvents`, so a
 //! record this suite sees is a record a client polling that group sees. The tables span what
@@ -861,4 +869,633 @@ async fn a_log_group_delivery_reports_the_log_group_destination_type() {
         Some(CWL),
         "case a log-group destination: expected the delivery to report {CWL}, got {created}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// The other two kinds of destination a delivery can name
+// ---------------------------------------------------------------------------
+
+/// The `DeliveryDestinationType` of a destination that is an Amazon S3 bucket, and of one that
+/// is a Firehose delivery stream (`smithy_query(query="shape",shape="DeliveryDestinationType")`).
+const S3: &str = "S3";
+const FH: &str = "FH";
+
+/// Amazon S3's and Firehose's own endpoints of this Region, and the `X-Amz-Target` prefix
+/// Firehose's `awsJson1_1` operations are named under (that model's `targetPrefix`). IAM is a
+/// partition-global endpoint, so its host carries no Region.
+const S3_HOST: &str = "s3.us-east-1.amazonaws.com";
+const FIREHOSE_HOST: &str = "firehose.us-east-1.amazonaws.com";
+const FIREHOSE_TARGET: &str = "Firehose_20150804";
+const IAM_HOST: &str = "iam.amazonaws.com";
+
+/// The record layout of the delivery that writes OBJECTS, and of the one that puts records on a
+/// delivery stream: two deliveries of one source whose `recordFields` differ in which fields
+/// they name, how many, and in what order.
+const BUCKET_RECORD_FIELDS: &[&str] = &[
+    "date",
+    "time",
+    "cs-uri-stem",
+    "sc-status",
+    "x-edge-result-type",
+    "x-edge-request-id",
+];
+const STREAM_RECORD_FIELDS: &[&str] = &["date", "time", "x-edge-request-id", "cs-method", "sc-status"];
+
+/// The prefix the delivery stream's own Amazon S3 destination writes its objects under.
+const STREAM_DESTINATION_PREFIX: &str = "from-the-stream/";
+
+/// The status a Firehose delivery stream that can take a record reports
+/// (`DeliveryStreamStatus`).
+const STREAM_ACTIVE: &str = "ACTIVE";
+
+/// The trust policy the delivery role carries: Firehose makes the delivery under it, so that
+/// service principal may assume it.
+const FIREHOSE_TRUST_POLICY: &str = concat!(
+    r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Service":"#,
+    r#""firehose.amazonaws.com"},"Action":"sts:AssumeRole"}]}"#
+);
+
+/// The role's permissions: the object write the stream's delivery makes.
+const FIREHOSE_ROLE_POLICY: &str = concat!(
+    r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","#,
+    r#""Action":["s3:PutObject"],"Resource":"*"}]}"#
+);
+
+/// One router carrying CloudFront, CloudWatch Logs, Amazon S3, Firehose and IAM over one shared
+/// engine: the delivery pipeline lives in CloudWatch Logs, the records travel from CloudFront,
+/// and the destinations a delivery can name are resources of the other three — so all five have
+/// to be mounted together for a record to have anywhere to land.
+fn emulator_with_delivery_destinations() -> MultiServiceRouter {
+    let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
+    let mut router = MultiServiceRouter::new();
+    router.set_request_authentication(false);
+    router.register_service(EmulatedService::new(Arc::clone(&engine)));
+    router.register_service(
+        service_com_amazonaws_cloudwatchlogs_logs_20140328::EmulatedService::new(Arc::clone(
+            &engine,
+        )),
+    );
+    router.register_service(service_com_amazonaws_s3_amazons3::EmulatedService::new(
+        Arc::clone(&engine),
+    ));
+    router.register_service(
+        service_com_amazonaws_firehose_firehose_20150804::EmulatedService::new(Arc::clone(&engine)),
+    );
+    router.register_service(
+        service_com_amazonaws_iam_awsidentitymanagementv20100508::EmulatedService::new(engine),
+    );
+    router
+}
+
+/// One request to the service `signing_name` serves, addressed to `host`; answers its status
+/// and its body bytes.
+async fn send(
+    router: &MultiServiceRouter,
+    signing_name: &str,
+    host: &str,
+    method: &str,
+    uri: &str,
+    headers: &[(&str, &str)],
+    body: Vec<u8>,
+) -> (u16, Vec<u8>) {
+    let mut request = ::http::Request::builder()
+        .method(method)
+        .uri(uri)
+        .header("host", host)
+        .header("authorization", authorization(signing_name));
+    for (name, value) in headers {
+        request = request.header(*name, *value);
+    }
+    let request = request
+        .body(::bytes::Bytes::from(body))
+        .expect("the request is well formed");
+    let response = router.dispatch(request).await;
+    let status = response.status().as_u16();
+    (status, response.into_body().to_vec())
+}
+
+/// `s3:CreateBucket` for a bucket of this Region, which a destination then names.
+async fn created_bucket(router: &MultiServiceRouter, bucket: &str) {
+    let (status, body) = send(router, "s3", S3_HOST, "PUT", &format!("/{bucket}"), &[], Vec::new())
+        .await;
+    assert_eq!(
+        status,
+        200,
+        "case creating {bucket}: expected HTTP 200, got {status} with {}",
+        String::from_utf8_lossy(&body)
+    );
+}
+
+/// Every key the bucket holds under `prefix`, as `ListObjectsV2` reports them, in key order.
+async fn keys_under(router: &MultiServiceRouter, bucket: &str, prefix: &str) -> Vec<String> {
+    let (status, body) = send(
+        router,
+        "s3",
+        S3_HOST,
+        "GET",
+        &format!("/{bucket}?list-type=2&prefix={prefix}"),
+        &[],
+        Vec::new(),
+    )
+    .await;
+    let text = String::from_utf8_lossy(&body).to_string();
+    assert_eq!(
+        status, 200,
+        "case listing {bucket} under {prefix:?}: expected HTTP 200, got {status} with {text}"
+    );
+    let mut keys: Vec<String> = text
+        .split("<Key>")
+        .skip(1)
+        .filter_map(|rest| rest.split_once("</Key>"))
+        .map(|(key, _after)| key.to_string())
+        .collect();
+    keys.sort();
+    keys
+}
+
+/// The bytes the bucket holds at `key`, as `GetObject` answers them.
+async fn object_bytes(router: &MultiServiceRouter, bucket: &str, key: &str) -> Vec<u8> {
+    let (status, body) = send(
+        router,
+        "s3",
+        S3_HOST,
+        "GET",
+        &format!("/{bucket}/{key}"),
+        &[],
+        Vec::new(),
+    )
+    .await;
+    assert_eq!(
+        status,
+        200,
+        "case reading {key}: expected HTTP 200, got {status} with {}",
+        String::from_utf8_lossy(&body)
+    );
+    body
+}
+
+/// One `awsQuery` IAM action that must succeed.
+async fn iam_action(router: &MultiServiceRouter, action: &str, parameters: &[(&str, &str)]) {
+    let mut body = format!("Action={action}&Version=2010-05-08");
+    for (name, value) in parameters {
+        body.push('&');
+        body.push_str(name);
+        body.push('=');
+        body.push_str(
+            &::percent_encoding::utf8_percent_encode(value, ::percent_encoding::NON_ALPHANUMERIC)
+                .to_string(),
+        );
+    }
+    let (status, answered) = send(
+        router,
+        "iam",
+        IAM_HOST,
+        "POST",
+        "/",
+        &[("content-type", "application/x-www-form-urlencoded")],
+        body.into_bytes(),
+    )
+    .await;
+    assert_eq!(
+        status,
+        200,
+        "case IAM {action}: expected HTTP 200, got {status} with {}",
+        String::from_utf8_lossy(&answered)
+    );
+}
+
+/// One Firehose operation, answering its JSON body.
+async fn firehose_call(router: &MultiServiceRouter, operation: &str, body: Value) -> Value {
+    let (status, answered) = send(
+        router,
+        "firehose",
+        FIREHOSE_HOST,
+        "POST",
+        "/",
+        &[
+            ("content-type", "application/x-amz-json-1.1"),
+            ("x-amz-target", &format!("{FIREHOSE_TARGET}.{operation}")),
+        ],
+        body.to_string().into_bytes(),
+    )
+    .await;
+    let text = String::from_utf8_lossy(&answered).to_string();
+    assert_eq!(
+        status, 200,
+        "case Firehose {operation}: expected HTTP 200, got {status} with {text}"
+    );
+    if text.trim().is_empty() {
+        return Value::Null;
+    }
+    ::serde_json::from_str(&text)
+        .unwrap_or_else(|error| panic!("case Firehose {operation}: no JSON ({error}): {text}"))
+}
+
+/// Look again until Firehose reports the stream `name` is [`STREAM_ACTIVE`] — the clock owes it
+/// that status from the moment it was created — or a generous deadline passes.
+///
+/// The CONDITION is what is waited for, never a span of the host's clock.
+async fn awaited_delivery_stream(router: &MultiServiceRouter, name: &str) {
+    let deadline = Instant::now() + READY_DEADLINE;
+    loop {
+        let described = firehose_call(
+            router,
+            "DescribeDeliveryStream",
+            json!({"DeliveryStreamName": name}),
+        )
+        .await;
+        let status = described["DeliveryStreamDescription"]["DeliveryStreamStatus"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        if status == STREAM_ACTIVE {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "case the delivery stream {name}: expected {STREAM_ACTIVE}, got {status:?}"
+        );
+        ::tokio::time::sleep(POLL_INTERVAL).await;
+    }
+}
+
+/// One VIEWER request, addressed host-style at the name the distribution published and carrying
+/// no credential. Answers the status the edge served and the `X-Amz-Cf-Id` it stamped on that
+/// answer, which is the identifier the record of this request is joined to it by.
+async fn viewed(
+    router: &MultiServiceRouter,
+    domain: &str,
+    method: &str,
+    target: &str,
+) -> (u16, String) {
+    let request = ::http::Request::builder()
+        .method(method)
+        .uri(target)
+        .header("host", domain)
+        .body(::bytes::Bytes::new())
+        .expect("the viewer request is well formed");
+    let answer = router.dispatch(request).await;
+    let status = answer.status().as_u16();
+    let request_id = answer
+        .headers()
+        .get("x-amz-cf-id")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+        .to_string();
+    (status, request_id)
+}
+
+/// Every record the bucket holds under `prefix`, in key order: each object is read, inflated
+/// where it is a gzip stream, and split into the one-record-per-line form a delivered log file
+/// carries.
+async fn delivered_records(router: &MultiServiceRouter, bucket: &str, prefix: &str) -> Vec<Value> {
+    use ::std::io::Read as _;
+
+    let mut records = Vec::new();
+    for key in keys_under(router, bucket, prefix).await {
+        let bytes = object_bytes(router, bucket, &key).await;
+        let text = if bytes.starts_with(&[0x1f, 0x8b]) {
+            let mut inflated = String::new();
+            ::flate2::read::GzDecoder::new(bytes.as_slice())
+                .read_to_string(&mut inflated)
+                .unwrap_or_else(|error| panic!("case reading {key}: not a gzip stream: {error}"));
+            inflated
+        } else {
+            String::from_utf8_lossy(&bytes).to_string()
+        };
+        for line in text.lines().filter(|line| !line.trim().is_empty()) {
+            records.push(::serde_json::from_str(line).unwrap_or_else(|error| {
+                panic!("case reading {key}: a record is no JSON ({error}): {line}")
+            }));
+        }
+    }
+    records
+}
+
+/// Look again until the bucket holds `wanted` records under `prefix` — the records the requests
+/// already served owe it — or a generous deadline passes, which fails the case.
+///
+/// The CONDITION is what is waited for, never a span of the host's clock.
+async fn awaited_records(
+    router: &MultiServiceRouter,
+    case: &str,
+    bucket: &str,
+    prefix: &str,
+    wanted: usize,
+) -> Vec<Value> {
+    let deadline = Instant::now() + READY_DEADLINE;
+    loop {
+        let held = delivered_records(router, bucket, prefix).await;
+        if held.len() >= wanted {
+            return held;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "case {case}: expected {wanted} record(s) under {bucket}/{prefix}, got {held:?}"
+        );
+        ::tokio::time::sleep(POLL_INTERVAL).await;
+    }
+}
+
+/// The record of `request_id` among `records`, which is the one record naming that request.
+fn record_of<'r>(case: &str, records: &'r [Value], request_id: &str) -> &'r Value {
+    let matched: Vec<&Value> = records
+        .iter()
+        .filter(|record| record["x-edge-request-id"].as_str() == Some(request_id))
+        .collect();
+    assert_eq!(
+        matched.len(),
+        1,
+        "case {case}: expected exactly one record naming the request {request_id:?}, got \
+         {matched:?} among {records:?}"
+    );
+    matched[0]
+}
+
+/// Every field of `record`, in the order the record carries them.
+fn fields_of(case: &str, record: &Value) -> Vec<String> {
+    record
+        .as_object()
+        .unwrap_or_else(|| panic!("case {case}: the record is no JSON object: {record}"))
+        .keys()
+        .cloned()
+        .collect()
+}
+
+/// A delivery destination is "an Amazon Web Services resource that represents an Amazon Web
+/// Services service that logs can be sent to", and `PutDeliveryDestination` names three that
+/// receive log records: "a log group in CloudWatch Logs, an Amazon S3 bucket, or a delivery
+/// stream in Firehose". So a distribution's access logs fan out to EVERY destination its
+/// deliveries name, whichever of those kinds each is: a served viewer request produces one
+/// record in the destination BUCKET, as the gzipped log file a reader of a bucket of vended logs
+/// fetches under the published object layout, and one record on the destination DELIVERY STREAM,
+/// which that stream then delivers to its own Amazon S3 destination — and the two records of one
+/// request carry the same `x-edge-request-id`, the identifier the edge answer handed the viewer
+/// as `X-Amz-Cf-Id`, so a consumer can join them.
+#[tokio::test]
+async fn a_served_request_reaches_the_bucket_and_the_delivery_stream_the_deliveries_name() {
+    let router = emulator_with_delivery_destinations();
+    let account = ::engine::emulator_account_id();
+    let vended_bucket = "cloudfront-vended-access-logs";
+    let stream_bucket = "cloudfront-stream-access-logs";
+    let stream = "cloudfront-access-logs";
+    let role = "cloudfront-access-logs-delivery";
+
+    // The two buckets, and the role the delivery stream's own delivery is made under.
+    created_bucket(&router, vended_bucket).await;
+    created_bucket(&router, stream_bucket).await;
+    iam_action(
+        &router,
+        "CreateRole",
+        &[
+            ("RoleName", role),
+            ("AssumeRolePolicyDocument", FIREHOSE_TRUST_POLICY),
+        ],
+    )
+    .await;
+    iam_action(
+        &router,
+        "PutRolePolicy",
+        &[
+            ("RoleName", role),
+            ("PolicyName", "deliver-objects"),
+            ("PolicyDocument", FIREHOSE_ROLE_POLICY),
+        ],
+    )
+    .await;
+    firehose_call(
+        &router,
+        "CreateDeliveryStream",
+        json!({
+            "DeliveryStreamName": stream,
+            "DeliveryStreamType": "DirectPut",
+            "ExtendedS3DestinationConfiguration": {
+                "RoleARN": format!("arn:aws:iam::{account}:role/{role}"),
+                "BucketARN": format!("arn:aws:s3:::{stream_bucket}"),
+                "Prefix": STREAM_DESTINATION_PREFIX,
+                // The shortest buffering the hints admit, so the stream's own delivery waits
+                // for nothing but the emulator's own flush span.
+                "BufferingHints": {"SizeInMBs": 1, "IntervalInSeconds": 0},
+            },
+        }),
+    )
+    .await;
+
+    let distribution = distribution(&router, "logging-v2-fan-out").await;
+    // The ONE source both deliveries below are paired with: the distribution is what sends the
+    // records.
+    logs(
+        &router,
+        "PutDeliverySource",
+        json!({
+            "name": "cf-fan-out",
+            "resourceArn": distribution.arn,
+            "logType": ACCESS_LOGS,
+        }),
+    )
+    .await;
+    // One delivery per kind of destination, each with its own record layout.
+    let bucket_destination_arn = format!("arn:aws:s3:::{vended_bucket}");
+    let stream_destination_arn =
+        format!("arn:aws:firehose:{REGION}:{account}:deliverystream/{stream}");
+    let wiring: [(&str, &str, &str, &[&str]); 2] = [
+        (
+            "the destination bucket",
+            S3,
+            &bucket_destination_arn,
+            BUCKET_RECORD_FIELDS,
+        ),
+        (
+            "the destination delivery stream",
+            FH,
+            &stream_destination_arn,
+            STREAM_RECORD_FIELDS,
+        ),
+    ];
+    for (index, (case, destination_type, resource_arn, fields)) in wiring.iter().enumerate() {
+        let destination = logs(
+            &router,
+            "PutDeliveryDestination",
+            json!({
+                "name": format!("cf-fan-out-{index}"),
+                "outputFormat": "json",
+                "deliveryDestinationConfiguration": {"destinationResourceArn": resource_arn},
+            }),
+        )
+        .await;
+        assert_eq!(
+            destination["deliveryDestination"]["deliveryDestinationType"].as_str(),
+            Some(*destination_type),
+            "case {case}: expected the destination to report {destination_type}, got {destination}"
+        );
+        let created = logs(
+            &router,
+            "CreateDelivery",
+            json!({
+                "deliverySourceName": "cf-fan-out",
+                "deliveryDestinationArn": destination["deliveryDestination"]["arn"],
+                "recordFields": fields,
+            }),
+        )
+        .await;
+        assert_eq!(
+            created["delivery"]["deliveryDestinationType"].as_str(),
+            Some(*destination_type),
+            "case {case}: expected the delivery to report {destination_type}, got {created}"
+        );
+    }
+
+    awaited_deployment(&router, "logging-v2-fan-out", &distribution.id).await;
+    awaited_delivery_stream(&router, stream).await;
+
+    // Rows differ along what the rule generalises over: the path the viewer addressed, whether
+    // it carried a query string, and the status the edge served it with.
+    let probes: [Probe; 3] = [
+        Probe {
+            case: "a read the origin serves",
+            method: "GET",
+            path: "/2020-05-31/distribution",
+            query: "",
+            status: 200,
+        },
+        Probe {
+            case: "the same read with a query string",
+            method: "GET",
+            path: "/2020-05-31/distribution",
+            query: "MaxItems=1",
+            status: 200,
+        },
+        Probe {
+            case: "a path the origin answers no object for",
+            method: "GET",
+            path: "/2020-05-31/distribution/E0NOTTHERE0000",
+            query: "",
+            status: 404,
+        },
+    ];
+    let mut served: Vec<(&Probe, String)> = Vec::new();
+    for probe in &probes {
+        let target = if probe.query.is_empty() {
+            probe.path.to_string()
+        } else {
+            format!("{}?{}", probe.path, probe.query)
+        };
+        let (status, request_id) = viewed(&router, &distribution.domain, probe.method, &target).await;
+        assert_eq!(
+            status, probe.status,
+            "case {}: expected the edge to answer {}, got {status}",
+            probe.case, probe.status
+        );
+        assert!(
+            !request_id.is_empty(),
+            "case {}: expected the answer to carry an X-Amz-Cf-Id",
+            probe.case
+        );
+        assert!(
+            served.iter().all(|(_probe, earlier)| *earlier != request_id),
+            "case {}: expected a request id of its own, got {request_id:?} again",
+            probe.case
+        );
+        served.push((probe, request_id));
+    }
+
+    // The BUCKET destination: one gzipped log file per served request, under the published
+    // object layout.
+    let layout = format!("AWSLogs/{account}/cloudfront/");
+    let keys = {
+        let case = "the destination bucket";
+        let records = awaited_records(&router, case, vended_bucket, &layout, probes.len()).await;
+        assert_eq!(
+            records.len(),
+            probes.len(),
+            "case {case}: expected one record per served request, got {records:?}"
+        );
+        for (probe, request_id) in &served {
+            let case = probe.case;
+            let record = record_of(case, &records, request_id);
+            assert_eq!(
+                fields_of(case, record),
+                BUCKET_RECORD_FIELDS
+                    .iter()
+                    .map(|field| (*field).to_string())
+                    .collect::<Vec<String>>(),
+                "case {case}: expected the delivery's own fields in its own order, got {record}"
+            );
+            for (field, expected) in [
+                ("cs-uri-stem", probe.path.to_string()),
+                ("sc-status", probe.status.to_string()),
+            ] {
+                let got = record[field].as_str().unwrap_or_default();
+                assert_eq!(
+                    got, expected,
+                    "case {case}: expected {field} {expected:?} in the delivered object, got \
+                     {got:?} from {record}"
+                );
+            }
+            let result_type = record["x-edge-result-type"].as_str().unwrap_or_default();
+            assert!(
+                !result_type.is_empty(),
+                "case {case}: expected the result type of the answer in the record, got {record}"
+            );
+        }
+        keys_under(&router, vended_bucket, &layout).await
+    };
+    for key in &keys {
+        assert!(
+            key.starts_with(&format!(
+                "{layout}{REGION}/{}/",
+                distribution.id
+            )) && key.ends_with(".log.gz"),
+            "case the destination bucket: expected the published object layout under \
+             {layout}{REGION}/{}/ and a gzipped log file, got {key:?}",
+            distribution.id
+        );
+        let bytes = object_bytes(&router, vended_bucket, key).await;
+        assert_eq!(
+            bytes.get(..2),
+            Some([0x1f, 0x8b].as_slice()),
+            "case the destination bucket: expected a gzip stream at {key:?}, got {:?}",
+            bytes.get(..2)
+        );
+    }
+
+    // The DELIVERY STREAM destination: the records the stream took, delivered to the stream's
+    // own Amazon S3 destination.
+    let case = "the destination delivery stream";
+    let records = awaited_records(
+        &router,
+        case,
+        stream_bucket,
+        STREAM_DESTINATION_PREFIX,
+        probes.len(),
+    )
+    .await;
+    assert_eq!(
+        records.len(),
+        probes.len(),
+        "case {case}: expected one record per served request, got {records:?}"
+    );
+    for (probe, request_id) in &served {
+        let case = probe.case;
+        let record = record_of(case, &records, request_id);
+        assert_eq!(
+            fields_of(case, record),
+            STREAM_RECORD_FIELDS
+                .iter()
+                .map(|field| (*field).to_string())
+                .collect::<Vec<String>>(),
+            "case {case}: expected the delivery's own fields in its own order, got {record}"
+        );
+        for (field, expected) in [
+            ("cs-method", probe.method.to_string()),
+            ("sc-status", probe.status.to_string()),
+        ] {
+            let got = record[field].as_str().unwrap_or_default();
+            assert_eq!(
+                got, expected,
+                "case {case}: expected {field} {expected:?} in the record the stream delivered, \
+                 got {got:?} from {record}"
+            );
+        }
+    }
 }

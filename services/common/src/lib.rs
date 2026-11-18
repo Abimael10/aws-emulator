@@ -609,6 +609,10 @@ pub mod s3_object_read;
 /// it — the gzipped log file an audit pipeline reads — so the layout and the framing are
 /// stated once rather than per service.
 pub mod trail_log_files;
+/// The ONE write a vended-log delivery makes into a destination that is not a log group: the
+/// gzipped object a bucket receives and the put record a delivery stream takes, stated once
+/// for every service that delivers its vended logs.
+pub mod vended_logs;
 /// The ONE reading of the JSON Schema document a gateway model carries, and the two
 /// documents a gateway control plane generates from it: the sample payload one answers a
 /// template request with, and the mapping skeleton the other does.

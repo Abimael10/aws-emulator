@@ -51,6 +51,7 @@ use aws_emulator_router::{build_router, InMemoryEngine};
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::eks_wire::{cluster_body, ec2, eks, iam, iam_as, role_arn, send};
+use crate::iam_authorization_details_pointer::{DETAILS_PAGE, POINTER_HEAD, POINTER_TAIL};
 use crate::query_wire::{element, elements, opt_element};
 
 /// Keep this at or above `boot_serve.rs`'s stack: the same assembly runs here.
@@ -607,11 +608,25 @@ fn a_pod_identity_credential_from_the_published_endpoint_carries_the_roles_permi
                             "case {case:?}: expected the error code AccessDenied, got {}",
                             listed.text
                         );
+                        // Every authorization refusal of the identity service closes with a
+                        // pointer at THAT request's own authorization details, whose id is
+                        // per-run — the rule [`super::iam_authorization_details_pointer`]
+                        // owns — so the SENTENCE is compared to the wording this call is
+                        // owed and the continuation is held to the fixed text it carries.
+                        let message = element(&listed.text, "Message");
+                        let (sentence, pointer) = message
+                            .split_once(POINTER_HEAD)
+                            .unwrap_or((message.as_str(), ""));
                         assert_eq!(
-                            element(&listed.text, "Message"),
+                            sentence,
                             refusal(&session_arn, &reason),
                             "case {case:?}: expected IAM's refusal naming the session, got {}",
                             listed.text
+                        );
+                        assert!(
+                            pointer.starts_with(DETAILS_PAGE) && pointer.contains(POINTER_TAIL),
+                            "case {case:?}: expected the refusal to point at this request's \
+                             authorization details, got {message:?}"
                         );
                     }
                 }

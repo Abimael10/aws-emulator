@@ -157,6 +157,11 @@ rcgen = "0.13"
 # emulated Amazon S3 on the same router, so the bundle `CreateTrustStore` reads is one a
 # client really put there. TEST-ONLY.
 service-com-amazonaws-s3-amazons3 = { workspace = true }
+# The Firehose delivery stream a standard-logging-v2 delivery destination names: the
+# standard-logging suite mounts the real emulated Firehose on the same router, so the record
+# the edge puts on that stream is delivered to the stream's own Amazon S3 destination and read
+# back from there. TEST-ONLY.
+service-com-amazonaws-firehose-firehose-20150804 = { workspace = true }
 # The published-address suite DIALS the `DomainName` a distribution reports, in this
 # process, exactly as a viewer handed that name does: tokio's socket and byte-stream halves
 # carry the HTTP exchange on it.

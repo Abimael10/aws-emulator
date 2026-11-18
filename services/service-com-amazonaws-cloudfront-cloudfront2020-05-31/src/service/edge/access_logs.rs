@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! STANDARD LOGGING v2: the ACCESS-LOG RECORD one served viewer request delivers to the
-//! CloudWatch Logs log group a vended-log delivery points the distribution at.
+//! STANDARD LOGGING v2: the ACCESS-LOG RECORD one served viewer request delivers to each
+//! destination a vended-log delivery points the distribution at.
 //!
 //! # The rule this module implements
 //!
@@ -10,15 +10,17 @@
 //! distribution's ARN and the one log type CloudFront sends, [`ACCESS_LOGS_LOG_TYPE`] ("For
 //! CloudFront, the valid value is ACCESS_LOGS",
 //! `smithy_query(query="doc",shape="PutDeliverySourceRequest",member="logType")`) — a delivery
-//! DESTINATION naming a log group, and a DELIVERY pairing the two. From then on CloudFront is
-//! the SENDER of that pipeline, so every viewer request the edge serves for that distribution
-//! produces ONE access-log record in the destination log group, readable through
-//! `FilterLogEvents` like any other log event of the group.
+//! DESTINATION naming the resource the logs are sent to, and a DELIVERY pairing the two. From
+//! then on CloudFront is the SENDER of that pipeline, so every viewer request the edge serves
+//! for that distribution produces ONE access-log record in EVERY destination its deliveries
+//! name, read back the way a consumer of that kind of destination reads it.
 //!
 //! Which deliveries carry a distribution's records, where each writes them and under which
 //! record layout are CloudWatch Logs' own records, so they are asked of that service
 //! (`crate::state::vended_log_dispatch` of the CloudWatch Logs emulator, over the store both
-//! services share) instead of being tracked a second time here. A distribution no delivery
+//! services share) instead of being tracked a second time here. That reading covers EVERY kind
+//! of destination a delivery can name — a log group, an S3 bucket or a Firehose delivery
+//! stream — so a distribution's records fan out to all of them, and a distribution no delivery
 //! names produces nothing, which is exactly what a client that wired no pipeline sees.
 //!
 //! # What one record says
@@ -36,8 +38,8 @@
 //! edge finished responding, which is the instant the real-time record's `timestamp` carries.
 //!
 //! Delivery is BEST EFFORT, as it is for every vended-logs destination: the viewer has already
-//! been answered, so a group the account has since deleted or a write CloudWatch Logs refuses
-//! loses the record and is reported in tracing rather than failing the request.
+//! been answered, so a destination the account has since deleted or a write the owning service
+//! refuses loses the record and is reported in tracing rather than failing the request.
 
 use std::time::SystemTime;
 
@@ -58,13 +60,24 @@ const DATE_FIELD: &str = "date";
 /// CloudFront server finished responding to the request (in UTC), for example, 01:42:39".
 const TIME_FIELD: &str = "time";
 
-/// Deliver the access-log record of one served viewer request to every log group a delivery
+/// How many destinations ONE served viewer request delivers its access-log record to.
+///
+/// THE EMULATOR'S OWN CEILING, not a quota cited from AWS: each delivery of the distribution's
+/// pipeline costs one in-process write while the edge holds the answered request, and the
+/// deliveries an account may create are bounded only by the CloudWatch Logs store that holds
+/// them — so without this, one viewer request could make as many writes as there are deliveries.
+/// It sits far above any realistic pipeline (a distribution delivering its access logs to one or
+/// a few destinations), and a request that exhausts it stops delivering and says so in the log
+/// rather than writing more.
+const MAX_ACCESS_LOG_DELIVERIES_PER_REQUEST: usize = 32;
+
+/// Deliver the access-log record of one served viewer request to every destination a delivery
 /// carries this distribution's access logs into.
 ///
 /// Called from the ONE seam that serves the edge with the answer in hand: a record describes a
 /// request that was ANSWERED, so its status, its size and the span it took are part of it and
 /// cannot be known earlier. Called with this service's store RELEASED — it awaits the write
-/// into CloudWatch Logs.
+/// into the service that owns each destination.
 ///
 /// Nothing here can fail the request: the viewer has already been answered.
 pub(super) async fn deliver<Eng: Send + Sync + 'static>(
@@ -74,39 +87,34 @@ pub(super) async fn deliver<Eng: Send + Sync + 'static>(
     logged: &LoggedRequest<'_>,
 ) {
     let resource_arn = crate::state::distribution_arn(distribution_id);
-    let deliveries = ::service_com_amazonaws_cloudwatchlogs_logs_20140328::state::log_group_deliveries(
+    let deliveries = ::service_com_amazonaws_cloudwatchlogs_logs_20140328::state::vended_log_deliveries(
         engine,
         &resource_arn,
         ACCESS_LOGS_LOG_TYPE,
     );
-    for delivery in deliveries {
+    for delivery in deliveries.iter().take(MAX_ACCESS_LOG_DELIVERIES_PER_REQUEST) {
         let record = delivery.record(|field| field_value(logged, field));
-        let written = ::service_common::cloudwatch_logs::delivered(
+        let written = ::service_com_amazonaws_cloudwatchlogs_logs_20140328::state::deliver_record(
             ctx,
-            &delivery.region,
-            &delivery.log_group,
-            &log_stream_name(distribution_id),
-            ::std::slice::from_ref(&record),
+            delivery,
+            logged.at,
+            &record,
         )
         .await;
         if !written {
             ::tracing::debug!(
                 delivery = %delivery.delivery_id,
-                "the log group this delivery names did not take the access-log record"
+                "the destination this delivery names did not take the access-log record"
             );
         }
     }
-}
-
-/// The stream a distribution's access-log records are written into, inside the destination log
-/// group.
-///
-/// AWS publishes no name for the stream a vended-log delivery writes into, so the records of
-/// one SENDER are kept in one stream of their own, named by the resource that sent them: a
-/// group several distributions deliver into keeps each one's records apart, and a client
-/// reading the group — `FilterLogEvents` reads across every stream of it — sees all of them.
-fn log_stream_name(distribution_id: &str) -> String {
-    distribution_id.to_string()
+    if deliveries.len() > MAX_ACCESS_LOG_DELIVERIES_PER_REQUEST {
+        ::tracing::warn!(
+            deliveries = MAX_ACCESS_LOG_DELIVERIES_PER_REQUEST,
+            "this request's access-log deliveries are spent, so the remaining deliveries of this \
+             distribution carry no record for it"
+        );
+    }
 }
 
 /// What this served request states for ONE record field.
