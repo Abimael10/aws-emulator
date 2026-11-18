@@ -357,14 +357,17 @@ pub fn change_not_found(domain_name: &str, change_id: Option<&str>) -> ResourceN
 /// The `ResourceNotFoundException` payload for a `DryRunId` a domain's history holds
 /// no dry run for, and for a domain on which no dry run was ever started.
 ///
-/// Worded as this service words every other miss of a record held ON a domain (a
-/// configuration change, a maintenance action): the domain the request named and,
-/// where it named one, the id it asked for.
+/// A request that NAMES an id is refused with the service's fixed sentence for an id
+/// that addresses no dry run, carrying the id the request asked for and nothing else —
+/// which is also what a caller sees for a run a later change to the domain superseded.
+/// A request that names none asks about the domain's latest run, so a domain that has
+/// no run at all is worded the way this service words every other miss of a record held
+/// ON a domain (a configuration change, a maintenance action).
 pub fn dry_run_not_found(domain_name: &str, dry_run_id: Option<&str>) -> ResourceNotFoundException {
     ResourceNotFoundException {
         message: Some(match dry_run_id {
             Some(dry_run_id) => {
-                format!("Dry run not found for domain {domain_name}: {dry_run_id}")
+                format!("No Dry Run found for the provided DryRunId: {dry_run_id}")
             }
             None => format!("No dry run found for domain {domain_name}"),
         }),

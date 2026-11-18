@@ -556,7 +556,7 @@ impl Domain {
     /// domain in and `deployment_type` the deployment kind it would need, both
     /// computed by the update path's own analysis of a COPY of this record — nothing
     /// about the domain itself moves, because a dry run applies nothing. The run is
-    /// [`DRY_RUN_STATUS_PENDING`] and the clock owes it its conclusion
+    /// [`DRY_RUN_STATUS_IN_PROGRESS`] and the clock owes it its conclusion
     /// ([`DryRun::settle`]), so a caller reading straight after the call still
     /// observes the analysis in flight.
     pub fn begin_dry_run(
@@ -582,6 +582,17 @@ impl Domain {
             self.dry_runs.pop_front();
         }
         run
+    }
+
+    /// Drop every dry run this domain holds, because a change has been APPLIED to it.
+    ///
+    /// A dry run is "a pre-update dry run analysis": it analyses a configuration change
+    /// against the configuration the domain had when the run was asked for. A change
+    /// that is actually applied supersedes that analysis, so the runs it recorded no
+    /// longer address anything and a later read of one is the operation's own not-found
+    /// refusal rather than a progress record for a plan the domain has moved past.
+    pub fn supersede_dry_runs(&mut self) {
+        self.dry_runs.clear();
     }
 
     /// The most recent dry run, which `DescribeDryRunProgress` reports when the

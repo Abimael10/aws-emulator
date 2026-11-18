@@ -171,10 +171,15 @@ pub const DRY_RUN_MODE_VERBOSE: &str = "Verbose";
 /// `DryRunProgressStatus$DryRunStatus` while the validation check the dry run runs
 /// has not finished — the status the call that started it answers with, so a caller
 /// polling straight after it still observes the analysis in flight.
-pub const DRY_RUN_STATUS_PENDING: &str = "PENDING";
+///
+/// `DryRunStatus` is a free `String` in the model, so its value set is recorded
+/// behaviour: the service reports it in LOWERCASE, with the terminal values below, and
+/// an analysis still running reports this one.
+pub const DRY_RUN_STATUS_IN_PROGRESS: &str = "in-progress";
 
-/// `DryRunProgressStatus$DryRunStatus` once that check has finished.
-pub const DRY_RUN_STATUS_COMPLETED: &str = "COMPLETED";
+/// `DryRunProgressStatus$DryRunStatus` once that check has finished and found the
+/// proposed configuration applicable — the terminal value a client polls a dry run to.
+pub const DRY_RUN_STATUS_SUCCEEDED: &str = "succeeded";
 
 /// One verbose dry run on a domain: the analysis an `UpdateDomainConfig` carrying
 /// `DryRun` with `DryRunMode` [`DRY_RUN_MODE_VERBOSE`] started, which
@@ -184,10 +189,10 @@ pub const DRY_RUN_STATUS_COMPLETED: &str = "COMPLETED";
 /// A dry run applies NOTHING: it is "a pre-update dry run analysis", so the record
 /// holds the configuration the change WOULD have left the domain in — computed by
 /// the same merge the real update performs, on a copy of the domain — beside the
-/// deployment kind that change would need. It is [`DRY_RUN_STATUS_PENDING`] from the
+/// deployment kind that change would need. It is [`DRY_RUN_STATUS_IN_PROGRESS`] from the
 /// call that started it until the span the clock owes the analysis has passed
 /// ([`PROVISIONING`]), and
-/// [`DRY_RUN_STATUS_COMPLETED`] after — materialised by whichever later call reads
+/// [`DRY_RUN_STATUS_SUCCEEDED`] after — materialised by whichever later call reads
 /// the record ([`Self::settle`]), so nothing sleeps.
 #[derive(Debug, Clone)]
 pub struct DryRun {
@@ -241,11 +246,16 @@ impl DryRun {
     }
 
     /// `DryRunProgressStatus$DryRunStatus` for this run.
+    ///
+    /// A configuration this service cannot apply is refused by the update path itself,
+    /// so every run that was started analyses a configuration that validated: the
+    /// conclusion the clock owes such a run is the terminal value for an analysis that
+    /// found nothing to report.
     pub fn status(&self) -> &'static str {
         if self.in_progress() {
-            DRY_RUN_STATUS_PENDING
+            DRY_RUN_STATUS_IN_PROGRESS
         } else {
-            DRY_RUN_STATUS_COMPLETED
+            DRY_RUN_STATUS_SUCCEEDED
         }
     }
 

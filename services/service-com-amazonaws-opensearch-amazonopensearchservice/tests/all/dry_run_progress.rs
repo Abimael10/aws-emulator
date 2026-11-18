@@ -26,22 +26,28 @@
 //! none, histories of one, two and four runs on one domain, the run addressed by id and
 //! the run left implicit, both sides of the analysis span, and five ways for a request
 //! to name no run at all.
+//!
+//! A dry run also CONCLUDES on its own and is superseded by a change the domain really
+//! applies, which [`a_dry_run_concludes_on_its_own_and_an_applied_change_supersedes_it`]
+//! asserts over three of those option containers.
 
 use serde_json::{json, Value};
 
 use super::domain_lifecycle::{
-    change_rows, create_baseline, error_code, string_member, Answer, Emulator, CHANGE_LOG_GROUP,
-    PREFIX, RECORDED_NOT_FOUND_STATUS, SETTLE_WAIT,
+    change_rows, create_baseline, error_code, poll_until, settled_domain, string_member, Answer,
+    Emulator, CHANGE_LOG_GROUP, PREFIX, RECORDED_NOT_FOUND_STATUS,
 };
 
 /// A well-formed `GUID` that names no dry run: the id space is 128 bits wide and the
 /// store mints v4 UUIDs, so the nil-shaped id below is never one of them.
 const ABSENT_DRY_RUN_ID: &str = "00000000-0000-4000-8000-000000000000";
 
-/// `DryRunProgressStatus$DryRunStatus` while the analysis is still running, and once it
-/// has finished.
-const PENDING: &str = "PENDING";
-const COMPLETED: &str = "COMPLETED";
+/// `DryRunProgressStatus$DryRunStatus` while the analysis is still running, and the
+/// terminal value it converges to once it has finished. The member is a free `String`
+/// in the model, so the value set is the service's own: lowercase, and terminal at
+/// `succeeded` for an analysis that found the proposed configuration applicable.
+const IN_PROGRESS: &str = "in-progress";
+const SUCCEEDED: &str = "succeeded";
 
 /// `GET /2021-01-01/opensearch/domain/{DomainName}/dryRun`, with the `dryRunId` and
 /// `loadDryRunConfig` query parameters when they are given.
@@ -136,13 +142,15 @@ async fn a_verbose_dry_run_is_reported_from_the_record_the_update_minted() {
     emulator.created_log_group(CHANGE_LOG_GROUP).await;
     let rows = change_rows();
 
-    // One domain per row, all created up front so a single wait settles them: a dry run
+    // One domain per row, all created up front so the waits below overlap: a dry run
     // against a domain still provisioning cannot predict a deployment type, which is
     // the update path's own rule and is asserted where it belongs.
     for index in 0..rows.len() {
         create_baseline(&emulator, &format!("verbose-{index}")).await;
     }
-    tokio::time::sleep(SETTLE_WAIT).await;
+    for index in 0..rows.len() {
+        settled_domain(&emulator, &format!("verbose-{index}")).await;
+    }
 
     for (index, (option, value, deployment)) in rows.into_iter().enumerate() {
         let name = format!("verbose-{index}");
@@ -154,7 +162,7 @@ async fn a_verbose_dry_run_is_reported_from_the_record_the_update_minted() {
         assert_guid(&dry_run_id, &case);
         assert_eq!(
             started_status["DryRunStatus"].as_str(),
-            Some(PENDING),
+            Some(IN_PROGRESS),
             "case {case}: the run the update started is still being analysed, got {started:?}"
         );
 
@@ -170,8 +178,8 @@ async fn a_verbose_dry_run_is_reported_from_the_record_the_update_minted() {
             );
             assert_eq!(
                 status["DryRunStatus"].as_str(),
-                Some(PENDING),
-                "case {case} ({named:?}): expected {PENDING} inside the analysis span, got \
+                Some(IN_PROGRESS),
+                "case {case} ({named:?}): expected {IN_PROGRESS} inside the analysis span, got \
                  {body:?}"
             );
             assert_eq!(
@@ -225,8 +233,13 @@ async fn a_verbose_dry_run_is_reported_from_the_record_the_update_minted() {
         );
 
         // The clock, not the reader, concludes the analysis — and the conclusion moves
-        // `UpdateDate` without moving `CreationDate`.
-        tokio::time::sleep(SETTLE_WAIT).await;
+        // `UpdateDate` without moving `CreationDate`. Waited for as the CONDITION the
+        // clock owes, so the case does not depend on how fast the host runs.
+        poll_until(&case, || async {
+            let body = progress_body(&emulator, &name, Some(&dry_run_id), None).await;
+            body["DryRunProgressStatus"]["DryRunStatus"].as_str() != Some(IN_PROGRESS)
+        })
+        .await;
         let case = format!("DescribeDryRunProgress({option}, concluded)");
         let concluded = progress_body(&emulator, &name, Some(&dry_run_id), None).await;
         let status = &concluded["DryRunProgressStatus"];
@@ -238,10 +251,10 @@ async fn a_verbose_dry_run_is_reported_from_the_record_the_update_minted() {
             ),
             (
                 Some(dry_run_id.as_str()),
-                Some(COMPLETED),
+                Some(SUCCEEDED),
                 Some(creation_date.as_str()),
             ),
-            "case {case}: the same run is now {COMPLETED} and was still created when it was, got \
+            "case {case}: the same run is now {SUCCEEDED} and was still created when it was, got \
              {concluded:?}"
         );
         let update_date = string_member(status, "UpdateDate", &case);
@@ -273,7 +286,7 @@ async fn every_dry_run_keeps_its_own_id_and_the_latest_is_the_implicit_one() {
     for runs in [1usize, 2, 4] {
         let name = format!("history-{runs}");
         create_baseline(&emulator, &name).await;
-        tokio::time::sleep(SETTLE_WAIT).await;
+        settled_domain(&emulator, &name).await;
 
         // (dry run id, the option that run analysed) in the order they were started.
         let mut history: Vec<(String, &'static str, &'static str)> = Vec::new();
@@ -347,7 +360,9 @@ async fn an_absent_domain_or_dry_run_is_the_modelled_not_found() {
     create_baseline(&emulator, "other-domain").await;
     // And one that never had a dry run asked for at all.
     create_baseline(&emulator, "no-run-domain").await;
-    tokio::time::sleep(SETTLE_WAIT).await;
+    for name in ["present-domain", "other-domain", "no-run-domain"] {
+        settled_domain(&emulator, name).await;
+    }
 
     let known = string_member(
         &start_verbose_dry_run(
@@ -384,15 +399,17 @@ async fn an_absent_domain_or_dry_run_is_the_modelled_not_found() {
 
     // Rows: a domain that was never created (with and without an id), a domain that was
     // deleted, a domain on which no dry run was ever started — the recorded case — and
-    // a well-formed id another domain's run carries.
-    for (name, dry_run_id) in [
-        ("absent-domain", None),
-        ("absent-domain", Some(ABSENT_DRY_RUN_ID)),
-        ("other-domain", None),
-        ("no-run-domain", None),
-        ("no-run-domain", Some(ABSENT_DRY_RUN_ID)),
-        ("present-domain", Some(ABSENT_DRY_RUN_ID)),
-        ("present-domain", Some(other.as_str())),
+    // a well-formed id another domain's run carries. The third column is what the
+    // refusal has to name: the id a request that addresses one asks about, and the
+    // domain for a request that addresses none or names no domain at all.
+    for (name, dry_run_id, names) in [
+        ("absent-domain", None, "absent-domain"),
+        ("absent-domain", Some(ABSENT_DRY_RUN_ID), "absent-domain"),
+        ("other-domain", None, "other-domain"),
+        ("no-run-domain", None, "no-run-domain"),
+        ("no-run-domain", Some(ABSENT_DRY_RUN_ID), ABSENT_DRY_RUN_ID),
+        ("present-domain", Some(ABSENT_DRY_RUN_ID), ABSENT_DRY_RUN_ID),
+        ("present-domain", Some(other.as_str()), other.as_str()),
     ] {
         let answer = dry_run_progress(&emulator, name, dry_run_id, None).await;
         assert_eq!(
@@ -408,12 +425,14 @@ async fn an_absent_domain_or_dry_run_is_the_modelled_not_found() {
              ResourceNotFoundException, got {:?}",
             answer.body
         );
+        // The refusal names what was asked for: the id, where the request addresses one
+        // of a domain that exists, and otherwise the domain itself.
         assert!(
             answer.body["message"]
                 .as_str()
-                .is_some_and(|message| message.contains(name)),
-            "case DescribeDryRunProgress({name:?}, {dry_run_id:?}): the refusal names what was \
-             asked for, got {:?}",
+                .is_some_and(|message| message.contains(names)),
+            "case DescribeDryRunProgress({name:?}, {dry_run_id:?}): the refusal names {names:?}, \
+             got {:?}",
             answer.body
         );
     }
@@ -442,7 +461,7 @@ async fn only_a_verbose_dry_run_leaves_a_run_to_report_on() {
     for (index, (case, mode, reportable)) in rows.into_iter().enumerate() {
         let name = format!("mode-{index}");
         create_baseline(&emulator, &name).await;
-        tokio::time::sleep(SETTLE_WAIT).await;
+        settled_domain(&emulator, &name).await;
 
         let mut body = json!({
             "ClusterConfig": { "InstanceType": "r6g.xlarge.search", "InstanceCount": 4 },
@@ -546,4 +565,110 @@ async fn a_malformed_dry_run_id_is_refused_by_the_modelled_constraint() {
          the handler, got {} with {:?}",
         answer.status, answer.body
     );
+}
+
+/// RULE: an analysis the clock owes a verbose dry run CONCLUDES on its own, so a client
+/// that polls the run reaches the service's terminal `DryRunStatus` without anything
+/// else happening to the domain; and a configuration change the domain really applies
+/// supersedes the analyses it was holding, so a request naming one of them afterwards is
+/// the operation's own not-found refusal — while a dry run asked for after that change
+/// is reportable again.
+#[tokio::test]
+async fn a_dry_run_concludes_on_its_own_and_an_applied_change_supersedes_it() {
+    let emulator = Emulator::new();
+    // Three of the shared change table's option containers, spanning both deployment
+    // kinds and three forms of value: two structures and an enum string.
+    let rows: Vec<(&'static str, Value, &'static str)> = change_rows()
+        .into_iter()
+        .filter(|(option, _, _)| {
+            matches!(*option, "ClusterConfig" | "SnapshotOptions" | "IPAddressType")
+        })
+        .collect();
+
+    for (index, (option, value, deployment)) in rows.into_iter().enumerate() {
+        let name = format!("settles-{index}");
+        create_baseline(&emulator, &name).await;
+        settled_domain(&emulator, &name).await;
+
+        let case = format!("DescribeDryRunProgress({option}, concluding)");
+        let started = start_verbose_dry_run(&emulator, &name, json!({ option: value.clone() })).await;
+        let dry_run_id = string_member(&started["DryRunProgressStatus"], "DryRunId", &case);
+        assert_eq!(
+            started["DryRunProgressStatus"]["DryRunStatus"].as_str(),
+            Some(IN_PROGRESS),
+            "case {case}: the call that starts the analysis reports it in flight, got {started:?}"
+        );
+
+        // Nothing but the clock concludes it: the reads below ask for the same record
+        // until the analysis the clock owed has landed.
+        poll_until(&case, || async {
+            let body = progress_body(&emulator, &name, Some(&dry_run_id), None).await;
+            body["DryRunProgressStatus"]["DryRunStatus"].as_str() != Some(IN_PROGRESS)
+        })
+        .await;
+        let concluded = progress_body(&emulator, &name, Some(&dry_run_id), None).await;
+        let status = &concluded["DryRunProgressStatus"];
+        assert_eq!(
+            (
+                status["DryRunStatus"].as_str(),
+                status["DryRunId"].as_str(),
+                concluded["DryRunResults"]["DeploymentType"].as_str(),
+            ),
+            (
+                Some(SUCCEEDED),
+                Some(dry_run_id.as_str()),
+                Some(deployment),
+            ),
+            "case {case}: expected the same run terminal at {SUCCEEDED}, got {concluded:?}"
+        );
+
+        // The change the run analysed, this time APPLIED.
+        let applied = emulator
+            .update_config(&name, json!({ option: value.clone() }))
+            .await;
+        assert_eq!(
+            applied.status, 200,
+            "case UpdateDomainConfig({option}, applied): expected 200, got {} with {:?}",
+            applied.status, applied.body
+        );
+
+        // The run the change superseded addresses nothing any more — by its own id, and
+        // as the domain's latest run.
+        let case = format!("DescribeDryRunProgress({option}, superseded)");
+        for named in [Some(dry_run_id.as_str()), None] {
+            let answer = dry_run_progress(&emulator, &name, named, None).await;
+            assert_eq!(
+                (answer.status, error_code(&answer).as_str()),
+                (RECORDED_NOT_FOUND_STATUS, "ResourceNotFoundException"),
+                "case {case} ({named:?}): expected the not-found refusal, got {} with {:?}",
+                answer.status,
+                answer.body
+            );
+        }
+        let refused = dry_run_progress(&emulator, &name, Some(&dry_run_id), None).await;
+        assert_eq!(
+            refused.body["message"].as_str(),
+            Some(format!("No Dry Run found for the provided DryRunId: {dry_run_id}").as_str()),
+            "case {case}: expected the service's sentence for an id that addresses no dry run, \
+             got {:?}",
+            refused.body
+        );
+
+        // And the domain still takes a new analysis: the change closed the runs it
+        // superseded, not the capability.
+        settled_domain(&emulator, &name).await;
+        let again = start_verbose_dry_run(&emulator, &name, json!({ option: value.clone() })).await;
+        let next_id = string_member(&again["DryRunProgressStatus"], "DryRunId", &case);
+        assert_ne!(
+            next_id, dry_run_id,
+            "case {case}: a run started after the change is its own, got {again:?}"
+        );
+        let reported = progress_body(&emulator, &name, Some(&next_id), None).await;
+        assert_eq!(
+            reported["DryRunProgressStatus"]["DryRunId"].as_str(),
+            Some(next_id.as_str()),
+            "case {case}: expected the run started after the change to be reportable, got \
+             {reported:?}"
+        );
+    }
 }

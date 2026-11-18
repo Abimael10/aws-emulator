@@ -946,6 +946,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // This change can be gone back from, so the change record carries the
             // configuration it was applied on top of.
             merged.record_revert(before);
+            // The change is APPLIED, so whatever pre-update analysis the domain was
+            // holding was made against a configuration it has now moved past: the runs
+            // are superseded and a read of one is the not-found refusal from here on.
+            merged.supersede_dry_runs();
         }
 
         // An update that moves a domain into a VPC makes it a VPC-access domain, so it

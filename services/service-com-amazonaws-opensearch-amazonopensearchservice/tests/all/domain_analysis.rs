@@ -1221,3 +1221,121 @@ async fn a_packaged_synonym_rule_finds_the_term_it_stands_for() {
         );
     }
 }
+
+/// RULE: an index's own `settings.analysis` — the custom analyzer, its tokenizer and its
+/// token filters, including one reading an associated package's file by path — is what
+/// the cluster indexes and queries a field through, whichever path CREATED the index: the
+/// cluster's own `PUT /{index}` and the control plane's `CreateIndex` leave the same
+/// index, so a document written to one is found by the same terms through either.
+#[tokio::test]
+async fn the_chain_an_index_defines_decides_search_however_the_index_was_created() {
+    let emulator = Emulator::new();
+    let domain = "analyze-search-flow";
+    let package = "analyze-search-flow-dictionary";
+    let package_id = given_domain_and_package(
+        &emulator,
+        domain,
+        package,
+        "# the words this domain drops\nfluffy\ndrift\n\n",
+    )
+    .await;
+    let path = associated(&emulator, domain, &package_id, "the search-flow package").await;
+    let schema = packaged_schema("stop", "stopwords_path", &path);
+
+    // The two creation paths, each leaving its own index: the cluster's REST create and
+    // the control plane's `CreateIndex`, handed the SAME schema.
+    let through_cluster = "weather-cluster";
+    let created = rest_prefixed(
+        &emulator,
+        domain,
+        "PUT",
+        &format!("/{through_cluster}"),
+        Some(schema.clone()),
+    )
+    .await;
+    assert_eq!(
+        created.status, 200,
+        "case \"PUT /{through_cluster}\": expected the cluster to create the index, got {} with \
+         {:?}",
+        created.status, created.body
+    );
+    let through_control_plane = "weather-control-plane";
+    created_index(
+        &emulator,
+        domain,
+        through_control_plane,
+        &schema,
+        "the index the control plane creates",
+    )
+    .await;
+
+    // (the case, the term, the tokens the packaged chain leaves of it, the hits through
+    // the chain's field, the hits through the control field)
+    let rows: Vec<(&str, &str, Vec<&str>, i64, i64)> = vec![
+        ("a word the package does not list", "clouds", vec!["clouds"], 1, 1),
+        ("a word the package lists", "fluffy", vec![], 0, 1),
+        ("another word the package lists", "drift", vec![], 0, 1),
+        ("a word in another case, which the chain folds", "SEATTLE", vec!["seattle"], 1, 1),
+        ("a word the document does not carry", "rain", vec!["rain"], 0, 0),
+    ];
+
+    for index in [through_cluster, through_control_plane] {
+        let written = rest_prefixed(
+            &emulator,
+            domain,
+            "PUT",
+            &format!("/{index}/_doc/1"),
+            Some(json!({
+                PACKAGED_FIELD: "Fluffy clouds drift over Seattle",
+                CONTROL_FIELD: "Fluffy clouds drift over Seattle",
+            })),
+        )
+        .await;
+        assert_eq!(
+            written.status, 201,
+            "case \"PUT /{index}/_doc/1\": expected 201, got {} with {:?}",
+            written.status, written.body
+        );
+        let refreshed = rest_prefixed(&emulator, domain, "POST", &format!("/{index}/_refresh"), None)
+            .await;
+        assert_eq!(
+            refreshed.status, 200,
+            "case \"POST /{index}/_refresh\": expected 200, got {} with {:?}",
+            refreshed.status, refreshed.body
+        );
+
+        for (case, term, expected, packaged_hits, control_hits) in &rows {
+            let case = format!("{case:?} on {index}");
+            let analyzed = analyze(
+                &emulator,
+                domain,
+                Some(index),
+                json!({ "field": PACKAGED_FIELD, "text": term }),
+            )
+            .await;
+            assert_eq!(
+                (analyzed.status, tokens(&analyzed)),
+                (
+                    200,
+                    expected.iter().map(|token| (*token).to_string()).collect()
+                ),
+                "case {case}: expected the packaged chain to leave {expected:?} of {term:?}, got \
+                 {} with {:?}",
+                analyzed.status,
+                analyzed.body
+            );
+            let through_package = hits(&emulator, domain, index, PACKAGED_FIELD, term).await;
+            assert_eq!(
+                through_package, *packaged_hits,
+                "case {case}: expected {packaged_hits} hits for {term:?} through the \
+                 package-driven field, got {through_package}"
+            );
+            let through_control = hits(&emulator, domain, index, CONTROL_FIELD, term).await;
+            assert_eq!(
+                through_control, *control_hits,
+                "case {case}: expected {control_hits} hits for {term:?} through the control \
+                 field, got {through_control}"
+            );
+        }
+    }
+}
