@@ -19,7 +19,11 @@
 //!    so the same cause reads identically in every Region;
 //! 5. a request-validation refusal advertises a `@pattern` without the model's
 //!    whole-value anchors, names a member the input wraps by the name the model
-//!    declares it with, and withholds the value of a member Config does not echo.
+//!    declares it with, and withholds the value of a member Config does not echo;
+//! 6. a request-validation refusal of a value outside an enumerated type lists the
+//!    values that type admits in the order CONFIG lists them, which is neither the
+//!    order the model declares them in nor a sort of it, and lists one type the same
+//!    way wherever a member targeting it carried the value.
 //!
 //! Every case drives the emulator the way a client does, through the same
 //! `MultiServiceRouter` the production router builds, reusing the `Emulator` harness
@@ -554,5 +558,240 @@ async fn a_wrapped_members_refusal_names_the_member_the_model_declares() {
             message, expected,
             "case {case:?}: expected {expected:?}, got {message:?}"
         );
+    }
+}
+
+/// The values the snapshot-frequency type admits, listed as Config lists them. The five
+/// values are `smithy_query(query="shape", shape="MaximumExecutionFrequency")`'s, which the
+/// model declares `One_Hour, Three_Hours, Six_Hours, Twelve_Hours, TwentyFour_Hours` — not
+/// the order Config lists them in.
+const SNAPSHOT_FREQUENCIES: &str =
+    "[TwentyFour_Hours, Twelve_Hours, Three_Hours, Six_Hours, One_Hour]";
+
+/// The clause requirement a refusal of a value outside the snapshot-frequency type states.
+fn frequency_requirement() -> String {
+    format!("Member must satisfy enum value set: {SNAPSHOT_FREQUENCIES}")
+}
+
+/// The values the enum clause of `message` lists, in the order it listed them.
+fn listed_value_set(case: &str, message: &str) -> Vec<String> {
+    let (_, listed) = message
+        .split_once("Member must satisfy enum value set: [")
+        .unwrap_or_else(|| panic!("case {case:?}: expected an enum value set, got {message:?}"));
+    let listed = listed.strip_suffix(']').unwrap_or_else(|| {
+        panic!("case {case:?}: expected the set closed by a bracket, got {message:?}")
+    });
+    listed.split(", ").map(str::to_string).collect()
+}
+
+/// A value outside an enumerated type's set is refused with that set listed in the order
+/// Config lists it, whatever the submitted value was.
+#[tokio::test]
+async fn an_out_of_set_frequency_lists_the_set_as_config_lists_it() {
+    // The rows differ along the value submitted: a frequency the type does not carry, the
+    // wrong casing of one it does, one spelled without the underscore, a value far longer
+    // than any of them, and the empty string.
+    for value in [
+        "One_Minute",
+        "one_hour",
+        "TwentyFourHours",
+        "Six_Hours_And_Then_Some_More_Hours",
+        "",
+    ] {
+        let emulator = Emulator::new();
+        let body = json!({
+            "DeliveryChannel": {
+                "name": "default",
+                "s3BucketName": "config-bucket",
+                "configSnapshotDeliveryProperties": { "deliveryFrequency": value },
+            }
+        });
+        let message = refusal(&emulator, "PutDeliveryChannel", &body, "ValidationException").await;
+        let expected = format!(
+            "1 validation error detected: Value '{value}' at \
+             'deliveryChannel.configSnapshotDeliveryProperties.deliveryFrequency' failed to \
+             satisfy constraint: {}",
+            frequency_requirement()
+        );
+        assert_eq!(
+            message, expected,
+            "case {value:?}: expected {expected:?}, got {message:?}"
+        );
+    }
+}
+
+/// ONE enumerated type, one listing: every member of this model that targets the
+/// snapshot-frequency type states the same set in the same order, in whatever operation and
+/// at whatever depth it sits.
+#[tokio::test]
+async fn one_type_is_listed_alike_wherever_a_member_carries_it() {
+    // (case, operation, body). Every member targeting `MaximumExecutionFrequency`
+    // (`smithy_query(query="shape", shape="ConfigSnapshotDeliveryProperties"|"ConfigRule"
+    // |"OrganizationManagedRuleMetadata"|"OrganizationCustomRuleMetadata"
+    // |"OrganizationCustomPolicyRuleMetadata")`), each carrying a different value outside
+    // it, and each with every other member of its request well formed so the refusal counts
+    // one error.
+    for (case, operation, body) in [
+        (
+            "the delivery channel's snapshot frequency",
+            "PutDeliveryChannel",
+            json!({
+                "DeliveryChannel": {
+                    "name": "default",
+                    "s3BucketName": "config-bucket",
+                    "configSnapshotDeliveryProperties": { "deliveryFrequency": "One_Minute" },
+                }
+            }),
+        ),
+        (
+            "a rule's maximum execution frequency",
+            "PutConfigRule",
+            json!({
+                "ConfigRule": {
+                    "ConfigRuleName": "rule-one",
+                    "Source": {
+                        "Owner": "AWS",
+                        "SourceIdentifier": "S3_BUCKET_VERSIONING_ENABLED",
+                    },
+                    "MaximumExecutionFrequency": "Two_Hours",
+                }
+            }),
+        ),
+        (
+            "an organization managed rule's",
+            "PutOrganizationConfigRule",
+            json!({
+                "OrganizationConfigRuleName": "org-rule",
+                "OrganizationManagedRuleMetadata": {
+                    "RuleIdentifier": "IAM_PASSWORD_POLICY",
+                    "MaximumExecutionFrequency": "twelve_hours",
+                },
+            }),
+        ),
+        (
+            "an organization custom rule's",
+            "PutOrganizationConfigRule",
+            json!({
+                "OrganizationConfigRuleName": "org-rule",
+                "OrganizationCustomRuleMetadata": {
+                    "LambdaFunctionArn":
+                        "arn:aws:lambda:us-east-1:000000000000:function:evaluator",
+                    "OrganizationConfigRuleTriggerTypes": ["ScheduledNotification"],
+                    "MaximumExecutionFrequency": "",
+                },
+            }),
+        ),
+        (
+            "an organization custom policy rule's",
+            "PutOrganizationConfigRule",
+            json!({
+                "OrganizationConfigRuleName": "org-rule",
+                "OrganizationCustomPolicyRuleMetadata": {
+                    "PolicyRuntime": "guard-2.x.x",
+                    "PolicyText": "rule always_true { 1 == 1 }",
+                    "MaximumExecutionFrequency": "48_Hours",
+                },
+            }),
+        ),
+    ] {
+        let emulator = Emulator::new();
+        let message = refusal(&emulator, operation, &body, "ValidationException").await;
+        assert!(
+            message.starts_with("1 validation error detected: ")
+                && message.ends_with(&frequency_requirement()),
+            "case {case:?}: expected one clause stating {:?}, got {message:?}",
+            frequency_requirement()
+        );
+    }
+}
+
+/// One position an enumerated type is carried at: the case, the operation and the request
+/// body that carries a value outside the type.
+type Position<'p> = (&'p str, &'p str, Value);
+
+/// One enumerated type as this model carries it: the type's name, the values the model
+/// declares for it, and every position a request can carry it at.
+type CarriedType<'t> = (&'t str, &'t [&'t str], &'t [Position<'t>]);
+
+/// Another enumerated type is listed the same way: the clause lists exactly the values the
+/// MODEL declares for that type, in one order whichever member of whichever operation
+/// carried the value outside it.
+#[tokio::test]
+async fn another_types_set_lists_the_models_values_in_one_order() {
+    // (the type, its values as `smithy_query(query="shape", shape=<the type>)` declares
+    // them, the positions that carry it: case, operation and body).
+    let types: [CarriedType<'_>; 2] = [
+        (
+            "ComplianceType",
+            &[
+                "COMPLIANT",
+                "NON_COMPLIANT",
+                "NOT_APPLICABLE",
+                "INSUFFICIENT_DATA",
+            ],
+            &[
+                (
+                    "a rule-compliance filter",
+                    "DescribeComplianceByConfigRule",
+                    json!({ "ComplianceTypes": ["NOT_A_COMPLIANCE_TYPE"] }),
+                ),
+                (
+                    "a resource-compliance filter",
+                    "DescribeComplianceByResource",
+                    json!({ "ComplianceTypes": ["compliant"] }),
+                ),
+                (
+                    "an external evaluation's verdict",
+                    "PutExternalEvaluation",
+                    json!({
+                        "ConfigRuleName": "rule-one",
+                        "ExternalEvaluation": {
+                            "ComplianceResourceType": "AWS::::Account",
+                            "ComplianceResourceId": "000000000000",
+                            "ComplianceType": "MAYBE",
+                            "OrderingTimestamp": 1_700_000_000,
+                        },
+                    }),
+                ),
+            ],
+        ),
+        (
+            "ChronologicalOrder",
+            &["Reverse", "Forward"],
+            &[(
+                "a configuration-history ordering",
+                "GetResourceConfigHistory",
+                json!({
+                    "resourceType": "AWS::S3::Bucket",
+                    "resourceId": "config-bucket",
+                    "chronologicalOrder": "Sideways",
+                }),
+            )],
+        ),
+    ];
+
+    for (declared_type, declared, positions) in types {
+        let mut one_listing: Option<Vec<String>> = None;
+        for (case, operation, body) in positions {
+            let emulator = Emulator::new();
+            let message = refusal(&emulator, operation, body, "ValidationException").await;
+            let listed = listed_value_set(case, &message);
+            assert!(
+                listed.len() == declared.len()
+                    && declared
+                        .iter()
+                        .all(|admitted| listed.iter().any(|value| value == admitted)),
+                "case {case:?} ({declared_type}): expected the model's own values \
+                 {declared:?}, got {listed:?}"
+            );
+            match &one_listing {
+                Some(first) => assert_eq!(
+                    &listed, first,
+                    "case {case:?} ({declared_type}): expected the one listing {first:?}, got \
+                     {listed:?}"
+                ),
+                None => one_listing = Some(listed),
+            }
+        }
     }
 }

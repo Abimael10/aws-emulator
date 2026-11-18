@@ -65,7 +65,10 @@
 //!    ([`UNSUPPORTED_RESOURCE_TYPE_MESSAGE`]) instead of a clause enumerating that
 //!    set, wherever a member targeting that shape carries it ([`resource_type_values`])
 //!    — except on a discovered-resource LISTING, whose member admits a CloudFormation
-//!    registry type name as well and so judges the name in its own handler.
+//!    registry type name as well and so judges the name in its own handler;
+//! 6. a clause about any OTHER enumerated member lists the values that type admits in
+//!    the order this service lists them ([`enum_value_sets`]) rather than the order the
+//!    model declares them in.
 //!
 //! The status (400) and the error code ([`VALIDATION_EXCEPTION`]) are the framework's
 //! own choice for a constraint failure and are unchanged; only the sentence differs.
@@ -102,6 +105,8 @@ use smithy_server_runtime::{
 };
 use std::marker::PhantomData;
 use std::sync::Arc;
+
+mod enum_value_sets;
 
 /// The error code this service answers a request-validation failure with.
 ///
@@ -523,11 +528,16 @@ fn is_unsupported_resource_type(violation: &Violation) -> bool {
 /// per violated constraint, in the order the validating walk found them — except for a
 /// resource type Config does not support, whose own fixed sentence replaces the whole
 /// envelope.
+///
+/// A clause about an enumerated member lists the values that type admits in the order this
+/// service lists them ([`enum_value_sets::in_stated_order`]), which is applied AFTER the
+/// resource-type sentence above: that sentence is chosen by the value set the violation
+/// reports, read against the model's own schemas ([`is_unsupported_resource_type`]).
 fn constraint_envelope(violations: &[Violation]) -> Option<String> {
     if violations.iter().any(is_unsupported_resource_type) {
         return Some(UNSUPPORTED_RESOURCE_TYPE_MESSAGE.to_string());
     }
-    let clauses: Vec<String> = violations
+    let clauses: Vec<String> = enum_value_sets::in_stated_order(violations)
         .iter()
         .map(constraint_clauses)
         .collect::<Option<Vec<_>>>()?
@@ -1755,7 +1765,10 @@ mod tests {
         }
 
         // Another shape's value set is still stated as a clause enumerating it: the
-        // sentence above belongs to the resource-type shape alone.
+        // sentence above belongs to the resource-type shape alone. The values are listed
+        // in the order this service lists that type ([`enum_value_sets`]), whichever order
+        // they reached the violation in — here the two of
+        // `smithy_query(query="shape", shape="ChronologicalOrder")`.
         let other = Violation {
             path: "chronologicalOrder".to_string(),
             kind: ViolationKind::EnumValue(vec!["Forward".to_string(), "Reverse".to_string()]),
@@ -1766,7 +1779,7 @@ mod tests {
             constraint_envelope(std::slice::from_ref(&other)).expect("an enum states a clause");
         let expected = "1 validation error detected: Value 'Sideways' at \
                         'chronologicalOrder' failed to satisfy constraint: Member must \
-                        satisfy enum value set: [Forward, Reverse]";
+                        satisfy enum value set: [Reverse, Forward]";
         assert_eq!(
             stated, expected,
             "case \"another shape's value set\": expected {expected:?}, got {stated:?}"
