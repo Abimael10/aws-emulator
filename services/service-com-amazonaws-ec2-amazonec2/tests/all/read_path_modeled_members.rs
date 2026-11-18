@@ -716,23 +716,24 @@ async fn a_published_prefix_list_reports_no_account_facts() {
 // Rule 5: an endpoint service of a Region is selected by its own name
 // ---------------------------------------------------------------------------
 
-/// One row of the endpoint-service table: the service's name, the `ServiceType` members it is
-/// reachable through, and the address types it answers on.
+/// One row of the endpoint-service table: the service's name and the ENDPOINT SERVICES
+/// published under it — one per endpoint type it is reachable through, each with the address
+/// types it answers on.
 struct ServiceCase {
     case: &'static str,
     service_name: String,
-    service_types: Vec<&'static str>,
-    ip_types: Vec<String>,
+    endpoint_services: Vec<(&'static str, Vec<String>)>,
 }
 
 /// A `service-name` filter naming a service the Region offers reports that service — and only
-/// that one — in both the names and the details, with the service types and address types it
-/// is reachable through.
+/// that one — in both the names and the details, with one detail per endpoint service
+/// published under the name and the address types each answers on.
 ///
 /// The rows differ along the published name family the service belongs to
 /// (`com.amazonaws.<region>.<service>`, `aws.api.<region>.<service>`,
 /// `api.aws.<region>.<service>`) and along the kind of endpoint it is reached through: an
-/// interface service, the one service reachable both ways, and a gateway-only service.
+/// interface service, the one service reachable both ways — which is therefore two endpoint
+/// services — and a gateway-only service.
 #[tokio::test]
 async fn an_endpoint_service_is_selected_by_its_name() {
     let (router, _engine) = ec2_query::emulator();
@@ -741,32 +742,33 @@ async fn an_endpoint_service_is_selected_by_its_name() {
         ServiceCase {
             case: "an interface service",
             service_name: format!("com.amazonaws.{REGION}.access-analyzer"),
-            service_types: vec!["Interface"],
-            ip_types: ipv4_and_ipv6.clone(),
+            endpoint_services: vec![("Interface", ipv4_and_ipv6.clone())],
         },
         ServiceCase {
-            case: "a service reachable both ways",
+            case: "a service reachable both ways, which is two endpoint services",
             service_name: format!("com.amazonaws.{REGION}.s3"),
-            service_types: vec!["Gateway", "Interface"],
-            ip_types: ipv4_and_ipv6.clone(),
+            endpoint_services: vec![
+                ("Gateway", ipv4_and_ipv6.clone()),
+                ("Interface", ipv4_and_ipv6.clone()),
+            ],
         },
         ServiceCase {
+            // A gateway endpoint service answers on the families the Region publishes a
+            // prefix list for it in, and the Region publishes `ipv6.dynamodb` beside
+            // `dynamodb` (rule 4's catalogue above).
             case: "a gateway-only service",
             service_name: format!("com.amazonaws.{REGION}.dynamodb"),
-            service_types: vec!["Gateway"],
-            ip_types: vec!["ipv4".to_string()],
+            endpoint_services: vec![("Gateway", ipv4_and_ipv6.clone())],
         },
         ServiceCase {
             case: "a service of the aws.api family",
             service_name: format!("aws.api.{REGION}.emr-service-cell01"),
-            service_types: vec!["Interface"],
-            ip_types: ipv4_and_ipv6.clone(),
+            endpoint_services: vec![("Interface", ipv4_and_ipv6.clone())],
         },
         ServiceCase {
             case: "a service of the api.aws family",
             service_name: format!("api.aws.{REGION}.cassandra-streams"),
-            service_types: vec!["Interface"],
-            ip_types: ipv4_and_ipv6.clone(),
+            endpoint_services: vec![("Interface", ipv4_and_ipv6.clone())],
         },
     ];
 
@@ -774,8 +776,7 @@ async fn an_endpoint_service_is_selected_by_its_name() {
         let ServiceCase {
             case,
             service_name,
-            service_types,
-            ip_types,
+            endpoint_services,
         } = row;
         let params = filters(&[("service-name", &[service_name.as_str()])]);
         let (status, body) = ec2_query::call(
@@ -803,39 +804,40 @@ async fn an_endpoint_service_is_selected_by_its_name() {
         let details = set_items(root, "serviceDetailSet");
         assert_eq!(
             details.len(),
-            1,
-            "case {case:?}: expected one service detail for {service_name}, got {body}"
+            endpoint_services.len(),
+            "case {case:?}: expected one service detail per endpoint service of \
+             {service_name}, got {body}"
         );
-        let detail = details[0];
-        assert_eq!(
-            child_text(detail, "serviceName"),
-            Some(service_name.clone()),
-            "case {case:?}: the detail must name the service, got {body}"
-        );
-        assert_eq!(
-            child_text(detail, "serviceRegion").as_deref(),
-            Some(REGION),
-            "case {case:?}: the service is hosted in the Region its name carries, got {body}"
-        );
-        let reported_types: Vec<String> = set_items(detail, "serviceType")
-            .into_iter()
-            .map(|node| child_text(node, "serviceType").unwrap_or_default())
-            .collect();
-        assert_eq!(
-            reported_types,
-            service_types
-                .iter()
-                .map(|value| (*value).to_string())
-                .collect::<Vec<String>>(),
-            "case {case:?}: expected the service types {service_types:?}, got {body}"
-        );
-        let reported_ip_types: Vec<String> = set_items(detail, "supportedIpAddressTypeSet")
-            .into_iter()
-            .map(|node| node.text().unwrap_or_default().to_string())
-            .collect();
-        assert_eq!(
-            reported_ip_types, ip_types,
-            "case {case:?}: expected the address types {ip_types:?}, got {body}"
-        );
+        for (detail, (endpoint_type, ip_types)) in details.into_iter().zip(&endpoint_services) {
+            let case = format!("{case} ({endpoint_type})");
+            assert_eq!(
+                child_text(detail, "serviceName"),
+                Some(service_name.clone()),
+                "case {case:?}: the detail must name the service, got {body}"
+            );
+            assert_eq!(
+                child_text(detail, "serviceRegion").as_deref(),
+                Some(REGION),
+                "case {case:?}: the service is hosted in the Region its name carries, got \
+                 {body}"
+            );
+            let reported_types: Vec<String> = set_items(detail, "serviceType")
+                .into_iter()
+                .map(|node| child_text(node, "serviceType").unwrap_or_default())
+                .collect();
+            assert_eq!(
+                reported_types,
+                vec![(*endpoint_type).to_string()],
+                "case {case:?}: expected the one service type {endpoint_type:?}, got {body}"
+            );
+            let reported_ip_types: Vec<String> = set_items(detail, "supportedIpAddressTypeSet")
+                .into_iter()
+                .map(|node| node.text().unwrap_or_default().to_string())
+                .collect();
+            assert_eq!(
+                &reported_ip_types, ip_types,
+                "case {case:?}: expected the address types {ip_types:?}, got {body}"
+            );
+        }
     }
 }

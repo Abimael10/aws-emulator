@@ -196,9 +196,15 @@ async fn an_endpoint_is_created_to_a_service_of_every_published_name_form() {
                 status, 200,
                 "case {case:?}: the Region offers this service, got {status} with {catalogue}"
             );
-            assert_eq!(
-                elements(&catalogue, "serviceName"),
-                vec![row.service_name.to_string()],
+            // The catalogue reports one row per ENDPOINT SERVICE, and a label reachable
+            // through more than one endpoint type carries one for each — so the name is what
+            // the rows agree on.
+            let catalogued_names = elements(&catalogue, "serviceName");
+            assert!(
+                !catalogued_names.is_empty()
+                    && catalogued_names
+                        .iter()
+                        .all(|name| name == row.service_name),
                 "case {case:?}: the catalogue reports the service by name, got {catalogue}"
             );
         } else {

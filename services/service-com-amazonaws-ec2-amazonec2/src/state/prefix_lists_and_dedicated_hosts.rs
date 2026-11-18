@@ -2176,17 +2176,29 @@ pub const AWS_API_ENDPOINT_SERVICE_PREFIX: &str = "aws.api.";
 /// the service of the Region its name carries.
 pub const API_AWS_ENDPOINT_SERVICE_PREFIX: &str = "api.aws.";
 
-/// The DNS suffix of the endpoint-specific names an interface endpoint answers on, under
-/// which the Region's own label sits (`<endpoint>.<service>.<region>.vpce.amazonaws.com`).
-pub const ENDPOINT_DNS_SUFFIX: &str = "vpce.amazonaws.com";
+/// The DNS suffix of the PrivateLink endpoint names this emulator publishes, under which the
+/// Region's own label sits (`<endpoint>.<service>.<region>.vpce.localhost`): the base name of
+/// an endpoint service ([`endpoint_services_in_region`],
+/// [`account_endpoint_service_base_dns_name`]) and the endpoint-specific names an interface
+/// endpoint answers on.
+///
+/// A name published here is one a CONSUMER resolves and then dials to reach the endpoint, so it
+/// has to lead back to THIS process: the `vpce` label of the PrivateLink endpoint domain sits
+/// in the zone a resolver answers with the loopback interface — the interface the core binds
+/// its listeners on unless the operator names another address
+/// (`service_common::data_plane_addressing::LOOPBACK_ZONE`) — rather than in a zone Amazon Web
+/// Services serves, which resolves nowhere near this emulator or, worse, to genuine
+/// infrastructure.
+pub const ENDPOINT_DNS_SUFFIX: &str = "vpce.localhost";
 
 /// How many characters the per-endpoint suffix of an interface endpoint's own DNS names
 /// carries.
 ///
-/// An interface endpoint's names are `<vpce-id>-<suffix>.<service>.<region>.vpce.amazonaws.com`
-/// and one `<vpce-id>-<suffix>-<zone>.…` per Availability Zone it is served in: the service
-/// gives each endpoint a short suffix of its own beside the endpoint's id, so two endpoints of
-/// one service in one Region never answer on the same name even where an id is reused.
+/// An interface endpoint's names are `<vpce-id>-<suffix>.<service>.<region>.<endpoint domain>`
+/// ([`ENDPOINT_DNS_SUFFIX`]) and one `<vpce-id>-<suffix>-<zone>.…` per Availability Zone it is
+/// served in: the service gives each endpoint a short suffix of its own beside the endpoint's
+/// id, so two endpoints of one service in one Region never answer on the same name even where
+/// an id is reused.
 pub const VPC_ENDPOINT_DNS_SUFFIX_CHARS: usize = 8;
 
 /// The per-endpoint suffix the DNS names of the endpoint `endpoint_id` carry.
@@ -2531,10 +2543,12 @@ pub(super) struct AwsEndpointService {
     /// in `com.amazonaws.us-west-2.logs`, and the label [`parse_endpoint_service_name`] reads
     /// back out of that name.
     pub(super) label: &'static str,
-    /// The `ServiceType` enum members this service is reachable through
-    /// ([`crate::ops::types::SERVICE_TYPE_VALUES`]). A LIST, because `ServiceDetail$ServiceType`
-    /// is one: Amazon S3 is reachable both through a gateway endpoint and through an interface
-    /// endpoint under the one service name.
+    /// The `ServiceType` enum members this label is reachable through
+    /// ([`crate::ops::types::SERVICE_TYPE_VALUES`]). A LIST, because one label may carry more
+    /// than one endpoint service: Amazon S3 is reachable both through a gateway endpoint and
+    /// through an interface endpoint under the one service name. Each entry is a SEPARATE
+    /// endpoint service — its own id, its own DNS names, its own address types — so
+    /// [`endpoint_services_in_region`] builds one [`EndpointServiceRecord`] per entry.
     pub(super) types: &'static [&'static str],
 }
 
@@ -2545,8 +2559,8 @@ pub(super) const INTERFACE_ONLY: &[&str] = &[VPC_ENDPOINT_TYPE_INTERFACE];
 /// A service reachable only through a gateway endpoint.
 pub(super) const GATEWAY_ONLY: &[&str] = &[VPC_ENDPOINT_TYPE_GATEWAY];
 
-/// A service reachable through either, reported in the order the `ServiceType` enum declares
-/// its members.
+/// A label reachable through either, which is therefore TWO endpoint services: they are
+/// reported in the order the `ServiceType` enum declares its members.
 pub(super) const GATEWAY_AND_INTERFACE: &[&str] = &[VPC_ENDPOINT_TYPE_GATEWAY, VPC_ENDPOINT_TYPE_INTERFACE];
 
 /// What an endpoint service of the catalogue offers an endpoint to it BEYOND being reachable:
@@ -2805,7 +2819,10 @@ pub struct EndpointServiceRecord {
     pub service_name: String,
     /// "The ID of the endpoint service" (`ServiceDetail$ServiceId`).
     pub service_id: String,
-    /// "The type of service" (`ServiceDetail$ServiceType`), as `ServiceType` enum members.
+    /// "The type of service" (`ServiceDetail$ServiceType`), as `ServiceType` enum members. One
+    /// entry for a service of the Region's catalogue, an endpoint service there being one
+    /// (name, endpoint type) pair; the entries the OWNER's load balancers decided for one of
+    /// the account's own configurations, which is one service whatever it carries.
     pub service_types: Vec<String>,
     /// "The Region where the service is hosted" (`ServiceDetail$ServiceRegion`), which is the
     /// Region the service's own NAME carries.
@@ -2847,6 +2864,24 @@ pub struct EndpointServiceRecord {
 }
 
 impl EndpointServiceRecord {
+    /// The key this endpoint service sits under in the report's order: its name, then the
+    /// endpoint types it is reported with.
+    ///
+    /// One NAME no longer names one reported service — a label reachable through more than one
+    /// endpoint type carries one endpoint service per type, each with its own id — so the order
+    /// `DescribeVpcEndpointServices` reports in, and the position a `NextToken` resumes at, is
+    /// a position in THIS key rather than in the name alone. Built with
+    /// [`ENDPOINT_SERVICE_KEY_SEPARATOR`], which is lower than every character a service name or
+    /// a `ServiceType` member carries, so ordering by the key is ordering by (name, types).
+    pub fn report_key(&self) -> String {
+        let mut key = self.service_name.clone();
+        for service_type in &self.service_types {
+            key.push(ENDPOINT_SERVICE_KEY_SEPARATOR);
+            key.push_str(service_type);
+        }
+        key
+    }
+
     /// This service as `DescribeVpcEndpointServices` reports it.
     pub fn to_service_detail(&self) -> ServiceDetail {
         ServiceDetail {
@@ -2888,10 +2923,19 @@ impl EndpointServiceRecord {
     }
 }
 
-/// The endpoint services Amazon Web Services offers in Region `region`, in `ServiceName`
-/// order — the order a `NextToken` walk of `DescribeVpcEndpointServices` resumes in, and
-/// unique by construction, one name per entry of [`AWS_ENDPOINT_SERVICES`], of
-/// [`AWS_API_ENDPOINT_SERVICES`] and of [`API_AWS_ENDPOINT_SERVICES`].
+/// The endpoint services Amazon Web Services offers in Region `region`, in
+/// [`EndpointServiceRecord::report_key`] order — the order a `NextToken` walk of
+/// `DescribeVpcEndpointServices` resumes in, and unique by construction, ONE RECORD PER
+/// (name, endpoint type) pair of [`AWS_ENDPOINT_SERVICES`], of [`AWS_API_ENDPOINT_SERVICES`]
+/// and of [`API_AWS_ENDPOINT_SERVICES`].
+///
+/// An endpoint service is one (name, endpoint type) pair, not one name: a label reachable both
+/// through a gateway endpoint and through an interface endpoint carries TWO endpoint services
+/// under the one name, each with its own id and each reached its own way, so a consumer picking
+/// an endpoint type reads them as the two separate services they are. Everything that follows
+/// from the type is therefore the record's own — the base endpoint DNS names, the default
+/// public DNS name and the address families it answers on — and nothing is merged across two
+/// of them.
 ///
 /// Every reported value is derived from the Region and the entry: the zones come from
 /// [`availability_zones_in_region`], so the service is available in exactly the zones the
@@ -2902,7 +2946,10 @@ impl EndpointServiceRecord {
 /// cannot disagree about what the service is called.
 pub fn endpoint_services_in_region(region: &str) -> Vec<EndpointServiceRecord> {
     let zones = availability_zones_in_region(region);
-    let record_of = |prefix: &str, service: &AwsEndpointService| -> EndpointServiceRecord {
+    let record_of = |prefix: &str,
+                     service: &AwsEndpointService,
+                     service_type: &str|
+     -> EndpointServiceRecord {
         let service_name = format!("{prefix}{region}.{}", service.label);
         // The DOMAIN this service's default public DNS name sits under follows the family
         // its name belongs to ([`public_dns_suffix`]): `com.amazonaws.<region>.<label>`
@@ -2916,32 +2963,19 @@ pub fn endpoint_services_in_region(region: &str) -> Vec<EndpointServiceRecord> {
         // endpoint policy or no default public DNS name is reported as offering neither
         // ([`endpoint_service_offering`]).
         let offering = endpoint_service_offering(service.label);
-        let interface = service.types.contains(&VPC_ENDPOINT_TYPE_INTERFACE);
-        let gateway = service.types.contains(&VPC_ENDPOINT_TYPE_GATEWAY);
-        // "The DNS names for the service": the base name an endpoint's own names sit
-        // under. An interface endpoint answers on
-        // `<endpoint>.<service>.<region>.vpce.amazonaws.com`, so the service's base name
-        // under that suffix is what a consumer resolves; a gateway endpoint mints no names
-        // of its own and is reached through the service's default public name.
-        let mut base_endpoint_dns_names = Vec::new();
-        if interface {
-            base_endpoint_dns_names.push(format!(
-                "{dns_label}.{region}.{ENDPOINT_DNS_SUFFIX}"
-            ));
-        }
-        if gateway {
-            base_endpoint_dns_names.push(format!(
-                "{dns_label}.{region}.{public_dns_suffix}"
-            ));
-        }
+        let interface = service_type == VPC_ENDPOINT_TYPE_INTERFACE;
+        // "The DNS names for the service" (`ServiceDetail$BaseEndpointDnsNames`): the base
+        // name the endpoint-specific names of an endpoint TO this service sit under — the
+        // PrivateLink endpoint domain this emulator publishes its endpoints in
+        // ([`ENDPOINT_DNS_SUFFIX`]) — which is published per SERVICE and is therefore the one
+        // name whichever endpoint type this record is. The service's own default public name
+        // is a different member (`ServiceDetail$PrivateDnsName`), so it is reported there and
+        // not here.
+        let base_endpoint_dns_names = vec![format!("{dns_label}.{region}.{ENDPOINT_DNS_SUFFIX}")];
         EndpointServiceRecord {
-            service_id: endpoint_service_id(&service_name),
+            service_id: endpoint_service_id(&service_name, service_type),
             service_name,
-            service_types: service
-                .types
-                .iter()
-                .map(|service_type| (*service_type).to_string())
-                .collect(),
+            service_types: vec![service_type.to_string()],
             service_region: region.to_string(),
             owner: AWS_ENDPOINT_SERVICE_OWNER_ALIAS.to_string(),
             availability_zones: zones
@@ -2973,66 +3007,109 @@ pub fn endpoint_services_in_region(region: &str) -> Vec<EndpointServiceRecord> {
             private_dns_name_verification_state: (interface && offering.private_dns)
                 .then(|| DNS_NAME_STATE_VERIFIED.to_string()),
             // "The supported IP address types" (`ServiceDetail$SupportedIpAddressTypes`) is
-            // about what the SERVICE answers on. An interface endpoint service answers on
-            // both IPv4 and IPv6, the interface endpoint's own addresses being what an
-            // endpoint of either type is created with; a gateway service is reached through
-            // its route-table entry, which is an IPv4 prefix list
-            // ([`service_prefix_lists_in_region`] publishes the IPv6 list separately, under
-            // its own name).
+            // about what the SERVICE answers on, and that follows the way THIS endpoint
+            // service is reached. An interface endpoint service answers on both IPv4 and
+            // IPv6, the interface endpoint's own addresses being what an endpoint of either
+            // type is created with; a gateway service is reached through its prefix list in a
+            // route table, so it answers on the address families the Region publishes a
+            // prefix list for it in ([`gateway_supported_ip_address_types`]).
             supported_ip_address_types: if interface {
                 vec![
                     IP_ADDRESS_TYPE_IPV4.to_string(),
                     IP_ADDRESS_TYPE_IPV6.to_string(),
                 ]
             } else {
-                vec![IP_ADDRESS_TYPE_IPV4.to_string()]
+                gateway_supported_ip_address_types(service.label)
             },
             // Nobody can tag a service Amazon Web Services offers, there being no resource
             // of the account to tag.
             tags: Vec::new(),
         }
     };
-    let mut records: Vec<EndpointServiceRecord> = AWS_ENDPOINT_SERVICES
-        .iter()
-        .map(|service| record_of(AWS_ENDPOINT_SERVICE_PREFIX, service))
-        .chain(
-            AWS_API_ENDPOINT_SERVICES
-                .iter()
-                .map(|service| record_of(AWS_API_ENDPOINT_SERVICE_PREFIX, service)),
-        )
-        .chain(
-            API_AWS_ENDPOINT_SERVICES
-                .iter()
-                .map(|service| record_of(API_AWS_ENDPOINT_SERVICE_PREFIX, service)),
-        )
-        .collect();
-    // The report is in `ServiceName` order whichever prefix a service's name sits under,
+    let mut records: Vec<EndpointServiceRecord> = Vec::new();
+    for (prefix, catalogue) in [
+        (AWS_ENDPOINT_SERVICE_PREFIX, AWS_ENDPOINT_SERVICES),
+        (AWS_API_ENDPOINT_SERVICE_PREFIX, AWS_API_ENDPOINT_SERVICES),
+        (API_AWS_ENDPOINT_SERVICE_PREFIX, API_AWS_ENDPOINT_SERVICES),
+    ] {
+        for service in catalogue {
+            // One record per endpoint type the label is reachable through: each is an
+            // endpoint service of its own.
+            for service_type in service.types {
+                records.push(record_of(prefix, service, service_type));
+            }
+        }
+    }
+    // The report is in name-then-type order whichever prefix a service's name sits under,
     // since that order is what a page cursor resumes in.
-    records.sort_by(|left, right| left.service_name.cmp(&right.service_name));
-    // `ServiceNames` selects by name and the page cursor names the service the next page
-    // starts at, so two services of one Region sharing a name would make both ambiguous. The
-    // catalog's labels are distinct, which keeps the names distinct; the assertion pins that
-    // invariant if the catalog grows.
+    records.sort_by_key(EndpointServiceRecord::report_key);
+    // `ServiceNames` selects by name and the page cursor names the endpoint service the next
+    // page starts at, so two endpoint services of one Region sharing a key would make both
+    // ambiguous. The catalog's labels are distinct and each names its types once, which keeps
+    // the keys distinct; the assertion pins that invariant if the catalog grows.
     debug_assert!(
         records
             .windows(2)
-            .all(|pair| pair[0].service_name < pair[1].service_name),
-        "the endpoint services of one Region must be distinct and sorted by name"
+            .all(|pair| pair[0].report_key() < pair[1].report_key()),
+        "the endpoint services of one Region must be distinct and sorted by name and type"
     );
     records
 }
 
-/// The id of the endpoint service named `service_name`.
+/// The IP address families a GATEWAY endpoint service of the label `label` answers on, as
+/// `IpAddressType` enum members ([`crate::ops::types::IP_ADDRESS_TYPE_VALUES`]).
 ///
-/// Derived from the name rather than stored, exactly as [`service_prefix_list_id`] derives a
-/// published prefix list's id: every read of one Region's service reports the same id, and two
-/// services with different names get different ids, without a store holding either. It carries
-/// 8 hexadecimal digits where [`ComAmazonawsEc2Amazonec2State::next_id`] mints 17, so a
-/// derived id can never collide with the id of a service configuration the account created.
-pub fn endpoint_service_id(service_name: &str) -> String {
+/// A gateway endpoint carries no addresses of its own: traffic to the service is routed by the
+/// prefix list the Region publishes for it, which a route of a route table names
+/// ([`service_prefix_lists_in_region`]). So the families the service answers on are the
+/// families of those lists — IPv4, and IPv6 where the Region publishes the service's IPv6 list
+/// beside it ([`AWS_MANAGED_PREFIX_LIST_SERVICES`], where such a list carries the label
+/// [`IPV6_PREFIX_LIST_LABEL_PREFIX`] ahead of the service's own) — reported in the order the
+/// `IpAddressType` enum declares its members.
+pub(super) fn gateway_supported_ip_address_types(label: &str) -> Vec<String> {
+    let ipv6_list = format!("{IPV6_PREFIX_LIST_LABEL_PREFIX}{label}");
+    let mut types = vec![IP_ADDRESS_TYPE_IPV4.to_string()];
+    if AWS_MANAGED_PREFIX_LIST_SERVICES
+        .iter()
+        .any(|entry| entry.ipv6 && entry.label == ipv6_list)
+    {
+        types.push(IP_ADDRESS_TYPE_IPV6.to_string());
+    }
+    types
+}
+
+/// What the label of a published prefix list carrying IPv6 ranges opens with, ahead of the
+/// service's own label: `com.amazonaws.<region>.ipv6.s3` is the IPv6 list of the service
+/// `com.amazonaws.<region>.s3`, the spelling the Amazon VPC User Guide's "AWS-managed prefix
+/// lists" page gives such a list.
+pub(super) const IPV6_PREFIX_LIST_LABEL_PREFIX: &str = "ipv6.";
+
+/// What separates the name of a reported endpoint service from its endpoint types in the key
+/// the report is ordered and paged by ([`EndpointServiceRecord::report_key`]).
+///
+/// Lower than every character a service name or a `ServiceType` member carries — both are made
+/// of letters, digits, `.` and `-` — so ordering by the key is ordering by the name and then
+/// the types, and no two keys can run together.
+pub const ENDPOINT_SERVICE_KEY_SEPARATOR: char = '\u{1}';
+
+/// The id of the endpoint service named `service_name` reached through `service_type`.
+///
+/// Derived from the pair rather than stored, the way [`service_prefix_list_id`] derives a
+/// published prefix list's id from its name: every read of one Region's endpoint service
+/// reports the same id, and two endpoint services get different ids — including the two a
+/// label reachable both ways carries, which share a name and are not one service, so the
+/// endpoint TYPE is part of what the id is derived from.
+///
+/// "The ID of the endpoint service" (`ServiceDetail$ServiceId`) takes the `vpce-svc-` prefix
+/// and 17 hexadecimal digits, so the derivation fills 17 of them, and its leading digit is
+/// never zero — which is what keeps a derived id clear of the 17-digit ids
+/// [`ComAmazonawsEc2Amazonec2State::next_id`] mints from a counter for the service
+/// configurations the account creates.
+pub fn endpoint_service_id(service_name: &str, service_type: &str) -> String {
+    let digest = stable_derived_id_hash(&format!("{service_name}/{service_type}"));
     format!(
-        "{VPC_ENDPOINT_SERVICE_ID_PREFIX}-{:08x}",
-        stable_derived_id_hash(service_name) & 0xffff_ffff
+        "{VPC_ENDPOINT_SERVICE_ID_PREFIX}-{leading:01x}{digest:016x}",
+        leading = 1 + digest % 15,
     )
 }
 
@@ -3150,8 +3227,15 @@ pub fn endpoint_service_name_is_offered(
 }
 
 /// The endpoint TYPES the endpoint service called `service_name` is reachable through — the
-/// `ServiceType` enum members `ServiceDetail$ServiceType` reports for it — or `None` for a
-/// name this service holds no catalogue entry for.
+/// `ServiceType` enum members `ServiceDetail$ServiceType` reports for it, across every endpoint
+/// service published under that name — or `None` for a name this service holds no catalogue
+/// entry for.
+///
+/// A name of the Region's catalogue may carry MORE THAN ONE endpoint service, one per type it
+/// is reachable through ([`endpoint_services_in_region`]), so the types of the name are the
+/// union of theirs, in the order the catalogue reports them. That is what a create of an
+/// endpoint is held to: the question it asks is whether the NAME it was given is reachable
+/// through the type it asked for.
 ///
 /// The two sources are the two [`endpoint_service_name_is_offered`] resolves a name against,
 /// read in the same order, so the types a create of an endpoint is held to are exactly the
@@ -3172,10 +3256,12 @@ pub fn endpoint_service_types(
     {
         return Some(service.service_types);
     }
-    endpoint_services_in_region(&parsed.region)
+    let types: Vec<String> = endpoint_services_in_region(&parsed.region)
         .into_iter()
-        .find(|service| service.service_name == service_name)
-        .map(|service| service.service_types)
+        .filter(|service| service.service_name == service_name)
+        .flat_map(|service| service.service_types)
+        .collect();
+    (!types.is_empty()).then_some(types)
 }
 
 /// The endpoint TYPES an endpoint created in `region` to the service called `service_name`,
@@ -3241,7 +3327,9 @@ pub const CROSS_REGION_ENDPOINT_TYPES: &[&str] = &[VPC_ENDPOINT_TYPE_INTERFACE];
 ///
 /// Read from the same two sources, in the same order, as [`endpoint_service_types`], so the
 /// name a create of an endpoint is held to is the one `DescribeVpcEndpointServices` reports
-/// for that service ([`EndpointServiceRecord::private_dns_name`]).
+/// for that service ([`EndpointServiceRecord::private_dns_name`]). A name of the catalogue may
+/// carry more than one endpoint service, and a private hosted zone is an INTERFACE endpoint's
+/// option, so the name reported is the one the endpoint service that publishes one carries.
 pub fn endpoint_service_private_dns_name(
     store: &ComAmazonawsEc2Amazonec2State,
     service_name: &str,
@@ -3257,8 +3345,8 @@ pub fn endpoint_service_private_dns_name(
     }
     endpoint_services_in_region(&parsed.region)
         .into_iter()
-        .find(|service| service.service_name == service_name)
-        .and_then(|service| service.private_dns_name)
+        .filter(|service| service.service_name == service_name)
+        .find_map(|service| service.private_dns_name)
 }
 
 /// EVERY default public DNS name of the endpoint service called `service_name` that private DNS
@@ -3298,7 +3386,9 @@ pub fn endpoint_service_private_dns_names(
 /// "Indicates whether the service supports endpoint policies"
 /// (`ServiceDetail$VpcEndpointPolicySupported`), read from the same two sources, in the same
 /// order, as [`endpoint_service_types`], so the answer a create is held to is the one
-/// `DescribeVpcEndpointServices` reports for that service.
+/// `DescribeVpcEndpointServices` reports for that service. Endpoint-policy support is a fact of
+/// the SERVICE rather than of the endpoint type ([`endpoint_service_offering`]), so every
+/// endpoint service published under one name answers the same and the first is read.
 pub fn endpoint_service_supports_endpoint_policy(
     store: &ComAmazonawsEc2Amazonec2State,
     service_name: &str,

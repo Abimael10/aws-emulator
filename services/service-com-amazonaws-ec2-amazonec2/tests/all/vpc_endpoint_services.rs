@@ -238,167 +238,217 @@ const CATALOGUE_CASES: [CatalogueCase; 6] = [
 /// about the report is tied to one Region.
 const REGIONS: [&str; 3] = ["us-east-1", "eu-west-2", "ap-southeast-2"];
 
-/// Whether `value` is a derived endpoint service id: `vpce-svc-` and 8 lowercase hexadecimal
-/// digits, the shorter of the two forms an EC2 resource id takes — the store mints 17 for a
-/// service configuration a caller created, so a derived id can never be mistaken for one.
+/// Whether `value` is an endpoint service id of the shape AWS publishes: `vpce-svc-` and 17
+/// lowercase hexadecimal digits, the longer of the two forms an EC2 resource id takes.
+///
+/// A derived id — one of a service of the Region's catalogue — never opens with a zero digit,
+/// which is what keeps it clear of the ids the store mints from its counter for a service
+/// configuration a caller created.
 fn is_derived_service_id(value: &str) -> bool {
-    value
-        .strip_prefix("vpce-svc-")
-        .is_some_and(|suffix| suffix.len() == 8 && suffix.bytes().all(|b| b.is_ascii_hexdigit()))
+    value.strip_prefix("vpce-svc-").is_some_and(|suffix| {
+        suffix.len() == 17
+            && !suffix.starts_with('0')
+            && suffix
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    })
 }
 
-/// Every row, in every Region, reports the service of THAT Region: the name, the Region, the
-/// owner alias, the endpoint types, the zones the Region has, the DNS names an endpoint to it
-/// answers under, and the flags a service Amazon Web Services offers carries.
+/// Every row, in every Region, reports the ENDPOINT SERVICES of THAT Region published under
+/// the name: one `serviceDetail` per endpoint type the label is reachable through, each with
+/// its own id, its own type, the zones the Region has, the base DNS name endpoints to it
+/// answer under, and the flags a service Amazon Web Services offers carries.
 #[tokio::test]
 async fn each_catalogued_service_is_reported_for_the_region_asked_about() {
     let router = super::ec2_query::emulator().0;
 
     for region in REGIONS {
+        // The service is available in the zones the Region HAS, which
+        // `DescribeAvailabilityZones` reports for the same Region.
+        let zones = available_zones(&router, region).await;
         for row in &CATALOGUE_CASES {
             let name = format!("com.amazonaws.{region}.{}", row.label);
             let case = format!("{name} asked about in {region}");
             let body = ok_in(&case, &router, region, &indexed("ServiceName", &[&name])).await;
             let services = reported(&case, &body);
+            // An endpoint service is one (name, endpoint type) pair, so a label reachable
+            // both ways carries one row for each, in the order the catalogue reports them.
             assert_eq!(
                 services.len(),
-                1,
-                "case {case:?}: expected exactly one service, got {services:?}"
-            );
-            let service = &services[0];
-            assert_eq!(
-                service.name, name,
-                "case {case:?}: expected the service name {name}, got {:?}",
-                service.name
+                row.types.len(),
+                "case {case:?}: expected one endpoint service per type {:?}, got {services:?}",
+                row.types
             );
             assert_eq!(
                 reported_names(&case, &body),
                 vec![name.clone()],
-                "case {case:?}: serviceNameSet must report the same selection, got {body}"
+                "case {case:?}: serviceNameSet must report the name once however many \
+                 endpoint services carry it, got {body}"
             );
-            assert!(
-                is_derived_service_id(&service.id),
-                "case {case:?}: expected a derived vpce-svc- id, got {:?}",
-                service.id
-            );
+            let ids: BTreeSet<&String> = services.iter().map(|service| &service.id).collect();
             assert_eq!(
-                service.types,
-                row.types.iter().map(|t| (*t).to_string()).collect::<Vec<_>>(),
-                "case {case:?}: expected the service types {:?}, got {:?}",
-                row.types,
-                service.types
+                ids.len(),
+                services.len(),
+                "case {case:?}: every endpoint service has an id of its own, got {services:?}"
             );
-            assert_eq!(
-                service.region, region,
-                "case {case:?}: expected the service Region {region}, got {:?}",
-                service.region
-            );
-            assert_eq!(
-                service.owner, "amazon",
-                "case {case:?}: expected the owner alias of a service Amazon Web Services \
-                 offers, got {:?}",
-                service.owner
-            );
-            // The service is available in the zones the Region HAS, which
-            // `DescribeAvailabilityZones` reports for the same Region.
-            let zones = available_zones(&router, region).await;
-            assert_eq!(
-                service.zones, zones,
-                "case {case:?}: expected the Region's own zones {zones:?}, got {:?}",
-                service.zones
-            );
-            assert_eq!(
-                service.zone_ids.len(),
-                zones.len(),
-                "case {case:?}: expected one zone id per zone, got {:?}",
-                service.zone_ids
-            );
-            // "The DNS names for the service": an interface endpoint's own names sit under
-            // the service's base name below `vpce.amazonaws.com`; a gateway endpoint mints
-            // none and is reached through the service's public name. Both sit under the host
-            // form of the service's label.
-            let mut expected_dns: Vec<String> = Vec::new();
-            if row.types.contains(&"Interface") {
-                expected_dns.push(format!("{}.{region}.vpce.amazonaws.com", row.dns_host));
+            for (service, endpoint_type) in services.iter().zip(row.types) {
+                let case = format!("{case} ({endpoint_type})");
+                assert_eq!(
+                    service.name, name,
+                    "case {case:?}: expected the service name {name}, got {:?}",
+                    service.name
+                );
+                assert!(
+                    is_derived_service_id(&service.id),
+                    "case {case:?}: expected a derived vpce-svc- id, got {:?}",
+                    service.id
+                );
+                assert_eq!(
+                    service.types,
+                    vec![(*endpoint_type).to_string()],
+                    "case {case:?}: a row reports the one type its endpoint service is \
+                     reached through, got {:?}",
+                    service.types
+                );
+                assert_eq!(
+                    service.region, region,
+                    "case {case:?}: expected the service Region {region}, got {:?}",
+                    service.region
+                );
+                assert_eq!(
+                    service.owner, "amazon",
+                    "case {case:?}: expected the owner alias of a service Amazon Web Services \
+                     offers, got {:?}",
+                    service.owner
+                );
+                assert_eq!(
+                    service.zones, zones,
+                    "case {case:?}: expected the Region's own zones {zones:?}, got {:?}",
+                    service.zones
+                );
+                assert_eq!(
+                    service.zone_ids.len(),
+                    zones.len(),
+                    "case {case:?}: expected one zone id per zone, got {:?}",
+                    service.zone_ids
+                );
+                // "The DNS names for the service": the base name the endpoint-specific names
+                // of an endpoint to it sit under, in the PrivateLink endpoint domain this
+                // emulator publishes its endpoints in — a name a consumer resolves has to
+                // lead back to this process rather than into a zone AWS serves. It is a fact
+                // of the service, so each of its endpoint services reports the one name.
+                let expected_dns = vec![format!("{}.{region}.{ENDPOINT_DOMAIN}", row.dns_host)];
+                assert_eq!(
+                    service.base_dns_names, expected_dns,
+                    "case {case:?}: expected the base endpoint DNS names {expected_dns:?}, \
+                     got {:?}",
+                    service.base_dns_names
+                );
+                // The default public name a private hosted zone answers on is an INTERFACE
+                // endpoint's option, so only that endpoint service of a service publishing
+                // one reports it.
+                let expected_private = (*endpoint_type == "Interface" && row.private_dns)
+                    .then(|| format!("{}.{region}.amazonaws.com", row.dns_host));
+                assert_eq!(
+                    service.private_dns_name, expected_private,
+                    "case {case:?}: expected the private DNS name {expected_private:?}, got \
+                     {:?}",
+                    service.private_dns_name
+                );
+                assert_eq!(
+                    service.private_dns_names,
+                    expected_private.iter().cloned().collect::<Vec<_>>(),
+                    "case {case:?}: privateDnsNameSet must carry the same name, got {:?}",
+                    service.private_dns_names
+                );
+                assert_eq!(
+                    service.verification_state,
+                    expected_private.is_some().then(|| "verified".to_string()),
+                    "case {case:?}: a service's own private name needs nothing verified, got \
+                     {:?}",
+                    service.verification_state
+                );
+                assert_eq!(
+                    service.policy_supported.as_deref(),
+                    Some(if row.policy { "true" } else { "false" }),
+                    "case {case:?}: expected the service's own endpoint-policy support, got \
+                     {:?}",
+                    service.policy_supported
+                );
+                assert_eq!(
+                    service.acceptance_required.as_deref(),
+                    Some("false"),
+                    "case {case:?}: nothing accepts a connection to a service Amazon Web \
+                     Services offers, got {:?}",
+                    service.acceptance_required
+                );
+                assert_eq!(
+                    service.manages_endpoints.as_deref(),
+                    Some("false"),
+                    "case {case:?}: the endpoint a caller creates is the caller's, got {:?}",
+                    service.manages_endpoints
+                );
+                assert_eq!(
+                    service.payer_responsibility.as_deref(),
+                    Some("ServiceOwner"),
+                    "case {case:?}: expected the one PayerResponsibility member, got {:?}",
+                    service.payer_responsibility
+                );
+                // "The supported IP address types" follows the way THIS endpoint service is
+                // reached: an interface endpoint service answers on both IPv4 and IPv6, the
+                // interface endpoint's own addresses being what it is created with, while a
+                // gateway endpoint service is reached through the prefix lists the Region
+                // publishes for it — asked of `DescribeManagedPrefixLists` rather than
+                // written out here.
+                let expected_ip_types = if *endpoint_type == "Interface" {
+                    vec!["ipv4".to_string(), "ipv6".to_string()]
+                } else {
+                    gateway_address_types(&router, region, row.label).await
+                };
+                assert_eq!(
+                    service.ip_address_types, expected_ip_types,
+                    "case {case:?}: expected the address types {expected_ip_types:?}, got {:?}",
+                    service.ip_address_types
+                );
+                assert!(
+                    service.tags.is_empty(),
+                    "case {case:?}: nobody can tag a service Amazon Web Services offers, got \
+                     {:?}",
+                    service.tags
+                );
             }
-            if row.types.contains(&"Gateway") {
-                expected_dns.push(format!("{}.{region}.amazonaws.com", row.dns_host));
-            }
-            expected_dns.sort();
-            let mut base_dns_names = service.base_dns_names.clone();
-            base_dns_names.sort();
-            assert_eq!(
-                base_dns_names, expected_dns,
-                "case {case:?}: expected the base endpoint DNS names {expected_dns:?}, got {:?}",
-                service.base_dns_names
-            );
-            let expected_private = row
-                .private_dns
-                .then(|| format!("{}.{region}.amazonaws.com", row.dns_host));
-            assert_eq!(
-                service.private_dns_name, expected_private,
-                "case {case:?}: expected the private DNS name {expected_private:?}, got {:?}",
-                service.private_dns_name
-            );
-            assert_eq!(
-                service.private_dns_names,
-                expected_private.iter().cloned().collect::<Vec<_>>(),
-                "case {case:?}: privateDnsNameSet must carry the same name, got {:?}",
-                service.private_dns_names
-            );
-            assert_eq!(
-                service.verification_state,
-                row.private_dns.then(|| "verified".to_string()),
-                "case {case:?}: a service's own private name needs nothing verified, got {:?}",
-                service.verification_state
-            );
-            assert_eq!(
-                service.policy_supported.as_deref(),
-                Some(if row.policy { "true" } else { "false" }),
-                "case {case:?}: expected the service's own endpoint-policy support, got \
-                 {:?}",
-                service.policy_supported
-            );
-            assert_eq!(
-                service.acceptance_required.as_deref(),
-                Some("false"),
-                "case {case:?}: nothing accepts a connection to a service Amazon Web Services \
-                 offers, got {:?}",
-                service.acceptance_required
-            );
-            assert_eq!(
-                service.manages_endpoints.as_deref(),
-                Some("false"),
-                "case {case:?}: the endpoint a caller creates is the caller's, got {:?}",
-                service.manages_endpoints
-            );
-            assert_eq!(
-                service.payer_responsibility.as_deref(),
-                Some("ServiceOwner"),
-                "case {case:?}: expected the one PayerResponsibility member, got {:?}",
-                service.payer_responsibility
-            );
-            // "The supported IP address types" is about what the SERVICE answers on: an
-            // interface endpoint service answers on both IPv4 and IPv6, while a service
-            // reached only through a gateway endpoint is reached through its route-table
-            // entry, which is an IPv4 prefix list.
-            let expected_ip_types = if row.types.contains(&"Interface") {
-                vec!["ipv4".to_string(), "ipv6".to_string()]
-            } else {
-                vec!["ipv4".to_string()]
-            };
-            assert_eq!(
-                service.ip_address_types, expected_ip_types,
-                "case {case:?}: expected the address types {expected_ip_types:?}, got {:?}",
-                service.ip_address_types
-            );
-            assert!(
-                service.tags.is_empty(),
-                "case {case:?}: nobody can tag a service Amazon Web Services offers, got {:?}",
-                service.tags
-            );
         }
     }
+}
+
+/// The PrivateLink endpoint domain this emulator publishes its endpoint DNS names in: the
+/// `vpce` label in the zone a resolver answers with the loopback interface, which is where the
+/// core binds its listeners unless the operator names another address. A name a consumer
+/// resolves must lead back to this process, so it is never published in a zone AWS serves.
+const ENDPOINT_DOMAIN: &str = "vpce.localhost";
+
+/// The address families a GATEWAY endpoint service of `label` answers on: IPv4, and IPv6 when
+/// the Region publishes the service's IPv6 prefix list beside its IPv4 one — the lists a route
+/// to a gateway endpoint names, read through `DescribeManagedPrefixLists` so the expectation
+/// comes from the Region's own published lists rather than from this test.
+async fn gateway_address_types(
+    router: &MultiServiceRouter,
+    region: &str,
+    label: &str,
+) -> Vec<String> {
+    let (status, body) =
+        super::ec2_query::call(router, region, "DescribeManagedPrefixLists", &[]).await;
+    assert_eq!(
+        status, 200,
+        "DescribeManagedPrefixLists for {region} must succeed, got {status}: {body}"
+    );
+    let published = super::ec2_query::elements(&body, "prefixListName");
+    let ipv6_list = format!("com.amazonaws.{region}.ipv6.{label}");
+    let mut types = vec!["ipv4".to_string()];
+    if published.contains(&ipv6_list) {
+        types.push("ipv6".to_string());
+    }
+    types
 }
 
 /// The zone names `DescribeAvailabilityZones` reports for `region` — the zones the Region
@@ -541,22 +591,34 @@ async fn a_regions_report_is_stable_and_its_services_are_distinct() {
         "case {case:?}: expected a Region to offer several services, got {services:?}"
     );
     let names: Vec<String> = services.iter().map(|service| service.name.clone()).collect();
+    // `serviceNameSet` answers which services a caller can create an endpoint to, which is a
+    // question about the NAME: it reports each name of the page once, however many of the
+    // page's endpoint services are published under it.
+    let mut distinct_names = names.clone();
+    distinct_names.dedup();
     assert_eq!(
         reported_names(case, &first),
-        names,
-        "case {case:?}: serviceNameSet must report the detailed selection, got {first}"
-    );
-    let unique_names: BTreeSet<&String> = names.iter().collect();
-    assert_eq!(
-        unique_names.len(),
-        names.len(),
-        "case {case:?}: a service name must be unique within a Region, got {names:?}"
+        distinct_names,
+        "case {case:?}: serviceNameSet must report each name of the detailed selection once, \
+         got {first}"
     );
     let unique_ids: BTreeSet<&String> = services.iter().map(|service| &service.id).collect();
     assert_eq!(
         unique_ids.len(),
         services.len(),
-        "case {case:?}: two services of one Region must not share an id, got {services:?}"
+        "case {case:?}: two endpoint services of one Region must not share an id, got \
+         {services:?}"
+    );
+    // One name may carry more than one endpoint service, but never two with the same type:
+    // the pair is what identifies an endpoint service.
+    let unique_rows: BTreeSet<(&String, &Vec<String>)> = services
+        .iter()
+        .map(|service| (&service.name, &service.types))
+        .collect();
+    assert_eq!(
+        unique_rows.len(),
+        services.len(),
+        "case {case:?}: an endpoint service is one name and one type, got {names:?}"
     );
     for service in &services {
         // Every service of the report is a service of the Region asked about, under one of
@@ -574,8 +636,9 @@ async fn a_regions_report_is_stable_and_its_services_are_distinct() {
             service.name
         );
         assert!(
-            !service.types.is_empty(),
-            "case {case:?}: every service is reachable through some endpoint type, got {service:?}"
+            service.types.len() == 1,
+            "case {case:?}: a row reports the one type its endpoint service is reached \
+             through, got {service:?}"
         );
     }
 
@@ -638,9 +701,19 @@ async fn service_names_narrows_the_report() {
         }
         let mut expected: Vec<String> = names.iter().map(|name| (*name).to_string()).collect();
         expected.sort();
+        // A name may carry more than one endpoint service, so the DETAILS may hold a name
+        // more than once; the names reported, and the names the details are published under,
+        // are exactly the ones asked for.
+        let mut distinct = got.clone();
+        distinct.dedup();
         assert_eq!(
-            got, expected,
+            distinct, expected,
             "case {case:?}: expected exactly the named services, got {got:?}"
+        );
+        assert_eq!(
+            reported_names(case, &body),
+            expected,
+            "case {case:?}: serviceNameSet must report each named service once, got {body}"
         );
     }
 }
@@ -871,15 +944,20 @@ fn filter_cases() -> Vec<FilterCase> {
             expected: None,
         },
         FilterCase {
-            // Every interface endpoint service answers on IPv6 too, so the type selects
-            // every service but the ones reachable only through a gateway endpoint: ANDing
-            // it with `service-type` leaves the one service reachable BOTH ways.
-            case: "an address type only the interface services support",
+            // Every endpoint service of the catalogue answers on IPv6 — an interface service
+            // through the endpoint's own addresses, a gateway service through the IPv6 prefix
+            // list the Region publishes beside its IPv4 one — so the address type narrows
+            // nothing on its own and ANDing it with `service-type` leaves the gateway
+            // services.
+            case: "an address type every service supports, ANDed with the gateway type",
             entries: vec![
                 ("supported-ip-address-types", &["ipv6"]),
                 ("service-type", &["Gateway"]),
             ],
-            expected: Some(vec!["com.amazonaws.us-east-1.s3"]),
+            expected: Some(vec![
+                "com.amazonaws.us-east-1.dynamodb",
+                "com.amazonaws.us-east-1.s3",
+            ]),
         },
         FilterCase {
             case: "an address type no service here supports",
@@ -924,10 +1002,13 @@ async fn documented_filters_narrow_the_report() {
             got, wanted,
             "case {case:?}: expected {wanted:?}, got {got:?}"
         );
+        let mut distinct = got.clone();
+        distinct.dedup();
         assert_eq!(
             reported_names(case, &body),
-            got,
-            "case {case:?}: serviceNameSet must report the same selection, got {body}"
+            distinct,
+            "case {case:?}: serviceNameSet must report each name of the selection once, got \
+             {body}"
         );
     }
 }

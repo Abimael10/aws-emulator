@@ -374,7 +374,7 @@ async fn each_endpoint_service_is_configured_persisted_and_read_back() {
         // "The DNS names for the service": the base name an interface endpoint's own names sit
         // under, and nothing for a service behind a Gateway Load Balancer.
         let expected_base_names: Vec<String> = if row.reported_type == "Interface" {
-            vec![format!("{service_id}.{REGION}.vpce.amazonaws.com")]
+            vec![format!("{service_id}.{REGION}.vpce.localhost")]
         } else {
             Vec::new()
         };

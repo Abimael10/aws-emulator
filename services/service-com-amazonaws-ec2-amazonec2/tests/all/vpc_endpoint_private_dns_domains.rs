@@ -155,7 +155,9 @@ struct ServiceRow {
     /// publishes none. Written out here rather than derived, so the suite pins the names and not
     /// the code that builds them.
     private_dns_name: Option<&'static str>,
-    /// The base endpoint DNS name an interface endpoint's own names sit under.
+    /// The base endpoint DNS name an interface endpoint's own names sit under, in the
+    /// PrivateLink endpoint domain this emulator publishes its endpoints in — the loopback
+    /// zone, since a name a consumer resolves has to lead back to this process.
     base_dns_name: &'static str,
     /// Whether an endpoint to it takes an endpoint policy.
     policy_supported: bool,
@@ -169,35 +171,35 @@ const SERVICE_ROWS: [ServiceRow; 5] = [
         case: "a one-component label",
         service_name: "com.amazonaws.us-west-2.logs",
         private_dns_name: Some("logs.us-west-2.amazonaws.com"),
-        base_dns_name: "logs.us-west-2.vpce.amazonaws.com",
+        base_dns_name: "logs.us-west-2.vpce.localhost",
         policy_supported: true,
     },
     ServiceRow {
         case: "the Docker registry label, reversed",
         service_name: "com.amazonaws.us-west-2.ecr.dkr",
         private_dns_name: Some("dkr.ecr.us-west-2.amazonaws.com"),
-        base_dns_name: "dkr.ecr.us-west-2.vpce.amazonaws.com",
+        base_dns_name: "dkr.ecr.us-west-2.vpce.localhost",
         policy_supported: true,
     },
     ServiceRow {
         case: "the AppStream streaming label, reversed",
         service_name: "com.amazonaws.us-west-2.appstream.streaming",
         private_dns_name: Some("streaming.appstream.us-west-2.amazonaws.com"),
-        base_dns_name: "streaming.appstream.us-west-2.vpce.amazonaws.com",
+        base_dns_name: "streaming.appstream.us-west-2.vpce.localhost",
         policy_supported: true,
     },
     ServiceRow {
         case: "the AWS IoT Core data plane, which offers neither",
         service_name: "com.amazonaws.us-west-2.iot.data",
         private_dns_name: None,
-        base_dns_name: "data.iot.us-west-2.vpce.amazonaws.com",
+        base_dns_name: "data.iot.us-west-2.vpce.localhost",
         policy_supported: false,
     },
     ServiceRow {
         case: "a service of the aws.api family",
         service_name: "aws.api.us-west-2.emr-service-cell01",
         private_dns_name: Some("emr-service-cell01.us-west-2.api.aws"),
-        base_dns_name: "emr-service-cell01.us-west-2.vpce.amazonaws.com",
+        base_dns_name: "emr-service-cell01.us-west-2.vpce.localhost",
         policy_supported: true,
     },
 ];

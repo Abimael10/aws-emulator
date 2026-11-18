@@ -1286,7 +1286,7 @@ pub(crate) struct EndpointPlacement {
 ///
 /// AWS gives an interface endpoint endpoint-specific regional and zonal names under
 /// [`crate::state::ENDPOINT_DNS_SUFFIX`] —
-/// `<endpoint>-<suffix>.<service>.<region>.vpce.amazonaws.com` and one
+/// `<endpoint>-<suffix>.<service>.<region>.<endpoint domain>` and one
 /// `<endpoint>-<suffix>-<zone>.…` per Availability Zone its interfaces sit in, where `<suffix>`
 /// is the endpoint's own DNS suffix ([`crate::state::vpc_endpoint_dns_suffix`]) — and, when a
 /// private hosted zone was asked for, the names the SERVICE publishes: "the default public DNS

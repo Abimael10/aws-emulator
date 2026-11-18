@@ -1275,7 +1275,10 @@ fn expected_dns_names(row: &DnsCase, endpoint_id: &str, zones: &[&str]) -> Vec<S
         "{endpoint_id}-{suffix}",
         suffix = ec2::state::vpc_endpoint_dns_suffix(endpoint_id),
     );
-    let host = format!("{}.{REGION}.vpce.amazonaws.com", row.dns_host);
+    // The endpoint's own names sit under the service's base name in the PrivateLink endpoint
+    // domain this emulator publishes its endpoints in: a name the client resolves and dials
+    // has to lead back to this process rather than into a zone AWS serves.
+    let host = format!("{}.{REGION}.vpce.localhost", row.dns_host);
     let mut expected = vec![format!("{endpoint}.{host}")];
     for zone in zones.iter().take(row.subnets) {
         expected.push(format!("{endpoint}-{zone}.{host}"));

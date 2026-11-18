@@ -5,8 +5,10 @@
 //! Regions the request asks about — the services Amazon Web Services offers there, which
 //! [`crate::state::endpoint_services_in_region`] derives from the Region, together with the
 //! account's own stored service configurations — narrowed by `ServiceNames` and the
-//! documented filters and paged by `MaxResults`/`NextToken`. This is the ONLY file to touch
-//! for this operation.
+//! documented filters and paged by `MaxResults`/`NextToken`. One `ServiceDetail` per ENDPOINT
+//! SERVICE, which is a (service name, endpoint type) pair: a name reachable both through a
+//! gateway and through an interface endpoint carries one row for each, with that type's own
+//! id, DNS names and address types. This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -303,13 +305,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
         drop(store);
-        // `ServiceNames` selects by name, and the page cursor below names the service the next
-        // page starts at, so ONE name has to name one service: the candidates are put in
-        // `ServiceName` order here — the order the pages walk — and a name reached twice,
-        // which only a stored configuration named exactly like a service of the catalogue
-        // could be, is kept once.
-        candidates.sort_by(|left, right| left.service_name.cmp(&right.service_name));
-        candidates.dedup_by(|later, earlier| earlier.service_name == later.service_name);
+        // `ServiceNames` selects by name, and the page cursor below names the endpoint service
+        // the next page starts at. A NAME may be carried by more than one endpoint service —
+        // one per endpoint type it is reachable through, each with its own id — so the
+        // candidates are put in [`state::EndpointServiceRecord::report_key`] order here, the
+        // order the pages walk, and an endpoint service reached twice, which only a stored
+        // configuration named and typed exactly like one of the catalogue could be, is kept
+        // once.
+        candidates.sort_by_key(state::EndpointServiceRecord::report_key);
+        candidates.dedup_by(|later, earlier| earlier.report_key() == later.report_key());
 
         // "The service names" (`ServiceNames`): a name that none of the Regions asked about
         // offers is an error rather than an absent row, which is what lets a client tell a
@@ -360,13 +364,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )));
         }
 
-        // Page in `ServiceName` order, which the cursor names a position in: the candidates
-        // were put in that order and made unique above, and the selection walked them in it,
-        // so a token naming the service the next page starts at always advances.
+        // Page in [`state::EndpointServiceRecord::report_key`] order, which the cursor names a
+        // position in: the candidates were put in that order and made unique above, and the
+        // selection walked them in it, so a token naming the endpoint service the next page
+        // starts at always advances.
         let from = match start_at.as_deref() {
             None => 0,
             Some(cursor) => {
-                selected.partition_point(|service| service.service_name.as_str() < cursor)
+                selected.partition_point(|service| service.report_key().as_str() < cursor)
             }
         };
         let page = selected.get(from..).unwrap_or_default();
@@ -382,22 +387,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .clamp(1, state::MAX_PAGE_SIZE);
 
         // "If there are no additional items to return, the string is empty"
-        // (`DescribeVpcEndpointServicesResult$NextToken`): a token only when a service follows
-        // this page.
+        // (`DescribeVpcEndpointServicesResult$NextToken`): a token only when an endpoint
+        // service follows this page.
         let next_token = page
             .get(limit)
-            .map(|service| state::encode_page_token(&service.service_name));
+            .map(|service| state::encode_page_token(&service.report_key()));
 
         // "The supported services" (`ServiceNames`) and "Information about the service"
         // (`ServiceDetails`) report the SAME selection, one as names and one in full, so a
-        // caller reading either sees the same page.
+        // caller reading either sees the same page. A name is reported ONCE however many of
+        // this page's endpoint services are published under it: `ServiceNames` answers which
+        // services a caller can create an endpoint to, which is a question about the name,
+        // while `ServiceDetails` carries one entry per endpoint service.
+        let mut service_names: Vec<String> = Vec::new();
+        for service in page.iter().take(limit) {
+            if service_names.last() != Some(&service.service_name) {
+                service_names.push(service.service_name.clone());
+            }
+        }
         Ok(DescribeVpcEndpointServicesOutput {
-            service_names: Some(
-                page.iter()
-                    .take(limit)
-                    .map(|service| service.service_name.clone())
-                    .collect(),
-            ),
+            service_names: Some(service_names),
             service_details: Some(
                 page.iter()
                     .take(limit)
