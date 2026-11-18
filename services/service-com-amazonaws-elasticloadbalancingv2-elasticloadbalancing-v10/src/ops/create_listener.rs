@@ -17,7 +17,9 @@
 //! provide exactly one certificate." — so one of those listeners is refused when it
 //! carries no certificate (or more than one), and any other listener is refused when
 //! it carries one. See [`check_default_certificate`]. A certificate ARN that names no
-//! certificate is `CertificateNotFoundException`, and a default action redirecting to
+//! certificate is `CertificateNotFoundException`, a certificate the service that holds it
+//! reports in a state it has no key material for is `UnsupportedCertificate`
+//! ([`crate::state::certificate_resolution`]), and a default action redirecting to
 //! cleartext HTTP on a listener that terminates TLS is
 //! `InvalidLoadBalancerActionException`.
 //!
@@ -268,20 +270,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The certificate the request names is RESOLVED: a value that is no certificate
         // ARN names no certificate of the account, so no listener is created for it — and
         // neither is one for a well-formed ARN the service that HOLDS the certificate
-        // reports none for ([`crate::state::certificate_resolution`]). No store of this
+        // reports none for, nor one for a certificate that service reports in a state it
+        // can hand over no key material for, which a listener could never answer a
+        // handshake with ([`crate::state::certificate_resolution`]). No store of this
         // service is locked yet, so nothing of it is held while that service is asked.
         let certificates = input.certificates.as_deref().unwrap_or_default();
-        let unresolved = match crate::state::unresolvable_certificate(certificates) {
-            Some(arn) => Some(arn),
-            None => crate::state::absent_certificate(ctx, certificates).await,
-        };
-        if let Some(arn) = unresolved {
-            return Err(CreateListenerErrorModeled::CertificateNotFoundException(
-                CertificateNotFoundException {
-                    message: Some(crate::state::certificate_not_found_message(arn)),
-                },
-            )
-            .into());
+        if let Some(arn) = crate::state::unresolvable_certificate(certificates) {
+            return Err(certificate_not_found(arn));
+        }
+        if let Some((arn, defect)) = crate::state::unusable_certificate(ctx, certificates).await {
+            return Err(match defect {
+                crate::state::CertificateDefect::Absent => certificate_not_found(arn),
+                crate::state::CertificateDefect::NotIssued => {
+                    crate::state::unsupported_certificate(arn)
+                }
+            });
         }
 
         // A redirect action is judged against the protocol of the listener it is attached
@@ -515,6 +518,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             listeners: Some(listeners),
         })
     }
+}
+
+/// The modelled refusal for a certificate ARN that resolves to no certificate of the
+/// account, which is what a value that is no certificate ARN at all does
+/// ([`crate::state::names_a_certificate`]) and what the service that holds certificates
+/// reports for an ARN it has none under.
+fn certificate_not_found(arn: &str) -> CreateListenerError {
+    CreateListenerErrorModeled::CertificateNotFoundException(CertificateNotFoundException {
+        message: Some(crate::state::certificate_not_found_message(arn)),
+    })
+    .into()
 }
 
 /// Enforce that bracket on the listener's default certificate: a TLS-terminating

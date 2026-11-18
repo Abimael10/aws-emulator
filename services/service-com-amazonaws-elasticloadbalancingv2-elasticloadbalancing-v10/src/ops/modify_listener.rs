@@ -236,21 +236,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // A certificate the request names is resolved against the service that HOLDS it
         // before the store is reached, so the listener keeps the certificate it had when
-        // that service reports none for the one the request named
-        // ([`crate::state::certificate_resolution`]) — and nothing of this store is held
+        // that service reports none for the one the request named, or reports one it can
+        // hand over no key material for ([`crate::state::certificate_resolution`]) — and
+        // nothing of this store is held
         // while that service is asked. The COUNT is judged FIRST, so no request can make
         // this handler ask that service once per certificate it chose to carry; the FORM of
         // each value is judged under the lock with the rest of the certificate rules
         // ([`apply_certificate_rules`]).
         let requested = input.certificates.as_deref().unwrap_or_default();
         check_certificate_count(requested)?;
-        if let Some(arn) = crate::state::absent_certificate(ctx, requested).await {
-            return Err(ModifyListenerErrorModeled::CertificateNotFoundException(
-                CertificateNotFoundException {
-                    message: Some(crate::state::certificate_not_found_message(arn)),
-                },
-            )
-            .into());
+        if let Some((arn, defect)) = crate::state::unusable_certificate(ctx, requested).await {
+            return Err(match defect {
+                crate::state::CertificateDefect::Absent => {
+                    ModifyListenerErrorModeled::CertificateNotFoundException(
+                        CertificateNotFoundException {
+                            message: Some(crate::state::certificate_not_found_message(arn)),
+                        },
+                    )
+                    .into()
+                }
+                crate::state::CertificateDefect::NotIssued => {
+                    crate::state::unsupported_certificate(arn)
+                }
+            });
         }
 
         let mut guard = state.lock();

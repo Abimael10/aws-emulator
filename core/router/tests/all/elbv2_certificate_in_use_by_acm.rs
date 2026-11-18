@@ -21,9 +21,15 @@
 //!
 //! The rows differ along which TLS-terminating protocol the listener speaks and whether
 //! the certificate is the listener's default one or an SNI entry of its certificate list.
+//!
+//! Every certificate a listener here is given is carried to `ISSUED` first, which is the
+//! only status a listener can present a certificate in: a private-CA request needs no
+//! domain validation ("if you are requesting a private certificate, domain validation is
+//! not required", `RequestCertificate` doc), so it reaches that status, and the suite waits
+//! for ACM to report it.
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use serde_json::{json, Value};
@@ -143,26 +149,58 @@ async fn acm(router: &MultiServiceRouter, operation: &str, body: &Value) -> (u16
     (status, parsed)
 }
 
-/// Request one certificate from ACM and answer the ARN it minted.
-async fn request_certificate(router: &MultiServiceRouter, case: &str, domain: &str) -> String {
+/// A private certificate authority ARN of the form `CertificateAuthorityArn`'s pattern
+/// requires. A request naming one needs no domain validation, so it is the request that
+/// reaches `ISSUED` — the status a certificate must be in for a listener to present it.
+fn private_ca_arn() -> String {
+    format!(
+        "arn:aws:acm-pca:{REGION}:000000000000:certificate-authority\
+         /12345678-1234-1234-1234-123456789012"
+    )
+}
+
+/// How long a case gives the issuance ACM owes a private request to fall due. Generous:
+/// the wait below is for the CONDITION, so this only bounds a status that never arrives.
+const ISSUANCE_DEADLINE: Duration = Duration::from_secs(60);
+
+/// Request one private certificate from ACM, wait until ACM reports it `ISSUED`, and answer
+/// the ARN it minted.
+async fn issued_certificate(router: &MultiServiceRouter, case: &str, domain: &str) -> String {
     let (status, body) = acm(
         router,
         "RequestCertificate",
-        &json!({ "DomainName": domain, "ValidationMethod": "DNS" }),
+        &json!({ "DomainName": domain, "CertificateAuthorityArn": private_ca_arn() }),
     )
     .await;
     assert_eq!(
         status, 200,
         "case {case:?}: RequestCertificate must answer 200, got {status} {body}"
     );
-    body["CertificateArn"]
+    let arn = body["CertificateArn"]
         .as_str()
         .unwrap_or_else(|| panic!("case {case:?}: no CertificateArn in {body}"))
-        .to_string()
+        .to_string();
+    // The issuance is a transition the clock owes the request, materialised by whichever
+    // call next touches that service's store — so the wait is for the status itself.
+    let deadline = Instant::now() + ISSUANCE_DEADLINE;
+    loop {
+        let reported = described(router, case, &arn).await["Status"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        if reported == "ISSUED" {
+            return arn;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "case {case:?}: expected ACM to report ISSUED for {arn}, got {reported:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
 }
 
-/// The resources `DescribeCertificate` reports as using `certificate_arn`.
-async fn in_use_by(router: &MultiServiceRouter, case: &str, certificate_arn: &str) -> Vec<String> {
+/// What `DescribeCertificate` reports for `certificate_arn`.
+async fn described(router: &MultiServiceRouter, case: &str, certificate_arn: &str) -> Value {
     let (status, body) = acm(
         router,
         "DescribeCertificate",
@@ -173,9 +211,15 @@ async fn in_use_by(router: &MultiServiceRouter, case: &str, certificate_arn: &st
         status, 200,
         "case {case:?}: DescribeCertificate must answer 200, got {status} {body}"
     );
-    body["Certificate"]["InUseBy"]
+    body["Certificate"].clone()
+}
+
+/// The resources `DescribeCertificate` reports as using `certificate_arn`.
+async fn in_use_by(router: &MultiServiceRouter, case: &str, certificate_arn: &str) -> Vec<String> {
+    let certificate = described(router, case, certificate_arn).await;
+    certificate["InUseBy"]
         .as_array()
-        .unwrap_or_else(|| panic!("case {case:?}: no InUseBy in {body}"))
+        .unwrap_or_else(|| panic!("case {case:?}: no InUseBy in {certificate}"))
         .iter()
         .map(|arn| arn.as_str().unwrap_or_default().to_string())
         .collect()
@@ -218,10 +262,10 @@ async fn acm_reports_the_load_balancer_whose_listener_serves_the_certificate() {
     for (case, protocol, attached) in rows {
         // One emulator per row, so each row's assertions are about its own store.
         let router = emulator();
-        let subject = request_certificate(&router, case, "in-use.example.com").await;
+        let subject = issued_certificate(&router, case, "in-use.example.com").await;
         // The certificate the listener holds as its default on the row that attaches the
         // subject to the list instead, so the subject is never the listener's only one.
-        let filler = request_certificate(&router, case, "filler.example.com").await;
+        let filler = issued_certificate(&router, case, "filler.example.com").await;
 
         // Nothing is serving it yet.
         assert!(

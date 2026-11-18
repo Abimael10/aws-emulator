@@ -259,6 +259,37 @@ pub static ACCESS_DENIED_SCHEMA: Schema = Schema::new_struct(
     &[&ACCESS_DENIED_MESSAGE],
 );
 
+/// The `message` member of the synthetic `UnsupportedCertificate` error shape.
+static UNSUPPORTED_CERTIFICATE_MESSAGE: Schema = Schema::new_member(
+    ShapeId::from_static(
+        "smithy.framework#UnsupportedCertificate$message",
+        "smithy.framework",
+        "message",
+    ),
+    ShapeType::String,
+    "message",
+    0,
+)
+.with_xml_name("Message");
+
+/// Schema for the synthetic `UnsupportedCertificate` error shape.
+///
+/// In the `smithy.framework` namespace for the same reason as `NotImplemented`: the shape is
+/// not in any service's model, so it must not collide with a modeled one. It exists because
+/// `UnsupportedCertificate` is the code Elastic Load Balancing refuses a certificate a
+/// TLS-terminating listener cannot present with — the model declares no shape for it, and
+/// the error code is what a client branches on. The rule that decides it, and the code
+/// itself, live with the certificate concern ([`crate::state::certificate_resolution`]).
+pub static UNSUPPORTED_CERTIFICATE_SCHEMA: Schema = Schema::new_struct(
+    ShapeId::from_static(
+        "smithy.framework#UnsupportedCertificate",
+        "smithy.framework",
+        "UnsupportedCertificate",
+    ),
+    ShapeType::Structure,
+    &[&UNSUPPORTED_CERTIFICATE_MESSAGE],
+);
+
 /// An operation's error channel: either the synthetic scaffold signal, or one of the
 /// operation's own modeled errors.
 #[derive(Debug)]
@@ -284,6 +315,12 @@ pub enum Scaffolded<E> {
     /// `message` member; only the wire code differs from
     /// [`Scaffolded::ValidationException`].
     ValidationError(ValidationException),
+    /// The certificate the request named is one no listener of this service can present,
+    /// with HTTP 400 and the error code `UnsupportedCertificate`. Not a missing
+    /// certificate: the account holds it, and the service that holds it reports it in a
+    /// state that has no key material behind it. The payload is the same single `message`
+    /// member as the refusals above.
+    UnsupportedCertificate(ValidationException),
     /// The caller may not perform the action the request named on the resource it addressed,
     /// with HTTP 403 and the error code `AccessDenied`. Not a bad request: the request is one
     /// the service would serve for a caller the IAM policies in force permit. The payload is
@@ -338,6 +375,16 @@ impl<E> Scaffolded<E> {
     pub fn access_denied(message: impl Into<String>) -> Self {
         Self::AccessDenied(ValidationException::new(message))
     }
+
+    /// Refuse the request with HTTP 400 `UnsupportedCertificate`.
+    ///
+    /// For a certificate the service that holds it cannot hand a listener key material for,
+    /// so the listener could never answer a handshake with it. The decision and the
+    /// sentence belong to [`crate::state::certificate_resolution`]; reach for that module's
+    /// `unsupported_certificate` rather than wording this refusal again.
+    pub fn unsupported_certificate(message: impl Into<String>) -> Self {
+        Self::UnsupportedCertificate(ValidationException::new(message))
+    }
 }
 
 impl<E: std::fmt::Display> std::fmt::Display for Scaffolded<E> {
@@ -347,6 +394,7 @@ impl<E: std::fmt::Display> std::fmt::Display for Scaffolded<E> {
             Self::Modeled(e) => write!(f, "{e}"),
             Self::ValidationException(e) => write!(f, "{e}"),
             Self::ValidationError(e) => write!(f, "{e}"),
+            Self::UnsupportedCertificate(e) => write!(f, "{e}"),
             Self::AccessDenied(e) => write!(f, "{e}"),
         }
     }
@@ -361,6 +409,7 @@ impl<E: std::error::Error + 'static> std::error::Error for Scaffolded<E> {
             Self::Modeled(e) => e.source(),
             Self::ValidationException(e) => e.source(),
             Self::ValidationError(e) => e.source(),
+            Self::UnsupportedCertificate(e) => e.source(),
             Self::AccessDenied(e) => e.source(),
         }
     }
@@ -377,6 +426,7 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
             Self::Modeled(e) => e.as_serializable(),
             Self::ValidationException(e) => e,
             Self::ValidationError(e) => e,
+            Self::UnsupportedCertificate(e) => e,
             Self::AccessDenied(e) => e,
         }
     }
@@ -387,6 +437,7 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
             Self::Modeled(e) => e.variant_schema(),
             Self::ValidationException(_) => &VALIDATION_EXCEPTION_SCHEMA,
             Self::ValidationError(_) => &VALIDATION_ERROR_SCHEMA,
+            Self::UnsupportedCertificate(_) => &UNSUPPORTED_CERTIFICATE_SCHEMA,
             Self::AccessDenied(_) => &ACCESS_DENIED_SCHEMA,
         }
     }
@@ -401,6 +452,7 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
             Self::Modeled(e) => e.shape_name(),
             Self::ValidationException(_) => "ValidationException",
             Self::ValidationError(_) => VALIDATION_ERROR,
+            Self::UnsupportedCertificate(_) => crate::state::UNSUPPORTED_CERTIFICATE,
             Self::AccessDenied(_) => crate::service::target_group_authorization::ACCESS_DENIED,
         }
     }
@@ -415,6 +467,7 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
             Self::Modeled(e) => e.http_status(),
             Self::ValidationException(_) => 400,
             Self::ValidationError(_) => 400,
+            Self::UnsupportedCertificate(_) => 400,
             // Not a bad request: the request is one this service would serve for a caller the
             // policies in force permit.
             Self::AccessDenied(_) => 403,
@@ -434,6 +487,10 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
             // comes from [`OperationError::shape_name`] above, not from a modelled trait,
             // and it IS the code AWS answers with — so there is nothing to override.
             Self::ValidationError(_) => None,
+            // Same reason again: the `<Code>UnsupportedCertificate</Code>` the envelope
+            // renders comes from [`OperationError::shape_name`] above, and it IS the code
+            // Elastic Load Balancing answers such a certificate with.
+            Self::UnsupportedCertificate(_) => None,
             // Same reason again: the `<Code>AccessDenied</Code>` the envelope renders comes
             // from [`OperationError::shape_name`] above.
             Self::AccessDenied(_) => None,

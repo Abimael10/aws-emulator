@@ -108,18 +108,23 @@ pub(crate) fn mint(names: &[&str]) -> Minted {
     }
 }
 
-/// Import one minted certificate through Certificate Manager's own `ImportCertificate`, and
-/// answer the ARN it was stored under.
-pub(crate) async fn import(router: &MultiServiceRouter, case: &str, minted: &Minted) -> String {
-    let body = serde_json::json!({
-        "Certificate": aws_smithy_types::base64::encode(minted.certificate_pem.as_bytes()),
-        "PrivateKey": aws_smithy_types::base64::encode(minted.private_key_pem.as_bytes()),
-    });
+/// Call one Certificate Manager operation over that service's own protocol
+/// (`awsJson1_1`: `POST /` with `X-Amz-Target: CertificateManager.<Op>`), and answer the
+/// status and the parsed body.
+///
+/// `pub(crate)` because every suite of this crate that needs a certificate talks to the
+/// service that HOLDS certificates through this one call, so no suite hand-rolls that
+/// service's protocol a second time.
+pub(crate) async fn certificate_manager(
+    router: &MultiServiceRouter,
+    operation: &str,
+    body: &serde_json::Value,
+) -> (u16, serde_json::Value) {
     let request = http::Request::builder()
         .method("POST")
         .uri("/")
         .header("content-type", "application/x-amz-json-1.1")
-        .header("x-amz-target", "CertificateManager.ImportCertificate")
+        .header("x-amz-target", format!("CertificateManager.{operation}"))
         .header(
             "authorization",
             format!(
@@ -128,13 +133,24 @@ pub(crate) async fn import(router: &MultiServiceRouter, case: &str, minted: &Min
             ),
         )
         .body(bytes::Bytes::from(
-            serde_json::to_vec(&body).expect("the import body serializes"),
+            serde_json::to_vec(body).expect("the request body serializes"),
         ))
-        .expect("a well-formed import request");
+        .expect("a well-formed request");
     let response = router.dispatch(request).await;
     let status = response.status().as_u16();
     let parsed: serde_json::Value =
         serde_json::from_slice(&response.into_body()).unwrap_or(serde_json::Value::Null);
+    (status, parsed)
+}
+
+/// Import one minted certificate through Certificate Manager's own `ImportCertificate`, and
+/// answer the ARN it was stored under.
+pub(crate) async fn import(router: &MultiServiceRouter, case: &str, minted: &Minted) -> String {
+    let body = serde_json::json!({
+        "Certificate": aws_smithy_types::base64::encode(minted.certificate_pem.as_bytes()),
+        "PrivateKey": aws_smithy_types::base64::encode(minted.private_key_pem.as_bytes()),
+    });
+    let (status, parsed) = certificate_manager(router, "ImportCertificate", &body).await;
     assert_eq!(
         status, 200,
         "case {case}: ImportCertificate must answer 200, got {status} {parsed}"

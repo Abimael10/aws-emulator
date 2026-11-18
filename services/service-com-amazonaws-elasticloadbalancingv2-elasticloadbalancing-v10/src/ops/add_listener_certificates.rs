@@ -222,10 +222,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // And the certificate itself is resolved against the service that HOLDS it: a
         // well-formed ARN that service reports no certificate for names no certificate of
-        // the account either, so the listener's list is left as it was rather than carrying
-        // an entry nothing backs.
-        if let Some(arn) = crate::state::absent_certificate(ctx, &input.certificates).await {
-            return Err(certificate_not_found(arn));
+        // the account either, and one it reports in a state it can hand over no key
+        // material for is a certificate this listener could never answer a handshake with
+        // — so the listener's list is left as it was rather than carrying an entry nothing
+        // backs.
+        if let Some((arn, defect)) =
+            crate::state::unusable_certificate(ctx, &input.certificates).await
+        {
+            return Err(match defect {
+                crate::state::CertificateDefect::Absent => certificate_not_found(arn),
+                crate::state::CertificateDefect::NotIssued => {
+                    crate::state::unsupported_certificate(arn)
+                }
+            });
         }
 
         let mut guard = state.lock();

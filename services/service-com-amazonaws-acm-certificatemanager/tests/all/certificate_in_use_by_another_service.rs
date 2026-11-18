@@ -472,9 +472,12 @@ async fn assert_in_use_by(
     );
 }
 
-/// The sentence ACM answers for a certificate something is still using.
+/// The sentence ACM answers for a certificate something is still using: the certificate
+/// and the account that holds it, which is the ARN's own account field — computed from the
+/// requested ARN here exactly as a caller reading the refusal computes it.
 fn expected_in_use_message(certificate_arn: &str) -> String {
-    format!("Certificate {certificate_arn} is in use.")
+    let account = certificate_arn.split(':').nth(4).unwrap_or_default();
+    format!("Certificate {certificate_arn} in account {account} is in use.")
 }
 
 /// Call one operation that would take the certificate away from the resources using it,

@@ -3192,12 +3192,18 @@ pub fn invalid_arn_message(certificate_arn: &str) -> String {
 ///
 /// `ResourceInUseException` carries one modelled member (`message: String`) and the model
 /// documents no text for it, so the sentence comes from ACM's recorded behaviour: one
-/// complete sentence naming the requested certificate and terminated by a period. It
-/// names no referencing resource — which resources those are is what
-/// `DescribeCertificate`'s `InUseBy` reports — and every operation that refuses on an
-/// association renders it here, so the template cannot drift between them.
+/// complete sentence naming the requested certificate AND the account that holds it, and
+/// terminated by a period. The account is read off the requested ARN, which carries it, so
+/// the sentence cannot name an account the request did not address — the same framing
+/// every other sentence of this service that has to say WHOSE resource it judged uses
+/// ([`certificate_domain_not_found_message`]). It names no referencing resource — which
+/// resources those are is what `DescribeCertificate`'s `InUseBy` reports — and every
+/// operation that refuses on an association renders it here, so the template cannot drift
+/// between them.
 pub fn certificate_in_use_message(certificate_arn: &str) -> String {
-    format!("Certificate {certificate_arn} is in use.")
+    let account =
+        acm_arn_account(certificate_arn).unwrap_or_else(|| ::engine::emulator_account_id());
+    format!("Certificate {certificate_arn} in account {account} is in use.")
 }
 
 /// The `ResourceNotFoundException` message for an ACM certificate ARN that no stored

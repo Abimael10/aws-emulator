@@ -35,11 +35,13 @@ mod certificate_consumers;
 
 pub use certificate_consumers::{certificate_association_directory, record_certificate_consumers};
 
-/// Whether the certificate an operation NAMES is one the account holds, asked of the
-/// service that owns the certificate.
+/// Whether the certificate an operation NAMES is one the account holds and one a listener
+/// can present, asked of the service that owns the certificate.
 pub mod certificate_resolution;
 
-pub use certificate_resolution::absent_certificate;
+pub use certificate_resolution::{
+    unsupported_certificate, unusable_certificate, CertificateDefect, UNSUPPORTED_CERTIFICATE,
+};
 
 /// Whether a load balancer is a managed resource of Amazon Application Recovery
 /// Controller, recorded where the service that reports managed resources can read it.
