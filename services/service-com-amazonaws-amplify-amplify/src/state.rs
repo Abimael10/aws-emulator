@@ -1587,6 +1587,20 @@ impl ComAmazonawsAmplifyAmplifyState {
             .find_map(|app| app.webhooks.get_mut(webhook_id))
     }
 
+    /// Take the webhook `webhook_id` names OUT of the app holding it, answering the
+    /// record as it stood at that moment.
+    ///
+    /// The same resolution as [`Self::webhook`], for `DeleteWebhook`: the record lives
+    /// in exactly one app's `webhooks` map, so removing it from that map is what makes
+    /// the deletion visible to every reader of the same map (`GetWebhook`,
+    /// `ListWebhooks`, and the app's own webhook quota). `None` for an id this store
+    /// does not hold, which is the caller's modelled 404.
+    pub fn remove_webhook(&mut self, webhook_id: &str) -> Option<Webhook> {
+        self.apps
+            .values_mut()
+            .find_map(|app| app.webhooks.remove(webhook_id))
+    }
+
     /// The tag map of the resource `resource_arn` names, to READ.
     ///
     /// Answers the map the resource carries — the empty map when it carries none —
