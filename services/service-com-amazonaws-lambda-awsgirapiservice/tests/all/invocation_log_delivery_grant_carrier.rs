@@ -43,8 +43,8 @@ use smithy_server_runtime::MultiServiceRouter;
 
 use crate::event_source_mapping_role_access::{allow, element, given_role, iam};
 use crate::invocation_log_delivery::{
-    create_function, delivered, emulator, events, groups, invoke, streams, Created, LOGS,
-    LOG_WRITES, NODE_RUNTIME, PYTHON_RUNTIME,
+    create_function, delivered, emulator, events, groups, invoke, record_text, streams, Created,
+    LOGS, LOG_WRITES, NODE_RUNTIME, PYTHON_RUNTIME,
 };
 // The reader a client polls a delivered log with, owned by the suite that first needed it
 // rather than written out a second time here.
@@ -385,7 +385,13 @@ async fn the_document_carrying_the_logs_grant_does_not_change_what_an_invocation
         let matched = filtered(&router, case, &group, row.marker).await;
         let texts: Vec<String> = matched
             .iter()
-            .map(|line| line.rsplit('\t').next().unwrap_or_default().to_string())
+            .map(|line| {
+                record_text(line)
+                    .rsplit('\t')
+                    .next()
+                    .unwrap_or_default()
+                    .to_string()
+            })
             .collect();
         let expected: Vec<String> = row.written.iter().map(|line| (*line).to_string()).collect();
         assert_eq!(

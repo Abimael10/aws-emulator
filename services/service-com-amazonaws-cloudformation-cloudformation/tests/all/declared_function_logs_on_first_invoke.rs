@@ -317,7 +317,9 @@ async fn awaited_state(router: &MultiServiceRouter, case: &str, name: &str) -> S
 }
 
 /// The messages of the events one stream holds, in the order they were written, read through
-/// `GetLogEvents`.
+/// `GetLogEvents`, each as the RECORD's own text: every record of a run is delivered closed by
+/// the line break the write that produced it ended with, which belongs to the record rather
+/// than to its text.
 ///
 /// `pub(crate)` for the reason [`logs`] is `pub(crate)`: the suite over a stack refused for a
 /// log-group name an earlier function's invocation left behind
@@ -351,7 +353,7 @@ pub(crate) async fn event_messages(
                     event
                         .get("message")
                         .and_then(Value::as_str)
-                        .map(ToString::to_string)
+                        .map(|message| message.strip_suffix('\n').unwrap_or(message).to_string())
                 })
                 .collect()
         })

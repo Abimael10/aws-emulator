@@ -48,7 +48,7 @@ use smithy_server_runtime::MultiServiceRouter;
 use crate::event_source_mapping_role_access::{allow, given_role};
 use crate::event_source_mappings::{call, router_on};
 use crate::invocation_log_delivery::{
-    create_function, groups, logs, Created, LOGS, LOG_WRITES, PYTHON_RUNTIME,
+    create_function, groups, logs, record_text, Created, LOGS, LOG_WRITES, PYTHON_RUNTIME,
 };
 
 /// Where `Invoke` is bound, under the functions collection.
@@ -270,7 +270,9 @@ async fn messages(router: &MultiServiceRouter, case: &str, group: &str) -> Vec<S
         .map(|found| {
             found
                 .iter()
-                .map(|event| event["message"].as_str().unwrap_or_default().to_string())
+                // Each event is one record of the run, closed by the break that ended the write
+                // it was made in; what this suite reads is the line the handler printed.
+                .map(|event| record_text(event["message"].as_str().unwrap_or_default()).to_string())
                 .collect()
         })
         .unwrap_or_default()

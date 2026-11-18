@@ -28,7 +28,8 @@
 use serde_json::json;
 
 use crate::invocation_log_delivery::{
-    create_function, emulator, invoke, logs, logs_answer, Created, NODE_RUNTIME, PYTHON_RUNTIME,
+    create_function, emulator, invoke, logs, logs_answer, record_text, Created, NODE_RUNTIME,
+    PYTHON_RUNTIME,
 };
 
 /// The execution role every row runs as. No policy is put on it, so nothing is known about it
@@ -165,10 +166,16 @@ async fn a_delivered_log_line_is_selectable_by_filter_pattern() {
         let selected = filtered(&router, case, &group, &format!("\"{}\"", row.marker)).await;
         // A node runtime delivers a console line FRAMED — the instant, the invocation's id,
         // the level, then the text — so what the pattern selected carries the handler's own
-        // text as its last field.
+        // text as its last field, inside the record the break that closed the write closes.
         let texts: Vec<String> = selected
             .iter()
-            .map(|message| message.rsplit('\t').next().unwrap_or_default().to_string())
+            .map(|message| {
+                record_text(message)
+                    .rsplit('\t')
+                    .next()
+                    .unwrap_or_default()
+                    .to_string()
+            })
             .collect();
         assert_eq!(
             texts,

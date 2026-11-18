@@ -312,11 +312,14 @@ async fn delivered(router: &MultiServiceRouter, group: &str) -> Option<Vec<Strin
                 events
                     .iter()
                     .map(|event| {
-                        event
+                        // Every record of a run is delivered closed by the line break the write
+                        // that produced it ended with, which belongs to the record rather than
+                        // to the text it carries.
+                        let message = event
                             .get("message")
                             .and_then(Value::as_str)
-                            .unwrap_or_default()
-                            .to_string()
+                            .unwrap_or_default();
+                        message.strip_suffix('\n').unwrap_or(message).to_string()
                     })
                     .collect()
             })

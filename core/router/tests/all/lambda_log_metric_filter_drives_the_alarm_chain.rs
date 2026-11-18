@@ -944,11 +944,14 @@ async fn what_an_invocation_prints_drives_the_metric_filter_alarm_and_subscripti
         let wanted = row.invocations * (row.lines + 1 + framing_per_run);
         let held = messages_in(&router, case, &group, wanted).await;
         for printed in &printed_lines {
-            let written = held.iter().filter(|message| *message == printed).count();
+            // Each record reaches the group as the bytes the run wrote it in, the line break
+            // that closed the write included, which is the form a client matching one reads.
+            let delivered = format!("{printed}\n");
+            let written = held.iter().filter(|message| **message == delivered).count();
             assert_eq!(
                 written, row.invocations,
-                "case {case:?}: expected {group:?} to hold the printed line {printed:?} once per \
-                 invocation ({}), got {written} of {held:?}",
+                "case {case:?}: expected {group:?} to hold the printed line {delivered:?} once \
+                 per invocation ({}), got {written} of {held:?}",
                 row.invocations
             );
         }

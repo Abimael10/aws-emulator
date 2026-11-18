@@ -215,6 +215,21 @@ pub(crate) async fn events(
         .unwrap_or_default()
 }
 
+/// The text of ONE delivered record: the message the group holds with the line break that
+/// closed the write it was made in taken off.
+///
+/// Every record of a run reaches CloudWatch Logs closed by that break — a run's log is a stream
+/// of newline-terminated records, and Lambda delivers each as it was written — so the break is
+/// part of the record rather than of its text. The suite about the delivery itself asserts it is
+/// there ([`an_invocation_delivers_its_log_to_the_functions_log_group`]); every suite reading a
+/// record for what it SAYS goes through here, so the terminator is stated in one place.
+///
+/// `pub(crate)` for the reason [`groups`] is.
+#[must_use]
+pub(crate) fn record_text(message: &str) -> &str {
+    message.strip_suffix('\n').unwrap_or(message)
+}
+
 /// Every message the group `group` holds, whichever stream carries it, as `FilterLogEvents`
 /// reports them — the read a client that has just invoked the function makes, knowing the group
 /// but not the stream.
@@ -258,8 +273,13 @@ pub(crate) async fn delivered(
     stream: &str,
 ) -> (Vec<String>, String) {
     let held = events(router, case, group, stream).await;
-    let lines: Vec<String> = held.iter().map(|(_, line)| line.clone()).collect();
-    let text = lines.iter().map(|line| format!("{line}\n")).collect();
+    // The text is the records as they were delivered, concatenated: each already carries the
+    // break that closed it, which is what makes the whole stream the run's log again.
+    let text = held.iter().map(|(_, record)| record.clone()).collect();
+    let lines: Vec<String> = held
+        .iter()
+        .map(|(_, record)| record_text(record).to_string())
+        .collect();
     (lines, text)
 }
 
@@ -574,6 +594,17 @@ async fn an_invocation_delivers_its_log_to_the_functions_log_group() {
             "case {case:?}: expected the group to hold the log the invocation reported, got \
              {rebuilt:?} against {reported:?}"
         );
+
+        // Each event is ONE record of the run, carried as the write produced it: the line break
+        // that closed the write is part of the message a client reads, and there is exactly one
+        // of them per record.
+        for (_, message) in events(&router, case, &group, &stream).await {
+            assert!(
+                message.ends_with('\n') && !record_text(&message).ends_with('\n'),
+                "case {case:?}: expected every delivered record closed by exactly one line \
+                 break, got {message:?}"
+            );
+        }
 
         // The framing, and the handler's own lines between it.
         assert!(

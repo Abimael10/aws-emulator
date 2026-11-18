@@ -38,6 +38,9 @@ use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::cloudformation_firehose_stream_stabilisation::stack_status;
+// The ONE statement this crate makes of a delivered log record's form: the line break that
+// closed the write belongs to the record rather than to the text it carries.
+use crate::lambda_log_records_delivered_under_the_roles_logs_grant::record_body;
 use crate::query_wire::{form_encode, outputs_of};
 
 /// The Region every request here is signed for. It is the Region the shared stack reader
@@ -756,7 +759,13 @@ async fn assert_logged(
                 .cloned()
                 .unwrap_or_default()
                 .iter()
-                .map(|event| event["message"].as_str().unwrap_or_default().to_string())
+                // A delivered record is closed by the line break the write that produced it
+                // ended with, which belongs to the record rather than to its text — the one
+                // statement of that in this crate.
+                .map(|event| {
+                    let message = event["message"].as_str().unwrap_or_default();
+                    record_body(message).unwrap_or(message).to_string()
+                })
                 .collect();
             if messages
                 .iter()

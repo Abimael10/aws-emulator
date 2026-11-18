@@ -48,6 +48,9 @@ use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::cloudformation_firehose_stream_stabilisation::wait_for_stack_status;
+// The ONE statement this crate makes of a delivered log record's form: the line break that
+// closed the write belongs to the record rather than to the text it carries.
+use crate::lambda_log_records_delivered_under_the_roles_logs_grant::record_body;
 use crate::query_wire::{element, form_encode, outputs_of};
 
 /// The Region every request here is signed for. It is the Region the shared stack reader
@@ -274,14 +277,16 @@ async fn read_log(router: &MultiServiceRouter, function: &str) -> (u16, Vec<Stri
 ///
 /// A rendered record is the level, the instant and the request id ahead of the message, each
 /// separated by a tab, so the message is the last of those fields and is compared whole — not
-/// as a suffix, which a key that ends another key would match too.
+/// as a suffix, which a key that ends another key would match too. A delivered record is closed
+/// by the line break the write that produced it ended with, which belongs to the record rather
+/// than to the message it carries, so it is taken off through the one statement of that in this
+/// crate ([`record_body`]).
 fn occurrences(lines: &[String], wanted: &str) -> usize {
     let opens = format!("[{LOGGED_LEVEL}]\t");
     lines
         .iter()
-        .filter(|line| {
-            line.starts_with(&opens) && line.split('\t').next_back() == Some(wanted)
-        })
+        .map(|line| record_body(line).unwrap_or(line))
+        .filter(|line| line.starts_with(&opens) && line.split('\t').next_back() == Some(wanted))
         .count()
 }
 

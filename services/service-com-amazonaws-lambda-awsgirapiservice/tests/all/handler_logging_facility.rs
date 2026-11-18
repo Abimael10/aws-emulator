@@ -27,8 +27,8 @@
 //! Every test here RUNS handlers, so each takes the target's one invocation stream
 //! ([`crate::invoke_request_id::one_invocation_stream_at_a_time`]).
 
-use crate::invocation_log_delivery::{create_function, emulator, invoke, logs, Created,
-                                    PYTHON_RUNTIME};
+use crate::invocation_log_delivery::{create_function, emulator, invoke, logs, record_text,
+                                    Created, PYTHON_RUNTIME};
 use crate::invoke_request_id::one_invocation_stream_at_a_time;
 use serde_json::json;
 
@@ -247,7 +247,9 @@ async fn the_logged_records_are_the_events_the_log_group_holds() {
         .as_array()
         .unwrap_or_else(|| panic!("case {case:?}: expected events, got {answered}"))
         .iter()
-        .map(|event| event["message"].as_str().unwrap_or_default().to_string())
+        // Each event is one record of the run, closed by the break that ended the write it was
+        // made in; what this suite reads is the record's own text.
+        .map(|event| record_text(event["message"].as_str().unwrap_or_default()).to_string())
         .collect();
     for (level, message) in ROWS[0].logged {
         let carried: Vec<&String> = messages

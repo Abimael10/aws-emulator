@@ -303,7 +303,9 @@ async fn wait_until_active(router: &MultiServiceRouter) {
 }
 
 /// The messages `FilterLogEvents` reports for the function's own log group, each with the
-/// stream it is in.
+/// stream it is in, and each as the RECORD's own text: every record of a run is delivered
+/// closed by the line break the write that produced it ended with, which belongs to the record
+/// rather than to its text.
 async fn delivered(router: &MultiServiceRouter, case: &str) -> Vec<(String, String)> {
     let group = format!("/aws/lambda/{FUNCTION}");
     let (status, body) = logs(router, "FilterLogEvents", json!({ "logGroupName": group })).await;
@@ -318,17 +320,17 @@ async fn delivered(router: &MultiServiceRouter, case: &str) -> Vec<(String, Stri
             events
                 .iter()
                 .map(|event| {
+                    let message = event
+                        .get("message")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default();
                     (
                         event
                             .get("logStreamName")
                             .and_then(Value::as_str)
                             .unwrap_or_default()
                             .to_string(),
-                        event
-                            .get("message")
-                            .and_then(Value::as_str)
-                            .unwrap_or_default()
-                            .to_string(),
+                        message.strip_suffix('\n').unwrap_or(message).to_string(),
                     )
                 })
                 .collect()

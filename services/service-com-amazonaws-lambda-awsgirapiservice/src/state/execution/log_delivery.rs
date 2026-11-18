@@ -32,9 +32,10 @@
 //! that decides whether Lambda writes at all, so a role short of a logs grant leaves exactly
 //! as little behind as before.
 //!
-//! Nothing here is synthesised. Every event's message is a line the run wrote, and its
-//! instant is the run's own: the opening frame carries the instant the run started, and the
-//! closing frames the instant it finished.
+//! Nothing here is synthesised. Every event's message is a record the run WROTE, carried as the
+//! bytes of that write — the line break that closed it included ([`events`]) — and its instant
+//! is the run's own: the opening frame carries the instant the run started, and the closing
+//! frames the instant it finished.
 
 use std::time::{Duration, SystemTime};
 
@@ -186,6 +187,13 @@ fn grants<Eng: Send + Sync + 'static>(
 /// `opened` is how many of `lines` belong to the opening frame, and `closed` how many to the
 /// closing one; the rest are the handler's own output, which was written while the run was
 /// going and so carries the instant the run started.
+///
+/// Each message is the record's own text CLOSED BY THE LINE BREAK that ended the write it was
+/// made in: a run's log is a stream of newline-terminated records, and Lambda delivers each of
+/// them to CloudWatch Logs as it was written rather than stripping its terminator — the same
+/// bytes the log tail of that run carries for the record. The lines reach here without their
+/// break (`super::run_log`), so it is put back once per event, for every record alike: the
+/// platform's own frames and the handler's output.
 #[must_use]
 pub(super) fn events(
     lines: &[String],
@@ -205,7 +213,7 @@ pub(super) fn events(
             } else {
                 start
             },
-            message: line.clone(),
+            message: format!("{line}{RECORD_TERMINATOR}"),
         })
         .collect()
 }
@@ -213,6 +221,11 @@ pub(super) fn events(
 /// How many lines close a run's log: the `END` line and the `REPORT` line
 /// ([`super::run_log`]).
 const CLOSING_FRAME_LINES: usize = 2;
+
+/// What closes ONE record of a run's log: the line break the write that produced it ended with,
+/// which is part of the record a client reads back and not a separator this delivery adds
+/// between records.
+const RECORD_TERMINATOR: char = '\n';
 
 /// How many events one `PutLogEvents` call carries at most, which is what AWS documents for
 /// one batch ("The maximum number of log events in a batch is 10,000") and what the model's
@@ -426,10 +439,16 @@ mod tests {
                 "case {case:?}: expected {expected:?}, got {stamps:?}"
             );
             let messages: Vec<&str> = built.iter().map(|event| event.message.as_str()).collect();
+            // Every event's message is a record the run wrote, carried with the line break
+            // that closed the write and no other change to it.
+            let written: Vec<String> = lines
+                .iter()
+                .map(|line| format!("{line}{RECORD_TERMINATOR}"))
+                .collect();
             assert_eq!(
                 messages,
-                lines.iter().map(String::as_str).collect::<Vec<&str>>(),
-                "case {case:?}: every event's message is a line the run wrote"
+                written.iter().map(String::as_str).collect::<Vec<&str>>(),
+                "case {case:?}: expected each record closed by its line break, got {messages:?}"
             );
             assert!(
                 stamps.windows(2).all(|pair| pair[0] <= pair[1]),
