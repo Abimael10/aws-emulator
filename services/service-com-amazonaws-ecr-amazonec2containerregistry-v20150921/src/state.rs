@@ -3328,6 +3328,46 @@ pub fn pull_time_update_exclusion_limit_message() -> String {
     )
 }
 
+/// The wording ECR uses when an `upstreamRegistryUrl` addresses no registry it caches
+/// from — the state `UnsupportedUpstreamRegistryException` documents ("The specified
+/// upstream registry isn't supported"). The URL the request carried is the one variable
+/// part, echoed as it was written; the sentence carries no trailing period.
+pub fn unsupported_upstream_registry_url_message(upstream_registry_url: &str) -> String {
+    format!(
+        "The upstream registry URL {upstream_registry_url} is invalid. Specify a valid \
+         upstream registry URL and try again"
+    )
+}
+
+/// The wording ECR uses when a rule would cache from an upstream that authenticates its
+/// callers while storing no credential to authenticate with — the other state
+/// `UnsupportedUpstreamRegistryException` reports. It names the Secrets Manager secret a
+/// `credentialArn` points at, and has no variable part.
+pub const UPSTREAM_REQUIRES_AUTHENTICATION_MESSAGE: &str =
+    "The specified upstream registry requires authentication. Specify a valid Secrets \
+     Manager ARN containing the upstream registry credentials and try again.";
+
+/// Whether the pair of credential references a pull through cache rule would store leaves
+/// it with something to authenticate to its upstream with: a `credentialArn` naming the
+/// Secrets Manager secret the upstream's credentials live in, or the `customRoleArn` ECR
+/// assumes to reach an upstream registry of its own.
+///
+/// An empty string stores neither: `customRoleArn` is modelled `@length(0..2048)`, so the
+/// empty string is a legal value that names no role, which is the same reading
+/// [`pull_through_cache_rule_failure`] takes of a stored record. A value of nothing but
+/// whitespace names no role either — no ARN is spelled out of spaces — so the two are read
+/// the same way, which is what lets an incoming request and a stored record be judged by
+/// this one function.
+pub fn stores_upstream_credential(
+    credential_arn: Option<&str>,
+    custom_role_arn: Option<&str>,
+) -> bool {
+    [credential_arn, custom_role_arn]
+        .into_iter()
+        .flatten()
+        .any(|arn| !arn.trim().is_empty())
+}
+
 /// The upstream registries ECR caches from WITHOUT a credential on the rule: the entries
 /// of the ECR user guide's supported-upstream table that require no authentication —
 /// Amazon ECR Public, Kubernetes and Quay, the public registries whose images are pulled
@@ -3501,10 +3541,9 @@ pub fn pull_through_cache_rule_failure(rule: &PullThroughCacheRule) -> Option<St
         return Some(failure);
     }
 
-    let credential = rule.credential_arn.as_deref().filter(|arn| !arn.is_empty());
-    let role = rule.custom_role_arn.as_deref().filter(|arn| !arn.is_empty());
-    if credential.is_none()
-        && role.is_none()
+    let credential = rule.credential_arn.as_deref();
+    let role = rule.custom_role_arn.as_deref();
+    if !stores_upstream_credential(credential, role)
         && upstream_needs_credential(rule.upstream_registry.as_deref(), url)
     {
         return Some(format!(

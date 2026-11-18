@@ -535,11 +535,15 @@ async fn describe_images_refuses_an_identifier_that_names_no_stored_image() {
 }
 
 /// Create a pull through cache rule for `prefix`, with the credentials `patch` carries.
+///
+/// The upstream is one ECR caches from anonymously, so a row that creates the rule with no
+/// credential at all is a rule `CreatePullThroughCacheRule` accepts: an upstream that
+/// authenticates its callers is refused without one.
 async fn given_rule(router: &MultiServiceRouter, case: &str, prefix: &str, patch: &Value) -> Value {
     let mut request = json!({
         "ecrRepositoryPrefix": prefix,
-        "upstreamRegistryUrl": "registry-1.docker.io",
-        "upstreamRegistry": "docker-hub",
+        "upstreamRegistryUrl": "public.ecr.aws",
+        "upstreamRegistry": "ecr-public",
     });
     for (member, value) in patch.as_object().into_iter().flatten() {
         request[member] = value.clone();

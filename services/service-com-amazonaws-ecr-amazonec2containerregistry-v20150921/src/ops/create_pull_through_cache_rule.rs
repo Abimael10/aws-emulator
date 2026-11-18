@@ -5,7 +5,9 @@
 //! persisted in [`crate::state`] and every member of the response — the ECR repository
 //! prefix, the upstream registry and its URL, the upstream repository prefix, the
 //! credential and role ARNs and the creation instant — is resolved once here and read
-//! back by `DescribePullThroughCacheRules`. A second rule for the same prefix is refused.
+//! back by `DescribePullThroughCacheRules`. A second rule for the same prefix is refused,
+//! as is a rule for an upstream registry that authenticates its callers when the request
+//! carries no credential to reach it with.
 //!
 //! ## Shape of an operation
 //!
@@ -248,16 +250,41 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .ok_or_else(|| {
                     CreatePullThroughCacheRuleErrorModeled::UnsupportedUpstreamRegistryException(
                         UnsupportedUpstreamRegistryException {
-                            message: Some(format!(
-                                "upstreamRegistryUrl '{}' names no supported upstream \
-                                 registry; specify upstreamRegistry",
-                                input.upstream_registry_url
-                            )),
+                            message: Some(
+                                crate::state::unsupported_upstream_registry_url_message(
+                                    &input.upstream_registry_url,
+                                ),
+                            ),
                         },
                     )
                 })?
                 .to_string(),
         };
+
+        // An upstream that authenticates its callers is reached with the credential the
+        // rule carries, so a rule storing none could never pull from it: the create is
+        // refused rather than registering a rule in a state no pull could use. Which
+        // upstreams authenticate is [`crate::state::upstream_needs_credential`], the one
+        // reading this service takes of that question, and either credential member is a
+        // credential — `customRoleArn` is what an Amazon ECR upstream is reached with.
+        if !crate::state::stores_upstream_credential(
+            input.credential_arn.as_deref(),
+            input.custom_role_arn.as_deref(),
+        ) && crate::state::upstream_needs_credential(
+            Some(&upstream_registry),
+            &input.upstream_registry_url,
+        ) {
+            return Err(
+                CreatePullThroughCacheRuleErrorModeled::UnsupportedUpstreamRegistryException(
+                    UnsupportedUpstreamRegistryException {
+                        message: Some(
+                            crate::state::UPSTREAM_REQUIRES_AUTHENTICATION_MESSAGE.to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        }
 
         // "When this field isn't specified, Amazon ECR will use the ROOT."
         let upstream_repository_prefix = input

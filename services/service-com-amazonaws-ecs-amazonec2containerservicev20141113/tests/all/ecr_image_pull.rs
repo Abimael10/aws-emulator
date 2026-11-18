@@ -42,6 +42,13 @@ use crate::task_lifecycle::container;
 /// The cluster every task below runs in.
 const CLUSTER: &str = "registrypull";
 
+/// The Secrets Manager secret the pull through cache rule below reads its upstream
+/// credentials from, in the namespace Amazon ECR's `CredentialArn` constrains one to
+/// (`^arn:aws(-\w+)*:secretsmanager:[a-zA-Z0-9-:]+:secret:ecr\-pullthroughcache\/[a-zA-Z0-9\/_+=.@-]+$`,
+/// length 50..612).
+const UPSTREAM_CREDENTIAL_ARN: &str =
+    "arn:aws:secretsmanager:us-east-1:000000000000:secret:ecr-pullthroughcache/docker-hub-AbCdEf";
+
 /// The EC2 instance id the cluster's one container instance is registered under: a task
 /// placed with the default `EC2` launch type runs on the capacity registered to its
 /// cluster, so every cluster below has one.
@@ -275,6 +282,10 @@ async fn a_task_pulls_its_ecr_image_as_its_execution_role_and_then_settles() {
         json!({
             "ecrRepositoryPrefix": "hub",
             "upstreamRegistryUrl": "registry-1.docker.io",
+            // The Docker Hub upstream authenticates its callers, so the rule carries the
+            // Secrets Manager secret the registry reads its credentials from — a rule
+            // without one is refused by `CreatePullThroughCacheRule`.
+            "credentialArn": UPSTREAM_CREDENTIAL_ARN,
         }),
         case,
     )

@@ -14,8 +14,8 @@
 //!    its API label where the request CARRIES it and by the validating walk's path where
 //!    it is a member of a NESTED structure, while the constraint is worded by whichever
 //!    validator HOLDS the rule the value broke — ECR's own words for a value class it
-//!    polices itself, or an ARN it must RESOLVE, and the model-driven walk's wording for
-//!    every other class;
+//!    polices itself, the signing profile ARN included, and the model-driven walk's
+//!    wording for every other class;
 //! 3. which operations police `RepositoryName`'s `@pattern` is ECR's own per-OPERATION
 //!    fact: a listing LOOKS the name up, so a name no repository carries — a registry-
 //!    qualified image reference passed where a name belongs included — is the modelled
@@ -170,6 +170,24 @@ const SIGNING_FILTER_PATTERN: &str =
 const PRINCIPAL_ARN_PATTERN: &str =
     r"^arn:aws(-[a-z]+)*:iam::[0-9]{12}:(role|user)/[\w+=,.@-]+(/[\w+=,.@-]+)*$";
 
+/// `CredentialArn`'s `@pattern` as THE MODEL declares it, anchors and `\/` escapes
+/// included (`smithy_query(query="shape", shape="CredentialArn")`): the Secrets Manager
+/// secret a pull through cache rule's upstream credential is read from is refused by the
+/// model's own constraint, so the model-driven walk's wording is what states it — the
+/// signing profile ARN is the one ARN class ECR words itself.
+const CREDENTIAL_ARN_PATTERN: &str =
+    r"^arn:aws(-\w+)*:secretsmanager:[a-zA-Z0-9-:]+:secret:ecr\-pullthroughcache\/[a-zA-Z0-9\/_+=.@-]+$";
+
+/// A `credentialArn` long enough to clear `CredentialArn`'s `@length(50..612)` while
+/// naming no `ecr-pullthroughcache/` secret, so the `@pattern` is what refuses it.
+const WRONG_NAMESPACE_SECRET: &str =
+    "arn:aws:secretsmanager:eu-west-1:000000000000:secret:not-the-pull-through-namespace";
+
+/// A second such value, of another partition, so the clause belongs to the value class
+/// rather than to one value.
+const WRONG_NAMESPACE_SECRET_OTHER_PARTITION: &str =
+    "arn:aws-us-gov:secretsmanager:us-gov-west-1:000000000000:secret:other/upstream-AbCdEf";
+
 /// `ImageTagMutabilityExclusionFilterValue`'s `@pattern`, as the model declares it
 /// (`smithy_query(query="shape", shape="ImageTagMutabilityExclusionFilter")`, member
 /// `filter`) — the same nested-member rule reached through another operation.
@@ -204,9 +222,9 @@ fn wildcard_filter(filter: &str) -> Value {
 /// The rows differ along what the rule generalises over: where the member sits (a
 /// top-level member, an element of a top-level list, a member of a structure nested in a
 /// list, and the SECOND such element so a position cannot be mistaken for a name), which
-/// constraint failed (`@pattern` on a plain string, on an ARN ECR resolves and on one it
-/// only records, `@enum`, `@length`, `@required`), and which operation was called. The
-/// three recorded instances are marked.
+/// constraint failed (`@pattern` on a plain string, on the one ARN class ECR words itself
+/// and on the ARN classes the model's constraint refuses, `@enum`, `@length`, `@required`),
+/// and which operation was called. The recorded instances are marked.
 #[tokio::test]
 async fn a_refused_parameter_is_stated_by_the_validator_that_caught_it() {
     let well_formed_profile =
@@ -223,7 +241,7 @@ async fn a_refused_parameter_is_stated_by_the_validator_that_caught_it() {
         ),
         (
             // The recorded instance: a top-level ARN whose value the registry only
-            // records, so the model's own constraint is what states it.
+            // records, which the model's own constraint refuses.
             "a top-level ARN the registry records rather than resolves",
             "RegisterPullTimeUpdateExclusion",
             json!({"principalArn": "not-an-arn"}),
@@ -238,6 +256,31 @@ async fn a_refused_parameter_is_stated_by_the_validator_that_caught_it() {
             format!("Member must satisfy regular expression pattern: {PRINCIPAL_ARN_PATTERN}"),
         ),
         (
+            // The recorded instance: a top-level ARN ECR resolves a SECRET from, which the
+            // model's own constraint refuses — so the walk's wording states it, over the
+            // expression the model spells, escapes and anchors included.
+            "a top-level ARN naming a secret outside the pull through cache namespace",
+            "CreatePullThroughCacheRule",
+            json!({
+                "ecrRepositoryPrefix": "docker-hub-cache",
+                "upstreamRegistryUrl": "registry-1.docker.io",
+                "credentialArn": WRONG_NAMESPACE_SECRET,
+            }),
+            "credentialArn".to_string(),
+            format!("Member must satisfy regular expression pattern: {CREDENTIAL_ARN_PATTERN}"),
+        ),
+        (
+            "the same member carrying a secret of another partition",
+            "CreatePullThroughCacheRule",
+            json!({
+                "ecrRepositoryPrefix": "docker-hub-cache",
+                "upstreamRegistryUrl": "registry-1.docker.io",
+                "credentialArn": WRONG_NAMESPACE_SECRET_OTHER_PARTITION,
+            }),
+            "credentialArn".to_string(),
+            format!("Member must satisfy regular expression pattern: {CREDENTIAL_ARN_PATTERN}"),
+        ),
+        (
             "an element of a top-level list, which is one value of that parameter",
             "DescribeRepositories",
             json!({"repositoryNames": ["well-formed", "ALSO-Upper"]}),
@@ -245,10 +288,10 @@ async fn a_refused_parameter_is_stated_by_the_validator_that_caught_it() {
             format!("must satisfy regular expression '{REPOSITORY_NAME_EXPRESSION}'"),
         ),
         (
-            // The recorded instance: ECR checks the form of an ARN it must RESOLVE in its
+            // The recorded instance: ECR states the form of a SIGNING PROFILE ARN in its
             // own code, wherever the request carries it, so the clause names the API
             // parameter and not the walk's path to it.
-            "an ARN ECR resolves, inside a list of structures",
+            "an ARN ECR words itself, inside a list of structures",
             "PutSigningConfiguration",
             json!({"signingConfiguration": {
                 "rules": [signing_rule("not-a-valid-signer-arn", None)],

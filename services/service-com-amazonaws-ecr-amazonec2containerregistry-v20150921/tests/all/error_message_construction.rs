@@ -489,22 +489,18 @@ async fn a_digest_that_does_not_match_is_refused_with_the_verdict_alone() {
 const REPOSITORY_NAME_EXPRESSION: &str =
     r"[a-z0-9]+((\.|_|__|-+)[a-z0-9]+)*(/[a-z0-9]+((\.|_|__|-+)[a-z0-9]+)*)*";
 
-/// A `credentialArn` long enough to clear `CredentialArn`'s `@length(50..612)` while
-/// naming no `ecr-pullthroughcache/` secret, so the `@pattern` is what refuses it.
-const WRONG_NAMESPACE_SECRET: &str =
-    "arn:aws:secretsmanager:eu-west-1:000000000000:secret:not-the-pull-through-namespace";
-
 /// A parameter whose value class ECR POLICES ITSELF is stated as the MEMBER at fault —
 /// never the validating walk's path to the value — with the constraint in ECR's own
-/// words: an ARN it must RESOLVE in prose naming the value, the `@pattern` of such a class
-/// as the expression with no escape a regular expression does not need, and every other
-/// constraint unchanged.
+/// words: the signing profile ARN in prose naming the value, the `@pattern` of such a
+/// class as the expression with no escape a regular expression does not need, and every
+/// other constraint unchanged.
 ///
 /// Every row is such a parameter: one the request CARRIES whose class ECR polices (the
-/// repository-name and account-id classes) or an ARN naming a resource the operation has
-/// to reach, which ECR checks the form of wherever the request carries it. A class the
-/// MODEL-DRIVEN walk states instead keeps the model's own spelling, escapes included, and
-/// is pinned in `parameter_constraint_clauses.rs`.
+/// repository-name and account-id classes) or the signing profile ARN, whose form ECR
+/// states in its own words wherever the request carries it. A class the MODEL-DRIVEN walk
+/// states instead keeps the model's own spelling, escapes included, and is pinned in
+/// `parameter_constraint_clauses.rs` — the `credentialArn` of a pull through cache rule
+/// among them.
 ///
 /// The rows differ along what the rule generalises over: which constraint failed
 /// (`@pattern` on a plain string, on an ARN, `@length`, `@required`), where the member
@@ -578,17 +574,6 @@ async fn a_parameter_ecr_validates_itself_is_stated_as_aws_states_it() {
             "The signing profile ARN 'arn:aws:iam::000000000000:role/NotASigningProfile' must \
              be well formed"
                 .to_string(),
-        ),
-        (
-            "a credential naming a secret outside the pull through cache namespace",
-            "CreatePullThroughCacheRule",
-            json!({
-                "ecrRepositoryPrefix": "docker-hub",
-                "upstreamRegistryUrl": "registry-1.docker.io",
-                "credentialArn": WRONG_NAMESPACE_SECRET,
-            }),
-            "credentialArn",
-            format!("The credential ARN '{WRONG_NAMESPACE_SECRET}' must be well formed"),
         ),
         (
             "a length bound, which is not worded as an expression at all",

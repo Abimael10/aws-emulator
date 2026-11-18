@@ -140,26 +140,27 @@ fn cases() -> Vec<Case<'static>> {
             failure_names: None,
         },
         Case {
-            name: "github-container-registry authenticates and the rule stores no credential",
+            name: "github-container-registry reached through a role instead of a secret",
             prefix: "ghcr-cache",
             upstream_registry: None,
             upstream_registry_url: "ghcr.io",
             credential_arn: None,
-            custom_role_arn: None,
-            valid: false,
-            failure_names: Some("requires authentication"),
+            custom_role_arn: Some(ROLE),
+            valid: true,
+            failure_names: None,
         },
         Case {
-            name: "gitlab-container-registry with an empty customRoleArn, which stores no role",
+            name: "gitlab-container-registry with an empty customRoleArn beside its secret",
             prefix: "gitlab-cache",
             upstream_registry: Some("gitlab-container-registry"),
             upstream_registry_url: "registry.gitlab.com",
-            credential_arn: None,
+            credential_arn: Some(SECRET),
             // `customRoleArn` is modelled `@length(0..2048)`, so the empty string is a
-            // legal value — and it names no role.
+            // legal value — and it names no role, so the secret is what the rule
+            // authenticates with.
             custom_role_arn: Some(""),
-            valid: false,
-            failure_names: Some("requires authentication"),
+            valid: true,
+            failure_names: None,
         },
         Case {
             name: "a customRoleArn that is not an ARN at all",
@@ -354,6 +355,10 @@ struct Upstream<'a> {
 /// caches from anonymously is the ECR user guide's supported-upstream table: Amazon ECR
 /// Public, Kubernetes and Quay, the public registries whose images are pulled without
 /// credentials; the rest authenticate their callers.
+///
+/// The rules are seeded: `CreatePullThroughCacheRule` refuses a rule for an upstream that
+/// authenticates its callers when the request carries no credential, so a STORED record
+/// of that shape is placed in the store the verdict is read from.
 #[tokio::test]
 async fn whether_a_rule_needs_a_credential_follows_from_its_upstream() {
     let rows = vec![
@@ -415,16 +420,16 @@ async fn whether_a_rule_needs_a_credential_follows_from_its_upstream() {
         },
     ];
 
-    let router = emulator();
+    let (router, engine) = emulator_with_engine();
     for row in &rows {
-        let mut request = json!({
-            "ecrRepositoryPrefix": row.prefix,
-            "upstreamRegistryUrl": row.upstream_registry_url,
-        });
-        if let Some(registry) = row.upstream_registry {
-            request["upstreamRegistry"] = json!(registry);
-        }
-        ok(&router, row.case, "CreatePullThroughCacheRule", &request).await;
+        seed_pull_through_cache_rule(
+            &engine,
+            row.prefix,
+            row.upstream_registry,
+            row.upstream_registry_url,
+            None,
+            None,
+        );
 
         let validated = ok(
             &router,

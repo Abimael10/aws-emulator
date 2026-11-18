@@ -151,20 +151,20 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
 ///   ([`pattern_requirement`]) over the expression ECR publishes for that class
 ///   ([`policed`]).
 ///
-/// Two refusals are worded by neither rule. An ARN ECR has to RESOLVE to a resource before
-/// the call can do its work is one ECR checks the form of itself, wherever the request
-/// carries it, and it says so in prose naming the kind of ARN and the value that is not
-/// one ([`arn_constraint`]) rather than quoting an expression. And a LIST ECR reads no
-/// value out of ([`element_constraint`]) has no one value to refuse, so its clause names
-/// the list itself and nests what each element must satisfy.
+/// Two refusals are worded by neither rule. An ARN of a class ECR words itself — the
+/// signing profile a signing rule names ([`ARN_EXPRESSIONS_ECR_WORDS_IN_PROSE`]) — is
+/// stated wherever the request carries it in prose naming the kind of ARN and the value
+/// that is not one ([`arn_constraint`]) rather than by quoting an expression. And a LIST
+/// ECR reads no value out of ([`element_constraint`]) has no one value to refuse, so its
+/// clause names the list itself and nests what each element must satisfy.
 ///
 /// A violation kind neither wording knows (the enum is `#[non_exhaustive]`) keeps the
 /// framework's own clause, which states the same two facts in its own words.
 fn clause(violation: &Violation) -> String {
     let member = member_at_fault(&violation.path);
-    // ECR checks such an ARN's form in its own code, wherever the request carries it, and
-    // states the kind of ARN and the value that is not one — so this branch is taken
-    // before the position of the member is even looked at.
+    // An ARN of a class ECR words in its own prose is stated that way wherever the request
+    // carries it, so this branch is taken before the position of the member is even looked
+    // at.
     if let ViolationKind::Pattern(pattern) = &violation.kind {
         if let Some(prose) = arn_constraint(&member, pattern, violation.value.as_deref()) {
             return stated(&member, &prose);
@@ -549,12 +549,27 @@ fn as_stated(pattern: &str) -> String {
 /// The suffix the name of a member holding an Amazon Resource Name ends in.
 const ARN_MEMBER_SUFFIX: &str = "Arn";
 
-/// The anchorless opening of a `@pattern` that describes an ARN.
-const ARN_PREFIX: &str = "arn:";
+/// The expressions of the ARN value classes whose `@pattern` refusal ECR words in PROSE
+/// rather than by quoting the expression, as THE MODEL spells them.
+///
+/// The recorded refusals show exactly one such class: the Amazon Web Services Signer
+/// signing profile ARN a signing rule carries, which ECR refuses with `The signing profile
+/// ARN '<value>' must be well formed`. Every OTHER ARN class this model carries is stated
+/// in the model-driven walk's wording over the expression the model spells — both the
+/// Secrets Manager secret a pull through cache rule's credential is read from and the IAM
+/// principal a pull time update exclusion is recorded for are recorded that way — so an ARN
+/// class absent from here keeps the walk's wording, whether or not ECR resolves the value.
+///
+/// Keyed on the EXPRESSION, exactly as [`EXPRESSIONS_ECR_POLICES_ITSELF`] and
+/// [`PUBLISHED_EXPRESSIONS`] are, so a class is worded the same way for every member
+/// targeting it and on every operation that carries one.
+/// `smithy_query(query="shape", shape="SigningProfileArn")` gives the spelling listed here.
+const ARN_EXPRESSIONS_ECR_WORDS_IN_PROSE: [&str; 1] =
+    [r"^arn:aws(-[a-z]+)*:signer:[a-z0-9-]+:[0-9]{12}:\/signing-profiles\/[a-zA-Z0-9_]{2,}$"];
 
-/// The constraint ECR states for a member holding an ARN IT RESOLVES, refused against its
-/// `@pattern`: prose naming the kind of ARN and the value that is not one, rather than the
-/// expression.
+/// The constraint ECR states for a member holding an ARN of a class it words itself,
+/// refused against its `@pattern`: prose naming the kind of ARN and the value that is not
+/// one, rather than the expression.
 ///
 /// For such an ARN ECR does not quote the member's expression back at the caller — it says
 /// the ARN is not well formed: `The signing profile ARN '<value>' must be well formed`.
@@ -562,57 +577,23 @@ const ARN_PREFIX: &str = "arn:";
 /// and its lowerCamel words separated (`signingProfileArn` -> `signing profile`), so every
 /// such member this service models is worded by the one rule and none is written out here.
 ///
-/// `None` — so the expression itself is stated — when the member is not ARN-valued: its
-/// name does not end in `Arn`, or the expression it failed does not describe an ARN. Also
-/// `None` for an ARN this registry does not resolve ([`names_an_iam_principal`]), and
-/// when the violation carries no value, which a `@pattern` failure always does (only an
-/// absent member has none) but which is not this function's to assume.
+/// `None` — so the expression itself is stated — for the expression of every other value
+/// class ([`ARN_EXPRESSIONS_ECR_WORDS_IN_PROSE`]), when the member is not ARN-valued (its
+/// name does not end in `Arn`), and when the violation carries no value, which a
+/// `@pattern` failure always does (only an absent member has none) but which is not this
+/// function's to assume.
 fn arn_constraint(member: &str, pattern: &str, value: Option<&str>) -> Option<String> {
+    if !ARN_EXPRESSIONS_ECR_WORDS_IN_PROSE.contains(&pattern) {
+        return None;
+    }
     let kind = member
         .strip_suffix(ARN_MEMBER_SUFFIX)
         .filter(|kind| !kind.is_empty())?;
-    if !unanchored(pattern).starts_with(ARN_PREFIX) || names_an_iam_principal(pattern) {
-        return None;
-    }
     let value = value?;
     Some(format!(
         "The {} ARN '{value}' must be well formed",
         in_words(kind)
     ))
-}
-
-/// The namespace an ARN of the identity service carries, as a `@pattern` describing one
-/// spells its service segment.
-const IAM_SERVICE_NAMESPACE: &str = "iam";
-
-/// The resources of that namespace that are PRINCIPALS — the two kinds of identity a
-/// request is made by (`smithy_query(query="shape", shape="PrincipalArn")`, whose
-/// expression admits exactly these). An expression names one as the ALTERNATION the two of
-/// them form, ahead of the resource's own name.
-const IAM_PRINCIPAL_RESOURCE_ALTERNATION: &str = "(role|user)/";
-
-/// Whether `pattern` is the expression of an ARN naming an IAM PRINCIPAL: the identity
-/// service's namespace with a role or a user as the resource.
-///
-/// Such a value is one this registry RECORDS — the pull time update exclusion list is
-/// keyed by it — rather than one an operation has to resolve to a resource before it can
-/// do its work, the way a signing profile is signed with and a secret is read from. ECR
-/// has nothing of its own to check it against, so the model's constraint is what refuses
-/// it and the model-driven walk's wording is what states it.
-///
-/// Keyed on the expression, so it holds for every member targeting that value class
-/// rather than for one operation's member — and on the alternation the expression OPENS
-/// its resource segment with, so a resource whose NAME happens to spell one of the two
-/// kinds is not mistaken for the kind itself. An expression that is not an ARN's, or whose
-/// segments an ARN's six do not account for, is not one of these.
-fn names_an_iam_principal(pattern: &str) -> bool {
-    let segments: Vec<&str> = unanchored(pattern).split(':').collect();
-    // arn : <partition> : <service> : <region> : <account> : <resource>
-    let ["arn", _partition, service, _region, _account, resource] = segments[..] else {
-        return false;
-    };
-    service == IAM_SERVICE_NAMESPACE
-        && resource.starts_with(IAM_PRINCIPAL_RESOURCE_ALTERNATION)
 }
 
 /// A lowerCamel member name as the words it is made of: `signingProfile` -> `signing
