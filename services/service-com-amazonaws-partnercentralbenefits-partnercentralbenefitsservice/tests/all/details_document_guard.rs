@@ -17,7 +17,10 @@
 //! (`smithy_query(query="shape",shape="CreateBenefitApplicationInput")`), so its depth,
 //! member-count and text-size bounds are enforced by the handlers that write it —
 //! `CreateBenefitApplication`, `UpdateBenefitApplication` and `AmendBenefitApplication` —
-//! and each of those refusals is a refusal of that member.
+//! and each of those refusals is a refusal of a member THAT operation binds: the document
+//! member for the two that carry one, and the amendment that produced the refused document
+//! for the amendment, which binds no document member (see
+//! `tests/all/refusal_member_path.rs` for that rule over the whole class).
 //!
 //! The tables span what the rule generalises over rather than the one document the issue
 //! named: which of the three bounds the document breaks, the FORM it breaks it in (nested
@@ -32,6 +35,7 @@ use service_com_amazonaws_partnercentralbenefits_partnercentralbenefitsservice::
 };
 
 use crate::benefit_application_lifecycle::{error_code, text, Harness, CATALOG};
+use crate::refusal_member_path::{amendment_member_path, AMENDMENT_NEW_VALUE};
 use crate::reserved_tag_keys::application_count;
 use crate::service_error_rules::{assert_validation_invariants, clause, message_of, one};
 
@@ -45,19 +49,19 @@ pub(crate) const MEMBER_PATH: &str = "benefitApplicationDetails";
 
 /// The requirement a document nested past the depth bound fails, written out here rather
 /// than read from the service's own helper so the wording itself is under test.
-fn depth_requirement() -> String {
+pub(crate) fn depth_requirement() -> String {
     format!("Member must nest no deeper than {MAX_DETAILS_DEPTH} levels")
 }
 
 /// The requirement a document holding more members than the service stores fails.
-fn member_requirement() -> String {
+pub(crate) fn member_requirement() -> String {
     format!("Member must hold no more than {MAX_DETAILS_MEMBERS} members")
 }
 
 /// The requirement a document carrying more text than the service stores fails: a length
 /// bound, so it is worded the way this service words every other length
 /// (`Member must have length less than or equal to <max>`).
-fn byte_requirement() -> String {
+pub(crate) fn byte_requirement() -> String {
     format!("Member must have length less than or equal to {MAX_DETAILS_BYTES}")
 }
 
@@ -88,7 +92,7 @@ fn nested_alternating(levels: usize) -> Value {
 }
 
 /// A flat object of `members` members, each a one-character value.
-fn flat_object(members: usize) -> Value {
+pub(crate) fn flat_object(members: usize) -> Value {
     let mut document = Map::new();
     for index in 0..members {
         document.insert(format!("m{index}"), json!("x"));
@@ -127,7 +131,7 @@ fn text_in_a_member_name(bytes: usize) -> Value {
 
 /// An object spreading its text over `members` members, each carrying a value of
 /// [`MAX_DETAILS_VALUE_LEN`] characters.
-fn text_spread_over_members(members: usize) -> Value {
+pub(crate) fn text_spread_over_members(members: usize) -> Value {
     let value = "v".repeat(MAX_DETAILS_VALUE_LEN);
     let mut document = Map::new();
     for index in 0..members {
@@ -137,7 +141,7 @@ fn text_spread_over_members(members: usize) -> Value {
 }
 
 /// How many members over [`MAX_DETAILS_BYTES`] of text it takes to pass the byte bound.
-fn members_past_the_byte_bound() -> usize {
+pub(crate) fn members_past_the_byte_bound() -> usize {
     MAX_DETAILS_BYTES / MAX_DETAILS_VALUE_LEN + 1
 }
 
@@ -254,12 +258,17 @@ fn accepted_rows() -> Vec<(&'static str, Value)> {
 
 /// Require that `operation` refused `body` as a document-guard violation: HTTP 400, the
 /// modelled `ValidationException`, and a `Message` that is the AWS envelope over the one
-/// clause naming [`MEMBER_PATH`] and `requirement` — with the same member path and
-/// requirement on the `FieldList` beside it.
+/// clause naming `path` and `requirement` — with the same member path and requirement on
+/// the `FieldList` beside it.
+///
+/// `path` is the member the refusal must name, which is the member the REFUSED OPERATION
+/// binds: [`MEMBER_PATH`] where the operation carries the document itself, and the
+/// amendment that produced it where the document is what the request's amendments produce.
 async fn assert_guard_refusal(
     harness: &Harness,
     case: &str,
     operation: &str,
+    path: &str,
     requirement: &str,
     body: &Value,
 ) {
@@ -279,8 +288,8 @@ async fn assert_guard_refusal(
     });
     assert_eq!(
         message,
-        one(&clause(MEMBER_PATH, requirement)),
-        "case {case:?}: expected the envelope over the clause for {MEMBER_PATH}, got {message:?}"
+        one(&clause(path, requirement)),
+        "case {case:?}: expected the envelope over the clause for {path}, got {message:?}"
     );
     assert_validation_invariants(case, &message);
     let field = out["FieldList"]
@@ -290,8 +299,8 @@ async fn assert_guard_refusal(
         .unwrap_or(Value::Null);
     assert_eq!(
         field["Name"],
-        json!(MEMBER_PATH),
-        "case {case:?}: the refusal's FieldList must name {MEMBER_PATH}, got {out:?}"
+        json!(path),
+        "case {case:?}: the refusal's FieldList must name {path}, got {out:?}"
     );
     assert_eq!(
         field["Message"],
@@ -334,6 +343,7 @@ async fn create_refuses_a_document_past_a_bound_through_the_envelope() {
             &harness,
             row.case,
             "CreateBenefitApplication",
+            MEMBER_PATH,
             &row.requirement,
             &body,
         )
@@ -388,6 +398,7 @@ async fn update_refuses_a_document_past_a_bound_through_the_envelope() {
             &harness,
             row.case,
             "UpdateBenefitApplication",
+            MEMBER_PATH,
             &row.requirement,
             &json!({
                 "Catalog": CATALOG,
@@ -440,6 +451,10 @@ async fn update_refuses_a_document_past_a_bound_through_the_envelope() {
 /// `MAX_DETAILS_DEPTH` segments, so no single amendment can nest the document past the
 /// depth bound, while both the member count and the text size can be grown by adding a
 /// member to a document already at the bound.
+///
+/// The requirement is the one the create and the update state for the same document; the
+/// member named is NOT theirs, because this operation binds no document member: it is the
+/// amendment that wrote the refused document, the one thing its caller can act on.
 #[tokio::test]
 async fn amend_refuses_a_document_past_a_bound_through_the_envelope() {
     let harness = Harness::new();
@@ -469,6 +484,7 @@ async fn amend_refuses_a_document_past_a_bound_through_the_envelope() {
             &harness,
             case,
             "AmendBenefitApplication",
+            &amendment_member_path(0, AMENDMENT_NEW_VALUE),
             &requirement,
             &json!({
                 "Catalog": CATALOG,

@@ -31,14 +31,38 @@
 //!    cursor this service never issued, the reserved tag namespace, a document guard, a
 //!    benefit the catalog no longer offers) and the shape of the path (the member alone, and
 //!    a member reached below it inside a collection element).
+//!
+//! The rule has a corollary, which the last two tables pin: **the member a refusal names is
+//! a member of the request as it was SENT** — an operation can only name an input member it
+//! binds, so where a rule is about state the request reaches INDIRECTLY, the refusal names
+//! the member that state arrived on. `AmendBenefitApplication` is where the two differ:
+//! it binds no `BenefitApplicationDetails`
+//! (`smithy_query(query="operation",operation="AmendBenefitApplication")` binds `Catalog`,
+//! `ClientToken`, `Revision`, `Identifier`, `AmendmentReason` and `Amendments`, and nothing
+//! else), and the document is what its amendments PRODUCE, so both rules stated about that
+//! document name the amendment element that produced it. Table 3 crosses which rule refuses
+//! (each document guard, the benefit's request schema), where in the document the rule is
+//! stated (a declared field, a field above the written one, the document itself), how many
+//! amendments the request carries and which of them wrote the refused position, and the two
+//! `FieldPath` spellings. Table 4 states the corollary over every refusal class of that
+//! operation.
+
 
 use serde_json::{json, Value};
 use service_com_amazonaws_partnercentralbenefits_partnercentralbenefitsservice::state::{
     encode_page_token, ALLOCATION_ID_PREFIX, APPLICATION_ID_PREFIX, BENEFIT_ID_PREFIX, ID_BODY_LEN,
-    MAX_DETAILS_DEPTH, RESERVED_TAG_KEY_PREFIX, VALIDATION_CODE_INVALID_VALUE,
+    MAX_AMENDMENTS_PER_REQUEST, MAX_DETAILS_DEPTH, MAX_DETAILS_MEMBERS, MAX_DETAILS_VALUE_LEN,
+    MAX_FIELD_PATH_LEN, RESERVED_TAG_KEY_PREFIX, VALIDATION_CODE_INVALID_VALUE,
+    VALIDATION_REASON_FIELD,
 };
 
+use crate::amend_benefit_application::{amend_body, amendment};
 use crate::benefit_application_lifecycle::{error_code, text, Harness, CATALOG};
+use crate::benefit_catalog_record::{catalog_benefits, declared_fields, UNDECLARED_FIELD};
+use crate::details_document_guard::{
+    byte_requirement, flat_object, member_requirement, members_past_the_byte_bound,
+    text_spread_over_members, MEMBER_PATH as DETAILS_PATH,
+};
 use crate::member_refusal_one_construction::withdrawn_benefit;
 use crate::reserved_tag_keys::{element_requirement, tag_key_path};
 use crate::resource_tagging::tag_payload;
@@ -421,4 +445,504 @@ async fn an_in_handler_refusal_names_the_walks_path_under_the_envelope() {
             "case {case:?}: the FieldList must carry the invalid-value code, got {out:?}"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// Tables 3 and 4: the member a refusal names is one the REQUEST carries
+// ---------------------------------------------------------------------------
+
+/// The member of one amendment that carries the value to write, as a refusal names it.
+pub(crate) const AMENDMENT_NEW_VALUE: &str = "newValue";
+
+/// The path a refusal names `member` of the `Amendments` element at the 0-based `position`
+/// by: the list member in the walk's spelling, the element's 1-based position and the
+/// collection step, then that member.
+///
+/// Written out here rather than read from the service's own helper, so the spelling itself
+/// is under test. Shared with `tests/all/details_document_guard.rs` and
+/// `tests/all/benefit_catalog_record.rs`, which assert the same paths on the document rules.
+pub(crate) fn amendment_member_path(position: usize, member: &str) -> String {
+    format!("amendments.{}.member.{member}", position + 1)
+}
+
+/// The input members `AmendBenefitApplication` binds, in the lowerCamel spelling the walk
+/// reports for an input member
+/// (`smithy_query(query="operation",operation="AmendBenefitApplication")`: `Catalog`,
+/// `ClientToken`, `Revision`, `Identifier`, `AmendmentReason` and `Amendments` — it binds no
+/// document member, so no refusal of it may name one).
+const AMEND_INPUT_PATHS: &[&str] = &[
+    "catalog",
+    "clientToken",
+    "revision",
+    "identifier",
+    "amendmentReason",
+    "amendments",
+];
+
+/// The longest value `Name` accepts, from the modelled `BenefitApplicationName`
+/// `@length(min: 1, max: 255)` (`smithy_query(query="shape",shape="BenefitApplicationName")`).
+const NAME_MAX_LEN: usize = 255;
+
+/// The input member the create carries a details document on, as the wire spells it: the
+/// member `AmendBenefitApplication` does NOT bind.
+const DETAILS_MEMBER: &str = "BenefitApplicationDetails";
+
+/// A benefit whose request schema an amendment can contradict: the benefit to apply for,
+/// and one field the schema declares with a JSON type an amendment's text `NewValue` cannot
+/// satisfy.
+struct SchemaSubject {
+    benefit: String,
+    field: String,
+    json_type: String,
+}
+
+/// The first `ACTIVE` benefit of [`CATALOG`] whose stored `BenefitRequestSchema` declares a
+/// field of a JSON type other than `string`, read through the catalog's own records — so a
+/// change to the seeded catalog changes the subject rather than breaking the tables. The
+/// schema's own root type is `object`, which [`declared_fields`] asserts.
+async fn schema_subject(harness: &Harness) -> SchemaSubject {
+    for benefit in catalog_benefits(harness, CATALOG).await {
+        if benefit.status != "ACTIVE" {
+            continue;
+        }
+        let Some(schema) = benefit.schema.as_ref() else {
+            continue;
+        };
+        if let Some((field, json_type)) = declared_fields(&benefit.id, schema)
+            .into_iter()
+            .find(|(_, json_type)| json_type != "string")
+        {
+            return SchemaSubject {
+                benefit: benefit.id,
+                field,
+                json_type,
+            };
+        }
+    }
+    panic!("case \"subject\": the seeded catalog must hold an ACTIVE benefit whose schema declares a non-string field")
+}
+
+/// Create one application of [`CATALOG`] for `benefit` carrying `details`, and return its
+/// id.
+async fn seeded_application(
+    harness: &Harness,
+    case: &str,
+    token: &str,
+    benefit: &str,
+    details: &Value,
+) -> String {
+    let created = harness
+        .create(
+            case,
+            &json!({
+                "Catalog": CATALOG,
+                "ClientToken": token,
+                "BenefitIdentifier": benefit,
+                "Name": "member-path",
+                "BenefitApplicationDetails": details,
+            }),
+        )
+        .await;
+    text(case, &created, "Id")
+}
+
+/// The `Revision` one stored application is at, read back through `GetBenefitApplication`.
+async fn current_revision(harness: &Harness, case: &str, identifier: &str) -> String {
+    let stored = harness.get(case, identifier).await;
+    text(case, &stored, "Revision")
+}
+
+/// One refused amendment of the details document: the document the application is seeded
+/// with, the amendments the request carries, and the path and the requirement the refusal
+/// must state.
+struct AmendRow {
+    case: String,
+    seeded: Value,
+    amendments: Value,
+    path: String,
+    requirement: String,
+}
+
+/// A rule stated about the details document the amendments PRODUCE is refused against the
+/// amendment that produced it — in the clause and in the `FieldList` alike — with the same
+/// requirement the create and the update state for that document, and nothing is persisted.
+#[tokio::test]
+async fn an_amend_document_refusal_names_the_amendment_that_wrote_the_refused_position() {
+    let harness = Harness::new();
+    let subject = schema_subject(&harness).await;
+    let field_path = format!("{DETAILS_MEMBER}.{}", subject.field);
+    // An `Amendment$NewValue` is a String, so text is all an amendment can write — which is
+    // what a field declared with any other JSON type cannot be satisfied by.
+    let wrong_type = "not of the declared type";
+    let type_requirement = format!("Member must be of type {}", subject.json_type);
+    let long_value = "v".repeat(MAX_DETAILS_VALUE_LEN);
+
+    let rows: Vec<AmendRow> = vec![
+        AmendRow {
+            case: format!(
+                "one amendment writing the declared {} field as text",
+                subject.json_type
+            ),
+            seeded: json!({}),
+            amendments: json!([amendment(&field_path, wrong_type)]),
+            path: amendment_member_path(0, AMENDMENT_NEW_VALUE),
+            requirement: type_requirement.clone(),
+        },
+        AmendRow {
+            case: "the second of two amendments writing it as text".to_string(),
+            seeded: json!({}),
+            amendments: json!([
+                amendment("Name", "amended"),
+                amendment(&field_path, wrong_type),
+            ]),
+            path: amendment_member_path(1, AMENDMENT_NEW_VALUE),
+            requirement: type_requirement.clone(),
+        },
+        AmendRow {
+            case: "a later amendment writing another field of the same document".to_string(),
+            seeded: json!({}),
+            amendments: json!([
+                amendment(&field_path, wrong_type),
+                amendment(
+                    &format!("{DETAILS_MEMBER}.{UNDECLARED_FIELD}"),
+                    "the partner's own note",
+                ),
+            ]),
+            path: amendment_member_path(0, AMENDMENT_NEW_VALUE),
+            requirement: type_requirement.clone(),
+        },
+        AmendRow {
+            case: "two amendments writing the same field".to_string(),
+            seeded: json!({}),
+            amendments: json!([
+                amendment(&field_path, wrong_type),
+                amendment(&field_path, "250"),
+            ]),
+            path: amendment_member_path(1, AMENDMENT_NEW_VALUE),
+            requirement: type_requirement.clone(),
+        },
+        AmendRow {
+            case: "an amendment writing a member below the declared field".to_string(),
+            seeded: json!({}),
+            amendments: json!([amendment(&format!("{field_path}.Nested"), wrong_type)]),
+            path: amendment_member_path(0, AMENDMENT_NEW_VALUE),
+            requirement: type_requirement.clone(),
+        },
+        AmendRow {
+            case: "the JSON-path spelling of the same write".to_string(),
+            seeded: json!({}),
+            amendments: json!([amendment(&format!("$.{field_path}"), wrong_type)]),
+            path: amendment_member_path(0, AMENDMENT_NEW_VALUE),
+            requirement: type_requirement.clone(),
+        },
+        AmendRow {
+            case: "an amendment replacing the whole document with text".to_string(),
+            seeded: json!({}),
+            amendments: json!([amendment(DETAILS_MEMBER, wrong_type)]),
+            path: amendment_member_path(0, AMENDMENT_NEW_VALUE),
+            // The schema's own root type, which every seeded schema declares `object`.
+            requirement: "Member must be of type object".to_string(),
+        },
+        AmendRow {
+            case: "an amendment adding one member too many".to_string(),
+            seeded: flat_object(MAX_DETAILS_MEMBERS),
+            amendments: json!([amendment(&format!("{DETAILS_MEMBER}.added"), "x")]),
+            path: amendment_member_path(0, AMENDMENT_NEW_VALUE),
+            requirement: member_requirement(),
+        },
+        AmendRow {
+            case: "the second amendment adding text past the byte bound".to_string(),
+            seeded: text_spread_over_members(members_past_the_byte_bound() - 1),
+            amendments: json!([
+                amendment("Name", "amended"),
+                amendment(&format!("{DETAILS_MEMBER}.added"), &long_value),
+            ]),
+            path: amendment_member_path(1, AMENDMENT_NEW_VALUE),
+            requirement: byte_requirement(),
+        },
+    ];
+
+    // The table covers both rules stated about the document — the emulator's own resource
+    // guard and the benefit's request schema — and more than one position in the amendment
+    // list, so it cannot shrink to one rule or to the first element.
+    for requirement in [member_requirement(), byte_requirement()] {
+        assert!(
+            rows.iter().any(|row| row.requirement == requirement),
+            "case \"table\": expected a row the document guard refuses with {requirement:?}, \
+             got {:?}",
+            rows.iter().map(|row| row.requirement.clone()).collect::<Vec<_>>()
+        );
+    }
+    assert!(
+        rows.iter()
+            .any(|row| row.requirement.starts_with("Member must be of type")),
+        "case \"table\": expected a row the benefit's request schema refuses, got {:?}",
+        rows.iter().map(|row| row.requirement.clone()).collect::<Vec<_>>()
+    );
+    for position in [0usize, 1] {
+        assert!(
+            rows.iter()
+                .any(|row| row.path == amendment_member_path(position, AMENDMENT_NEW_VALUE)),
+            "case \"table\": expected a row naming the amendment at position {position}, got {:?}",
+            rows.iter().map(|row| row.path.clone()).collect::<Vec<_>>()
+        );
+    }
+
+    for (index, row) in rows.iter().enumerate() {
+        let case = &row.case;
+        let id = seeded_application(
+            &harness,
+            case,
+            &format!("tok-amend-named-seed-{index}"),
+            &subject.benefit,
+            &row.seeded,
+        )
+        .await;
+        let before = harness.get(case, &id).await;
+        let body = amend_body(
+            &id,
+            &text(case, &before, "Revision"),
+            &format!("tok-amend-named-{index}"),
+            row.amendments.clone(),
+        );
+
+        let (status, out) = harness.call("AmendBenefitApplication", &body).await;
+        assert_eq!(
+            status, 400,
+            "case {case:?}: expected the modelled ValidationException's 400, got {status} {out:?}"
+        );
+        assert_eq!(
+            error_code(&out),
+            "ValidationException",
+            "case {case:?}: expected ValidationException, got {out:?}"
+        );
+        let message = message_of(&out).unwrap_or_else(|| {
+            panic!("case {case:?}: the refusal carries no modelled Message member: {out:?}")
+        });
+        assert_eq!(
+            message,
+            one(&clause(&row.path, &row.requirement)),
+            "case {case:?}: expected the envelope over the clause for {:?}, got {message:?}",
+            row.path
+        );
+        assert_validation_invariants(case, &message);
+        assert!(
+            !message.contains(DETAILS_PATH),
+            "case {case:?}: the refusal names a member this operation does not bind, \
+             got {message:?}"
+        );
+        assert_eq!(
+            out["Reason"],
+            json!(VALIDATION_REASON_FIELD),
+            "case {case:?}: expected the field-validation reason, got {out:?}"
+        );
+        let field = out["FieldList"]
+            .as_array()
+            .and_then(|fields| fields.first())
+            .cloned()
+            .unwrap_or(Value::Null);
+        assert_eq!(
+            field["Name"],
+            json!(row.path),
+            "case {case:?}: the refusal's FieldList must name {:?}, got {out:?}",
+            row.path
+        );
+        assert_eq!(
+            field["Message"],
+            json!(row.requirement),
+            "case {case:?}: the FieldList must state the requirement, got {out:?}"
+        );
+        assert_eq!(
+            field["Code"],
+            json!(VALIDATION_CODE_INVALID_VALUE),
+            "case {case:?}: the FieldList must carry the invalid-value code, got {out:?}"
+        );
+        assert_eq!(
+            harness.get(case, &id).await,
+            before,
+            "case {case:?}: a refused amendment must change nothing"
+        );
+    }
+}
+
+/// One refused amendment request: which application it amends, and the amendments it
+/// carries.
+struct BoundMemberRow {
+    case: String,
+    identifier: String,
+    revision: String,
+    amendments: Value,
+}
+
+/// EVERY refusal `AmendBenefitApplication` answers names an input member the operation
+/// BINDS, in the walk's spelling — never a member of another operation's input, which its
+/// caller could not have sent and cannot act on.
+///
+/// The rows span the refusal classes of the operation: a path naming nothing amendable, a
+/// path past its own length bound, a value past the modelled length of the member it
+/// writes, a value past this service's bound on a position of the document, an element
+/// position the record does not hold, both ends of the amendment-count bound, each rule
+/// stated about the document the amendments produce, and a modelled constraint the
+/// centralized walk refuses ahead of the handler.
+#[tokio::test]
+async fn every_amend_refusal_names_an_input_member_the_operation_binds() {
+    let harness = Harness::new();
+    let subject = schema_subject(&harness).await;
+    let field_path = format!("{DETAILS_MEMBER}.{}", subject.field);
+    let plain = seeded_application(
+        &harness,
+        "a plain application",
+        "tok-amend-binds-plain",
+        &subject.benefit,
+        &json!({}),
+    )
+    .await;
+    let filled = seeded_application(
+        &harness,
+        "an application at the member bound",
+        "tok-amend-binds-filled",
+        &subject.benefit,
+        &flat_object(MAX_DETAILS_MEMBERS),
+    )
+    .await;
+    let plain_revision = current_revision(&harness, "a plain application", &plain).await;
+    let filled_revision =
+        current_revision(&harness, "an application at the member bound", &filled).await;
+    let amend_one = |field: &str, value: &str| json!([amendment(field, value)]);
+
+    let rows: Vec<BoundMemberRow> = vec![
+        BoundMemberRow {
+            case: "a path naming no amendable field".to_string(),
+            identifier: plain.clone(),
+            revision: plain_revision.clone(),
+            amendments: amend_one("Programs", "would-not"),
+        },
+        BoundMemberRow {
+            case: "a path past its own length bound".to_string(),
+            identifier: plain.clone(),
+            revision: plain_revision.clone(),
+            amendments: amend_one(
+                &format!("{DETAILS_MEMBER}.{}", "a".repeat(MAX_FIELD_PATH_LEN)),
+                "x",
+            ),
+        },
+        BoundMemberRow {
+            case: "a value past the modelled length of the member it writes".to_string(),
+            identifier: plain.clone(),
+            revision: plain_revision.clone(),
+            amendments: amend_one("Name", &"n".repeat(NAME_MAX_LEN + 1)),
+        },
+        BoundMemberRow {
+            case: "a value past the bound on a position of the document".to_string(),
+            identifier: plain.clone(),
+            revision: plain_revision.clone(),
+            amendments: amend_one(
+                &format!("{DETAILS_MEMBER}.note"),
+                &"v".repeat(MAX_DETAILS_VALUE_LEN + 1),
+            ),
+        },
+        BoundMemberRow {
+            case: "an element position the record does not hold".to_string(),
+            identifier: plain.clone(),
+            revision: plain_revision.clone(),
+            amendments: amend_one("PartnerContacts.0.Email", "partner@example.com"),
+        },
+        BoundMemberRow {
+            case: "no amendments at all".to_string(),
+            identifier: plain.clone(),
+            revision: plain_revision.clone(),
+            amendments: json!([]),
+        },
+        BoundMemberRow {
+            case: "more amendments than one request may carry".to_string(),
+            identifier: plain.clone(),
+            revision: plain_revision.clone(),
+            amendments: Value::Array(
+                (0..=MAX_AMENDMENTS_PER_REQUEST)
+                    .map(|position| amendment("Name", &format!("amended-{position}")))
+                    .collect(),
+            ),
+        },
+        BoundMemberRow {
+            case: "a document the resource guard refuses".to_string(),
+            identifier: filled.clone(),
+            revision: filled_revision.clone(),
+            amendments: amend_one(&format!("{DETAILS_MEMBER}.added"), "x"),
+        },
+        BoundMemberRow {
+            case: "a document the benefit's request schema refuses".to_string(),
+            identifier: plain.clone(),
+            revision: plain_revision.clone(),
+            amendments: amend_one(&field_path, "not of the declared type"),
+        },
+        BoundMemberRow {
+            case: "an identifier outside its modelled pattern".to_string(),
+            identifier: "not-an-application-identifier".to_string(),
+            revision: plain_revision.clone(),
+            amendments: amend_one("Name", "amended"),
+        },
+    ];
+
+    let mut named: Vec<String> = Vec::new();
+    for (index, row) in rows.iter().enumerate() {
+        let case = &row.case;
+        let body = amend_body(
+            &row.identifier,
+            &row.revision,
+            &format!("tok-amend-binds-{index}"),
+            row.amendments.clone(),
+        );
+        let (status, out) = harness.call("AmendBenefitApplication", &body).await;
+        assert_eq!(
+            status, 400,
+            "case {case:?}: expected the modelled ValidationException's 400, got {status} {out:?}"
+        );
+        assert_eq!(
+            error_code(&out),
+            "ValidationException",
+            "case {case:?}: expected ValidationException, got {out:?}"
+        );
+        let message = message_of(&out).unwrap_or_else(|| {
+            panic!("case {case:?}: the refusal carries no modelled Message member: {out:?}")
+        });
+        assert_validation_invariants(case, &message);
+        let path = stated_path(case, &message);
+        // A refusal the centralized walk produced carries no modelled `FieldList`, so the
+        // path is read from the clause; where a handler's own refusal states one, it must
+        // name the same path.
+        let field = out["FieldList"]
+            .as_array()
+            .and_then(|fields| fields.first())
+            .cloned();
+        if let Some(field) = field {
+            assert_eq!(
+                field["Name"],
+                json!(path),
+                "case {case:?}: the clause and the FieldList must name one path, got {out:?}"
+            );
+        }
+        let member = path.split('.').next().unwrap_or_default().to_string();
+        assert!(
+            AMEND_INPUT_PATHS.contains(&member.as_str()),
+            "case {case:?}: expected the refusal to name one of the members this operation \
+             binds ({AMEND_INPUT_PATHS:?}), got {path:?}"
+        );
+        named.push(member);
+    }
+
+    // The table is not degenerate: the amendment list is named, and so is at least one
+    // other member the operation binds.
+    assert!(
+        named.iter().any(|member| member == "amendments"),
+        "case \"table\": expected a row naming the amendment list, got {named:?}"
+    );
+    assert!(
+        named.iter().any(|member| member != "amendments"),
+        "case \"table\": expected a row naming another bound member, got {named:?}"
+    );
+    // And no row named the document member, which is the create's and the update's input.
+    assert!(
+        !named.iter().any(|member| member == DETAILS_PATH),
+        "case \"table\": no refusal of this operation may name {DETAILS_PATH:?}, got {named:?}"
+    );
 }

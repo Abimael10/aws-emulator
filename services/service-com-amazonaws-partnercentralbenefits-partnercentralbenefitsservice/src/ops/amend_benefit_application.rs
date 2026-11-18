@@ -72,12 +72,24 @@
 //! application's benefit declares, exactly as a document supplied to the create or the
 //! update is: an amended document that contradicts the schema is refused with the modelled
 //! `ValidationException` and nothing is persisted — see
-//! [`crate::state::benefit_schema_refusal`]. `Amendment$NewValue` is modelled as a String
+//! [`crate::state::benefit_schema_violation`]. `Amendment$NewValue` is modelled as a String
 //! and is written as one, so a path naming a field the schema declares with another JSON
 //! type cannot be satisfied by any amendment: such a request is refused rather than
 //! answered by writing text where the schema says number. The caller changes that field
 //! through `UpdateBenefitApplication`, whose `BenefitApplicationDetails` is a `Document`
 //! and so can carry the declared type.
+//!
+//! ## Which member a refusal names
+//!
+//! This operation binds no document member: a caller reaches the details document only
+//! through an amendment's `FieldPath` and `NewValue`. So every refusal it answers names one
+//! of the members the REQUEST carries — the amendment element a caller must change or drop
+//! (`amendments.<position>.member.fieldPath` for where it writes,
+//! `amendments.<position>.member.newValue` for what it writes, both through
+//! [`member_path`]) — in the message's clause and in `ValidationExceptionField$Name` alike,
+//! including the two rules stated about the document as the amendments leave it
+//! ([`document_refusal_member`]). A refusal naming a member of the create's or the update's
+//! input would hand this operation's caller a path it cannot act on.
 //!
 //! ## Shape of an operation
 //!
@@ -243,6 +255,14 @@ impl AmendmentRefusal {
 /// The input member one amendment arrives on, as the wire spells it.
 const AMENDMENTS_MEMBER: &str = "Amendments";
 
+/// The member of one amendment that names what to write: the member a refusal about WHERE
+/// an amendment writes names.
+const MEMBER_FIELD_PATH: &str = "fieldPath";
+
+/// The member of one amendment that carries the value to write: the member a refusal about
+/// WHAT an amendment writes names.
+const MEMBER_NEW_VALUE: &str = "newValue";
+
 /// The path of one member of `Amendments[position]`, spelled the way this service's
 /// validation messages spell a member path — through the one construction that spells a
 /// nested member of a list element ([`crate::state::element_member_path`]), e.g.
@@ -308,6 +328,67 @@ fn list_element_path<'p>(rest: &[&'p str]) -> Option<(usize, &'p str)> {
         .then(|| position.parse().ok())
         .flatten()
         .map(|index| (index, *member))
+}
+
+/// The segments one amendment writes INSIDE the details document, or `None` for one that
+/// writes something else (a top-level string member, a list element) or carries a
+/// `FieldPath` this service cannot read at all.
+///
+/// They are the `FieldPath`'s own segments, which open with [`FIELD_DETAILS`]: the position
+/// in the document the amendment writes at.
+fn details_path_segments(field_path: &str) -> Option<Vec<&str>> {
+    let segments = path_segments(field_path)?;
+    (segments.first() == Some(&FIELD_DETAILS)).then_some(segments)
+}
+
+/// Whether a write at `written` is the write a refusal stated at `refused` is about: either
+/// position is at or inside the other, so the refusal names the exact field the amendment
+/// wrote, a field inside the value it wrote, or an object that write created above it.
+fn same_document_position(written: &[&str], refused: &[&str]) -> bool {
+    written
+        .iter()
+        .zip(refused)
+        .all(|(written, refused)| written == refused)
+}
+
+/// The input member a refusal of the details document the amendments PRODUCED names: the
+/// `NewValue` of the amendment that wrote it.
+///
+/// The document is no input member of this operation — it binds none, and a caller reaches
+/// the document only through an amendment's `FieldPath`/`NewValue` — so the member such a
+/// refusal names has to be the amendment element that produced it, which is what a caller
+/// can act on, exactly as every other refusal of this handler names one ([`member_path`]).
+///
+/// `refused_path` is the position inside the document the rule is stated at, where the rule
+/// states one (the schema walk reports the field it stopped at); the amendment named is the
+/// last one that wrote that position, since a later write of the same position is the one
+/// that left the value the refusal is about. A rule stated about the document as a WHOLE
+/// names no position, and neither does one whose position no amendment wrote, so there the
+/// last amendment that wrote the document at all is named. A request whose amendments write
+/// the document not at all cannot be refused for it — the stored document was judged by
+/// these same rules when it was written — so the list member the amendments arrived on
+/// stands in for that unreachable case, and no refusal of this operation names a member the
+/// request could not have sent.
+fn document_refusal_member(amendments: &[Amendment], refused_path: Option<&str>) -> String {
+    let writers = || {
+        amendments
+            .iter()
+            .enumerate()
+            .rev()
+            .filter_map(|(position, amendment)| {
+                Some((position, details_path_segments(&amendment.field_path)?))
+            })
+    };
+    let refused_segments: Option<Vec<&str>> = refused_path.map(|path| path.split('.').collect());
+    let at_the_position = refused_segments.as_ref().and_then(|refused| {
+        writers()
+            .find(|(_, written)| same_document_position(written, refused))
+            .map(|(position, _)| position)
+    });
+    match at_the_position.or_else(|| writers().next().map(|(position, _)| position)) {
+        Some(position) => member_path(position, MEMBER_NEW_VALUE),
+        None => AMENDMENTS_MEMBER.to_string(),
+    }
 }
 
 /// The requirement `value` fails as the member `member` of the modelled structure
@@ -507,7 +588,7 @@ fn apply_amendment(
 ) -> Result<(), AmendmentRefusal> {
     let unamendable = || {
         AmendmentRefusal::new(
-            member_path(position, "fieldPath"),
+            member_path(position, MEMBER_FIELD_PATH),
             format!(
                 "Member must name one of the amendable fields ({}), a `.`-separated path \
                  into {FIELD_DETAILS}, or a member of one element of \
@@ -517,10 +598,10 @@ fn apply_amendment(
         )
     };
     let refused_path = |requirement: String| {
-        AmendmentRefusal::new(member_path(position, "fieldPath"), requirement)
+        AmendmentRefusal::new(member_path(position, MEMBER_FIELD_PATH), requirement)
     };
     let refused_value = |requirement: String| {
-        AmendmentRefusal::new(member_path(position, "newValue"), requirement)
+        AmendmentRefusal::new(member_path(position, MEMBER_NEW_VALUE), requirement)
     };
 
     if let Some(clause) = field_path_length_clause(&amendment.field_path) {
@@ -921,23 +1002,34 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // An amendment can nest the details document deeper, so the bound the create and
-        // the update enforce on a supplied document is enforced on the amended one too,
-        // and refused exactly as they refuse it.
-        if let Some(refusal) = crate::state::details_refusal(
-            crate::state::DETAILS_MEMBER,
-            amended.benefit_application_details.as_ref(),
-        ) {
-            return Err(AmendBenefitApplicationErrorModeled::ValidationException(refusal).into());
+        // the update enforce on a supplied document is enforced on the amended one too, and
+        // refused exactly as they refuse it. This operation binds no document member, so the
+        // refusal names the amendment that produced the refused document
+        // ([`document_refusal_member`]) rather than a member only the create and the update
+        // carry; the requirement is the one those two state for the same document, so one
+        // rule reads the same wherever it refuses.
+        if let Some(requirement) =
+            crate::state::details_requirement(amended.benefit_application_details.as_ref())
+        {
+            return Err(refused(
+                &document_refusal_member(&input.amendments, None),
+                &requirement,
+            ));
         }
 
         // The amended document has to satisfy the benefit's request schema just as a
-        // supplied one does: an amendment can write a field the schema declares, so the
-        // rule the create applies to the document it stores is applied to this one.
-        if let Some(refusal) = crate::state::benefit_schema_refusal(
+        // supplied one does: an amendment can write a field the schema declares, so the rule
+        // the create applies to the document it stores is applied to this one. The
+        // violation's own position inside the document is what picks the amendment the
+        // refusal names.
+        if let Some(violation) = crate::state::benefit_schema_violation(
             benefit_schema.as_ref(),
             amended.benefit_application_details.as_ref(),
         ) {
-            return Err(AmendBenefitApplicationErrorModeled::ValidationException(refusal).into());
+            return Err(refused(
+                &document_refusal_member(&input.amendments, Some(&violation.member)),
+                &violation.requirement,
+            ));
         }
 
         // The revision and `UpdatedAt` move only when the record actually changed, so an

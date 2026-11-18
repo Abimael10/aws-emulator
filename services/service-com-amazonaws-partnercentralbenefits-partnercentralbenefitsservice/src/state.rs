@@ -2498,17 +2498,20 @@ pub fn details_requirement(details: Option<&Document>) -> Option<String> {
 /// guards is answered with, or `None` when the document can be stored.
 ///
 /// `member` is the input member the document arrived on, spelled as the wire spells it,
-/// so the clause names the member the caller must fix. The exception is built by the one
-/// construction every member refusal of this crate goes through
+/// so the clause names the member the caller must fix — which is why an operation binding
+/// no document member of its own states the requirement ([`details_requirement`]) against
+/// an input member its caller DID send instead of calling this. The exception is built by
+/// the one construction every member refusal of this crate goes through
 /// ([`member_validation_exception`], which renders the message with
 /// [`crate::service::member_clause`] and [`crate::service::validation_envelope`]), so a
 /// client that parses a clause to learn which member and which requirement failed reads
 /// this refusal exactly as it reads one the centralized walk produced, and NOTHING of the
 /// rejected document is echoed.
 ///
-/// Every operation that writes the member applies this — the create and the update to the
-/// document they were handed, `AmendBenefitApplication` to the document its amendments
-/// produced — so one rule is refused in one form wherever it holds.
+/// Every operation that BINDS the member applies this — the create and the update to the
+/// document they were handed — so one rule is refused in one form wherever it holds;
+/// `AmendBenefitApplication` applies the same rule ([`details_requirement`]) to the
+/// document its amendments produced and names the amendment that produced it.
 pub fn details_refusal(
     member: &str,
     details: Option<&Document>,
@@ -2561,8 +2564,9 @@ fn document_fits(value: &Document, budget: usize) -> bool {
     }
 }
 
-/// The input member a refusal of an application-details document names, spelled as the
-/// wire spells it.
+/// The input member the create and the update carry an application-details document on,
+/// spelled as the wire spells it: the member their refusals of that document name. An
+/// operation that binds no document member names an input member of its own instead.
 pub const DETAILS_MEMBER: &str = "BenefitApplicationDetails";
 
 /// The input member a refusal of the benefit a create applies for names, spelled as the
@@ -2581,9 +2585,15 @@ const SCHEMA_PROPERTIES: &str = "properties";
 /// path failed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SchemaViolation {
-    /// The input member, followed by the document's own `.`-separated path to the field
-    /// that does not satisfy the schema — the same path form `AmendBenefitApplication`
-    /// addresses a field of the document with, so a caller can act on it.
+    /// The input member the document arrived on, spelled as the wire spells it, followed by
+    /// the document's own `.`-separated path to the field that does not satisfy the schema.
+    ///
+    /// It is the member path a refusal names where the operation BINDS the document (the
+    /// create and the update): the leading input member is re-cased to the walk's own
+    /// spelling where the refusal is rendered ([`member_validation_exception`]), so a caller
+    /// of those operations reads it exactly as it reads a path the centralized walk
+    /// reported. An operation that binds no document member reads the POSITION out of it
+    /// instead, to name an input member its own caller sent.
     pub member: String,
     /// The requirement that field failed, worded like every other requirement this
     /// service states (see [`crate::service::member_clause`]).
@@ -2601,9 +2611,10 @@ pub struct SchemaViolation {
 /// declare is the caller's own.
 ///
 /// The member is modelled optional wherever it is written, so a request that supplies NO
-/// document has nothing to judge; a document it does supply is judged as a whole — which
-/// is why the create, the update and the amendment each apply this to the document they
-/// would store.
+/// document has nothing to judge; a document it does supply is judged as a whole — which is
+/// why the create and the update apply this to the document they would store, and
+/// `AmendBenefitApplication` applies the rule itself ([`benefit_schema_violation`]) to the
+/// document its amendments produced, naming the amendment that produced it.
 pub fn benefit_schema_refusal(
     schema: Option<&Document>,
     details: Option<&Document>,

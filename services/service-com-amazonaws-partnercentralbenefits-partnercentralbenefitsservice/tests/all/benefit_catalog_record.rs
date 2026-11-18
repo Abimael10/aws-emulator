@@ -29,9 +29,11 @@
 //!    document shapes the schema's own `type` refuses.
 //! 3. **One rule, wherever the member is written**: `UpdateBenefitApplication` and
 //!    `AmendBenefitApplication` judge the document they would store by the same schema, and
-//!    a refused write changes nothing. Rows: an update and an amendment of a declared
-//!    string field (which conform) and of a declared number field written as text (which
-//!    does not).
+//!    a refused write changes nothing. Each states the SAME requirement and names the
+//!    member the operation it refused BINDS — the document member for the update, the
+//!    amendment that wrote the refused field for the amendment, which binds no document
+//!    member at all. Rows: an update and an amendment of a declared string field (which
+//!    conform) and of a declared number field written as text (which does not).
 
 use serde_json::{json, Map, Value};
 use service_com_amazonaws_partnercentralbenefits_partnercentralbenefitsservice::state::{
@@ -41,6 +43,7 @@ use service_com_amazonaws_partnercentralbenefits_partnercentralbenefitsservice::
 
 use crate::benefit_application_lifecycle::{error_code, text, Harness, CATALOG};
 use crate::details_document_guard::MEMBER_PATH as DETAILS_PATH;
+use crate::refusal_member_path::{amendment_member_path, AMENDMENT_NEW_VALUE};
 use crate::resource_tagging::expected_arn;
 
 /// The PATH a refusal names the benefit member by: the input member in lowerCamel, the
@@ -50,23 +53,26 @@ const BENEFIT_IDENTIFIER_PATH: &str = "benefitIdentifier";
 
 /// A field name no seeded `BenefitRequestSchema` declares, so a document carrying it
 /// carries something the schema says nothing about.
-const UNDECLARED_FIELD: &str = "PartnersOwnNote";
+pub(crate) const UNDECLARED_FIELD: &str = "PartnersOwnNote";
 
 /// One benefit of a catalog, as the catalog's own records report it.
-struct CatalogBenefit {
-    id: String,
+///
+/// Shared with `tests/all/refusal_member_path.rs`, which needs the same schema records to
+/// drive a refusal of a document field.
+pub(crate) struct CatalogBenefit {
+    pub(crate) id: String,
     /// A `BenefitStatus` value, from `GetBenefit$Status`.
-    status: String,
+    pub(crate) status: String,
     /// `GetBenefit$BenefitRequestSchema`, absent for a benefit whose request needs no
     /// fields.
-    schema: Option<Value>,
+    pub(crate) schema: Option<Value>,
 }
 
 /// Every benefit of `catalog`, read through `ListBenefits` and `GetBenefit`.
 ///
 /// The rows of the tables below are the catalog's own records rather than a list written
 /// here, so a change to the seeded catalog changes the rows rather than breaking them.
-async fn catalog_benefits(harness: &Harness, catalog: &str) -> Vec<CatalogBenefit> {
+pub(crate) async fn catalog_benefits(harness: &Harness, catalog: &str) -> Vec<CatalogBenefit> {
     let mut benefits = Vec::new();
     for summary in harness.benefits(catalog).await {
         let id = text(catalog, &summary, "Id");
@@ -97,7 +103,7 @@ async fn catalog_benefits(harness: &Harness, catalog: &str) -> Vec<CatalogBenefi
 /// (`smithy_query(query="doc",shape="GetBenefitOutput",member="BenefitRequestSchema")` —
 /// "the schema definition that describes the required fields for requesting this
 /// benefit").
-fn declared_fields(case: &str, schema: &Value) -> Vec<(String, String)> {
+pub(crate) fn declared_fields(case: &str, schema: &Value) -> Vec<(String, String)> {
     assert_eq!(
         schema.get("type"),
         Some(&json!("object")),
@@ -554,7 +560,10 @@ async fn update_and_amend_judge_the_document_they_would_store_by_the_same_schema
     );
 
     // Writing the declared number field as text contradicts the schema, so the amendment
-    // is refused and nothing changes.
+    // is refused and nothing changes. `AmendBenefitApplication` binds no document member —
+    // the document is what its amendments PRODUCE — so the refusal names the amendment that
+    // wrote the refused field, which is what its caller can act on; the requirement is the
+    // one the update states for the same field, so one rule reads the same on both.
     let case = format!("an amendment writing {number_field} as text");
     assert_refused(
         &harness,
@@ -571,7 +580,7 @@ async fn update_and_amend_judge_the_document_they_would_store_by_the_same_schema
                 "NewValue": "250",
             }],
         }),
-        &format!("{DETAILS_PATH}.{number_field}"),
+        &amendment_member_path(0, AMENDMENT_NEW_VALUE),
         "Member must be of type number",
     )
     .await;
