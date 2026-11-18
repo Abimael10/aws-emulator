@@ -24,7 +24,7 @@ use std::sync::Arc;
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::harness::{now_ms, past_completion};
+use crate::harness::now_ms;
 
 /// The Region every request here is signed for.
 const REGION: &str = "eu-west-2";
@@ -34,6 +34,27 @@ const HOST: &str = "s3.eu-west-2.amazonaws.com";
 
 /// Milliseconds in one hour.
 const HOUR: i64 = 60 * 60 * 1_000;
+
+/// The name of the one object an export writes that is NOT exported log data: the check that
+/// the destination takes the export's writes at all, which `CreateExportTask` requires
+/// ("you must use credentials that have permission to write to the S3 bucket that you specify
+/// as the destination"), left under the task's own destination prefix.
+///
+/// Shared with the suites whose subject is also what an export LANDS in the destination
+/// bucket, so every one of them tells the check apart from the exported data the same way.
+pub(crate) const WRITE_TEST_OBJECT: &str = "aws-logs-write-test";
+
+/// What that object holds.
+pub(crate) const WRITE_TEST_BODY: &str = "Permission Check Successful";
+
+/// The statuses of the model's `ExportTaskStatusCode` enum an export task never leaves.
+const TERMINAL_STATUSES: [&str; 3] = ["COMPLETED", "CANCELLED", "FAILED"];
+
+/// How often, and how many times, [`Emulator::awaited_terminal_status`] looks again. The
+/// product is far past the spans an export is under way for, so a settled export is never
+/// missed and nothing waits for a fixed duration instead of for the status itself.
+const TERMINAL_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
+const TERMINAL_POLL_ATTEMPTS: usize = 600;
 
 /// CloudWatch Logs and Amazon S3 on one shared engine, reached over the wire.
 ///
@@ -170,6 +191,22 @@ impl Emulator {
             .collect()
     }
 
+    /// Every key under `prefix` that holds EXPORTED LOG DATA: the gzip objects, which is
+    /// every key under it but the export's own permission check
+    /// ([`WRITE_TEST_OBJECT`]).
+    pub(crate) async fn exported_keys_under(
+        &self,
+        case: &str,
+        bucket: &str,
+        prefix: &str,
+    ) -> Vec<String> {
+        self.keys_under(case, bucket, prefix)
+            .await
+            .into_iter()
+            .filter(|key| !key.ends_with(WRITE_TEST_OBJECT))
+            .collect()
+    }
+
     /// The bytes `bucket` holds at `key`, read through `GetObject`.
     pub(crate) async fn object(&self, case: &str, bucket: &str, key: &str) -> Vec<u8> {
         let (status, body) = self.s3("GET", &format!("/{bucket}/{key}"), b"").await;
@@ -185,7 +222,7 @@ impl Emulator {
     /// The exported text under `prefix`: every object there, gunzipped and concatenated.
     pub(crate) async fn exported_text(&self, case: &str, bucket: &str, prefix: &str) -> String {
         let mut text = String::new();
-        for key in self.keys_under(case, bucket, prefix).await {
+        for key in self.exported_keys_under(case, bucket, prefix).await {
             let body = self.object(case, bucket, &key).await;
             let mut decoded = Vec::new();
             flate2::read::GzDecoder::new(body.as_slice())
@@ -196,6 +233,20 @@ impl Emulator {
             text.push_str(&String::from_utf8_lossy(&decoded));
         }
         text
+    }
+
+    /// The terminal status `task_id` settles at, polled for the way a client polls for it —
+    /// look again until the status itself is terminal, so nothing here waits for a span of the
+    /// clock.
+    pub(crate) async fn awaited_terminal_status(&self, case: &str, task_id: &str) -> String {
+        for _ in 0..TERMINAL_POLL_ATTEMPTS {
+            let status = self.task_status(case, task_id).await;
+            if TERMINAL_STATUSES.contains(&status.as_str()) {
+                return status;
+            }
+            tokio::time::sleep(TERMINAL_POLL_INTERVAL).await;
+        }
+        panic!("case {case:?}: the export task must settle within {TERMINAL_POLL_ATTEMPTS} polls")
     }
 
     /// The status code `DescribeExportTasks` reports for `task_id`.
@@ -343,10 +394,9 @@ async fn an_export_task_writes_the_windows_events_under_the_destination_prefix()
             .unwrap_or_else(|| panic!("case {:?}: a started export reports a taskId", row.case))
             .to_string();
 
-        // Wait past both spans the create armed: the task is terminal by then, so this is
-        // exactly what a client that waits for the terminal status observes.
-        tokio::time::sleep(past_completion()).await;
-        let status = emulator.task_status(row.case, &task_id).await;
+        // Wait for the terminal status the way a client does, and read the destination with
+        // no further wait: an export whose objects land after its status settles cannot pass.
+        let status = emulator.awaited_terminal_status(row.case, &task_id).await;
         assert_eq!(
             status, "COMPLETED",
             "case {:?}: the export must complete, got {status}",
@@ -355,7 +405,14 @@ async fn an_export_task_writes_the_windows_events_under_the_destination_prefix()
 
         // "If you don't specify a value, the default is exportedlogs".
         let prefix = row.prefix.unwrap_or("exportedlogs");
-        let keys = emulator.keys_under(row.case, bucket, prefix).await;
+        for key in &emulator.keys_under(row.case, bucket, prefix).await {
+            assert!(
+                key.starts_with(&format!("{prefix}/")),
+                "case {:?}: every object the export writes is keyed under {prefix}/, got {key}",
+                row.case
+            );
+        }
+        let keys = emulator.exported_keys_under(row.case, bucket, prefix).await;
         assert!(
             !keys.is_empty(),
             "case {:?}: the export must write an object under {prefix}/, got {keys:?}",
@@ -363,8 +420,8 @@ async fn an_export_task_writes_the_windows_events_under_the_destination_prefix()
         );
         for key in &keys {
             assert!(
-                key.starts_with(&format!("{prefix}/")) && key.ends_with(".gz"),
-                "case {:?}: every exported object is a gzip object under {prefix}/, got {key}",
+                key.ends_with(".gz"),
+                "case {:?}: every exported object is a gzip object, got {key}",
                 row.case
             );
             assert!(
@@ -458,9 +515,8 @@ async fn the_window_includes_its_start_and_excludes_its_end() {
         .expect("a started export reports a taskId")
         .to_string();
 
-    tokio::time::sleep(past_completion()).await;
     assert_eq!(
-        emulator.task_status(case, &task_id).await,
+        emulator.awaited_terminal_status(case, &task_id).await,
         "COMPLETED",
         "case {case:?}: the export must complete"
     );
@@ -476,7 +532,7 @@ async fn the_window_includes_its_start_and_excludes_its_end() {
 }
 
 #[tokio::test]
-async fn an_export_whose_window_selects_no_event_writes_no_object() {
+async fn an_export_whose_window_selects_no_event_writes_no_exported_object() {
     let case = "a window before every event";
     let emulator = Emulator::new();
     let group = "export/empty";
@@ -523,15 +579,21 @@ async fn an_export_whose_window_selects_no_event_writes_no_object() {
         .expect("a started export reports a taskId")
         .to_string();
 
-    tokio::time::sleep(past_completion()).await;
     assert_eq!(
-        emulator.task_status(case, &task_id).await,
+        emulator.awaited_terminal_status(case, &task_id).await,
         "COMPLETED",
         "case {case:?}: the export still completes"
     );
     assert_eq!(
-        emulator.keys_under(case, bucket, "nothing").await,
+        emulator.exported_keys_under(case, bucket, "nothing").await,
         Vec::<String>::new(),
-        "case {case:?}: no event falls in the window, so no object is written"
+        "case {case:?}: no event falls in the window, so no log data is written"
+    );
+    // The export still reached the destination, and the check it writes to establish that is
+    // what shows it under a prefix no exported data landed under.
+    assert_eq!(
+        emulator.keys_under(case, bucket, "nothing").await,
+        vec![format!("nothing/{WRITE_TEST_OBJECT}")],
+        "case {case:?}: the export's own write check is under its prefix"
     );
 }

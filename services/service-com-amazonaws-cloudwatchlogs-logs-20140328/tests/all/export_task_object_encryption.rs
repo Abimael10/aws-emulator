@@ -39,6 +39,7 @@ use std::time::Duration;
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
+use crate::export_task_objects::{WRITE_TEST_BODY, WRITE_TEST_OBJECT};
 use crate::harness::now_ms;
 
 /// The Region every request here is signed for, which is the Region the ARNs carry.
@@ -653,8 +654,20 @@ async fn an_exported_object_carries_the_destination_buckets_own_encryption() {
                 }
             }
 
-            // And the bytes under those headers are the exported log data.
+            // And the bytes under those headers are the exported log data — in the objects
+            // that hold it: the one object an export writes that is not exported log data is
+            // the check that the destination takes its writes at all
+            // ([`crate::export_task_objects::WRITE_TEST_OBJECT`]), which carries the same
+            // encryption and plain text rather than a gzip frame.
             let (_headers, body) = emulator.get_object(case, bucket, key).await;
+            if key.ends_with(WRITE_TEST_OBJECT) {
+                assert_eq!(
+                    String::from_utf8_lossy(&body),
+                    WRITE_TEST_BODY,
+                    "case {case:?}: the object at {key} is the export's write check"
+                );
+                continue;
+            }
             let mut decoded = Vec::new();
             flate2::read::GzDecoder::new(body.as_slice())
                 .read_to_end(&mut decoded)

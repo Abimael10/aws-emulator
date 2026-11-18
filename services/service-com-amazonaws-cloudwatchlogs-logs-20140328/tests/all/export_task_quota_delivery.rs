@@ -50,17 +50,8 @@ const LIMIT_EXCEEDED_MESSAGE: &str = "Resource limit exceeded.";
 /// specify a value, the default is exportedlogs" (`CreateExportTask$destinationPrefix`).
 const DEFAULT_PREFIX: &str = "exportedlogs";
 
-/// The statuses of the model's `ExportTaskStatusCode` enum an export task never leaves.
-const TERMINAL_STATUSES: [&str; 3] = ["COMPLETED", "CANCELLED", "FAILED"];
-
 /// The statuses that enum calls active — the two an export is under way in.
 const ACTIVE_STATUSES: [&str; 2] = ["PENDING", "RUNNING"];
-
-/// How often, and how many times, a case polls for the terminal status. The product is far
-/// past the spans an export is under way for, so a settled export is never missed, and no
-/// case waits for a fixed duration instead of for the status itself.
-const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
-const POLL_ATTEMPTS: usize = 300;
 
 /// One row of the table.
 struct Row {
@@ -245,7 +236,7 @@ async fn an_accepted_export_delivers_its_data_while_a_second_create_is_refused()
 
         // Waiting for the terminal status is all a client does before reading the data, so
         // nothing else is waited for here.
-        let settled = await_terminal(&emulator, case, &task_id).await;
+        let settled = emulator.awaited_terminal_status(case, &task_id).await;
         assert_eq!(
             settled, "COMPLETED",
             "case {case:?}: the accepted export must complete, got {settled}"
@@ -257,15 +248,22 @@ async fn an_accepted_export_delivers_its_data_while_a_second_create_is_refused()
         let prefix = row.prefix.unwrap_or(DEFAULT_PREFIX);
         let key_prefix = format!("{}/", prefix.trim_end_matches('/'));
         let keys = emulator.all_keys(case, bucket).await;
-        assert!(
-            !keys.is_empty(),
-            "case {case:?}: a completed export has written its data, got {keys:?}"
-        );
         for key in &keys {
             assert!(
-                key.starts_with(&key_prefix) && key.ends_with(".gz"),
-                "case {case:?}: every object of the export is a gzip object under \
-                 {key_prefix}, got {key}"
+                key.starts_with(&key_prefix),
+                "case {case:?}: every object of the export is keyed under {key_prefix}, \
+                 got {key}"
+            );
+        }
+        let exported = emulator.exported_keys_under(case, bucket, prefix).await;
+        assert!(
+            !exported.is_empty(),
+            "case {case:?}: a completed export has written its data, got {keys:?}"
+        );
+        for key in &exported {
+            assert!(
+                key.ends_with(".gz"),
+                "case {case:?}: every object of the exported data is a gzip object, got {key}"
             );
         }
 
@@ -299,19 +297,4 @@ async fn an_accepted_export_delivers_its_data_while_a_second_create_is_refused()
             );
         }
     }
-}
-
-/// The terminal status `task_id` settles at, polled for the way a client polls for it.
-async fn await_terminal(emulator: &Emulator, case: &str, task_id: &str) -> String {
-    for _ in 0..POLL_ATTEMPTS {
-        let status = emulator.task_status(case, task_id).await;
-        if TERMINAL_STATUSES.contains(&status.as_str()) {
-            return status;
-        }
-        tokio::time::sleep(POLL_INTERVAL).await;
-    }
-    panic!(
-        "case {case:?}: the export task must settle within \
-         {POLL_ATTEMPTS:?} polls, and still reports an active status"
-    )
 }

@@ -14,6 +14,13 @@
 //!
 //! What is written follows the task:
 //!
+//! * first the permission check — `CreateExportTask` requires "credentials that have
+//!   permission to write to the S3 bucket that you specify as the destination", and the
+//!   export establishes that it has them by WRITING: one small object of its own
+//!   ([`WRITE_TEST_OBJECT_NAME`]) under the task's destination prefix, before any exported
+//!   data. A destination that answers that it refuses that write takes no exported data
+//!   either, and the prefix of an export whose window selected no event still shows that the
+//!   export reached the bucket;
 //! * which events — the named log group's events whose timestamp falls in the task's window
 //!   ("events with a timestamp before this time are not exported" / "events with a timestamp
 //!   later than this time are not exported"), taken from the streams the task's
@@ -33,8 +40,11 @@
 //!
 //! The store's guard is never held across a write: the events are read under it, the objects
 //! are written with it released, and it is taken again only to record what the export did.
-//! An export whose objects Amazon S3 refused is `FAILED` — the status CloudWatch Logs
-//! reports for an export that stopped on an error — rather than completed over nothing.
+//! An export that did not land its data is `FAILED` — the status CloudWatch Logs reports for
+//! an export that stopped on an error — rather than completed over nothing. The permission
+//! check alone is judged on what Amazon S3 ANSWERED ([`refused_the_write`]), because a call
+//! that reached no object store at all establishes nothing about the destination, which is
+//! the ground the create's own resolution of it stands on ([`super::export_destination`]).
 //!
 //! The work one export does is BOUNDED by what the store can hold: at most one object per log
 //! stream of the group ([`super::MAX_STREAMS_PER_GROUP`]), each built from that stream's
@@ -72,6 +82,19 @@ const WRITE_FAILED_STATUS_MESSAGE: &str = "Unable to write the exported log data
 /// numbers the objects of a stream from zero and gzip-frames each; one export of a stream's
 /// selected events is one object here, so it is the first of that numbering.
 const FIRST_OBJECT_NAME: &str = "000000.gz";
+
+/// The name of the object the export writes to check that the destination takes its writes.
+///
+/// `CreateExportTask` requires "credentials that have permission to write to the S3 bucket
+/// that you specify as the destination", and the export establishes that by writing — this
+/// object, under the task's own destination prefix, before any exported log data. It is the
+/// name CloudWatch Logs leaves that check under in the destination bucket.
+const WRITE_TEST_OBJECT_NAME: &str = "aws-logs-write-test";
+
+/// What that object holds: the outcome of the check it IS, as plain text rather than as
+/// exported log data, so a reader of the destination can tell the check apart from the
+/// gzip-framed objects beside it.
+const WRITE_TEST_BODY: &str = "Permission Check Successful";
 
 /// Run the export the call that returns this accepted.
 ///
@@ -151,31 +174,40 @@ async fn run<Eng: Send + Sync + 'static>(
             .collect();
         WritePlan {
             bucket: task.destination.clone(),
+            check_key: prefixed_key(&task.destination_prefix, WRITE_TEST_OBJECT_NAME),
             objects,
         }
     };
 
     let client = s3_client(callback, region);
-    let mut written = true;
-    for (key, body) in &plan.objects {
-        let answer = client
-            .put_object()
-            .bucket(&plan.bucket)
-            .key(key)
-            .body(::aws_sdk_s3::primitives::ByteStream::from(body.clone()))
-            .send()
-            .await;
-        if let Err(error) = answer {
-            // The caller's own values are rendered in their escaped `Debug` form, so a
-            // bucket name or prefix carrying a newline cannot forge a log line.
-            ::tracing::warn!(
-                bucket = ?plan.bucket,
-                key = ?key,
-                error = %::aws_smithy_types::error::display::DisplayErrorContext(&error),
-                "an export task's object could not be written to Amazon S3"
-            );
-            written = false;
-            break;
+    // The permission check leads: the destination's answer to the export's OWN write settles
+    // whether there is an export to do at all, before any exported log data is sent, and it
+    // is what shows in the prefix of an export whose window selected nothing.
+    let mut written = match write_object(
+        &client,
+        &plan.bucket,
+        &plan.check_key,
+        WRITE_TEST_BODY.as_bytes().to_vec(),
+    )
+    .await
+    {
+        Ok(()) => true,
+        // A destination that ANSWERS that it refuses the write is a destination this export
+        // cannot land in. Any other answer is this emulator failing to ask an object store at
+        // all, which establishes nothing about the destination — the same stance the create's
+        // own resolution of it takes ([`super::export_destination`]) — so it refuses nothing
+        // here either, and the exported data below is attempted and judged on its own answer.
+        Err(error) => !refused_the_write(&error),
+    };
+    if written {
+        for (key, body) in &plan.objects {
+            if write_object(&client, &plan.bucket, key, body.clone())
+                .await
+                .is_err()
+            {
+                written = false;
+                break;
+            }
         }
     }
 
@@ -215,8 +247,64 @@ struct WritePlan {
     /// `ExportTask$destination` — "the name of the S3 bucket to which the log data was
     /// exported".
     bucket: String,
-    /// Each object as `(key, gzip-framed body)`.
+    /// The key the export's own permission check goes to
+    /// ([`WRITE_TEST_OBJECT_NAME`]).
+    check_key: String,
+    /// Each object of exported log data as `(key, gzip-framed body)`.
     objects: Vec<(String, Vec<u8>)>,
+}
+
+/// Put one object of this export into the destination bucket, reporting whether it landed.
+///
+/// The export names no encryption of its own, so each object is stored under the destination
+/// bucket's own default encryption configuration.
+async fn write_object(
+    client: &::aws_sdk_s3::Client,
+    bucket: &str,
+    key: &str,
+    body: Vec<u8>,
+) -> Result<(), Box<PutFailure>> {
+    client
+        .put_object()
+        .bucket(bucket)
+        .key(key)
+        .body(::aws_sdk_s3::primitives::ByteStream::from(body))
+        .send()
+        .await
+        .map(|_| ())
+        .map_err(|error| {
+            // The caller's own values are rendered in their escaped `Debug` form, so a
+            // bucket name or prefix carrying a newline cannot forge a log line.
+            ::tracing::warn!(
+                bucket = ?bucket,
+                key = ?key,
+                error = %::aws_smithy_types::error::display::DisplayErrorContext(&error),
+                "an export task's object could not be written to Amazon S3"
+            );
+            Box::new(error)
+        })
+}
+
+/// What [`write_object`] hands back when the object did not land. It is BOXED where it is
+/// returned: the SDK's failure is far larger than the nothing that stands beside it.
+type PutFailure = ::aws_sdk_s3::error::SdkError<
+    ::aws_sdk_s3::operation::put_object::PutObjectError,
+    ::aws_smithy_runtime_api::client::orchestrator::HttpResponse,
+>;
+
+/// Whether `error` is Amazon S3 ANSWERING that it refuses the write — an answer carrying an
+/// error code of its own — as opposed to the call not reaching an object store at all.
+///
+/// Only the first is a destination this export cannot land in; the second establishes nothing
+/// about the destination, which is the same ground the create's own resolution of it stands
+/// on ([`super::export_destination`]).
+fn refused_the_write(error: &PutFailure) -> bool {
+    use ::aws_sdk_s3::error::ProvideErrorMetadata;
+
+    error
+        .as_service_error()
+        .and_then(ProvideErrorMetadata::code)
+        .is_some()
 }
 
 /// The S3 key of the object holding `stream_name`'s exported events.
@@ -225,11 +313,24 @@ struct WritePlan {
 /// object exported"; the task's own id and the stream's name follow it, so one prefix can
 /// hold the output of several exports and of several streams without collision.
 fn object_key(destination_prefix: &str, task_id: &str, stream_name: &str) -> String {
+    prefixed_key(
+        destination_prefix,
+        &format!("{task_id}/{stream_name}/{FIRST_OBJECT_NAME}"),
+    )
+}
+
+/// `rest` under `destination_prefix`, separated by one `/` and no more.
+///
+/// The prefix is "the prefix that was used as the start of Amazon S3 key for every object
+/// exported", so every key the export writes — the exported data and the permission check
+/// alike — begins with it; a prefix already ending in a separator does not gain a second one,
+/// and an empty prefix contributes none.
+fn prefixed_key(destination_prefix: &str, rest: &str) -> String {
     let prefix = destination_prefix.trim_end_matches('/');
     if prefix.is_empty() {
-        format!("{task_id}/{stream_name}/{FIRST_OBJECT_NAME}")
+        rest.to_string()
     } else {
-        format!("{prefix}/{task_id}/{stream_name}/{FIRST_OBJECT_NAME}")
+        format!("{prefix}/{rest}")
     }
 }
 
