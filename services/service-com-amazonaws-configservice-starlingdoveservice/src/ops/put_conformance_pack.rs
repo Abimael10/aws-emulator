@@ -61,8 +61,9 @@
 //! A deployment can only create a resource THIS ACCOUNT COULD CREATE DIRECTLY, so every
 //! resource the template declares is judged by the preconditions the operation that
 //! creates that kind of resource enforces: a remediation action by
-//! `PutRemediationConfigurations`' own ([`crate::state::unusable_remediation`]) and the
-//! declared Config rules by this Region's Config rules quota. A deployment that cannot
+//! `PutRemediationConfigurations`' own ([`crate::state::unusable_remediation`]), a Config
+//! rule by `PutConfigRule`'s own ([`crate::state::unusable_config_rule`]) and the declared
+//! Config rules together by this Region's Config rules quota. A deployment that cannot
 //! create what the template declares creates NOTHING — leaving a previous deployment of
 //! the same pack standing — and is reported in the modelled `CREATE_FAILED` state with
 //! the reason (`ConformancePackStatusReason`) rather than as a completion of work nothing
@@ -975,15 +976,36 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // A deployment can only CREATE a resource this account could create directly, so
         // every resource the template declares is judged by the preconditions the
-        // operation that creates that kind of resource enforces. For a remediation action
-        // those are `PutRemediationConfigurations`' own
+        // operation that creates that kind of resource enforces. For a Config rule those
+        // are `PutConfigRule`'s own ([`crate::state::unusable_config_rule`]), and for a
+        // remediation action `PutRemediationConfigurations`' own
         // ([`crate::state::unusable_remediation`]), asked of Systems Manager before the
         // store is locked because the target is another service's resource. A template
         // declaring one the account could not create deploys NOTHING and the pack settles
         // in the modelled `CREATE_FAILED` carrying this reason, rather than reporting a
-        // deployment that created a remediation no create would have accepted.
+        // deployment that created a resource no create would have accepted.
         let mut deployment_failure: Option<String> = None;
         for resource in &declared {
+            let DeclaredResource::Rule(rule) = resource else {
+                continue;
+            };
+            // Judged under the name the TEMPLATE declared the rule with, which is what the
+            // reason has to name: the name Config gives a pack's rule is minted below, and
+            // the template's author cannot fix a name they never wrote.
+            if let Some(detail) =
+                crate::state::unusable_config_rule(&rule.declared_name, rule.scope.as_ref())
+            {
+                deployment_failure =
+                    Some(format!("The conformance pack could not be deployed: {detail}."));
+                break;
+            }
+        }
+        for resource in &declared {
+            // A deployment that cannot be performed is reported by the FIRST resource that
+            // cannot be created, so nothing further is asked of another service for it.
+            if deployment_failure.is_some() {
+                break;
+            }
             let DeclaredResource::Remediation(remediation) = resource else {
                 continue;
             };

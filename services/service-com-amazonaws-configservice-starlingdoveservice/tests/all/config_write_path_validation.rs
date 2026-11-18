@@ -23,7 +23,12 @@
 //!    only of an AUTOMATIC remediation, so a manual one carrying no role parameter is
 //!    accepted;
 //! 5. `ListTagsForResource` always reports `Tags` — an empty list for a resource that
-//!    carries none — so a caller reads the member unconditionally.
+//!    carries none — so a caller reads the member unconditionally;
+//! 6. a Config rule's `Scope` selects resources along ONE dimension — resource types and
+//!    ids, OR a tag — so a scope naming both is refused 400
+//!    `InvalidParameterValueException` with the service's fixed sentence, wherever a
+//!    scope is written (`PutConfigRule` directly, and a rule a conformance pack's
+//!    template declares), while each single-dimension form is accepted and read back.
 //!
 //! Every case drives the emulator the way a client does — an `awsJson1_1` `POST /`
 //! through the same `MultiServiceRouter` the production router builds — using the
@@ -37,6 +42,8 @@ use crate::config_discovered_resource_counts::counts_of;
 use crate::config_setup_and_rule_loop::{
     managed_rule, with_recorder_and_channel, with_verdicts, Emulator,
 };
+use crate::conformance_pack_type_and_stack_identity::settled;
+use crate::conformance_packs::pack_from_body;
 
 /// The name Config assigns a configuration recorder created without one
 /// (`ConfigurationRecorder$name`: "Config automatically assigns the name of
@@ -667,6 +674,367 @@ async fn list_tags_for_resource_always_reports_the_tags_member() {
         assert_eq!(
             reported, expected,
             "case {case:?}: expected the tags {expected:?} reported, got {reported:?}"
+        );
+    }
+}
+
+/// How Config words its refusal of a `Scope` that selects along both of its dimensions:
+/// FIXED text, stating that the two cannot be combined and taking nothing from the
+/// request.
+const SCOPE_BOTH_DIMENSIONS: &str = "Scope cannot be applied to both resource and tag";
+
+/// The state a rule Config has written reports (`ConfigRuleState`), from
+/// `smithy_query(query="shape", shape="ConfigRuleState")`: `ACTIVE`, `DELETING`,
+/// `DELETING_RESULTS`, `EVALUATING`.
+const ACTIVE: &str = "ACTIVE";
+
+/// The `PutConfigRule` body for the managed rule `name`, scoped by `scope` when the case
+/// names one.
+fn rule_scoped_by(name: &str, scope: Option<&Value>) -> Value {
+    let mut rule = json!({
+        "ConfigRuleName": name,
+        "Source": { "Owner": "AWS", "SourceIdentifier": "S3_BUCKET_VERSIONING_ENABLED" },
+    });
+    if let Some(scope) = scope {
+        rule["Scope"] = scope.clone();
+    }
+    json!({ "ConfigRule": rule })
+}
+
+/// A scope naming the RESOURCE dimension alone — one of the three forms a scope has — the
+/// scope every refusal case's rule is created with.
+fn resource_scope() -> Value {
+    json!({ "ComplianceResourceTypes": ["AWS::S3::Bucket"] })
+}
+
+/// The rule `name` as `DescribeConfigRules` reports it.
+async fn described_rule(case: &str, emulator: &Emulator, name: &str) -> Value {
+    let described = emulator
+        .ok("DescribeConfigRules", &json!({ "ConfigRuleNames": [name] }))
+        .await;
+    let rules = described["ConfigRules"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    let [rule] = rules.as_slice() else {
+        panic!("case {case:?}: expected exactly one rule named {name:?}, got {described}");
+    };
+    rule.clone()
+}
+
+#[tokio::test]
+async fn put_config_rule_refuses_a_scope_naming_both_a_resource_and_a_tag() {
+    // A scope selects resources along ONE dimension, so a scope naming the resource
+    // dimension and the tag dimension together is refused. Rows differ along WHICH
+    // members of the two dimensions the scope combines and how many values each names:
+    // resource types with a tag key, with a key and a value, with a value alone, several
+    // resource types, one resource type with one resource id, a resource id with either
+    // tag member, and a tag key sent with the surrounding space a client is free to send.
+    let cases: [(&str, Value); 7] = [
+        (
+            "resource types and a tag key",
+            json!({ "ComplianceResourceTypes": ["AWS::S3::Bucket"], "TagKey": "stage" }),
+        ),
+        (
+            "resource types and a tag key and value",
+            json!({
+                "ComplianceResourceTypes": ["AWS::S3::Bucket"],
+                "TagKey": "stage",
+                "TagValue": "prod",
+            }),
+        ),
+        (
+            "several resource types and a tag value alone",
+            json!({
+                "ComplianceResourceTypes": ["AWS::S3::Bucket", "AWS::SQS::Queue"],
+                "TagValue": "prod",
+            }),
+        ),
+        (
+            "one resource type, one resource id and a tag key",
+            json!({
+                "ComplianceResourceTypes": ["AWS::S3::Bucket"],
+                "ComplianceResourceId": "the-logs-bucket",
+                "TagKey": "stage",
+            }),
+        ),
+        (
+            "a resource id and a tag key",
+            json!({ "ComplianceResourceId": "the-logs-bucket", "TagKey": "stage" }),
+        ),
+        (
+            "a resource id and a tag value",
+            json!({ "ComplianceResourceId": "the-logs-bucket", "TagValue": "prod" }),
+        ),
+        (
+            "resource types and a tag key with surrounding space",
+            json!({ "ComplianceResourceTypes": ["AWS::S3::Bucket"], "TagKey": "  stage " }),
+        ),
+    ];
+
+    for (index, (case, scope)) in cases.into_iter().enumerate() {
+        let emulator = Emulator::new();
+        with_recorder_and_channel(&emulator).await;
+
+        // The rule the UPDATE is refused for, created with the resource dimension alone.
+        let name = format!("scoped-rule-{index}");
+        emulator
+            .ok("PutConfigRule", &rule_scoped_by(&name, Some(&resource_scope())))
+            .await;
+
+        let (status, code, message) =
+            refusal(&emulator, "PutConfigRule", &rule_scoped_by(&name, Some(&scope))).await;
+        assert_eq!(
+            (status, code.as_str(), message.as_str()),
+            (400, "InvalidParameterValueException", SCOPE_BOTH_DIMENSIONS),
+            "case {case:?}: expected the scope refusal for {scope}, got {status} with {code} \
+             and {message:?}"
+        );
+
+        // The refused write changed NOTHING: the rule still selects along the one
+        // dimension it was created with — carrying no tag member at all — and is still
+        // the state Config wrote it in.
+        let held = described_rule(case, &emulator, &name).await;
+        assert_eq!(
+            held["Scope"],
+            resource_scope(),
+            "case {case:?}: a refused update must leave the rule's scope as it was, got {held}"
+        );
+        assert_eq!(
+            held["ConfigRuleState"].as_str(),
+            Some(ACTIVE),
+            "case {case:?}: a refused update must leave the rule {ACTIVE}, got {held}"
+        );
+
+        // The CREATE leg is the same write: the same scope under a name the account does
+        // not hold is refused the same way and creates no rule at all.
+        let fresh = format!("{name}-fresh");
+        let (status, code, message) =
+            refusal(&emulator, "PutConfigRule", &rule_scoped_by(&fresh, Some(&scope))).await;
+        assert_eq!(
+            (status, code.as_str(), message.as_str()),
+            (400, "InvalidParameterValueException", SCOPE_BOTH_DIMENSIONS),
+            "case {case:?}: expected the create to be refused too, got {status} with {code} \
+             and {message:?}"
+        );
+        let (status, code) = emulator
+            .refused("DescribeConfigRules", &json!({ "ConfigRuleNames": [fresh] }))
+            .await;
+        assert_eq!(
+            (status, code.as_str()),
+            (400, "NoSuchConfigRuleException"),
+            "case {case:?}: a refused create must create no rule, got {status} with {code}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn put_config_rule_accepts_a_scope_naming_one_dimension() {
+    // The positive controls of the same rule: each form a scope has is accepted and read
+    // back exactly. Rows differ along which dimension the scope names and how many values
+    // it names along it — no scope at all, an empty one, a tag key, a tag key and value,
+    // one resource type, several, one resource type with one resource id — and the last
+    // row names NO resource type (an empty list), so it selects along the tag dimension
+    // alone and combines with nothing.
+    #[allow(clippy::type_complexity)]
+    let cases: [(&str, Option<Value>, &[&str], Option<&str>, Option<&str>, Option<&str>); 8] = [
+        ("no Scope at all", None, &[], None, None, None),
+        ("an empty Scope", Some(json!({})), &[], None, None, None),
+        (
+            "a tag key alone",
+            Some(json!({ "TagKey": "stage" })),
+            &[],
+            None,
+            Some("stage"),
+            None,
+        ),
+        (
+            "a tag key and value",
+            Some(json!({ "TagKey": "stage", "TagValue": "prod" })),
+            &[],
+            None,
+            Some("stage"),
+            Some("prod"),
+        ),
+        (
+            "one resource type",
+            Some(json!({ "ComplianceResourceTypes": ["AWS::S3::Bucket"] })),
+            &["AWS::S3::Bucket"],
+            None,
+            None,
+            None,
+        ),
+        (
+            "several resource types",
+            Some(json!({
+                "ComplianceResourceTypes": ["AWS::S3::Bucket", "AWS::SQS::Queue", "AWS::KMS::Key"],
+            })),
+            &["AWS::S3::Bucket", "AWS::SQS::Queue", "AWS::KMS::Key"],
+            None,
+            None,
+            None,
+        ),
+        (
+            "one resource type and one resource id",
+            Some(json!({
+                "ComplianceResourceTypes": ["AWS::S3::Bucket"],
+                "ComplianceResourceId": "the-logs-bucket",
+            })),
+            &["AWS::S3::Bucket"],
+            Some("the-logs-bucket"),
+            None,
+            None,
+        ),
+        (
+            "an empty resource type list and a tag key",
+            Some(json!({ "ComplianceResourceTypes": [], "TagKey": "stage" })),
+            &[],
+            None,
+            Some("stage"),
+            None,
+        ),
+    ];
+
+    for (index, (case, scope, types, resource_id, tag_key, tag_value)) in
+        cases.into_iter().enumerate()
+    {
+        let emulator = Emulator::new();
+        with_recorder_and_channel(&emulator).await;
+        let name = format!("accepted-rule-{index}");
+
+        let answered = emulator
+            .ok("PutConfigRule", &rule_scoped_by(&name, scope.as_ref()))
+            .await;
+        assert_eq!(
+            answered,
+            json!({}),
+            "case {case:?}: PutConfigRule answers an empty body, got {answered}"
+        );
+
+        // Read back: the scope the rule now selects by is the one that was written, member
+        // for member, and the rule Config wrote is in the state it writes one in.
+        let held = described_rule(case, &emulator, &name).await;
+        let reported_types: Vec<String> = held["Scope"]["ComplianceResourceTypes"]
+            .as_array()
+            .map(|reported| {
+                reported
+                    .iter()
+                    .map(|value| value.as_str().unwrap_or_default().to_string())
+                    .collect()
+            })
+            .unwrap_or_default();
+        assert_eq!(
+            reported_types, types,
+            "case {case:?}: expected the resource types {types:?} read back, got {held}"
+        );
+        assert_eq!(
+            (
+                held["Scope"]["ComplianceResourceId"].as_str(),
+                held["Scope"]["TagKey"].as_str(),
+                held["Scope"]["TagValue"].as_str(),
+            ),
+            (resource_id, tag_key, tag_value),
+            "case {case:?}: expected the scope {scope:?} read back member for member, got {held}"
+        );
+        assert_eq!(
+            held["ConfigRuleState"].as_str(),
+            Some(ACTIVE),
+            "case {case:?}: expected the written rule to be {ACTIVE}, got {held}"
+        );
+    }
+}
+
+/// A YAML conformance pack template declaring one Config rule named `rule_name` whose
+/// `Scope` carries the properties `scope`.
+///
+/// `AWS::Config::ConfigRule` is one of the two resource types a conformance pack template
+/// declares (`PutConformancePack`: "You can use a YAML template with two resource types:
+/// Config rule (AWS::Config::ConfigRule) and remediation action
+/// (AWS::Config::RemediationConfiguration)"), and the `Source` is what CloudFormation
+/// requires of one.
+fn scoped_rule_template(rule_name: &str, scope: &str) -> String {
+    format!(
+        "Resources:\n  OnlyRule:\n    Type: AWS::Config::ConfigRule\n    Properties:\n      \
+         ConfigRuleName: {rule_name}\n      Source:\n        Owner: AWS\n        \
+         SourceIdentifier: S3_BUCKET_VERSIONING_ENABLED\n      Scope:\n{scope}"
+    )
+}
+
+#[tokio::test]
+async fn a_pack_rule_scoped_by_both_a_resource_and_a_tag_fails_the_deployment() {
+    // A deployment creates only what a direct create would accept, so the same scope rule
+    // decides a Config rule a conformance pack's template declares: a declared rule
+    // naming both dimensions deploys NOTHING and the pack settles in CREATE_FAILED with
+    // the reason naming it. Rows differ along which members the declared scope combines,
+    // and the last two are the positive controls: each single-dimension form deploys.
+    let cases: [(&str, &str, bool); 4] = [
+        (
+            "resource types and a tag key",
+            "        ComplianceResourceTypes:\n          - AWS::S3::Bucket\n        \
+             TagKey: stage\n",
+            false,
+        ),
+        (
+            "a resource id and a tag value",
+            "        ComplianceResourceId: the-logs-bucket\n        TagValue: prod\n",
+            false,
+        ),
+        (
+            "a tag key and value alone",
+            "        TagKey: stage\n        TagValue: prod\n",
+            true,
+        ),
+        (
+            "resource types alone",
+            "        ComplianceResourceTypes:\n          - AWS::S3::Bucket\n",
+            true,
+        ),
+    ];
+
+    for (case, scope, deploys) in cases {
+        let emulator = Emulator::new();
+        let pack = "scoped-pack";
+        let declared = "scoped-pack-rule";
+        // The request is ACCEPTED either way — it is the deployment that fails.
+        emulator
+            .ok(
+                "PutConformancePack",
+                &pack_from_body(pack, &scoped_rule_template(declared, scope)),
+            )
+            .await;
+
+        let detail = settled(case, &emulator, pack).await;
+        let rules = emulator.ok("DescribeConfigRules", &json!({})).await;
+        let deployed = rules["ConfigRules"].as_array().map(Vec::len).unwrap_or_default();
+        if deploys {
+            assert_eq!(
+                detail["ConformancePackState"].as_str(),
+                Some("CREATE_COMPLETE"),
+                "case {case:?}: a declared rule the account can create deploys, got {detail}"
+            );
+            assert_eq!(
+                deployed, 1,
+                "case {case:?}: the declared rule must be deployed, got {rules}"
+            );
+            continue;
+        }
+
+        assert_eq!(
+            detail["ConformancePackState"].as_str(),
+            Some("CREATE_FAILED"),
+            "case {case:?}: a deployment the account cannot perform is CREATE_FAILED, got \
+             {detail}"
+        );
+        assert!(
+            detail["ConformancePackStatusReason"]
+                .as_str()
+                .is_some_and(|reason| reason.contains(declared)),
+            "case {case:?}: the failure must name the declared rule that cannot be created, \
+             got {detail}"
+        );
+        assert_eq!(
+            deployed, 0,
+            "case {case:?}: a failed deployment creates no Config rule, got {rules}"
         );
     }
 }

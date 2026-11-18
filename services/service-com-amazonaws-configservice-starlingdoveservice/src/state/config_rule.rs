@@ -641,3 +641,65 @@ pub fn invalid_source_identifier_message(identifier: &str) -> String {
          for a list of valid sourceIdentifiers that can be used when AWS is the Owner."
     )
 }
+
+/// How Config words `InvalidParameterValueException` for a rule whose `Scope` selects
+/// resources along both of a scope's dimensions.
+///
+/// The sentence is FIXED: it states that the two dimensions cannot be combined and takes
+/// nothing from the request, because a scope naming both is wrong whatever either names.
+pub const SCOPE_RESOURCE_AND_TAG_MESSAGE: &str = "Scope cannot be applied to both resource and tag";
+
+/// Whether `scope` selects resources along BOTH of a `Scope`'s dimensions — the resource
+/// dimension and the tag dimension — which is a scope no Config rule can carry.
+///
+/// A rule's scope "can include one or more resource types, a combination of a tag key and
+/// value, or a combination of one resource type and one resource ID" (`Scope`): those
+/// three forms are ALTERNATIVES, so the resource dimension
+/// (`Scope$ComplianceResourceTypes`, `Scope$ComplianceResourceId`) and the tag dimension
+/// (`Scope$TagKey`, `Scope$TagValue`) cannot both be selected along by one scope.
+///
+/// A member naming nothing selects along no dimension, so it combines with neither: an
+/// absent member, a blank one, and an empty list of resource types all leave the
+/// dimension they belong to unnamed. `Scope$ServicePrincipals` is not one of the two
+/// dimensions — "the field is populated only if the service-linked rule is created by a
+/// service" — so it narrows nothing a caller selects along and is not read here.
+pub fn scope_names_both_dimensions(scope: Option<&Scope>) -> bool {
+    let Some(scope) = scope else {
+        return false;
+    };
+    let names_resource = scope
+        .compliance_resource_types
+        .iter()
+        .flatten()
+        .any(|resource_type| names_a_value(Some(resource_type)))
+        || names_a_value(scope.compliance_resource_id.as_deref());
+    let names_tag =
+        names_a_value(scope.tag_key.as_deref()) || names_a_value(scope.tag_value.as_deref());
+    names_resource && names_tag
+}
+
+/// Whether a scope member names a value at all: a member the request left out, or left
+/// blank, narrows nothing.
+fn names_a_value(member: Option<&str>) -> bool {
+    member.is_some_and(|value| !value.trim().is_empty())
+}
+
+/// Why the Config rule `name`, scoped by `scope`, is not one this account can create, or
+/// `None` for one it can.
+///
+/// This is the precondition `PutConfigRule` enforces on a rule a caller writes directly,
+/// stated in ONE place so a rule a conformance pack's template declares is judged by
+/// exactly the same rule — nothing can create a Config rule a create of it would refuse —
+/// the way [`unusable_remediation`] is the one reading for a declared remediation action.
+///
+/// The answer is a REASON for a deployment that could not be performed rather than the
+/// refusal the API answers a caller with, because that is what the caller of this reports;
+/// it names the rule that was declared and what about it cannot be created.
+pub fn unusable_config_rule(name: &str, scope: Option<&Scope>) -> Option<String> {
+    scope_names_both_dimensions(scope).then(|| {
+        format!(
+            "the Config rule {name} is scoped by both a resource and a tag, and a scope \
+             selects resources along one of those dimensions only"
+        )
+    })
+}

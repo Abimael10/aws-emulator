@@ -10,6 +10,11 @@
 //! no managed rule to evaluate, so the write is refused rather than creating a rule
 //! nothing evaluates ([`crate::state::withdrawn_managed_rule_identifier`]).
 //!
+//! A rule's `Scope` selects the resources it evaluates along ONE dimension — resource
+//! types and ids, OR a tag — so a scope naming both is no scope Config can select with and
+//! the write is refused, leaving the rule the account holds as it was
+//! ([`crate::state::scope_names_both_dimensions`]).
+//!
 //! A rule owned by CUSTOM_LAMBDA is evaluated by the function its `SourceIdentifier` names
 //! rather than by Config, so the write is refused `InsufficientPermissionsException` where
 //! Config could not invoke that function — the ARN names none, or its own resource-based
@@ -283,6 +288,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(PutConfigRuleErrorModeled::InvalidParameterValueException(
                 InvalidParameterValueException {
                     message: Some(crate::state::invalid_source_identifier_message(withdrawn)),
+                },
+            )
+            .into());
+        }
+
+        // A rule's scope selects the resources it evaluates along ONE of its dimensions:
+        // resource types and ids, or a tag. A scope naming BOTH names no selection Config
+        // makes, so no rule is created or updated to carry one
+        // ([`crate::state::scope_names_both_dimensions`]). Judged before anything is
+        // written, so a refused request leaves the rule the account holds — or does not
+        // hold — exactly as it was.
+        if crate::state::scope_names_both_dimensions(requested.scope.as_ref()) {
+            return Err(PutConfigRuleErrorModeled::InvalidParameterValueException(
+                InvalidParameterValueException {
+                    message: Some(crate::state::SCOPE_RESOURCE_AND_TAG_MESSAGE.to_string()),
                 },
             )
             .into());

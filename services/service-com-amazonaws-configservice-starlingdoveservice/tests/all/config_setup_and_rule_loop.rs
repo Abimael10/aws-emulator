@@ -719,18 +719,30 @@ async fn a_rule_is_read_back_exactly_as_it_was_put() {
             }),
         ));
     }
+    // A scope selects along ONE of its dimensions ("one or more resource types, a
+    // combination of a tag key and value, or a combination of one resource type and one
+    // resource ID", `Scope`), so the scoped rows carry one form each: this one the
+    // resource form, the next the tag form.
     cases.push((
-        "a scoped rule".to_string(),
+        "a rule scoped to one resource type and one resource id".to_string(),
         json!({
             "ConfigRuleName": "scoped-rule",
             "Description": "resources in scope only",
             "Source": { "Owner": "AWS", "SourceIdentifier": "S3_BUCKET_VERSIONING_ENABLED" },
             "Scope": {
                 "ComplianceResourceTypes": ["AWS::S3::Bucket"],
-                "TagKey": "env",
-                "TagValue": "prod",
+                "ComplianceResourceId": "the-logs-bucket",
             },
             "InputParameters": "{\"minimumCount\":\"1\"}",
+        }),
+    ));
+    cases.push((
+        "a rule scoped by a tag".to_string(),
+        json!({
+            "ConfigRuleName": "tag-scoped-rule",
+            "Description": "tagged resources only",
+            "Source": { "Owner": "AWS", "SourceIdentifier": "S3_BUCKET_VERSIONING_ENABLED" },
+            "Scope": { "TagKey": "env", "TagValue": "prod" },
         }),
     ));
     cases.push((
