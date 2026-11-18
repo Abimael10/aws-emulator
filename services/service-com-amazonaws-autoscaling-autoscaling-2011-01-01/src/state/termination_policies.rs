@@ -67,7 +67,7 @@ use std::cmp::Reverse;
 use std::collections::BTreeMap;
 use std::time::{Duration, SystemTime};
 
-use super::{StoredGroup, StoredInstance, StoredLaunchConfiguration, LIFECYCLE_TERMINATING};
+use super::{StoredGroup, StoredInstance, StoredLaunchConfiguration};
 
 /// The policy a group that configures none applies ([`super::DEFAULT_TERMINATION_POLICY`]).
 pub const DEFAULT: &str = "Default";
@@ -190,9 +190,7 @@ fn candidates(group: &StoredGroup) -> Vec<&StoredInstance> {
     let mut candidates: Vec<&StoredInstance> = group
         .instances
         .iter()
-        .filter(|instance| {
-            instance.lifecycle_state != LIFECYCLE_TERMINATING && !instance.protected_from_scale_in
-        })
+        .filter(|instance| !instance.is_leaving_group() && !instance.protected_from_scale_in)
         .collect();
     candidates.sort_by_key(|instance| Reverse((instance.launched_at, instance.launch_sequence)));
     candidates

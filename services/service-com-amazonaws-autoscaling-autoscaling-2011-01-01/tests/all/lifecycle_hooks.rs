@@ -30,6 +30,8 @@
 
 use smithy_server_runtime::MultiServiceRouter;
 
+use service_com_amazonaws_autoscaling_autoscaling_2011_01_01 as autoscaling;
+
 use crate::support::{
     borrowed, new_engine, p, query, router_with, tag_value, tag_values, xml_unescape,
 };
@@ -1228,4 +1230,592 @@ async fn a_call_against_an_absent_group_is_refused() {
         hooks.is_empty(),
         "the refusals above wrote nothing on the group that does exist, got {hooks:?}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// THE HOLD a stored hook puts in front of the transition it names.
+//
+// The rule: a hook is not a record a client reads back — when the group holds one for the
+// transition an instance is taking, that instance is put into the transition's WAIT state
+// and a `LifecycleActionToken` is minted for the hold; it stays there until the token (or
+// the instance id) is passed back through `CompleteLifecycleAction`, with
+// `RecordLifecycleActionHeartbeat` keeping it waiting, or until the hook's heartbeat runs
+// out and the hook's own `DefaultResult` is applied. A launch that carries on then comes
+// into service, a launch that is abandoned leaves the group, and a termination resumes
+// either way.
+//
+// The rows span what that rule generalises over: WHICH transition is held, HOW the hold
+// ends (the instance id, the token, a heartbeat and then the token, or the hook's own
+// deadline), and WHICH result ends it. The announcement of the hold on the account's event
+// bus — the only place the token reaches a client — is the cross-service half of the same
+// rule and is covered by `core/router/tests/all/autoscaling_lifecycle_hook_actions.rs`,
+// which drives the whole mounted service set.
+// ---------------------------------------------------------------------------
+
+/// The two wait states a held instance is reported in, and the state a launch that carried
+/// on reaches: the model's own `LifecycleState` values
+/// (`smithy_query(query="shape",shape="LifecycleState")`), written out here so a wrong
+/// constant in the implementation cannot make these rows pass.
+const PENDING_WAIT: &str = "Pending:Wait";
+const TERMINATING_WAIT: &str = "Terminating:Wait";
+const IN_SERVICE: &str = "InService";
+
+/// How long a `LifecycleActionToken` is: `@length(min: 36, max: 36)` on the model's own
+/// `LifecycleActionToken` shape.
+const TOKEN_LENGTH: usize = 36;
+
+/// The launch source the held groups launch from, created over Amazon EC2's own wire
+/// because an instance is only launched from a template that can produce one.
+const HOLD_TEMPLATE: &str = "lt-hold";
+
+/// How long a leg waits for what it is waiting on before giving up, and how often it looks:
+/// far above the work one capacity change makes, and driven off what the group REPORTS
+/// rather than off a fixed sleep, so a loaded machine delays a row instead of breaking it.
+const HOLD_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
+const HOLD_POLL: std::time::Duration = std::time::Duration::from_millis(25);
+
+/// The one instance the group holds and the `LifecycleState` it is reported in, or `None`
+/// when the group holds none.
+async fn held_instance(router: &MultiServiceRouter, group: &str) -> Option<(String, String)> {
+    let (status, body) = query(
+        router,
+        "DescribeAutoScalingGroups",
+        &[("AutoScalingGroupNames.member.1", group)],
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "the group {group:?} must be readable, got {status} with {body:?}"
+    );
+    let ids = tag_values(&body, "InstanceId");
+    assert!(
+        ids.len() <= 1,
+        "every group of this table holds at most one instance, got {ids:?}"
+    );
+    ids.into_iter()
+        .next()
+        .map(|id| (id, tag_value(&body, "LifecycleState")))
+}
+
+/// Look at the group until it reports `expected` for the one instance it holds — `None`
+/// meaning it holds none at all — or [`HOLD_DEADLINE`] passes; answer that instance's id.
+async fn poll_state(
+    router: &MultiServiceRouter,
+    case: &str,
+    group: &str,
+    expected: Option<&str>,
+) -> Option<String> {
+    let deadline = std::time::Instant::now() + HOLD_DEADLINE;
+    loop {
+        let held = held_instance(router, group).await;
+        if held.as_ref().map(|(_, state)| state.as_str()) == expected {
+            return held.map(|(id, _)| id);
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "case {case:?}: the group must report {expected:?}, got {held:?}"
+        );
+        tokio::time::sleep(HOLD_POLL).await;
+    }
+}
+
+/// The lifecycle actions the store is holding for the group, as
+/// `(instance id, hook name, token)`.
+///
+/// Read off the store because the token is published to the account's event bus and
+/// nowhere in this service's own API: what is under test here is the hold itself, so the
+/// token is taken from where the handler wrote it and passed back over the wire, which is
+/// the only way a callback can address the action at all.
+fn held_actions(
+    engine: &std::sync::Arc<engine::InMemoryEngine>,
+    group: &str,
+) -> Vec<(String, String, String)> {
+    let state = autoscaling::state::service_state(&**engine)
+        .expect("the Auto Scaling store is mounted on this engine");
+    let store = state.lock();
+    let Some(stored) = store.groups.get(group) else {
+        return Vec::new();
+    };
+    stored
+        .instances
+        .iter()
+        .flat_map(|instance| {
+            instance
+                .pending_lifecycle_actions
+                .iter()
+                .map(|action| {
+                    (
+                        instance.instance_id.clone(),
+                        action.hook_name.clone(),
+                        action.token.clone(),
+                    )
+                })
+                .collect::<Vec<(String, String, String)>>()
+        })
+        .collect()
+}
+
+/// Backdate every hold the group has taken, so each one's own deadline has passed.
+///
+/// The shortest `HeartbeatTimeout` the service accepts ([`MIN_HEARTBEAT_TIMEOUT`]) is far
+/// longer than a test may wait, so a row drives the CLOCK rather than waiting for it: the
+/// deadline the hold stored is moved into the past, and the next read of the store
+/// materialises what that instant made due exactly as it would have on its own.
+fn time_out_every_hold(engine: &std::sync::Arc<engine::InMemoryEngine>, group: &str) {
+    let state = autoscaling::state::service_state(&**engine)
+        .expect("the Auto Scaling store is mounted on this engine");
+    let mut store = state.lock();
+    let stored = store
+        .groups
+        .get_mut(group)
+        .unwrap_or_else(|| panic!("the group {group:?} must be stored for its holds to time out"));
+    for instance in &mut stored.instances {
+        for action in &mut instance.pending_lifecycle_actions {
+            action.heartbeat_due = std::time::SystemTime::UNIX_EPOCH;
+            action.global_due = std::time::SystemTime::UNIX_EPOCH;
+        }
+    }
+}
+
+/// One row of the hold table.
+struct HoldRow {
+    case: &'static str,
+    /// The transition the row's hook holds.
+    transition: &'static str,
+    /// The `LifecycleState` the held instance must be reported in.
+    wait_state: &'static str,
+    /// The hook's `DefaultResult`, which is what its own deadline applies.
+    default_result: &'static str,
+    /// The result a callback passes back, or `None` to leave the hold to that deadline.
+    callback: Option<&'static str>,
+    /// Whether the callback is addressed by the action's TOKEN (and heartbeated first)
+    /// rather than by the instance id.
+    by_token: bool,
+    /// What the group must report for the instance once the hold has ended and settled:
+    /// `None` for an instance that left the group.
+    settles_at: Option<&'static str>,
+}
+
+/// THE RULE: a hook holds the transition it names until the action it minted is resolved.
+#[tokio::test]
+async fn a_hook_holds_the_transition_it_is_configured_for() {
+    let rows: &[HoldRow] = &[
+        HoldRow {
+            case: "a launch continued by the instance id",
+            transition: TRANSITIONS[0],
+            wait_state: PENDING_WAIT,
+            default_result: RESULTS[1],
+            callback: Some(RESULTS[0]),
+            by_token: false,
+            settles_at: Some(IN_SERVICE),
+        },
+        HoldRow {
+            case: "a launch heartbeated and then continued by its token",
+            transition: TRANSITIONS[0],
+            wait_state: PENDING_WAIT,
+            default_result: RESULTS[1],
+            callback: Some(RESULTS[0]),
+            by_token: true,
+            settles_at: Some(IN_SERVICE),
+        },
+        HoldRow {
+            case: "a launch abandoned by its token",
+            transition: TRANSITIONS[0],
+            wait_state: PENDING_WAIT,
+            default_result: RESULTS[0],
+            callback: Some(RESULTS[1]),
+            by_token: true,
+            settles_at: None,
+        },
+        HoldRow {
+            case: "a launch left to its own deadline, defaulting to CONTINUE",
+            transition: TRANSITIONS[0],
+            wait_state: PENDING_WAIT,
+            default_result: RESULTS[0],
+            callback: None,
+            by_token: false,
+            settles_at: Some(IN_SERVICE),
+        },
+        HoldRow {
+            case: "a launch left to its own deadline, defaulting to ABANDON",
+            transition: TRANSITIONS[0],
+            wait_state: PENDING_WAIT,
+            default_result: RESULTS[1],
+            callback: None,
+            by_token: false,
+            settles_at: None,
+        },
+        HoldRow {
+            case: "a termination continued by the instance id",
+            transition: TRANSITIONS[1],
+            wait_state: TERMINATING_WAIT,
+            default_result: RESULTS[1],
+            callback: Some(RESULTS[0]),
+            by_token: false,
+            settles_at: None,
+        },
+        HoldRow {
+            case: "a termination abandoned by its token",
+            transition: TRANSITIONS[1],
+            wait_state: TERMINATING_WAIT,
+            default_result: RESULTS[0],
+            callback: Some(RESULTS[1]),
+            by_token: true,
+            settles_at: None,
+        },
+        HoldRow {
+            case: "a termination left to its own deadline",
+            transition: TRANSITIONS[1],
+            wait_state: TERMINATING_WAIT,
+            default_result: RESULTS[1],
+            callback: None,
+            by_token: false,
+            settles_at: None,
+        },
+    ];
+
+    for (index, row) in rows.iter().enumerate() {
+        let case = row.case;
+        // One emulator per row, so one row's group and hook cannot decide another's.
+        let (router, engine) = crate::support::emulator();
+        crate::support::create_launch_template(&router, HOLD_TEMPLATE).await;
+        let subnet = crate::support::seed_subnets(&engine, 1)
+            .first()
+            .expect("one seeded subnet")
+            .id
+            .clone();
+
+        let group = format!("asg-held-{index}");
+        let params = vec![
+            p("AutoScalingGroupName", &group),
+            p("LaunchTemplate.LaunchTemplateName", HOLD_TEMPLATE),
+            p("MinSize", "0"),
+            p("MaxSize", "1"),
+            p("DesiredCapacity", "0"),
+            p("VPCZoneIdentifier", &subnet),
+        ];
+        let (status, body) = query(&router, "CreateAutoScalingGroup", &borrowed(&params)).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: the group must be created, got {status} with {body:?}"
+        );
+        let (status, code, message) = put_hook(
+            &router,
+            &group,
+            "hold",
+            &[
+                p("LifecycleTransition", row.transition),
+                p("DefaultResult", row.default_result),
+                p("HeartbeatTimeout", "300"),
+            ],
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: the hook must be stored, got {status} with {code:?} {message:?}"
+        );
+
+        // What puts the instance into the held transition: the capacity change the row's
+        // hook is configured for. A terminating hook holds the SCALE-IN, so the group's one
+        // instance has to be in service before it.
+        set_capacity(&router, case, &group, 1).await;
+        if row.transition == TRANSITIONS[1] {
+            poll_state(&router, case, &group, Some(IN_SERVICE)).await;
+            set_capacity(&router, case, &group, 0).await;
+        }
+
+        let instance_id = poll_state(&router, case, &group, Some(row.wait_state))
+            .await
+            .unwrap_or_else(|| panic!("case {case:?}: the held instance must be reported"));
+        // The hold the hook took: one action, under that hook, carrying a token of the
+        // modelled length.
+        let actions = held_actions(&engine, &group);
+        assert_eq!(
+            actions.len(),
+            1,
+            "case {case:?}: the one hook holding the instance must hold one action, got \
+             {actions:?}"
+        );
+        let (held_id, hook_name, token) = actions[0].clone();
+        assert_eq!(
+            (held_id.as_str(), hook_name.as_str()),
+            (instance_id.as_str(), "hold"),
+            "case {case:?}: the action must be held against the reported instance by the \
+             group's own hook, got {actions:?}"
+        );
+        assert_eq!(
+            token.chars().count(),
+            TOKEN_LENGTH,
+            "case {case:?}: the minted token must be {TOKEN_LENGTH} characters, got {token:?}"
+        );
+
+        match row.callback {
+            None => {
+                time_out_every_hold(&engine, &group);
+                // The next read materialises what that instant made due.
+                held_instance(&router, &group).await;
+            }
+            Some(result) if row.by_token => {
+                // The heartbeat keeps the hold waiting, and the group still reports it so.
+                let (status, body) = query(
+                    &router,
+                    "RecordLifecycleActionHeartbeat",
+                    &[
+                        ("AutoScalingGroupName", group.as_str()),
+                        ("LifecycleHookName", "hold"),
+                        ("LifecycleActionToken", token.as_str()),
+                    ],
+                )
+                .await;
+                assert_eq!(
+                    status, 200,
+                    "case {case:?}: the heartbeat must be accepted, got {status} with {body:?}"
+                );
+                let still = held_instance(&router, &group).await;
+                assert_eq!(
+                    still.as_ref().map(|(_, state)| state.as_str()),
+                    Some(row.wait_state),
+                    "case {case:?}: a heartbeat keeps the instance waiting, got {still:?}"
+                );
+                complete_hold(
+                    &router,
+                    case,
+                    &group,
+                    "hold",
+                    &[
+                        ("LifecycleActionToken", token.as_str()),
+                        ("LifecycleActionResult", result),
+                    ],
+                )
+                .await;
+            }
+            Some(result) => {
+                complete_hold(
+                    &router,
+                    case,
+                    &group,
+                    "hold",
+                    &[
+                        ("InstanceId", instance_id.as_str()),
+                        ("LifecycleActionResult", result),
+                    ],
+                )
+                .await;
+            }
+        }
+
+        poll_state(&router, case, &group, row.settles_at).await;
+        assert!(
+            held_actions(&engine, &group).is_empty(),
+            "case {case:?}: a resolved hold is no longer held, got {:?}",
+            held_actions(&engine, &group)
+        );
+    }
+}
+
+/// Ask for `desired` capacity on the group, which must be accepted.
+async fn set_capacity(router: &MultiServiceRouter, case: &str, group: &str, desired: i32) {
+    let (status, body) = query(
+        router,
+        "SetDesiredCapacity",
+        &[
+            ("AutoScalingGroupName", group),
+            ("DesiredCapacity", &desired.to_string()),
+        ],
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: SetDesiredCapacity {desired} must be accepted, got {status} with \
+         {body:?}"
+    );
+}
+
+/// Post one `CompleteLifecycleAction` against the hook `hook`, carrying `members` beyond
+/// the group and hook names, which must be accepted.
+async fn complete_hold(
+    router: &MultiServiceRouter,
+    case: &str,
+    group: &str,
+    hook: &str,
+    members: &[(&str, &str)],
+) {
+    let mut params: Vec<(&str, &str)> = vec![
+        ("AutoScalingGroupName", group),
+        ("LifecycleHookName", hook),
+    ];
+    params.extend_from_slice(members);
+    let (status, body) = query(router, "CompleteLifecycleAction", &params).await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: the callback must be accepted, got {status} with {body:?}"
+    );
+}
+
+/// A hold does not outlive the move it was waiting on: taking an instance out of service
+/// while a LAUNCH hook is still holding it discards that hold, so the instance leaves the
+/// group, the hold's own deadline cannot bring it back, and the token it was addressed by
+/// resolves nothing.
+///
+/// Two rows, differing along what the group holds for the termination it is now taking: no
+/// hook at all (the instance goes straight out) and a termination hook (the launch hold is
+/// replaced by that hook's own, under a new token). Each group's launch hook defaults to
+/// CONTINUE, so a hold left behind would be the one that reports a terminated instance in
+/// service again.
+#[tokio::test]
+async fn a_held_instance_taken_out_of_service_leaves_the_group() {
+    // (case, whether the group also holds a hook for the terminating transition)
+    for (index, (case, also_terminating)) in [
+        ("a group holding only the launch hook", false),
+        ("a group holding a termination hook as well", true),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let (router, engine) = crate::support::emulator();
+        crate::support::create_launch_template(&router, HOLD_TEMPLATE).await;
+        let subnet = crate::support::seed_subnets(&engine, 1)
+            .first()
+            .expect("one seeded subnet")
+            .id
+            .clone();
+
+        let group = format!("asg-held-out-{index}");
+        let params = vec![
+            p("AutoScalingGroupName", &group),
+            p("LaunchTemplate.LaunchTemplateName", HOLD_TEMPLATE),
+            p("MinSize", "0"),
+            p("MaxSize", "1"),
+            p("DesiredCapacity", "0"),
+            p("VPCZoneIdentifier", &subnet),
+        ];
+        let (status, body) = query(&router, "CreateAutoScalingGroup", &borrowed(&params)).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: the group must be created, got {status} with {body:?}"
+        );
+        let (status, code, message) = put_hook(
+            &router,
+            &group,
+            "hold",
+            &[
+                p("LifecycleTransition", TRANSITIONS[0]),
+                p("DefaultResult", RESULTS[0]),
+                p("HeartbeatTimeout", "300"),
+            ],
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: the launch hook must be stored, got {status} with {code:?} \
+             {message:?}"
+        );
+        if also_terminating {
+            let (status, code, message) = put_hook(
+                &router,
+                &group,
+                "hold-out",
+                &[
+                    p("LifecycleTransition", TRANSITIONS[1]),
+                    p("DefaultResult", RESULTS[1]),
+                    p("HeartbeatTimeout", "300"),
+                ],
+            )
+            .await;
+            assert_eq!(
+                status, 200,
+                "case {case:?}: the termination hook must be stored, got {status} with \
+                 {code:?} {message:?}"
+            );
+        }
+
+        set_capacity(&router, case, &group, 1).await;
+        poll_state(&router, case, &group, Some(PENDING_WAIT)).await;
+        let launch_hold = held_actions(&engine, &group);
+        assert_eq!(
+            launch_hold.len(),
+            1,
+            "case {case:?}: the launch hook must be holding the instance, got {launch_hold:?}"
+        );
+        let stale_token = launch_hold[0].2.clone();
+
+        // The scale-in takes the instance the launch hook is still holding.
+        set_capacity(&router, case, &group, 0).await;
+
+        if also_terminating {
+            // The launch hold is over, so the termination hook's own hold replaces it: a new
+            // action under that hook, and the token the launch hold was addressed by
+            // resolves nothing.
+            poll_state(&router, case, &group, Some(TERMINATING_WAIT)).await;
+            let terminate_hold = held_actions(&engine, &group);
+            assert_eq!(
+                terminate_hold.len(),
+                1,
+                "case {case:?}: exactly the termination hook's hold must remain, got \
+                 {terminate_hold:?}"
+            );
+            assert_eq!(
+                terminate_hold[0].1, "hold-out",
+                "case {case:?}: the remaining hold belongs to the termination hook, got \
+                 {terminate_hold:?}"
+            );
+            assert_ne!(
+                terminate_hold[0].2, stale_token,
+                "case {case:?}: the termination hold carries its own token, got \
+                 {terminate_hold:?}"
+            );
+            let (status, body) = query(
+                &router,
+                "CompleteLifecycleAction",
+                &[
+                    ("AutoScalingGroupName", group.as_str()),
+                    ("LifecycleHookName", "hold"),
+                    ("LifecycleActionToken", stale_token.as_str()),
+                    ("LifecycleActionResult", RESULTS[0]),
+                ],
+            )
+            .await;
+            assert_eq!(
+                status, 400,
+                "case {case:?}: the discarded launch token must resolve nothing, got {status} \
+                 with {body:?}"
+            );
+            assert_eq!(
+                xml_unescape(&tag_value(&body, "Message")),
+                format!("No active Lifecycle Action found with token {stale_token}"),
+                "case {case:?}: got {body:?}"
+            );
+            complete_hold(
+                &router,
+                case,
+                &group,
+                "hold-out",
+                &[
+                    ("InstanceId", terminate_hold[0].0.as_str()),
+                    ("LifecycleActionResult", RESULTS[0]),
+                ],
+            )
+            .await;
+        } else {
+            assert!(
+                held_actions(&engine, &group).is_empty(),
+                "case {case:?}: the launch hold must be discarded when the instance is taken \
+                 out of service, got {:?}",
+                held_actions(&engine, &group)
+            );
+        }
+
+        // The instance leaves the group, and nothing the clock owes brings it back: the
+        // group reports none from then on.
+        poll_state(&router, case, &group, None).await;
+        for _ in 0..3 {
+            tokio::time::sleep(HOLD_POLL).await;
+            let held = held_instance(&router, &group).await;
+            assert!(
+                held.is_none(),
+                "case {case:?}: a group whose only instance was taken out of service reports \
+                 none, got {held:?}"
+            );
+        }
+    }
 }

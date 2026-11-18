@@ -27,7 +27,7 @@ use std::time::SystemTime;
 
 use super::{
     ec2_instances, AutoScalingState, InstanceLifecycle, InstanceLifecycleChange,
-    LIFECYCLE_TERMINATING, LIFECYCLE_TRANSITION,
+    LIFECYCLE_TRANSITION,
 };
 
 /// What the activity of an instance the group lost to an Amazon EC2 state change records,
@@ -55,9 +55,9 @@ impl AutoScalingState {
     /// and let each group converge on the capacity it is configured for — which launches a
     /// replacement for every unit those instances were providing.
     ///
-    /// An instance already on its way out of its group ([`LIFECYCLE_TERMINATING`]) is left
-    /// alone: it is leaving for a reason the group itself recorded, and Amazon EC2 reports
-    /// it shutting down precisely because the group asked for that.
+    /// An instance already on its way out of its group ([`StoredInstance::is_leaving_group`])
+    /// is left alone: it is leaving for a reason the group itself recorded, and Amazon EC2
+    /// reports it shutting down precisely because the group asked for that.
     ///
     /// Reads Amazon EC2's store ONCE for every member of every group, and writes nothing
     /// for a group that has lost nothing, so the pass every handler makes costs one read of
@@ -76,7 +76,7 @@ impl AutoScalingState {
                 let instance_ids: Vec<String> = group
                     .instances
                     .iter()
-                    .filter(|instance| instance.lifecycle_state != LIFECYCLE_TERMINATING)
+                    .filter(|instance| !instance.is_leaving_group())
                     .map(|instance| instance.instance_id.clone())
                     .collect();
                 (group.name.clone(), instance_ids)
@@ -121,7 +121,7 @@ impl AutoScalingState {
             let cause = format!("{EC2_INSTANCE_GONE_REASON}.");
             let replacement_cause = format!("{UNHEALTHY_REPLACEMENT_REASON}.");
             let due = now + LIFECYCLE_TRANSITION;
-            self.terminate_group_instances(engine, &group_name, &lost, due);
+            self.terminate_group_instances(engine, &group_name, &lost, now, due);
             for instance_id in &lost {
                 self.record_instance_lifecycle_change(
                     engine,

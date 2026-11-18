@@ -287,6 +287,11 @@ impl AutoScalingState {
                     launch_sequence: first_sequence
                         .saturating_add(u64::try_from(offset).unwrap_or(u64::MAX)),
                     transition_due: Some(due),
+                    // The group's own launch lifecycle hooks are put in front of the
+                    // attached instance once it is placed below
+                    // ([`super::lifecycle_actions`]).
+                    pending_lifecycle_actions: Vec::new(),
+                    held_step: None,
                 })
             })
             .collect();
@@ -297,6 +302,15 @@ impl AutoScalingState {
         if let Some(group) = self.groups.get_mut(group_name) {
             group.instances.extend(attached);
         }
+        // An instance an attach brought into the group is coming into service, so every
+        // launch lifecycle hook the group configures holds it exactly as it holds one the
+        // group launched itself ([`super::lifecycle_actions`]).
+        self.hold_lifecycle_transition(
+            group_name,
+            super::HeldTransition::Launching,
+            &attached_ids,
+            now,
+        );
         // Amazon EC2 Auto Scaling puts its own group tag on every instance of a group, so
         // the instance an attach took reports the group it is now part of where Amazon EC2
         // reports an instance's tags.

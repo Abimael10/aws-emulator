@@ -107,11 +107,25 @@ pub mod lifecycle_hooks;
 
 pub use lifecycle_hooks::{
     absent_lifecycle_hook_message, heartbeat_timeout_violation_message, put_lifecycle_hook,
-    too_many_hooks_message, transition_missing_message, unknown_result_message,
-    unknown_transition_message, unsupported_notification_target_message,
+    too_many_hooks_message, transition_missing_message, unknown_lifecycle_action_result_message,
+    unknown_result_message, unknown_transition_message, unsupported_notification_target_message,
     validate_lifecycle_hook_members, LifecycleHookPut, LifecycleHookRefusal, LifecycleHooks,
     StoredLifecycleHook, DEFAULT_HEARTBEAT_TIMEOUT, DEFAULT_LIFECYCLE_ACTION_RESULT,
-    LIFECYCLE_ACTION_RESULTS, MAX_LIFECYCLE_HOOKS_PER_GROUP, NOTIFICATION_TARGET_VENDORS,
+    LIFECYCLE_ACTION_CONTINUE, LIFECYCLE_ACTION_RESULTS, MAX_LIFECYCLE_HOOKS_PER_GROUP,
+    NOTIFICATION_TARGET_VENDORS,
+};
+
+/// The lifecycle ACTIONS those hooks hold a group's instances at: the wait state an instance
+/// is held in, the token a client completes the hold with, and the events that announce it.
+pub mod lifecycle_actions;
+
+pub use lifecycle_actions::{
+    abandoned_launch_cause, no_active_action_by_instance_message, no_active_action_by_token_message,
+    not_addressed_message, HeldStep, HeldTransition, LifecycleActionKey, LifecycleActionRefusal,
+    PendingLifecycleActionEvent, StoredLifecycleAction, LAUNCH_LIFECYCLE_ACTION,
+    LIFECYCLE_PENDING_PROCEED, LIFECYCLE_PENDING_WAIT, LIFECYCLE_TERMINATING_PROCEED,
+    LIFECYCLE_TERMINATING_WAIT, MAX_PENDING_LIFECYCLE_ACTION_EVENTS, TERMINATE_LIFECYCLE_ACTION,
+    TRANSITION_LAUNCHING, TRANSITION_TERMINATING,
 };
 
 /// The warm pool of a group: the pre-initialized instances `PutWarmPool` has the group
@@ -707,7 +721,20 @@ pub struct StoredInstance {
     /// instance. Not part of what the API reports for an instance.
     pub launch_sequence: u64,
     /// When this instance's transient lifecycle state comes due, if it is in one.
+    ///
+    /// Unfilled while a lifecycle hook is holding the instance
+    /// ([`Self::pending_lifecycle_actions`]): nothing the clock owes moves a held instance
+    /// on, only the resolution of the hold does.
     pub transition_due: Option<SystemTime>,
+    /// The lifecycle actions the group's own lifecycle hooks are holding this instance at,
+    /// one per hook configured for the transition it is taking ([`lifecycle_actions`]).
+    /// Empty for an instance no hook is holding, which is every instance of a group that
+    /// configures no hook for its transition.
+    pub pending_lifecycle_actions: Vec<StoredLifecycleAction>,
+    /// The step the group is mid-way through for this instance while a hook holds it — the
+    /// activity it recorded and the event it queued — neither of which is a fact until that
+    /// hold resolves ([`lifecycle_actions::HeldStep`]).
+    pub held_step: Option<HeldStep>,
 }
 
 impl StoredInstance {
@@ -887,7 +914,7 @@ impl StoredGroup {
     pub fn active_instances(&self) -> impl Iterator<Item = &StoredInstance> {
         self.instances
             .iter()
-            .filter(|i| i.lifecycle_state != LIFECYCLE_TERMINATING && !i.is_in_standby())
+            .filter(|i| !i.is_leaving_group() && !i.is_in_standby())
     }
 
     /// How many instances count towards the group's capacity.
@@ -1127,10 +1154,10 @@ impl StoredGroup {
     pub fn instances_to_terminate(&self, instance_ids: &[String]) -> Vec<String> {
         let mut taken: Vec<String> = Vec::new();
         for instance_id in instance_ids {
-            let still_in_service = self.instances.iter().any(|instance| {
-                instance.instance_id == *instance_id
-                    && instance.lifecycle_state != LIFECYCLE_TERMINATING
-            });
+            let still_in_service = self
+                .instances
+                .iter()
+                .any(|instance| instance.instance_id == *instance_id && !instance.is_leaving_group());
             if still_in_service && !taken.contains(instance_id) {
                 taken.push(instance_id.clone());
             }
@@ -1368,6 +1395,11 @@ pub struct ComAmazonawsAutoscalingAutoscaling20110101State {
     /// ([`lifecycle_events`]). At most [`lifecycle_events::MAX_PENDING_EVENTS`] entries,
     /// the oldest dropped first.
     pending_lifecycle_events: VecDeque<PendingLifecycleEvent>,
+    /// The lifecycle-action events this store has not published to EventBridge yet, oldest
+    /// first, each due from the instant the hold it announces started
+    /// ([`lifecycle_actions`]). At most [`MAX_PENDING_LIFECYCLE_ACTION_EVENTS`] entries, the
+    /// oldest dropped first.
+    pending_lifecycle_action_events: VecDeque<PendingLifecycleActionEvent>,
     /// Whether a clock pump ([`drive_lifecycle_clock`]) is already waiting on this store's
     /// due instants, so at most one runs per store.
     lifecycle_clock_pump_running: bool,
@@ -1844,7 +1876,9 @@ impl AutoScalingState {
             for instance in &mut group.instances {
                 if instance.transition_due.is_some_and(|due| due <= now) {
                     instance.transition_due = None;
-                    if instance.lifecycle_state == LIFECYCLE_PENDING {
+                    if instance.lifecycle_state == LIFECYCLE_PENDING
+                        || instance.lifecycle_state == LIFECYCLE_PENDING_PROCEED
+                    {
                         instance.lifecycle_state = LIFECYCLE_IN_SERVICE.to_string();
                     } else if instance.lifecycle_state == LIFECYCLE_ENTERING_STANDBY {
                         // An instance `EnterStandby` started parking has finished parking.
@@ -1852,11 +1886,18 @@ impl AutoScalingState {
                     }
                 }
             }
-            // An instance whose `Terminating` span has elapsed has left the group.
-            group
-                .instances
-                .retain(|i| i.lifecycle_state != LIFECYCLE_TERMINATING || i.transition_due.is_some());
+            // An instance whose span out of the group has elapsed has left it. One a
+            // termination hook is still holding has NOT: its wait is what the group is
+            // waiting on, and resolving that hold is what starts the span
+            // ([`lifecycle_actions`]).
+            group.instances.retain(|i| {
+                !i.is_leaving_group() || i.transition_due.is_some() || i.is_held_by_lifecycle_hook()
+            });
         }
+        // The holds the clock has timed out: a lifecycle action nobody completed before its
+        // own deadline resolves to the hook's `DefaultResult`, which is what keeps an
+        // instance from waiting for a client that never came back.
+        self.expire_lifecycle_actions(engine, now);
         // The warm pools the groups maintain: the transitions of their instances, and the
         // difference between each pool's size and the size it maintains, which the clock
         // owes exactly as it owes a group's own ([`warm_pools`]).
@@ -1974,7 +2015,7 @@ impl AutoScalingState {
         group.cooldown_until = Some(now + Duration::from_secs(u64::from(cooldown.unsigned_abs())));
 
         let terminated_ids = self.scale_in_selection(group_name, surplus_units, now);
-        self.terminate_group_instances(engine, group_name, &terminated_ids, due);
+        self.terminate_group_instances(engine, group_name, &terminated_ids, now, due);
 
         for instance_id in launched_ids {
             self.record_instance_lifecycle_change(
@@ -2107,7 +2148,7 @@ impl AutoScalingState {
         };
 
         let due = now + LIFECYCLE_TRANSITION;
-        self.terminate_group_instances(engine, group_name, &taken, due);
+        self.terminate_group_instances(engine, group_name, &taken, now, due);
         // Each termination is recorded — and its event queued — through THE ONE path a
         // lifecycle step of a group's instance goes down, so a termination a caller named
         // is announced exactly like one a capacity change chose. The activity it stored is
@@ -2305,6 +2346,11 @@ impl AutoScalingState {
                 launch_sequence: first_sequence
                     .saturating_add(u64::try_from(offset).unwrap_or(u64::MAX)),
                 transition_due: Some(request.due),
+                // A launch into the GROUP may be held by the group's own launch lifecycle
+                // hooks, which is applied once the instances are placed below
+                // ([`lifecycle_actions`]).
+                pending_lifecycle_actions: Vec::new(),
+                held_step: None,
             })
             .collect();
         let launched_ids: Vec<String> = launched
@@ -2332,6 +2378,18 @@ impl AutoScalingState {
         if !placed {
             ec2_instances::terminate(engine, &launched_ids);
             return GroupLaunchOutcome::unplaced(request.count, None);
+        }
+        // An instance launched INTO THE GROUP is held by every launch lifecycle hook the
+        // group configures, which is where the hold a client completes starts
+        // ([`lifecycle_actions`]). A warm pool's own instances are not instances of the
+        // group, so nothing holds them here.
+        if request.destination == LaunchDestination::Group {
+            self.hold_lifecycle_transition(
+                request.group_name,
+                HeldTransition::Launching,
+                &launched_ids,
+                request.launched_at,
+            );
         }
         GroupLaunchOutcome {
             launched_ids,
@@ -2370,25 +2428,45 @@ impl AutoScalingState {
     /// where it lives, so the account sees it shut down rather than vanish from one
     /// service's view alone.
     ///
+    /// A group holding a lifecycle hook for the terminating transition HOLDS each of them
+    /// instead ([`AutoScalingState::hold_lifecycle_transition`]): such an instance waits in
+    /// that transition's wait state, and is reported `Terminating` — and shut down in Amazon
+    /// EC2 — only once the hold resolves, because a hook that cannot stop a termination can
+    /// still delay it.
+    ///
     /// An id the group does not hold, or one already on its way out, changes nothing.
     fn terminate_group_instances<Eng: Send + Sync + 'static>(
         &mut self,
         engine: &Eng,
         group_name: &str,
         instance_ids: &[String],
+        now: SystemTime,
         due: SystemTime,
     ) {
+        let held = self.hold_lifecycle_transition(
+            group_name,
+            HeldTransition::Terminating,
+            instance_ids,
+            now,
+        );
+        // What this call actually takes out of service: a named instance the group still
+        // holds, that no termination hook is holding and that is not already on its way out.
+        // An instance a LAUNCH hook was holding is among them — the hold above discarded that
+        // hold, because the launch it was waiting for is over.
+        let mut leaving: Vec<String> = Vec::new();
         if let Some(group) = self.groups.get_mut(group_name) {
             for instance in &mut group.instances {
                 if instance_ids.contains(&instance.instance_id)
-                    && instance.lifecycle_state != LIFECYCLE_TERMINATING
+                    && !held.contains(&instance.instance_id)
+                    && !instance.is_leaving_group()
                 {
                     instance.lifecycle_state = LIFECYCLE_TERMINATING.to_string();
                     instance.transition_due = Some(due);
+                    leaving.push(instance.instance_id.clone());
                 }
             }
         }
-        ec2_instances::terminate(engine, instance_ids);
+        ec2_instances::terminate(engine, &leaving);
     }
 
     /// Materialise every instance-refresh replacement the clock has made due at
@@ -2647,7 +2725,7 @@ impl AutoScalingState {
         } else {
             vec![instance_id.to_string()]
         };
-        self.terminate_group_instances(engine, group_name, &replaced, due);
+        self.terminate_group_instances(engine, group_name, &replaced, now, due);
 
         for launched_id in &launched_ids {
             self.record_instance_lifecycle_change(
@@ -2944,10 +3022,10 @@ pub const ADJUSTMENT_TYPE_PERCENT_CHANGE_IN_CAPACITY: &str = "PercentChangeInCap
 /// scale-out events, specify autoscaling:EC2_INSTANCE_LAUNCHING. To create a
 /// lifecycle hook for scale-in events, specify
 /// autoscaling:EC2_INSTANCE_TERMINATING"). In ASCII order.
-pub const LIFECYCLE_HOOK_TYPES: &[&str] = &[
-    "autoscaling:EC2_INSTANCE_LAUNCHING",
-    "autoscaling:EC2_INSTANCE_TERMINATING",
-];
+/// Named beside the transitions themselves ([`lifecycle_actions`]), which is where the hold
+/// each one puts an instance in is implemented, so the catalog a read publishes and the
+/// transitions a hold is taken at cannot drift apart.
+pub const LIFECYCLE_HOOK_TYPES: &[&str] = &[TRANSITION_LAUNCHING, TRANSITION_TERMINATING];
 
 /// The catalog `DescribeAutoScalingNotificationTypes` reports: the event types a
 /// group can notify about.

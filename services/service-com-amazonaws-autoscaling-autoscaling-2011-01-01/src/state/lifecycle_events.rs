@@ -103,7 +103,7 @@ pub const MAX_PENDING_EVENTS: usize = 4_000;
 /// The bound the service this publishes to declares: its `PutEventsRequestEntryList` is
 /// `@length(min: 1, max: 10)`, so a drain holding more events than that is published in
 /// several requests rather than one the service would refuse.
-const MAX_PUT_EVENTS_ENTRIES: usize = 10;
+pub(crate) const MAX_PUT_EVENTS_ENTRIES: usize = 10;
 
 /// How many events ONE drain publishes.
 ///
@@ -283,6 +283,14 @@ impl AutoScalingState {
         change: &InstanceLifecycleChange<'_>,
     ) -> String {
         let description = change.kind.description(change.instance_id);
+        // WHEN the step completes. A step a lifecycle hook is holding the instance at is not
+        // a fact at the end of the transient span: the hold is what it is waiting on, so the
+        // activity stays in progress and the event stays unpublished until the hold
+        // resolves. The hold's own latest deadline stands in until then
+        // ([`super::lifecycle_actions`] re-dates both the moment it resolves), so a step is
+        // never owed at an instant the hold could still be running at.
+        let held = self.held_step_deadline(change);
+        let due = held.unwrap_or(change.due);
         let activity_id = self.record_activity(
             change.group_name,
             change.group_arn,
@@ -290,8 +298,11 @@ impl AutoScalingState {
             change.cause.to_string(),
             GROUP_STATE_IN_SERVICE,
             change.start_time,
-            Some(change.due),
+            Some(due),
         );
+        if held.is_some() {
+            self.remember_held_step(change, &activity_id);
+        }
         let region = self
             .groups
             .get(change.group_name)
@@ -321,7 +332,7 @@ impl AutoScalingState {
             description,
             cause: change.cause.to_string(),
             start_time: change.start_time,
-            due: change.due,
+            due,
         });
         activity_id
     }
@@ -402,6 +413,10 @@ impl AutoScalingState {
                     .iter()
                     .filter_map(|refresh| refresh.next_step_due),
             )
+            // And what the holds a group's lifecycle hooks have taken owe: the deadline each
+            // one resolves itself at, and the publication of each announcement
+            // ([`super::lifecycle_actions`]).
+            .chain(self.lifecycle_action_timeouts())
             .min()
     }
 
@@ -427,6 +442,7 @@ impl AutoScalingState {
             .pending_lifecycle_events
             .iter()
             .any(|event| event.due <= now)
+            || self.owes_lifecycle_action_event(now)
         {
             return Some(now);
         }
@@ -607,7 +623,7 @@ fn date_time_text(at: SystemTime) -> String {
 }
 
 /// `at` as the epoch milliseconds the event's `time` carries.
-fn epoch_millis(at: SystemTime) -> i64 {
+pub(crate) fn epoch_millis(at: SystemTime) -> i64 {
     i64::try_from(
         at.duration_since(UNIX_EPOCH)
             .unwrap_or_default()
@@ -619,7 +635,7 @@ fn epoch_millis(at: SystemTime) -> i64 {
 /// The ARN of the Amazon EC2 instance an event is about, which the envelope's `resources`
 /// names beside the group's: the event names every resource it is about, which is what a
 /// rule filtering on `resources` reads.
-fn instance_arn(region: &str, instance_id: &str) -> String {
+pub(crate) fn instance_arn(region: &str, instance_id: &str) -> String {
     ::engine::emulator_arn("ec2", region, &format!("instance/{instance_id}"))
 }
 
@@ -639,11 +655,25 @@ async fn publish_pending<Eng: Send + Sync + 'static>(
         return;
     };
     loop {
-        let due = state
-            .lock()
-            .take_due_lifecycle_events(SystemTime::now(), MAX_PUBLISHED_PER_DRAIN);
-        if due.is_empty() {
+        let (due, due_actions) = {
+            let mut guard = state.lock();
+            let now = SystemTime::now();
+            (
+                guard.take_due_lifecycle_events(now, MAX_PUBLISHED_PER_DRAIN),
+                guard.take_due_lifecycle_action_events(now, MAX_PUBLISHED_PER_DRAIN),
+            )
+        };
+        if due.is_empty() && due_actions.is_empty() {
             return;
+        }
+        if !due_actions.is_empty() {
+            // The holds a group's lifecycle hooks have taken, announced on the same bus by
+            // the same drain: a client waiting for a hook's event makes no further call
+            // either ([`super::lifecycle_actions`]).
+            super::lifecycle_actions::publish(callback, &due_actions).await;
+        }
+        if due.is_empty() {
+            continue;
         }
         publish_batch(callback, &due).await;
         // The same steps, to the topics the group's own notification configurations asked
@@ -657,59 +687,105 @@ async fn publish_pending<Eng: Send + Sync + 'static>(
     }
 }
 
-/// Publish one pass, in `PutEvents` requests of at most [`MAX_PUT_EVENTS_ENTRIES`] entries,
-/// each addressed to the Region the group it is about lives in.
-async fn publish_batch(
+/// One event this service is publishing, reduced to what the publication itself needs.
+///
+/// THE ONE shape every event of this service reaches the bus as, so the two kinds it
+/// publishes — the instance lifecycle steps of this module and the held lifecycle actions of
+/// [`super::lifecycle_actions`] — go out through one request loop rather than through two
+/// copies of it that can drift apart.
+pub(crate) struct OutboundEvent {
+    /// The Region the event is published in, which is the Region the group lives in.
+    pub region: String,
+    /// The `detail-type` it carries.
+    pub detail_type: &'static str,
+    /// WHEN it happened, which is the event's own `time` rather than the instant the queue
+    /// was drained: `PutEventsRequestEntry$Time` is "the time stamp of the event, per
+    /// RFC3339. If no time stamp is provided, the time stamp of the PutEvents call is used."
+    pub time: SystemTime,
+    /// Every resource the event is about, which is what a rule filtering on `resources`
+    /// reads.
+    pub resources: Vec<String>,
+    /// The rendered `detail`.
+    pub detail: String,
+    /// What a batch that could not be delivered is named by in the log: an event that was
+    /// not delivered is otherwise invisible.
+    pub subject: String,
+}
+
+/// Publish `events` onto the account's default event bus, in `PutEvents` requests of at most
+/// [`MAX_PUT_EVENTS_ENTRIES`] entries, each addressed to the Region the event belongs to.
+///
+/// Called with NO store lock held. Publication is best effort — an emulator with no
+/// EventBridge mounted has nowhere to publish — so a failure is logged, naming the subjects
+/// of the batch that did not reach the bus, and the operation's own answer stands.
+pub(crate) async fn publish_events(
     callback: &smithy_server_runtime::EmbeddedEmulator,
-    events: &[PendingLifecycleEvent],
+    events: &[OutboundEvent],
 ) {
     let mut regions: Vec<&str> = events.iter().map(|event| event.region.as_str()).collect();
     regions.sort_unstable();
     regions.dedup();
     for region in regions {
         let client = ::service_common::eventbridge_client::eventbridge_client(callback, region);
-        let of_region: Vec<&PendingLifecycleEvent> = events
+        let of_region: Vec<&OutboundEvent> = events
             .iter()
             .filter(|event| event.region == region)
             .collect();
         for window in of_region.chunks(MAX_PUT_EVENTS_ENTRIES) {
             let mut request = client.put_events();
             for event in window {
-                let entry = ::aws_sdk_eventbridge::types::PutEventsRequestEntry::builder()
+                let mut entry = ::aws_sdk_eventbridge::types::PutEventsRequestEntry::builder()
                     .event_bus_name(DEFAULT_EVENT_BUS)
                     .source(EVENT_SOURCE)
-                    .detail_type(event.kind.detail_type())
-                    // The event's `time` is WHEN the instance moved, not when the queue was
-                    // drained: `PutEventsRequestEntry$Time` is "the time stamp of the
-                    // event, per RFC3339. If no time stamp is provided, the time stamp of
-                    // the PutEvents call is used."
+                    .detail_type(event.detail_type)
                     .time(::aws_sdk_eventbridge::primitives::DateTime::from_millis(
-                        epoch_millis(event.due),
+                        epoch_millis(event.time),
                     ))
-                    .resources(&event.group_arn)
-                    .resources(instance_arn(&event.region, &event.instance_id))
-                    .detail(lifecycle_event_detail(event).to_string())
-                    .build();
-                request = request.entries(entry);
+                    .detail(&event.detail);
+                for resource in &event.resources {
+                    entry = entry.resources(resource);
+                }
+                request = request.entries(entry.build());
             }
             if let Err(error) = request.send().await {
-                // Named rather than only counted: an event that was not delivered is
-                // otherwise invisible, so the group and the instances of the batch that
-                // did not reach the bus are what a developer needs to see.
                 let dropped: Vec<&str> = window
                     .iter()
-                    .map(|event| event.instance_id.as_str())
+                    .map(|event| event.subject.as_str())
                     .collect();
                 ::tracing::warn!(
                     error = %::aws_smithy_types::error::display::DisplayErrorContext(&error),
                     region,
-                    instances = ?dropped,
-                    "Auto Scaling instance lifecycle events could not be published to \
-                     EventBridge"
+                    subjects = ?dropped,
+                    "Auto Scaling events could not be published to EventBridge"
                 );
             }
         }
     }
+}
+
+/// Publish one pass of the instance lifecycle steps, through the one request loop every
+/// event of this service goes out by ([`publish_events`]).
+async fn publish_batch(
+    callback: &smithy_server_runtime::EmbeddedEmulator,
+    events: &[PendingLifecycleEvent],
+) {
+    let outbound: Vec<OutboundEvent> = events
+        .iter()
+        .map(|event| OutboundEvent {
+            region: event.region.clone(),
+            detail_type: event.kind.detail_type(),
+            time: event.due,
+            // The event names every resource it is about: the group, and the instance that
+            // moved.
+            resources: vec![
+                event.group_arn.clone(),
+                instance_arn(&event.region, &event.instance_id),
+            ],
+            detail: lifecycle_event_detail(event).to_string(),
+            subject: event.instance_id.clone(),
+        })
+        .collect();
+    publish_events(callback, &outbound).await;
 }
 
 /// Publish the lifecycle events the CLOCK owes, as they fall due, with no further call from

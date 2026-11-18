@@ -96,7 +96,7 @@ use std::time::SystemTime;
 
 use ::service_com_amazonaws_elasticloadbalancingv2_elasticloadbalancing_v10::state as elbv2;
 
-use crate::state::{AutoScalingState, StoredGroup, LIFECYCLE_TERMINATING};
+use crate::state::{AutoScalingState, StoredGroup};
 
 /// The `TargetTypeEnum` value of a target group whose targets are Amazon EC2 instances,
 /// which is the only kind an Auto Scaling group's instances can be registered in
@@ -429,7 +429,7 @@ pub fn wanted_of(store: &AutoScalingState, group_name: &str) -> Vec<TargetRegist
     let mut registrations = Vec::new();
     for arn in attached_arns(group) {
         for instance in &group.instances {
-            if instance.lifecycle_state == LIFECYCLE_TERMINATING {
+            if instance.is_leaving_group() {
                 continue;
             }
             registrations.push(TargetRegistration {

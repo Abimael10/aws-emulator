@@ -75,9 +75,14 @@ pub const DEFAULT_LIFECYCLE_ACTION_RESULT: &str = "ABANDON";
 /// below states this set, so a caller is told which vendors it may choose from.
 pub const NOTIFICATION_TARGET_VENDORS: &[&str] = &["sqs", "sns", "lambda"];
 
+/// The result that lets the transition a lifecycle hook holds an instance at CARRY ON,
+/// from the same documentation ("Valid values: CONTINUE | ABANDON").
+pub const LIFECYCLE_ACTION_CONTINUE: &str = "CONTINUE";
+
 /// The results a lifecycle hook may default to, from the same documentation: "Valid
 /// values: CONTINUE | ABANDON".
-pub const LIFECYCLE_ACTION_RESULTS: &[&str] = &["CONTINUE", DEFAULT_LIFECYCLE_ACTION_RESULT];
+pub const LIFECYCLE_ACTION_RESULTS: &[&str] =
+    &[LIFECYCLE_ACTION_CONTINUE, DEFAULT_LIFECYCLE_ACTION_RESULT];
 
 /// One lifecycle hook of a group, as it is stored.
 ///
@@ -346,6 +351,18 @@ pub fn unknown_transition_message() -> String {
 /// with, in the same shape.
 pub fn unknown_result_message() -> String {
     outside_value_set_message("DefaultResult", LIFECYCLE_ACTION_RESULTS)
+}
+
+/// The message a call that completes a held lifecycle action with a result outside that
+/// same pair is refused with, in the same shape.
+///
+/// The member is the one `CompleteLifecycleAction` carries the result in — "the action for
+/// the group to take. You can specify either CONTINUE or ABANDON"
+/// (`smithy_query(query="doc",shape="CompleteLifecycleActionType",member="LifecycleActionResult")`)
+/// — and the admissible values are the pair a hook may default to, since both state the
+/// same outcome of the same wait.
+pub fn unknown_lifecycle_action_result_message() -> String {
+    outside_value_set_message("LifecycleActionResult", LIFECYCLE_ACTION_RESULTS)
 }
 
 /// The message a request whose notification target is a resource of a vendor this

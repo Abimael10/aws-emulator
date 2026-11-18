@@ -222,7 +222,11 @@ fn lifecycle_document(event: &PendingLifecycleEvent) -> String {
 const COMPLETED_PROGRESS: i64 = 100;
 
 /// Write one text member into a rendered document.
-fn insert_text(document: &mut ::serde_json::Map<String, ::serde_json::Value>, key: &str, value: &str) {
+pub(crate) fn insert_text(
+    document: &mut ::serde_json::Map<String, ::serde_json::Value>,
+    key: &str,
+    value: &str,
+) {
     document.insert(
         key.to_string(),
         ::serde_json::Value::String(value.to_string()),
